@@ -427,16 +427,13 @@ class ClippedPGLossFn(LossFunction):
             )
 
             # Compute KL loss
-            kl = (
-                kl_importance_weights
-                * self.reference_policy_kl_penalty
-                * calculate_kl(
-                    logprobs=curr_logprobs_unfiltered,
-                    logprobs_reference=reference_policy_logprobs,
-                    kl_type=self.reference_policy_kl_type,
-                    input_clamp_value=self.kl_input_clamp_value,
-                    output_clamp_value=self.kl_output_clamp_value,
-                )
+            kl = self.reference_policy_kl_penalty * calculate_kl(
+                logprobs=curr_logprobs_unfiltered,
+                logprobs_reference=reference_policy_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+                importance_sampling_weights=kl_importance_weights,
             )
 
             # Reduce KL loss
@@ -1164,15 +1161,16 @@ class MseValueLossFn(LossFunction):
 
     def __call__(
         self,
-        values: torch.Tensor,
+        logits: torch.Tensor,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute Mean Squared Error value loss, optionally with clipping."""
         # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
-        if values.ndim > 2 and values.shape[-1] == 1:
-            values = values.squeeze(-1)
+        if logits.ndim > 2 and logits.shape[-1] == 1:
+            logits = logits.squeeze(-1)
+        values = logits
 
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]

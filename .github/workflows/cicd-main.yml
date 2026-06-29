@@ -264,7 +264,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
-          version: "0.9.1"
+          version: "0.11.18"
           enable-cache: true
           prune-cache: false
       # Faster than uv python install since it caches python alongside runner
@@ -841,6 +841,8 @@ jobs:
           - script: L1_Functional_Tests_Megatron_4
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_AutoModel
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_SGLang
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}

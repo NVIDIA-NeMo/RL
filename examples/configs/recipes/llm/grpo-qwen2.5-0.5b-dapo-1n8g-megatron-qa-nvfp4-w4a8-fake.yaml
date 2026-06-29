@@ -1,0 +1,22 @@
+# DAPO + Qwen2.5-0.5B + NVFP4 W4A8 + Megatron, 1 node x 8 GPUs.
+# Uses vLLM fake-quant rollout.
+defaults: ./grpo-qwen2.5-0.5b-dapo-1n8g-megatron.yaml
+
+policy:
+  quant_cfg: examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml
+  quant_calib_data: cnn_dailymail
+  quant_calib_size: 4
+  quant_batch_size: 1
+  quant_sequence_length: 128
+  generation:
+    quant_cfg: examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml
+
+checkpointing:
+  checkpoint_dir: checkpoints/grpo-qwen2.5-0.5b-dapo-1n8g-w4a8-fake
+
+logger:
+  log_dir: logs/grpo-qwen2.5-0.5b-dapo-1n8g-w4a8-fake
+  wandb:
+    name: grpo-qwen2.5-0.5b-dapo-1n8g-w4a8-fake
+  tensorboard:
+    log_dir: tb_logs-grpo-qwen2.5-0.5b-dapo-1n8g-w4a8-fake
