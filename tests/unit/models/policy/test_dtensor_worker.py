@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pprint
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -61,6 +62,109 @@ def test_dtensor_prepare_for_training_restores_optimizer(monkeypatch):
 
     assert model.train_called
     assert restored_devices == ["cuda"]
+
+
+def test_dtensor_checkpoint_engine_weight_iterator():
+    from nemo_rl.models.policy.workers.dtensor_policy_worker import (
+        DTensorPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(DTensorPolicyWorkerImpl)
+    worker.model = torch.nn.Linear(2, 1)
+    worker.dtype = torch.float32
+
+    weights = list(DTensorPolicyWorkerImpl._checkpoint_engine_weight_iterator(worker))
+
+    assert [name for name, _tensor in weights] == ["weight", "bias"]
+    for _name, tensor in weights:
+        assert tensor.dtype == torch.float32
+        assert tensor.is_contiguous()
+
+
+def test_dtensor_checkpoint_engine_rejects_kv_scales():
+    from nemo_rl.models.policy.workers.dtensor_policy_worker import (
+        DTensorPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(DTensorPolicyWorkerImpl)
+    worker.model = torch.nn.Linear(2, 1)
+    worker.dtype = torch.float32
+
+    with pytest.raises(NotImplementedError, match="FP8 kvcache"):
+        DTensorPolicyWorkerImpl._checkpoint_engine_weight_iterator(
+            worker, kv_scales={"scale": 1.0}
+        )
+
+
+def test_dtensor_checkpoint_engine_cpu_offload_hooks():
+    from nemo_rl.models.policy.workers.dtensor_policy_worker import (
+        DTensorPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(DTensorPolicyWorkerImpl)
+    worker.model = "cpu_model"
+    worker.cpu_offload = True
+    calls = []
+
+    def move_to_cuda(model):
+        calls.append(("cuda", model))
+        return "cuda_model"
+
+    def move_to_cpu(model):
+        calls.append(("cpu", model))
+        return "cpu_model"
+
+    worker.move_to_cuda = move_to_cuda
+    worker.move_to_cpu = move_to_cpu
+
+    with pytest.warns(UserWarning, match="cpu_offload adds an onload/offload cycle"):
+        DTensorPolicyWorkerImpl._prepare_checkpoint_engine_weight_send(worker)
+    assert worker.model == "cuda_model"
+    DTensorPolicyWorkerImpl._finalize_checkpoint_engine_weight_send(worker)
+
+    assert worker.model == "cpu_model"
+    assert calls == [("cuda", "cpu_model"), ("cpu", "cuda_model")]
+
+
+def test_dtensor_policy_reconstructs_tokenizer_in_worker(monkeypatch):
+    from nemo_rl.models.policy import lm_policy as lm_policy_mod
+
+    captured_builders = []
+
+    class FakeCluster:
+        _sorted_bundle_indices = None
+        num_gpus_per_node = 1
+
+        def world_size(self):
+            return 1
+
+    class FakeWorkerGroup:
+        def __init__(self, _cluster, worker_builder, **_kwargs):
+            captured_builders.append(worker_builder)
+
+        def shutdown(self, *_args, **_kwargs):
+            pass
+
+    config = create_test_config("dummy-model")
+    tokenizer = MagicMock()
+    tokenizer.pad_token_id = 0
+
+    monkeypatch.setattr(lm_policy_mod, "RayQueue", lambda: object())
+    monkeypatch.setattr(lm_policy_mod, "RayWorkerGroup", FakeWorkerGroup)
+    monkeypatch.setattr(lm_policy_mod, "get_default_hf_config", lambda _name: {})
+    monkeypatch.setattr(
+        lm_policy_mod.FLOPTracker,
+        "from_config",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    Policy(FakeCluster(), config, tokenizer, init_reference_model=False)
+
+    assert captured_builders
+    worker_kwargs = captured_builders[0].kwargs
+    assert "tokenizer" not in worker_kwargs
+    assert "processor" not in worker_kwargs
+    assert config["tokenizer"]["use_processor"] is False
 
 
 def create_test_config(

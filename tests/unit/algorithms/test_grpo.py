@@ -1634,6 +1634,43 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
 
 
+def test_refit_policy_generation_checkpoint_engine_uses_weight_sync(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    policy = object()
+    sync = MagicMock()
+    kv_scales = {"layer_0": 1.0}
+
+    class DummyGeneration:
+        cfg = {
+            "backend": "vllm",
+            "checkpoint_engine": {"enabled": True, "backend": "nixl"},
+        }
+
+    generation = DummyGeneration()
+    create_sync = MagicMock(return_value=sync)
+    monkeypatch.setattr(grpo_mod, "create_weight_synchronizer", create_sync)
+
+    grpo_mod.refit_policy_generation(
+        policy=policy,
+        policy_generation=generation,
+        colocated_inference=False,
+        _refit_buffer_size_gb=2,
+        timer=None,
+        kv_scales=kv_scales,
+    )
+
+    create_sync.assert_called_once_with(
+        policy=policy,
+        generation=generation,
+        generation_backend="vllm",
+        colocated=False,
+        refit_buffer_size_gb=2,
+    )
+    sync.sync_weights.assert_called_once_with(timer=None, kv_scales=kv_scales)
+    sync.shutdown.assert_called_once_with()
+
+
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):

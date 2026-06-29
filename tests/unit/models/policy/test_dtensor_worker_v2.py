@@ -98,6 +98,62 @@ def test_dtensor_v2_update_moe_gate_bias_noop_when_unsupported():
     DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
 
 
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_checkpoint_engine_weight_iterator():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = nn.Linear(2, 1)
+    worker.dtype = torch.float32
+
+    weights = list(DTensorPolicyWorkerV2Impl._checkpoint_engine_weight_iterator(worker))
+
+    assert [name for name, _tensor in weights] == ["weight", "bias"]
+    for _name, tensor in weights:
+        assert tensor.dtype == torch.float32
+        assert tensor.is_contiguous()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_checkpoint_engine_rejects_kv_scales():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = nn.Linear(2, 1)
+    worker.dtype = torch.float32
+
+    with pytest.raises(NotImplementedError, match="FP8 kvcache"):
+        DTensorPolicyWorkerV2Impl._checkpoint_engine_weight_iterator(
+            worker, kv_scales={"scale": 1.0}
+        )
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_checkpoint_engine_cpu_offload_hooks():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = "cpu_model"
+    worker.cpu_offload = True
+    calls = []
+
+    def move_to_cuda(model):
+        calls.append(("cuda", model))
+        return "cuda_model"
+
+    def move_to_cpu(model):
+        calls.append(("cpu", model))
+        return "cpu_model"
+
+    worker.move_to_cuda = move_to_cuda
+    worker.move_to_cpu = move_to_cpu
+
+    with pytest.warns(UserWarning, match="cpu_offload adds an onload/offload cycle"):
+        DTensorPolicyWorkerV2Impl._prepare_checkpoint_engine_weight_send(worker)
+    assert worker.model == "cuda_model"
+    DTensorPolicyWorkerV2Impl._finalize_checkpoint_engine_weight_send(worker)
+
+    assert worker.model == "cpu_model"
+    assert calls == [("cuda", "cpu_model"), ("cpu", "cuda_model")]
+
+
 def create_test_config(
     model_name: str,
     tp: int = 1,

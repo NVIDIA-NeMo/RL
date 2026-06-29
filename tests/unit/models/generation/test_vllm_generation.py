@@ -37,6 +37,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    _generated_token_logprob,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -157,6 +158,19 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
 
     assert _resolve_enable_prefix_caching({}) is False
+
+
+def test_generated_token_logprob_uses_generated_token_id():
+    first_logprob = types.SimpleNamespace(logprob=-0.1)
+    generated_logprob = types.SimpleNamespace(logprob=-2.5)
+
+    logprob_dict = {
+        11: first_logprob,
+        22: generated_logprob,
+    }
+
+    assert _generated_token_logprob(logprob_dict, 22) == -2.5
+    assert _generated_token_logprob(logprob_dict, 33) is None
 
 
 basic_lora_test_config: LoRAConfig = {

@@ -55,6 +55,15 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
+def _generated_token_logprob(
+    logprob_dict: dict[int, Any], token_id: int
+) -> float | None:
+    logprob = logprob_dict.get(token_id)
+    if logprob is None:
+        return None
+    return float(logprob.logprob)
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -216,7 +225,11 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        _apply_vllm_patches(self.py_executable, extra_env_vars=extra_env_vars)
+        _apply_vllm_patches(
+            self.py_executable,
+            extra_env_vars=extra_env_vars,
+            checkpoint_engine_config=config.get("checkpoint_engine"),
+        )
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -579,6 +592,14 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             ),
         )
 
+    def checkpoint_engine_rpc(
+        self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
+    ) -> Any:  # pragma: no cover
+        result = self.llm.collective_rpc(checkpoint_method, args=method_args)
+        if checkpoint_method == "update_weights_from_checkpoint_engine":
+            return all(item for item in result if item is not None)
+        return result
+
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -678,11 +699,13 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             if hasattr(generation, "logprobs") and generation.logprobs:
                 try:
                     for idx, logprob_dict in enumerate(generation.logprobs):
-                        if logprob_dict:
+                        if logprob_dict and idx < len(generated_tokens):
+                            token_id = generated_tokens[idx]
+                            logprob = _generated_token_logprob(logprob_dict, token_id)
+                            if logprob is None:
+                                continue
                             position = sequence_length + idx
-                            full_logprobs[position] = next(iter(logprob_dict.items()))[
-                                1
-                            ].logprob
+                            full_logprobs[position] = logprob
                 except Exception:
                     import traceback
 

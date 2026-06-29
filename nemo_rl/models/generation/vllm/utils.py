@@ -12,15 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import concurrent.futures
+import inspect
 from collections import defaultdict
 from typing import Any, Optional
 
+import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 
 R3_MISSING_ROUTE_SENTINEL = -1
+
+
+async def resolve_collective_rpc_result(result: Any) -> Any:
+    """Recursively resolve a vLLM ``collective_rpc`` result to concrete values.
+
+    ``collective_rpc`` may hand back awaitables, ``concurrent.futures.Future``
+    objects, ``ray.ObjectRef`` handles, or nested lists/tuples of those. Unwrap
+    them all so callers see plain Python values (preserving list/tuple shape).
+    """
+    while inspect.isawaitable(result):
+        result = await result
+    if isinstance(result, concurrent.futures.Future):
+        return await resolve_collective_rpc_result(await asyncio.wrap_future(result))
+    if isinstance(result, ray.ObjectRef):
+        return await asyncio.to_thread(ray.get, result)
+    if isinstance(result, list | tuple):
+        items = [await resolve_collective_rpc_result(item) for item in result]
+        return tuple(items) if isinstance(result, tuple) else items
+    return result
 
 
 def format_prompt_for_vllm_generation(

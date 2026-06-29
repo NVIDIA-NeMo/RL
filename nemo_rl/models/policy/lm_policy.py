@@ -237,9 +237,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
 
-        if use_v2:
-            # DTensor v2 workers reconstruct tokenizer/processor locally to avoid
-            # pickling across incompatible transformers versions (v4 head → v5 worker).
+        if dtensor_enable:
+            # DTensor workers reconstruct tokenizer/processor locally to avoid
+            # pickling across incompatible transformers versions.
             config["tokenizer"]["use_processor"] = processor is not None
         else:
             worker_kwargs["tokenizer"] = tokenizer

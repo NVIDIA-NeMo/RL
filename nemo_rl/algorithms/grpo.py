@@ -108,6 +108,7 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.weight_sync import create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -1131,8 +1132,23 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    checkpoint_engine_config = generation_config.get("checkpoint_engine")
+    if checkpoint_engine_config and not checkpoint_engine_config["enabled"]:
+        checkpoint_engine_config = None
+
+    if checkpoint_engine_config is not None and backend != "vllm":
+        # Megatron/SGLang generation backends do not go through the
+        # checkpoint-engine weight synchronizer, so an enabled checkpoint_engine
+        # would be silently ignored (and skip the collective init below). Fail
+        # fast instead.
+        raise NotImplementedError(
+            "checkpoint-engine refit is only supported for the vLLM generation "
+            f"backend, but policy.generation.backend={backend!r}. Disable "
+            "policy.generation.checkpoint_engine.enabled."
+        )
+
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and checkpoint_engine_config is None:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -1170,6 +1186,11 @@ def setup(
             )  # type: ignore
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    elif not colocated_inference:
+        print(
+            f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
+            flush=True,
+        )
 
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
@@ -1867,26 +1888,44 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
-    # Megatron generation backend needs explicit suspend/resume around refits.
-    if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.suspend_for_refit()
+    checkpoint_engine_config = getattr(policy_generation, "cfg", {}).get(
+        "checkpoint_engine"
+    )
+    if checkpoint_engine_config and not checkpoint_engine_config["enabled"]:
+        checkpoint_engine_config = None
 
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
+    if (colocated_inference or checkpoint_engine_config is not None) and not isinstance(
+        policy_generation, MegatronGeneration
+    ):
+        weight_sync = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=policy_generation.cfg["backend"],
+            colocated=colocated_inference,
+            refit_buffer_size_gb=_refit_buffer_size_gb,
+        )
+        try:
+            weight_sync.sync_weights(timer=timer, kv_scales=kv_scales)
+        finally:
+            weight_sync.shutdown()
+        return
+
+    is_megatron_generation = isinstance(policy_generation, MegatronGeneration)
+    if is_megatron_generation:
+        # Megatron generation needs explicit suspend/resume around refits.
+        # In non-colocated mode it also needs to enter inference mode after refit.
+        policy_generation.suspend_for_refit()
         policy.offload_before_refit()
-    # Colocated inference needs to prepare for generation.
-    # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["weights"])
 
-    if (
-        not colocated_inference
-        and isinstance(policy_generation, MegatronGeneration)
-        and policy_generation.cfg["mcore_generation_config"]["refit_backend"]
-        == "nvshmem"
-    ):
-        futures_train = policy.preinit_nvshmem()
-        futures_inference = policy_generation.preinit_nvshmem_collective()
-        ray.get(futures_train + futures_inference)
+        if (
+            not colocated_inference
+            and policy_generation.cfg["mcore_generation_config"]["refit_backend"]
+            == "nvshmem"
+        ):
+            futures_train = policy.preinit_nvshmem()
+            futures_inference = policy_generation.preinit_nvshmem_collective()
+            ray.get(futures_train + futures_inference)
 
     # Create a context manager that does nothing when timer is None
     timer_context = (

@@ -192,13 +192,6 @@ class VllmGeneration(GenerationInterface):
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
-        if self.cfg["vllm_cfg"]["async_engine"]:
-            worker_builder = RayWorkerBuilder(
-                worker_cls, config, defer_model_load=defer_model_load
-            )
-        else:
-            worker_builder = RayWorkerBuilder(worker_cls, config)
-
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
         # User-supplied per-recipe env vars (e.g. vllm_cfg.env_vars in the yaml).
@@ -223,6 +216,19 @@ class VllmGeneration(GenerationInterface):
         # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
         if self.ep_size > self.tp_size:
             env_vars["VLLM_DP_SIZE"] = str(self.vllm_dp_size)
+
+        extra_env_vars = list(env_vars)
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            worker_builder = RayWorkerBuilder(
+                worker_cls,
+                config,
+                defer_model_load=defer_model_load,
+                extra_env_vars=extra_env_vars,
+            )
+        else:
+            worker_builder = RayWorkerBuilder(
+                worker_cls, config, extra_env_vars=extra_env_vars
+            )
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:

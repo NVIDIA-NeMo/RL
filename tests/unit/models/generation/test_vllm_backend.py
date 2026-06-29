@@ -160,6 +160,43 @@ def test_load_mtp_weights_from_disk_returns_false_without_drafter(tmp_path):
 
 
 @pytest.mark.vllm
+def test_sharded_weight_load_context_is_scoped_to_current_tensor():
+    """A mixed full/sharded refit stream should only mark sharded tensors."""
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    param = torch.nn.Parameter(torch.zeros(1, 8, 4), requires_grad=False)
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
+        )
+    )
+    expert_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    non_expert_name = "model.layers.0.self_attn.q_proj.weight"
+    ext.state_dict_info = {
+        expert_name: (torch.Size([8, 4]), torch.float32),
+        non_expert_name: (torch.Size([8, 4]), torch.float32),
+    }
+
+    stream = ext._with_sharded_weight_load_contexts(
+        [
+            (expert_name, torch.zeros(4, 4)),
+            (non_expert_name, torch.zeros(4, 4)),
+        ]
+    )
+
+    assert next(stream)[0] == expert_name
+    assert param.is_sharded_weight is True
+    assert next(stream)[0] == non_expert_name
+    assert not hasattr(param, "is_sharded_weight")
+
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+@pytest.mark.vllm
 def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
     tmp_path, monkeypatch
 ):

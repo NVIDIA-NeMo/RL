@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
+from collections.abc import Generator
 from typing import Any, Optional
 
 import ray
@@ -22,8 +24,117 @@ from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def maybe_preinit_nixl_checkpoint_engine(config: dict[str, Any]) -> Any:
+    """Preinitialize NIXL when checkpoint-engine refit is configured."""
+    generation_cfg = config.get("generation")
+    if not generation_cfg:
+        return None
+    checkpoint_cfg = generation_cfg.get("checkpoint_engine")
+    if not (
+        checkpoint_cfg
+        and checkpoint_cfg["enabled"]
+        and checkpoint_cfg["backend"] == "nixl"
+    ):
+        return None
+
+    from nemo_rl.utils.checkpoint_engines.nixl import (
+        preinit_nixl_agent,
+        resolve_nixl_backend_kwargs,
+    )
+
+    backend_name, backend_init_params = resolve_nixl_backend_kwargs(
+        checkpoint_cfg["engine_kwargs"]["nixl"]
+    )
+    return preinit_nixl_agent(
+        backend_name=backend_name, backend_init_params=backend_init_params
+    )
+
+
+class DTensorCheckpointEngineSendMixin:
+    """Shared checkpoint-engine send hooks for DTensor/FSDP2 policy workers.
+
+    With cpu_offload enabled the model sits in host memory between steps, so it
+    must be onloaded to CUDA for the transfer and offloaded again afterwards.
+    """
+
+    def _prepare_checkpoint_engine_weight_send(self) -> None:
+        if self.cpu_offload:
+            warnings.warn(
+                "cpu_offload adds an onload/offload cycle during non-colocated "
+                "checkpoint-engine refit. Disable it unless GPU memory requires it.",
+                stacklevel=2,
+            )
+            self.model = self.move_to_cuda(self.model)
+
+    def _finalize_checkpoint_engine_weight_send(self) -> None:
+        if self.cpu_offload:
+            self.model = self.move_to_cpu(self.model)
+
+
 class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
+
+    def _checkpoint_engine_weight_iterator(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Yield policy weights for checkpoint-engine refit."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support checkpoint-engine refit."
+        )
+
+    def _prepare_checkpoint_engine_weight_send(self) -> None:
+        """Prepare worker state before checkpoint-engine weight transfer."""
+        pass
+
+    def _finalize_checkpoint_engine_weight_send(self) -> None:
+        """Restore worker state after checkpoint-engine weight transfer."""
+        pass
+
+    async def send_weights_via_checkpoint_engine(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
+        self._prepare_checkpoint_engine_weight_send()
+        try:
+            with torch.no_grad():
+                await self.checkpoint_engine.send_weights(
+                    self._checkpoint_engine_weight_iterator(kv_scales=kv_scales)
+                )
+        finally:
+            self._finalize_checkpoint_engine_weight_send()
+
+    async def checkpoint_engine_rpc(
+        self, checkpoint_method: str, method_kwargs: Optional[dict[str, Any]] = None
+    ) -> Any:
+        kwargs = method_kwargs or {}
+        if checkpoint_method == "init_checkpoint_engine":
+            if getattr(self, "checkpoint_engine", None) is None:
+                from nemo_rl.utils.checkpoint_engines.base import (
+                    create_checkpoint_engine,
+                )
+
+                self.checkpoint_engine = create_checkpoint_engine(
+                    kwargs["backend"],
+                    bucket_size_bytes=kwargs["bucket_size_bytes"],
+                    engine_kwargs=kwargs["engine_kwargs"],
+                )
+            return
+        if checkpoint_method == "prepare_checkpoint_engine":
+            metadata = self.checkpoint_engine.prepare()
+            if isinstance(metadata, dict):
+                return {**metadata, "rank": self.rank}
+            return metadata
+        if checkpoint_method == "init_checkpoint_engine_process_group":
+            return self.checkpoint_engine.init_policy_process_group(
+                worker_rank=self.rank, **kwargs
+            )
+        if checkpoint_method == "send_weights_via_checkpoint_engine":
+            return await self.send_weights_via_checkpoint_engine(**kwargs)
+        if checkpoint_method == "finalize_checkpoint_engine":
+            checkpoint_engine = getattr(self, "checkpoint_engine", None)
+            if checkpoint_engine is not None:
+                checkpoint_engine.finalize()
+            return
+        return getattr(self.checkpoint_engine, checkpoint_method)(**kwargs)
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int

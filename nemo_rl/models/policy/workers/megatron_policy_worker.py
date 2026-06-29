@@ -22,6 +22,8 @@ from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
+from transformers import PreTrainedTokenizerBase
+
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
@@ -40,8 +42,6 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config
-from transformers import PreTrainedTokenizerBase
-
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -87,7 +87,10 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
-from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.base_policy_worker import (
+    AbstractPolicyWorker,
+    maybe_preinit_nixl_checkpoint_engine,
+)
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -132,6 +135,30 @@ def _model_self_packs_for_cp(model: Any) -> bool:
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
     return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+
+
+def _vllm_hf_expert_tp_shard_dim(name: str, tensor: torch.Tensor) -> int | None:
+    """Return the HF tensor dim that vLLM TP-loaders shard for MoE experts."""
+    if ".mlp.experts." not in name:
+        return None
+    if name.endswith((".gate_proj.weight", ".up_proj.weight")):
+        return 0
+    if name.endswith(".down_proj.weight") and tensor.ndim > 1:
+        return 1
+    return None
+
+
+def _maybe_shard_vllm_hf_weight(
+    name: str, tensor: torch.Tensor, *, tp_rank: int, tp_size: int
+) -> torch.Tensor:
+    shard_dim = _vllm_hf_expert_tp_shard_dim(name, tensor)
+    if shard_dim is None or shard_dim >= tensor.ndim:
+        return tensor
+    if tp_size <= 1 or tensor.shape[shard_dim] % tp_size != 0:
+        return tensor
+
+    shard_size = tensor.shape[shard_dim] // tp_size
+    return tensor.narrow(shard_dim, tp_rank * shard_size, shard_size).contiguous()
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -270,6 +297,7 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -1352,6 +1380,39 @@ class MegatronPolicyWorkerImpl(
             rank=self.rank,
             worker_name=str(self),
         )
+
+    def _checkpoint_engine_weight_iterator(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        base_iter = self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+        checkpoint_engine = getattr(self, "checkpoint_engine", None)
+        if not bool(getattr(checkpoint_engine, "shard_hf_weights", False)):
+            return base_iter
+
+        target_rollout_rank = getattr(checkpoint_engine, "target_rollout_rank", None)
+        if target_rollout_rank is None:
+            return base_iter
+
+        rollout_world_size = int(getattr(checkpoint_engine, "rollout_world_size", 1))
+        target_tp_size = int(
+            getattr(checkpoint_engine, "sharded_target_tp_size", None)
+            or rollout_world_size
+        )
+        if target_tp_size < 1:
+            raise ValueError("sharded_target_tp_size must be >= 1.")
+        target_tp_rank = int(target_rollout_rank) % target_tp_size
+
+        def sharded_iter() -> Iterator[tuple[str, torch.Tensor]]:
+            for name, tensor in base_iter:
+                sharded_tensor = _maybe_shard_vllm_hf_weight(
+                    name,
+                    tensor,
+                    tp_rank=target_tp_rank,
+                    tp_size=target_tp_size,
+                )
+                yield name, sharded_tensor
+
+        return sharded_iter()
 
     @torch.no_grad()
     def broadcast_weights_for_collective(

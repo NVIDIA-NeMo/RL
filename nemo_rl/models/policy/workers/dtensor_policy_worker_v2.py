@@ -71,7 +71,11 @@ from nemo_rl.models.policy.utils import (
     ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
 )
-from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.base_policy_worker import (
+    AbstractPolicyWorker,
+    DTensorCheckpointEngineSendMixin,
+    maybe_preinit_nixl_checkpoint_engine,
+)
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
 )
@@ -196,7 +200,10 @@ def get_train_context(
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerV2Impl(
-    TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
+    TQWorkerMixin,
+    DTensorCheckpointEngineSendMixin,
+    AbstractPolicyWorker,
+    ColocatablePolicyInterface,
 ):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -289,6 +296,7 @@ class DTensorPolicyWorkerV2Impl(
         self.dp_size = distributed_context.dp_size
         self.tp_size = distributed_context.tp_size
         self.cp_size = distributed_context.cp_size
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Initialize checkpoint manager now that distributed is set up
         self._init_checkpoint_manager(
@@ -1147,6 +1155,15 @@ class DTensorPolicyWorkerV2Impl(
             buffer_size_bytes=buffer_size_bytes,
             worker_state=self._ipc_worker_state,
         )
+
+    def _checkpoint_engine_weight_iterator(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+        return dtensor_params_generator(self.model, self.dtype)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
