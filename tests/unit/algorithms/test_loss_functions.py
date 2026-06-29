@@ -872,6 +872,61 @@ def test_calculate_kl(kl_type):
     assert torch.allclose(kl_clamped, expected_kl_clamped[kl_type], rtol=1e-3)
 
 
+def test_calculate_kl_detaches_importance_sampling_when_input_clamped():
+    """Input-clamped KL terms should not keep score-function gradients alive."""
+    logprobs = torch.tensor([[-3.0, -1.0]], requires_grad=True)
+    logprobs_reference = torch.zeros_like(logprobs)
+    importance_sampling_weights = torch.exp(logprobs - logprobs.detach())
+
+    kl = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=logprobs_reference,
+        kl_type="k3",
+        input_clamp_value=2.0,
+        output_clamp_value=None,
+        importance_sampling_weights=importance_sampling_weights,
+    )
+
+    expected_kl = torch.tensor([[4.389056, 0.7182818]])
+    torch.testing.assert_close(kl.detach(), expected_kl)
+
+    kl.sum().backward()
+
+    torch.testing.assert_close(
+        logprobs.grad,
+        torch.tensor([[0.0, -1.0]]),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_calculate_kl_output_clamp_includes_importance_sampling_weight():
+    """Output clamping should apply after IS weighting and block IS gradients."""
+    logprobs = torch.tensor([[-1.0]], requires_grad=True)
+    logprobs_reference = torch.zeros_like(logprobs)
+    importance_sampling_weights = 100.0 * torch.exp(logprobs - logprobs.detach())
+
+    kl = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=logprobs_reference,
+        kl_type="k3",
+        input_clamp_value=None,
+        output_clamp_value=1.0,
+        importance_sampling_weights=importance_sampling_weights,
+    )
+
+    torch.testing.assert_close(kl.detach(), torch.tensor([[1.0]]))
+
+    kl.sum().backward()
+
+    torch.testing.assert_close(
+        logprobs.grad,
+        torch.zeros_like(logprobs),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 # Simplified KL Penalty Test using original Loss
 def test_clipped_pg_loss_kl_penalty():
     """Tests KL penalty calculations directly."""
