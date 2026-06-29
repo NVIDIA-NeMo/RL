@@ -115,9 +115,13 @@ class VllmInternalWorkerExtension:
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size
         )
+        # Free cached torch-allocator blocks so NCCL's P2P transport buffers
+        # (raw cudaMalloc at comm init) have headroom; otherwise comm_init OOMs
+        # on memory-tight shapes (mirror the train side).
+        torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=self.device)
 
-    def init_per_pp_refit_comm_group(
+    def init_nccl_xfer_comm_group(
         self,
         rank_prefix: int,
         pp_ips: list[str],
@@ -126,17 +130,20 @@ class VllmInternalWorkerExtension:
         train_ranks_per_stage: int,
         sub_world_size: int,
     ) -> None:
-        """Initialize per-PP-stage communication groups for nccl_xfer refit.
+        """Bootstrap this gen worker's nccl_xfer bulk-path comm group(s).
 
-        Gen workers join ALL ``pp_size`` groups sequentially (they need all
-        layers).  Groups are created in order stage 0, 1, … so that train
-        ranks (which only join their own stage) unblock deterministically.
+        One comm group per PP stage; gen workers join ALL ``pp_size`` groups
+        (they need every stage's layers), created in stage order so the train
+        ranks (each in only their own stage) unblock deterministically.
+        Non-PP is simply ``pp_size == 1`` that contains all the gen ranks.
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
         local_rank = torch.distributed.get_rank()
         gen_rank_in_group = train_ranks_per_stage + rank_prefix + local_rank
 
+        # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
+        torch.cuda.empty_cache()
         self.pp_comm_groups = {}  # pyrefly: ignore[implicitly-defined-attribute]
         for stage in range(pp_size):
             group = StatelessProcessGroup(
@@ -740,18 +747,42 @@ class VllmInternalWorkerExtension:
             if spec.post is not None:
                 spec.post(ctx)
 
-        use_per_stage = hasattr(self, "pp_comm_groups") and self.pp_comm_groups
-        num_streams = (
-            int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")) if use_per_stage else 1
-        )
-
-        # Group params into ordered batches to concurrently recieve params from
-        # different pp-stages
+        # Group params by PP stage so different stages' bulk reshards run
+        # concurrently on their own streams.  Non-PP = single stage 0 (params
+        # carry no "pp_stage" key), so this collapses to one stage / one stream.
         stage_params = OrderedDict()
         for layer_name in self.nccl_xfer_refit_info["layer_names"]:
             for p in self.nccl_xfer_refit_info["per_layer_params"][layer_name]:
-                key = p["pp_stage"] if use_per_stage else 0
-                stage_params.setdefault(key, []).append(p)
+                stage_params.setdefault(p.get("pp_stage", 0), []).append(p)
+
+        num_streams = min(
+            int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)
+        )
+
+        # Overlapping broadcast and the nccl-xfer path refits.
+        import concurrent.futures
+
+        # The misc producer requires the worker's CUDA device setting.
+        # Otherwise it defaults to device 0
+        _misc_device = torch.cuda.current_device()
+
+        def _run_misc_recv():
+            torch.cuda.set_device(_misc_device)
+            self._receive_and_load_misc_params()
+
+        # Serialize the bulk reshard and the misc broadcast (bulk -> misc) by
+        # default: running the two NCCL communicators concurrently can deadlock —
+        _parallel_misc = os.environ.get(
+            "NRL_NCCL_XFER_REFIT_PARALLEL_MISC", ""
+        ).lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if _parallel_misc:
+            _misc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _misc_future = _misc_pool.submit(_run_misc_recv)
 
         streams = [torch.cuda.Stream() for _ in range(num_streams)]
         events = {}
@@ -760,18 +791,20 @@ class VllmInternalWorkerExtension:
             if (idx - num_streams) in events:
                 events[idx - num_streams].synchronize()
             with torch.cuda.stream(streams[idx % num_streams]):
-                group = (
-                    self.pp_comm_groups[stage]
-                    if use_per_stage
-                    else self.model_update_group
-                )
+                group = self.pp_comm_groups[stage]
                 for p in params:
                     _recv_one_param(p, group)
                 ev = torch.cuda.Event()
                 ev.record()
                 events[idx] = ev
 
-        self._receive_and_load_misc_params()
+        # Bulk reshard done.  Default: run misc now (serial, no concurrent
+        # communicators).  Parallel opt-in: join the background misc broadcast.
+        if not _parallel_misc:
+            _run_misc_recv()
+        else:
+            _misc_future.result()
+            _misc_pool.shutdown(wait=True)
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
