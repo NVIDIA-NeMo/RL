@@ -24,7 +24,6 @@ _QUANT_IGNORE_NAME_SUFFIXES = (
     ".weight_scale",
     ".weight_scale_2",
 )
-
 # Layers kept in native dtype by the real-quant vLLM rollout. Shared between the
 # vLLM quantization_config and the Megatron export-side ignore patterns.
 DEFAULT_NVFP4_IGNORE = [
@@ -36,6 +35,39 @@ DEFAULT_NVFP4_IGNORE = [
     "*self_attention*",
     "*self_attn*",
 ]
+
+# Nano3 keeps non-MLP/MoE GEMM paths and several sensitive layers in BF16.
+NANO3_NVFP4_IGNORE = [
+    *DEFAULT_NVFP4_IGNORE,
+    "*proj_out.*",
+    "*.gate.*",
+    "*mlp.shared_expert_gate.*",
+    "*linear_attn.conv1d*",
+    "*mixer.conv1d*",
+    "*.mixer.in_proj*",
+    "*.mixer.out_proj*",
+    "*.shared_expert.*",
+    "*.shared_experts.*",
+    "*.norm.*",
+    "*.q_proj*",
+    "*.k_proj*",
+    "*.v_proj*",
+    "*.o_proj*",
+    "*.qkv_proj*",
+    "*.linear_proj*",
+    "*.linear_qkv*",
+    "*.layers.4.*",
+    "*.layers.11.*",
+    "*.layers.18.*",
+    "*.layers.25.*",
+    "*.layers.32.*",
+    "*.layers.41.*",
+]
+
+REAL_QUANT_IGNORE_ALIASES = {
+    "DEFAULT_NVFP4_IGNORE": DEFAULT_NVFP4_IGNORE,
+    "NANO3_NVFP4_IGNORE": NANO3_NVFP4_IGNORE,
+}
 
 
 def _iter_quant_ignore_suffix_variants(name: str) -> Iterator[str]:
@@ -69,9 +101,25 @@ def matches_quant_ignore_pattern(name: str, patterns: list[str]) -> bool:
     )
 
 
+def resolve_real_quant_ignore(ignore: list[str] | str | None = None) -> list[str]:
+    """Resolve a real-quant ignore profile or explicit pattern list."""
+    if ignore is None:
+        return list(DEFAULT_NVFP4_IGNORE)
+    if isinstance(ignore, str):
+        alias = REAL_QUANT_IGNORE_ALIASES.get(ignore)
+        if alias is None:
+            known = ", ".join(sorted(REAL_QUANT_IGNORE_ALIASES))
+            raise ValueError(
+                f"Unknown real_quant_ignore profile '{ignore}'. "
+                f"Expected one of: {known}, or provide a list of patterns."
+            )
+        return list(alias)
+    return list(ignore)
+
+
 def build_vllm_modelopt_nvfp4_config(
     *,
-    ignore: list[str] | None = None,
+    ignore: list[str] | str | None = None,
 ) -> dict[str, Any]:
     """Build the HuggingFace quantization_config consumed by vLLM ModelOpt NVFP4.
 
@@ -93,7 +141,7 @@ def build_vllm_modelopt_nvfp4_config(
                 "targets": ["Linear"],
             }
         },
-        "ignore": ignore if ignore is not None else list(DEFAULT_NVFP4_IGNORE),
+        "ignore": resolve_real_quant_ignore(ignore),
         "quant_algo": "NVFP4",
         "quant_mode": "w4a16_nvfp4",
         "weight_only": True,

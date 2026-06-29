@@ -109,6 +109,22 @@ except ImportError:
     )
 
 
+def _modelopt_quant_module():
+    return importlib.import_module("modelopt.torch.quantization")
+
+
+def _modelopt_config_module():
+    return importlib.import_module("modelopt.torch.quantization.config")
+
+
+def _modelopt_dataset_utils_module():
+    return importlib.import_module("modelopt.torch.utils.dataset_utils")
+
+
+def _modelopt_plugins_module():
+    return importlib.import_module("modelopt.torch.utils.plugins")
+
+
 def test_get_tokenizer_applies_modelopt_calibration_defaults(monkeypatch):
     tokenizer = types.SimpleNamespace(padding_side="right", model_max_length=0)
     monkeypatch.setattr(worker_utils, "_base_get_tokenizer", lambda cfg: tokenizer)
@@ -127,7 +143,7 @@ def test_megatron_forward_loop_prefills_batch_input_ids(monkeypatch):
         batch_size=1,
     )
     monkeypatch.setattr(
-        worker_utils,
+        _modelopt_plugins_module(),
         "megatron_prefill",
         lambda model, input_ids, skip_return_logits: seen.append(
             (model, input_ids.clone(), skip_return_logits)
@@ -151,16 +167,22 @@ def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
         "resolve_quant_cfg",
         lambda quant_cfg: {"quant_cfg": [{"name": quant_cfg}]},
     )
-    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: False)
     monkeypatch.setattr(
-        worker_utils.mtq,
+        _modelopt_config_module(), "need_calibration", lambda cfg: False
+    )
+    monkeypatch.setattr(
+        _modelopt_quant_module(),
         "quantize",
         lambda model_arg, cfg, forward_loop: calls.append(
             (model_arg, cfg, forward_loop)
         )
         or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        _modelopt_quant_module(),
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
@@ -177,7 +199,7 @@ def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
 def test_quantize_model_requires_calibration_data(monkeypatch):
     model = torch.nn.Linear(1, 1)
     monkeypatch.setattr(worker_utils, "resolve_quant_cfg", lambda quant_cfg: {})
-    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: True)
+    monkeypatch.setattr(_modelopt_config_module(), "need_calibration", lambda cfg: True)
 
     with pytest.raises(ValueError, match="policy.quant_calib_data"):
         worker_utils.quantize_model(
@@ -194,7 +216,7 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
     calls = []
 
     monkeypatch.setattr(worker_utils, "resolve_quant_cfg", lambda quant_cfg: {})
-    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: True)
+    monkeypatch.setattr(_modelopt_config_module(), "need_calibration", lambda cfg: True)
     monkeypatch.setattr(
         worker_utils,
         "get_forward_loop_func",
@@ -205,11 +227,15 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        worker_utils.mtq,
+        _modelopt_quant_module(),
         "quantize",
         lambda model_arg, cfg, forward_loop: calls.append(forward_loop) or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        _modelopt_quant_module(),
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
@@ -232,9 +258,9 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
     calls = []
 
     monkeypatch.setattr(worker_utils, "resolve_quant_cfg", lambda quant_cfg: {})
-    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: True)
+    monkeypatch.setattr(_modelopt_config_module(), "need_calibration", lambda cfg: True)
     monkeypatch.setattr(
-        worker_utils,
+        _modelopt_dataset_utils_module(),
         "get_dataset_dataloader",
         lambda **kwargs: calls.append(("dataset", kwargs)) or dataloader,
     )
@@ -248,14 +274,18 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        worker_utils.mtq,
+        _modelopt_quant_module(),
         "quantize",
         lambda model_arg, cfg, forward_loop: calls.append(
             ("quantize", model_arg, cfg, forward_loop)
         )
         or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        _modelopt_quant_module(),
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,

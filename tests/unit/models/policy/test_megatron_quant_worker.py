@@ -90,7 +90,7 @@ def _make_real_quant_worker():
             "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
             "real_quant": True,
             "real_quant_ignore": ["lm_head"],
-            "vllm_cfg": {},
+            "vllm_cfg": {"kv_cache_dtype": "auto"},
         }
     }
     worker.model = object()
@@ -126,7 +126,6 @@ def test_modelopt_layer_spec_config_selects_layer_specs():
     from megatron.core.post_training.modelopt.gpt.model_specs import (
         get_gpt_modelopt_spec,
     )
-
     from nemo_rl.modelopt.models.policy.workers.utils import (
         get_quantization_layer_spec,
         get_quantization_mamba_stack_spec,
@@ -226,8 +225,8 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
 
     monkeypatch.setattr(
         megatron_quant_policy_worker,
-        "TensorQuantizer",
-        FakeTensorQuantizer,
+        "_tensor_quantizer_cls",
+        lambda: FakeTensorQuantizer,
     )
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl,

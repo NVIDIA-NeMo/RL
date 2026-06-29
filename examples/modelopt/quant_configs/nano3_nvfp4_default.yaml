@@ -80,6 +80,8 @@ quantize:
       enable: false
     - quantizer_name: '*router*'
       enable: false
+    - quantizer_name: '*.gate.*'
+      enable: false
     - quantizer_name: '*mlp.gate.*'
       enable: false
     - quantizer_name: '*mlp.shared_expert_gate.*'
@@ -88,13 +90,29 @@ quantize:
       enable: false
     - quantizer_name: '*mixer.conv1d*'
       enable: false
+    - quantizer_name: '*.mixer.in_proj.*'
+      enable: false
+    - quantizer_name: '*.mixer.out_proj.*'
+      enable: false
+    - quantizer_name: '*.shared_expert.*'
+      enable: false
+    - quantizer_name: '*.shared_experts.*'
+      enable: false
+    - quantizer_name: '*.norm.*'
+      enable: false
     - quantizer_name: '*output_layer*'
       enable: false
     - quantizer_name: 'output.*'
       enable: false
     # Nano3-specific BF16 layers: attention projections and explicit
     # pre-attention layers 4/11/18/25/32/41.
-    - quantizer_name: '*.[q|k|v|o]_proj.*'
+    - quantizer_name: '*.q_proj.*'
+      enable: false
+    - quantizer_name: '*.k_proj.*'
+      enable: false
+    - quantizer_name: '*.v_proj.*'
+      enable: false
+    - quantizer_name: '*.o_proj.*'
       enable: false
     - quantizer_name: '*.qkv_proj.*'
       enable: false

@@ -1,0 +1,41 @@
+defaults: ../../../../examples/modelopt/qa_grpo_nano3_megatron.yaml
+grpo:
+  max_num_steps: 1
+  val_period: 0
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
+policy:
+  model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/nvidia_nvidia-nemotron-3-nano-30b-a3b-bf16/hf/hf-cbd3fa9_orig
+  tokenizer:
+    name: ${policy.model_name}
+  quant_calib_size: 16
+  quant_sequence_length: 1024
+  generation:
+    real_quant: true
+    real_quant_ignore: NANO3_NVFP4_IGNORE
+    vllm_cfg:
+      gpu_memory_utilization: 0.35
+      enable_prefix_caching: false
+    vllm_kwargs:
+      tokenizer: ${policy.tokenizer.name}
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  default:
+    prompt_file: null
+env:
+  dapo:
+    num_workers: 2
+  math:
+    num_workers: 2
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
+  wandb:
+    name: grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
+  tensorboard:
+    log_dir: tb_logs-grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
