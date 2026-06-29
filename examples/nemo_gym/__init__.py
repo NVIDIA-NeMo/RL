@@ -20,33 +20,39 @@
 # package (no __init__.py → __file__ = None → "(unknown location)"), shadowing
 # the real nemo_gym library before the editable-install finder can reach it.
 #
-# Fix: temporarily filter `examples/` out of sys.path, import the real nemo_gym,
-# then replace this placeholder module in sys.modules with the real one.
+# Fix: when imported as the top-level `nemo_gym` package (__name__ == "nemo_gym"),
+# temporarily filter `examples/` out of sys.path, import the real nemo_gym, then
+# replace this placeholder module in sys.modules with the real one.
+#
+# When imported as `examples.nemo_gym` (e.g. from unit tests that do
+# `from examples.nemo_gym import run_distillation_nemo_gym`), no redirect is
+# needed — this directory already behaves as a normal Python package.
 
 import os
 import sys
 
-_self_dir = os.path.dirname(os.path.abspath(__file__))  # .../examples/nemo_gym
-_examples_dir = os.path.abspath(os.path.dirname(_self_dir))  # .../examples
+if __name__ == "nemo_gym":
+    _self_dir = os.path.dirname(os.path.abspath(__file__))  # .../examples/nemo_gym
+    _examples_dir = os.path.abspath(os.path.dirname(_self_dir))  # .../examples
 
-# Build a filtered sys.path that excludes examples/ so PathFinder won't loop
-# back to this file when we re-import nemo_gym below.
-_saved_path = list(sys.path)
-sys.path[:] = [p for p in sys.path if p and os.path.abspath(p) != _examples_dir]
+    # Build a filtered sys.path that excludes examples/ so PathFinder won't loop
+    # back to this file when we re-import nemo_gym below.
+    _saved_path = list(sys.path)
+    sys.path[:] = [p for p in sys.path if p and os.path.abspath(p) != _examples_dir]
 
-# Remove the in-progress (fake) module so importlib can find the real package.
-sys.modules.pop("nemo_gym", None)
+    # Remove the in-progress (fake) module so importlib can find the real package.
+    sys.modules.pop("nemo_gym", None)
 
-try:
-    import nemo_gym as _real_nemo_gym  # finds the real Gym library
-except Exception:
-    sys.path[:] = _saved_path  # restore on failure so callers get a clean state
-    raise
+    try:
+        import nemo_gym as _real_nemo_gym  # finds the real Gym library
+    except Exception:
+        sys.path[:] = _saved_path  # restore on failure so callers get a clean state
+        raise
 
-# Preserve any new sys.path entries added by the real __init__.py (e.g. PARENT_DIR).
-_added = [p for p in sys.path if p not in set(_saved_path)]
-sys.path[:] = _saved_path + _added
+    # Preserve any new sys.path entries added by the real __init__.py (e.g. PARENT_DIR).
+    _added = [p for p in sys.path if p not in set(_saved_path)]
+    sys.path[:] = _saved_path + _added
 
-# Replace ourselves with the real module for this and all future imports.
-sys.modules["nemo_gym"] = _real_nemo_gym
-globals().update(vars(_real_nemo_gym))
+    # Replace ourselves with the real module for this and all future imports.
+    sys.modules["nemo_gym"] = _real_nemo_gym
+    globals().update(vars(_real_nemo_gym))
