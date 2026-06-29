@@ -32,6 +32,7 @@ data:
     data_path: ${oc.env:HF_HOME}/superv3_data/rlhf/val-split.jsonl
 env:
   nemo_gym:
+    uv_venv_dir: "${oc.env:HF_HOME}/gym_venvs"
     num_gpu_nodes: 1
     genrm_compare_resources_server:
       resources_servers:

@@ -50,6 +50,7 @@ data:
 
 env:
   nemo_gym:
+    uv_venv_dir: "${oc.env:HF_HOME}/gym_venvs"
     genrm_compare_resources_server:
       resources_servers:
         genrm_compare:
