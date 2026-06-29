@@ -37,10 +37,12 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
-from nemo_rl.models.generation.sglang.utils.ray_utils import (
-    find_available_port,
-    get_host_info,
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_MASTER_PORT_RANGE_HIGH,
+    DEFAULT_MASTER_PORT_RANGE_LOW,
+    _get_free_port_local,
 )
+from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
 from tests.unit.models.generation.sglang.weight_update_actor import MockFSDPWorker
 
 from .helpers import make_actor_env_vars, post_and_assert_200
@@ -160,7 +162,9 @@ def mock_trainer(ray_cluster, sglang_gen):
     fit both worker groups.
     """
     host_ip = get_host_info()[1]
-    master_port = find_available_port(29500)
+    master_port = _get_free_port_local(
+        DEFAULT_MASTER_PORT_RANGE_LOW, DEFAULT_MASTER_PORT_RANGE_HIGH
+    )
     env_vars = make_actor_env_vars()
 
     pg = sglang_gen.cluster.get_placement_groups()[0]

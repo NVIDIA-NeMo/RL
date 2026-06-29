@@ -17,6 +17,10 @@ import logging
 
 import ray
 
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+)
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
 
 logger = logging.getLogger(__name__)
@@ -48,14 +52,16 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     sglang_cfg,
     local_all_engines,
     rank_offset=0,
-    base_port=15000,
+    port_range_low: int = DEFAULT_GENERATION_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    node_port_cursor: dict[int, int] | None = None,
 ):
     # get ports
     # there are 4 ports we need to allocate
     # 1. server port
     # 2. nccl port
     # 3. dist_init_addr port
-    # 4. other ports for dp_attention, which is of size 4 + dp_size
+    # 4. other ports for dp_attention, which is of size 30 + dp_size
 
     sglang_dp_size = sglang_cfg["sglang_cfg"]["dp_size"]
     num_gpus_per_engine = sglang_cfg["sglang_cfg"]["sglang_server_config"][
@@ -68,8 +74,10 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     addr_and_ports: dict[int, dict] = {}
 
     # Track per-node port cursors so that different server groups (called
-    # sequentially) never race for the same ports on a given node.
-    node_port_cursor: dict[int, int] = {}
+    # sequentially) never race for the same ports on a given node.  Seeded from
+    # the caller's cursor so successive _start_engines calls keep advancing.
+    if node_port_cursor is None:
+        node_port_cursor = {}
 
     visited_nodes = set()
     for rank, engine in local_all_engines:
@@ -85,16 +93,18 @@ def _allocate_rollout_engine_addr_and_ports_normal(
         )
 
         def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
+            # allocate from the reserved generation band, advancing a per-node
+            # cursor so blocks never overlap on a given node
+            start_port = node_port_cursor.get(node_idx, port_range_low)
 
             def port(consecutive=1):
                 nonlocal start_port
                 _, port = ray.get(
                     engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
+                        port_range_low=port_range_low,
+                        port_range_high=port_range_high,
                         consecutive=consecutive,
+                        start_port=start_port,
                     )
                 )
                 start_port = port + consecutive
@@ -102,7 +112,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
                 return port
 
             def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
+                addr = ray.get(engine._get_current_node_ip.remote())
                 if addr is None:
                     addr = get_host_info()[1]
                 return addr
