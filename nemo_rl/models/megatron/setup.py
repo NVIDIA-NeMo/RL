@@ -20,6 +20,8 @@ import warnings
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
+from omegaconf import OmegaConf
+
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.peft.lora import LoRA
@@ -454,8 +456,21 @@ def setup_model_config(
             )
 
         try:
-            cfg_from_pretrained = ConfigContainer.from_yaml(
-                pretrained_run_config, mode=InstantiationMode.STRICT
+            # Load as a plain dict first so we can drop config values that cannot
+            # round-trip through STRICT instantiation. DSv4 recipes set a custom
+            # pipeline_model_parallel_layout (a PipelineParallelLayerLayout), which
+            # serializes into run_config.yaml as a no-arg ``_target_`` stub whose
+            # __init__ args can't be reconstructed from its attributes -> STRICT
+            # would try ``PipelineParallelLayerLayout()`` and raise "missing N
+            # required positional arguments". The pretrained layout is never used:
+            # _apply_parallelism_config() below overwrites it with the RL config's
+            # own layout. So null it out before strict-instantiating.
+            conf = OmegaConf.load(pretrained_run_config)
+            if "model" in conf and "pipeline_model_parallel_layout" in conf.model:
+                conf.model.pipeline_model_parallel_layout = None
+            cfg_from_pretrained = ConfigContainer.from_dict(
+                OmegaConf.to_container(conf, resolve=True),
+                mode=InstantiationMode.STRICT,
             )
         except Exception as e:
             # Add helpful context as a note to the exception
