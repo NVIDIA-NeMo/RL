@@ -1,9 +1,0 @@
-defaults: ./grpo-qwen3-235b-32n4g-async-1off.yaml
-checkpointing:
-  checkpoint_dir: results/grpo-qwen3-235b-32n4g-async-1off-segment16
-logger:
-  log_dir: logs/grpo-qwen3-235b-32n4g-async-1off-segment16
-  wandb:
-    name: grpo-qwen3-235b-32n4g-async-1off-segment16
-cluster:
-  segment_size: 16
