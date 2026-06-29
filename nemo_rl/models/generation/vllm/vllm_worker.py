@@ -953,7 +953,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    def init_per_pp_refit_comm_group(
+    def init_nccl_xfer_comm_group(
         self,
         rank_prefix: int,
         pp_ips: list[str],
@@ -962,9 +962,9 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         train_ranks_per_stage: int,
         sub_world_size: int,
     ) -> None:
-        """Forward per-PP-stage comm group init to vLLM backend workers."""
+        """Forward nccl_xfer bulk-path comm group init to vLLM backend workers."""
         self.llm.collective_rpc(
-            "init_per_pp_refit_comm_group",
+            "init_nccl_xfer_comm_group",
             args=(
                 rank_prefix,
                 pp_ips,

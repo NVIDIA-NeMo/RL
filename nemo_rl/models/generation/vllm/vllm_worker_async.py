@@ -1470,7 +1470,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    async def init_per_pp_refit_comm_group_async(
+    async def init_nccl_xfer_comm_group_async(
         self,
         rank_prefix: int,
         pp_ips: list[str],
@@ -1479,9 +1479,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         train_ranks_per_stage: int,
         sub_world_size: int,
     ) -> None:
-        """Async version of init_per_pp_refit_comm_group."""
+        """Async version of init_nccl_xfer_comm_group."""
         await self.llm.collective_rpc(
-            "init_per_pp_refit_comm_group",
+            "init_nccl_xfer_comm_group",
             args=(
                 rank_prefix,
                 pp_ips,

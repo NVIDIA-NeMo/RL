@@ -42,9 +42,15 @@ class AbstractPolicyWorker:
             master_address=ip, port=port, rank=self.rank, world_size=world_size
         )
         device = torch.cuda.current_device()
+        # Return cached (unused) torch-allocator blocks to CUDA so NCCL's P2P
+        # transport buffers (raw cudaMalloc at comm init) have headroom.  Without
+        # this, comm_init OOMs ("Cuda failure ... out of memory" in
+        # transport/p2p.cc) on memory-tight shapes (e.g. EP4TP2DP2 / PP=1 / 30B),
+        # surfacing as NCCLError UnhandledCudaError.
+        torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=device)
 
-    def init_per_pp_refit_comm_group(
+    def init_nccl_xfer_comm_group(
         self,
         pp_ips: list[str],
         pp_ports: list[int],
@@ -53,11 +59,11 @@ class AbstractPolicyWorker:
         sub_world_size: int,
         my_rank_in_group: int,
     ) -> None:
-        """Initialize a per-PP-stage communication group for nccl_xfer refit.
+        """Bootstrap this train worker's nccl_xfer comm group.
 
-        Each train worker creates exactly one group — for its own PP stage.
-        ``pp_ips[my_pp_stage]`` and ``pp_ports[my_pp_stage]`` identify the
-        TCPStore master address for this stage's group.
+        One comm group per PP stage; each train worker joins exactly its own
+        stage's group (``pp_ips[my_pp_stage]`` / ``pp_ports[my_pp_stage]``).
+        Non-PP is simply ``pp_size == 1`` that contains all the train ranks.
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
@@ -68,6 +74,8 @@ class AbstractPolicyWorker:
             world_size=sub_world_size,
         )
         device = torch.cuda.current_device()
+        # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
+        torch.cuda.empty_cache()
         self.pp_comm_group.init_nccl_communicator(device=device)
         self.my_pp_stage = my_pp_stage
 
