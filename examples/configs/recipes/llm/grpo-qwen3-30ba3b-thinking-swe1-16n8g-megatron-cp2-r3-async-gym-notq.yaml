@@ -1,0 +1,35 @@
+defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_thinking_swe1.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_val_samples: 32
+  val_batch_size: 32
+  skip_reference_policy_logprobs_calculation: true
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym-notq
+  enabled: false
+data_plane: null
+policy:
+  train_global_batch_size: 128
+  logprob_batch_size: 1
+  router_replay:
+    enabled: true
+  generation:
+    vllm_cfg:
+      enable_prefix_caching: false
+    vllm_kwargs:
+      enable_chunked_prefill: false
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym-notq
+  wandb:
+    name: grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym-notq
+cluster:
+  num_nodes: 16
+  gpus_per_node: 8

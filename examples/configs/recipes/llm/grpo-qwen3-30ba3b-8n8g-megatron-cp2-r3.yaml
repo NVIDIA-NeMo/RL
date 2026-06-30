@@ -30,7 +30,7 @@ policy:
 data:
   max_input_seq_length: 2048
 data_plane:
-  enabled: true
+  enabled: false
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3
   wandb:

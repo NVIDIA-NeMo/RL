@@ -1,0 +1,11 @@
+defaults: ./grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3-tq_simple
+data_plane:
+  enabled: true
+  backend: simple
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3-tq_simple
+  wandb:
+    name: grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3-tq_simple
