@@ -1283,6 +1283,16 @@ def grpo_train_sync(
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
+            # Surface payload / storage size from the data-plane client
+            # when observability is enabled (``data_plane.observability
+            # .enabled=true``). No-op otherwise — the driver-side TQPolicy
+            # holds the wrapped client and ``snapshot`` exists only on
+            # ``MetricsDataPlaneClient``.
+            dp_client = getattr(policy, "dp_client", None)
+            if dp_client is not None and hasattr(dp_client, "snapshot"):
+                logger.log_metrics(
+                    dp_client.snapshot(), total_steps + 1, prefix="data_plane"
+                )
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,
