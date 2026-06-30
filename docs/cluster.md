@@ -178,6 +178,73 @@ sbatch ray.sub \
 > For the most part, you will not need to change ports unless these
 > are already taken by some other service backgrounded on your cluster.
 
+### Topology-Aware Placement for MoE (avoiding cross-rack stalls)
+
+On clusters where one NVLink domain spans a fixed set of nodes (e.g. a GB200
+NVL72 rack = 18 nodes = one fabric domain), a MoE job's expert-parallel (EP)
+`all_to_all` can intermittently stall under sustained load when an EP group is
+split across two NVLink domains (two racks). The fix is to keep every EP group
+inside a single NVLink domain. This requires **two coordinated knobs**, both
+sized to the EP group's node span:
+
+```
+segment_size (nodes) = expert_model_parallel_size / gpus_per_node
+```
+
+For example `expert_model_parallel_size=8` on a 4-GPU/node cluster spans 2
+nodes, so the segment size is `2`.
+
+* **`cluster.segment_size`** (recipe YAML) — application/Ray side. After the
+  Slurm allocation exists, NeMo RL selects topology-aligned nodes (complete
+  `segment_size`-node segments per NVLink domain) and orders global ranks so
+  each EP group lands on one segment. It is a *post-allocation selector*: it
+  cannot change what Slurm allocated, and raises `ResourceInsufficientError` if
+  the allocated nodes cannot form complete segments. The requested node count
+  must be evenly divisible by `segment_size`.
+
+  ```yaml
+  cluster:
+    gpus_per_node: 4
+    segment_size: 2   # = EP group node span; keeps each EP group intra-rack
+  ```
+
+* **`sbatch --segment=<size>`** (Slurm side, block topology) — allocation side.
+  Tells Slurm to allocate nodes in segments of `<size>` nodes, each segment
+  guaranteed within a single topology block (rack); segments themselves may
+  span blocks. This makes the physical allocation match what
+  `cluster.segment_size` expects (and forces an even node count per rack, so
+  odd splits like 5+3 cannot occur). The node count must be evenly divisible by
+  the segment size.
+
+  ```sh
+  ... \
+  sbatch --nodes=8 --segment=2 ray.sub \
+     ...
+  ```
+
+> [!NOTE]
+> Set both to the same value. `--segment` alone guarantees the physical layout
+> but not the rank→node mapping; `cluster.segment_size` alone aligns ranks but
+> can fail (or silently fall back) if Slurm hands you a layout that cannot form
+> complete segments. The guarantee also relies on EP being the contiguous
+> (inner) parallel dimension in the global rank order, which is the default for
+> `tp-...-ep-dp-pp` layouts with TP/PP not interleaving EP.
+
+For nightly/release tests launched with `tools/launch`, you do not pass
+`--segment` by hand: add `SEGMENT_SIZE=<size>` to the script's
+`# ===== BEGIN CONFIG =====` block (mirroring `cluster.segment_size` in the
+recipe) and `tools/launch` validates divisibility and appends
+`--segment=<size>` to the `sbatch` invocation automatically.
+
+```sh
+# ===== BEGIN CONFIG =====
+NUM_NODES=8
+GPUS_PER_NODE=4
+SEGMENT_SIZE=2     # nodes per NVLink-domain segment; -> sbatch --segment
+...
+# ===== END CONFIG =====
+```
+
 ## Kubernetes
 
 This guide outlines the process of migrating NemoRL training jobs from a Slurm environment to a Kubernetes cluster utilizing Ray orchestration and NVIDIA GPUs.
