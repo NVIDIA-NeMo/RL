@@ -25,6 +25,9 @@ Lifecycle per sync:
      generation.update_weights_via_ipc_zmq() -- receive weights
   4. policy.offload_after_refit()        -- restore optimizer state
   5. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
+
+Set NRL_VLLM_WAKEUP_COMBINED_TAGS=1 to wake both tags in a single call
+(tags=["weights", "kv_cache"]) before transfer and skip step 5.
 """
 
 import os
@@ -69,8 +72,13 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
+        combine_wakeup_tags = (
+            os.getenv("NRL_VLLM_WAKEUP_COMBINED_TAGS", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self._policy.offload_before_refit()
-        self._generation.prepare_for_generation(tags=["weights"])
+        wakeup_tags = ["weights", "kv_cache"] if combine_wakeup_tags else ["weights"]
+        self._generation.prepare_for_generation(tags=wakeup_tags)
 
         sync_succeeded = False
         try:
@@ -99,7 +107,8 @@ class IPCWeightSynchronizer(WeightSynchronizer):
             sync_succeeded = True
         finally:
             self._policy.offload_after_refit()
-            self._generation.prepare_for_generation(tags=["kv_cache"])
+            if not combine_wakeup_tags:
+                self._generation.prepare_for_generation(tags=["kv_cache"])
 
         self._stale = not sync_succeeded
 

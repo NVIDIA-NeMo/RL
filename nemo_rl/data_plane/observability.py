@@ -45,7 +45,15 @@ class DataPlaneEvent(TypedDict):
 
 
 import torch
-from tensordict import TensorDict
+try:
+    from tensordict import TensorDict as _TensorDictType
+except ModuleNotFoundError:
+    # Some worker roles import data-plane modules without exercising
+    # TensorDict-based paths. Keep module importable in that environment.
+    _TensorDictType = ()
+    TensorDict = Any  # type: ignore[misc,assignment]
+else:
+    TensorDict = _TensorDictType
 
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 
@@ -191,7 +199,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
             raise
         # If the call returns a TensorDict, the read-side bytes are more
         # informative than the input estimate.
-        if isinstance(out, TensorDict):
+        if _TensorDictType and isinstance(out, _TensorDictType):
             n_bytes = _td_bytes(out)
         elif isinstance(out, KVBatchMeta) and not n_keys:
             n_keys = len(out.sample_ids)

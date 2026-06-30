@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
@@ -1038,7 +1039,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Shut down all HF workers and clean up resources."""
         try:
             # Use the worker group's shutdown method with the worker's cleanup method
-            return self.worker_group.shutdown(cleanup_method="shutdown")
+            ok = self.worker_group.shutdown(cleanup_method="shutdown")
+            self._shutdown_called = True
+            return ok
         except Exception as e:
             print(f"Error during policy shutdown: {e}")
             return False
@@ -1050,8 +1053,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         the object is lost due to leaving a function scope. It's always recommended that the
         user calls worker_group.shutdown().
         """
+        # Avoid invoking Ray operations while the interpreter is finalizing.
+        # During shutdown, Ray can attempt a fresh `ray.init()` from actor methods,
+        # which may fail with PythonFinalizationError / double-init crashes.
+        if sys.is_finalizing():
+            return
+
+        if getattr(self, "_shutdown_called", False):
+            return
+
         if hasattr(self, "worker_group"):
-            self.worker_group.shutdown(cleanup_method="shutdown")
+            try:
+                # Only run the safety-net shutdown if Ray is still alive.
+                if ray.is_initialized():
+                    self.worker_group.shutdown(cleanup_method="shutdown")
+            except Exception:
+                # Destructors should never raise.
+                pass
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

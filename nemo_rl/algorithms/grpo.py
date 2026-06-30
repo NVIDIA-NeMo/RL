@@ -1491,9 +1491,14 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    combine_wakeup_tags = (
+        os.getenv("NRL_VLLM_WAKEUP_COMBINED_TAGS", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     if colocated_inference:
         policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
+        wakeup_tags = ["weights", "kv_cache"] if combine_wakeup_tags else ["weights"]
+        policy_generation.prepare_for_generation(tags=wakeup_tags)
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -1568,7 +1573,8 @@ def refit_policy_generation(
 
     if colocated_inference:
         policy.offload_after_refit()
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
+        if not combine_wakeup_tags:
+            policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
 def _log_mixed_rewards_and_advantages_information(
