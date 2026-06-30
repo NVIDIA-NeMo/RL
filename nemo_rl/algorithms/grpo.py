@@ -3742,6 +3742,12 @@ def async_grpo_train(
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
+                # Baseline spec-decode counters; the delta read at metrics time gives
+                # MTP acceptance over this step's generation window (async generation
+                # runs continuously in the background collector).
+                if hasattr(policy_generation, "snapshot_step_metrics"):
+                    policy_generation.snapshot_step_metrics()
+
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
                     # Extract original prompt messages using the length field
@@ -4103,6 +4109,10 @@ def async_grpo_train(
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics.update(seq_logprob_error_metrics)
+
+                # Speculative-decoding (MTP) acceptance metrics for this step.
+                if hasattr(policy_generation, "get_step_metrics"):
+                    metrics.update(policy_generation.get_step_metrics())
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config.grpo["num_prompts_per_step"]

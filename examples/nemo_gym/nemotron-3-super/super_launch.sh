@@ -57,7 +57,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8480}"
 MTP_EXTRA_ARGS=""
 if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
     MTP_EXTRA_ARGS="\
-++policy.generation.vllm_cfg.enable_prefix_caching=true \
+++policy.generation.vllm_cfg.enable_prefix_caching=false \
 ++policy.generation.vllm_kwargs.enable_chunked_prefill=true \
 ++policy.generation.vllm_kwargs.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} \
 ++policy.generation.vllm_kwargs.mamba_cache_mode=align \
@@ -181,6 +181,11 @@ fi
 
 if [[ -n "$MTP_EXTRA_ARGS" ]]; then
     COMMAND="$COMMAND ${MTP_EXTRA_ARGS}"
+fi
+
+# Arbitrary extra Hydra overrides (space-separated), appended last so they win.
+if [[ -n "${EXTRA_HYDRA_ARGS:-}" ]]; then
+    COMMAND="$COMMAND ${EXTRA_HYDRA_ARGS}"
 fi
 
 export CONTAINER

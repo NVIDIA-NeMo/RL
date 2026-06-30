@@ -150,8 +150,14 @@ def main() -> None:
     assert config.policy["generation"] is not None, (
         "A generation config is required for GRPO"
     )
+    has_refit_draft_weights = bool((config.policy.get("draft") or {}).get("enabled"))
+    megatron_cfg = config.policy.get("megatron_cfg") or {}
+    trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
     config.policy["generation"] = configure_generation_config(
-        config.policy["generation"], tokenizer
+        config.policy["generation"],
+        tokenizer,
+        has_refit_draft_weights=has_refit_draft_weights,
+        trains_mtp=trains_mtp,
     )
 
     # NeMo-Gym specific config setup.
