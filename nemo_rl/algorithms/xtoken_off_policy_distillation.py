@@ -616,6 +616,7 @@ def xtoken_off_policy_distillation_train(
             val_dataloader,
             loss_fn,
             master_config,
+            skip_keys=skip_keys,
             timer=timer,
         )
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -685,6 +686,7 @@ def xtoken_off_policy_distillation_train(
                         val_dataloader,
                         loss_fn,
                         master_config,
+                        skip_keys=skip_keys,
                         timer=timer,
                     )
                     logger.log_metrics(
@@ -880,12 +882,17 @@ def validate(
     val_dataloader: StatefulDataLoader,
     loss_fn: CrossTokenizerDistillationLossFn,
     master_config: MasterConfig,
+    skip_keys: frozenset[str],
     timer: Optional[Timer] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Held-out KL/CE on a validation dataloader.
 
     Reuses the same per-step path as training, but in eval mode so no
     backward / optimizer step runs. Returns mean train-style metrics.
+
+    ``skip_keys`` is the non-student-seq-axis key set for the worker's
+    ``check_sequence_dim`` pre-flight; built once in the train loop and threaded
+    in so it can't drift from a parallel rebuild here.
     """
     distill_cfg = master_config.distillation
     timer = timer if timer is not None else Timer()
@@ -916,7 +923,6 @@ def validate(
             for i, teacher_policy in enumerate(teacher_policies)
         ],
     )
-    skip_keys = xtoken_non_student_seq_keys(loss_fn)
 
     with timer.time("validation_total"):
         for batch in val_dataloader:

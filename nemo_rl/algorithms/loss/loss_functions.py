@@ -1279,11 +1279,15 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     """Config for cross-tokenizer distillation loss.
 
     Attributes:
-        projection_matrix_path: Filesystem path to the .pt file containing
-            either the dense top-k projection (dict with 'indices' and
-            'likelihoods' tensors of shape [V_student, top_k]) or the sparse
-            multi-token format (dict[(student_id, teacher_id)] -> count).
-            Loaded lazily on first call by each worker process.
+        projection_matrix_paths: Per-teacher list of filesystem paths to the
+            .pt projection file (``None`` marks a same-tokenizer teacher: direct
+            KL, no projection). Each .pt holds either the dense top-k projection
+            (dict with 'indices' and 'likelihoods' tensors of shape
+            [V_student, top_k]) or the sparse multi-token format
+            (dict[(student_id, teacher_id)] -> count), loaded lazily on first
+            call by each worker process. Runtime-injected by
+            ``xtoken_off_policy_distillation.setup`` from ``teachers[i]``; not a
+            user loss_fn key in YAML.
         gold_loss: If True, switch to the gold-loss formulation: split the
             vocab into an exact-token-mapped *common* set (KL) and an
             *uncommon* set (sorted L1).
@@ -1320,10 +1324,10 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             sparse projection file) keeps V_s in lockstep with
             ``logits.shape[-1]`` when the file's highest student ids happen
             to be absent.
-        teacher_vocab_size: Full teacher tokenizer vocab size, used to size
-            the projection matrix's teacher-side (V_t) axis. Runtime-injected
-            symmetrically to ``student_vocab_size`` from
-            ``len(teacher_tokenizer)``; not a user knob in YAML.
+        teacher_vocab_sizes: Per-teacher list of full teacher tokenizer vocab
+            sizes, used to size each projection matrix's teacher-side (V_t) axis.
+            Runtime-injected symmetrically to ``student_vocab_size`` from each
+            ``len(teacher_tokenizer)``; not a user loss_fn key in YAML.
     """
 
     gold_loss: bool
