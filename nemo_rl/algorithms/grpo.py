@@ -190,6 +190,14 @@ class RewardPenaltyConfig(BaseModel, extra="allow"):
         return self
 
 
+_REWARD_PENALTY_FLAGS = (
+    "penalize_duplicated_reasoning",
+    "penalize_empty_final_answer",
+    "penalize_unwanted_tokens",
+    "penalize_malformed_think_tag",
+)
+
+
 class GRPOConfig(TypedDict):
     num_prompts_per_step: int
     num_generations_per_prompt: int
@@ -493,6 +501,9 @@ def setup(
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
     enable_nemo_gym = _should_use_nemo_gym(master_config)
+    _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
     nemo_gym_actor = None
     if enable_nemo_gym:
         nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
@@ -1540,12 +1551,34 @@ def _resolve_message_level_advantage_penalties(
     # The is_invalid_tool_call / has_malformed_thinking flags these penalties rely on
     # are only populated by the NeMo-Gym environment. Without that path the penalties
     # would silently no-op, so fail loudly instead.
-    assert _should_use_nemo_gym(master_config), (
-        "grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage require "
-        "the NeMo-Gym path (env.should_use_nemo_gym=true); they are not supported with "
-        "the native generation path."
-    )
+    if not _should_use_nemo_gym(master_config):
+        raise ValueError(
+            "grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage require "
+            "the NeMo-Gym path (env.should_use_nemo_gym=true); they are not supported with "
+            "the native generation path."
+        )
     return invalid_tool_call_advantage, malformed_thinking_advantage
+
+
+def _raise_if_reward_penalties_enabled_without_nemo_gym(
+    master_config: MasterConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Validate reward-zeroing penalties are only used with NeMo-Gym."""
+    if enable_nemo_gym:
+        return
+
+    if not any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    ):
+        return
+
+    raise ValueError(
+        "reward_penalties require the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); they are not supported with the native "
+        "generation path."
+    )
 
 
 def _apply_message_level_advantage_penalties(
