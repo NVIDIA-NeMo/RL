@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import io
 import re
+import time
 import traceback
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
 import zmq
@@ -24,8 +27,14 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
+from nemo_rl.utils import weight_transfer_sparse_codec as sparse_codec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+
+_EXPERT_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.*\.experts)\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
 
 try:
     import vllm  # noqa: F401
@@ -91,7 +100,29 @@ def _read_mtp_layer_weights_from_checkpoint(
     return weights
 
 
+@dataclass(frozen=True)
+class _SparseDeltaTargetPlan:
+    target: torch.Tensor | None
+    source_shape: tuple[int, ...] = ()
+    source_strides: tuple[int, ...] = ()
+    target_strides: tuple[int, ...] = ()
+    target_offset: int = 0
+    shard_dim: int | None = None
+    shard_start: int = 0
+    shard_size: int = 0
+    segment_shards: tuple[tuple[int, int, int], ...] = ()
+    log_delta_transform: bool = False
+    identity: bool = False
+
+
 class VllmInternalWorkerExtension:
+    state_dict_info: dict[str, Any] | None = None
+    _direct_sparse_delta_targets: dict[str, torch.Tensor] | None = None
+    _direct_sparse_delta_modules: dict[str, torch.nn.Module] | None = None
+    _direct_sparse_delta_plan_cache: dict[str, _SparseDeltaTargetPlan | None] | None = (
+        None
+    )
+
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
 
@@ -137,6 +168,12 @@ class VllmInternalWorkerExtension:
 
         return get_device_uuid(self.device.index)
 
+    def report_node_hostname(self) -> str:
+        """Return the host shared by worker processes on this node."""
+        import socket
+
+        return socket.gethostname()
+
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""
         return f"ipc:///tmp/{self.report_device_id()}.sock"
@@ -165,9 +202,29 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._direct_sparse_delta_targets = None
+        self._direct_sparse_delta_modules = None
+        self._direct_sparse_delta_plan_cache = None
+
+    def _process_weights_after_loading(
+        self,
+        model_config: Any,
+        target_device: torch.device,
+    ) -> None:
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
+
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(
+                self.model_runner.model,
+                model_config,
+                target_device,
+            )
 
     def _maybe_process_fp8_kv_cache(self) -> None:
-        """Process weights after loading for FP8 KV cache (static scales)."""
+        """Process weights after loading for FP8 KV cache static scales."""
         use_fp8_kv_cache = False
         if hasattr(self.model_runner.vllm_config, "cache_config"):
             kv_cache_dtype = getattr(
@@ -176,26 +233,12 @@ class VllmInternalWorkerExtension:
             use_fp8_kv_cache = (
                 kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
             )
-
         if not use_fp8_kv_cache:
             return
-
-        # FP8 KV cache: process KV scales after weight loading
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.model_loader.utils import (
-            process_weights_after_loading,
+        self._process_weights_after_loading(
+            self.model_runner.model_config,
+            next(self.model_runner.model.parameters()).device,
         )
-
-        # Get target device for processing
-        target_device = next(self.model_runner.model.parameters()).device
-
-        # Call process_weights_after_loading to handle KV scales
-        with set_current_vllm_config(self.model_runner.vllm_config):
-            process_weights_after_loading(
-                self.model_runner.model,
-                self.model_runner.model_config,
-                target_device,
-            )
 
     @staticmethod
     def _split_policy_and_draft_weights(
@@ -295,10 +338,12 @@ class VllmInternalWorkerExtension:
             return False
 
         predictor = draft_model.model
+        mtp_start_layer_idx = cast(int, predictor.mtp_start_layer_idx)
+        num_mtp_layers = cast(int, predictor.num_mtp_layers)
         mtp_layer_indices = set(
             range(
-                predictor.mtp_start_layer_idx,
-                predictor.mtp_start_layer_idx + predictor.num_mtp_layers,
+                mtp_start_layer_idx,
+                mtp_start_layer_idx + num_mtp_layers,
             )
         )
         weights = _read_mtp_layer_weights_from_checkpoint(model_path, mtp_layer_indices)
@@ -353,6 +398,529 @@ class VllmInternalWorkerExtension:
 
         self._load_draft_weights(draft_weights)
 
+    def _apply_sparse_weight_deltas(
+        self,
+        payload_tensors: tuple[torch.Tensor, torch.Tensor],
+        metadata: list[dict[str, Any]],
+    ) -> None:
+        """Apply sparse deltas directly after validating every target plan."""
+        if self._direct_sparse_delta_uses_loader_transform():
+            raise RuntimeError(
+                "Direct sparse delta refit does not support transformed or FP8 weights."
+            )
+
+        targets = self._direct_sparse_delta_target_map()
+        raw_locations, raw_values = payload_tensors
+        plans = []
+        for item in metadata:
+            plan = self._cached_direct_sparse_delta_target_plan(item, targets)
+            if plan is None:
+                raise RuntimeError(
+                    f"No direct sparse delta target plan for {item['name']!r}."
+                )
+            plans.append((item, plan))
+
+        with torch.no_grad():
+            for item, plan in plans:
+                target = plan.target
+                if target is None:
+                    continue
+
+                value_start = int(item["value_start"])
+                value_end = int(item["value_end"])
+                values = raw_values[value_start:value_end].to(
+                    device=target.device,
+                    dtype=target.dtype,
+                    non_blocking=True,
+                )
+                if plan.identity and item["index_encoding"] == "range":
+                    range_start = int(item["range_start"])
+                    range_count = value_end - value_start
+                    target.data.view(-1).narrow(0, range_start, range_count).add_(
+                        values
+                    )
+                    continue
+
+                locations = sparse_codec.sparse_locations_for_item(
+                    item,
+                    raw_locations,
+                    device=target.device,
+                )
+                locations, values = self._local_sparse_delta_update_inputs(
+                    locations,
+                    values,
+                    plan,
+                )
+                if locations.numel():
+                    target_flat = target.data.view(-1)
+                    if plan.log_delta_transform:
+                        current = target_flat.index_select(0, locations)
+                        updated = current * values.float().exp().to(dtype=current.dtype)
+                        target_flat.index_copy_(0, locations, updated)
+                    else:
+                        target_flat.index_add_(0, locations, values)
+
+    def _direct_sparse_delta_target_map(self) -> dict[str, torch.Tensor]:
+        if self._direct_sparse_delta_targets is None:
+            self._direct_sparse_delta_targets = dict(
+                self.model_runner.model.named_parameters()
+            )
+            self._direct_sparse_delta_targets.update(
+                self.model_runner.model.named_buffers()
+            )
+        return self._direct_sparse_delta_targets
+
+    def _direct_sparse_delta_named_module(
+        self,
+        module_name: str,
+    ) -> torch.nn.Module | None:
+        if self._direct_sparse_delta_modules is None:
+            self._direct_sparse_delta_modules = dict(
+                self.model_runner.model.named_modules()
+            )
+        return self._direct_sparse_delta_modules.get(module_name)
+
+    def _direct_sparse_delta_uses_loader_transform(self) -> bool:
+        architectures = self.model_runner.vllm_config.model_config.architectures
+        if {"GptOssForCausalLM", "Gemma3ForConditionalGeneration"} & set(architectures):
+            return True
+
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        return fp8.is_fp8_model(self.model_runner.vllm_config)
+
+    def _cached_direct_sparse_delta_target_plan(
+        self,
+        item: dict[str, Any],
+        targets: dict[str, torch.Tensor],
+    ) -> _SparseDeltaTargetPlan | None:
+        name = str(item["name"])
+        if self._direct_sparse_delta_plan_cache is None:
+            self._direct_sparse_delta_plan_cache = {}
+        if name not in self._direct_sparse_delta_plan_cache:
+            self._direct_sparse_delta_plan_cache[name] = (
+                self._direct_sparse_delta_target_plan(item, targets)
+            )
+        return self._direct_sparse_delta_plan_cache[name]
+
+    def _direct_sparse_delta_target_plan(
+        self,
+        item: dict[str, Any],
+        targets: dict[str, torch.Tensor],
+    ) -> _SparseDeltaTargetPlan | None:
+        name = str(item["name"])
+        if name.startswith("mtp."):
+            return _SparseDeltaTargetPlan(target=None)
+        target_name = self._map_direct_sparse_delta_name(name)
+        if target_name is None:
+            return None
+        if ".mixer." in target_name:
+            mamba_plan = self._direct_sparse_delta_mamba2_plan(
+                item, target_name, targets
+            )
+            if mamba_plan is not None:
+                return mamba_plan
+            if ".mixer.conv1d." in target_name or ".mixer.in_proj." in target_name:
+                return None
+        if any(f".{candidate}_proj." in target_name for candidate in ("q", "k", "v")):
+            return self._direct_sparse_delta_qkv_plan(item, target_name, targets)
+        if _EXPERT_WEIGHT_RE.match(target_name):
+            return self._direct_sparse_delta_expert_plan(item, target_name, targets)
+
+        target = targets.get(target_name)
+        if target is None:
+            return None
+        source_shape = tuple(item["shape"])
+        target_shape = tuple(target.shape)
+        if target_shape == source_shape:
+            return self._make_sparse_delta_target_plan(target, source_shape)
+        return self._direct_sparse_delta_shard_plan(item, target)
+
+    def _direct_sparse_delta_qkv_plan(
+        self,
+        item: dict[str, Any],
+        target_name: str,
+        targets: dict[str, torch.Tensor],
+    ) -> _SparseDeltaTargetPlan | None:
+        shard_id = next(x for x in "qkv" if f".{x}_proj." in target_name)
+        packed_name = target_name.replace(f".{shard_id}_proj.", ".qkv_proj.", 1)
+        target = targets.get(packed_name)
+        if target is None:
+            return None
+        output_dim = int(cast(Any, target).output_dim) % target.ndim
+        module = cast(
+            Any,
+            getattr(getattr(target, "weight_loader", None), "__self__", None)
+            or self._direct_sparse_delta_named_module(packed_name.rsplit(".", 1)[0]),
+        )
+        shard_offset = int(module._get_shard_offset_mapping(shard_id))
+        shard_size = int(module._get_shard_size_mapping(shard_id))
+        shard_rank = int(module.tp_rank)
+        if shard_id != "q":
+            shard_rank //= int(module.num_kv_head_replicas)
+
+        source_shape = tuple(item["shape"])
+        shard_start = shard_rank * shard_size
+        if source_shape[output_dim] < shard_start:
+            return _SparseDeltaTargetPlan(target=None)
+        return self._make_sparse_delta_target_plan(
+            target,
+            source_shape=source_shape,
+            shard_dim=output_dim,
+            shard_start=shard_start,
+            shard_size=min(shard_size, source_shape[output_dim] - shard_start),
+            target_offset=shard_offset * target.stride(output_dim),
+        )
+
+    def _direct_sparse_delta_mamba2_plan(
+        self,
+        item: dict[str, Any],
+        target_name: str,
+        targets: dict[str, torch.Tensor],
+    ) -> _SparseDeltaTargetPlan | None:
+        target = targets.get(target_name)
+        if target is None:
+            return None
+
+        if target_name.endswith(".A"):
+            source_shape = tuple(item["shape"])
+            if tuple(target.shape) == source_shape:
+                return self._make_sparse_delta_target_plan(
+                    target,
+                    source_shape=source_shape,
+                    log_delta_transform=True,
+                )
+            return self._direct_sparse_delta_shard_plan(
+                item,
+                target,
+                log_delta_transform=True,
+            )
+
+        if not (".mixer.conv1d." in target_name or ".mixer.in_proj." in target_name):
+            return None
+
+        mixer_name = target_name.split(".mixer.", 1)[0] + ".mixer"
+        attrs = cast(Any, self._direct_sparse_delta_named_module(mixer_name))
+        tp_size = int(attrs.tp_size)
+        if tp_size <= 1:
+            return None
+        intermediate_size = int(attrs.intermediate_size)
+        groups_ssm_state_size = int(attrs.groups_ssm_state_size)
+        num_heads = int(attrs.num_heads)
+        source_shape = tuple(item["shape"])
+        fixed_size = intermediate_size
+        if ".mixer.in_proj." in target_name:
+            fixed_size += intermediate_size + num_heads
+        group_size, remainder = divmod(source_shape[0] - fixed_size, 2)
+        extra_group_size = groups_ssm_state_size - group_size
+        if remainder or group_size <= 0 or extra_group_size < 0:
+            return None
+        tp_rank = int(
+            getattr(target, "tp_rank", self._direct_sparse_delta_tp_rank(tp_size))
+        )
+        intermediate = (intermediate_size, 0, False)
+        group = (groups_ssm_state_size, extra_group_size, extra_group_size > 0)
+        segment_specs = (
+            (intermediate, group, group)
+            if ".mixer.conv1d." in target_name
+            else (intermediate, intermediate, group, group, (num_heads, 0, False))
+        )
+
+        target_shape = tuple(target.shape)
+        source_to_target_dims = tuple(range(len(source_shape)))
+        if len(target_shape) == len(source_shape) + 1 and target_shape[1] == 1:
+            source_to_target_dims = (0, *range(2, len(target_shape)))
+        elif len(target_shape) != len(source_shape):
+            return None
+        segment_shards: list[tuple[int, int, int]] = []
+        target_start = 0
+        source_start = 0
+        for full_dim, extra, duplicate_groups in segment_specs:
+            shard_size = full_dim // tp_size
+            rank = 0 if duplicate_groups else tp_rank
+            source_dim = full_dim - extra
+            source_local_start = source_start + rank * shard_size
+            take = min(shard_size, source_dim - rank * shard_size)
+            if take > 0:
+                segment_shards.append((source_local_start, target_start, take))
+            target_start += shard_size
+            source_start += source_dim
+        if source_shape[0] != source_start or target_shape[0] != target_start:
+            return None
+
+        return self._make_sparse_delta_target_plan(
+            target,
+            source_shape=source_shape,
+            source_to_target_dims=source_to_target_dims,
+            shard_dim=0,
+            segment_shards=tuple(segment_shards),
+        )
+
+    def _direct_sparse_delta_expert_plan(
+        self,
+        item: dict[str, Any],
+        target_name: str,
+        targets: dict[str, torch.Tensor],
+    ) -> _SparseDeltaTargetPlan | None:
+        match = cast(re.Match[str], _EXPERT_WEIGHT_RE.match(target_name))
+
+        prefix = match.group("prefix")
+        global_expert_id = int(match.group("expert"))
+        proj = match.group("proj")
+        packed_weight, shard_id = {
+            "gate_proj": ("w13_weight", "w1"),
+            "up_proj": ("w13_weight", "w3"),
+            "down_proj": ("w2_weight", "w2"),
+        }[proj]
+        packed_name = f"{prefix}.{packed_weight}"
+
+        target = targets.get(packed_name)
+        if target is None:
+            return None
+        module_attrs = cast(
+            Any,
+            getattr(getattr(target, "weight_loader", None), "__self__", None)
+            or self._direct_sparse_delta_named_module(packed_name.rsplit(".", 1)[0]),
+        )
+        if shard_id == "w3" and not module_attrs.moe_config.is_act_and_mul:
+            shard_id = "w1"
+        local_expert_id = int(
+            module_attrs._map_global_expert_id_to_local_expert_id(global_expert_id)
+        )
+        if local_expert_id < 0:
+            return _SparseDeltaTargetPlan(target=None)
+
+        source_shape = tuple(item["shape"])
+        target_shape = tuple(target.shape)
+        shard_dim = 1 if shard_id == "w2" else 0
+        if local_expert_id >= target_shape[0]:
+            return None
+        target_shard_dim = shard_dim + 1
+
+        shard_size = target_shape[target_shard_dim]
+        if shard_id in ("w1", "w3") and module_attrs.moe_config.is_act_and_mul:
+            shard_size //= 2
+        target_shard_offset = shard_size if shard_id == "w3" else 0
+        if target_shape[target_shard_dim] < target_shard_offset + shard_size:
+            return None
+        tp_rank = int(module_attrs.tp_rank)
+        shard_start = tp_rank * shard_size
+        if source_shape[shard_dim] < shard_start:
+            return _SparseDeltaTargetPlan(target=None)
+
+        return self._make_sparse_delta_target_plan(
+            target,
+            source_shape=source_shape,
+            source_to_target_dims=tuple(dim + 1 for dim in range(len(source_shape))),
+            target_offset=(
+                local_expert_id * target.stride(0)
+                + target_shard_offset * target.stride(target_shard_dim)
+            ),
+            shard_dim=shard_dim,
+            shard_start=shard_start,
+            shard_size=min(shard_size, source_shape[shard_dim] - shard_start),
+        )
+
+    def _make_sparse_delta_target_plan(
+        self,
+        target: torch.Tensor,
+        source_shape: tuple[int, ...],
+        *,
+        source_to_target_dims: tuple[int, ...] | None = None,
+        target_offset: int = 0,
+        shard_dim: int | None = None,
+        shard_start: int = 0,
+        shard_size: int = 0,
+        segment_shards: tuple[tuple[int, int, int], ...] = (),
+        log_delta_transform: bool = False,
+    ) -> _SparseDeltaTargetPlan | None:
+        if source_to_target_dims is None:
+            source_to_target_dims = tuple(range(len(source_shape)))
+        target_shape = tuple(target.shape)
+        ignored_dim = (
+            shard_dim if shard_dim is not None else 0 if segment_shards else -1
+        )
+        if len(source_to_target_dims) != len(source_shape) or any(
+            target_dim >= len(target_shape)
+            or (
+                source_dim != ignored_dim
+                and source_shape[source_dim] != target_shape[target_dim]
+            )
+            for source_dim, target_dim in enumerate(source_to_target_dims)
+        ):
+            return None
+        identity = (
+            shard_dim is None
+            and target_offset == 0
+            and not segment_shards
+            and not log_delta_transform
+            and source_to_target_dims == tuple(range(len(source_shape)))
+            and source_shape == target_shape
+        )
+        return _SparseDeltaTargetPlan(
+            target=target,
+            source_shape=source_shape,
+            source_strides=torch.empty(source_shape, device="meta").stride(),
+            target_strides=tuple(
+                target.stride(target_dim) for target_dim in source_to_target_dims
+            ),
+            target_offset=target_offset,
+            shard_dim=shard_dim,
+            shard_start=shard_start,
+            shard_size=shard_size,
+            segment_shards=segment_shards,
+            log_delta_transform=log_delta_transform,
+            identity=identity,
+        )
+
+    def _direct_sparse_delta_shard_plan(
+        self,
+        item: dict[str, Any],
+        target: torch.Tensor,
+        *,
+        log_delta_transform: bool = False,
+    ) -> _SparseDeltaTargetPlan | None:
+        source_shape = tuple(item["shape"])
+        target_shape = tuple(target.shape)
+        if len(source_shape) != len(target_shape):
+            return None
+
+        candidate_dims = list(
+            dict.fromkeys(
+                dim % len(source_shape)
+                for attr in ("output_dim", "input_dim")
+                if isinstance(dim := getattr(target, attr, None), int)
+            )
+        )
+        if not candidate_dims:
+            candidate_dims = [
+                dim
+                for dim, (source_dim, target_dim) in enumerate(
+                    zip(source_shape, target_shape, strict=True)
+                )
+                if source_dim != target_dim
+            ]
+            if len(candidate_dims) != 1:
+                return None
+
+        for shard_dim in candidate_dims:
+            shard_size = target_shape[shard_dim]
+            tp_size = int(getattr(target, "tp_size", 1))
+            if tp_size <= 1:
+                if shard_size <= 0 or source_shape[shard_dim] % shard_size:
+                    continue
+                tp_size = source_shape[shard_dim] // shard_size
+                if tp_size <= 1:
+                    continue
+            if source_shape[shard_dim] > shard_size * tp_size:
+                continue
+            tp_rank = int(
+                getattr(target, "tp_rank", self._direct_sparse_delta_tp_rank(tp_size))
+            )
+            plan = self._make_sparse_delta_target_plan(
+                target=target,
+                source_shape=source_shape,
+                shard_dim=shard_dim,
+                shard_start=tp_rank * shard_size,
+                shard_size=shard_size,
+                log_delta_transform=log_delta_transform,
+            )
+            if plan is not None:
+                return plan
+        return None
+
+    def _local_sparse_delta_update_inputs(
+        self,
+        locations: torch.Tensor,
+        values: torch.Tensor,
+        plan: _SparseDeltaTargetPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if plan.identity:
+            return locations, values
+
+        source_shape = plan.source_shape
+        source_strides = plan.source_strides
+        target_strides = plan.target_strides
+        shard_dim = plan.shard_dim
+
+        if source_strides == target_strides:
+            if shard_dim is None:
+                return locations + plan.target_offset, values
+            if shard_dim == 0:
+                shard_stride = source_strides[0]
+                shard_coords = torch.div(locations, shard_stride, rounding_mode="floor")
+                if plan.segment_shards:
+                    mapped_locations = locations + plan.target_offset
+                    keep = torch.zeros_like(locations, dtype=torch.bool)
+                    for source_start, target_start, take in plan.segment_shards:
+                        segment = (shard_coords >= source_start) & (
+                            shard_coords < source_start + take
+                        )
+                        mapped_locations[segment] += (
+                            target_start - source_start
+                        ) * shard_stride
+                        keep |= segment
+                    return mapped_locations[keep], values[keep]
+                shard_end = min(
+                    plan.shard_start + plan.shard_size, source_shape[shard_dim]
+                )
+                keep = (shard_coords >= plan.shard_start) & (shard_coords < shard_end)
+                return (
+                    locations[keep]
+                    + plan.target_offset
+                    - plan.shard_start * shard_stride,
+                    values[keep],
+                )
+
+        selected_locations = locations
+        selected_values = values
+
+        if shard_dim is not None:
+            shard_coords = torch.div(
+                locations,
+                source_strides[shard_dim],
+                rounding_mode="floor",
+            ).remainder(source_shape[shard_dim])
+            shard_end = min(
+                plan.shard_start + plan.shard_size,
+                source_shape[shard_dim],
+            )
+            keep = (shard_coords >= plan.shard_start) & (shard_coords < shard_end)
+            selected_locations = locations[keep]
+            selected_values = values[keep]
+            if selected_locations.numel() == 0:
+                return selected_locations, selected_values
+
+        local_locations = torch.full_like(selected_locations, plan.target_offset)
+        for dim, (source_stride, target_stride) in enumerate(
+            zip(source_strides, target_strides, strict=True)
+        ):
+            coord = torch.div(
+                selected_locations,
+                source_stride,
+                rounding_mode="floor",
+            ).remainder(source_shape[dim])
+            if dim == plan.shard_dim:
+                coord = coord - plan.shard_start
+            local_locations.add_(coord * target_stride)
+        return local_locations, selected_values
+
+    def _direct_sparse_delta_tp_rank(self, tp_size: int) -> int:
+        if tp_size <= 1:
+            return 0
+        rank = int(getattr(self, "rank", 0))
+        return rank % tp_size
+
+    def _map_direct_sparse_delta_name(self, name: str) -> str | None:
+        mapper = getattr(self.model_runner.model, "hf_to_vllm_mapper", None)
+        if mapper is not None:
+            name = cast(Any, mapper)._map_name(name)
+            if name is None:
+                return None
+        if name.startswith("draft."):
+            return None
+        return name
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -371,26 +939,24 @@ class VllmInternalWorkerExtension:
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
-                    from vllm.config import set_current_vllm_config
-                    from vllm.model_executor.model_loader.utils import (
-                        process_weights_after_loading,
-                    )
-
-                    with set_current_vllm_config(self.model_runner.vllm_config):
-                        process_weights_after_loading(
-                            self.model_runner.model, self.model_config, self.device
-                        )
+                    self._process_weights_after_loading(self.model_config, self.device)
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
                 ipc_handle, list_keys, used_bytes = payload
                 buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
+                state_dict_info = self.state_dict_info
+                if state_dict_info is None:
+                    raise RuntimeError(
+                        "state_dict_info is not prepared. "
+                        "Call prepare_refit_info before loading weights."
+                    )
 
                 weight = None
                 weights = []
                 offset = 0
                 for key in list_keys:
-                    shape, dtype = self.state_dict_info[key]  # pyrefly
+                    shape, dtype = state_dict_info[key]
                     if isinstance(shape, list):
                         shape = torch.Size(shape)
 
@@ -479,6 +1045,91 @@ class VllmInternalWorkerExtension:
         gc.collect()
         torch.cuda.empty_cache()
         return True
+
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_serialized_sparse_payload"
+    )
+    def update_weights_from_serialized_sparse_payload(
+        self,
+        serialized_payload: bytes,
+        synchronize: bool = True,
+    ) -> dict[str, Any]:
+        """Apply one serialized sparse-delta payload received from S3."""
+        return self._load_and_apply_sparse_payload(
+            io.BytesIO(serialized_payload), synchronize
+        )
+
+    def _load_and_apply_sparse_payload(
+        self,
+        source: str | io.BytesIO,
+        synchronize: bool,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        payload = cast(
+            sparse_codec.TensorPayload,
+            torch.load(
+                source,
+                map_location="cpu",
+                weights_only=True,
+            ),
+        )
+        deserialize_s = time.perf_counter() - started
+        result = self._apply_sparse_request(payload, synchronize=synchronize)
+        result["receiver_deserialize_s"] = deserialize_s
+        result["receiver_total_s"] = time.perf_counter() - started
+        return result
+
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_sparse_payload_files"
+    )
+    def update_weights_from_sparse_payload_files(
+        self,
+        *payload_paths: str,
+        synchronize: bool = True,
+    ) -> dict[str, Any]:
+        """Apply sparse payloads in FIFO order with one final sync."""
+        if not payload_paths:
+            raise ValueError("A sparse refit batch must contain at least one payload.")
+        started = time.perf_counter()
+        deserialize_s = 0.0
+        sparse_apply_s = 0.0
+        for path in payload_paths:
+            result = self._load_and_apply_sparse_payload(path, synchronize=False)
+            deserialize_s += float(result["receiver_deserialize_s"])
+            sparse_apply_s += float(result["receiver_sparse_apply_s"])
+        if synchronize and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        return {
+            "ok": True,
+            "receiver_deserialize_s": deserialize_s,
+            "receiver_sparse_apply_s": sparse_apply_s,
+            "receiver_total_s": time.perf_counter() - started,
+        }
+
+    def _apply_sparse_request(
+        self,
+        payload: sparse_codec.TensorPayload,
+        *,
+        synchronize: bool,
+    ) -> dict[str, Any]:
+        locations, values, metadata = payload
+
+        sparse_started = time.perf_counter()
+        self._apply_sparse_weight_deltas((locations, values), metadata)
+        sparse_apply_s = time.perf_counter() - sparse_started
+
+        if synchronize and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        return {
+            "ok": True,
+            "receiver_sparse_apply_s": sparse_apply_s,
+        }
+
+    def synchronize_device(self) -> dict[str, Any]:
+        """Synchronize this vLLM worker's CUDA device after deferred refit applies."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        return {"ok": True}
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
