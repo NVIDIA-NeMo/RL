@@ -16,6 +16,7 @@ import importlib
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -94,6 +95,43 @@ def _install_fake_modelopt_tensor_quantizer(monkeypatch):
     ].tensor_quantizer = tensor_quantizer_module
 
 
+def _make_fake_quant_attention_model():
+    root = torch.nn.Module()
+    root.model = torch.nn.Module()
+    root.model.layers = torch.nn.ModuleDict({"0": torch.nn.Module()})
+    root.model.layers["0"].self_attn = torch.nn.Module()
+    return root
+
+
+def _make_fake_quant_extension(backend, model):
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension.model_runner = types.SimpleNamespace(model=model)
+    return extension
+
+
+def _make_fake_quantizer(
+    backend,
+    *,
+    amax,
+    enabled=True,
+    use_constant_amax=False,
+    public_amax_only=False,
+):
+    class FakeQuantizer(backend.TensorQuantizer):
+        def __init__(self):
+            super().__init__()
+            self.is_enabled = enabled
+            self._use_constant_amax = use_constant_amax
+            if amax is None:
+                self._amax = None
+            elif public_amax_only:
+                self.amax = amax.clone()
+            else:
+                self.register_buffer("_amax", amax.clone())
+
+    return FakeQuantizer()
+
+
 def test_w4a16_real_quant_config_keeps_weight_only_default():
     cfg = build_vllm_modelopt_nvfp4_config()
 
@@ -166,7 +204,15 @@ def test_quant_ignore_name_candidates_include_model_prefix_and_base_names():
     ]
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
+@pytest.mark.parametrize(
+    "quant_cfg",
+    [
+        "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml",
+        "examples/modelopt/quant_configs/kv_cache_fp8.yaml",
+        "examples/modelopt/quant_configs/kv_cache_nvfp4.yaml",
+    ],
+)
+def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, quant_cfg):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
@@ -175,7 +221,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
 
     llm_kwargs = {}
     worker_mod._configure_quant_engine_kwargs(
-        {"quant_cfg": "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml"},
+        {"quant_cfg": quant_cfg},
         llm_kwargs,
     )
 
@@ -185,9 +231,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
     assert llm_kwargs["worker_extension_cls"] == (
         "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
     )
-    assert os.environ["VLLM_QUANT_CFG"] == (
-        "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml"
-    )
+    assert os.environ["VLLM_QUANT_CFG"] == quant_cfg
     assert "quantization" not in llm_kwargs
 
 
@@ -553,6 +597,360 @@ def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
     torch.testing.assert_close(child.input_quantizer_amax, torch.tensor([3.0]))
 
 
+def test_fake_quant_load_weights_consumes_only_kv_quantizer_amax(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    quantizer = torch.nn.Module()
+    quantizer.register_buffer("_amax", torch.tensor([-1.0], dtype=torch.float16))
+    model.model.layers["0"].self_attn.k_bmm_quantizer = quantizer
+    extension = _make_fake_quant_extension(backend, model)
+    forwarded = []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        "_load_weights",
+        lambda self, weights: forwarded.extend(weights) or "loaded",
+    )
+
+    assert (
+        extension._load_weights(
+            [
+                (
+                    "model.layers.0.self_attn.k_bmm_quantizer._amax",
+                    torch.tensor([5.0], dtype=torch.float32),
+                ),
+                (
+                    "model.layers.0.self_attn.q_bmm_quantizer._amax",
+                    torch.tensor([7.0], dtype=torch.float32),
+                ),
+                ("decoder.weight", torch.tensor([1.0], dtype=torch.float32)),
+            ]
+        )
+        == "loaded"
+    )
+
+    assert [name for name, _ in forwarded] == [
+        "model.layers.0.self_attn.q_bmm_quantizer._amax",
+        "decoder.weight",
+    ]
+    torch.testing.assert_close(
+        model.model.layers["0"].self_attn.k_bmm_quantizer._amax,
+        torch.tensor([5.0], dtype=torch.float16),
+    )
+
+
+def test_fake_quant_load_weights_resolves_intermediate_attn_kv_quantizer_amax(
+    monkeypatch,
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    model.model.layers["0"].self_attn.attn = torch.nn.Module()
+    quantizer = torch.nn.Module()
+    quantizer.register_buffer("_amax", torch.tensor([-1.0]))
+    model.model.layers["0"].self_attn.attn.v_bmm_quantizer = quantizer
+    extension = _make_fake_quant_extension(backend, model)
+    forwarded = []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        "_load_weights",
+        lambda self, weights: forwarded.extend(weights) or "loaded",
+    )
+
+    assert (
+        extension._load_weights(
+            [
+                (
+                    "model.layers.0.self_attn.v_bmm_quantizer._amax",
+                    torch.tensor([4.0]),
+                ),
+            ]
+        )
+        is None
+    )
+    assert forwarded == []
+    torch.testing.assert_close(
+        model.model.layers["0"].self_attn.attn.v_bmm_quantizer._amax,
+        torch.tensor([4.0]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "weight", "message"),
+    [
+        (lambda model: None, torch.tensor([2.0]), "exactly one fake-quant KV amax"),
+        (
+            lambda model: (
+                setattr(
+                    model.model.layers["0"].self_attn,
+                    "k_bmm_quantizer",
+                    torch.nn.Module(),
+                ),
+                model.model.layers["0"].self_attn.k_bmm_quantizer.register_buffer(
+                    "_amax", torch.tensor([-1.0])
+                ),
+                setattr(model.model.layers["0"].self_attn, "attn", torch.nn.Module()),
+                setattr(
+                    model.model.layers["0"].self_attn.attn,
+                    "k_bmm_quantizer",
+                    torch.nn.Module(),
+                ),
+                model.model.layers["0"].self_attn.attn.k_bmm_quantizer.register_buffer(
+                    "_amax", torch.tensor([-1.0])
+                ),
+            ),
+            torch.tensor([2.0]),
+            "exactly one fake-quant KV amax",
+        ),
+        (
+            lambda model: (
+                setattr(
+                    model.model.layers["0"].self_attn,
+                    "k_bmm_quantizer",
+                    torch.nn.Module(),
+                ),
+                model.model.layers["0"].self_attn.k_bmm_quantizer.register_buffer(
+                    "_amax", torch.tensor([-1.0])
+                ),
+            ),
+            torch.tensor([2.0, 3.0]),
+            "Shape mismatch",
+        ),
+        (
+            lambda model: (
+                setattr(
+                    model.model.layers["0"].self_attn,
+                    "k_bmm_quantizer",
+                    torch.nn.Module(),
+                ),
+                model.model.layers["0"].self_attn.k_bmm_quantizer.register_buffer(
+                    "_amax", torch.tensor([-1.0])
+                ),
+            ),
+            torch.tensor([float("inf")]),
+            "Non-finite",
+        ),
+        (
+            lambda model: (
+                setattr(
+                    model.model.layers["0"].self_attn,
+                    "k_bmm_quantizer",
+                    torch.nn.Module(),
+                ),
+                model.model.layers["0"].self_attn.k_bmm_quantizer.register_buffer(
+                    "_amax", torch.tensor([-1.0])
+                ),
+            ),
+            torch.tensor([0.0]),
+            "Non-positive",
+        ),
+    ],
+)
+def test_fake_quant_kv_quantizer_amax_load_failures(
+    monkeypatch, builder, weight, message
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    builder(model)
+    extension = _make_fake_quant_extension(backend, model)
+
+    with pytest.raises(RuntimeError, match=message):
+        extension._consume_fake_quant_kv_amax(
+            [
+                (
+                    "model.layers.0.self_attn.k_bmm_quantizer._amax",
+                    weight,
+                )
+            ]
+        )
+
+
+def test_fake_quant_kv_quantizer_amax_validation_accepts_finite_fp8_and_nvfp4(
+    monkeypatch,
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    model.model.layers["0"].self_attn.k_bmm_quantizer = _make_fake_quantizer(
+        backend, amax=torch.tensor([448.0])
+    )
+    model.model.layers["0"].self_attn.v_bmm_quantizer = _make_fake_quantizer(
+        backend, amax=torch.tensor([6.0])
+    )
+    extension = _make_fake_quant_extension(backend, model)
+
+    extension._validate_fake_quant_kv_amax()
+
+
+def test_fake_quant_kv_quantizer_validation_accepts_public_amax(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    model.model.layers["0"].self_attn.k_bmm_quantizer = _make_fake_quantizer(
+        backend,
+        amax=torch.tensor([3.0]),
+        public_amax_only=True,
+    )
+    extension = _make_fake_quant_extension(backend, model)
+
+    extension._validate_fake_quant_kv_amax()
+
+
+def test_fake_quant_kv_quantizer_amax_validation_rejects_sentinel(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    model.model.layers["0"].self_attn.k_bmm_quantizer = _make_fake_quantizer(
+        backend, amax=torch.tensor([-1.0])
+    )
+    extension = _make_fake_quant_extension(backend, model)
+
+    with pytest.raises(RuntimeError, match="Uninitialized or non-positive"):
+        extension._validate_fake_quant_kv_amax()
+
+
+def test_fake_quant_kv_quantizer_amax_validation_accepts_constant_amax(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    model.model.layers["0"].self_attn.k_bmm_quantizer = _make_fake_quantizer(
+        backend,
+        amax=torch.tensor([-1.0]),
+        use_constant_amax=True,
+    )
+    model.model.layers["0"].self_attn.v_bmm_quantizer = _make_fake_quantizer(
+        backend,
+        amax=torch.tensor([2.0]),
+    )
+    extension = _make_fake_quant_extension(backend, model)
+
+    extension._validate_fake_quant_kv_amax()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "base_method_name"),
+    [
+        ("update_weights_via_ipc_zmq", "update_weights_via_ipc_zmq"),
+        ("update_weights_from_collective", "update_weights_from_collective"),
+    ],
+)
+def test_fake_quant_kv_quantizer_amax_requires_fresh_state_per_refit(
+    monkeypatch, method_name, base_method_name
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    quantizer = _make_fake_quantizer(backend, amax=torch.tensor([2.0]))
+    model.model.layers["0"].self_attn.k_bmm_quantizer = quantizer
+    extension = _make_fake_quant_extension(backend, model)
+    calls = 0
+
+    def update_once(self):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            quantizer._amax.fill_(3.0)
+        return True
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        base_method_name,
+        update_once,
+    )
+
+    method = getattr(extension, method_name)
+    assert method() is True
+    with pytest.raises(RuntimeError, match="Uninitialized or non-positive"):
+        method()
+    assert calls == 2
+
+
+def test_non_real_quant_ipc_skips_validation_when_base_does_not_report_success(
+    monkeypatch,
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    extension = _make_fake_quant_extension(backend, torch.nn.Module())
+    calls = []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: False,
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        "update_weights_via_ipc_zmq",
+        lambda self: "delegated",
+    )
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_validate_fake_quant_kv_amax",
+        lambda self: calls.append("validate"),
+    )
+
+    assert extension.update_weights_via_ipc_zmq() == "delegated"
+    assert calls == []
+
+
+def test_real_quant_collective_reload_skips_fake_quant_kv_validation(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    patch_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_modelopt_patch"
+    )
+
+    extension = _make_fake_quant_extension(backend, torch.nn.Linear(1, 1))
+    extension.device = torch.device("cpu")
+    calls = []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "prepare_modelopt_for_weight_reload",
+        lambda model_arg, device: None,
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "modelopt_process_weights_after_loading",
+        lambda model_arg: None,
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        "update_weights_from_collective",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_validate_fake_quant_kv_amax",
+        lambda self: calls.append("validate"),
+    )
+
+    assert extension.update_weights_from_collective() is True
+    assert calls == []
+
+
 def test_real_quant_collective_reload_runs_modelopt_hooks(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     patch_mod = pytest.importorskip(
@@ -633,7 +1031,7 @@ def test_real_quant_collective_reload_skips_processing_when_base_fails(monkeypat
 def test_non_real_quant_collective_reload_delegates(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension = _make_fake_quant_extension(backend, torch.nn.Module())
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
@@ -797,7 +1195,7 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
 def test_non_real_quant_ipc_delegates(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension = _make_fake_quant_extension(backend, torch.nn.Module())
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
@@ -851,6 +1249,7 @@ def test_get_quantizer_stats_counts_enabled_positive_amax(monkeypatch):
         "enabled": 3,
         "with_amax": 2,
         "positive_amax": 1,
+        "kv_amax": {},
     }
 
 
@@ -870,6 +1269,31 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
     }
 
     assert captured["config_file"] == "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+
+
+@pytest.mark.parametrize(
+    ("recipe", "num_bits"),
+    [("kv_cache_fp8.yaml", (4, 3)), ("kv_cache_nvfp4.yaml", (2, 1))],
+)
+def test_resolve_kv_cache_quant_recipe(recipe, num_bits):
+    repo_root = Path(__file__).resolve().parents[4]
+
+    config = resolve_quant_cfg(
+        str((repo_root / "examples/modelopt/quant_configs" / recipe).resolve())
+    )
+
+    kv_config = config["quant_cfg"][1]
+    assert config["algorithm"] == "max"
+    assert config["quant_cfg"][0] == {"quantizer_name": "*", "enable": False}
+    assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
+    assert kv_config["enable"] is True
+    assert kv_config["cfg"]["num_bits"] == num_bits
+    if recipe == "kv_cache_nvfp4.yaml":
+        assert kv_config["cfg"]["block_sizes"] == {
+            -1: 16,
+            "type": "dynamic",
+            "scale_bits": (4, 3),
+        }
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):

@@ -41,6 +41,12 @@ if os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1":
 
 
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
+    _FAKE_QUANT_KV_AMAX_SUFFIXES = (
+        ".k_bmm_quantizer._amax",
+        ".v_bmm_quantizer._amax",
+    )
+    _FAKE_QUANT_KV_QUANTIZER_SUFFIXES = ("k_bmm_quantizer", "v_bmm_quantizer")
+
     def _is_real_quant_model(self) -> bool:
         return os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1"
 
@@ -76,6 +82,133 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             model.named_parameters = original_named_parameters
             for buf in patched_quantizer_buffers:
                 del buf.weight_loader
+
+    @classmethod
+    def _get_fake_quant_kv_amax_suffix(cls, name: str) -> str | None:
+        for suffix in cls._FAKE_QUANT_KV_AMAX_SUFFIXES:
+            if name.endswith(suffix):
+                return suffix
+        return None
+
+    def _resolve_fake_quant_kv_amax_buffer(
+        self,
+        name: str,
+        named_buffers: dict[str, torch.Tensor],
+    ) -> tuple[str, torch.Tensor]:
+        suffix = self._get_fake_quant_kv_amax_suffix(name)
+        if suffix is None:
+            raise RuntimeError(f"Unsupported fake-quant KV amax key '{name}'")
+
+        prefix = name[: -len(suffix)]
+        candidate_names = [name]
+        if prefix.endswith(".attn"):
+            candidate_names.append(prefix.removesuffix(".attn") + suffix)
+        else:
+            candidate_names.append(prefix + ".attn" + suffix)
+
+        matches = [
+            (candidate_name, named_buffers[candidate_name])
+            for candidate_name in dict.fromkeys(candidate_names)
+            if candidate_name in named_buffers
+        ]
+        if len(matches) != 1:
+            found = [candidate_name for candidate_name, _ in matches] or ["<none>"]
+            raise RuntimeError(
+                f"Expected exactly one fake-quant KV amax buffer for '{name}', found {found}"
+            )
+        return matches[0]
+
+    def _copy_fake_quant_kv_amax(
+        self,
+        source_name: str,
+        loaded_weight: torch.Tensor,
+        destination_name: str,
+        destination: torch.Tensor,
+    ) -> None:
+        if tuple(loaded_weight.shape) != tuple(destination.shape):
+            raise RuntimeError(
+                f"Shape mismatch for fake-quant KV amax '{source_name}' -> "
+                f"'{destination_name}': expected {tuple(destination.shape)}, "
+                f"got {tuple(loaded_weight.shape)}"
+            )
+        if not bool(torch.isfinite(loaded_weight).all().item()):
+            raise RuntimeError(
+                f"Non-finite fake-quant KV amax for '{source_name}' -> "
+                f"'{destination_name}'"
+            )
+        if not bool((loaded_weight > 0).all().item()):
+            raise RuntimeError(
+                f"Non-positive fake-quant KV amax for '{source_name}' -> "
+                f"'{destination_name}'"
+            )
+        destination.copy_(
+            loaded_weight.to(device=destination.device, dtype=destination.dtype)
+        )
+
+    def _consume_fake_quant_kv_amax(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+    ) -> list[tuple[str, torch.Tensor]]:
+        named_buffers = dict(self.model_runner.model.named_buffers())
+        filtered = []
+        for name, weight in weights:
+            if self._get_fake_quant_kv_amax_suffix(name) is None:
+                filtered.append((name, weight))
+                continue
+            destination_name, destination = self._resolve_fake_quant_kv_amax_buffer(
+                name, named_buffers
+            )
+            self._copy_fake_quant_kv_amax(name, weight, destination_name, destination)
+        return filtered
+
+    @staticmethod
+    def _uses_constant_amax(quantizer: TensorQuantizer) -> bool:
+        return bool(
+            getattr(quantizer, "_use_constant_amax", False)
+            or getattr(quantizer, "use_constant_amax", False)
+        )
+
+    def _iter_fake_quant_kv_quantizers(self):
+        for name, module in self.model_runner.model.named_modules():
+            if not isinstance(module, TensorQuantizer):
+                continue
+            if not getattr(module, "is_enabled", False):
+                continue
+            if not name.endswith(self._FAKE_QUANT_KV_QUANTIZER_SUFFIXES):
+                continue
+            if self._uses_constant_amax(module):
+                continue
+            yield name, module
+
+    @staticmethod
+    def _get_quantizer_amax(quantizer: TensorQuantizer) -> torch.Tensor | None:
+        amax = getattr(quantizer, "_amax", None)
+        if amax is None:
+            amax = getattr(quantizer, "amax", None)
+        return amax
+
+    def _reset_fake_quant_kv_amax(self) -> None:
+        for _, module in self._iter_fake_quant_kv_quantizers():
+            amax = self._get_quantizer_amax(module)
+            if amax is not None:
+                amax.fill_(-1)
+
+    def _validate_fake_quant_kv_amax(self) -> None:
+        for name, module in self._iter_fake_quant_kv_quantizers():
+            amax = self._get_quantizer_amax(module)
+            if amax is None:
+                raise RuntimeError(
+                    f"Missing fake-quant KV quantizer _amax for '{name}' after refit"
+                )
+            if not bool(torch.isfinite(amax).all().item()):
+                raise RuntimeError(
+                    f"Non-finite fake-quant KV quantizer _amax for '{name}' after refit"
+                )
+            if not bool((amax > 0).all().item()):
+                raise RuntimeError(
+                    f"Uninitialized or non-positive fake-quant KV quantizer _amax "
+                    f"for '{name}' after refit"
+                )
 
     def _load_weights(self, weights):
         """Load pre-folded weights and input_quantizer amax buffers.
@@ -122,6 +255,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 return None
             return super()._load_weights(weights)
 
+        weights = self._consume_fake_quant_kv_amax(weights)
+        if not weights:
+            return None
         with ExitStack() as contexts:
             for _, child in self.model_runner.model.named_children():
                 contexts.enter_context(
@@ -132,7 +268,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update weights through CUDA IPC."""
         if not self._is_real_quant_model():
-            return super().update_weights_via_ipc_zmq()
+            self._reset_fake_quant_kv_amax()
+            result = super().update_weights_via_ipc_zmq()
+            if result is True:
+                self._validate_fake_quant_kv_amax()
+            return result
 
         from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
             modelopt_process_weights_after_loading,
@@ -189,7 +329,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def update_weights_from_collective(self) -> bool:
         """Receive and update weights through collective communication."""
         if not self._is_real_quant_model():
-            return super().update_weights_from_collective()
+            self._reset_fake_quant_kv_amax()
+            result = super().update_weights_from_collective()
+            if result is True:
+                self._validate_fake_quant_kv_amax()
+            return result
 
         from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
             modelopt_process_weights_after_loading,
@@ -219,8 +363,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         enabled = 0
         with_amax = 0
         positive_amax = 0
+        kv_amax = {}
         model = self.model_runner.model
-        for _, module in model.named_modules():
+        for name, module in model.named_modules():
             if isinstance(module, TensorQuantizer):
                 total += 1
                 if module.is_enabled:
@@ -229,9 +374,12 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         with_amax += 1
                         if (module.amax > 0).all():
                             positive_amax += 1
+                        if name.endswith(self._FAKE_QUANT_KV_QUANTIZER_SUFFIXES):
+                            kv_amax[name] = module.amax.detach().cpu().clone()
         return {
             "total": total,
             "enabled": enabled,
             "with_amax": with_amax,
             "positive_amax": positive_amax,
+            "kv_amax": kv_amax,
         }

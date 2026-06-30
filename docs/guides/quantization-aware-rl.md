@@ -29,6 +29,38 @@ The following workflow + quantization recipe combinations have been validated en
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The `nvfp4_w4a8_fp8.yaml` recipe uses the same NVFP4 weight format and enables FP8 e4m3 input activation fake quantization.
 
+## Simulated KV-Cache Quantization
+
+QARL can apply ModelOpt fake quantization to the attention K/V tensors in both
+the Megatron policy and vLLM rollout model. Use the same complete recipe for
+both workers; calibrated K/V amax values are transferred during refit.
+
+```yaml
+policy:
+  quant_cfg: /absolute/path/to/examples/modelopt/quant_configs/kv_cache_fp8.yaml
+
+  generation:
+    backend: vllm
+    quant_cfg: /absolute/path/to/examples/modelopt/quant_configs/kv_cache_fp8.yaml
+```
+
+The KV-only examples are:
+
+- `kv_cache_fp8.yaml`: calibrated FP8 E4M3 K/V fake quantization.
+- `kv_cache_nvfp4.yaml`: calibrated NVFP4 K/V fake quantization with dynamic
+  per-block scales and a calibrated global amax.
+
+These recipes intentionally disable weight, input, Q, and P quantizers so a
+test can isolate simulated K/V behavior. They can also serve as the K/V portion
+of a complete user-authored recipe. Constant-amax K/V recipes need no amax
+transfer, but policy and rollout must still use the same recipe.
+
+This path does not enable vLLM's native FP8 KV-cache storage. Set neither
+`policy.generation.real_quant` nor a native vLLM KV-cache dtype for these
+simulated recipes. Affine/rotate recipes, MLA cache quantization, Mamba state
+cache quantization, speculative draft/MTP layers, and models whose HF format
+omits or shares K/V projection tensors are not supported here.
+
 ## ModelOpt Layer Spec Toggle
 
 For QARL configs, try setting `policy.disable_modelopt_layer_spec=true` first.

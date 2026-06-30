@@ -1,0 +1,16 @@
+# FP8 simulated KV-cache quantization recipe for QARL.
+#
+# Use this same absolute path for policy.quant_cfg and
+# policy.generation.quant_cfg so Megatron and vLLM apply identical fake quant.
+metadata:
+  recipe_type: ptq
+  description: FP8 E4M3 simulated KV-cache quantization.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*[kv]_bmm_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
