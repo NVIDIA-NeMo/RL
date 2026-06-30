@@ -10,6 +10,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 4
   max_total_sequence_length: 4096
+  logprob_chunk_size: 512
   sequence_packing:
     fuse_loss: true
   dtensor_cfg:
@@ -20,6 +21,7 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
+    defer_fp32_logits: true
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 8
@@ -32,7 +34,7 @@ policy:
       lr_warmup_iters: 50
       lr_warmup_init: 3.0e-08
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
