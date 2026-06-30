@@ -13,6 +13,9 @@
 # limitations under the License.
 import os
 import subprocess
+import sys
+from collections import Counter
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
@@ -36,6 +39,15 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _has_nan_generation_logprobs(result: dict) -> bool:
+    """Return whether a postprocessed rollout contains NaN policy logprobs."""
+    return any(
+        message.get("generation_logprobs") is not None
+        and torch.isnan(message["generation_logprobs"]).any()
+        for message in result["message_log"]
+    )
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -224,14 +236,6 @@ Depending on your data shape, you may want to change these values."""
             "port": self.head_server_port,
         }
 
-        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
-            "rollout_max_attempts_to_avoid_lp_nan", 1
-        )
-
-        assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
-            "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
-        )
-
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
@@ -254,64 +258,69 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
-    ) -> list[dict]:
+    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+        """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        if not nemo_gym_examples:
+            raise ValueError("NeMo-Gym rollout batch must not be empty")
+
         timer = Timer()
+        counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         timer.start("_run_rollouts_total")
-        max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
-        while trial < max_attempts:
-            nemo_gym_num_rows = len(nemo_gym_examples)
-            nemo_gym_result_iterator = self.rch.run_examples(
-                examples=nemo_gym_examples, head_server_config=self.head_server_config
-            )
-
-            nemo_rl_rowidxs = []
-            nemo_rl_results = []
-            for task in nemo_gym_result_iterator:
-                with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
-
-                with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
-                    )
-
-                nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
-                nemo_rl_results.append(nemo_rl_result)
-
-            # determine if generation_logprobs contain NaN; if not, break;
-            logprob_contains_nan = False
-            for nemo_rl_result in nemo_rl_results:
-                for message in nemo_rl_result["message_log"]:
-                    if (
-                        "generation_logprobs" in message
-                        and message["generation_logprobs"] is not None
-                    ):
-                        if torch.isnan(message["generation_logprobs"]).any():
-                            logprob_contains_nan = True
-                            break
-            if logprob_contains_nan:
-                trial += 1
-                print(
-                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_attempts})"
-                )
-                continue
-            else:
-                break
-
-        nemo_rl_sort_results = [None] * nemo_gym_num_rows
-        for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
-            nemo_rl_sort_results[rowidx] = result
-        nemo_rl_results = nemo_rl_sort_results
-
-        timer.stop("_run_rollouts_total")
-        timing_metrics = timer.get_timing_metrics("sum")
-        total_time = timing_metrics.pop("_run_rollouts_total")
-        timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-            100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+        nemo_gym_result_iterator = self.rch.run_examples(
+            examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
 
-        return nemo_rl_results, timing_metrics
+        num_results = 0
+        for task in nemo_gym_result_iterator:
+            with timer.time(label=f"{timer_prefix}/await_results"):
+                try:
+                    nemo_gym_row, nemo_gym_result = await task
+                except Exception as error:
+                    if hasattr(error, "response_content"):
+                        print(
+                            "EXCEPTION RESULT",
+                            error.response_content,
+                            file=sys.stderr,
+                        )
+                    raise
+
+            with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                    nemo_gym_result, tokenizer
+                )
+                if _has_nan_generation_logprobs(nemo_rl_result):
+                    raise RuntimeError("Generation logprobs contain NaN")
+
+            num_results += 1
+            timing_metrics = None
+            if num_results == len(nemo_gym_examples):
+                timer.stop("_run_rollouts_total")
+                timing_metrics = timer.get_timing_metrics("sum")
+                total_time = timing_metrics.pop("_run_rollouts_total")
+                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                    100
+                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                    / total_time
+                )
+
+            agent_name = nemo_gym_row["agent_ref"]["name"]
+            counts_left[agent_name] -= 1
+            if counts_left[agent_name] <= 0:
+                counts_left.pop(agent_name)
+            if num_results % 10 == 0 and counts_left:
+                top_left = counts_left.most_common(5)
+                top_left_str = "\n".join(
+                    f"{index + 1}. {name}: {count}"
+                    for index, (name, count) in enumerate(top_left)
+                )
+                print(
+                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                    f"{top_left_str}",
+                    file=sys.stderr,
+                )
+
+            yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
