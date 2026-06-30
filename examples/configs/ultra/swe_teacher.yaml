@@ -57,6 +57,7 @@ checkpointing:
   checkpoint_must_save_by: "00:03:30:00"
   model_save_format: "safetensors"
   save_consolidated: false
+  save_optimizer: true
 
 # =============================================================================
 # GRPO Algorithm
