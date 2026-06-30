@@ -22,8 +22,8 @@ grpo:
     target_min: -1.0
   reward_shaping:
     enabled: false
-    overlong_buffer_length: 2048
-    max_response_length: 1024
+    overlong_buffer_length: 512
+    max_response_length: 2048
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -36,44 +36,61 @@ loss_fn:
   token_level_loss: true
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-minimax-m3-32n8g-non-colocated
+  checkpoint_dir: results/grpo-m3-32n8g-non-colocated-fusedadam-pp
   keep_top_k: 2
-  save_period: 5
+  save_period: 3
   checkpoint_must_save_by: "00:03:45:00"
   save_optimizer: true
 policy:
-  model_name: MiniMaxAI/MiniMax-M3
+  model_name: /apps/models/MiniMax-M3
   hf_config_overrides:
     text_config:
       num_mtp_modules: 0
   train_micro_batch_size: 1
   train_global_batch_size: 512
   logprob_batch_size: 1
-  max_total_sequence_length: 2048
+  max_total_sequence_length: 4096
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
   optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
-      lr: 2.0e-06
+      lr: 1.0e-06
       weight_decay: 0.1
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: "torch.bfloat16"
+      exp_avg_sq_dtype: "torch.bfloat16"
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
       start_factor: 1.0e-08
       end_factor: 1.0
-      total_iters: 5
+      total_iters: 10
   - name: torch.optim.lr_scheduler.ConstantLR
     kwargs:
       factor: 1.0
       total_iters: 10000000000
   - milestones:
-    - 5
+    - 10
   dtensor_cfg:
-    expert_parallel_size: 128
+    pipeline_parallel_size: 4
+    expert_parallel_size: 32
     activation_checkpointing: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     automodel_kwargs:
+      pipeline_config:
+        _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
+        pp_schedule: interleaved1f1b
+        pp_microbatch_size: 1
+        layers_per_stage: 2
+        round_virtual_stages_to_pp_multiple: down
+        scale_grads_in_schedule: false
+        patch_inner_model: false
+        patch_causal_lm_model: false
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
         attn: sdpa
@@ -82,7 +99,7 @@ policy:
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
-        experts: gmm
+        experts: torch_mm
         dispatcher: deepep
         enable_fsdp_optimizations: true
       freeze_config:
@@ -92,9 +109,9 @@ policy:
   sequence_packing:
     enabled: false
   dynamic_batching:
-    enabled: true
+    enabled: false
   generation:
-    max_new_tokens: 1024
+    max_new_tokens: 2048
     vllm_kwargs:
       language_model_only: true
       block_size: 128
@@ -104,14 +121,16 @@ policy:
       expert_parallel_size: 16
       gpu_memory_utilization: 0.8
       enforce_eager: true
-      max_model_len: 2048
+      max_model_len: 4096
+      env_vars:
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: "0"
     colocated:
       enabled: false
       resources:
         gpus_per_node: 8
         num_nodes: 16
 data:
-  max_input_seq_length: 1024
+  max_input_seq_length: 2048
   train:
     dataset_name: DAPOMath17K
   validation:
@@ -127,7 +146,7 @@ logger:
   tensorboard_enabled: false
   wandb:
     project: nemorl-m3
-    name: grpo-minimax-m3-32n8g-non-colocated
+    name: grpo-m3-32n8g-non-colocated-fusedadam-pp
 cluster:
   gpus_per_node: 8
   num_nodes: 32
