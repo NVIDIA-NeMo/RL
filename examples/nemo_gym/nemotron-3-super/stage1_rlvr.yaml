@@ -129,6 +129,7 @@ policy:
     apply_rope_fusion: True
     bias_activation_fusion: False
     gradient_accumulation_fusion: False
+    use_fused_weighted_squared_relu: false
     defer_fp32_logits: True
     moe_per_layer_logging: True
 
@@ -183,6 +184,13 @@ policy:
       fp8_param: false
 
     env_vars: null
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
 
   dynamic_batching:
     enabled: False
