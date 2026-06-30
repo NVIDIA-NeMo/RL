@@ -25,7 +25,8 @@ nemo_rl.models.megatron.setup, focusing on:
 """
 
 import os
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1761,6 +1762,44 @@ class TestSetupModelConfig:
 
         mock_ac.assert_called_once_with("test-model", trust_remote_code=True)
 
+    @pytest.mark.parametrize(
+        ("flag_value", "expected_batch_invariant_mode"),
+        [(True, True), (False, False), (None, False)],
+    )
+    def test_bf16_true_on_policy_controls_batch_invariant_mode(
+        self, request, flag_value, expected_batch_invariant_mode
+    ):
+        """bf16_true_on_policy should be the single policy flag for Megatron BI mode."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        mock_model_cfg = self._make_model_cfg_mock()
+        mock_provider = MagicMock()
+        mock_provider.to_megatron_provider.return_value = mock_model_cfg
+
+        config = {
+            "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
+            "megatron_cfg": {},
+        }
+        if flag_value is not None:
+            config["bf16_true_on_policy"] = flag_value
+
+        with (
+            patch("transformers.AutoConfig.from_pretrained"),
+            patch("nemo_rl.models.megatron.setup.AutoBridge") as mock_ab,
+        ):
+            mock_ab.from_hf_config.return_value = mock_provider
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path="/ckpt/iter_0005000",
+            )
+
+        assert mock_model_cfg.batch_invariant_mode is expected_batch_invariant_mode
+
     def test_megatron_bridge_with_hf_config_overrides_warns(self, tmp_path, request):
         """hf_config_overrides set with megatron_bridge format must emit a UserWarning."""
         from nemo_rl.models.megatron.setup import setup_model_config
@@ -2037,6 +2076,88 @@ class TestSetupModelAndOptimizer:
         assert len(call_kwargs.get("pre_wrap_hook", [])) > 0
 
         assert result.param_sync_func == mock_model_chunk.start_param_sync
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    @patch("nemo_rl.models.megatron.setup.GlobalState")
+    @patch("nemo_rl.models.megatron.setup.initialize_megatron")
+    @patch("nemo_rl.models.megatron.setup.set_jit_fusion_options")
+    @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
+    @patch("nemo_rl.models.megatron.setup.build_tokenizer")
+    @patch("nemo_rl.models.megatron.setup.get_model")
+    @patch("nemo_rl.models.megatron.setup.setup_optimizer")
+    @patch("nemo_rl.models.megatron.setup.checkpoint_exists")
+    @patch("nemo_rl.models.megatron.setup.get_attached_draft_model")
+    @patch("torch.distributed.all_reduce")
+    @patch("torch.distributed.barrier")
+    @patch("torch.tensor")
+    def test_setup_enables_megatron_batch_invariant_mode(
+        self,
+        mock_tensor,
+        mock_barrier,
+        mock_all_reduce,
+        mock_get_attached_draft_model,
+        mock_checkpoint_exists,
+        mock_setup_optimizer,
+        mock_get_model,
+        mock_build_tokenizer,
+        mock_init_ckpt_context,
+        mock_set_jit,
+        mock_init_megatron,
+        mock_global_state,
+        mock_pg_collection,
+    ):
+        """setup_model_and_optimizer should enable Megatron BI kernels when configured."""
+        from nemo_rl.models.megatron.setup import setup_model_and_optimizer
+
+        mock_state = MagicMock()
+        mock_state.start_time = 0.0
+        mock_global_state.return_value = mock_state
+
+        mock_megatron_cfg = MagicMock()
+        mock_megatron_cfg.ft = None
+        mock_megatron_cfg.model.batch_invariant_mode = True
+        mock_megatron_cfg.model.vocab_size = 32000
+        mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
+        mock_megatron_cfg.model.tensor_model_parallel_size = 1
+        mock_megatron_cfg.tokenizer.hf_tokenizer_kwargs = None
+        mock_megatron_cfg.checkpoint.load = None
+        mock_megatron_cfg.checkpoint.pretrained_checkpoint = None
+        mock_megatron_cfg.ddp.overlap_param_gather = False
+        mock_megatron_cfg.ddp.align_param_gather = False
+        mock_megatron_cfg.dist.use_torch_fsdp2 = False
+
+        mock_model = [MagicMock()]
+        mock_get_model.return_value = mock_model
+        mock_get_attached_draft_model.return_value = None
+        mock_tensor_instance = MagicMock()
+        mock_tensor_instance.item.return_value = 0.0
+        mock_tensor.return_value = mock_tensor_instance
+        mock_checkpoint_exists.return_value = False
+
+        fake_bi_module = ModuleType(
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels"
+        )
+        fake_bi_module.enable_batch_invariant_mode = MagicMock()
+
+        policy_cfg = {
+            "megatron_cfg": {
+                "freeze_moe_router": False,
+            }
+        }
+
+        with patch.dict(
+            sys.modules,
+            {
+                "megatron.core.transformer.custom_layers.batch_invariant_kernels": fake_bi_module
+            },
+        ):
+            setup_model_and_optimizer(
+                policy_cfg=policy_cfg,
+                megatron_cfg=mock_megatron_cfg,
+                load_optimizer=False,
+            )
+
+        fake_bi_module.enable_batch_invariant_mode.assert_called_once_with()
 
 
 @pytest.mark.mcore
