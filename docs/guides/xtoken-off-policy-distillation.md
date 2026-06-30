@@ -212,14 +212,15 @@ Hydra CLI:
 ```bash
 uv run python examples/run_xtoken_off_policy_distillation.py \
     --config examples/configs/xtoken_off_policy_distillation.yaml \
-    loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
+    teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```
 
-The exemplar config keeps only `loss_fn.projection_matrix_path` as `null`, so
-the projection matrix must always be supplied at the CLI — this keeps the
-config reusable across (student, teacher) pairs. `data.train.data_files`
+The exemplar config keeps each teacher's `projection_matrix_path` as `null`, so
+the projection matrix must always be supplied at the CLI (per teacher, e.g.
+`teachers.0.projection_matrix_path=...`) — this keeps the config reusable across
+(student, teacher) pairs. `data.train.data_files`
 already points at the default NVIDIA corpus described above; override it only
 to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus.
 
@@ -246,8 +247,8 @@ This run distills a `meta-llama/Llama-3.2-1B` student from two teachers at
 once: `microsoft/Phi-4-mini-instruct` (a cross-tokenizer teacher, projected
 through its projection matrix) and `meta-llama/Llama-3.2-3B` (which shares the
 student's tokenizer, so it contributes a direct full-vocab KL with no
-projection). The per-teacher objectives are summed (`loss_fn.kd_loss_mode=sum`,
-`loss_fn.kl_type=mixed`). Config: global batch 96, micro-batch 1, sequence
+projection). The per-teacher objectives are summed (`loss_fn.kd_loss_mode=sum`).
+Config: global batch 96, micro-batch 1, sequence
 length 2048, 100 steps, 2 nodes (8 GPUs each), on the default
 Nemotron-Pretraining-Specialized-v1.1 / Formal-Logic corpus. The distillation
 objective converges and the student tracks both teachers more closely over
