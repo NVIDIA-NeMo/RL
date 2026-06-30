@@ -118,6 +118,9 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.weight_sync.vllm_s3_sparse_weight_synchronizer import (
+    VllmS3SparseWeightSynchronizer,
+)
 
 # ===============================================================================
 # Configuration
@@ -907,6 +910,10 @@ def setup(
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    use_vllm_s3_sparse_refit = (
+        backend == "vllm"
+        and generation_config.get("refit_transport") == "vllm_s3_sparse"
+    )
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
@@ -1095,6 +1102,30 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
+        vllm_cfg = generation_config["vllm_cfg"]
+        refit_transport = generation_config.get("refit_transport", None)
+        if refit_transport not in (None, "vllm_s3_sparse"):
+            raise ValueError(f"Unsupported vLLM refit transport {refit_transport!r}.")
+        if use_vllm_s3_sparse_refit:
+            delta_config = generation_config.get("delta_compression")
+            if (
+                colocated_inference
+                or not policy_config["megatron_cfg"]["enabled"]
+                or vllm_cfg["async_engine"]
+                or vllm_cfg["precision"] == "fp8"
+                or vllm_cfg["kv_cache_dtype"].startswith("fp8")
+                or not delta_config
+                or not delta_config.get("enabled")
+                or generation_config.get("quant_cfg")
+                or generation_config.get("real_quant")
+                or not vllm_cfg.get("expose_http_refit_server")
+            ):
+                raise ValueError(
+                    "vllm_s3_sparse requires a non-colocated Megatron policy, "
+                    "synchronous BF16/FP16 vLLM, delta compression, an unquantized "
+                    "rollout, and the refit HTTP server."
+                )
+
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
@@ -1232,7 +1263,7 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and not use_vllm_s3_sparse_refit:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -1271,9 +1302,24 @@ def setup(
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    if use_vllm_s3_sparse_refit:
+        t0 = time.perf_counter()
+        assert isinstance(policy_generation, VllmGeneration)
+        policy_generation.weight_synchronizer = VllmS3SparseWeightSynchronizer(
+            policy,
+            policy_generation,
+            api_key_env_var=generation_config["vllm_cfg"].get(
+                "http_refit_api_key_env_var"
+            ),
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        worker_init_timing_metrics["s3_sparse_refit_init_time_s"] = (
+            time.perf_counter() - t0
+        )
+    else:
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -2044,6 +2090,16 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    if (
+        isinstance(policy_generation, VllmGeneration)
+        and policy_generation.weight_synchronizer is not None
+    ):
+        policy_generation.weight_synchronizer.sync_weights(
+            timer=timer,
+            kv_scales=kv_scales,
+        )
+        return
+
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.suspend_for_refit()

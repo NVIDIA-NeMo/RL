@@ -43,6 +43,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class VllmGeneration(GenerationInterface):
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load
+        self.weight_synchronizer: WeightSynchronizer | None = None
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -927,6 +929,17 @@ class VllmGeneration(GenerationInterface):
 
         # Wait for all futures to complete
         ray.get(futures)
+
+    def report_refit_server_base_urls(self) -> list[str]:
+        """Return base URLs for vLLM workers exposing sparse refit endpoints."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_refit_server_base_url",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return [url for url in ray.get(futures) if url]
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""

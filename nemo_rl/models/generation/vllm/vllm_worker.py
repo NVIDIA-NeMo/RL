@@ -12,11 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copy
 import gc
 import logging
 import os
 import sys
+import tempfile
+import threading
+import time
+import traceback
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Optional, cast
 
 import ray
@@ -25,8 +32,12 @@ from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
+    _get_free_port_local,
+    _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
@@ -47,6 +58,18 @@ from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+from nemo_rl.utils.weight_transfer_s3_manifest import (
+    G_VLLM_REFIT_API_KEY_HEADER,
+    G_VLLM_REFIT_FLUSH_PATH,
+    G_VLLM_REFIT_S3_MANIFEST_PATH,
+    download_s3_refit_payload,
+    merge_vllm_refit_receiver_timing,
+    vllm_refit_api_key,
+)
+
+G_REFIT_APPLY_QUEUE_DEPTH_ENV = "NRL_REFIT_APPLY_QUEUE_DEPTH"
+G_REFIT_APPLY_BATCH_SIZE_ENV = "NRL_REFIT_APPLY_BATCH_SIZE"
+G_REFIT_BATCH_STAGING_DIR_ENV = "NRL_REFIT_BATCH_STAGING_DIR"
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +266,28 @@ class BaseVllmGenerationWorker:
         # the affinity file.
         if bundle_indices is not None and len(bundle_indices) == 1:
             bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
+        self._refit_apply_queue_lock = threading.Lock()
+        self._refit_apply_executor = ThreadPoolExecutor(max_workers=1)
+        self._refit_apply_futures: deque[Future[dict[str, Any]]] = deque()
+        self._refit_apply_pending_payloads: list[bytes] = []
+        self._refit_apply_payload_count = 0
+        self._refit_apply_batch_count = 0
+        self._refit_workers_share_node = False
+        self._refit_apply_queue_depth = int(
+            os.getenv(G_REFIT_APPLY_QUEUE_DEPTH_ENV) or 2
+        )
+        self._refit_apply_batch_size = int(os.getenv(G_REFIT_APPLY_BATCH_SIZE_ENV) or 8)
+        self._refit_batch_staging_dir = (
+            os.getenv(G_REFIT_BATCH_STAGING_DIR_ENV) or "/dev/shm"
+        )
+        if self._refit_apply_queue_depth < 1:
+            raise ValueError(f"{G_REFIT_APPLY_QUEUE_DEPTH_ENV} must be >= 1.")
+        if self._refit_apply_batch_size < 1:
+            raise ValueError(f"{G_REFIT_APPLY_BATCH_SIZE_ENV} must be >= 1.")
+        self.refit_server_base_url: str | None = None
+        self.refit_server: Any | None = None
+        self.refit_server_thread: threading.Thread | None = None
 
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
@@ -650,6 +695,155 @@ class BaseVllmGenerationWorker:
                     metrics[metric.name] = metric.value
         return metrics
 
+    def _enqueue_sparse_payload_apply(
+        self,
+        payload: bytes,
+    ) -> dict[str, Any]:
+        completed: list[Future[dict[str, Any]]] = []
+        with self._refit_apply_queue_lock:
+            while self._refit_apply_futures and (
+                self._refit_apply_futures[0].done()
+                or len(self._refit_apply_futures) >= self._refit_apply_queue_depth
+            ):
+                completed.append(self._refit_apply_futures.popleft())
+            response = self._collect_refit_apply_results(completed)
+            self._refit_apply_pending_payloads.append(payload)
+            self._refit_apply_payload_count += 1
+            if len(self._refit_apply_pending_payloads) == self._refit_apply_batch_size:
+                self._submit_pending_sparse_payloads()
+        return response
+
+    def _submit_pending_sparse_payloads(self) -> None:
+        payloads = tuple(self._refit_apply_pending_payloads)
+        self._refit_apply_pending_payloads.clear()
+        self._refit_apply_futures.append(
+            self._refit_apply_executor.submit(
+                self.update_weights_from_serialized_sparse_payloads,
+                payloads,
+                False,
+            )
+        )
+        self._refit_apply_batch_count += 1
+
+    def _collect_refit_apply_results(
+        self,
+        futures: list[Future[dict[str, Any]]],
+        *,
+        synchronize: bool = False,
+    ) -> dict[str, Any]:
+        results = [future.result() for future in futures]
+        if synchronize and results:
+            assert self.llm is not None
+            self.llm.collective_rpc("synchronize_device", args=())
+        timing: dict[str, float] = {}
+        merge_vllm_refit_receiver_timing(timing, results, maximum=False)
+        return {
+            "ok": True,
+            "payloads": sum(int(result.get("payloads", 0)) for result in results),
+            **timing,
+        }
+
+    @staticmethod
+    def _refit_collective_response(worker_results: Any) -> dict[str, Any]:
+        return {
+            "ok": True,
+            **merge_vllm_refit_receiver_timing(
+                {}, cast(list[dict[str, Any]], worker_results), maximum=True
+            ),
+        }
+
+    def _flush_queued_sparse_payloads(self) -> dict[str, Any]:
+        started = time.perf_counter()
+        with self._refit_apply_queue_lock:
+            if self._refit_apply_pending_payloads:
+                self._submit_pending_sparse_payloads()
+            futures = list(self._refit_apply_futures)
+            self._refit_apply_futures.clear()
+            payload_count = self._refit_apply_payload_count
+            batch_count = self._refit_apply_batch_count
+            self._refit_apply_payload_count = 0
+            self._refit_apply_batch_count = 0
+        response = self._collect_refit_apply_results(futures, synchronize=True)
+        response.update(
+            payloads=payload_count,
+            batches=batch_count,
+            seconds=time.perf_counter() - started,
+        )
+        if futures:
+            print(
+                "REFIT_RECEIVER_TIMING "
+                f"payloads={payload_count} batches={batch_count} "
+                f"total_s={response['seconds']:.3f} "
+                f"payload_total_s={response.get('receiver_total_s', 0.0):.3f}",
+                flush=True,
+            )
+        return response
+
+    def update_weights_from_serialized_sparse_payload(
+        self, serialized_payload: bytes, synchronize: bool = True
+    ) -> dict[str, Any]:
+        return self.update_weights_from_serialized_sparse_payloads(
+            (serialized_payload,), synchronize
+        )
+
+    def update_weights_from_serialized_sparse_payloads(
+        self,
+        serialized_payloads: tuple[bytes, ...],
+        synchronize: bool = True,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    async def _apply_s3_manifest_payload(
+        self,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        body = await asyncio.to_thread(download_s3_refit_payload, manifest)
+        download_s = time.perf_counter() - started
+        result = await asyncio.to_thread(self._enqueue_sparse_payload_apply, body)
+        result.update(payloads=1, receiver_s3_download_s=download_s)
+        return result
+
+    def _setup_vllm_refit_api_server(self, app: Any) -> None:
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+
+        token = vllm_refit_api_key(
+            self.cfg["vllm_cfg"].get("http_refit_api_key_env_var")
+        )
+
+        async def respond(raw_request: Request, *, flush: bool = False) -> JSONResponse:
+            if (
+                token is not None
+                and raw_request.headers.get(G_VLLM_REFIT_API_KEY_HEADER) != token
+            ):
+                return JSONResponse(
+                    content={"ok": False, "error": "unauthorized"}, status_code=403
+                )
+            try:
+                result = (
+                    await asyncio.to_thread(self._flush_queued_sparse_payloads)
+                    if flush
+                    else await self._apply_s3_manifest_payload(await raw_request.json())
+                )
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+            return JSONResponse(
+                content=result,
+                status_code=200 if result.get("ok") is True else 500,
+            )
+
+        @app.post(G_VLLM_REFIT_S3_MANIFEST_PATH)
+        async def apply_s3_manifest_refit(raw_request: Request) -> JSONResponse:
+            return await respond(raw_request)
+
+        @app.post(G_VLLM_REFIT_FLUSH_PATH)
+        async def flush_sparse_delta_refit(raw_request: Request) -> JSONResponse:
+            return await respond(raw_request, flush=True)
+
+    def report_refit_server_base_url(self) -> str | None:
+        return self.refit_server_base_url
+
 
 class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
@@ -665,6 +859,38 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
             )
+        if self.cfg["vllm_cfg"].get("expose_http_refit_server"):
+            self._refit_workers_share_node = (
+                len(set(self.llm.collective_rpc("report_node_hostname", args=()))) == 1
+            )
+            self._setup_vllm_refit_server()
+
+    def _setup_vllm_refit_server(self) -> None:
+        import uvicorn
+        from fastapi import FastAPI
+
+        app = FastAPI()
+        self._setup_vllm_refit_api_server(app)
+        port = self.cfg["vllm_cfg"].get(
+            "http_refit_server_port"
+        ) or _get_free_port_local(
+            self.cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
+            self.cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="0.0.0.0",
+                port=port,
+                timeout_keep_alive=120,
+            )
+        )
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        self.refit_server_base_url = f"http://{_get_node_ip_local()}:{port}"
+        self.refit_server = server
+        self.refit_server_thread = thread
+        print(f"Starting vLLM refit server on {self.refit_server_base_url}", flush=True)
 
     def init_collective(
         self,
@@ -790,8 +1016,6 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                                 1
                             ].logprob
                 except Exception:
-                    import traceback
-
                     traceback.print_exc()
 
             logprobs_list.append(full_logprobs)
@@ -989,8 +1213,6 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
-            import traceback
-
             traceback.print_exc()
             return False
 
@@ -1020,10 +1242,59 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
-            import traceback
-
             traceback.print_exc()
             return False
+
+    def update_weights_from_serialized_sparse_payloads(
+        self,
+        serialized_payloads: tuple[bytes, ...],
+        synchronize: bool = True,
+    ) -> dict[str, Any]:
+        """Apply a FIFO batch of S3 sparse deltas through one collective RPC."""
+        if self.llm is None:
+            raise RuntimeError(
+                "Attempting to update weights with either an uninitialized vLLM "
+                "or non-model-owner"
+            )
+        if not serialized_payloads:
+            raise ValueError("A sparse refit batch must contain at least one payload.")
+        if not self._refit_workers_share_node:
+            results = [
+                self._refit_collective_response(
+                    self.llm.collective_rpc(
+                        "update_weights_from_serialized_sparse_payload",
+                        args=(payload, False),
+                    )
+                )
+                for payload in serialized_payloads
+            ]
+            if synchronize:
+                self.llm.collective_rpc("synchronize_device", args=())
+            timing: dict[str, float] = {}
+            merge_vllm_refit_receiver_timing(timing, results, maximum=False)
+            return {"ok": True, "payloads": len(serialized_payloads), **timing}
+
+        paths: list[str] = []
+        try:
+            for payload in serialized_payloads:
+                fd, path = tempfile.mkstemp(
+                    prefix="nemo_rl_refit_", dir=self._refit_batch_staging_dir
+                )
+                paths.append(path)
+                with os.fdopen(fd, "wb") as staged:
+                    staged.write(payload)
+            response = self._refit_collective_response(
+                self.llm.collective_rpc(
+                    "update_weights_from_sparse_payload_files",
+                    args=tuple(paths),
+                    kwargs={"synchronize": synchronize},
+                )
+            )
+        finally:
+            for path in paths:
+                os.unlink(path)
+        response["payloads"] = len(serialized_payloads)
+        return response
 
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
@@ -1090,6 +1361,15 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self.refit_server is not None:
+                self.refit_server.should_exit = True
+
+            self._flush_queued_sparse_payloads()
+            self._refit_apply_executor.shutdown(wait=True)
+
+            if self.refit_server_thread is not None:
+                self.refit_server_thread.join(timeout=5.0)
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())
