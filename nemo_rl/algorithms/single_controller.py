@@ -397,12 +397,19 @@ class SingleControllerActor:
                         for _ in range(evicted):
                             self._buffer_capacity.release()
 
-                    # TODO @yukih: wait train pump merged, now always return min_prompt_groups_per_batch
-                    # need to add a max_prompt_groups_per_batch
+                    # Get train data
                     with self._timer.time("exposed_generation"):
+                        max_prompt_groups = (
+                            grpo_cfg["num_prompts_per_step"] - groups_dispatched
+                        )
+                        min_prompt_groups = min(
+                            self._async_cfg.min_prompt_groups_per_batch,
+                            max_prompt_groups,
+                        )
                         train_meta, num_groups = await self._sampler.select(
                             current_train_weight=self._trainer_version,
-                            min_prompt_groups=self._async_cfg.min_prompt_groups_per_batch,
+                            min_prompt_groups=min_prompt_groups,
+                            max_prompt_groups=max_prompt_groups,
                         )
 
                     if train_meta is None:

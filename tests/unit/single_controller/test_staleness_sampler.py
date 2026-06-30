@@ -76,14 +76,22 @@ class TestStalenessSamplerSelect:
         buf.add("g0", weight=5)
         sampler = StalenessSampler(buf, max_staleness_versions=2)
 
-        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        result = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
+        )
         assert result == (None, 0)
 
     def test_select_returns_none_on_empty_buffer(self):
         buf = FakeBuffer()
         sampler = StalenessSampler(buf, max_staleness_versions=2)
 
-        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=1))
+        result = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1
+            )
+        )
         assert result == (None, 0)
 
     def test_select_filters_by_staleness_window(self):
@@ -97,7 +105,9 @@ class TestStalenessSamplerSelect:
         )
 
         selected, num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=2)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
         )
 
         assert selected is not None
@@ -114,7 +124,9 @@ class TestStalenessSamplerSelect:
         )
 
         selected, num_groups = _run(
-            sampler.select(current_train_weight=6, min_prompt_groups=2)
+            sampler.select(
+                current_train_weight=6, min_prompt_groups=2, max_prompt_groups=2
+            )
         )
         assert selected is not None
         assert selected.sample_ids == ["v5_g0", "v4_g0"]
@@ -129,7 +141,9 @@ class TestStalenessSamplerSelect:
         )
 
         selected, num_groups = _run(
-            sampler.select(current_train_weight=6, min_prompt_groups=2)
+            sampler.select(
+                current_train_weight=6, min_prompt_groups=2, max_prompt_groups=2
+            )
         )
         assert selected is not None
         assert selected.sample_ids == ["v3_g0", "v4_g0"]
@@ -142,7 +156,9 @@ class TestStalenessSamplerSelect:
         sampler = StalenessSampler(buf, max_staleness_versions=10)
 
         selected, num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=1)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1
+            )
         )
 
         assert selected is not None
@@ -156,7 +172,9 @@ class TestStalenessSamplerSelect:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         selected, num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=2)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
         )
 
         assert selected is not None
@@ -176,12 +194,18 @@ class TestStalenessSamplerSelect:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         # 3 eligible (need weight=5), only have 2
-        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=3))
+        result = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=3, max_prompt_groups=3
+            )
+        )
         assert result == (None, 0)
 
         # Buffer still intact: select with min=3 returned None without dropping anything.
         selected, num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=2)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
         )
         assert selected is not None
         assert selected.sample_ids == ["g1_g0", "g2_g0"]
@@ -194,7 +218,9 @@ class TestStalenessSamplerSelect:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         first_meta, first_num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=1)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1
+            )
         )
         assert first_meta is not None
         assert first_meta.sample_ids == ["g0_g0"]
@@ -204,7 +230,9 @@ class TestStalenessSamplerSelect:
         assert buf.remove_calls[-1][1] is False
 
         second_meta, second_num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=1)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1
+            )
         )
         assert second_meta is not None
         assert second_meta.sample_ids == ["g1_g0"]
@@ -214,7 +242,60 @@ class TestStalenessSamplerSelect:
         buf = FakeBuffer()
         sampler = StalenessSampler(buf, max_staleness_versions=0)
         with pytest.raises(ValueError):
-            _run(sampler.select(current_train_weight=0, min_prompt_groups=0))
+            _run(
+                sampler.select(
+                    current_train_weight=0, min_prompt_groups=0, max_prompt_groups=0
+                )
+            )
+
+    def test_select_rejects_max_less_than_min(self):
+        buf = FakeBuffer()
+        for i in range(3):
+            buf.add(f"g{i}", weight=5)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        with pytest.raises(ValueError):
+            _run(
+                sampler.select(
+                    current_train_weight=5, min_prompt_groups=2, max_prompt_groups=1
+                )
+            )
+
+    def test_select_caps_at_max_prompt_groups(self):
+        buf = FakeBuffer()
+        for i in range(5):
+            buf.add(f"g{i}", weight=5)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        selected, num_groups = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=3
+            )
+        )
+
+        assert selected is not None
+        # FIFO order; capped at max=3 even though 5 are eligible.
+        assert selected.sample_ids == ["g0_g0", "g1_g0", "g2_g0"]
+        assert num_groups == 3
+        # The remaining two stay in the buffer.
+        assert buf.start_weight_list == [5, 5]
+
+    def test_select_takes_all_available_when_between_min_and_max(self):
+        buf = FakeBuffer()
+        for i in range(3):
+            buf.add(f"g{i}", weight=5)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        selected, num_groups = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=8
+            )
+        )
+
+        assert selected is not None
+        assert selected.sample_ids == ["g0_g0", "g1_g0", "g2_g0"]
+        assert num_groups == 3
+        assert buf.start_weight_list == []
 
 
 class TestStalenessSamplerEvict:
@@ -288,7 +369,9 @@ class TestStalenessSamplerReady:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         selected, num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=1)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1
+            )
         )
 
         assert selected is not None
@@ -301,7 +384,11 @@ class TestStalenessSamplerReady:
         buf.add("g1", weight=5, ready=True)
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
-        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        result = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
+        )
         assert result == (None, 0)
 
 
@@ -314,7 +401,9 @@ class TestStalenessSamplerRequireOrder:
         sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
 
         selected, num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=2)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
         )
 
         assert selected is not None
@@ -333,7 +422,11 @@ class TestStalenessSamplerRequireOrder:
         buf.add("v5_b", weight=5, ready=True)
         sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
 
-        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        result = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
+        )
         assert result == (None, 0)
         # Buffer untouched: nothing removed.
         assert buf.start_weight_list == [4, 4, 5, 5]
@@ -345,7 +438,11 @@ class TestStalenessSamplerRequireOrder:
         # Only 1 ready in oldest batch; need 2.
         sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
 
-        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        result = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
+        )
         assert result == (None, 0)
 
     def test_ignores_future_versions_when_picking_target(self):
@@ -358,7 +455,9 @@ class TestStalenessSamplerRequireOrder:
         sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
 
         selected, num_groups = _run(
-            sampler.select(current_train_weight=5, min_prompt_groups=2)
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=2, max_prompt_groups=2
+            )
         )
 
         assert selected is not None

@@ -57,8 +57,9 @@ class StalenessSampler:
         *,
         current_train_weight: int,
         min_prompt_groups: int,
+        max_prompt_groups: int,
     ) -> tuple[KVBatchMeta | None, int]:
-        """Concat the first min_prompt_groups eligible groups and drop them from the buffer.
+        """Concat up to max_prompt_groups eligible groups and drop them from the buffer.
 
         Eligibility = ready and weight in
         [current_train_weight - max_staleness_versions, current_train_weight].
@@ -67,6 +68,7 @@ class StalenessSampler:
         Args:
             current_train_weight: Current trainer weight version.
             min_prompt_groups: Minimum groups required; returns (None, 0) below this.
+            max_prompt_groups: Cap on groups returned when the threshold is met.
 
         Returns:
             meta: Concatenated KVBatchMeta, or None if not enough groups.
@@ -74,6 +76,11 @@ class StalenessSampler:
         """
         if min_prompt_groups < 1:
             raise ValueError(f"min_prompt_groups must be >= 1, got {min_prompt_groups}")
+        if max_prompt_groups < min_prompt_groups:
+            raise ValueError(
+                f"max_prompt_groups ({max_prompt_groups}) must be >= "
+                f"min_prompt_groups ({min_prompt_groups})"
+            )
 
         if self.force_in_order:
             # target_step exact match; staleness window ignored.
@@ -119,7 +126,8 @@ class StalenessSampler:
                 )
             )
 
-        selected_idxs = valid_idxs[:min_prompt_groups]
+        requested_groups = min(len(valid_idxs), max_prompt_groups)
+        selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
 
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
