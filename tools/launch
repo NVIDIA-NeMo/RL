@@ -120,10 +120,27 @@ for SCRIPT in $SCRIPTS; do
         # Error message is already printed by extract_config
         exit 1
     fi
+    # Reset optional per-script config vars so a value from a previous script in
+    # the loop does not leak into a script that omits it.
+    SEGMENT_SIZE=""
     eval "$config"
 
     # Default GPUS_PER_NODE to 8 if not specified in config (H100 default)
     export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
+    # Optional topology-aware allocation: if the script's CONFIG defines
+    # SEGMENT_SIZE (mirrors cluster.segment_size in the recipe yaml), ask Slurm
+    # to allocate nodes in segments of that many nodes, each kept within a single
+    # topology block (rack), so MoE expert-parallel groups never span racks
+    # (#2937). Must evenly divide NUM_NODES. Empty => no --segment (default).
+    SEGMENT_ARG=""
+    if [[ -n "${SEGMENT_SIZE:-}" ]]; then
+        if (( NUM_NODES % SEGMENT_SIZE != 0 )); then
+            echo "[ERROR]: SEGMENT_SIZE=$SEGMENT_SIZE must evenly divide NUM_NODES=$NUM_NODES (in $SCRIPT)" >&2
+            exit 1
+        fi
+        SEGMENT_ARG="--segment=$SEGMENT_SIZE "
+    fi
 
     # NUM_RUNS * NUM_NODES * NUM_GPUS * (NUM_MINUTES / 60)
     gpu_hours=$((NUM_RUNS * NUM_NODES * GPUS_PER_NODE * NUM_MINUTES / 60))
@@ -180,7 +197,7 @@ SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-}" \\
 SANDBOX_COMMAND="${SANDBOX_COMMAND:-}" \\
 SANDBOX_ENV_VARS="${SANDBOX_ENV_VARS:-}" \\
 sbatch \\
-    --nodes=$NUM_NODES \\
+    --nodes=$NUM_NODES ${SEGMENT_ARG}\\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
