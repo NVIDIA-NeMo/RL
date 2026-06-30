@@ -68,6 +68,7 @@ env:
     safety_judge_model:
       responses_api_models:
         local_vllm_model:
+          hf_home: "${oc.env:HF_HOME}"
           vllm_serve_kwargs:
             max_num_seqs: 16
 
