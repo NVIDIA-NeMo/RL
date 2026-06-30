@@ -28,6 +28,7 @@ the IPC producer.
 
 from __future__ import annotations
 
+import math
 import os
 from copy import deepcopy
 from types import SimpleNamespace
@@ -816,12 +817,15 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
     # path: it assumes the student's tokenizer and would mismatch the
     # student's token_mask when the teacher length differs (T_t != T_s).
     fn = _bare_averaged_logits_loss_fn(["t0_proj.pt", "t1_proj.pt"])
+    fn.teacher_weights = [2.0, 3.0]  # distinct weights so weighting is exercised
 
     fallback_calls = []
 
     def _fallback(i, *args, **kwargs):
         fallback_calls.append(i)
-        return torch.tensor(0.0), {}
+        # Distinct nonzero per-teacher KD so the weighted sum is non-trivial:
+        # a "last teacher overwrites" or "weight ignored" bug would change it.
+        return torch.tensor(float(i + 1)), {}
 
     def _fast_path(*args, **kwargs):
         raise AssertionError(
@@ -847,7 +851,8 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
         cp_group=None,
     )
     assert fallback_calls == [0, 1]  # per-teacher fallback path, one call each
-    assert total_kd is not None
+    # total_kd = Σ_i weight_i * kd_i = 2*1 + 3*2 = 8.
+    assert total_kd.item() == pytest.approx(2.0 * 1.0 + 3.0 * 2.0)
 
 
 def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
@@ -958,6 +963,23 @@ def test_sum_weights_metric_rejected_outside_sum_mode(mode):
                 "gold_loss": False,
                 "kd_loss_mode": mode,
                 "sum_weights_metric": "ce",
+            }
+        )
+
+
+@pytest.mark.parametrize("weights", [[0.0, 0.0], [1.0, -1.0]])
+def test_averaged_logits_rejects_zero_weight_sum(weights):
+    # averaged_logits divides by sum(teacher_weights) to form a convex average,
+    # so a zero weight-sum (all zeros, or a signed set cancelling to 0) is
+    # rejected at construction with a clear message instead of failing with a
+    # deep ZeroDivisionError mid-step.
+    with pytest.raises(ValueError, match="must not sum to zero"):
+        CrossTokenizerDistillationLossFn(
+            {
+                "xtoken_loss": False,
+                "gold_loss": False,
+                "kd_loss_mode": "averaged_logits",
+                "teacher_weights": weights,
             }
         )
 
@@ -1088,3 +1110,180 @@ def test_select_teacher_picks_lowest_ce_teacher(better):
 
     assert metrics["selected_teacher"] == better
     assert selected == [better]  # KD computed only for the selected teacher
+
+
+# ---------------------------------------------------------------------------
+# sum-mode aggregation: weighted sum + normalize_teacher_by_vocab rescaling
+# ---------------------------------------------------------------------------
+
+
+def _bare_sum_kd_loss_fn(
+    *,
+    num_teachers,
+    teacher_weights,
+    normalize_teacher_by_vocab=False,
+    teacher_vocab_sizes=None,
+):
+    """A ``CrossTokenizerDistillationLossFn`` carrying only the attrs ``_sum_kd``
+    reads, built via ``__new__`` to skip the config-driven ``__init__``.
+    Static weights only (``sum_weights_metric=None``)."""
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn.num_teachers = num_teachers
+    fn.teacher_weights = list(teacher_weights)
+    fn.sum_weights_metric = None
+    fn.normalize_teacher_by_vocab = normalize_teacher_by_vocab
+    fn.teacher_vocab_sizes = (
+        list(teacher_vocab_sizes) if teacher_vocab_sizes else [1] * num_teachers
+    )
+    return fn
+
+
+def test_sum_kd_weighted_sum_of_per_teacher_kd():
+    # total_kd = Σ_i weight_i * KD_i. Distinct nonzero per-teacher KD + distinct
+    # weights so "last teacher overwrites" or "per-teacher weight ignored" can't
+    # pass silently.
+    fn = _bare_sum_kd_loss_fn(num_teachers=2, teacher_weights=[2.0, 3.0])
+
+    def _fake_kd(i, *args, **kwargs):
+        return torch.tensor(float(i + 1)), {"kl_loss": float(i + 1)}
+
+    fn._compute_teacher_kd = _fake_kd
+
+    total_kd, per_metrics = fn._sum_kd(
+        torch.zeros(1, 4, 8),  # student_logits_contig (only used for device/dtype)
+        {},
+        {},
+        {},
+        torch.tensor(10.0),
+        tp_group=None,
+        cp_group=None,
+    )
+    # 2*1 + 3*2 = 8.
+    assert total_kd.item() == pytest.approx(2.0 * 1.0 + 3.0 * 2.0)
+    # Per-teacher KD metrics are suffixed and the static weights are reported.
+    assert per_metrics["kl_loss_t0"] == 1.0
+    assert per_metrics["kl_loss_t1"] == 2.0
+    assert per_metrics["weight_t0"] == 2.0
+    assert per_metrics["weight_t1"] == 3.0
+
+
+def test_sum_kd_normalize_teacher_by_vocab_rescales_by_log_ratio():
+    # With normalize_teacher_by_vocab, each teacher's KD is scaled by
+    # log(V_t_i) / log(min_j V_t_j). V0 = min so its scale is exactly 1; V1 = V0^2
+    # so its scale = 2. A min<->max or numerator/denominator swap changes this.
+    v0, v1 = 100, 10000  # log(v1)/log(v0) == 2
+    fn = _bare_sum_kd_loss_fn(
+        num_teachers=2,
+        teacher_weights=[1.0, 1.0],
+        normalize_teacher_by_vocab=True,
+        teacher_vocab_sizes=[v0, v1],
+    )
+
+    def _fake_kd(i, *args, **kwargs):
+        return torch.tensor(float(i + 1)), {}
+
+    fn._compute_teacher_kd = _fake_kd
+
+    total_kd, _ = fn._sum_kd(
+        torch.zeros(1, 4, 8),
+        {},
+        {},
+        {},
+        torch.tensor(10.0),
+        tp_group=None,
+        cp_group=None,
+    )
+    s0 = math.log(v0) / math.log(v0)  # 1.0
+    s1 = math.log(v1) / math.log(v0)  # 2.0
+    # kd = [1, 2], weights = [1, 1]: 1*1*s0 + 2*1*s1.
+    assert total_kd.item() == pytest.approx(1.0 * s0 + 2.0 * s1)
+
+
+# ---------------------------------------------------------------------------
+# dynamic teacher weights: softmax(alpha * per-teacher scores) across teachers
+# ---------------------------------------------------------------------------
+
+
+def _dynamic_weights_fn(alpha, scores):
+    """``CrossTokenizerDistillationLossFn`` stubbed to feed fixed per-teacher
+    scores into ``_compute_dynamic_weights`` (isolates the aggregation)."""
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn.num_teachers = len(scores)
+    fn.alpha = alpha
+    fn.normalize_teacher_by_vocab = False
+    fn._teacher_score_inputs = lambda i, *a, **k: (None, None, None)
+    it = iter([torch.tensor(float(s)) for s in scores])
+    fn._teacher_weight_score = lambda *a, **k: next(it)
+    return fn
+
+
+def test_compute_dynamic_weights_softmax_over_teachers():
+    # Weights are softmax(alpha * scores) over the teacher axis. Stubbed scores
+    # isolate the aggregation, catching "softmax over wrong axis" or "alpha
+    # applied to logits not scores".
+    data = {"input_ids": torch.zeros(1, 1), "sample_mask": torch.ones(1)}
+
+    weights = _dynamic_weights_fn(1.0, [1.0, 0.0])._compute_dynamic_weights(
+        data, {}, {}
+    )
+    expected = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)
+    assert len(weights) == 2
+    assert weights[0].item() == pytest.approx(expected[0].item())
+    assert weights[1].item() == pytest.approx(expected[1].item())
+    assert (weights[0] + weights[1]).item() == pytest.approx(1.0)
+    assert weights[0].item() > weights[1].item()  # higher score -> higher weight
+
+    # alpha multiplies the scores before softmax: a larger alpha sharpens onto
+    # the top-scoring teacher.
+    sharp = _dynamic_weights_fn(8.0, [1.0, 0.0])._compute_dynamic_weights(data, {}, {})
+    assert sharp[0].item() == pytest.approx(
+        torch.softmax(torch.tensor([8.0, 0.0]), dim=0)[0].item()
+    )
+    assert sharp[0].item() > weights[0].item()
+
+
+# ---------------------------------------------------------------------------
+# per-teacher gold/xtoken overrides + the xtoken-requires-gold guard
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_gold_xtoken_per_teacher_overrides():
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn.gold_loss = False  # global defaults
+    fn.xtoken_loss = False
+    fn.teacher_gold_loss = [True, None]  # t0 overrides gold; t1 falls back
+    fn.teacher_xtoken_loss = [None, True]  # t0 falls back; t1 overrides xtoken
+
+    # use_per_teacher=True honors per-teacher overrides; None falls back to global.
+    assert fn._resolve_gold_xtoken(0, True) == (True, False)
+    assert fn._resolve_gold_xtoken(1, True) == (False, True)
+    # use_per_teacher=False ignores the per-teacher lists -> globals for all.
+    assert fn._resolve_gold_xtoken(0, False) == (False, False)
+    assert fn._resolve_gold_xtoken(1, False) == (False, False)
+
+
+def test_compute_teacher_kd_rejects_xtoken_without_gold():
+    # A cross-tokenizer teacher resolved to xtoken_loss=True but gold_loss=False
+    # must fail loud per teacher (xtoken is a modifier inside the gold path).
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn.gold_loss = False
+    fn.xtoken_loss = False
+    fn.projection_matrix_paths = ["t0_proj.pt"]  # non-null => cross-tokenizer
+    fn.teacher_vocab_sizes = [24]
+    fn.teacher_gold_loss = [False]
+    fn.teacher_xtoken_loss = [True]
+
+    with pytest.raises(
+        ValueError, match="teacher 0: xtoken_loss=True requires gold_loss=True"
+    ):
+        fn._compute_teacher_kd(
+            0,
+            torch.zeros(1, 4, 8),
+            {},
+            {0: torch.zeros(1, 4, 24)},
+            {0: MagicMock()},
+            torch.tensor(10.0),
+            use_per_teacher_flags=True,
+            tp_group=None,
+            cp_group=None,
+        )

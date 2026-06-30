@@ -1470,6 +1470,21 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 "normalize_teacher_by_vocab is only applied in kd_loss_mode='sum'; "
                 f"it is ignored by '{cfg['kd_loss_mode']}'. Unset one of them."
             )
+        # averaged_logits forms a convex combination of teacher logits
+        # (weight_i / sum(weights)); a zero weight-sum (all zeros, or a signed
+        # set cancelling to 0) makes that division undefined. Reject it here
+        # rather than fail with a deep ZeroDivisionError mid-step.
+        _weights = cfg.get("teacher_weights")
+        if (
+            cfg["kd_loss_mode"] == "averaged_logits"
+            and _weights is not None
+            and sum(_weights) == 0
+        ):
+            raise ValueError(
+                "teacher_weights must not sum to zero in "
+                "kd_loss_mode='averaged_logits' (they form a convex combination "
+                f"of teacher logits); got teacher_weights={list(_weights)}."
+            )
         # Global loss knobs (shared across all teachers).
         self.gold_loss = cfg["gold_loss"]
         self.xtoken_loss = cfg["xtoken_loss"]

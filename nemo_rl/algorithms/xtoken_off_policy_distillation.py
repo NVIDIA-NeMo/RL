@@ -644,9 +644,6 @@ def xtoken_off_policy_distillation_train(
                     train_data = export_teacher_logits_and_pack(
                         teacher_policies, loss_fn, batch, teacher_mbs, timer=timer
                     )
-                # `.to("cpu")` is a no-op on the IPC handle list (lists are
-                # not tensors).
-                train_data.to("cpu")
 
                 with timer.time("training_prep"):
                     student_policy.prepare_for_training()
@@ -932,7 +929,6 @@ def validate(
             train_data = export_teacher_logits_and_pack(
                 teacher_policies, loss_fn, batch, teacher_mbs, timer=timer
             )
-            train_data.to("cpu")
             student_policy.prepare_for_training()
             try:
                 results = student_policy.train(
