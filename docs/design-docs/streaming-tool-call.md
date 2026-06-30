@@ -1,20 +1,28 @@
 # Streaming Tool Call Prefill
 
-Status: Implemented behind a disabled-by-default flag; validation in progress
+Status: Implemented v1 behind a disabled-by-default flag; validation and
+follow-up optimization are in progress
 
 ## Implementation Status
 
-The initial hybrid path is implemented across NeMo RL, NeMo Gym, and the
+The v1 hybrid path is implemented across NeMo RL, NeMo Gym, and the
 OpenHands checkout used by the SWE harness:
 
 - `BashSession` publishes revisioned cumulative output snapshots without
   changing the final `CmdOutputObservation`.
 - `LocalRuntime` polls snapshots only for eligible single `CmdRunAction` tool
-  calls and treats every streaming failure as a baseline fallback.
-- The Gym model proxy tokenizes every candidate through the same preprocessing
-  as normal chat completions and preserves its existing sticky client cookie.
+  calls. It holds the first non-empty snapshot locally and starts remote work
+  only after a second extending snapshot reaches `min_chunk_chars`.
+- `LocalRuntime` requires strict append-only snapshot growth. A terminal-screen
+  rewrite or any streaming exception falls back to the baseline path.
+- The Gym model proxy fully retokenizes every cumulative candidate through the
+  same preprocessing as normal chat completions and preserves its existing
+  sticky client cookie.
 - The vLLM worker commits only the longest token prefix proven stable by two
   consecutive candidates, minus a configurable token holdback.
+- Each session has serialized appends, a one-item engine input queue, a global
+  session-count limit, request timeouts, and lazy TTL expiration when a new
+  session starts.
 - Active sessions are admission-paused and fully cancelled before weight
   updates or cache resets. Sleep keeps admission paused until wake-up.
 - Tool completion closes the speculative request after exact final-prefix
@@ -25,18 +33,30 @@ The OpenHands integration is stored as
 submodule. The setup path applies it to both new and cached compatible
 OpenHands checkouts.
 
+The following items from the broader design are not implemented in v1:
+
+- tokenizer state that incrementally encodes only new text,
+- suffix-revision handling through a mutable text frontier,
+- a global pending-token limit or KV-cache/queue high-water admission control,
+- a maximum application chunk size or background TTL cleanup task,
+- cancellation of an already in-flight HTTP prefill request when the tool
+  finishes, and
+- the complete planned observability and deterministic-parity test matrix.
+
 ## Summary
 
-SWE agents currently wait for a tool to finish before tokenizing its observation
-and prefilling the next model request. Long-running commands therefore leave an
-opportunity to overlap tool execution with model prefill.
+With the feature disabled, SWE agents wait for a tool to finish before
+tokenizing its observation and prefilling the next model request. Long-running
+commands therefore leave an opportunity to overlap tool execution with model
+prefill.
 
-This design introduces *streaming tool call prefill*: stable portions of a
-running tool's output are tokenized incrementally and submitted to vLLM as
-prefill chunks. The model does not produce the next agent response until the
-tool has finished and the final observation has been constructed.
+This design introduces *streaming tool call prefill*: cumulative candidates for
+a running tool's output are fully tokenized, and newly proven stable token
+prefixes are incrementally submitted to vLLM as prefill chunks. The model does
+not produce the next agent response until the tool has finished and the final
+observation has been constructed.
 
-The first implementation should use a hybrid approach:
+The implemented v1 uses a hybrid approach:
 
 1. Use one resumable vLLM request for intermediate prefill chunks.
 2. At tool completion, construct and tokenize the normal authoritative prompt.
@@ -73,9 +93,10 @@ chunk can be considered later after the hybrid implementation is validated.
 - Supporting every OpenHands tool and runtime in the first version.
 - Replacing vLLM's internal chunked-prefill scheduler.
 
-## Current Flow
+## Baseline Flow
 
-The SWE rollout path currently has a blocking boundary at every stage:
+With the feature disabled, the SWE rollout path has a blocking boundary at
+every stage:
 
 1. `CodeActAgent.step()` builds the complete message list and waits for
    `NemoGymClient.model_call()`.
@@ -101,7 +122,7 @@ The relevant implementation surfaces are:
 - `nemo_rl/models/generation/vllm/vllm_worker_async.py`
 - `nemo_rl/environments/nemo_gym.py`
 
-## Proposed Architecture
+## Implemented v1 Architecture
 
 ```mermaid
 sequenceDiagram
@@ -141,7 +162,7 @@ sequenceDiagram
 
 The data-plane protocol exposes four ordered operations:
 
-- `start`: create a bounded, expiring prefill session.
+- `start`: create a bounded, lazily expiring prefill session.
 - `append`: submit one ordered full-prompt tokenization candidate and return an
   acknowledgement after any newly proven stable prefix is prefetched. A retry
   with the same sequence and candidate is idempotent.
@@ -168,12 +189,13 @@ chunk. Intermediate sampled tokens must be drained and must never be returned
 to OpenHands, included in metrics as policy output, or advance a stochastic
 sampling RNG.
 
-The following restrictions apply to the initial implementation:
+The v1 resumable prefill request is fixed as follows:
 
-- `n` must equal one.
-- Stop strings are unsupported for the resumable request.
-- Output kind cannot be `FINAL_ONLY`.
-- Intermediate chunks use no detokenization and no logprob collection.
+- Sampling is greedy with one output sequence and `max_tokens=1`.
+- No stop strings or logprobs are requested.
+- Output kind is `DELTA`.
+- Intermediate output text is ignored; only generated token IDs acknowledge
+  submitted chunks and contribute to dummy-token accounting.
 - The normal final request remains responsible for output text, tool parsing,
   generated token IDs, and log probabilities.
 
@@ -218,7 +240,7 @@ must never appear in:
 The monotonic-token assertion in `NemoGym._postprocess_nemo_gym_to_nemo_rl_result()`
 must continue to pass without modification.
 
-## Incremental Tokenization
+## Cumulative Retokenization and Incremental Prefill
 
 ### Why raw append-only tokenization is unsafe
 
@@ -235,56 +257,61 @@ Shell output and tokenizer state can revise a recent suffix:
 
 ### State maintained per tool call
 
-The incremental tokenizer maintains:
+`LocalRuntime` maintains the first locally held candidate, the last remotely
+sent cumulative text, the last snapshot revision, the request sequence number,
+and client-side counters. The vLLM manager maintains committed token IDs, the
+previous full candidate tokenization, the last idempotent result, a configurable
+token stability holdback, acknowledged chunk and dummy-token counts, and any
+terminal engine error.
 
-- the latest cumulative observation snapshot,
-- the last observed common prefix,
-- the committed text frontier,
-- committed token IDs,
-- the previous full candidate tokenization,
-- a configurable token stability holdback,
-- the number and IDs of acknowledged prefill chunks, and
-- a terminal fallback reason, if any.
+### Implemented commit algorithm
 
-### Commit algorithm
+V1 handles every new cumulative snapshot as follows:
 
-The correctness-first implementation handles every new cumulative snapshot as
-follows:
+1. Require the new snapshot text to extend the locally held or last remotely
+   sent text with `startswith()`. Any terminal-screen rewrite causes fallback.
+2. Hold the first non-empty snapshot locally without creating an HTTP or vLLM
+   session.
+3. When a second distinct snapshot extends it and cumulative output reaches
+   `min_chunk_chars`, send the held snapshot as `start` and the latest snapshot
+   as `append`.
+4. For every `start`, `append`, and `close`, fully tokenize the cumulative chat
+   candidate through the normal Gym and vLLM chat preprocessing path, including
+   `_replace_prefix_tokens()`.
+5. Compute the token longest common prefix between the previous and current
+   full candidate tokenizations.
+6. Verify that this token prefix still contains every committed token. A
+   mismatch causes fail-open fallback.
+7. Hold back `stability_margin_tokens` from the common prefix and append only
+   the newly proven stable token suffix to the resumable vLLM request.
+8. Acknowledge a submitted chunk after its deterministic dummy token is drained.
+   Empty stable suffixes advance the sequence without engine work.
+9. At tool completion, fully tokenize the authoritative final observation and
+   require committed token IDs to be its exact prefix before closing the
+   speculative request.
 
-1. Compute its longest common text prefix with the previous snapshot.
-2. If the changed region crosses the committed text frontier, stop streaming
-   and mark the session for baseline fallback.
-3. Tokenize the candidate through the same Gym and vLLM chat preprocessing used
-   for the final request, including `_replace_prefix_tokens()`.
-4. Compute the token longest-common-prefix with the previous candidate.
-5. Verify that the common prefix still contains every committed token.
-6. Hold back the configured number of trailing common-prefix tokens and commit
-   only the older stable prefix.
-7. Emit a chunk only after the minimum-token or maximum-delay threshold is met.
-8. Retain any smaller suffix for the next snapshot.
+`BashSession` applies the existing observation truncation to every published
+snapshot. If truncation or terminal rendering rewrites already observed text,
+the strict append-only check falls back rather than trying to maintain a mutable
+head/tail frontier.
 
-Because current observation truncation retains the head and tail, streaming
-must not commit beyond the first retained half of command output. Once output
-could exceed the truncation limit, the rolling tail and truncation marker stay
-mutable until final observation construction.
-
-At completion, the normal full prompt is tokenized once. This full pass is the
-authoritative validation and is equivalent to work already performed by the
-baseline. An incremental-only final tokenization can be considered later, but
-is not required for the first version.
+True incremental tokenizer state that encodes only a new suffix, including BPE
+boundary repair, is future work. V1 performs incremental prefill, not
+incremental encoding. The normal final model call remains authoritative and
+unchanged.
 
 ## Runtime Output Streaming
 
 OpenHands already defines `BaseRuntime.subscribe_to_shell_stream()`, while the
-local action server uses a blocking `/execute_action` request. The initial
-implementation adds a lightweight `/shell_stream_snapshot` endpoint and polls
+local action server uses a blocking `/execute_action` request. V1 adds a
+lightweight `/shell_stream_snapshot` endpoint and polls
 it concurrently from `LocalRuntime`. `BashSession.execute()` publishes changed,
 cumulative command-output snapshots from its existing polling loop and still
 returns the identical final observation. A push transport can replace polling
 later without changing the prefill protocol.
 
 The callback must receive observation-like content, not raw PTY bytes. This
-keeps the incremental tokenizer aligned with the formatting that will
+keeps cumulative tokenization candidates aligned with the formatting that will
 eventually reach `ConversationMemory`. Completion metadata remains final-only
 and is included by authoritative final tokenization.
 
@@ -293,27 +320,30 @@ unchanged.
 
 ## Eligibility and Fallback
 
-The initial version is eligible only when all of the following are true:
+V1 is eligible only when all of the following are true:
 
 - The feature flag is enabled.
 - The active runtime is `LocalRuntime`.
 - The model response contains exactly one tool call.
-- That tool call maps to one `CmdRunAction`.
-- The configured tokenizer and chat template support the incremental renderer.
-- vLLM prefix caching and the async engine are enabled.
-- Sampling uses one output sequence and no stop strings.
+- That tool call maps to one visible, non-static, non-input `CmdRunAction`.
+- The model response ID and tool-call context survive OpenHands event
+  serialization.
+
+The reference recipe also enables vLLM automatic prefix caching and the async
+engine. Those settings are required for the intended reuse and overlap benefit,
+but v1 does not add a separate runtime eligibility check for them.
 
 Fallback to the existing path is required for:
 
 - multiple tool calls or queued actions,
 - non-shell tools,
 - unsupported runtimes, tokenizers, or templates,
-- a rewrite before the committed frontier,
-- an overlap-token mismatch,
+- any rewrite of the locally held or remotely sent cumulative text,
+- a committed token-prefix mismatch,
 - final-prefix validation failure,
 - request timeout or disconnection,
-- session eviction or replica-routing failure,
-- model-weight epoch change,
+- session expiration or replica-routing failure,
+- a model lifecycle transition that invalidates active sessions,
 - context-length exhaustion, or
 - any internal streaming exception.
 
@@ -321,11 +351,14 @@ Fallback is a normal operating mode and must not fail the rollout.
 
 ## Backpressure and Scheduling
 
-Speculative prefill must remain subordinate to ordinary decoding:
+V1 implements the following controls:
 
-- Allow at most one append request in flight per tool call.
-- Keep a bounded, latest-snapshot-only queue and coalesce superseded snapshots.
-- Enforce a global maximum number of sessions and pending tokens per replica.
+- `LocalRuntime` awaits at most one prefill request per tool call. Polling reads
+  only the latest snapshot revision, naturally coalescing intermediate revisions
+  while a request is in flight.
+- Each manager session has a serialized append lock and a one-item engine input
+  queue.
+- Each replica enforces `max_sessions`; capacity errors fail open.
 - Hold the first non-empty cumulative candidate locally. Admit a remote session
   only after a second distinct snapshot extends it and cumulative output reaches
   `min_chunk_chars`, then send the held candidate as `start` and the latest
@@ -333,15 +366,17 @@ Speculative prefill must remain subordinate to ordinary decoding:
   tokenization, HTTP, or vLLM session setup overhead, and a below-threshold
   command is never admitted remotely. `flush_interval_seconds` applies only to
   later appends after admission.
-- Stop appending when KV-cache use, engine queue depth, or prefill latency
-  crosses a configured high-water mark.
-- At tool completion, cancel outstanding speculative work rather than waiting
-  for a long chunk before starting final generation.
-- Apply a TTL and cleanup task to every session.
+- HTTP work is bounded by `request_timeout_seconds` and any error returns the
+  unchanged baseline action response.
+- Stale sessions are expired lazily before admitting a new session. Weight,
+  cache, sleep, and shutdown transitions pause admission and invalidate active
+  sessions.
 
-Initial chunk thresholds should be conservative, for example 256-512 minimum
-stable tokens with a 1,024-token maximum chunk. Exact defaults must be selected
-from benchmarks and stored in YAML as the single source of truth.
+V1 does not yet enforce a global pending-token limit, maximum application chunk
+size, KV-cache/queue/prefill-latency high-water mark, or background TTL cleanup.
+It also awaits an already in-flight HTTP prefill request if the tool completes
+during that request. These are follow-up controls required before considering
+default enablement at larger scale.
 
 ## Weight Updates and Cache Validity
 
@@ -362,12 +397,13 @@ When a refit begins or the epoch changes:
    until wake-up.
 5. Let affected final requests follow the existing baseline cache semantics.
 
-This guard is required before enabling the feature during async training.
+This guard is implemented and remains required whenever the feature is used
+during async training.
 
 ## Configuration
 
 Configuration defaults belong in the relevant exemplar YAML and must be
-represented in the vLLM configuration `TypedDict`. A proposed shape is:
+represented in the vLLM configuration `TypedDict`. V1 uses:
 
 ```yaml
 policy:
@@ -392,15 +428,26 @@ keys do not gain separate hidden defaults in Python.
 
 ## Observability
 
-Record at least the following metrics:
+V1 exports these per-sample metrics through the SWE agent result and W&B:
+
+- sessions started,
+- prefill requests and accepted prefill tokens,
+- completed chunks and discarded dummy tokens,
+- final committed-prefix matches,
+- fail-open fallbacks, and
+- aggregate client-side streaming request time.
+
+The vLLM metrics logger also separates streaming prefill and dummy-token work
+from ordinary generation token accounting.
+
+The following planned observability is not implemented yet:
 
 - eligible and enabled tool calls,
 - fallback count and reason,
 - received shell snapshots and bytes,
-- incremental-tokenizer CPU time,
-- stable, committed, acknowledged, and discarded token counts,
-- chunk count and size distribution,
-- intermediate dummy-decode count,
+- cumulative-tokenizer CPU time,
+- stable and committed token distributions,
+- chunk size distribution,
 - prefill request queue and execution time,
 - tool execution time overlapped by prefill,
 - tool-completion-to-first-model-token latency,
@@ -409,42 +456,50 @@ Record at least the following metrics:
 - cancellation and TTL cleanup count, and
 - session model-weight epoch.
 
-## Testing Plan
+## Testing Status and Remaining Plan
 
-### Unit tests
+### Implemented manager tests
 
-- Incremental tokenization equals full tokenization for normal append-only text.
-- Unicode and tokenizer merge boundaries across every possible transport split.
-- Carriage-return and progress-line rewrites remain inside the mutable suffix.
-- Rewrites before the committed frontier cause fallback.
-- Observation truncation, prefix, suffix, working directory, interpreter, and
-  exit-code formatting remain unchanged.
-- Latest-only queue coalescing, per-session ordering, TTL, cancellation, and
-  idempotent cleanup.
-- The final request never waits for an optional speculative chunk.
+- Monotonic token candidates prefill only the newly proven stable suffix.
+- Duplicate sequences are idempotent; reordered or changed retries fail.
+- Candidate and final committed-prefix mismatches are rejected or reported.
+- Capacity, abort, missing-session, lazy TTL, pause/resume, and lifecycle
+  invalidation behavior is covered.
+- Close cancels an in-flight manager append without waiting for engine output.
+- Engine failures reach the waiting append, and stability holdback is enforced.
 
-### vLLM integration tests
+### Implemented OpenHands and Gym tests
 
-- One resumable request accepts multiple prompt-token deltas.
-- Each intermediate chunk produces exactly one discarded greedy token.
-- Closing or aborting a session makes complete KV blocks available to APC.
-- A normal final request reports the expected number of cached tokens.
-- Baseline and enabled requests have identical final prompt and generated token
-  IDs for deterministic sampling.
-- Log probabilities match within the existing numerical tolerance.
-- Session invalidation works across cache reset and weight updates.
+- `BashSession` publishes cumulative snapshots without changing the final
+  observation.
+- `LocalRuntime` sends ordered `start`, `append`, and `close` operations and
+  returns the original final action response.
+- A below-threshold or single-snapshot command creates no HTTP client or remote
+  session.
+- The loop-local HTTP session preserves sticky model cookies without reusing
+  NeMo Gym's event-loop-bound global client.
+- The Gym proxy uses the selected sticky client and normal chat tokenization.
 - The disabled path creates no streaming sessions or additional requests.
 
-### OpenHands and NeMo Gym tests
+### End-to-end evidence
 
-- `LocalRuntime` streams snapshots and returns the same final observation.
-- NeMo Gym cookies and session IDs keep all operations on one model client.
-- Single command tool calls use streaming; multiple and unsupported tool calls
-  fall back cleanly.
-- Intermediate tokens do not appear in response output or the NeMo RL message
-  log.
+The paired generation-only SWE runs below prove the live path can create a
+resumable request, append and acknowledge prefill chunks, close it, and continue
+through the unchanged normal final model call. They also verify that disabled
+metrics remain zero and that streaming failures fail open.
 
-### End-to-end tests
+### Remaining tests
+
+- Report final APC cached-token reuse for a controlled prompt.
+- Compare final prompt IDs, generated IDs, and log probabilities against a
+  deterministic baseline within existing tolerances.
+- Add true incremental-encoding tests for Unicode and BPE split boundaries if
+  incremental tokenizer state is implemented.
+- Exercise async training, in-flight refit, cache reset, sleep/wake, and shutdown
+  under active sessions.
+- Run larger repeated accuracy and throughput comparisons.
+
+### Reproducing the end-to-end smoke
 
 Use `examples/swe_bench/run_grpo_swe2_scale_gen.sh` for paired baseline and
 enabled runs. Validate generation-only behavior before testing async training
@@ -493,34 +548,45 @@ trajectories, so exact generated-token parity cannot be inferred from this
 comparison. The feature remains disabled by default pending larger repeated
 accuracy and performance runs.
 
+The live runs also exposed teardown noise. NeMo Gym's process-global aiohttp
+client can report a pre-existing cross-event-loop close error. With admitted
+streaming sessions, abort or cleanup requests can additionally race vLLM
+endpoint shutdown and log `ConnectionRefusedError` after reward processing.
+The measured jobs still exited successfully, but shutdown ordering should be
+cleaned up before default enablement.
+
 ## Implementation Phases
 
 ### Phase 0: vLLM feasibility spike
 
-Use a tiny model to validate resumable input, intermediate dummy-token
-discarding, cancellation, APC reuse after close, and weight-epoch invalidation.
-This phase decides whether the existing vLLM API is sufficient.
+Status: partially complete. Unit and live SWE runs validate resumable input,
+dummy-token draining, cancellation, and lifecycle invalidation. A controlled
+test that reports exact APC cached-token reuse remains.
 
 ### Phase 1: OpenHands runtime stream
 
-Implement cumulative shell snapshots for `LocalRuntime` and prove exact final
-observation parity independently of model prefill.
+Status: complete for `CmdRunAction` on `LocalRuntime`. Cumulative snapshots and
+unchanged final action responses are covered by tests.
 
 ### Phase 2: Hybrid streaming prefill
 
-Implement incremental tokenization, the session protocol, Gym sticky proxying,
-final-prefix validation, cancellation, and the unchanged normal final model
-call.
+Status: v1 complete with cumulative full-candidate retokenization. The session
+protocol, Gym sticky proxying, final-prefix validation, cancellation, and
+unchanged normal final model call are implemented. True incremental encoding is
+still future work.
 
 ### Phase 3: Performance tuning
 
-Tune lazy-start and chunk thresholds, global concurrency, cache high-water
-marks, and scheduler interaction using the SWE benchmark entrypoint.
+Status: in progress. Progressive two-snapshot admission removed the measured
+short-command regression and produced a faster eight-sample smoke, but global
+pending-token limits, cache high-water admission, and larger repeated benchmarks
+remain.
 
 ### Phase 4: Optional direct final generation
 
-Only after parity and performance are established, evaluate using the final
-`StreamingInput` chunk for real sampling. This requires isolating intermediate
+Status: not started. Only after parity and performance are established, evaluate
+using the final `StreamingInput` chunk for real sampling. This requires isolating
+intermediate
 dummy output from vLLM detokenizer and logprob state while preserving the
 existing OpenAI-compatible tool and reasoning parsers.
 
