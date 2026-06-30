@@ -40,7 +40,7 @@ import numpy as np
 from huggingface_hub import snapshot_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
-from nemo_rl.data.datasets.utils import get_huggingface_cache_path
+from nemo_rl.data.datasets.utils import get_huggingface_cache_path, load_audio_from_file
 
 logger = logging.getLogger(__name__)
 
@@ -167,23 +167,8 @@ def _resolve_video_path(snapshot_dir: str, relpath: str) -> str | None:
 
 
 def _load_audio_from_video(video_path: str, sampling_rate: int = 16000) -> np.ndarray:
-    """Decode the audio track of a video file as a 1-D float32 array.
-
-    Uses decord's ``AudioReader`` because it's already a project dependency for
-    video decoding. Raises ``RuntimeError`` if the video has no decodable audio
-    track so callers can drop or skip the sample.
-    """
-    import decord
-
-    try:
-        reader = decord.AudioReader(video_path, sample_rate=sampling_rate, mono=True)
-        # Shape: (channels, T). With mono=True channels=1; squeeze to (T,).
-        audio = reader[:].asnumpy()
-        if audio.ndim > 1:
-            audio = audio[0]
-        return audio.astype(np.float32)
-    except Exception as e:  # decord raises a variety of errors for missing audio
-        raise RuntimeError(f"Failed to decode audio from {video_path}: {e}") from e
+    """Decode the audio track of a video file as a 1-D float32 array."""
+    return load_audio_from_file(video_path, sampling_rate=sampling_rate)
 
 
 def _read_manifest(snapshot_dir: str, manifest_filename: str) -> list[dict[str, Any]]:
@@ -238,6 +223,11 @@ class IntentDataset(RawDataset):
             raise ValueError(
                 "IntentDataset does not support a system prompt; set "
                 "data.*.system_prompt_file=null."
+            )
+        if kwargs.get("prompt_file") is not None:
+            raise ValueError(
+                "IntentDataset does not support a prompt file; set "
+                "data.*.prompt_file=null."
             )
         self.split = split
         self._cfg = _SPLIT_CONFIG[split]

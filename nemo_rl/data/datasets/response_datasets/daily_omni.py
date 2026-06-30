@@ -15,36 +15,14 @@
 import os
 from typing import Any
 
-import numpy as np
 from huggingface_hub import snapshot_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import (
     get_huggingface_cache_path,
+    load_audio_from_file,
     load_dataset_from_path,
 )
-
-
-def _load_audio_16k_mono(path: str) -> np.ndarray:
-    """Decode an audio file as a 1-D float32 array at 16 kHz mono.
-
-    Daily-Omni ships each clip's audio track as a sibling ``*_audio.wav`` next
-    to ``*_video.mp4``. We feed it as an independent ``{type: audio}`` content
-    item (mirroring the IntentTrain training path) so the Qwen2.5-Omni chat
-    template renders an ``<|AUDIO|>`` placeholder and vLLM populates
-    ``multi_modal_data["audio"]``. The benchmark is audio-visual, so video
-    frames alone leave audio-dependent questions unanswerable. Uses decord
-    (already a project dependency for video decoding) for the same 16 kHz mono
-    pipeline the training path uses.
-    """
-    import decord
-
-    reader = decord.AudioReader(path, sample_rate=16000, mono=True)
-    # Shape: (channels, T). With mono=True channels=1; squeeze to (T,).
-    audio = reader[:].asnumpy()
-    if audio.ndim > 1:
-        audio = audio[0]
-    return audio.astype(np.float32)
 
 
 class DailyOmniDataset(RawDataset):
@@ -147,7 +125,7 @@ class DailyOmniDataset(RawDataset):
         # placeholders (Daily-Omni is an audio-visual benchmark).
         user_content = [
             {"type": "video", "video": video_path},
-            {"type": "audio", "audio": _load_audio_16k_mono(audio_path)},
+            {"type": "audio", "audio": load_audio_from_file(audio_path)},
             {"type": "text", "text": self.get_prompt(data)},
         ]
         return {

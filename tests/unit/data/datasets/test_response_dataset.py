@@ -401,6 +401,11 @@ def test_intent_rejects_system_prompt():
         IntentDataset(split="train", system_prompt_file="some_system_prompt.txt")
 
 
+def test_intent_rejects_prompt_file():
+    with pytest.raises(ValueError, match="does not support a prompt file"):
+        IntentDataset(split="train", prompt_file="some_prompt.txt")
+
+
 def test_intent_format_options():
     # No options -> empty string (question stem only).
     assert _format_options(None) == ""
@@ -410,3 +415,5 @@ def test_intent_format_options():
     assert rendered == " Options:\nA. yes\nB. no"
     # String repr of a list (as some manifests store it) is parsed too.
     assert _format_options("['A. yes', 'B. no']") == " Options:\nA. yes\nB. no"
+    # Unparseable string falls back to raw rendering (no crash).
+    assert _format_options("not a list") == " Options:\nnot a list"

@@ -58,7 +58,7 @@ def setup_data(tokenizer, data_config, env_configs):
     # otherwise fall back to the single key in env_configs.
     env_key = next(iter(env_configs))
     env_name = data_config.get("env_name", env_key)
-    env = create_env(env_name=env_name, env_config=env_configs[env_key])
+    env = create_env(env_name=env_name, env_config=env_configs[env_name])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,

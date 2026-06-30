@@ -116,6 +116,43 @@ def test_vllm_utils_vlm_with_audio_and_video_intent_path():
         assert "mm_processor_kwargs" not in prompt
 
 
+def test_vllm_utils_vlm_with_video_only():
+    """Video-only path (no audio, no images) produces multi_modal_data with video key only."""
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": ["<s>user: q1</s>", "<s>user: q2</s>"],
+            "vllm_videos": [["frames-1"], ["frames-2"]],
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+    assert len(prompts) == 2
+    for i, prompt in enumerate(prompts):
+        assert "multi_modal_data" in prompt, f"prompt {i} missing multi_modal_data"
+        mm = prompt["multi_modal_data"]
+        assert "video" in mm, f"prompt {i} missing video key"
+        assert "audio" not in mm, f"prompt {i} should not have audio key"
+        assert "image" not in mm, f"prompt {i} should not have image key"
+
+
+def test_vllm_utils_vlm_with_empty_videos_fallback_to_tokens():
+    """Empty vllm_videos (per-sample) should fall back to prompt_token_ids."""
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": ["a", "b"],
+            "vllm_videos": [[], []],
+        }
+    )
+    prompts = format_prompt_for_vllm_generation(data)
+    assert all("prompt_token_ids" in p for p in prompts)
+
+
 def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
     input_ids, input_lengths = _mk_inputs()
     # images None triggers fallback
