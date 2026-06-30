@@ -16,6 +16,8 @@ import types
 
 import pytest
 
+pytestmark = pytest.mark.vllm
+
 
 @pytest.fixture()
 def fp8_module():

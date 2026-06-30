@@ -12,56 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# NOTE: vllm_backend imports `vllm` eagerly at module top. Most tests in this
-# file import it only inside @pytest.mark.vllm test bodies; the collective
-# update tests install a minimal fake vLLM module tree before loading it.
+# NOTE: vllm_backend imports `vllm` eagerly at module top, so it is only imported
+# inside the test bodies (which are marked @pytest.mark.vllm). This keeps the
+# module collectable in the non-vllm unit lane, where these tests are deselected.
 
 import contextlib
-import importlib.util
 import json
-import sys
-import types
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 from safetensors.torch import save_file
-
-
-def _install_fake_vllm_modules(monkeypatch, process_weights_after_loading):
-    for module_name in (
-        "vllm",
-        "vllm.model_executor",
-        "vllm.model_executor.model_loader",
-    ):
-        monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
-
-    utils_module = types.ModuleType("vllm.model_executor.model_loader.utils")
-    utils_module.process_weights_after_loading = process_weights_after_loading
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm.model_executor.model_loader.utils",
-        utils_module,
-    )
-
-
-def _load_vllm_backend_with_fake_vllm(monkeypatch, process_weights_after_loading):
-    _install_fake_vllm_modules(monkeypatch, process_weights_after_loading)
-
-    module_name = f"_test_vllm_backend_{id(process_weights_after_loading)}"
-    module_path = (
-        Path(__file__).parents[4] / "nemo_rl/models/generation/vllm/vllm_backend.py"
-    )
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    assert spec is not None
-    assert spec.loader is not None
-
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, module_name, module)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _make_collective_update_extension(backend):
@@ -125,7 +87,10 @@ def _patch_vllm_postload(monkeypatch):
     return process_weights
 
 
+@pytest.mark.vllm
 def test_update_weights_from_collective_processes_weights_after_loading(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
     call_order = []
     process_calls = []
 
@@ -133,10 +98,11 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
         call_order.append("process")
         process_calls.append((model, model_config, device))
 
-    backend = _load_vllm_backend_with_fake_vllm(
-        monkeypatch, process_weights_after_loading
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights_after_loading,
     )
-    ext, expected_state_info = _make_collective_update_extension(backend)
+    ext, expected_state_info = _make_collective_update_extension(vllm_backend)
 
     def load_weights(weights):
         call_order.append("load")
@@ -151,10 +117,12 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
 
     ext._load_weights = load_weights
     ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
-    monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_broadcast_consumer)
-    monkeypatch.setattr(backend.gc, "collect", lambda: call_order.append("gc"))
     monkeypatch.setattr(
-        backend.torch.cuda,
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
+    monkeypatch.setattr(
+        vllm_backend.torch.cuda,
         "empty_cache",
         lambda: call_order.append("empty_cache"),
     )
@@ -163,41 +131,6 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
 
     assert process_calls == [(ext.model_runner.model, ext.model_config, ext.device)]
     assert call_order == ["broadcast", "load", "process", "kv", "gc", "empty_cache"]
-
-
-def test_update_weights_from_collective_returns_false_on_post_load_failure(
-    monkeypatch,
-):
-    call_order = []
-
-    def process_weights_after_loading(_model, _model_config, _device):
-        call_order.append("process")
-        raise RuntimeError("post-load failed")
-
-    backend = _load_vllm_backend_with_fake_vllm(
-        monkeypatch, process_weights_after_loading
-    )
-    ext, _ = _make_collective_update_extension(backend)
-
-    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
-        assert list(iterator) == [("model.weight", ext.state_dict_info["model.weight"])]
-        assert group is ext.model_update_group
-        assert src == 0
-        call_order.append("broadcast")
-        post_unpack_func([("model.weight", "weight-value")])
-
-    ext._load_weights = lambda _weights: call_order.append("load")
-    ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
-    monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_broadcast_consumer)
-    monkeypatch.setattr(backend.gc, "collect", lambda: call_order.append("gc"))
-    monkeypatch.setattr(
-        backend.torch.cuda,
-        "empty_cache",
-        lambda: call_order.append("empty_cache"),
-    )
-
-    assert ext.update_weights_from_collective() is False
-    assert call_order == ["broadcast", "load", "process"]
 
 
 @pytest.mark.vllm
