@@ -16,11 +16,10 @@ import base64
 import importlib
 import io
 import os
-
-import numpy as np
 from pathlib import Path
 from typing import Any, Optional, Union
 
+import numpy as np
 import torch
 from datasets import (
     Dataset,
