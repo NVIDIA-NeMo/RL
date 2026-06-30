@@ -1,0 +1,17 @@
+defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n4g-fsdp2tp1.v3.yaml
+
+# Binary-TV DPPO smoke coverage. This keeps the small Qwen math recipe shape
+# and swaps only the policy-gradient loss.
+grpo:
+  max_num_steps: 50
+loss_fn:
+  loss_mode: dppo_binary_tv
+  ratio_clip_min: 0.15
+  ratio_clip_max: 0.15
+  dppo_clip_ratio_c: 20.0
+checkpointing:
+  checkpoint_dir: results/grpo-dppo-binary-tv-qwen2.5-math-1.5b-instruct-1n4g-fsdp2tp1
+logger:
+  log_dir: logs/grpo-dppo-binary-tv-qwen2.5-math-1.5b-instruct-1n4g-fsdp2tp1
+  wandb:
+    name: grpo-dppo-binary-tv-qwen2.5-math-1.5b-instruct-1n4g-fsdp2tp1
