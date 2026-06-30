@@ -562,15 +562,50 @@ documented `sbatch` + `ray.sub` path:
 | Enabled, two-snapshot admission | `13244211` | 887.1 s | 0.125 / 0.125 | No sessions admitted |
 | Enabled, progressive admission | `13245446` | 817.3 s | 0 / 0 | 20 sessions; 75 requests; 2 completed chunks |
 
-The progressive-admission run prefetched 1,158,614 tokens, produced and
-discarded two dummy tokens, and recorded 27.5 seconds of aggregate client-side
-streaming request time. It was 7.3% faster than the paired baseline while
-matching its reward and resolved metrics; every sample produced a patch in both
-arms. This is one small asynchronous smoke test, not a statistically conclusive
-throughput or accuracy result. Repeated temperature-zero runs produced different
-trajectories, so exact generated-token parity cannot be inferred from this
-comparison. The feature remains disabled by default pending larger repeated
-accuracy and performance runs.
+The last three arms are successive enabled implementations, not repeated
+measurements of the same implementation:
+
+- **Before lazy admission**
+  ([W&B run `tp3ju5vo`](https://wandb.ai/nvidia/swe-benchmark/runs/tp3ju5vo))
+  opened a remote session as soon as an eligible command produced output. Across
+  eight samples this created 432 sessions and 517 start/append
+  requests, reported 1,729,849 accepted prefill tokens, and spent 322.4 seconds
+  in client-side streaming requests. Of the sessions, 402 passed the final
+  committed-prefix check and 30 fell back, but no engine chunk completed and no
+  dummy token was produced. A match against an empty committed prefix is valid,
+  so the 402 matches are not evidence that useful KV state was created. This arm
+  was 18.9% slower than the disabled baseline and exposed the cost of eagerly
+  admitting short or fast commands.
+- **Two-snapshot admission**
+  ([W&B run `l4hqi8vt`](https://wandb.ai/nvidia/swe-benchmark/runs/l4hqi8vt))
+  held the first non-empty snapshot locally and required the next distinct,
+  append-only snapshot to reach the 256-character admission threshold.
+  That initial pair was the only admission opportunity for an action. No command
+  qualified in this run, so all streaming counters were zero: there was no
+  streaming HTTP, tokenization, or vLLM work. Its 887.1-second rollout time was
+  0.6% above the baseline and is consistent with a nearly free disabled path.
+  One of eight samples resolved, but streaming cannot explain that result because
+  it never admitted a session.
+- **Progressive admission**
+  ([W&B run `p3x2fwqy`](https://wandb.ai/nvidia/swe-benchmark/runs/p3x2fwqy))
+  retained the pending first snapshot and continued evaluating later append-only
+  revisions until the cumulative output reached the threshold. Six
+  samples still admitted no sessions; the other two admitted ten each. In total,
+  the arm issued 75 start/append requests across 20 sessions, reported 1,158,614
+  accepted prefill tokens, recorded two final prefix matches and 20 fail-open
+  fallback events, completed two engine chunks, and produced and discarded two
+  dummy tokens. Client-side streaming request time fell to 27.5 seconds: 91.5%
+  less than the eager arm, with 95.4% fewer sessions and 85.5% fewer requests.
+  This is the first arm that both filtered short commands and demonstrated live
+  prefill completion.
+
+The progressive arm was 7.3% faster than the paired baseline while matching its
+reward and resolved metrics; every sample produced a patch in both arms. This is
+one small asynchronous smoke test, not a statistically conclusive throughput or
+accuracy result. Repeated temperature-zero runs produced different trajectories,
+so the timing difference and exact generated-token parity cannot be attributed
+to streaming from this comparison alone. The feature remains disabled by
+default pending larger repeated accuracy and performance runs.
 
 The live runs also exposed teardown noise. NeMo Gym's process-global aiohttp
 client can report a pre-existing cross-event-loop close error. With admitted
