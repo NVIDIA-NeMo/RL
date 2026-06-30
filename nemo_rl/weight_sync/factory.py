@@ -37,6 +37,7 @@ def create_weight_synchronizer(
     train_cluster: Optional[Any] = None,
     inference_cluster: Optional[Any] = None,
     refit_buffer_size_gb: Optional[int] = None,
+    nccl_xfer_refit: bool = False,
 ) -> WeightSynchronizer:
     """Create the appropriate WeightSynchronizer for the given deployment.
 
@@ -48,6 +49,9 @@ def create_weight_synchronizer(
         train_cluster: RayVirtualCluster for training workers (required for non-colocated).
         inference_cluster: RayVirtualCluster for inference workers (required for non-colocated).
         refit_buffer_size_gb: Optional fixed buffer size for IPC weight staging.
+        nccl_xfer_refit: Non-colocated only. When True, use the ``xferdtensor``
+            shard-to-shard reshard transport (Megatron train -> vLLM gen) instead
+            of the full-tensor NCCL broadcast.
 
     Returns:
         A WeightSynchronizer instance appropriate for the deployment topology.
@@ -75,6 +79,18 @@ def create_weight_synchronizer(
             raise ValueError(
                 "train_cluster and inference_cluster are required "
                 "for non-colocated weight synchronization."
+            )
+
+        if nccl_xfer_refit:
+            from nemo_rl.weight_sync.nccl_xfer_weight_synchronizer import (
+                NcclXferWeightSynchronizer,
+            )
+
+            return NcclXferWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
             )
 
         from nemo_rl.weight_sync.collective_weight_synchronizer import (
