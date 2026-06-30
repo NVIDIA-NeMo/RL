@@ -56,9 +56,13 @@ def setup_data(tokenizer, data_config, env_configs):
 
     # Determine env from config: use explicit env_name if provided,
     # otherwise fall back to the single key in env_configs.
+    # env_name is the registered environment class (e.g. "vlm", "math").
+    # env_key is the config dict key (e.g. "mmau", "vlm", "math") which may
+    # differ from env_name when the config block is named after the dataset.
     env_key = next(iter(env_configs))
     env_name = data_config.get("env_name", env_key)
-    env = create_env(env_name=env_name, env_config=env_configs[env_name])
+    env_cfg_key = env_name if env_name in env_configs else env_key
+    env = create_env(env_name=env_name, env_config=env_configs[env_cfg_key])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
