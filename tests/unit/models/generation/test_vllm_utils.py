@@ -14,6 +14,7 @@
 
 import math
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -356,6 +357,72 @@ def test_attach_routed_experts_to_chat_response_choices_requires_routed_experts(
     )
 
     with pytest.raises(RuntimeError, match="did not include routed_experts"):
+        attach_routed_experts_to_chat_response_choices(
+            response,
+            final_res,
+            device=torch.device("cpu"),
+        )
+
+
+def test_attach_routed_experts_to_chat_response_choices_warns_on_missing_routes():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[200, 201],
+                routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+    logger = MagicMock()
+
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+        logger=logger,
+    )
+
+    logger.warning.assert_called_once_with(
+        "R3 router replay fallback: vLLM returned incomplete "
+        "routed_experts for chat choice_idx=%d, "
+        "missing_token_routes=%d, actual_routes=%d, "
+        "expected_routes=%d. Megatron will use its own router "
+        "for those missing token routes.",
+        0,
+        2,
+        2,
+        4,
+    )
+    assert response.choices[0].message.routed_experts == [
+        [[10]],
+        [[11]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+        [[0]],
+    ]
+
+
+def test_attach_routed_experts_to_chat_response_choices_raises_for_unmatched_choice():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        outputs=[
+            SimpleNamespace(
+                index=1,
+                token_ids=[200],
+                routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match=r"missing_choice_indices=\[0\]"):
         attach_routed_experts_to_chat_response_choices(
             response,
             final_res,
