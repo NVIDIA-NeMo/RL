@@ -20,12 +20,14 @@ import threading
 import time
 import uuid
 import warnings
+from dataclasses import asdict
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -40,6 +42,11 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.streaming_tool_call import (
+    StreamingToolCallError,
+    StreamingToolCallPrefillManager,
+    StreamingToolCallSessionNotFoundError,
+)
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     format_prompt_for_vllm_generation,
@@ -49,6 +56,27 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
+
+
+class StreamingToolCallPrefillRequest(BaseModel):
+    """Tokenized candidate prompt for a streaming prefill session."""
+
+    session_id: str
+    sequence_no: int
+    prompt_token_ids: list[int]
+
+
+class StreamingToolCallCloseRequest(BaseModel):
+    """Authoritative final prompt for a streaming prefill session."""
+
+    session_id: str
+    final_prompt_token_ids: list[int]
+
+
+class StreamingToolCallAbortRequest(BaseModel):
+    """Request to abort a streaming prefill session."""
+
+    session_id: str
 
 
 def _replace_prefix_tokens(
@@ -296,6 +324,55 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
+        self.streaming_tool_call_manager = None
+        streaming_tool_call_config = self.cfg["vllm_cfg"].get("streaming_tool_call")
+        if (
+            streaming_tool_call_config is not None
+            and streaming_tool_call_config["enabled"]
+        ):
+            from vllm import TokensPrompt
+            from vllm.engine.protocol import StreamingInput
+            from vllm.sampling_params import RequestOutputKind, SamplingParams
+
+            prefill_sampling_params = SamplingParams(
+                temperature=0,
+                top_p=1,
+                top_k=1,
+                max_tokens=1,
+                output_kind=RequestOutputKind.DELTA,
+            )
+
+            def generate_prefill(input_stream, request_id):
+                return self.llm.generate(
+                    prompt=input_stream,
+                    sampling_params=prefill_sampling_params,
+                    request_id=request_id,
+                )
+
+            def make_streaming_input(token_ids):
+                return StreamingInput(
+                    prompt=TokensPrompt(prompt_token_ids=token_ids),
+                    sampling_params=prefill_sampling_params,
+                )
+
+            def count_output_tokens(output):
+                return sum(
+                    len(completion_output.token_ids)
+                    for completion_output in output.outputs
+                )
+
+            self.streaming_tool_call_manager = StreamingToolCallPrefillManager(
+                generate=generate_prefill,
+                make_streaming_input=make_streaming_input,
+                count_output_tokens=count_output_tokens,
+                max_sessions=streaming_tool_call_config["max_sessions"],
+                session_ttl_seconds=streaming_tool_call_config["session_ttl_seconds"],
+                stability_margin_tokens=streaming_tool_call_config[
+                    "stability_margin_tokens"
+                ],
+            )
+
+        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             # Must run after AsyncLLM.from_engine_args and before
             # _setup_vllm_server spawns the uvicorn thread.
@@ -359,6 +436,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
+        self.streaming_tool_call_dummy_tokens: list[int] = []
+        self.streaming_tool_call_prefill_tokens: list[int] = []
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -379,7 +458,28 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                                     self.kv_cache_usage_perc.append(float(m.value))
                             elif isinstance(m, Counter):
                                 if m.name == "vllm:generation_tokens":
-                                    self.generation_tokens.append(int(m.value))
+                                    manager = getattr(
+                                        self, "streaming_tool_call_manager", None
+                                    )
+                                    dummy_tokens = (
+                                        manager.total_dummy_tokens
+                                        if manager is not None
+                                        else 0
+                                    )
+                                    prefill_tokens = (
+                                        manager.total_prefill_tokens
+                                        if manager is not None
+                                        else 0
+                                    )
+                                    self.generation_tokens.append(
+                                        max(0, int(m.value) - dummy_tokens)
+                                    )
+                                    self.streaming_tool_call_dummy_tokens.append(
+                                        dummy_tokens
+                                    )
+                                    self.streaming_tool_call_prefill_tokens.append(
+                                        prefill_tokens
+                                    )
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -408,6 +508,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
+                "streaming_tool_call_dummy_tokens": copy.deepcopy(
+                    self.streaming_tool_call_dummy_tokens
+                ),
+                "streaming_tool_call_prefill_tokens": copy.deepcopy(
+                    self.streaming_tool_call_prefill_tokens
+                ),
             }
         return metric
 
@@ -420,6 +526,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
             self.generation_tokens = []
+            self.streaming_tool_call_dummy_tokens = []
+            self.streaming_tool_call_prefill_tokens = []
 
     async def post_init_async(self):
         if self.llm is not None:
@@ -854,6 +962,68 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
+
+        ########################################
+        # Streaming tool-call prefill endpoints
+        ########################################
+
+        def get_streaming_tool_call_manager() -> StreamingToolCallPrefillManager:
+            manager = getattr(self, "streaming_tool_call_manager", None)
+            if manager is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="streaming tool-call prefill is not enabled",
+                )
+            return manager
+
+        @app.post("/v1/streaming_tool_call/start")
+        async def start_streaming_tool_call(
+            request: StreamingToolCallPrefillRequest,
+        ):
+            manager = get_streaming_tool_call_manager()
+            try:
+                result = await manager.start(
+                    session_id=request.session_id,
+                    prompt_token_ids=request.prompt_token_ids,
+                    sequence_no=request.sequence_no,
+                )
+            except StreamingToolCallError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return asdict(result)
+
+        @app.post("/v1/streaming_tool_call/append")
+        async def append_streaming_tool_call(
+            request: StreamingToolCallPrefillRequest,
+        ):
+            manager = get_streaming_tool_call_manager()
+            try:
+                result = await manager.append(
+                    session_id=request.session_id,
+                    prompt_token_ids=request.prompt_token_ids,
+                    sequence_no=request.sequence_no,
+                )
+            except StreamingToolCallSessionNotFoundError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
+            except StreamingToolCallError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return asdict(result)
+
+        @app.post("/v1/streaming_tool_call/close")
+        async def close_streaming_tool_call(request: StreamingToolCallCloseRequest):
+            manager = get_streaming_tool_call_manager()
+            try:
+                result = await manager.close(
+                    session_id=request.session_id,
+                    final_prompt_token_ids=request.final_prompt_token_ids,
+                )
+            except StreamingToolCallSessionNotFoundError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
+            return asdict(result)
+
+        @app.post("/v1/streaming_tool_call/abort")
+        async def abort_streaming_tool_call(request: StreamingToolCallAbortRequest):
+            manager = get_streaming_tool_call_manager()
+            return {"aborted": await manager.abort(session_id=request.session_id)}
 
         ########################################
         # Logging
@@ -1397,6 +1567,23 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    async def _invalidate_streaming_tool_call_sessions(self) -> int:
+        manager = getattr(self, "streaming_tool_call_manager", None)
+        if manager is None:
+            return 0
+        return await manager.invalidate_all()
+
+    async def _pause_streaming_tool_call_sessions(self) -> int:
+        manager = getattr(self, "streaming_tool_call_manager", None)
+        if manager is None:
+            return 0
+        return await manager.pause_and_invalidate()
+
+    async def _resume_streaming_tool_call_sessions(self) -> None:
+        manager = getattr(self, "streaming_tool_call_manager", None)
+        if manager is not None:
+            await manager.resume()
+
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
@@ -1411,15 +1598,20 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     "update_weights_via_ipc_zmq_async can only be used with async_engine=True. Use update_weights_via_ipc_zmq instead."
                 )
 
-            # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
-            result_or_coro = await self.llm.collective_rpc(
-                "update_weights_via_ipc_zmq", args=tuple()
-            )
+            await self._pause_streaming_tool_call_sessions()
 
-            if asyncio.iscoroutine(result_or_coro):
-                worker_results = await result_or_coro
-            else:
-                worker_results = result_or_coro
+            # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
+            try:
+                result_or_coro = await self.llm.collective_rpc(
+                    "update_weights_via_ipc_zmq", args=tuple()
+                )
+
+                if asyncio.iscoroutine(result_or_coro):
+                    worker_results = await result_or_coro
+                else:
+                    worker_results = result_or_coro
+            finally:
+                await self._resume_streaming_tool_call_sessions()
 
             worker_result = worker_results[0]
 
@@ -1448,14 +1640,19 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
                 )
 
-            result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
-            )
+            await self._pause_streaming_tool_call_sessions()
 
-            if asyncio.iscoroutine(result_or_coro):
-                worker_results = await result_or_coro
-            else:
-                worker_results = result_or_coro
+            try:
+                result_or_coro = await self.llm.collective_rpc(
+                    "update_weights_from_collective", args=tuple()
+                )
+
+                if asyncio.iscoroutine(result_or_coro):
+                    worker_results = await result_or_coro
+                else:
+                    worker_results = result_or_coro
+            finally:
+                await self._resume_streaming_tool_call_sessions()
 
             worker_result = worker_results[0]
 
@@ -1483,7 +1680,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
 
-        await self.llm.reset_prefix_cache()
+        await self._pause_streaming_tool_call_sessions()
+        try:
+            await self.llm.reset_prefix_cache()
+        finally:
+            await self._resume_streaming_tool_call_sessions()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1498,15 +1699,20 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "sleep_async can only be used with async_engine=True. Use sleep instead."
             )
 
-        # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
-        await self.llm.reset_prefix_cache()
-        # Reset the multimodal processor cache (sender side) so it stays in
-        # sync with the receiver cache that vLLM clears internally during
-        # sleep.  Without this, the sender thinks images are already cached on
-        # the receiver and sends data=None, causing an assertion error.
-        if hasattr(self.llm, "reset_mm_cache"):
-            await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=1)
+        await self._pause_streaming_tool_call_sessions()
+        try:
+            # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
+            await self.llm.reset_prefix_cache()
+            # Reset the multimodal processor cache (sender side) so it stays in
+            # sync with the receiver cache that vLLM clears internally during
+            # sleep.  Without this, the sender thinks images are already cached on
+            # the receiver and sends data=None, causing an assertion error.
+            if hasattr(self.llm, "reset_mm_cache"):
+                await self.llm.reset_mm_cache()
+            await self.llm.sleep(level=1)
+        except Exception:
+            await self._resume_streaming_tool_call_sessions()
+            raise
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1529,10 +1735,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             wake_up_args["tags"] = tags
 
         await self.llm.wake_up(**wake_up_args)
+        await self._resume_streaming_tool_call_sessions()
 
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            await self._pause_streaming_tool_call_sessions()
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())
