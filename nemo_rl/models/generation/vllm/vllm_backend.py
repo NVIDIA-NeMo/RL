@@ -14,7 +14,7 @@
 import gc
 import re
 import traceback
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import zmq
@@ -92,6 +92,10 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    # True once the MTP drafter has been served by a one-time disk load (see
+    # load_mtp_weights_from_disk); refit then leaves those static weights alone.
+    _mtp_drafter_from_disk: bool = False
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -236,15 +240,22 @@ class VllmInternalWorkerExtension:
             trimmed.append((key, tensor))
         return trimmed
 
+    def _get_drafter_model(self) -> Optional[torch.nn.Module]:
+        """Return the vLLM drafter's underlying model, or None if absent.
+
+        The drafter holds the speculative-decoding draft model (Eagle3 or MTP),
+        which vLLM keeps as a module separate from the main model.
+        """
+        draft_owner = getattr(self.model_runner, "drafter", None)
+        return getattr(draft_owner, "model", None) if draft_owner else None
+
     def _load_draft_weights(
         self, draft_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
         if not draft_weights:
             return
 
-        draft_owner = getattr(self.model_runner, "drafter", None)
-        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
-
+        draft_model = self._get_drafter_model()
         if draft_model is None:
             print(
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
@@ -252,6 +263,67 @@ class VllmInternalWorkerExtension:
             return
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
+
+    def _mtp_drafter_refit_enabled(self) -> bool:
+        """Whether MTP drafter weights should be refreshed from the refit stream.
+
+        For MTP speculative decoding where the trainer co-trains the MTP layer
+        (``mtp_num_layers > 0``), the MTP weights are exported as part of the
+        policy weight stream during refit (without the ``draft.`` prefix used by
+        Eagle3), so the drafter must be fed those weights on every refit.
+
+        Returns False when the MTP weights were instead loaded once from disk
+        (see ``load_mtp_weights_from_disk``) — the path used when the trainer
+        does not co-train the MTP layer — to avoid clobbering and re-processing
+        those static weights.
+        """
+        if self._mtp_drafter_from_disk:
+            return False
+        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
+        method = getattr(spec_config, "method", None) if spec_config else None
+        if method not in ("deepseek_mtp", "mtp"):
+            return False
+        return self._get_drafter_model() is not None
+
+    def _maybe_refit_mtp_drafter(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+        """Load refit weights into an MTP drafter co-trained with the policy.
+
+        The drafter's ``load_weights`` selects the MTP-specific parameters (and
+        shared embed_tokens / lm_head) it needs from the full policy weight
+        stream. Megatron pads the vocab dimension, so weights are trimmed to the
+        drafter's expected vocab size first, matching ``_load_draft_weights``.
+        """
+        if not self._mtp_drafter_refit_enabled():
+            return
+        draft_model = self._get_drafter_model()
+        if draft_model is None:
+            return
+        weights = self._trim_vocab_padding(draft_model, weights)
+        draft_model.load_weights(weights=weights)
+
+    def _maybe_process_mtp_drafter_after_loading(self) -> None:
+        """Finalize MTP drafter weights after a refit (e.g. MoE grouped-GEMM layout).
+
+        Mirrors the main-model post-processing so the freshly refit MTP layers
+        are converted to their runtime layout. Skipped for the disk-load path,
+        which already processes its weights once at startup.
+        """
+        if not self._mtp_drafter_refit_enabled():
+            return
+        draft_model = self._get_drafter_model()
+        if draft_model is None:
+            return
+
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
+
+        draft_model_config = (
+            self.model_runner.vllm_config.speculative_config.draft_model_config
+        )
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(draft_model, draft_model_config, self.device)
 
     def load_mtp_weights_from_disk(self, model_path: str) -> bool:
         """Load only the MTP (multi-token-prediction) draft weights from disk.
@@ -269,8 +341,7 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if MTP weights were loaded.
         """
-        draft_owner = getattr(self.model_runner, "drafter", None)
-        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
+        draft_model = self._get_drafter_model()
         if draft_model is None:
             print("[mtp] Drafter unavailable; cannot load MTP weights from disk.")
             return False
@@ -304,6 +375,9 @@ class VllmInternalWorkerExtension:
         )
         with set_current_vllm_config(self.model_runner.vllm_config):
             process_weights_after_loading(draft_model, draft_model_config, self.device)
+        # Mark that the MTP drafter is served from a one-time disk load so refit
+        # does not re-load or re-process these static weights.
+        self._mtp_drafter_from_disk = True
         print(
             f"[mtp] Loaded MTP draft weights for layers "
             f"{sorted(mtp_layer_indices)} from {model_path}"
@@ -333,6 +407,9 @@ class VllmInternalWorkerExtension:
             self.model_runner.model.load_weights(weights=policy_weights)
 
         self._load_draft_weights(draft_weights)
+        # MTP drafters co-trained with the policy receive their weights from the
+        # policy stream (no `draft.` prefix), so feed it the policy weights too.
+        self._maybe_refit_mtp_drafter(policy_weights)
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
@@ -361,6 +438,7 @@ class VllmInternalWorkerExtension:
                         process_weights_after_loading(
                             self.model_runner.model, self.model_config, self.device
                         )
+                    self._maybe_process_mtp_drafter_after_loading()
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
@@ -440,6 +518,9 @@ class VllmInternalWorkerExtension:
                 src=0,
                 post_unpack_func=load_model_weight_func,
             )
+
+            # Finalize MTP drafter weights refreshed during the collective update.
+            self._maybe_process_mtp_drafter_after_loading()
 
             # Process weights after loading for FP8 KV cache
             self._maybe_process_fp8_kv_cache()

@@ -257,6 +257,21 @@ class BaseVllmGenerationWorker:
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
 
+        # A speculative_config with num_speculative_tokens == 0 is the supported
+        # way to disable speculative decoding (e.g. MTP) from a launch script
+        # without restructuring the config. Drop it so vLLM runs without a drafter.
+        speculative_config = vllm_kwargs.get("speculative_config")
+        if (
+            isinstance(speculative_config, dict)
+            and speculative_config.get("num_speculative_tokens") == 0
+        ):
+            vllm_kwargs["speculative_config"] = None
+            if not _resolve_enable_prefix_caching(self.cfg["vllm_cfg"]):
+                logger.warning(
+                    "Speculative decoding is disabled (num_speculative_tokens=0); "
+                    "consider enabling prefix caching for better generation performance."
+                )
+
         # Calculate total parallel size (TP * PP)
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
 
@@ -308,7 +323,7 @@ class BaseVllmGenerationWorker:
         # weights via refit, but the MTP draft layer is not covered by refit, so
         # those layers are loaded directly from the checkpoint after engine init
         # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
-        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config")
+        spec_cfg = vllm_kwargs.get("speculative_config")
         mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
         self._mtp_load_from_disk: bool = (
             load_format == "dummy"
