@@ -394,5 +394,7 @@ semantics, and §9's wandb table for what to verify across the sweep.
 | `MAX_NUM_STEPS` | *(unset)* | cap training steps (handy for a quick smoke) |
 | `SBATCH_TIME` | `4:0:0` | SLURM walltime |
 | `DRY_RUN` | `0` | `1` = print the derived config and exit (no `sbatch`) |
+| `STREAMING_TOOL_CALL` | `0` | `1` enables guarded streaming tool-call prefill and adds `-streamtool` to the default run name |
+| `TEMPERATURE` | `1.0` | generation temperature; use `0` for deterministic prompt/output parity checks |
 
 Job id is written to `${REPO_ROOT}/latest_scale_gen_job_id.txt`.
