@@ -38,6 +38,8 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
     _generated_token_logprob,
+    _resolve_data_parallel_local_rank,
+    _resolve_distributed_executor_backend,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -171,6 +173,35 @@ def test_generated_token_logprob_uses_generated_token_id():
 
     assert _generated_token_logprob(logprob_dict, 22) == -2.5
     assert _generated_token_logprob(logprob_dict, 33) is None
+
+
+@pytest.mark.parametrize(
+    ("tp", "pp", "ep", "expected"),
+    [
+        (2, 1, 2, "ray"),
+        (1, 2, 2, "ray"),
+        (1, 1, 8, "uni"),
+        (1, 1, 1, None),
+    ],
+)
+def test_resolve_distributed_executor_backend(tp, pp, ep, expected):
+    assert _resolve_distributed_executor_backend(tp, pp, ep) == expected
+
+
+@pytest.mark.parametrize(
+    ("rank", "model_parallel_size", "executor_backend", "expected"),
+    [
+        (7, 1, "uni", 0),
+        (6, 2, "ray", 3),
+    ],
+)
+def test_resolve_data_parallel_local_rank(
+    rank, model_parallel_size, executor_backend, expected
+):
+    assert (
+        _resolve_data_parallel_local_rank(rank, model_parallel_size, executor_backend)
+        == expected
+    )
 
 
 basic_lora_test_config: LoRAConfig = {

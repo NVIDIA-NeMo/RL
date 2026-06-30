@@ -47,8 +47,7 @@ Key settings:
 | `update_weights_bucket_megabytes` | Reusable transfer-buffer size per participating worker. Start with `2048`; tune only after measuring. |
 | `device` | `cuda` uses GPU RDMA buffers. `cpu` uses host-pinned buffers and is mainly a fallback. |
 | `cleanup_after_load` | Set `false` to avoid extra `torch.cuda.empty_cache()` overhead after each refit when memory is stable. |
-| `shard_hf_weights` | Megatron/vLLM MoE optimization that sends vLLM TP-sharded HF expert weights. |
-| `sharded_target_tp_size` | vLLM target TP size used with `shard_hf_weights`; defaults to rollout world size. |
+| `shard_hf_weights` | Megatron/vLLM MoE optimization that sends each worker only its destination-local expert weights. |
 | `backend_init_params` | NIXL backend parameters such as UCX peer error handling, device lists, and UCX engine config. |
 
 The built-in NIXL topology is paired policy-to-rollout transfer, so allocate at
@@ -94,7 +93,12 @@ For large MoE models with vLLM, leave enough GPU memory for NIXL buffers:
 policy:
   generation:
     vllm_cfg:
+      tensor_parallel_size: 4
+      expert_parallel_size: 32
+      async_engine: false
       gpu_memory_utilization: 0.82
+    vllm_kwargs:
+      moe_backend: triton
     checkpoint_engine:
       update_weights_bucket_megabytes: 4096
       engine_kwargs:
@@ -102,11 +106,28 @@ policy:
           device: cuda
           cleanup_after_load: false
           shard_hf_weights: true
-          sharded_target_tp_size: 32
 ```
 
-`shard_hf_weights` is a Megatron/vLLM MoE optimization. Do not enable it for
-non-MoE models or for vLLM models that cannot load sharded HF expert weights.
+With `shard_hf_weights`, each vLLM worker reports its live expert layout during
+checkpoint-engine setup. For tensor-parallel MoE, the source sends that TP
+rank's slice of every expert. For expert-parallel MoE, the source sends complete
+experts only to ranks that own them, followed by any intra-expert TP slice
+reported by vLLM. Any static ownership map reported by vLLM is supported.
+Dynamic expert load balancing and redundant experts are not supported because
+ownership can change after metadata exchange. The direct-copy load path accepts
+only unquantized Triton expert storage; FP8 and backends that transpose or
+shuffle expert weights are rejected during setup. This includes FlashInfer
+TRT-LLM MXFP8 layouts that reorder W13 to W31 and shuffle weights and scales.
+
+Only destination-local expert tensors use this direct-copy path. Dense and
+unhandled tensors continue through vLLM's standard `load_weights` path. CUDA
+NIXL still stages transfers through GPU RDMA buffers, but tensors spanning
+multiple buffers are reassembled on CPU before that standard loader to limit
+peak GPU memory.
+
+When vLLM EP is larger than TP, NeMo RL currently requires `async_engine: false`.
+Do not enable `shard_hf_weights` for non-MoE models or models whose HF expert
+names do not map to vLLM `w13_weight` and `w2_weight` parameters.
 
 Avoid `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for CUDA-buffer NIXL
 refit unless that workload has been explicitly validated with it.

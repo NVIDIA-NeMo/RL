@@ -53,6 +53,10 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationRefitMixin,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.refit_layout import (
+    VllmWeightLayout,
+    select_hf_weight_for_vllm_target,
+)
 from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -135,30 +139,6 @@ def _model_self_packs_for_cp(model: Any) -> bool:
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
     return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
-
-
-def _vllm_hf_expert_tp_shard_dim(name: str, tensor: torch.Tensor) -> int | None:
-    """Return the HF tensor dim that vLLM TP-loaders shard for MoE experts."""
-    if ".mlp.experts." not in name:
-        return None
-    if name.endswith((".gate_proj.weight", ".up_proj.weight")):
-        return 0
-    if name.endswith(".down_proj.weight") and tensor.ndim > 1:
-        return 1
-    return None
-
-
-def _maybe_shard_vllm_hf_weight(
-    name: str, tensor: torch.Tensor, *, tp_rank: int, tp_size: int
-) -> torch.Tensor:
-    shard_dim = _vllm_hf_expert_tp_shard_dim(name, tensor)
-    if shard_dim is None or shard_dim >= tensor.ndim:
-        return tensor
-    if tp_size <= 1 or tensor.shape[shard_dim] % tp_size != 0:
-        return tensor
-
-    shard_size = tensor.shape[shard_dim] // tp_size
-    return tensor.narrow(shard_dim, tp_rank * shard_size, shard_size).contiguous()
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -1389,28 +1369,23 @@ class MegatronPolicyWorkerImpl(
         if not bool(getattr(checkpoint_engine, "shard_hf_weights", False)):
             return base_iter
 
-        target_rollout_rank = getattr(checkpoint_engine, "target_rollout_rank", None)
-        if target_rollout_rank is None:
+        if getattr(checkpoint_engine, "next_agent", None) is None:
             return base_iter
 
-        rollout_world_size = int(getattr(checkpoint_engine, "rollout_world_size", 1))
-        target_tp_size = int(
-            getattr(checkpoint_engine, "sharded_target_tp_size", None)
-            or rollout_world_size
+        target_weight_layout = cast(
+            VllmWeightLayout,
+            checkpoint_engine.target_weight_layout,
         )
-        if target_tp_size < 1:
-            raise ValueError("sharded_target_tp_size must be >= 1.")
-        target_tp_rank = int(target_rollout_rank) % target_tp_size
 
         def sharded_iter() -> Iterator[tuple[str, torch.Tensor]]:
             for name, tensor in base_iter:
-                sharded_tensor = _maybe_shard_vllm_hf_weight(
+                selected_tensor = select_hf_weight_for_vllm_target(
                     name,
                     tensor,
-                    tp_rank=target_tp_rank,
-                    tp_size=target_tp_size,
+                    target_layout=target_weight_layout,
                 )
-                yield name, sharded_tensor
+                if selected_tensor is not None:
+                    yield name, selected_tensor
 
         return sharded_iter()
 

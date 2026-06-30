@@ -200,18 +200,13 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         cleanup_after_load: bool = True,
         backend_init_params: dict[str, Any] | None = None,
         shard_hf_weights: bool = False,
-        sharded_target_tp_size: int | None = None,
     ) -> None:
         if bucket_size < 1:
             raise ValueError("NIXL checkpoint-engine bucket_size must be >= 1 byte.")
-        if sharded_target_tp_size is not None and sharded_target_tp_size < 1:
-            raise ValueError("sharded_target_tp_size must be >= 1 when set.")
         self.bucket_size = bucket_size
         self.cleanup_after_load = cleanup_after_load
         self.shard_hf_weights = shard_hf_weights
-        self.sharded_target_tp_size = sharded_target_tp_size
-        self.target_rollout_rank: int | None = None
-        self.rollout_world_size: int | None = None
+        self.target_weight_layout: dict[str, Any] | None = None
         self.agent = NixlAgent(backend_name, backend_init_params)
         self.prev_agent: str | None = None
         self.next_agent: str | None = None
@@ -261,7 +256,6 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
     ) -> None:
         self.worker_rank = worker_rank
         self._disconnect_peers()
-        self.rollout_world_size = rollout_world_size
         source_to_rollout = {
             _source_rank_for_rollout(
                 rollout_rank,
@@ -272,10 +266,10 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         }
         rollout_rank = source_to_rollout.get(worker_rank)
         if rollout_rank is not None:
-            self.target_rollout_rank = rollout_rank
-            self.next_agent = self.agent.add_remote_agent(
-                metadata[train_world_size + rollout_rank]
-            )
+            target_metadata = metadata[train_world_size + rollout_rank]
+            if self.shard_hf_weights:
+                self.target_weight_layout = target_metadata["weight_layout"]
+            self.next_agent = self.agent.add_remote_agent(target_metadata)
 
     def init_rollout_process_group(
         self,
@@ -287,7 +281,6 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
     ) -> None:
         self.rollout_rank = rollout_rank
         self._disconnect_peers()
-        self.rollout_world_size = rollout_world_size
         source_rank = _source_rank_for_rollout(
             rollout_rank,
             train_world_size=train_world_size,
@@ -302,7 +295,7 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
             self.agent.remove_remote_agent(self.next_agent)
         self.prev_agent = None
         self.next_agent = None
-        self.target_rollout_rank = None
+        self.target_weight_layout = None
 
     def finalize(self) -> None:
         self._disconnect_peers()
@@ -386,8 +379,10 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
     async def receive_weight_batches(
         self,
     ) -> AsyncGenerator[list[tuple[str, torch.Tensor]], None]:
+        # Keep full tensors off GPU when they span multiple RDMA buckets.
         async for batch in merge_weight_chunk_batches(
-            self._receive_weight_chunk_batches()
+            self._receive_weight_chunk_batches(),
+            merge_device="cpu" if self._transfer_device.type == "cuda" else None,
         ):
             yield batch
 

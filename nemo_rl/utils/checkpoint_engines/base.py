@@ -116,6 +116,8 @@ def split_weight_chunks(
 
 async def merge_weight_chunk_batches(
     chunk_batches: AsyncGenerator[list[tuple[TensorMeta, torch.Tensor]], None],
+    *,
+    merge_device: torch.device | str | None = None,
 ) -> AsyncGenerator[list[tuple[str, torch.Tensor]], None]:
     merge_weight: torch.Tensor | None = None
     merge_offset = 0
@@ -129,7 +131,9 @@ async def merge_weight_chunk_batches(
                 continue
             if merge_weight is None:
                 merge_weight = torch.empty(
-                    meta.shape, dtype=meta.dtype, device=chunk.device
+                    meta.shape,
+                    dtype=meta.dtype,
+                    device=merge_device or chunk.device,
                 )
                 merge_offset = 0
             merge_weight.view(-1).view(torch.uint8)[

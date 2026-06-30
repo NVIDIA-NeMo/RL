@@ -209,6 +209,14 @@ not send. A rollout worker connects to the policy metadata entry at its rollout
 rank, so production runs should allocate at least as many policy workers as
 rollout workers for this backend.
 
+When sharded HF refit is enabled, rollout metadata also contains the actual
+vLLM expert layout for that worker. Each expert parameter reports whether vLLM
+uses expert placement, its local global-expert IDs, and any remaining TP
+coordinate. The paired policy worker uses this destination manifest to either
+slice every expert for TP or filter complete experts for EP before filling NIXL
+buckets. This avoids deriving vLLM EP ownership from Ray/global rank ordering
+and also skips expert layers owned by other pipeline stages.
+
 `device` controls the staged transfer-buffer device:
 
 - `cuda`: allocate CUDA buffers and use CUDA-capable NIXL/UCX transfer. If
@@ -275,3 +283,7 @@ Current limitations:
 - Checkpoint-engine refit targets non-colocated policy-to-vLLM refit.
 - SGLang checkpoint-engine refit is not implemented.
 - The built-in NIXL backend uses paired policy-to-rollout transfer only.
+- Sharded vLLM EP refit supports static expert ownership and canonical
+  unquantized Triton expert storage. Dynamic EPLB, redundant experts, and
+  quantized or shuffled layouts require a destination layout adapter and are
+  rejected during setup.

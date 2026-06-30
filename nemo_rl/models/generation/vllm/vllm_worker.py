@@ -64,6 +64,30 @@ def _generated_token_logprob(
     return float(logprob.logprob)
 
 
+def _resolve_distributed_executor_backend(
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int,
+    expert_parallel_size: int,
+) -> str | None:
+    if tensor_parallel_size * pipeline_parallel_size > 1:
+        return "ray"
+    if expert_parallel_size > tensor_parallel_size:
+        # External DP already runs each rank in a GPU-owning Ray actor. Using
+        # vLLM's Ray executor here would request a second GPU per rank.
+        return "uni"
+    return None
+
+
+def _resolve_data_parallel_local_rank(
+    rank: int, model_parallel_size: int, executor_backend: str | None
+) -> int:
+    # Ray exposes one remapped GPU to each external-DP actor, so its local
+    # device rank is always zero when vLLM runs in-process.
+    if executor_backend == "uni":
+        return 0
+    return (rank % 8) // model_parallel_size
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -289,11 +313,12 @@ class BaseVllmGenerationWorker:
                 f"VLLM_RAY_BUNDLE_INDICES environment variable set to: {os.environ.get('VLLM_RAY_BUNDLE_INDICES')}"
             )
 
-            # Use Ray for distributed execution in parallel mode
-            vllm_kwargs["distributed_executor_backend"] = "ray"
-        else:
-            # For non-parallel mode, explicitly set executor to None to avoid Ray issues
-            vllm_kwargs["distributed_executor_backend"] = None
+        executor_backend = _resolve_distributed_executor_backend(
+            self.tensor_parallel_size,
+            self.pipeline_parallel_size,
+            self.expert_parallel_size,
+        )
+        vllm_kwargs["distributed_executor_backend"] = executor_backend
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -305,7 +330,11 @@ class BaseVllmGenerationWorker:
             world_size = int(os.environ["VLLM_DP_SIZE"]) * model_parallel_size
             rank = int(os.environ["RANK"]) % world_size
             os.environ["VLLM_DP_RANK"] = str(rank // model_parallel_size)
-            os.environ["VLLM_DP_RANK_LOCAL"] = str((rank % 8) // model_parallel_size)
+            os.environ["VLLM_DP_RANK_LOCAL"] = str(
+                _resolve_data_parallel_local_rank(
+                    rank, model_parallel_size, executor_backend
+                )
+            )
             # set vLLM DP address and port
             leader_rank = int(os.environ["RANK"]) // world_size * world_size
             addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])

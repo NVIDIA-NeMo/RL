@@ -86,7 +86,6 @@ policy:
           device: cuda  # "cuda" for GPU buffers, "cpu" for host-pinned fallback
           cleanup_after_load: false
           # shard_hf_weights: false  # Megatron/vLLM MoE expert-sharded refit
-          # sharded_target_tp_size: null  # defaults to rollout world size
           backend_name: UCX
           backend_init_params: null  # set UCX/NIXL backend params here if needed
 

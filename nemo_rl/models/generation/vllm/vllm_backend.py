@@ -23,6 +23,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 import zmq
 
+from nemo_rl.models.generation.vllm.refit_layout import (
+    VllmExpertParamLayout,
+    VllmWeightLayout,
+    parse_hf_expert_weight,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -58,11 +63,12 @@ def maybe_preinit_nixl_for_vllm_worker(
     )
 
 
-_VLLM_HF_EXPERT_WEIGHT_RE = re.compile(
-    r"^(?P<prefix>.+\.mlp\.experts)\."
-    r"(?P<expert_id>\d+)\."
-    r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
-)
+def _global_rollout_rank(rank_prefix: int, rollout_world_size: int) -> int:
+    rank = torch.distributed.get_rank()
+    if torch.distributed.get_world_size() == rollout_world_size:
+        # External vLLM DP uses one distributed group across all rollout ranks.
+        return rank
+    return rank_prefix + rank
 
 
 def fix_gemma3_vision_weight_name(key: str) -> str:
@@ -132,9 +138,10 @@ class VllmInternalWorkerExtension:
         """Initialize the collective communication."""
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        local_rank = torch.distributed.get_rank()
         # Place vLLM ranks after all training ranks so all training workers can join
-        rank = train_world_size + rank_prefix + local_rank
+        rank = train_world_size + _global_rollout_rank(
+            rank_prefix, world_size - train_world_size
+        )
 
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size
@@ -158,7 +165,9 @@ class VllmInternalWorkerExtension:
     def prepare_checkpoint_engine(self) -> Any:  # pragma: no cover
         metadata = self.checkpoint_engine.prepare()
         if isinstance(metadata, dict):
-            return {**metadata, "rank": torch.distributed.get_rank()}
+            metadata = {**metadata, "rank": torch.distributed.get_rank()}
+            if getattr(self.checkpoint_engine, "shard_hf_weights", False):
+                metadata["weight_layout"] = self._checkpoint_engine_weight_layout()
         return metadata
 
     def init_checkpoint_engine_process_group(
@@ -168,9 +177,8 @@ class VllmInternalWorkerExtension:
         rollout_world_size: int,
         metadata: list[Any],
     ) -> None:  # pragma: no cover
-        local_rank = torch.distributed.get_rank()
         self.checkpoint_engine.init_rollout_process_group(
-            rollout_rank=rank_prefix + local_rank,
+            rollout_rank=_global_rollout_rank(rank_prefix, rollout_world_size),
             train_world_size=train_world_size,
             rollout_world_size=rollout_world_size,
             metadata=metadata,
@@ -392,13 +400,8 @@ class VllmInternalWorkerExtension:
         return torch.Size(full_shape) != tensor.shape
 
     def _sharded_refit_param_names(self, name: str) -> list[str]:
-        expert_match = _VLLM_HF_EXPERT_WEIGHT_RE.match(name)
-        if expert_match is not None:
-            projection = expert_match.group("projection")
-            param_leaf = "w2_weight" if projection == "down_proj" else "w13_weight"
-            return [f"{expert_match.group('prefix')}.{param_leaf}"]
-
-        return []
+        expert_weight = parse_hf_expert_weight(name)
+        return [] if expert_weight is None else [expert_weight.parameter_name]
 
     @contextmanager
     def _vllm_sharded_weight_load_context(self, param_names: list[str]):
@@ -472,24 +475,77 @@ class VllmInternalWorkerExtension:
             self._nrl_named_parameters = params
         return params
 
-    def _parse_sharded_expert_weight(
-        self, name: str, tensor: torch.Tensor
-    ) -> tuple[str, str, int] | None:
-        match = _VLLM_HF_EXPERT_WEIGHT_RE.match(name)
-        if match is None:
-            return None
-        if not self._is_sharded_refit_weight(name, tensor):
-            return None
+    def _checkpoint_engine_weight_layout(self) -> VllmWeightLayout:
+        expert_params: dict[str, VllmExpertParamLayout] = {}
+        for name, param in self._get_named_parameters().items():
+            if not name.endswith((".w13_weight", ".w2_weight")):
+                continue
 
-        projection = match.group("projection")
-        shard_id = {
-            "gate_proj": "w1",
-            "up_proj": "w3",
-            "down_proj": "w2",
-        }[projection]
-        param_leaf = "w2_weight" if projection == "down_proj" else "w13_weight"
-        mapped_name = f"{match.group('prefix')}.{param_leaf}"
-        return mapped_name, shard_id, int(match.group("expert_id"))
+            if bool(getattr(param, "is_transposed", False)):
+                raise ValueError(
+                    "Sharded NIXL HF refit requires canonical expert-weight "
+                    f"orientation, but {name} is transposed."
+                )
+
+            weight_loader = getattr(param, "weight_loader", None)
+            owner = getattr(weight_loader, "__self__", None)
+            if owner is None:
+                raise RuntimeError(
+                    f"Could not inspect the vLLM expert weight loader for {name}."
+                )
+
+            quant_method = getattr(owner, "base_quant_method", None)
+            backend = getattr(quant_method, "unquantized_backend", None)
+            backend_name = getattr(backend, "name", None)
+            if getattr(owner, "quant_config", None) is not None or backend_name not in {
+                "TRITON",
+                "BATCHED_TRITON",
+            }:
+                raise ValueError(
+                    "Sharded NIXL HF refit requires canonical unquantized Triton "
+                    f"expert weights, but {name} uses "
+                    f"{type(quant_method).__name__}/{backend_name}. Set "
+                    "policy.generation.vllm_kwargs.moe_backend=triton."
+                )
+
+            use_ep = bool(getattr(owner, "use_ep", False))
+            local_expert_ids: list[int] | None = None
+            if use_ep:
+                if bool(getattr(owner, "enable_eplb", False)):
+                    raise RuntimeError(
+                        "Sharded refit does not support dynamic vLLM expert load "
+                        "balancing because ownership can change after metadata exchange."
+                    )
+                expert_map = getattr(owner, "_expert_map", None)
+                if expert_map is None:
+                    raise RuntimeError(
+                        f"vLLM reports EP for {name} without an expert ownership map."
+                    )
+                logical_num_experts = int(
+                    getattr(owner, "logical_num_experts", expert_map.numel())
+                )
+                global_num_experts = int(
+                    getattr(owner, "global_num_experts", logical_num_experts)
+                )
+                if global_num_experts != logical_num_experts:
+                    raise RuntimeError(
+                        "Sharded refit does not support redundant vLLM experts."
+                    )
+                local_expert_ids = [
+                    expert_id
+                    for expert_id, local_id in enumerate(
+                        expert_map.detach().cpu().tolist()[:logical_num_experts]
+                    )
+                    if int(local_id) >= 0
+                ]
+
+            expert_params[name] = {
+                "tp_rank": int(getattr(owner, "tp_rank", 0)),
+                "tp_size": int(getattr(owner, "tp_size", 1)),
+                "local_expert_ids": local_expert_ids,
+            }
+
+        return expert_params
 
     def _local_expert_id(self, param: torch.nn.Parameter, expert_id: int) -> int:
         weight_loader = getattr(param, "weight_loader", None)
@@ -553,22 +609,29 @@ class VllmInternalWorkerExtension:
         remaining_weights: list[tuple[str, torch.Tensor]] = []
 
         for name, tensor in weights:
-            parsed = self._parse_sharded_expert_weight(name, tensor)
-            if parsed is None:
+            expert_weight = parse_hf_expert_weight(name)
+            if expert_weight is None:
                 remaining_weights.append((name, tensor))
                 continue
 
-            mapped_name, shard_id, expert_id = parsed
+            mapped_name = expert_weight.parameter_name
             param = params.get(mapped_name)
             if param is None or param.data.ndim != 3 or tensor.ndim != 2:
                 remaining_weights.append((name, tensor))
                 continue
 
-            local_expert_id = self._local_expert_id(param, expert_id)
+            owner = getattr(getattr(param, "weight_loader", None), "__self__", None)
+            if not self._is_sharded_refit_weight(name, tensor) and not bool(
+                getattr(owner, "use_ep", False)
+            ):
+                remaining_weights.append((name, tensor))
+                continue
+
+            local_expert_id = self._local_expert_id(param, expert_weight.expert_id)
             if local_expert_id == -1:
                 continue
 
-            groups.setdefault((mapped_name, shard_id), []).append(
+            groups.setdefault((mapped_name, expert_weight.shard_id), []).append(
                 (local_expert_id, tensor)
             )
 

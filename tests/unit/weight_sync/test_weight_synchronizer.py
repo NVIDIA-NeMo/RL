@@ -651,6 +651,34 @@ def test_merge_weight_chunk_batches_uses_aligned_zero_copy_view():
     )
 
 
+def test_merge_weight_chunk_batches_uses_requested_device(monkeypatch):
+    tensor = torch.arange(8, dtype=torch.float32)
+    chunks = list(split_weight_chunks(iter([("weight", tensor)]), tensor.nbytes // 2))
+    devices = []
+    torch_empty = torch.empty
+
+    def record_empty(*args, **kwargs):
+        devices.append(kwargs["device"])
+        return torch_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", record_empty)
+
+    async def run():
+        async def batches():
+            for chunk in chunks:
+                yield [chunk]
+
+        return [
+            batch
+            async for batch in merge_weight_chunk_batches(batches(), merge_device="cpu")
+        ]
+
+    merged = asyncio.run(run())
+
+    assert devices == ["cpu"]
+    torch.testing.assert_close(merged[0][0][1], tensor)
+
+
 def test_policy_worker_checkpoint_engine_rpc_runs_weight_send():
     worker = _CheckpointPolicyWorker()
     _run_checkpoint_rpc(
@@ -815,14 +843,14 @@ def test_nixl_finalize_disconnects_peers():
     engine.agent = FakeAgent()
     engine.prev_agent = "policy"
     engine.next_agent = "rollout"
-    engine.target_rollout_rank = 3
+    engine.target_weight_layout = {"layer": {}}
 
     engine.finalize()
 
     assert engine.agent.removed == ["policy", "rollout"]
     assert engine.prev_agent is None
     assert engine.next_agent is None
-    assert engine.target_rollout_rank is None
+    assert engine.target_weight_layout is None
 
 
 def test_nixl_agent_binds_zmq_socket_atomically(monkeypatch):
@@ -873,18 +901,23 @@ def test_nixl_process_group_uses_parallel_policy_to_rollout_topology():
         engine = NIXLCheckpointEngine.__new__(NIXLCheckpointEngine)
         engine.prev_agent = None
         engine.next_agent = None
+        engine.target_weight_layout = None
+        engine.shard_hf_weights = True
         engine.agent = MagicMock()
         engine.agent.add_remote_agent.side_effect = lambda metadata: metadata["name"]
         return engine
 
+    rollout_0_layout = {"layer.0": {}}
+    rollout_1_layout = {"layer.1": {}}
+    rollout_2_layout = {"layer.2": {}}
     metadata = [
         {"name": "policy-0"},
         {"name": "policy-1"},
         {"name": "policy-2"},
         {"name": "policy-3"},
-        {"name": "rollout-0"},
-        {"name": "rollout-1"},
-        {"name": "rollout-2"},
+        {"name": "rollout-0", "weight_layout": rollout_0_layout},
+        {"name": "rollout-1", "weight_layout": rollout_1_layout},
+        {"name": "rollout-2", "weight_layout": rollout_2_layout},
     ]
 
     policy_rank_0 = engine_with_agent()
@@ -895,8 +928,7 @@ def test_nixl_process_group_uses_parallel_policy_to_rollout_topology():
         metadata=metadata,
     )
     assert policy_rank_0.next_agent == "rollout-0"
-    assert policy_rank_0.target_rollout_rank == 0
-    assert policy_rank_0.rollout_world_size == 3
+    assert policy_rank_0.target_weight_layout is rollout_0_layout
 
     policy_rank_1 = engine_with_agent()
     policy_rank_1.init_policy_process_group(
@@ -906,7 +938,7 @@ def test_nixl_process_group_uses_parallel_policy_to_rollout_topology():
         metadata=metadata,
     )
     assert policy_rank_1.next_agent == "rollout-1"
-    assert policy_rank_1.target_rollout_rank == 1
+    assert policy_rank_1.target_weight_layout is rollout_1_layout
 
     policy_rank_3 = engine_with_agent()
     policy_rank_3.init_policy_process_group(
@@ -916,7 +948,7 @@ def test_nixl_process_group_uses_parallel_policy_to_rollout_topology():
         metadata=metadata,
     )
     assert policy_rank_3.next_agent is None
-    assert policy_rank_3.target_rollout_rank is None
+    assert policy_rank_3.target_weight_layout is None
     policy_rank_3.agent.add_remote_agent.assert_not_called()
 
     rollout_rank_0 = engine_with_agent()
