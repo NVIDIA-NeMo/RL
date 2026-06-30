@@ -13,7 +13,7 @@ grpo:
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym-notq
+  checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym
   enabled: false
 data_plane: null
 policy:
@@ -27,9 +27,9 @@ policy:
     vllm_kwargs:
       enable_chunked_prefill: false
 logger:
-  log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym-notq
+  log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym
   wandb:
-    name: grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym-notq
+    name: grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym
 cluster:
   num_nodes: 16
   gpus_per_node: 8

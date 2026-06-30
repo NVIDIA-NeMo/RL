@@ -8,7 +8,7 @@ grpo:
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
-  checkpoint_dir: results/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-notq
+  checkpoint_dir: results/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async
 data_plane:
   enabled: false
 policy:
@@ -21,9 +21,9 @@ policy:
     vllm_cfg:
       async_engine: true
 logger:
-  log_dir: logs/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-notq
+  log_dir: logs/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async
   wandb:
-    name: grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-notq
+    name: grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async
 cluster:
   num_nodes: 10
   gpus_per_node: 8
