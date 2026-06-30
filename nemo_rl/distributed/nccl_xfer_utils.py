@@ -594,13 +594,18 @@ def check_nccl_xfer_refit_support(master_config: dict) -> None:
                 "(FP8 storage on train side has no BF16 gen consumer)."
             )
 
-    # vllm related restricions. NCCL reshard only support TP & DP for the vllm-side
+    # Gen-backend restrictions.  The reshard supports gen-side TP, DP, and EP;
+    # the vLLM backend shards experts by index across its TP ranks, so its EP
+    # is either 1 (TP-sharded experts) or equal to TP (EP-sharded).  PP is not
+    # yet supported gen-side.
     if generation.get("backend") == "vllm":
+        gen_tp = vllm_cfg.get("tensor_parallel_size", 1)
         gen_ep = vllm_cfg.get("expert_parallel_size", 1)
         gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
-        if gen_ep != 1:
+        if gen_ep != 1 and gen_ep != gen_tp:
             violations.append(
-                f"policy.generation.vllm_cfg.expert_parallel_size must be 1 (got {gen_ep})."
+                "policy.generation.vllm_cfg.expert_parallel_size must be 1 or "
+                f"equal to tensor_parallel_size (got ep={gen_ep}, tp={gen_tp})."
             )
         if gen_pp != 1:
             violations.append(
@@ -676,6 +681,38 @@ def build_nccl_xfer_refit_info(
         )
         return (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map)
 
+    # Gen (dst) side.  Non-expert params are TP-sharded across the gen ranks.
+    # Expert params follow the gen-side expert-parallel size:
+    #   * gen ep_size == 1 -> experts are TP-sharded like dense (shared mesh).
+    #   * gen ep_size > 1  -> experts are EP-sharded by expert index (Shard(0))
+    #     over the EP ranks (tp_size=1, ep_size=gen_ep).
+    # Mirrors the train (src) expert/non-expert mesh split.
+    # TODO: current logic might be tied to the vllm-backend. The logic might need
+    # to be revised when we support other gen-backends.
+    gen_tp = gen_parallelism.get("tp_size", 1)
+    gen_ep = gen_parallelism.get("ep_size", 1)
+    gen_pp = gen_parallelism.get("pp_size", 1)
+
+    def _build_dst_meshes(num_gpus: int, rank_offset: int):
+        non_expert = build_mesh_info(
+            num_gpus,
+            rank_offset=rank_offset,
+            tp_size=gen_tp,
+            ep_size=1,
+            pp_size=gen_pp,
+        )
+        if gen_ep > 1:
+            expert = build_mesh_info(
+                num_gpus,
+                rank_offset=rank_offset,
+                tp_size=1,
+                ep_size=gen_ep,
+                pp_size=gen_pp,
+            )
+        else:
+            expert = non_expert
+        return non_expert, expert
+
     if use_per_stage:
         # Per-PP-stage meshes: within each sub-group, train ranks are
         # 0..train_ranks_per_stage-1 and gen ranks follow immediately after.
@@ -691,20 +728,16 @@ def build_nccl_xfer_refit_info(
             )
 
         # dst mesh: gen ranks start at train_ranks_per_stage within each sub-group
-        dst_mesh, dst_dim_map = build_mesh_info(
-            gen_world_size,
-            rank_offset=train_ranks_per_stage,
-            **{k: gen_parallelism.get(k, 1) for k in ("tp_size", "ep_size", "pp_size")},
+        dst_non_expert, dst_expert = _build_dst_meshes(
+            gen_world_size, rank_offset=train_ranks_per_stage
         )
     else:
         # Single global mesh pair (PP=1 or no per-stage mapping)
         (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map) = (
             _build_train_src_meshes(train_world_size, rank_offset=0, stage_pp=pp_size)
         )
-        dst_mesh, dst_dim_map = build_mesh_info(
-            gen_world_size,
-            rank_offset=train_world_size,
-            **{k: gen_parallelism.get(k, 1) for k in ("tp_size", "ep_size", "pp_size")},
+        dst_non_expert, dst_expert = _build_dst_meshes(
+            gen_world_size, rank_offset=train_world_size
         )
 
     per_layer_params: dict[str, list] = OrderedDict()
@@ -712,6 +745,9 @@ def build_nccl_xfer_refit_info(
         layer = _extract_layer_name(name)
         ndim = len(meta["shape"])
         expert = is_expert_param(name)
+        # Pick the gen (dst) mesh: experts go to the EP/TP-expert mesh, all other
+        # params to the TP non-expert mesh (identical when gen EP is off).
+        dst_mesh, dst_dim_map = dst_expert if expert else dst_non_expert
 
         if use_per_stage:
             stage = layer_to_pp_stage.get(layer, 0)
