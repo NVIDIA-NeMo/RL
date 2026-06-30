@@ -91,8 +91,10 @@ class VllmInternalWorkerExtension:
                 continue
             raw_attr = cls.__dict__["_get_hidden_dim"]
             is_staticmethod = isinstance(raw_attr, staticmethod)
-            original = raw_attr.__func__ if is_staticmethod else getattr(
-                cls, "_get_hidden_dim"
+            original = (
+                raw_attr.__func__
+                if is_staticmethod
+                else getattr(cls, "_get_hidden_dim")
             )
             if getattr(original, "_nrl_shard_dim_compat_wrapper", False):
                 continue

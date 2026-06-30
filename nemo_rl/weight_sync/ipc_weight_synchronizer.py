@@ -72,10 +72,9 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        combine_wakeup_tags = (
-            os.getenv("NRL_VLLM_WAKEUP_COMBINED_TAGS", "0").strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
+        combine_wakeup_tags = os.getenv(
+            "NRL_VLLM_WAKEUP_COMBINED_TAGS", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._policy.offload_before_refit()
         wakeup_tags = ["weights", "kv_cache"] if combine_wakeup_tags else ["weights"]
         self._generation.prepare_for_generation(tags=wakeup_tags)

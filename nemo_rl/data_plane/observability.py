@@ -45,6 +45,7 @@ class DataPlaneEvent(TypedDict):
 
 
 import torch
+
 try:
     from tensordict import TensorDict as _TensorDictType
 except ModuleNotFoundError:

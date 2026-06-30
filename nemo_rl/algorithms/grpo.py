@@ -1491,10 +1491,9 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
-    combine_wakeup_tags = (
-        os.getenv("NRL_VLLM_WAKEUP_COMBINED_TAGS", "0").strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
+    combine_wakeup_tags = os.getenv(
+        "NRL_VLLM_WAKEUP_COMBINED_TAGS", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     if colocated_inference:
         policy.offload_before_refit()
         wakeup_tags = ["weights", "kv_cache"] if combine_wakeup_tags else ["weights"]
