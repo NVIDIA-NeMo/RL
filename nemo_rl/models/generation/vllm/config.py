@@ -17,6 +17,38 @@ from typing import Any, Literal, NotRequired, TypedDict
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class StreamingToolCallConfig(TypedDict):
+    """Configuration for resumable prefill during a running tool call.
+
+    Attributes:
+        enabled: Whether streaming tool-call prefill endpoints are enabled.
+            The recommended default is false until the full environment path is
+            configured.
+        max_sessions: Maximum number of concurrent prefill sessions per vLLM
+            replica. The recommended default is 256.
+        session_ttl_seconds: Idle lifetime of a prefill session before cleanup.
+            The recommended default is 900 seconds.
+        stability_margin_tokens: Number of tokens held behind the proven common
+            prefix to protect tokenizer boundary changes. The recommended
+            default is 8.
+        min_chunk_chars: Minimum new shell-output characters before requesting
+            another tokenization. The recommended default is 256.
+        flush_interval_seconds: Maximum interval between eligible partial-output
+            tokenizations. The recommended default is 0.25 seconds.
+        request_timeout_seconds: Maximum duration of one streaming prefill HTTP
+            request before the action falls back to normal execution. The
+            recommended default is 60 seconds.
+    """
+
+    enabled: bool
+    max_sessions: int
+    session_ttl_seconds: float
+    stability_margin_tokens: int
+    min_chunk_chars: int
+    flush_interval_seconds: float
+    request_timeout_seconds: float
+
+
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     pipeline_parallel_size: int
@@ -39,6 +71,7 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    streaming_tool_call: NotRequired[StreamingToolCallConfig]
 
 
 class VllmConfig(GenerationConfig):

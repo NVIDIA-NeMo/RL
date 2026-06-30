@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # ============================================================================
 # GENERATION-SCALING launcher for async SWE GRPO (derived from
 # run_grpo_repro_bihu_swe2.sh / bihu dc3m70us).
@@ -29,7 +43,8 @@
 #   NUM_VLLM_REPLICAS=64 DRY_RUN=1 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh   # print config, no submit
 #   SKIP_TRAINING=1 NUM_VLLM_REPLICAS=4 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh  # generation-only (no-op train, 1 node, R%4)
 # Optional env: SKIP_TRAINING, TRAIN_NODES, WANDB_GROUP, EXP_SUFFIX, MODEL_PATH, CONTAINER,
-#               MAX_NUM_STEPS, SBATCH_TIME, PERSISTENT_CACHE, BASE_LOG_DIR
+#               MAX_NUM_STEPS, SBATCH_TIME, PERSISTENT_CACHE, BASE_LOG_DIR,
+#               STREAMING_TOOL_CALL
 # Credentials are NOT sourced here — export HF_HOME / HF_TOKEN / WANDB_API_KEY yourself.
 # ============================================================================
 
@@ -63,6 +78,14 @@ export CPUS_PER_WORKER=114
 # (no optimizer, weights frozen, refit every step + keep-alive matmul). Training
 # parallelism must fit 1 node, so model_parallel = TP*CP*PP must divide gpus_per_node(=8).
 SKIP_TRAINING="${SKIP_TRAINING:-0}"
+STREAMING_TOOL_CALL="${STREAMING_TOOL_CALL:-0}"
+if [ "${STREAMING_TOOL_CALL}" = "1" ]; then
+  STREAMING_TOOL_CALL_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="-streamtool"
+else
+  STREAMING_TOOL_CALL_ENABLED=False
+  STREAMING_TOOL_CALL_TAG=""
+fi
 if [ "${SKIP_TRAINING}" = "1" ]; then
   TP=8; EP=8; CP=1; PP=1; ETP=1     # model_parallel = 8 (fits 1 node), train_DP=1
 else
@@ -182,7 +205,7 @@ MOE_ROUTER_LOAD_BALANCING_TYPE="none"
 MOE_ROUTER_BIAS_UPDATE_RATE="1e-3"
 
 # ======================= Generation / vLLM =======================
-TEMPERATURE=1.0
+TEMPERATURE="${TEMPERATURE:-1.0}"
 
 # =================== Checkpointing & validation ===================
 SAVE_PERIOD=5
@@ -213,7 +236,7 @@ if [ "${ASYNC_GRPO_ENABLED}" = "True" ]; then
 else
   SYNC_MODE="sync"
 fi
-EXP_SUFFIX="${EXP_SUFFIX:-swe-genscale-${SYNC_MODE}-genrep${NUM_VLLM_REPLICAS}-nodes${TOTAL_NODES}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}}"
+EXP_SUFFIX="${EXP_SUFFIX:-swe-genscale-${SYNC_MODE}-genrep${NUM_VLLM_REPLICAS}-nodes${TOTAL_NODES}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}${STREAMING_TOOL_CALL_TAG}}"
 WANDB_NAME="${EXP_SUFFIX}"
 CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${EXP_SUFFIX}"
 SNAPSHOT_DIR="${REPO_ROOT}"
@@ -273,6 +296,7 @@ echo "  CONCURRENCY   = ${CONCURRENCY}"
 echo "  invariants    : samples/replica=${PER_REPLICA_SAMPLES}, batch/train-GPU=${PER_GPU_BATCH}"
 echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, pad=${MAKE_SEQ_DIVISIBLE_BY}"
 echo "Model: ${MODEL_PATH}"
+echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
 echo "Checkpoint: ${CHECKPOINT_DIR}"
 echo "=========================================="
 
@@ -406,6 +430,8 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   policy.generation.vllm_cfg.tensor_parallel_size=${VLLM_TP} \
   policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_UTIL} \
   policy.generation.vllm_cfg.skip_tokenizer_init=False \
+  policy.generation.vllm_cfg.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
+  env.nemo_gym.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
   loss_fn.reference_policy_kl_penalty=${KL} \
   loss_fn.ratio_clip_min=${CLIP_MIN} \
   loss_fn.ratio_clip_max=${CLIP_MAX} \
