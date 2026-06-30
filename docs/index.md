@@ -329,6 +329,7 @@ design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
+design-docs/streaming-tool-call.md
 ```
 
 ```{toctree}
