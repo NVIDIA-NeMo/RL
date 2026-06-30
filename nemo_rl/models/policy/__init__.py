@@ -392,11 +392,48 @@ class CoupledGRPOLogprobEstimationConfig(TypedDict):
     verify_gen_kl_with_sglang_mask: NotRequired[bool]
 
 
+class ESPOBlockAwareLogprobEstimationConfig(TypedDict):
+    """Estimate response logprobs for block-aware ESPO (antithetic coupled pair).
+
+    Runs the CoupledGRPO complementary mask pair (level 0 masks ``M``, level 1 the
+    complement ``Mbar``) over the asymmetric ``[noisy | clean]`` layout. The
+    per-token ``[N, S]`` logprobs are reduced in the loss to a per-sequence
+    block-aware ELBO scalar -- each block reweighted by its realized masking ratio,
+    the two masks' ELBOs averaged, then length-normalized by the total response
+    length (see ``nemo_rl/algorithms/espo_logprobs.py``). The mask is seeded per
+    row from ``data['coupled_grpo_seed']`` (set in grpo.py) so prev / reference /
+    training logprobs share one realization. Two forward passes (DP-uniform).
+    """
+
+    type: Literal["espo_block_aware"]
+    mask_token_id: int
+    # If omitted, the model module's ``config.block_size`` is used.
+    block_size: NotRequired[int]
+    # Per-sample masking ratio bounds; default to CoupledGRPO's [0.2, 0.8].
+    mask_ratio_min: NotRequired[float]
+    mask_ratio_max: NotRequired[float]
+    # Base offset folded into the per-row mask seed; defaults to 0.
+    seed_base: NotRequired[int]
+    # Monte-Carlo masks per sequence; must be 2 (the coupled pair). MC > 2 is not
+    # yet supported.
+    num_mc_samples: NotRequired[int]
+    # Whole sequences per training microbatch (K). Each carries its num_mc_samples
+    # level rows grouped (sample-major), so a microbatch has
+    # ``num_samples_per_micro_batch * num_mc_samples`` rows and the gradient
+    # accumulates over ``per_rank_sequences / K`` microbatches. Requires
+    # ``train_micro_batch_size == num_samples_per_micro_batch * num_mc_samples``.
+    # Defaults to 1 (one sequence per microbatch, like CoupledGRPO).
+    num_samples_per_micro_batch: NotRequired[int]
+    # Drop the MASK token from the scored logits (matches DiffuGRPO default).
+    exclude_mask_token_from_logits: NotRequired[bool]
+
+
 LogprobEstimationConfig = Union[
     JustGRPOLeftmostRevealLogprobEstimationConfig,
     DiffuGRPOLogprobEstimationConfig,
     BlockJustGRPOLogprobEstimationConfig,
     CoupledGRPOLogprobEstimationConfig,
+    ESPOBlockAwareLogprobEstimationConfig,
 ]
 
 

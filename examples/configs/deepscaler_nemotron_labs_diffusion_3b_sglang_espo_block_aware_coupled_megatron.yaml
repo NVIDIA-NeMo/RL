@@ -1,0 +1,98 @@
+# Block-aware ESPO (antithetic coupled mask pair) on Nemotron-Labs-Diffusion-3B,
+# DeepScaleR train / AIME 2024 val.
+#
+# Trains with a SEQUENCE-LEVEL clipped objective whose likelihood proxy is a
+# BLOCK-AWARE ELBO matching our semi-AR (sequential-block) generation. ESPO uses
+# the antithetic coupled pair (scheme (b)): level 0 masks a per-sample random
+# subset M of the response (ratio t ~ U(0.2, 0.8)), level 1 masks the exact
+# complement Mbar; every response token is masked in exactly one level. Each
+# mask's block-aware ELBO is reduced with its OWN realized per-block reweight
+# (Lb/|Mb| and Lb/|Mbar_b|), then the two ELBOs are AVERAGED into one L_hat per
+# sequence (the 1/M=1/2 factor) BEFORE forming the single length-normalized ratio
+# rho = exp(Lnorm_theta - Lnorm_old) and the k2 KL on Lnorm. The [N] scalar feeds
+# the existing aligned loss entry point (Route B):
+#   ratio = exp(Lnorm_theta - Lnorm_old)         via sequence_level_importance_ratios
+#   KL_k2 = 0.5*(Lnorm_theta - Lnorm_ref)^2      via reference_policy_kl_type: k2
+# See nemo_rl/algorithms/espo_logprobs.py.
+#
+# The ESPO objective is separable ACROSS sequences and coupled only WITHIN a
+# sequence's two level rows, so training uses SAMPLE-MAJOR microbatching with
+# gradient accumulation: each microbatch holds K = num_samples_per_micro_batch
+# WHOLE sequences (their two level rows grouped, [s0L0, s0L1, s1L0, ...]); the loss
+# reshapes the microbatch [K*M] -> [K, M], reduces each level with its own harvest
+# mask, averages the two ELBOs, and forms the per-sequence ratio. The gradient
+# accumulates over per_rank/K microbatches (standard NeMo-RL path). Memory per
+# forward is just K * num_levels rows (K=1 -> 2 rows, like CoupledGRPO).
+#
+# MICROBATCH SIZING: set
+#   policy.train_micro_batch_size = num_samples_per_micro_batch (K) * num_mc_samples (2)
+# train_micro_batch_size is DECOUPLED from per_rank_sequences -- the full global
+# batch trains via accumulation, no single-microbatch / OOM constraint. The worker
+# raises a clear error if train_micro_batch_size != K * num_mc_samples, or if K
+# does not divide the per-rank sequence count.
+#
+# prev/reference logprobs run BOTH levels and sum to one [N, S] (each response
+# token harvested in exactly one level), reduced per level in the loss -- so they
+# stay [N, S] with no scalar plumbing, identical reduction to curr. The per-row
+# mask seed is shared across prev/reference/training (set in grpo.py) so the ratio
+# is valid; it resamples every step. Two forwards on every rank -> DP-uniform. The
+# logprob (prev/ref) path microbatches by logprob_batch_size (set to 1 below so it
+# always divides the per-rank logprob batch); it is no-grad and independent of K.
+#
+# Inherits the CoupledGRPO config for the shared diffusion-model / SGLang setup
+# and only swaps the policy worker, the logprob estimator, and the loss to the
+# sequence-level (ESPO) formulation. Starts KL-free (reference_policy_kl_penalty:
+# 0); raise beta later (the k2 is on the NORMALIZED ELBO, off the paper's raw
+# L_hat by a 1/L^2 constant absorbed into beta).
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron.yaml"
+
+policy:
+  worker_cls_fqn: "nemo_rl.models.policy.workers.espo_megatron_policy_worker.ESPOMegatronPolicyWorker"
+
+  logprob_estimation:
+    # Fully replace the inherited CoupledGRPO logprob_estimation block (drops its
+    # coupled-only keys, e.g. verify_gen_kl_with_sglang_mask) instead of merging.
+    _override_: true
+    type: "espo_block_aware"
+    mask_token_id: 100
+    # Block size used to build the noisy layout AND to factor the ELBO; matches
+    # the model's block_size (Nemotron-Labs-Diffusion-3B = 32).
+    block_size: 32
+    exclude_mask_token_from_logits: true
+    # Per-sample masking ratio bounds (CoupledGRPO default; ablate full range).
+    mask_ratio_min: 0.2
+    mask_ratio_max: 0.8
+    # Base offset folded into the per-row mask seed (grpo.py adds step & row).
+    seed_base: 0
+    # Antithetic coupled pair; MC > 2 is not yet supported (worker requires == 2).
+    num_mc_samples: 2
+    # Whole sequences per training microbatch (K). train_micro_batch_size must be
+    # K * num_mc_samples; gradient accumulates over per_rank/K microbatches. K must
+    # divide the per-rank sequence count.
+    num_samples_per_micro_batch: 1
+
+  # num_samples_per_micro_batch (K=1) * num_mc_samples (2) = 2 rows per microbatch
+  # (the worker validates this). Decoupled from per_rank_sequences: the full global
+  # batch (1024) trains via gradient accumulation over per_rank/K microbatches, so
+  # there is no single-microbatch OOM constraint. Raise K to trade memory for fewer
+  # accumulation steps (train_micro_batch_size = K * 2).
+  train_micro_batch_size: 2
+  # logprob (prev/ref) microbatch size; 1 always divides the per-rank logprob batch
+  # (no-grad, independent of training K).
+  logprob_batch_size: 1
+
+loss_fn:
+  # Route B sequence-level ESPO: one ratio per sequence on the [N,1] ELBO scalar.
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+  reference_policy_kl_type: "k2"
+  # Start KL-free (= KL-free ESPO); raise beta once the ratio/clip-frac look sane.
+  reference_policy_kl_penalty: 0
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-espo-block-aware-coupled-deepscaler-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-espo-block-aware-coupled-deepscaler-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-espo-block-aware-coupled-deepscaler-megatron-sglang"

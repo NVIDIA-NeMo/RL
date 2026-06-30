@@ -1,0 +1,42 @@
+# Block-aware ESPO (coupled pair) DeepScaleR Megatron toy smoke config.
+# Runs only 8 prompts x 8 generations per prompt (64 samples) for a fast read.
+# Inherits the ESPO coupled production config and shrinks the grpo batch.
+#
+# SAMPLE-MAJOR MICROBATCHING + GRADIENT ACCUMULATION. The ESPO objective is
+# separable across sequences and coupled only within a sequence's num_levels rows,
+# so each training microbatch holds K = num_samples_per_micro_batch WHOLE sequences
+# (their level rows grouped) and the gradient accumulates over per_rank/K
+# microbatches. The worker requires:
+#   train_micro_batch_size == num_samples_per_micro_batch (K) * num_mc_samples (2)
+# train_micro_batch_size is DECOUPLED from per_rank_sequences (no single-microbatch
+# constraint), so memory per forward is just K * 2 rows.
+#
+# Here K = 1 -> train_micro_batch_size = 1 * 2 = 2 (one sequence/microbatch, 2 rows,
+# fits like CoupledGRPO). With colocated generation the policy uses every GPU:
+#   data_parallel_size = num_nodes(1) * gpus_per_node(8) / (TP*PP*CP=1) = 8
+#   per_rank_sequences = train_global_batch_size(64) / 8 = 8
+#   num_microbatches   = per_rank_sequences(8) / K(1) = 8  (gradient accumulation)
+# num_nodes is overridden to 1 (vs the inherited 8): TP = PP = 1 puts the whole
+# 3B model on a single GPU, so one 8-GPU node is a sufficient and cheaper smoke
+# allocation.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_espo_block_aware_coupled_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+
+policy:
+  train_global_batch_size: 64
+  # K (num_samples_per_micro_batch=1, inherited) * num_mc_samples (2) = 2 rows.
+  train_micro_batch_size: 2
+
+cluster:
+  num_nodes: 1
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-espo-block-aware-coupled-deepscaler-megatron-toy-8p8g"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-espo-block-aware-coupled-deepscaler-megatron-sglang-toy-8p8g"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-espo-block-aware-coupled-deepscaler-megatron-sglang-toy-8p8g"

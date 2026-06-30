@@ -90,7 +90,9 @@ def maybe_set_coupled_grpo_seed(
 ) -> None:
     """Attach the per-row CoupledGRPO mask seed to ``data`` in place.
 
-    No-op unless ``policy_cfg`` selects the ``coupled_grpo`` estimator. The seed
+    No-op unless ``policy_cfg`` selects the ``coupled_grpo`` or
+    ``espo_block_aware`` estimator (both build CoupledGRPO's complementary mask
+    pair from this seed). The seed
     is shared across a step's prev / reference / training forwards so the same
     random+complement mask realization is used everywhere (required for a valid
     GRPO ratio) and varies by ``(row, step)`` so the mask resamples each step.
@@ -100,7 +102,10 @@ def maybe_set_coupled_grpo_seed(
     that feeds prev/reference/training logprobs (see ``nemo_rl/algorithms/grpo.py``).
     """
     estimation_cfg = policy_cfg.get("logprob_estimation", {})
-    if estimation_cfg.get("type") != "coupled_grpo":
+    # Block-aware ESPO reuses CoupledGRPO's complementary mask pair, built from the
+    # same ``coupled_grpo_seed``; fire for it under the identical shared-seed
+    # contract (one realization across prev / reference / training).
+    if estimation_cfg.get("type") not in ("coupled_grpo", "espo_block_aware"):
         return
     seed_base = int(estimation_cfg.get("seed_base", 0))
     data["coupled_grpo_seed"] = (
