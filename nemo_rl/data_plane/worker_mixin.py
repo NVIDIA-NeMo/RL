@@ -580,8 +580,18 @@ class TQWorkerMixin:
         clip, steps the optimizer + scheduler, then zeros gradients.
         Returns the aggregated step result (``loss``, ``grad_norm``,
         ``all_mb_metrics``, …).
+
+        Tags the result with ``is_replica_leader`` so the driver-side
+        aggregator can dedupe TP/CP/non-last-PP-stage twins that hold
+        identical copies of this DP shard's metrics. Without it the
+        driver's ``run_all_workers_single_data`` returns one dict per
+        GPU and the metric list ends up TP×CP×PP times too long, which
+        inflates every per-token aggregate (gen_kl_error, probs_ratio,
+        etc.) by that same factor.
         """
-        return self.finish_train_step(step_id=step_id)  # type: ignore[attr-defined]
+        result = self.finish_train_step(step_id=step_id)  # type: ignore[attr-defined]
+        result["is_replica_leader"] = bool(self._is_replica_leader())
+        return result
 
     @wrap_with_nvtx_name("policy_worker/abort_train_step_presharded")
     def abort_train_step_presharded(

@@ -564,7 +564,15 @@ class TQPolicy(Policy):
             step_id=step_id,
         )
         results = self.worker_group.get_all_worker_results(futures)
-        aggregated_results = _aggregate_train_results(results)
+        # Filter to DP-replica leaders only. ``run_all_workers_single_data``
+        # returns one result per GPU (TP×CP×PP×DP), but TP/CP/non-last-PP
+        # twins hold identical copies of their DP shard's metric list.
+        # Aggregating without dedup inflates every per-token metric by
+        # TP*CP*(1 if PP==1 else PP_last_stage_count). ``train_from_meta``
+        # gets this for free via ``output_is_replicated`` on its sharded
+        # dispatch; finish has no data to shard, so we dedupe here.
+        leader_results = [r for r in results if r.get("is_replica_leader", True)]
+        aggregated_results = _aggregate_train_results(leader_results)
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
