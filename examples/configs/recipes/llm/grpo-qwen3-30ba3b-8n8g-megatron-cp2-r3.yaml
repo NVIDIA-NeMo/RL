@@ -29,8 +29,6 @@ policy:
       enable_chunked_prefill: false
 data:
   max_input_seq_length: 2048
-data_plane:
-  enabled: false
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3
   wandb:

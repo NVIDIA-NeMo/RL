@@ -1,16 +1,12 @@
 defaults: ./grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.yaml
-
 grpo:
   async_grpo:
     enabled: true
-    max_trajectory_age_steps: 1
     in_flight_weight_updates: true
 loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async
-data_plane:
-  enabled: false
 policy:
   generation:
     colocated:
@@ -26,4 +22,3 @@ logger:
     name: grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async
 cluster:
   num_nodes: 10
-  gpus_per_node: 8
