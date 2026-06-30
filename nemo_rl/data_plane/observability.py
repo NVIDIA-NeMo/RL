@@ -69,6 +69,31 @@ def log_event(event: DataPlaneEvent) -> None:
     logger.info("data_plane_event: %s", event)
 
 
+def log_snapshot(
+    trainer_logger: Any,
+    dp_client: Any,
+    step: int,
+    *,
+    prefix: str = "data_plane",
+) -> None:
+    """Push ``dp_client.snapshot()`` through a trainer logger once per step.
+
+    No-op when ``dp_client`` is ``None`` or lacks ``snapshot`` (i.e. data
+    plane is disabled, or observability is off so the client wasn't
+    wrapped in :class:`MetricsDataPlaneClient`). Lets every trainer
+    (`grpo_sync`, `grpo_async`, `ppo`, `dpo`, `sft`) surface the same
+    `data_plane/*` metrics with a single call.
+
+    ``trainer_logger`` is duck-typed — anything with a
+    ``log_metrics(dict, step, prefix=...)`` method works. We avoid
+    importing ``nemo_rl.utils.logger.Logger`` here so this module stays
+    independent of the trainer-side logger stack.
+    """
+    if dp_client is None or not hasattr(dp_client, "snapshot"):
+        return
+    trainer_logger.log_metrics(dp_client.snapshot(), step, prefix=prefix)
+
+
 @dataclass
 class DataPlaneStats:
     total_bytes: int = 0

@@ -71,6 +71,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.observability import log_snapshot
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -1284,15 +1285,8 @@ def grpo_train_sync(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
             # Surface payload / storage size from the data-plane client
-            # when observability is enabled (``data_plane.observability
-            # .enabled=true``). No-op otherwise — the driver-side TQPolicy
-            # holds the wrapped client and ``snapshot`` exists only on
-            # ``MetricsDataPlaneClient``.
-            dp_client = getattr(policy, "dp_client", None)
-            if dp_client is not None and hasattr(dp_client, "snapshot"):
-                logger.log_metrics(
-                    dp_client.snapshot(), total_steps + 1, prefix="data_plane"
-                )
+            # when observability is enabled. No-op otherwise.
+            log_snapshot(logger, getattr(policy, "dp_client", None), total_steps + 1)
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,
