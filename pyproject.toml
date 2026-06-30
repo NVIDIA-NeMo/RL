@@ -280,6 +280,8 @@ constraint-dependencies = [
   "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
   "protobuf>=6.33.5",         # Address CVE GHSA-7gcm-g887-7qv7
   "python-multipart>=0.0.22", # Address CVE GHSA-wp53-j4wj-2cfg
+  # 8.0.1 fixed _IncludedRouter.path crash on fastapi>=0.137 (github.com/trallnag/prometheus-fastapi-instrumentator/issues/370)
+  "prometheus-fastapi-instrumentator>=8.0.2",
 ]
 
 conflicts = [
