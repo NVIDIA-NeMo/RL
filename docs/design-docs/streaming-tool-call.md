@@ -562,6 +562,8 @@ documented `sbatch` + `ray.sub` path:
 | Enabled, two-snapshot admission | `13244211` | 887.1 s | 0.125 / 0.125 | No sessions admitted |
 | Enabled, progressive admission | `13245446` | 817.3 s | 0 / 0 | 20 sessions; 75 requests; 2 completed chunks |
 
+The disabled baseline is
+[W&B run `3umuz7g6`](https://wandb.ai/nvidia/swe-benchmark/runs/3umuz7g6).
 The last three arms are successive enabled implementations, not repeated
 measurements of the same implementation:
 
