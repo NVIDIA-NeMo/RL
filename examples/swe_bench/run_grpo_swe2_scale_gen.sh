@@ -42,9 +42,10 @@
 #   NUM_VLLM_REPLICAS=64 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh
 #   NUM_VLLM_REPLICAS=64 DRY_RUN=1 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh   # print config, no submit
 #   SKIP_TRAINING=1 NUM_VLLM_REPLICAS=4 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh  # generation-only (no-op train, 1 node, R%4)
-# Optional env: SKIP_TRAINING, TRAIN_NODES, WANDB_GROUP, EXP_SUFFIX, MODEL_PATH, CONTAINER,
-#               MAX_NUM_STEPS, SBATCH_TIME, PERSISTENT_CACHE, BASE_LOG_DIR,
-#               STREAMING_TOOL_CALL
+# Optional env: SKIP_TRAINING, TRAIN_NODES, TRAIN_TP, WANDB_GROUP, EXP_SUFFIX,
+#               MODEL_PATH, CONTAINER, MAX_NUM_STEPS, SBATCH_TIME,
+#               PERSISTENT_CACHE, BASE_LOG_DIR, STREAMING_TOOL_CALL,
+#               LOG_GYM_RESPONSES
 # Credentials are NOT sourced here — export HF_HOME / HF_TOKEN / WANDB_API_KEY yourself.
 # ============================================================================
 
@@ -89,7 +90,7 @@ fi
 if [ "${SKIP_TRAINING}" = "1" ]; then
   TP=8; EP=8; CP=1; PP=1; ETP=1     # model_parallel = 8 (fits 1 node), train_DP=1
 else
-  TP=4; EP=8; CP=4; PP=2; ETP=1     # linear-train default (model_parallel=32)
+  TP="${TRAIN_TP:-4}"; EP=8; CP=4; PP=2; ETP=1
 fi
 VLLM_TP=2
 MIN_PAD=1
@@ -221,7 +222,7 @@ WANDB_PROJ="swe-benchmark"
 # Shared group for the whole generation-scaling sweep (compare runs by R).
 WANDB_GROUP="${WANDB_GROUP:-swe-gen-scale-linear}"
 # Log full trajectories to wandb so we can verify function_call items appear.
-LOG_GYM_RESPONSES=true
+LOG_GYM_RESPONSES="${LOG_GYM_RESPONSES:-true}"
 
 # ========================= SLURM submission =========================
 SBATCH_ACCOUNT="nemotron_sw_post"
