@@ -246,6 +246,49 @@ class MasterConfig(BaseModel, extra="allow"):
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
 
+def _configure_vllm_for_bf16_true_on_policy(generation_config: VllmConfig) -> None:
+    """Validate and configure vLLM for BF16 true-on-policy parity."""
+    if generation_config["vllm_cfg"]["async_engine"]:
+        raise ValueError(
+            "policy.bf16_true_on_policy=True requires "
+            "policy.generation.vllm_cfg.async_engine=false."
+        )
+    if generation_config["vllm_cfg"]["precision"] != "bfloat16":
+        raise ValueError(
+            "policy.bf16_true_on_policy=True requires "
+            "policy.generation.vllm_cfg.precision=bfloat16."
+        )
+    if generation_config["vllm_cfg"].get("enforce_eager") is True:
+        print(
+            "  ✓ Using vLLM eager mode for policy.bf16_true_on_policy "
+            "because policy.generation.vllm_cfg.enforce_eager=true",
+            flush=True,
+        )
+        return
+
+    vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+    compilation_config = vllm_kwargs.get("compilation_config", None)
+    if compilation_config is None:
+        compilation_config = {}
+        vllm_kwargs["compilation_config"] = compilation_config
+    elif not isinstance(compilation_config, dict):
+        raise TypeError(
+            "policy.generation.vllm_kwargs.compilation_config must "
+            "be a dict when policy.bf16_true_on_policy=true, got "
+            f"{type(compilation_config)}."
+        )
+
+    compilation_config["mode"] = 0
+    compilation_config["cudagraph_mode"] = "FULL_DECODE_ONLY"
+    compilation_config["splitting_ops"] = []
+    print(
+        "  ✓ Configured vLLM CUDA graph-only mode for "
+        "policy.bf16_true_on_policy "
+        "(torch compile disabled, decode CUDA graphs enabled)",
+        flush=True,
+    )
+
+
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
@@ -853,6 +896,7 @@ def setup(
     # Policy subclass without this shared setup needing to know the data
     # plane exists. Default is the plain Policy class — legacy behavior.
     _make_policy = policy_factory if policy_factory is not None else Policy
+    bf16_true_on_policy = policy_config.get("bf16_true_on_policy") is True
 
     def init_policy():
         """Initialize policy training workers."""
@@ -872,9 +916,27 @@ def setup(
     def init_vllm():
         """Initialize vLLM generation workers."""
         t0 = time.perf_counter()
-        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
+        pg = VllmGeneration(
+            cluster=inference_cluster,
+            config=generation_config,
+            bf16_true_on_policy=bf16_true_on_policy,
+        )
+        install_vllm_true_on_policy_patches(pg)
         pg.finish_generation()
         return pg, time.perf_counter() - t0
+
+    def install_vllm_true_on_policy_patches(pg: VllmGeneration) -> None:
+        """Install vLLM BF16 true-on-policy patches when requested."""
+        if not bf16_true_on_policy:
+            return
+
+        patch_info = pg.install_true_on_policy_patches(
+            bf16_true_on_policy=bf16_true_on_policy,
+        )
+        print(
+            f"  ✓ Installed vLLM true-on-policy patches: {patch_info}",
+            flush=True,
+        )
 
     def init_sglang():
         """Initialize SGLang generation workers."""
@@ -995,6 +1057,8 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
+        if bf16_true_on_policy:
+            _configure_vllm_for_bf16_true_on_policy(generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
@@ -1033,6 +1097,7 @@ def setup(
                 cluster=inference_cluster,
                 config=generation_config,
                 defer_model_load=True,
+                bf16_true_on_policy=bf16_true_on_policy,
             )
             print(
                 f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
@@ -1044,6 +1109,7 @@ def setup(
                 """Complete the deferred vLLM model load started above."""
                 t0 = time.perf_counter()
                 deferred_vllm.load_and_start()
+                install_vllm_true_on_policy_patches(deferred_vllm)
                 deferred_vllm.finish_generation()
                 return deferred_vllm, time.perf_counter() - t0
 
