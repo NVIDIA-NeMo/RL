@@ -16,10 +16,11 @@
 # Submit a full streaming-tool-call SWE run with real training and weight refit.
 # This wraps run_grpo_swe2_scale_gen.sh, which submits through sbatch + ray.sub.
 #
-# Defaults use the exact 16-node reproduction shape for one training step:
+# Defaults use the exact 16-node dc3m70us reference recipe:
 #   32 vLLM replicas = 8 generation nodes + 8 training nodes, 64 rollouts/step.
-# Use NUM_VLLM_REPLICAS=16 for the smallest valid full-training shape (8 nodes).
-# Set MAX_NUM_STEPS=all to use the recipe's uncapped training duration.
+#   Megatron TP=2, sequence padding divisor=16, uncapped training duration.
+# Use NUM_VLLM_REPLICAS=8 for the smallest valid full-training shape (4 nodes).
+# Set MAX_NUM_STEPS to cap the run for testing.
 
 set -euo pipefail
 
@@ -42,7 +43,7 @@ fi
 
 NUM_VLLM_REPLICAS="${NUM_VLLM_REPLICAS:-32}"
 STREAMING_TOOL_CALL="${STREAMING_TOOL_CALL:-1}"
-MAX_NUM_STEPS_VALUE="${MAX_NUM_STEPS:-1}"
+MAX_NUM_STEPS_VALUE="${MAX_NUM_STEPS:-all}"
 RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 
 if [[ "${STREAMING_TOOL_CALL}" == "1" ]]; then
@@ -58,8 +59,10 @@ export REPO_ROOT
 export NUM_VLLM_REPLICAS
 export STREAMING_TOOL_CALL
 export SKIP_TRAINING=0
+export TRAIN_TP="${TRAIN_TP:-2}"
+export LOG_GYM_RESPONSES="${LOG_GYM_RESPONSES:-false}"
 export TEMPERATURE="${TEMPERATURE:-1.0}"
-export SBATCH_TIME="${SBATCH_TIME:-6:00:00}"
+export SBATCH_TIME="${SBATCH_TIME:-4:00:00}"
 export WANDB_GROUP="${WANDB_GROUP:-streaming-tool-call-full-e2e}"
 export EXP_SUFFIX="${EXP_SUFFIX:-streaming-tool-call-full-${MODE}-r${NUM_VLLM_REPLICAS}-steps${MAX_NUM_STEPS_VALUE}-${RUN_STAMP}}"
 
@@ -73,6 +76,8 @@ echo "Submitting full SWE run:"
 echo "  mode=${MODE}"
 echo "  replicas=${NUM_VLLM_REPLICAS}"
 echo "  max_steps=${MAX_NUM_STEPS_VALUE}"
+echo "  train_tp=${TRAIN_TP}"
+echo "  log_gym_responses=${LOG_GYM_RESPONSES}"
 echo "  wandb_group=${WANDB_GROUP}"
 echo "  experiment=${EXP_SUFFIX}"
 
