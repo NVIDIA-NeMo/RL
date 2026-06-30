@@ -396,7 +396,14 @@ constraint-dependencies = [
   "pyjwt>=2.13.0",
   "dulwich>=1.2.5",
   "diffusers>=0.38.0",
+  # 8.0.1 fixed _IncludedRouter.path crash on fastapi>=0.137 (github.com/trallnag/prometheus-fastapi-instrumentator/issues/370)
+  "prometheus-fastapi-instrumentator>=8.0.2",
 ]
+
+# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
+# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
+# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
+exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
   [
