@@ -250,6 +250,7 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
+COPY --from=nemo-rl patch_mpi4py.py ./tools/patch_mpi4py.py
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
@@ -304,6 +305,12 @@ if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
         "${BUILD_CUSTOM_TRTLLM_REF:-v1.3.0rc15}" \
         "${BUILD_CUSTOM_TRTLLM_MODELOPT_URL:-https://github.com/NVIDIA/TensorRT-Model-Optimizer.git}" \
         "${BUILD_CUSTOM_TRTLLM_MODELOPT_REF:-0.37.0}"
+    # WAR: uv.lock pins flashinfer-python==0.6.4 but TRT-LLM requires >=0.6.12
+    # (SSDCombined import). --no-deps prevents downgrading nvidia-cublas-cu13/cudnn-cu13.
+    pip install --quiet flashinfer-python==0.6.12 --no-deps --no-build-isolation
+    # Patch mpi4py to strip SLURM PMI vars before MPI_Init (prevents OpenPMIx crash
+    # when Ray workers start inside a SLURM job that has PMI_FD/PMI_PORT set).
+    python3 tools/patch_mpi4py.py
     deactivate
 fi
 
