@@ -143,6 +143,63 @@ def test_modelopt_layer_spec_config_selects_layer_specs():
 
 
 @requires_weight_folding
+def test_quantization_model_specs_support_hybrid_and_legacy_mamba_providers():
+    from nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker import (
+        _set_quantization_model_specs,
+    )
+    from nemo_rl.modelopt.models.policy.workers.utils import (
+        get_quantization_layer_spec,
+        get_quantization_mamba_stack_spec,
+    )
+
+    hybrid_config = SimpleNamespace(hybrid_stack_spec=None)
+    _set_quantization_model_specs(hybrid_config, True)
+    assert hybrid_config.transformer_layer_spec is get_quantization_layer_spec(True)
+    assert hybrid_config.hybrid_stack_spec is get_quantization_mamba_stack_spec(True)
+
+    legacy_config = SimpleNamespace(mamba_stack_spec=None)
+    _set_quantization_model_specs(legacy_config, False)
+    assert (
+        legacy_config.transformer_layer_spec.func
+        is get_quantization_layer_spec(False).func
+    )
+    assert legacy_config.mamba_stack_spec is get_quantization_mamba_stack_spec(False)
+
+
+@requires_weight_folding
+def test_warns_when_other_quantized_startup_caches_exist(tmp_path, monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    base_path = tmp_path / "model"
+    selected_path = tmp_path / "model_modelopt_selected"
+    old_hashed_path = tmp_path / "model_modelopt_old"
+    legacy_path = tmp_path / "model_quantized"
+    invalid_path = tmp_path / "model_modelopt_invalid"
+    for cache_path in (old_hashed_path, legacy_path, invalid_path):
+        (cache_path / "iter_0000000").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "has_modelopt_state",
+        lambda path: "invalid" not in path,
+    )
+
+    with pytest.warns(
+        UserWarning,
+        match=r"checkpointing\.checkpoint_dir",
+    ) as warning_records:
+        megatron_quant_policy_worker._warn_if_other_quant_checkpoint_caches(
+            base_path.as_posix(),
+            selected_path.as_posix(),
+        )
+
+    message = str(warning_records[0].message)
+    assert old_hashed_path.as_posix() in message
+    assert legacy_path.as_posix() in message
+    assert invalid_path.as_posix() not in message
+
+
+@requires_weight_folding
 def test_real_quant_refit_detection_requires_vllm_quant_cfg_and_flag():
     worker = _make_real_quant_worker()
 
@@ -225,8 +282,8 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
 
     monkeypatch.setattr(
         megatron_quant_policy_worker,
-        "_tensor_quantizer_cls",
-        lambda: FakeTensorQuantizer,
+        "TensorQuantizer",
+        FakeTensorQuantizer,
     )
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl,
@@ -243,6 +300,63 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
         "model.layers.0.mlp.down_proj.input_quantizer._amax",
     ]
     torch.testing.assert_close(output[1][1], torch.tensor([3.0]))
+
+
+@requires_weight_folding
+def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class FailingQuantizer:
+        def __call__(self, _weight):
+            raise ValueError("invalid quantizer state")
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "quant_cfg": "FP8_DEFAULT_CFG",
+            "real_quant": False,
+        }
+    }
+    worker.rank = 0
+    task = SimpleNamespace(
+        param_name="decoder.layers.0.mlp.linear_fc2.weight",
+        global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
+        param_weight=torch.ones(2, 2),
+        megatron_module=object(),
+        mapping=SimpleNamespace(hf_param="model.layers.0.mlp.down_proj.weight"),
+    )
+    worker.refit_conversion_tasks = [task]
+
+    monkeypatch.setattr(
+        worker,
+        "_find_weight_quantizer",
+        lambda *_args: FailingQuantizer(),
+    )
+
+    def access_refit_task_weights(self, kv_scales=None):
+        for refit_task in self.refit_conversion_tasks:
+            yield refit_task.param_name, refit_task.param_weight
+
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_iter_params_with_optional_kv_scales",
+        access_refit_task_weights,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        list(worker._iter_params_with_optional_kv_scales())
+
+    assert (
+        "Failed to apply weight quantizer for param "
+        "'decoder.layers.0.mlp.linear_fc2.weight'"
+    ) in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert str(exc_info.value.__cause__) == "invalid quantizer state"
+    assert worker.refit_conversion_tasks == [task]
 
 
 @requires_weight_folding

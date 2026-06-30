@@ -60,4 +60,4 @@ class VllmConfig(GenerationConfig):
     # NVFP4 kernels and stream packed quantized weights instead of fake-quant
     # modules. This is intended for ModelOpt NVFP4 rollout experiments.
     real_quant: NotRequired[bool]
-    real_quant_ignore: NotRequired[list[str] | str]
+    real_quant_ignore: NotRequired[list[str]]

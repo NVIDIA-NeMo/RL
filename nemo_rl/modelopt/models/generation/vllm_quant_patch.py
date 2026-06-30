@@ -47,9 +47,9 @@ def _tolerate_dummy_weight_nan_amax():
 
     Scoping this monkey-patch to the prolog (instead of editing
     `MaxCalibrator.collect` in modelopt) keeps modelopt's source pristine
-    and limits the behavior to the single dummy-weight code path that needs
-    it. Genuine numerical NaN at runtime — when the calibrator is no longer
-    active — would still be caught by the production callsite.
+    and limits the workaround to the single dummy-weight code path that
+    needs it. Genuine numerical NaN at runtime — when the calibrator is
+    no longer active — would still be caught by the production callsite.
 
     Nonfinite dummy activations are sanitized before calibration reduce. The
     patch is active only inside the dummy-weight prolog, before runtime

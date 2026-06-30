@@ -12,7 +12,38 @@ policy:
   quant_sequence_length: 1024
   generation:
     real_quant: true
-    real_quant_ignore: NANO3_NVFP4_IGNORE
+    # Nano3-specific paths that stay in BF16 during real-quant rollout.
+    real_quant_ignore:
+      - lm_head
+      - '*output_layer*'
+      - '*mlp.gate'
+      - '*router*'
+      - '*block_sparse_moe.gate*'
+      - '*self_attention*'
+      - '*self_attn*'
+      - '*proj_out.*'
+      - '*.gate.*'
+      - '*mlp.shared_expert_gate.*'
+      - '*linear_attn.conv1d*'
+      - '*mixer.conv1d*'
+      - '*.mixer.in_proj*'
+      - '*.mixer.out_proj*'
+      - '*.shared_expert.*'
+      - '*.shared_experts.*'
+      - '*.norm.*'
+      - '*.q_proj*'
+      - '*.k_proj*'
+      - '*.v_proj*'
+      - '*.o_proj*'
+      - '*.qkv_proj*'
+      - '*.linear_proj*'
+      - '*.linear_qkv*'
+      - '*.layers.4.*'
+      - '*.layers.11.*'
+      - '*.layers.18.*'
+      - '*.layers.25.*'
+      - '*.layers.32.*'
+      - '*.layers.41.*'
     vllm_cfg:
       gpu_memory_utilization: 0.35
       enable_prefix_caching: false

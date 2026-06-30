@@ -17,8 +17,15 @@ import os
 from functools import partial
 from pathlib import Path
 
+import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
+from modelopt.torch.quantization.config import need_calibration
+from modelopt.torch.utils.dataset_utils import (
+    create_forward_loop,
+    get_dataset_dataloader,
+)
+from modelopt.torch.utils.plugins import megatron_prefill
 from torch.utils.data import DataLoader, Dataset
 
 from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
@@ -79,13 +86,9 @@ def get_forward_loop_func(
 ):
     """Gets the forward loop function for the model."""
     if not is_megatron:
-        from modelopt.torch.utils.dataset_utils import create_forward_loop
-
         return create_forward_loop(dataloader=calib_dataloader)
 
     def _forward_loop(model):
-        from modelopt.torch.utils.plugins import megatron_prefill
-
         for batch in calib_dataloader:
             megatron_prefill(model, batch["input_ids"], skip_return_logits=True)
 
@@ -114,11 +117,6 @@ def quantize_model(
         auto_quantize_bits: The effective bits constraint for auto_quantize.
         data: the name of the calibration dataset.
     """
-    # Keep ModelOpt imports local because this module is imported by workers
-    # that do not always run quantization.
-    import modelopt.torch.quantization as mtq
-    from modelopt.torch.quantization.config import need_calibration
-
     mtq_cfg = resolve_quant_cfg(quant_cfg)
     use_calibration = need_calibration(mtq_cfg)
     if not use_calibration:
@@ -147,8 +145,6 @@ def quantize_model(
                 batch_size=1,
             )
         else:
-            from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
-
             calib_dataloader = get_dataset_dataloader(
                 dataset_name=data,
                 tokenizer=tokenizer,

@@ -16,6 +16,7 @@
 import hashlib
 import json
 import os
+import warnings
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,6 +24,7 @@ from pathlib import Path
 import ray
 import torch
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
+from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from megatron.bridge.training.post_training.checkpointing import (
@@ -67,12 +69,73 @@ def _quant_checkpoint_cache_suffix(config: Mapping[str, object]) -> str:
     return f"_modelopt_{digest}"
 
 
-def _tensor_quantizer_cls() -> type:
-    # Keep ModelOpt imports lazy so non-quant policy workers do not load
-    # ModelOpt's Megatron plugin path during module import.
-    from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+def _find_other_quant_checkpoint_caches(
+    base_pretrained_path: str,
+    selected_pretrained_path: str,
+) -> list[Path]:
+    """Find valid quantized startup caches other than the selected cache."""
+    base_path = Path(base_pretrained_path)
+    parent = base_path.parent
+    if not parent.is_dir():
+        return []
 
-    return TensorQuantizer
+    selected_path = Path(selected_pretrained_path)
+    hashed_prefix = f"{base_path.name}_modelopt_"
+    legacy_name = f"{base_path.name}_quantized"
+    caches = []
+    for candidate in parent.iterdir():
+        if candidate == selected_path or not (
+            candidate.name.startswith(hashed_prefix) or candidate.name == legacy_name
+        ):
+            continue
+        iter0_path = candidate / "iter_0000000"
+        if iter0_path.exists() and has_modelopt_state(iter0_path.as_posix()):
+            caches.append(candidate)
+    return sorted(caches)
+
+
+def _warn_if_other_quant_checkpoint_caches(
+    base_pretrained_path: str,
+    selected_pretrained_path: str,
+) -> None:
+    """Warn when a different quantization config already has a startup cache."""
+    other_caches = _find_other_quant_checkpoint_caches(
+        base_pretrained_path,
+        selected_pretrained_path,
+    )
+    if not other_caches:
+        return
+
+    warnings.warn(
+        "Found quantized startup checkpoint cache(s) created with a different "
+        f"quantization configuration: {', '.join(map(str, other_caches))}. "
+        f"They will not be reused; the selected cache is {selected_pretrained_path}. "
+        "This startup-cache check does not validate resumed training checkpoints. "
+        "When changing an experiment configuration, use a new "
+        "checkpointing.checkpoint_dir.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+def _set_quantization_model_specs(model_config, disable_modelopt_layer_spec: bool):
+    """Select quantization-compatible specs across Bridge hybrid API versions.
+
+    Recent Megatron-Bridge revisions load Nemotron-H checkpoints as a
+    ``HybridModelProvider`` and use ``hybrid_stack_spec``.  Older revisions use
+    the deprecated ``mamba_stack_spec`` field.  Setting only the latter leaves
+    the recent provider to infer the local ModelOpt stack when
+    ``restore_modelopt_state=True``; that stack contains ``SequentialMLP`` and
+    cannot restore quantizers with both tensor and expert parallelism enabled.
+    """
+    model_config.transformer_layer_spec = get_quantization_layer_spec(
+        disable_modelopt_layer_spec
+    )
+    stack_spec = get_quantization_mamba_stack_spec(disable_modelopt_layer_spec)
+    if hasattr(model_config, "hybrid_stack_spec"):
+        model_config.hybrid_stack_spec = stack_spec
+    elif hasattr(model_config, "mamba_stack_spec"):
+        model_config.mamba_stack_spec = stack_spec
 
 
 @ray.remote(
@@ -153,6 +216,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if config.get("pretrained_checkpoint") is not None:
                 return hf_model_name, pretrained_path, pt_checkpoint_exists
 
+            base_pretrained_path = pretrained_path
             pretrained_path += _quant_checkpoint_cache_suffix(config)
             iter0_path = os.path.join(pretrained_path, "iter_0000000")
             pt_checkpoint_exists = os.path.exists(iter0_path) and has_modelopt_state(
@@ -165,6 +229,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if pre_quantized_model_path is not None and not pt_checkpoint_exists:
                 symlink_pre_quantized_model(pre_quantized_model_path, pretrained_path)
                 pt_checkpoint_exists = True
+
+            if not pt_checkpoint_exists and self.rank == 0:
+                _warn_if_other_quant_checkpoint_caches(
+                    base_pretrained_path,
+                    pretrained_path,
+                )
 
             return hf_model_name, pretrained_path, pt_checkpoint_exists
 
@@ -193,13 +263,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     "disable_modelopt_layer_spec", False
                 )
                 megatron_cfg.model.restore_modelopt_state = True
-                megatron_cfg.model.transformer_layer_spec = get_quantization_layer_spec(
-                    disable_modelopt_layer_spec
+                _set_quantization_model_specs(
+                    megatron_cfg.model, disable_modelopt_layer_spec
                 )
-                if hasattr(megatron_cfg.model, "mamba_stack_spec"):
-                    megatron_cfg.model.mamba_stack_spec = (
-                        get_quantization_mamba_stack_spec(disable_modelopt_layer_spec)
-                    )
 
             return original_setup_model_and_optimizer(
                 policy_cfg, megatron_cfg, *args, **kwargs
@@ -234,7 +300,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             yield
             return
 
-        TensorQuantizer = _tensor_quantizer_cls()
         inner_module = self.model.module
         original_named_modules = inner_module.named_modules
 
@@ -262,7 +327,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     @contextmanager
     def disable_quantization(self):
         """Context manager that temporarily disables quantization."""
-        TensorQuantizer = _tensor_quantizer_cls()
         quantizers = []
         try:
             for _, module in self.model.named_modules():
@@ -318,7 +382,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         triggers spurious validation/serialization errors. We strip it for
         the duration of the call and restore it on exit.
         """
-        TensorQuantizer = _tensor_quantizer_cls()
         configs = {}
         try:
             for name, module in self.model.named_modules():
@@ -336,7 +399,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         Useful for verifying that calibration ran and amax values are valid.
         """
-        TensorQuantizer = _tensor_quantizer_cls()
         total = 0
         enabled = 0
         with_amax = 0
@@ -386,11 +448,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         kv_scales: dict[str, float] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
-        from nemo_rl.modelopt.utils import resolve_real_quant_ignore
+        from nemo_rl.modelopt.utils import DEFAULT_NVFP4_IGNORE
 
         generation_cfg = self.cfg["generation"]
         vllm_cfg = generation_cfg["vllm_cfg"]
-        ignore = resolve_real_quant_ignore(generation_cfg.get("real_quant_ignore"))
+        ignore = generation_cfg.get("real_quant_ignore")
+        if ignore is None:
+            ignore = DEFAULT_NVFP4_IGNORE
         yield from self.megatron_bridge.export_hf_weights_modelopt(
             [self.model],
             quant_mode="w4a16_nvfp4",
@@ -435,19 +499,28 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         module: object,
         param_weight: object,
     ) -> object | None:
-        """Find the enabled ModelOpt weight quantizer for ``param_weight``."""
+        """Find the enabled weight quantizer that corresponds to ``param_weight``.
+
+        Uses ModelOpt's ``QuantModule.iter_weights_for_calibration`` to discover
+        ``(weight, weight_quantizer)`` pairs, then matches by identity.
+        This handles standard ``weight`` / ``weight_quantizer`` as well as
+        custom names like ``gate_up_proj`` / ``gate_up_proj_weight_quantizer``.
+
+        Returns the matching ``TensorQuantizer`` or ``None``.
+        """
         if module is None or param_weight is None:
             return None
+        if not isinstance(module, QuantModule):
+            return None
 
-        from megatron.bridge.models.conversion.modelopt_utils import (
-            find_modelopt_weight_quantizer_and_module,
-        )
-
-        weight_quantizer, _ = find_modelopt_weight_quantizer_and_module(
-            module,
-            param_weight,
-        )
-        return weight_quantizer
+        for weight, wq in module.iter_weights_for_calibration():
+            if (
+                param_weight is weight
+                and isinstance(wq, TensorQuantizer)
+                and wq.is_enabled
+            ):
+                return wq
+        return None
 
     @staticmethod
     def _iter_hf_input_amax_names(mapping):
@@ -457,7 +530,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @staticmethod
     def _get_enabled_input_amax(task):
-        TensorQuantizer = _tensor_quantizer_cls()
         input_quantizer = getattr(task.megatron_module, "input_quantizer", None)
         if not isinstance(input_quantizer, TensorQuantizer):
             return None
@@ -524,7 +596,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     return None
                 try:
                     return self._wq(w.float()).to(w.dtype)
-                except RuntimeError as e:
+                except Exception as e:
                     raise RuntimeError(
                         f"Failed to apply weight quantizer for param "
                         f"'{self._task.param_name}': {e}"

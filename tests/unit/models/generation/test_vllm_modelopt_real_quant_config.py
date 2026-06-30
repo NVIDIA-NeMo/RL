@@ -35,7 +35,6 @@ from nemo_rl.modelopt.utils import (
     iter_quant_ignore_name_candidates,
     matches_quant_ignore_pattern,
     resolve_quant_cfg,
-    resolve_real_quant_ignore,
 )
 
 
@@ -151,22 +150,14 @@ def test_w4a16_real_quant_config_keeps_weight_only_default():
 
 
 def test_real_quant_config_allows_explicit_ignore_override():
-    cfg = build_vllm_modelopt_nvfp4_config(ignore=["lm_head"])
+    ignore = ["lm_head", "*.mixer.in_proj*"]
+    cfg = build_vllm_modelopt_nvfp4_config(ignore=ignore)
 
-    assert cfg["ignore"] == ["lm_head"]
-
-
-def test_real_quant_config_resolves_named_ignore_profiles():
-    cfg = build_vllm_modelopt_nvfp4_config(ignore="NANO3_NVFP4_IGNORE")
-
-    assert "*.mixer.in_proj*" in cfg["ignore"]
+    assert cfg["ignore"] == ignore
     assert matches_quant_ignore_pattern(
         "model.layers.0.mixer.in_proj.weight",
         cfg["ignore"],
     )
-
-    with pytest.raises(ValueError, match="Unknown real_quant_ignore profile"):
-        resolve_real_quant_ignore("missing-profile")
 
 
 def test_default_ignore_patterns_match_expected_layers():
