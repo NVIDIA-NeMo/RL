@@ -687,6 +687,96 @@ def test_fake_quant_load_weights_resolves_intermediate_attn_kv_quantizer_amax(
     )
 
 
+def test_fake_quant_load_weights_resolves_hybrid_model_root_and_attn_child(
+    monkeypatch,
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    model.model.layers["5"] = torch.nn.Module()
+    model.model.layers["5"].mixer = torch.nn.Module()
+    model.model.layers["5"].mixer.attn = torch.nn.Module()
+    quantizer = torch.nn.Module()
+    quantizer.register_buffer("_amax", torch.tensor([-1.0]))
+    model.model.layers["5"].mixer.attn.k_bmm_quantizer = quantizer
+    model.vision_model = torch.nn.Module()
+    model.vision_model.layers = torch.nn.ModuleDict({"5": torch.nn.Module()})
+    model.vision_model.layers["5"].mixer = torch.nn.Module()
+    model.vision_model.layers["5"].mixer.attn = torch.nn.Module()
+    distractor = torch.nn.Module()
+    distractor.register_buffer("_amax", torch.tensor([-1.0]))
+    model.vision_model.layers["5"].mixer.attn.k_bmm_quantizer = distractor
+    extension = _make_fake_quant_extension(backend, model)
+
+    remaining = extension._consume_fake_quant_kv_amax(
+        [
+            (
+                "backbone.layers.5.mixer.k_bmm_quantizer._amax",
+                torch.tensor([6.0]),
+            )
+        ]
+    )
+
+    assert remaining == []
+    torch.testing.assert_close(
+        model.model.layers["5"].mixer.attn.k_bmm_quantizer._amax,
+        torch.tensor([6.0]),
+    )
+    torch.testing.assert_close(
+        model.vision_model.layers["5"].mixer.attn.k_bmm_quantizer._amax,
+        torch.tensor([-1.0]),
+    )
+
+
+def test_fake_quant_load_weights_rejects_unrecognized_hybrid_model_root(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = torch.nn.Module()
+    for root_name in ("model", "backbone"):
+        root = torch.nn.Module()
+        root.layers = torch.nn.ModuleDict({"5": torch.nn.Module()})
+        root.layers["5"].mixer = torch.nn.Module()
+        root.layers["5"].mixer.attn = torch.nn.Module()
+        quantizer = torch.nn.Module()
+        quantizer.register_buffer("_amax", torch.tensor([-1.0]))
+        root.layers["5"].mixer.attn.k_bmm_quantizer = quantizer
+        setattr(model, root_name, root)
+    extension = _make_fake_quant_extension(backend, model)
+
+    with pytest.raises(RuntimeError, match="exactly one fake-quant KV amax"):
+        extension._consume_fake_quant_kv_amax(
+            [
+                (
+                    "language_model.layers.5.mixer.k_bmm_quantizer._amax",
+                    torch.tensor([6.0]),
+                )
+            ]
+        )
+
+
+def test_fake_quant_load_weights_rejects_missing_hybrid_layer_path(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    model = _make_fake_quant_attention_model()
+    model.model.layers["6"] = torch.nn.Module()
+    model.model.layers["6"].mixer = torch.nn.Module()
+    model.model.layers["6"].mixer.attn = torch.nn.Module()
+    quantizer = torch.nn.Module()
+    quantizer.register_buffer("_amax", torch.tensor([-1.0]))
+    model.model.layers["6"].mixer.attn.k_bmm_quantizer = quantizer
+    extension = _make_fake_quant_extension(backend, model)
+
+    with pytest.raises(RuntimeError, match="exactly one fake-quant KV amax"):
+        extension._consume_fake_quant_kv_amax(
+            [
+                (
+                    "backbone.layers.5.mixer.k_bmm_quantizer._amax",
+                    torch.tensor([6.0]),
+                )
+            ]
+        )
+
+
 @pytest.mark.parametrize(
     ("builder", "weight", "message"),
     [

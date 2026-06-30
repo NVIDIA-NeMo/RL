@@ -100,15 +100,22 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             raise RuntimeError(f"Unsupported fake-quant KV amax key '{name}'")
 
         prefix = name[: -len(suffix)]
-        candidate_names = [name]
-        if prefix.endswith(".attn"):
-            candidate_names.append(prefix.removesuffix(".attn") + suffix)
-        else:
-            candidate_names.append(prefix + ".attn" + suffix)
+        prefix_variants = {prefix}
+        layer_marker = ".layers."
+        root, marker, layer_path = prefix.partition(layer_marker)
+        if marker and root == "backbone":
+            prefix_variants.add(f"model{layer_marker}{layer_path}")
 
+        for candidate in tuple(prefix_variants):
+            if candidate.endswith(".attn"):
+                prefix_variants.add(candidate.removesuffix(".attn"))
+            else:
+                prefix_variants.add(candidate + ".attn")
+
+        candidate_names = [candidate + suffix for candidate in prefix_variants]
         matches = [
             (candidate_name, named_buffers[candidate_name])
-            for candidate_name in dict.fromkeys(candidate_names)
+            for candidate_name in candidate_names
             if candidate_name in named_buffers
         ]
         if len(matches) != 1:
