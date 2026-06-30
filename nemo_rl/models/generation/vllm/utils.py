@@ -23,6 +23,78 @@ from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 R3_MISSING_ROUTE_SENTINEL = -1
 
 
+def is_modelopt_real_quant_fp8_kv(generation_config: dict[str, Any]) -> bool:
+    """Return whether FP8 KV is backed by ModelOpt real-quant vLLM rollout."""
+    vllm_cfg = generation_config.get("vllm_cfg", {})
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "")
+    return (
+        generation_config.get("backend") == "vllm"
+        and bool(generation_config.get("real_quant"))
+        and generation_config.get("quant_cfg") is not None
+        and isinstance(kv_cache_dtype, str)
+        and kv_cache_dtype.startswith("fp8")
+    )
+
+
+def can_sync_apply_modelopt_real_quant_fp8_kv(
+    generation_config: dict[str, Any],
+) -> bool:
+    """Return whether sync worker RPCs can apply ModelOpt FP8 KV scales."""
+    return is_modelopt_real_quant_fp8_kv(generation_config) and can_sync_apply_fp8_kv(
+        generation_config
+    )
+
+
+def can_sync_apply_fp8_kv(generation_config: dict[str, Any]) -> bool:
+    """Return whether sync vLLM workers can apply FP8 KV scales."""
+    vllm_cfg = generation_config.get("vllm_cfg", {})
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "")
+    return (
+        generation_config.get("backend") == "vllm"
+        and isinstance(kv_cache_dtype, str)
+        and kv_cache_dtype.startswith("fp8")
+        and not bool(vllm_cfg.get("async_engine", False))
+    )
+
+
+def is_modelopt_qarl_fp8_kv(
+    policy_config: dict[str, Any], generation_config: dict[str, Any]
+) -> bool:
+    """Return whether ModelOpt QARL can pair real-quant rollout with FP8 KV."""
+    return bool(policy_config.get("quant_cfg")) and is_modelopt_real_quant_fp8_kv(
+        generation_config
+    )
+
+
+def validate_vllm_fp8_kv_cache_config(
+    policy_config: dict[str, Any],
+    generation_config: dict[str, Any],
+    *,
+    use_async_rollouts: bool,
+) -> None:
+    """Validate vLLM FP8 KV-cache constraints shared by GRPO and PPO."""
+    vllm_cfg = generation_config.get("vllm_cfg", {})
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+    if not kv_cache_dtype.startswith("fp8"):
+        return
+
+    assert vllm_cfg["precision"] in {"bfloat16", "fp8"} or is_modelopt_qarl_fp8_kv(
+        policy_config, generation_config
+    ), (
+        f"kv_cache_dtype='{kv_cache_dtype}' requires bfloat16 or fp8 vLLM "
+        "weights, or ModelOpt real-quant rollout with policy.quant_cfg set."
+    )
+    assert not use_async_rollouts, (
+        "Async rollouts is not supported with kv cache fp8 enabled."
+    )
+    assert policy_config["dtensor_cfg"]["enabled"] == False, (
+        "DTensor backend is not supported with kv cache fp8 enabled."
+    )
+    assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+        "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+    )
+
+
 def format_prompt_for_vllm_generation(
     data: BatchedDataDict[GenerationDatumSpec], sample_idx: Optional[int] = None
 ) -> list[dict[str, Any]]:

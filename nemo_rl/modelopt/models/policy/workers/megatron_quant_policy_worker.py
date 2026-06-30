@@ -395,15 +395,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         if not vllm_cfg.get("kv_cache_dtype", "").startswith("fp8"):
             return
 
-        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
-            get_vllm_qkv_scale_names,
-        )
-
-        keys: list[str] = []
-        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
-            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
-
-        for param_name in keys:
+        for param_name in self._get_vllm_kv_scale_names(kv_scales):
             scale_value = (
                 kv_scales[param_name] if kv_scales and param_name in kv_scales else 1.0
             )

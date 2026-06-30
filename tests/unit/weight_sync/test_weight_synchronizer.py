@@ -143,6 +143,45 @@ class TestIPCWeightSynchronizer:
         assert call_kwargs.kwargs["buffer_size_bytes"] == 2 * (1024**3)
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+    def test_sync_weights_passes_and_applies_kv_scales(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.cfg = {
+            "backend": "vllm",
+            "vllm_cfg": {"kv_cache_dtype": "fp8_e4m3"},
+        }
+        sync = IPCWeightSynchronizer(policy, gen)
+        kv_scales = {"model.layers.0.self_attn.k_scale": 2.0}
+
+        sync.sync_weights(kv_scales=kv_scales)
+
+        stream_kwargs = policy.stream_weights_via_ipc_zmq.call_args.kwargs
+        assert stream_kwargs["kv_scales"] == kv_scales
+        gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
+        gen.apply_kv_cache_scales.assert_called_once_with(kv_scales)
+
+    @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
+    def test_sync_weights_skips_sync_kv_apply_for_async_vllm(self, mock_ray):
+        mock_ray.get.return_value = [True]
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.cfg = {
+            "backend": "vllm",
+            "vllm_cfg": {"kv_cache_dtype": "fp8_e4m3", "async_engine": True},
+        }
+        sync = IPCWeightSynchronizer(policy, gen)
+        kv_scales = {"model.layers.0.self_attn.k_scale": 2.0}
+
+        sync.sync_weights(kv_scales=kv_scales)
+
+        assert (
+            policy.stream_weights_via_ipc_zmq.call_args.kwargs["kv_scales"] == kv_scales
+        )
+        gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
+        gen.apply_kv_cache_scales.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
     def test_dynamic_buffer_size(self, mock_ray, monkeypatch):
         monkeypatch.delenv("NRL_REFIT_BUFFER_MEMORY_RATIO", raising=False)
         mock_ray.get.return_value = [True]

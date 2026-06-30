@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
+
+
+_ATTENTION_LAYER_RE = re.compile(
+    r"(?:^|\.)layers\.(?P<layer_idx>\d+)\.(?:self_attn|self_attention)\."
+)
+
 
 def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
     """Get vLLM-compatible parameter names for Q/K/V FP8 scales.
@@ -46,6 +53,29 @@ def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
         "k_scale": f"model.layers.{layer_idx}.self_attn.k_scale",
         "v_scale": f"model.layers.{layer_idx}.self_attn.v_scale",
     }
+
+
+def get_attention_layer_indices_from_param_names(param_names: list[str]) -> list[int]:
+    """Return attention-owning layer ids visible in exported/HF parameter names."""
+    layer_indices: set[int] = set()
+    for name in param_names:
+        match = _ATTENTION_LAYER_RE.search(name)
+        if match:
+            layer_indices.add(int(match.group("layer_idx")))
+    return sorted(layer_indices)
+
+
+def validate_vllm_qkv_scale_completeness(
+    expected_scale_names: list[str],
+    kv_scales: dict[str, float],
+) -> None:
+    """Require calibrated scales for every expected local attention component."""
+    missing = sorted(set(expected_scale_names) - set(kv_scales))
+    if missing:
+        raise RuntimeError(
+            "Calibrated FP8 KV scale payload is incomplete; missing "
+            f"expected attention scales: {missing[:8]}"
+        )
 
 
 def convert_calibration_to_vllm_format(

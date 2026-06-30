@@ -26,9 +26,11 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import (
+    _raise_if_initial_validation_requires_kv_scale_sync,
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
+    _validate_calibrated_fp8_kv_scales,
     aggregate_rollout_metrics,
     refit_policy_generation,
 )
@@ -69,6 +71,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.utils import validate_vllm_fp8_kv_cache_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -217,6 +220,12 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+    if generation_config["backend"] == "vllm":
+        validate_vllm_fp8_kv_cache_config(
+            policy_config,
+            generation_config,
+            use_async_rollouts=_should_use_async_rollouts(master_config),
+        )
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
@@ -663,6 +672,10 @@ def distillation_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
+    sync_kv_scales = NEED_REFIT and bool(
+        getattr(student_generation, "requires_kv_scale_sync", False)
+    )
+    kv_scales_cache: Optional[dict[str, float]] = None
     use_nemo_gym = _should_use_nemo_gym(master_config)
     if use_nemo_gym:
         print("▶ Using NeMo-Gym rollouts for distillation", flush=True)
@@ -688,12 +701,21 @@ def distillation_train(
         "max_num_steps"
     ]  # max number of steps to train for
 
+    _raise_if_initial_validation_requires_kv_scale_sync(
+        val_at_start=val_at_start,
+        current_step=total_steps,
+        sync_kv_scales=sync_kv_scales,
+    )
+
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(
-                student_policy, student_generation, colocated_inference
+                student_policy,
+                student_generation,
+                colocated_inference,
+                kv_scales=kv_scales_cache if sync_kv_scales else None,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -748,11 +770,46 @@ def distillation_train(
                 )
                 with timer.time("prepare_for_generation"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
+                        if sync_kv_scales and kv_scales_cache is None:
+                            print("▶ Computing KV cache scales...", flush=True)
+                            student_policy.prepare_for_lp_inference()
+                            calib_flat, calib_input_lengths = (
+                                batched_message_log_to_flat_message(
+                                    repeated_batch["message_log"],
+                                    pad_value_dict={
+                                        "token_ids": tokenizer.pad_token_id
+                                    },
+                                    make_sequence_length_divisible_by=master_config.policy[
+                                        "make_sequence_length_divisible_by"
+                                    ],
+                                )
+                            )
+                            calibration_data = BatchedDataDict[
+                                DistillationLossDataDict
+                            ](
+                                {
+                                    "input_ids": calib_flat["token_ids"],
+                                    "input_lengths": calib_input_lengths,
+                                }
+                            )
+                            calibration_data.update(
+                                calib_flat.get_multimodal_dict(as_tensors=False)
+                            )
+                            calibration_data.to("cpu")
+                            kv_scales_cache = student_policy.calibrate_qkv_fp8_scales(
+                                calibration_data, include_q=True
+                            )["layers"]
+                            _validate_calibrated_fp8_kv_scales(
+                                kv_scales_cache,
+                                context="initial distillation rollout refit",
+                            )
+
                         refit_policy_generation(
                             student_policy,
                             student_generation,
                             colocated_inference,
                             timer=timer,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -881,6 +938,21 @@ def distillation_train(
                         timer=timer,
                     )
 
+                if sync_kv_scales:
+                    with timer.time("recompute_kv_scales"):
+                        print(
+                            "▶ Recomputing KV cache scales after policy update...",
+                            flush=True,
+                        )
+                        kv_scales_cache = student_policy.calibrate_qkv_fp8_scales(
+                            train_data, include_q=True
+                        )["layers"]
+                        _validate_calibrated_fp8_kv_scales(
+                            kv_scales_cache,
+                            context="post-training distillation refit",
+                        )
+                        POLICY_GENERATION_STALE = True
+
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
                     and (current_step + 1 == len(dataloader))
@@ -892,7 +964,10 @@ def distillation_train(
                 ):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            student_policy, student_generation, colocated_inference
+                            student_policy,
+                            student_generation,
+                            colocated_inference,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
                     else:

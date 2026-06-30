@@ -95,7 +95,12 @@ def _make_real_quant_worker():
     }
     worker.model = object()
     worker.draft_model = None
-    worker.refit_conversion_tasks = ["task"]
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            param_name="decoder.layers.0.self_attention.linear_qkv.weight",
+            mapping=SimpleNamespace(hf_param="model.layers.0.self_attn.q_proj.weight"),
+        )
+    ]
     worker.megatron_bridge = _FakeModelOptBridge()
     worker.rank = 0
     return worker
@@ -186,10 +191,83 @@ def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch)
         lambda kv_scales=None: iter([("real.weight", torch.ones(1))]),
     )
 
-    output = list(worker._iter_params_with_optional_kv_scales({"scale": 1.0}))
+    kv_scales = {
+        "model.layers.0.self_attn.attn.q_scale": 1.0,
+        "model.layers.0.self_attn.k_scale": 2.0,
+        "model.layers.0.self_attn.v_scale": 3.0,
+    }
+    output = list(worker._iter_params_with_optional_kv_scales(kv_scales))
 
     assert output[0][0] == "real.weight"
     torch.testing.assert_close(output[0][1], torch.ones(1))
+
+
+@requires_weight_folding
+def test_get_vllm_kv_scale_names_uses_explicit_kv_scales():
+    worker = _make_real_quant_worker()
+    kv_scales = {
+        "model.layers.0.self_attn.attn.q_scale": 1.0,
+        "model.layers.0.self_attn.k_scale": 2.0,
+        "model.layers.0.self_attn.v_scale": 3.0,
+    }
+
+    assert worker._get_vllm_kv_scale_names(kv_scales) == list(kv_scales)
+
+
+@requires_weight_folding
+def test_get_vllm_kv_scale_names_derives_attention_layers_from_refit_tasks():
+    worker = _make_real_quant_worker()
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            param_name="decoder.layers.1.mixer.in_proj.weight",
+            mapping=SimpleNamespace(hf_param="model.layers.1.mamba.in_proj.weight"),
+        ),
+        SimpleNamespace(
+            param_name="decoder.layers.0.self_attention.linear_qkv.weight",
+            mapping=SimpleNamespace(hf_param="model.layers.0.self_attn.q_proj.weight"),
+        ),
+        SimpleNamespace(
+            param_name="decoder.layers.2.self_attention.linear_qkv.weight",
+            mapping=SimpleNamespace(hf_param="model.layers.2.self_attn.q_proj.weight"),
+        ),
+    ]
+
+    assert worker._get_vllm_kv_scale_names() == [
+        "model.layers.0.self_attn.attn.q_scale",
+        "model.layers.0.self_attn.k_scale",
+        "model.layers.0.self_attn.v_scale",
+        "model.layers.2.self_attn.attn.q_scale",
+        "model.layers.2.self_attn.k_scale",
+        "model.layers.2.self_attn.v_scale",
+    ]
+
+
+@requires_weight_folding
+def test_get_vllm_kv_scale_names_uses_hybrid_layer_type_fallback():
+    worker = _make_real_quant_worker()
+    worker.refit_conversion_tasks = []
+    worker.megatron_bridge.transformer_config = SimpleNamespace(
+        layers_block_type=["mamba", "attention", "mamba", "full_attention", "moe"]
+    )
+
+    assert worker._get_vllm_kv_scale_names() == [
+        "model.layers.1.self_attn.attn.q_scale",
+        "model.layers.1.self_attn.k_scale",
+        "model.layers.1.self_attn.v_scale",
+        "model.layers.3.self_attn.attn.q_scale",
+        "model.layers.3.self_attn.k_scale",
+        "model.layers.3.self_attn.v_scale",
+    ]
+
+
+@requires_weight_folding
+def test_get_vllm_kv_scale_names_raises_without_attention_source():
+    worker = _make_real_quant_worker()
+    worker.refit_conversion_tasks = []
+    worker.megatron_bridge.transformer_config = SimpleNamespace(num_layers=0)
+
+    with pytest.raises(RuntimeError, match="Unable to derive attention layer ids"):
+        worker._get_vllm_kv_scale_names()
 
 
 @requires_weight_folding

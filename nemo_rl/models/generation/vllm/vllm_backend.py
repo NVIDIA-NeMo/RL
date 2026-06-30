@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import re
 import traceback
 from typing import Any
@@ -92,6 +93,12 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    _pending_kv_cache_scales: dict[str, float]
+    _KV_SCALE_RE = re.compile(
+        r"^(?P<prefix>.*\.(?:self_attn|self_attention))(?:(?:\.attn)?\.(?P<kind>q)_scale|\.(?P<kv_kind>[kv])_scale)$"
+    )
+    _Q_SCALE_UNSUPPORTED_BACKENDS = {"TRITON_ATTN", "ROCM_ATTN"}
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -137,6 +144,198 @@ class VllmInternalWorkerExtension:
             )  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
+
+    @classmethod
+    def _parse_kv_scale_name(cls, name: str) -> tuple[str, str] | None:
+        match = cls._KV_SCALE_RE.match(name)
+        if match is None:
+            return None
+        kind = match.group("kind") or match.group("kv_kind")
+        return f"{match.group('prefix')}.attn", kind
+
+    @staticmethod
+    def _without_model_prefix(name: str) -> str:
+        return name.removeprefix("model.")
+
+    def _iter_attention_modules(self):
+        model = getattr(self.model_runner, "model", None)
+        if model is not None and hasattr(model, "named_modules"):
+            yield from model.named_modules()
+
+        vllm_config = getattr(self.model_runner, "vllm_config", None)
+        context = getattr(vllm_config, "compilation_config", None)
+        static_context = getattr(context, "static_forward_context", None)
+        if isinstance(static_context, dict) and static_context:
+            yield from static_context.items()
+
+    def _attention_module_map(self) -> dict[str, torch.nn.Module]:
+        modules: dict[str, torch.nn.Module] = {}
+        for name, module in self._iter_attention_modules():
+            if all(
+                hasattr(module, attr) for attr in ("_q_scale", "_k_scale", "_v_scale")
+            ):
+                modules[name] = module
+                modules[self._without_model_prefix(name)] = module
+        return modules
+
+    @staticmethod
+    def _get_attention_backend_name(module: torch.nn.Module) -> str:
+        get_attn_backend = getattr(module, "get_attn_backend", None)
+        if callable(get_attn_backend):
+            backend = get_attn_backend()
+            if hasattr(backend, "get_name"):
+                return str(backend.get_name())
+        backend = getattr(module, "attn_backend", None)
+        if hasattr(backend, "get_name"):
+            return str(backend.get_name())
+        backend = getattr(module, "backend", None)
+        if backend is not None:
+            return str(backend)
+        return module.impl.__class__.__name__ if hasattr(module, "impl") else "unknown"
+
+    @classmethod
+    def _q_scale_supported(cls, module: torch.nn.Module) -> bool:
+        backend_name = cls._get_attention_backend_name(module)
+        if backend_name in cls._Q_SCALE_UNSUPPORTED_BACKENDS:
+            return False
+        impl_module = getattr(getattr(module, "impl", None), "__module__", "")
+        return not (
+            impl_module.endswith(".triton_attn") or impl_module.endswith(".rocm_attn")
+        )
+
+    @staticmethod
+    def _platform_adjust_scale(value: float) -> float:
+        from vllm.platforms import current_platform
+
+        return value * 2 if current_platform.is_fp8_fnuz() else value
+
+    @staticmethod
+    def _set_scale(module: torch.nn.Module, kind: str, value: float) -> None:
+        attr = f"_{kind}_scale"
+        tensor = getattr(module, attr)
+        with torch.no_grad():
+            tensor.copy_(torch.tensor(value, dtype=tensor.dtype, device=tensor.device))
+        setattr(module, f"_{kind}_scale_float", float(value))
+
+    @staticmethod
+    def _invalidate_attention_scale_cache(module: torch.nn.Module) -> None:
+        impl = getattr(module, "impl", None)
+        if impl is not None:
+            for attr in ("bmm1_scale", "bmm2_scale", "o_sf_scale"):
+                if hasattr(impl, attr):
+                    setattr(impl, attr, None)
+        if hasattr(module, "_o_scale_float"):
+            setattr(module, "_o_scale_float", None)
+
+    def apply_kv_cache_scales(self, kv_scales: dict[str, float] | None = None) -> dict:
+        scales = (
+            kv_scales
+            if kv_scales is not None
+            else getattr(self, "_pending_kv_cache_scales", {})
+        )
+        modules = self._attention_module_map()
+        resolved = []
+        missing = []
+
+        for transport_name, raw_value in scales.items():
+            parsed = self._parse_kv_scale_name(transport_name)
+            if parsed is None:
+                missing.append(transport_name)
+                continue
+            module_name, kind = parsed
+            module = modules.get(module_name) or modules.get(
+                self._without_model_prefix(module_name)
+            )
+            if module is None:
+                missing.append(transport_name)
+                continue
+
+            raw_float = float(raw_value)
+            if kind == "q" and raw_float != 1.0 and not self._q_scale_supported(module):
+                backend_name = self._get_attention_backend_name(module)
+                raise RuntimeError(
+                    f"Attention backend {backend_name} does not support non-1.0 q_scale for {transport_name}."
+                )
+            value = self._platform_adjust_scale(raw_float)
+            resolved.append((module_name, module, kind, value))
+
+        if missing:
+            raise KeyError(
+                "Failed to apply FP8 KV cache scales for missing or malformed keys: "
+                f"{missing[:8]}"
+            )
+
+        applied = {"q": 0, "k": 0, "v": 0}
+        applied_values = []
+        backends = {}
+        for module_name, module, kind, value in resolved:
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"Invalid FP8 KV cache scale for {module_name}.{kind}: {value}"
+                )
+            self._set_scale(module, kind, value)
+            self._invalidate_attention_scale_cache(module)
+            applied[kind] += 1
+            applied_values.append(value)
+            backends[module_name] = self._get_attention_backend_name(module)
+
+        non_default = sum(
+            not math.isclose(value, 1.0, rel_tol=0.0, abs_tol=1e-12)
+            for value in applied_values
+        )
+        if applied_values and non_default == 0:
+            raise RuntimeError(
+                "FP8 KV cache scales are all 1.0; calibrated scales were not applied."
+            )
+        summary = {
+            "applied": applied,
+            "total": sum(applied.values()),
+            "min": min(applied_values) if applied_values else None,
+            "max": max(applied_values) if applied_values else None,
+            "non_default": non_default,
+            "backends": backends,
+        }
+        if kv_scales is None:
+            self._pending_kv_cache_scales = {}
+        print(
+            "FP8 KV cache scales applied: "
+            f"total={summary['total']}, applied={summary['applied']}, "
+            f"min={summary['min']}, max={summary['max']}, "
+            f"non_default={summary['non_default']}",
+            flush=True,
+        )
+        return summary
+
+    def get_kv_cache_scale_snapshot(self) -> dict[str, dict[str, float | str]]:
+        snapshot: dict[str, dict[str, float | str]] = {}
+        for module_name, module in self._attention_module_map().items():
+            if module_name.startswith("model."):
+                continue
+            transport_prefix = f"model.{module_name}"
+            if transport_prefix.endswith(".self_attn.attn"):
+                base = transport_prefix.removesuffix(".attn")
+                names = {
+                    "q": f"{transport_prefix}.q_scale",
+                    "k": f"{base}.k_scale",
+                    "v": f"{base}.v_scale",
+                }
+            else:
+                names = {
+                    "q": f"{transport_prefix}.q_scale",
+                    "k": f"{transport_prefix}.k_scale",
+                    "v": f"{transport_prefix}.v_scale",
+                }
+            backend = self._get_attention_backend_name(module)
+            for kind, key in names.items():
+                tensor = getattr(module, f"_{kind}_scale")
+                snapshot[key] = {
+                    "tensor": float(
+                        tensor.detach().float().cpu().reshape(-1)[0].item()
+                    ),
+                    "host": float(getattr(module, f"_{kind}_scale_float")),
+                    "backend": backend,
+                }
+        return snapshot
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
@@ -326,6 +525,11 @@ class VllmInternalWorkerExtension:
             for idx, (key, weight) in enumerate(weights):
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
+        weights = [
+            (name, weight)
+            for name, weight in weights
+            if self._parse_kv_scale_name(name) is None
+        ]
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(policy_weights, self.model_runner)

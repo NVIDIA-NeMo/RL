@@ -72,6 +72,7 @@ def matches_quant_ignore_pattern(name: str, patterns: list[str]) -> bool:
 def build_vllm_modelopt_nvfp4_config(
     *,
     ignore: list[str] | None = None,
+    kv_cache_dtype: str | None = None,
 ) -> dict[str, Any]:
     """Build the HuggingFace quantization_config consumed by vLLM ModelOpt NVFP4.
 
@@ -79,7 +80,7 @@ def build_vllm_modelopt_nvfp4_config(
     ``mtq.quantize``. vLLM expects the deployment/export-side
     ``quantization_config`` shape instead.
     """
-    return {
+    config = {
         "quant_method": "modelopt",
         "config_groups": {
             "group_0": {
@@ -100,6 +101,13 @@ def build_vllm_modelopt_nvfp4_config(
         "group_size": 16,
         "producer": {"name": "modelopt"},
     }
+    if kv_cache_dtype is not None and kv_cache_dtype.startswith("fp8"):
+        config["kv_cache_scheme"] = {
+            "dynamic": False,
+            "num_bits": 8,
+            "type": "float",
+        }
+    return config
 
 
 def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:

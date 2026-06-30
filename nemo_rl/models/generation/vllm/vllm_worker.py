@@ -256,6 +256,7 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        vllm_kwargs["kv_cache_dtype"] = self.cfg["vllm_cfg"]["kv_cache_dtype"]
 
         # Calculate total parallel size (TP * PP)
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
@@ -917,6 +918,36 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
             traceback.print_exc()
             return False
+
+    def apply_kv_cache_scales(self, kv_scales: dict[str, float] | None = None) -> dict:
+        """Apply authoritative FP8 KV cache scales inside vLLM workers."""
+        assert self.llm is not None, (
+            "Attempting to apply KV cache scales with either an uninitialized vLLM or non-model-owner"
+        )
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "apply_kv_cache_scales can only be used with async_engine=False."
+            )
+        result_or_coro = self.llm.collective_rpc(
+            "apply_kv_cache_scales",
+            args=(kv_scales,),
+        )
+        return cast(dict, result_or_coro[0])
+
+    def get_kv_cache_scale_snapshot(self) -> dict:
+        """Return a named snapshot of vLLM FP8 KV cache scales."""
+        assert self.llm is not None, (
+            "Attempting to snapshot KV cache scales with either an uninitialized vLLM or non-model-owner"
+        )
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "get_kv_cache_scale_snapshot can only be used with async_engine=False."
+            )
+        result_or_coro = self.llm.collective_rpc(
+            "get_kv_cache_scale_snapshot",
+            args=tuple(),
+        )
+        return cast(dict, result_or_coro[0])
 
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""

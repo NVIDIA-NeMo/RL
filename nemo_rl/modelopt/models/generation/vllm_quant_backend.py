@@ -44,6 +44,31 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def _is_real_quant_model(self) -> bool:
         return os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1"
 
+    def _maybe_process_fp8_kv_cache(self) -> None:
+        if self._is_real_quant_model():
+            # Real-quant ModelOpt KV scales are streamed out of band and applied
+            # explicitly; vLLM's generic post-load hook also revisits dense
+            # ModelOpt layers, which is not safe after W4A16 refit.
+            return
+        return super()._maybe_process_fp8_kv_cache()
+
+    def _record_pending_kv_scales(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
+        pending = dict(getattr(self, "_pending_kv_cache_scales", {}))
+        filtered = []
+        for name, weight in weights:
+            if self._parse_kv_scale_name(name) is None:
+                filtered.append((name, weight))
+                continue
+            if weight.numel() != 1:
+                raise ValueError(
+                    f"Only scalar FP8 KV scale refit is supported, got {name} with shape {tuple(weight.shape)}"
+                )
+            pending[name] = float(weight.detach().float().cpu().reshape(-1)[0].item())
+        self._pending_kv_cache_scales = pending
+        return filtered
+
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):
         """Temporarily patches model.named_parameters() to also yield input_quantizer buffers.
@@ -84,6 +109,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         applied during export), so no fold_weight step is needed here.
         """
         if self._is_real_quant_model():
+            weights = self._record_pending_kv_scales(list(weights))
             quant_config = (
                 self.model_runner.vllm_config.model_config.hf_config.quantization_config
             )
@@ -200,6 +226,12 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         result = super().update_weights_from_collective()
         if result:
             modelopt_process_weights_after_loading(self.model_runner.model)
+            # Base collective reload processes FP8 KV cache before ModelOpt's
+            # post-load hooks. Run it again here so vLLM rebuilds cache-scale
+            # state after ModelOpt has finalized the loaded weights.
+            self._maybe_process_fp8_kv_cache()
+            if getattr(self, "_pending_kv_cache_scales", None):
+                self.apply_kv_cache_scales()
         return result
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:

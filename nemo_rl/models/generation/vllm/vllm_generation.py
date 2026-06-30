@@ -1076,6 +1076,33 @@ class VllmGeneration(GenerationInterface):
             print(f"Error invalidating vLLM caches: {e}")
             return False
 
+    def apply_kv_cache_scales(self, kv_scales: dict[str, float] | None = None) -> dict:
+        """Apply authoritative FP8 KV cache scales after colocated KV-cache wake."""
+        if self.cfg["vllm_cfg"].get("async_engine", False):
+            raise RuntimeError(
+                "apply_kv_cache_scales can only be used with async_engine=False."
+            )
+        futures = self.worker_group.run_all_workers_single_data(
+            "apply_kv_cache_scales",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            kv_scales=kv_scales,
+        )
+        results = ray.get(futures)
+        return {"workers": [result for result in results if result is not None]}
+
+    def get_kv_cache_scale_snapshot(self) -> dict:
+        """Return named FP8 KV cache scale snapshots from vLLM workers."""
+        if self.cfg["vllm_cfg"].get("async_engine", False):
+            raise RuntimeError(
+                "get_kv_cache_scale_snapshot can only be used with async_engine=False."
+            )
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_kv_cache_scale_snapshot",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        results = ray.get(futures)
+        return {"workers": [result for result in results if result is not None]}
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.

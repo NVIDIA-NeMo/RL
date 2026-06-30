@@ -94,6 +94,70 @@ def _install_fake_modelopt_tensor_quantizer(monkeypatch):
     ].tensor_quantizer = tensor_quantizer_module
 
 
+def _install_fake_vllm_platform(monkeypatch, *, fp8_fnuz=False):
+    platforms_module = types.ModuleType("vllm.platforms")
+    platforms_module.current_platform = types.SimpleNamespace(
+        is_fp8_fnuz=lambda: fp8_fnuz
+    )
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms_module)
+
+
+class _FakeAttention(torch.nn.Module):
+    def __init__(self, backend_name="FLASHINFER"):
+        super().__init__()
+        self.register_buffer("_q_scale", torch.tensor(1.0))
+        self.register_buffer("_k_scale", torch.tensor(1.0))
+        self.register_buffer("_v_scale", torch.tensor(1.0))
+        self._q_scale_float = 1.0
+        self._k_scale_float = 1.0
+        self._v_scale_float = 1.0
+        self._o_scale_float = 7.0
+        self.impl = types.SimpleNamespace(
+            bmm1_scale=2.0,
+            bmm2_scale=3.0,
+            o_sf_scale=4.0,
+        )
+        self._backend = types.SimpleNamespace(get_name=lambda: backend_name)
+
+    def get_attn_backend(self):
+        return self._backend
+
+
+def _make_extension_with_attention(backend, attention):
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    model = torch.nn.Module()
+    extension.model_runner = types.SimpleNamespace(
+        model=model,
+        vllm_config=types.SimpleNamespace(
+            compilation_config=types.SimpleNamespace(
+                static_forward_context={"model.layers.0.self_attn.attn": attention}
+            ),
+            model_config=types.SimpleNamespace(
+                hf_config=types.SimpleNamespace(quantization_config={"ignore": []})
+            ),
+        ),
+    )
+    return extension
+
+
+def _make_extension_with_named_attention(
+    backend, attention, module_name="layers.0.self_attn.attn"
+):
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    model = types.SimpleNamespace(
+        named_modules=lambda: iter([(module_name, attention)])
+    )
+    extension.model_runner = types.SimpleNamespace(
+        model=model,
+        vllm_config=types.SimpleNamespace(
+            model_config=types.SimpleNamespace(
+                hf_config=types.SimpleNamespace(quantization_config={"ignore": []})
+            ),
+        ),
+    )
+    return extension
+
+
 def test_w4a16_real_quant_config_keeps_weight_only_default():
     cfg = build_vllm_modelopt_nvfp4_config()
 
@@ -119,6 +183,17 @@ def test_w4a16_real_quant_config_keeps_weight_only_default():
         "*self_attention*",
         "*self_attn*",
     ]
+    assert "kv_cache_scheme" not in cfg
+
+
+def test_w4a16_real_quant_config_adds_fp8_kv_scheme_when_requested():
+    cfg = build_vllm_modelopt_nvfp4_config(kv_cache_dtype="fp8_e4m3")
+
+    assert cfg["kv_cache_scheme"] == {
+        "dynamic": False,
+        "num_bits": 8,
+        "type": "float",
+    }
 
 
 def test_real_quant_config_allows_explicit_ignore_override():
@@ -211,6 +286,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
             "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
             "real_quant": True,
             "real_quant_ignore": ["lm_head"],
+            "vllm_cfg": {"kv_cache_dtype": "fp8_e4m3"},
         },
         llm_kwargs,
     )
@@ -221,7 +297,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     assert "worker_cls" not in llm_kwargs
     assert llm_kwargs["quantization"] == "modelopt"
     assert llm_kwargs["hf_overrides"]["quantization_config"] == (
-        build_vllm_modelopt_nvfp4_config(ignore=["lm_head"])
+        build_vllm_modelopt_nvfp4_config(ignore=["lm_head"], kv_cache_dtype="fp8_e4m3")
     )
 
 
@@ -511,6 +587,252 @@ def test_real_quant_load_weights_forwards_ignored_shape_mismatch(monkeypatch):
     assert forwarded == [("lm_head.weight", mismatched)]
 
 
+def test_real_quant_load_weights_records_and_filters_kv_scales(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_attention(backend, attention)
+    forwarded = []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        "_load_weights",
+        lambda self, weights: forwarded.extend(weights) or "loaded",
+    )
+
+    assert (
+        extension._load_weights(
+            [
+                ("model.layers.0.self_attn.k_scale", torch.tensor([2.0])),
+                ("model.layers.0.mlp.down_proj.weight", torch.ones(1)),
+            ]
+        )
+        == "loaded"
+    )
+
+    assert extension._pending_kv_cache_scales == {
+        "model.layers.0.self_attn.k_scale": 2.0
+    }
+    assert len(forwarded) == 1
+    assert forwarded[0][0] == "model.layers.0.mlp.down_proj.weight"
+    torch.testing.assert_close(forwarded[0][1], torch.ones(1))
+
+
+def test_real_quant_load_weights_rejects_non_scalar_kv_scale(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_attention(backend, attention)
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: True,
+    )
+
+    with pytest.raises(ValueError, match="Only scalar FP8 KV scale refit"):
+        extension._load_weights([("model.layers.0.self_attn.k_scale", torch.ones(2))])
+
+
+def test_real_quant_load_weights_records_self_attention_kv_scales(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_named_attention(
+        backend, attention, module_name="layers.0.self_attention.attn"
+    )
+    forwarded = []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        "_load_weights",
+        lambda self, weights: forwarded.extend(weights) or "loaded",
+    )
+
+    assert (
+        extension._load_weights(
+            [
+                ("model.layers.0.self_attention.k_scale", torch.tensor([2.0])),
+                ("model.layers.0.mlp.down_proj.weight", torch.ones(1)),
+            ]
+        )
+        == "loaded"
+    )
+
+    assert extension._pending_kv_cache_scales == {
+        "model.layers.0.self_attention.k_scale": 2.0
+    }
+    assert [name for name, _ in forwarded] == ["model.layers.0.mlp.down_proj.weight"]
+
+
+def test_apply_kv_cache_scales_updates_buffers_and_invalidates_cache(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_attention(backend, attention)
+
+    summary = extension.apply_kv_cache_scales(
+        {
+            "model.layers.0.self_attn.attn.q_scale": 1.0,
+            "model.layers.0.self_attn.k_scale": 2.0,
+            "model.layers.0.self_attn.v_scale": 3.0,
+        }
+    )
+
+    assert summary["applied"] == {"q": 1, "k": 1, "v": 1}
+    torch.testing.assert_close(attention._q_scale, torch.tensor(1.0))
+    torch.testing.assert_close(attention._k_scale, torch.tensor(2.0))
+    torch.testing.assert_close(attention._v_scale, torch.tensor(3.0))
+    assert attention._q_scale_float == 1.0
+    assert attention._k_scale_float == 2.0
+    assert attention._v_scale_float == 3.0
+    assert attention.impl.bmm1_scale is None
+    assert attention.impl.bmm2_scale is None
+    assert attention.impl.o_sf_scale is None
+    assert attention._o_scale_float is None
+
+    snapshot = extension.get_kv_cache_scale_snapshot()
+    assert snapshot["model.layers.0.self_attn.attn.q_scale"]["host"] == 1.0
+    assert snapshot["model.layers.0.self_attn.k_scale"]["host"] == 2.0
+    assert snapshot["model.layers.0.self_attn.v_scale"]["host"] == 3.0
+
+
+def test_apply_kv_cache_scales_uses_named_modules_fallback(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_named_attention(backend, attention)
+
+    summary = extension.apply_kv_cache_scales({"model.layers.0.self_attn.k_scale": 2.0})
+
+    assert summary["applied"] == {"q": 0, "k": 1, "v": 0}
+    torch.testing.assert_close(attention._k_scale, torch.tensor(2.0))
+
+
+def test_apply_kv_cache_scales_clears_pending_after_implicit_apply(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_attention(backend, attention)
+    extension._pending_kv_cache_scales = {"model.layers.0.self_attn.k_scale": 2.0}
+
+    summary = extension.apply_kv_cache_scales()
+
+    assert summary["applied"] == {"q": 0, "k": 1, "v": 0}
+    assert extension._pending_kv_cache_scales == {}
+    torch.testing.assert_close(attention._k_scale, torch.tensor(2.0))
+
+
+def test_apply_kv_cache_scales_accepts_self_attention_keys(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_named_attention(
+        backend, attention, module_name="layers.0.self_attention.attn"
+    )
+
+    summary = extension.apply_kv_cache_scales(
+        {"model.layers.0.self_attention.k_scale": 2.0}
+    )
+
+    assert summary["applied"] == {"q": 0, "k": 1, "v": 0}
+    torch.testing.assert_close(attention._k_scale, torch.tensor(2.0))
+
+
+def test_apply_kv_cache_scales_validates_before_mutating(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_attention(backend, attention)
+
+    with pytest.raises(KeyError, match="missing or malformed"):
+        extension.apply_kv_cache_scales(
+            {
+                "model.layers.0.self_attn.k_scale": 2.0,
+                "model.layers.99.self_attn.k_scale": 3.0,
+            }
+        )
+
+    torch.testing.assert_close(attention._k_scale, torch.tensor(1.0))
+
+
+def test_apply_kv_cache_scales_rejects_nonpositive_scale(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_attention(backend, attention)
+
+    with pytest.raises(ValueError, match="Invalid FP8 KV cache scale"):
+        extension.apply_kv_cache_scales({"model.layers.0.self_attn.k_scale": 0.0})
+
+    torch.testing.assert_close(attention._k_scale, torch.tensor(1.0))
+
+
+def test_apply_kv_cache_scales_rejects_all_default_scales(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch)
+
+    attention = _FakeAttention()
+    extension = _make_extension_with_attention(backend, attention)
+
+    with pytest.raises(RuntimeError, match="all 1.0"):
+        extension.apply_kv_cache_scales(
+            {
+                "model.layers.0.self_attn.attn.q_scale": 1.0,
+                "model.layers.0.self_attn.k_scale": 1.0,
+                "model.layers.0.self_attn.v_scale": 1.0,
+            }
+        )
+
+
+def test_apply_kv_cache_scales_rejects_non_unit_q_scale_on_unsupported_backend(
+    monkeypatch,
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch)
+
+    attention = _FakeAttention(backend_name="TRITON_ATTN")
+    extension = _make_extension_with_attention(backend, attention)
+
+    with pytest.raises(RuntimeError, match="does not support non-1.0 q_scale"):
+        extension.apply_kv_cache_scales({"model.layers.0.self_attn.attn.q_scale": 2.0})
+
+
+def test_apply_kv_cache_scales_checks_logical_q_scale_before_fnuz_adjustment(
+    monkeypatch,
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    _install_fake_vllm_platform(monkeypatch, fp8_fnuz=True)
+
+    attention = _FakeAttention(backend_name="TRITON_ATTN")
+    extension = _make_extension_with_attention(backend, attention)
+
+    extension.apply_kv_cache_scales({"model.layers.0.self_attn.attn.q_scale": 1.0})
+    torch.testing.assert_close(attention._q_scale, torch.tensor(2.0))
+
+    attention = _FakeAttention(backend_name="TRITON_ATTN")
+    extension = _make_extension_with_attention(backend, attention)
+    with pytest.raises(RuntimeError, match="does not support non-1.0 q_scale"):
+        extension.apply_kv_cache_scales({"model.layers.0.self_attn.attn.q_scale": 0.5})
+    torch.testing.assert_close(attention._q_scale, torch.tensor(1.0))
+
+
 def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
@@ -579,17 +901,28 @@ def test_real_quant_collective_reload_runs_modelopt_hooks(monkeypatch):
         "modelopt_process_weights_after_loading",
         lambda model_arg: calls.append(("process", model_arg)),
     )
+
+    def fake_collective(self):
+        calls.append("collective")
+        self._pending_kv_cache_scales = {"model.layers.0.self_attn.k_scale": 2.0}
+        return True
+
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "update_weights_from_collective",
-        lambda self: True,
+        fake_collective,
     )
     extension.device = torch.device("cpu")
+    extension._maybe_process_fp8_kv_cache = lambda: calls.append("kv")
+    extension.apply_kv_cache_scales = lambda: calls.append("apply")
 
     assert extension.update_weights_from_collective() is True
     assert calls == [
         ("prepare", model, torch.device("cpu")),
+        "collective",
         ("process", model),
+        "kv",
+        "apply",
     ]
 
 
@@ -810,6 +1143,37 @@ def test_non_real_quant_ipc_delegates(monkeypatch):
     )
 
     assert extension.update_weights_via_ipc_zmq() == "delegated"
+
+
+def test_real_quant_fp8_kv_processing_skips_base_post_load(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    calls = []
+    monkeypatch.setattr(
+        backend.VllmInternalWorkerExtension,
+        "_maybe_process_fp8_kv_cache",
+        lambda self: calls.append("base"),
+    )
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: True,
+    )
+
+    extension._maybe_process_fp8_kv_cache()
+
+    assert calls == []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: False,
+    )
+
+    extension._maybe_process_fp8_kv_cache()
+
+    assert calls == ["base"]
 
 
 def test_weight_snapshot_returns_cpu_clone_and_missing_name_raises(monkeypatch):

@@ -36,6 +36,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.utils import validate_vllm_fp8_kv_cache_config
 from nemo_rl.models.generation.vllm.vllm_worker import (
     _resolve_enable_prefix_caching,
 )
@@ -136,6 +137,65 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+def test_apply_kv_cache_scales_dispatches_rank0_collective_rpc(monkeypatch):
+    vllm_generation = object.__new__(VllmGeneration)
+    vllm_generation.cfg = {"vllm_cfg": {"async_engine": False}}
+    vllm_generation.worker_group = MagicMock()
+    vllm_generation.worker_group.run_all_workers_single_data.return_value = [
+        "worker-future",
+        None,
+    ]
+    monkeypatch.setattr(ray, "get", lambda futures: [{"applied": {"k": 1}}, None])
+
+    result = vllm_generation.apply_kv_cache_scales(
+        {"model.layers.0.self_attn.k_scale": 2.0}
+    )
+
+    vllm_generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "apply_kv_cache_scales",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        kv_scales={"model.layers.0.self_attn.k_scale": 2.0},
+    )
+    assert result == {"workers": [{"applied": {"k": 1}}]}
+
+
+def test_apply_kv_cache_scales_rejects_async_engine():
+    vllm_generation = object.__new__(VllmGeneration)
+    vllm_generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    vllm_generation.worker_group = MagicMock()
+
+    with pytest.raises(RuntimeError, match="async_engine=False"):
+        vllm_generation.apply_kv_cache_scales({})
+
+
+def test_get_kv_cache_scale_snapshot_dispatches_rank0_collective_rpc(monkeypatch):
+    vllm_generation = object.__new__(VllmGeneration)
+    vllm_generation.cfg = {"vllm_cfg": {"async_engine": False}}
+    vllm_generation.worker_group = MagicMock()
+    vllm_generation.worker_group.run_all_workers_single_data.return_value = [
+        "worker-future",
+        None,
+    ]
+    monkeypatch.setattr(ray, "get", lambda futures: [{"scale": 2.0}, None])
+
+    result = vllm_generation.get_kv_cache_scale_snapshot()
+
+    vllm_generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "get_kv_cache_scale_snapshot",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    assert result == {"workers": [{"scale": 2.0}]}
+
+
+def test_get_kv_cache_scale_snapshot_rejects_async_engine():
+    vllm_generation = object.__new__(VllmGeneration)
+    vllm_generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    vllm_generation.worker_group = MagicMock()
+
+    with pytest.raises(RuntimeError, match="async_engine=False"):
+        vllm_generation.get_kv_cache_scale_snapshot()
 
 
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
@@ -2445,9 +2505,26 @@ def test_vllm_generation_with_megatron_training(
     if vllm_precision == "fp8":
         skip_fp8_known_failures()
 
-    # Skip invalid configurations: kv_cache_dtype=fp8 requires precision=fp8
-    if kv_cache_dtype == "fp8" and vllm_precision != "fp8":
-        pytest.skip("kv_cache_dtype='fp8' requires precision='fp8'")
+    try:
+        validate_vllm_fp8_kv_cache_config(
+            {
+                "quant_cfg": None,
+                "dtensor_cfg": {"enabled": False},
+                "megatron_cfg": {"pipeline_model_parallel_size": 1},
+            },
+            {
+                "backend": "vllm",
+                "real_quant": False,
+                "quant_cfg": None,
+                "vllm_cfg": {
+                    "precision": vllm_precision,
+                    "kv_cache_dtype": kv_cache_dtype or "auto",
+                },
+            },
+            use_async_rollouts=False,
+        )
+    except AssertionError as exc:
+        pytest.skip(str(exc))
 
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")

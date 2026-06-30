@@ -227,6 +227,82 @@ def test_distillation_train_max_steps(mock_components):
     assert mock_components["student_policy"].train.call_count == 5
 
 
+def test_distillation_rejects_initial_validation_before_fp8_kv_calibration(
+    mock_components,
+):
+    master_config = mock_components["master_config"]
+    master_config.distillation["max_num_steps"] = 0
+    master_config.distillation["val_at_start"] = True
+    student_generation = MagicMock()
+    student_generation.requires_kv_scale_sync = True
+
+    with pytest.raises(ValueError, match="val_at_start=True"):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            student_generation,
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            master_config,
+        )
+
+
+def test_distillation_calibrates_and_refits_fp8_kv_scales(mock_components):
+    master_config = mock_components["master_config"]
+    master_config.distillation["max_num_steps"] = 1
+    master_config.distillation["max_num_epochs"] = 1
+    master_config.distillation["val_period"] = 0
+    student_generation = MagicMock()
+    student_generation.requires_kv_scale_sync = True
+    kv_scales = {
+        "model.layers.0.self_attn.attn.q_scale": 0.001,
+        "model.layers.0.self_attn.k_scale": 0.002,
+        "model.layers.0.self_attn.v_scale": 0.003,
+    }
+    mock_components["student_policy"].calibrate_qkv_fp8_scales.return_value = {
+        "layers": kv_scales
+    }
+    rollout_batch = next(iter(mock_components["train_dataloader"]))
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            return_value=(rollout_batch, {"mean_gen_tokens_per_sample": 3.0}),
+        ),
+        patch("nemo_rl.algorithms.distillation.refit_policy_generation") as mock_refit,
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            student_generation,
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            master_config,
+        )
+
+    assert mock_components["student_policy"].calibrate_qkv_fp8_scales.call_count == 2
+    for call in mock_components[
+        "student_policy"
+    ].calibrate_qkv_fp8_scales.call_args_list:
+        assert call.kwargs["include_q"] is True
+    mock_refit.assert_called_once()
+    assert mock_refit.call_args.kwargs["kv_scales"] == kv_scales
+
+
 def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     master_config = mock_components["master_config"]
     master_config.distillation["max_num_steps"] = 1

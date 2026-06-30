@@ -31,6 +31,8 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
+    _raise_if_initial_validation_requires_kv_scale_sync,
+    _validate_calibrated_fp8_kv_scales,
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
@@ -71,6 +73,7 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.utils import validate_vllm_fp8_kv_cache_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -570,22 +573,11 @@ def setup(
             assert loss_config.use_importance_sampling_correction is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
-            # FP8 KV cache requires FP8 model precision
-            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
-                "FP8 KV cache can only be used together with FP8 model weights."
-            )
-            # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not _should_use_async_rollouts(master_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-            )
+        validate_vllm_fp8_kv_cache_config(
+            policy_config,
+            generation_config,
+            use_async_rollouts=_should_use_async_rollouts(master_config),
+        )
 
         ## make vllm hf overrides match the training policy
         generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
@@ -934,6 +926,11 @@ def ppo_train(
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Run validation at the start if configured
+    _raise_if_initial_validation_requires_kv_scale_sync(
+        val_at_start=val_at_start,
+        current_step=current_step,
+        sync_kv_scales=sync_kv_scales,
+    )
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
@@ -1023,6 +1020,10 @@ def ppo_train(
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                                 calibration_data, include_q=True
                             )["layers"]
+                            _validate_calibrated_fp8_kv_scales(
+                                kv_scales_cache,
+                                context="initial rollout refit",
+                            )
 
                         refit_policy_generation(
                             policy,
@@ -1314,6 +1315,10 @@ def ppo_train(
                         kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                             train_data, include_q=True
                         )["layers"]
+                        _validate_calibrated_fp8_kv_scales(
+                            kv_scales_cache,
+                            context="post-training refit",
+                        )
                         POLICY_GENERATION_STALE = True
 
                 is_last_step = (total_steps + 1 >= max_num_steps) or (

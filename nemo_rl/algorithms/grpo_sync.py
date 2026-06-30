@@ -51,8 +51,10 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
+    _raise_if_initial_validation_requires_kv_scale_sync,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
+    _validate_calibrated_fp8_kv_scales,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
     scale_rewards,
@@ -432,6 +434,12 @@ def grpo_train_sync(
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
+    _raise_if_initial_validation_requires_kv_scale_sync(
+        val_at_start=val_at_start,
+        current_step=current_step,
+        sync_kv_scales=sync_kv_scales,
+    )
+
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
     # bootstraps the controller and attaches workers; ``policy.dp_cfg``
@@ -601,6 +609,10 @@ def grpo_train_sync(
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                                 calibration_data, include_q=True
                             )["layers"]
+                            _validate_calibrated_fp8_kv_scales(
+                                kv_scales_cache,
+                                context="initial rollout refit",
+                            )
 
                         refit_policy_generation(
                             policy,
@@ -924,6 +936,10 @@ def grpo_train_sync(
                             calibration_data,
                             include_q=True,
                         )["layers"]
+                        _validate_calibrated_fp8_kv_scales(
+                            kv_scales_cache,
+                            context="post-training refit",
+                        )
                         POLICY_GENERATION_STALE = True
 
                 # Stash input_ids and content before clear_samples so the

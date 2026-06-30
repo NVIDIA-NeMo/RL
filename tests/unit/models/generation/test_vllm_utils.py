@@ -18,12 +18,16 @@ import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+    validate_vllm_qkv_scale_completeness,
+)
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
+    validate_vllm_fp8_kv_cache_config,
 )
 
 
@@ -32,6 +36,120 @@ def _mk_inputs(batch_size: int = 2, seq_len: int = 5):
     # make second example shorter
     input_lengths = torch.tensor([seq_len, seq_len - 2])
     return input_ids, input_lengths
+
+
+def _fp8_kv_policy_generation_configs():
+    policy_config = {
+        "quant_cfg": None,
+        "dtensor_cfg": {"enabled": False},
+        "megatron_cfg": {"pipeline_model_parallel_size": 1},
+    }
+    generation_config = {
+        "backend": "vllm",
+        "real_quant": False,
+        "quant_cfg": None,
+        "vllm_cfg": {
+            "precision": "bfloat16",
+            "kv_cache_dtype": "fp8_e4m3",
+            "async_engine": False,
+        },
+    }
+    return policy_config, generation_config
+
+
+def test_validate_vllm_fp8_kv_cache_accepts_fp8_precision():
+    policy_config, generation_config = _fp8_kv_policy_generation_configs()
+    generation_config["vllm_cfg"]["precision"] = "fp8"
+
+    validate_vllm_fp8_kv_cache_config(
+        policy_config, generation_config, use_async_rollouts=False
+    )
+
+
+def test_validate_vllm_fp8_kv_cache_accepts_modelopt_qarl_bf16_precision():
+    policy_config, generation_config = _fp8_kv_policy_generation_configs()
+    policy_config["quant_cfg"] = "NVFP4_DEFAULT_CFG"
+    generation_config["real_quant"] = True
+    generation_config["quant_cfg"] = "NVFP4_DEFAULT_CFG"
+
+    validate_vllm_fp8_kv_cache_config(
+        policy_config, generation_config, use_async_rollouts=False
+    )
+
+
+def test_validate_vllm_fp8_kv_cache_accepts_bf16_weights_without_modelopt_quant():
+    policy_config, generation_config = _fp8_kv_policy_generation_configs()
+
+    validate_vllm_fp8_kv_cache_config(
+        policy_config, generation_config, use_async_rollouts=False
+    )
+
+
+def test_validate_vllm_fp8_kv_cache_rejects_unsupported_weight_precision():
+    policy_config, generation_config = _fp8_kv_policy_generation_configs()
+    generation_config["vllm_cfg"]["precision"] = "float16"
+
+    with pytest.raises(AssertionError, match="bfloat16 or fp8"):
+        validate_vllm_fp8_kv_cache_config(
+            policy_config, generation_config, use_async_rollouts=False
+        )
+
+
+def test_validate_vllm_fp8_kv_cache_rejects_async_rollouts():
+    policy_config, generation_config = _fp8_kv_policy_generation_configs()
+    policy_config["quant_cfg"] = "NVFP4_DEFAULT_CFG"
+    generation_config["real_quant"] = True
+    generation_config["quant_cfg"] = "NVFP4_DEFAULT_CFG"
+
+    with pytest.raises(AssertionError, match="Async rollouts"):
+        validate_vllm_fp8_kv_cache_config(
+            policy_config, generation_config, use_async_rollouts=True
+        )
+
+
+def test_validate_vllm_fp8_kv_cache_rejects_dtensor_policy():
+    policy_config, generation_config = _fp8_kv_policy_generation_configs()
+    generation_config["vllm_cfg"]["precision"] = "fp8"
+    policy_config["dtensor_cfg"]["enabled"] = True
+
+    with pytest.raises(AssertionError, match="DTensor backend"):
+        validate_vllm_fp8_kv_cache_config(
+            policy_config, generation_config, use_async_rollouts=False
+        )
+
+
+def test_validate_vllm_fp8_kv_cache_rejects_pipeline_parallel_policy():
+    policy_config, generation_config = _fp8_kv_policy_generation_configs()
+    generation_config["vllm_cfg"]["precision"] = "fp8"
+    policy_config["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+
+    with pytest.raises(AssertionError, match="pipeline_model_parallel_size=1"):
+        validate_vllm_fp8_kv_cache_config(
+            policy_config, generation_config, use_async_rollouts=False
+        )
+
+
+def test_validate_vllm_qkv_scale_completeness_accepts_global_superset():
+    expected = [
+        "model.layers.0.self_attn.attn.q_scale",
+        "model.layers.0.self_attn.k_scale",
+        "model.layers.0.self_attn.v_scale",
+    ]
+    kv_scales = {name: 0.1 for name in [*expected, "model.layers.1.self_attn.k_scale"]}
+
+    validate_vllm_qkv_scale_completeness(expected, kv_scales)
+
+
+def test_validate_vllm_qkv_scale_completeness_rejects_missing_component():
+    expected = [
+        "model.layers.0.self_attn.attn.q_scale",
+        "model.layers.0.self_attn.k_scale",
+        "model.layers.0.self_attn.v_scale",
+    ]
+    kv_scales = {name: 0.1 for name in expected[:-1]}
+
+    with pytest.raises(RuntimeError, match="payload is incomplete"):
+        validate_vllm_qkv_scale_completeness(expected, kv_scales)
 
 
 def test_vllm_utils_regular_llm_path():

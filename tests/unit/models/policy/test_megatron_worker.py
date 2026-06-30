@@ -75,6 +75,40 @@ def test_megatron_prepare_for_training_restores_optimizer():
     assert restored_devices == ["cuda"]
 
 
+def test_core_attention_name_match_excludes_child_quantizers():
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    helper_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_is_self_attention_core_attention_module_name"
+    )
+    module = ast.Module(body=[helper_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace: dict[str, object] = {}
+    exec(compile(module, str(source_path), "exec"), namespace)
+    _is_self_attention_core_attention_module_name = namespace[
+        "_is_self_attention_core_attention_module_name"
+    ]
+
+    assert _is_self_attention_core_attention_module_name(
+        "module.module.decoder.layers.0.self_attention.core_attention"
+    )
+    assert not _is_self_attention_core_attention_module_name(
+        "module.module.decoder.layers.0.self_attention.core_attention.q_bmm_quantizer"
+    )
+    assert not _is_self_attention_core_attention_module_name(
+        "module.module.decoder.layers.0.self_attention.core_attention.k_bmm_quantizer"
+    )
+    assert not _is_self_attention_core_attention_module_name(
+        "module.module.decoder.layers.0.self_attention.core_attention.v_bmm_quantizer"
+    )
+
+
 def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
     """_set_moe_grad_scale_func should set/clear moe_grad_scale_func on the config."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (

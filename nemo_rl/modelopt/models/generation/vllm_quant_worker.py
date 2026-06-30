@@ -53,6 +53,7 @@ def _configure_quant_engine_kwargs(
         hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
         hf_overrides["quantization_config"] = build_vllm_modelopt_nvfp4_config(
             ignore=cfg.get("real_quant_ignore"),
+            kv_cache_dtype=cfg.get("vllm_cfg", {}).get("kv_cache_dtype"),
         )
         llm_kwargs["quantization"] = "modelopt"
     else:

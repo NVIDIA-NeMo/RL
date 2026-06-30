@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import os
 import time
 import warnings
@@ -91,6 +92,10 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.utils import (
+    can_sync_apply_fp8_kv,
+    validate_vllm_fp8_kv_cache_config,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -999,22 +1004,11 @@ def setup(
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
-            # FP8 KV cache requires FP8 model precision
-            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
-                "FP8 KV cache can only be used together with FP8 model weights."
-            )
-            # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not _should_use_async_rollouts(master_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-            )
+        validate_vllm_fp8_kv_cache_config(
+            policy_config,
+            generation_config,
+            use_async_rollouts=_should_use_async_rollouts(master_config),
+        )
 
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
@@ -1892,7 +1886,8 @@ def refit_policy_generation(
             else:
                 # Original ZMQ IPC path for vLLM
                 futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
+                    buffer_size_bytes=buffer_size_bytes,
+                    kv_scales=kv_scales,
                 )
                 futures_inference = policy_generation.update_weights_via_ipc_zmq()
                 # wait for all futures to complete
@@ -1934,9 +1929,88 @@ def refit_policy_generation(
     # Megatron non-colocated inference needs to enter inference mode after refit.
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
+        if (
+            kv_scales is not None
+            and not isinstance(policy_generation, MegatronGeneration)
+            and can_sync_apply_fp8_kv(getattr(policy_generation, "cfg", {}))
+            and hasattr(policy_generation, "apply_kv_cache_scales")
+        ):
+            policy_generation.apply_kv_cache_scales(kv_scales)
 
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.resume_after_refit()
+
+
+def _raise_if_initial_validation_requires_kv_scale_sync(
+    *,
+    val_at_start: bool,
+    current_step: int,
+    sync_kv_scales: bool,
+) -> None:
+    if not (val_at_start and current_step == 0 and sync_kv_scales):
+        return
+
+    raise ValueError(
+        "val_at_start=True is not supported when the generation backend requires "
+        "FP8 KV-cache scale synchronization. Initial validation happens before a "
+        "rollout/training batch has produced calibrated KV scales, so validating "
+        "after a refit would use unauthoritative KV scales. Set val_at_start=False "
+        "and use val_period/val_at_end validation after the first calibrated refit."
+    )
+
+
+def _summarize_fp8_kv_scales(kv_scales: dict[str, Any]) -> dict[str, Any]:
+    values = []
+    counts = {"q": 0, "k": 0, "v": 0, "unknown": 0}
+    for name, value in kv_scales.items():
+        scale = float(value)
+        values.append(scale)
+        if name.endswith(".q_scale"):
+            counts["q"] += 1
+        elif name.endswith(".k_scale"):
+            counts["k"] += 1
+        elif name.endswith(".v_scale"):
+            counts["v"] += 1
+        else:
+            counts["unknown"] += 1
+
+    non_default = sum(
+        not math.isclose(value, 1.0, rel_tol=0.0, abs_tol=1e-12) for value in values
+    )
+    return {
+        "total": len(values),
+        "counts": counts,
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+        "non_default": non_default,
+        "zero_or_negative": sum(value <= 0.0 for value in values),
+        "non_finite": sum(not math.isfinite(value) for value in values),
+    }
+
+
+def _validate_calibrated_fp8_kv_scales(
+    kv_scales: dict[str, Any],
+    *,
+    context: str,
+) -> dict[str, Any]:
+    summary = _summarize_fp8_kv_scales(kv_scales)
+    print(f"FP8 KV scale summary ({context}): {summary}", flush=True)
+
+    if summary["total"] == 0:
+        raise RuntimeError(f"No FP8 KV cache scales were produced during {context}.")
+    if summary["non_finite"] > 0 or summary["zero_or_negative"] > 0:
+        raise RuntimeError(f"Invalid FP8 KV cache scales during {context}: {summary}")
+    counts = summary["counts"]
+    if counts["unknown"] > 0 or not (counts["q"] == counts["k"] == counts["v"]):
+        raise RuntimeError(
+            f"Incomplete FP8 Q/K/V cache scales during {context}: {summary}"
+        )
+    if summary["non_default"] == 0:
+        raise RuntimeError(
+            f"FP8 KV cache scales stayed at the default value 1.0 during {context}; "
+            "this means calibration did not produce authoritative scales."
+        )
+    return summary
 
 
 def _log_mixed_rewards_and_advantages_information(
@@ -2160,7 +2234,11 @@ def grpo_train(
     adv_estimator = _create_advantage_estimator(master_config)
 
     # Run validation at the start if configured
-    # TODO: Add validation with kv scales if needed
+    _raise_if_initial_validation_requires_kv_scale_sync(
+        val_at_start=val_at_start,
+        current_step=current_step,
+        sync_kv_scales=sync_kv_scales,
+    )
     if val_at_start and current_step == 0:
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
@@ -2280,6 +2358,10 @@ def grpo_train(
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                                 calibration_data, include_q=True
                             )["layers"]
+                            _validate_calibrated_fp8_kv_scales(
+                                kv_scales_cache,
+                                context="initial rollout refit",
+                            )
 
                         refit_policy_generation(
                             policy,
@@ -2704,6 +2786,10 @@ def grpo_train(
                         kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                             train_data, include_q=True
                         )["layers"]
+                        _validate_calibrated_fp8_kv_scales(
+                            kv_scales_cache,
+                            context="post-training refit",
+                        )
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
 

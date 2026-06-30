@@ -134,6 +134,10 @@ def _model_self_packs_for_cp(model: Any) -> bool:
     return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
 
 
+def _is_self_attention_core_attention_module_name(name: str) -> bool:
+    return name.endswith("self_attention.core_attention")
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
@@ -1275,10 +1279,6 @@ class MegatronPolicyWorkerImpl(
         This helper is used by both IPC-based streaming and collective broadcast
         so that the logic for adding KV scales stays consistent in one place.
         """
-        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
-            get_vllm_qkv_scale_names,
-        )
-
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
@@ -1315,14 +1315,7 @@ class MegatronPolicyWorkerImpl(
         if not use_fp8_kv_cache:
             return
 
-        # Append KV (and potentially Q) scale entries to match metadata.
-        num_layers = self.megatron_bridge.transformer_config.num_layers
-        keys: list[str] = []
-        for layer_idx in range(num_layers):
-            scale_names = get_vllm_qkv_scale_names(layer_idx)
-            keys.extend(scale_names.values())
-
-        for param_name in keys:
+        for param_name in self._get_vllm_kv_scale_names(kv_scales):
             if kv_scales and param_name in kv_scales:
                 scale_value = kv_scales[param_name]
             else:
@@ -1331,6 +1324,65 @@ class MegatronPolicyWorkerImpl(
                 scale_value, dtype=torch.float32, device="cuda"
             ).reshape(1)
             yield param_name, scale_tensor
+
+    def _get_vllm_kv_scale_names(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[str]:
+        """Return vLLM transport keys for attention KV/Q scales."""
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            get_attention_layer_indices_from_param_names,
+            get_vllm_qkv_scale_names,
+            validate_vllm_qkv_scale_completeness,
+        )
+
+        param_names = []
+        for task in getattr(self, "refit_conversion_tasks", []):
+            mapping = getattr(task, "mapping", None)
+            hf_param = getattr(mapping, "hf_param", None)
+            if isinstance(hf_param, str):
+                param_names.append(hf_param)
+            param_name = getattr(task, "param_name", None)
+            if isinstance(param_name, str):
+                param_names.append(param_name)
+
+        layer_indices = get_attention_layer_indices_from_param_names(param_names)
+        if not layer_indices:
+            transformer_config = self.megatron_bridge.transformer_config
+            layer_types = getattr(transformer_config, "layers_block_type", None)
+            if layer_types is None:
+                layer_types = getattr(transformer_config, "layer_types", None)
+            if isinstance(layer_types, (list, tuple)):
+                layer_indices = [
+                    idx
+                    for idx, layer_type in enumerate(layer_types)
+                    if "attention" in str(layer_type).lower()
+                ]
+            elif layer_types is not None:
+                raise RuntimeError(
+                    "Unable to derive attention layer ids for FP8 KV scale emission "
+                    f"from layer metadata type {type(layer_types).__name__}."
+                )
+            else:
+                num_layers = getattr(transformer_config, "num_layers", None)
+                if isinstance(num_layers, int) and num_layers > 0:
+                    layer_indices = list(range(num_layers))
+
+        if not layer_indices:
+            raise RuntimeError(
+                "Unable to derive attention layer ids for FP8 KV scale emission. "
+                "Provide calibrated kv_scales or ensure refit conversion tasks include "
+                "HF attention parameter names."
+            )
+
+        keys: list[str] = []
+        for layer_idx in layer_indices:
+            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
+
+        if kv_scales is not None:
+            validate_vllm_qkv_scale_completeness(keys, kv_scales)
+            return list(kv_scales)
+        return keys
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
@@ -1850,7 +1902,7 @@ class MegatronPolicyWorkerImpl(
         matched_modules = []
         # Try to register forward_pre_hook on core_attention first
         for name, module in self.model.named_modules():
-            if "self_attention.core_attention" in name:
+            if _is_self_attention_core_attention_module_name(name):
                 try:
                     handle = module.register_forward_pre_hook(
                         _pre_hook_builder_core_attention(name)
