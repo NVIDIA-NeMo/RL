@@ -314,6 +314,8 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    refit_transport: null  # Set to "vllm_s3_sparse" to use S3 sparse-delta refit.
+    delta_compression: null  # S3 sparse-delta refit config; null uses the existing refit path.
     mcore_generation_config:
       async_engine: false
       max_model_len: ${policy.max_total_sequence_length}
@@ -351,6 +353,9 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
+      expose_http_refit_server: false # Start the internal sparse-delta refit endpoint on vLLM workers.
+      http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
+      http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs

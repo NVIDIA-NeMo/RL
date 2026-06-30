@@ -93,6 +93,11 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
+from nemo_rl.utils.weight_transfer_s3_manifest import (
+    init_sparse_delta_baseline_from_iterator,
+    stream_sparse_delta_payloads_via_s3_manifest,
+)
+from nemo_rl.utils.weight_transfer_sparse_codec import DeltaCompressionTracker
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -340,6 +345,12 @@ class MegatronPolicyWorkerImpl(
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
+        delta_config = self.cfg.get("generation", {}).get("delta_compression")
+        self.delta_weight_transfer_tracker = (
+            DeltaCompressionTracker(delta_config)
+            if delta_config and delta_config["enabled"]
+            else None
+        )
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
@@ -1210,6 +1221,53 @@ class MegatronPolicyWorkerImpl(
         elif hasattr(model, "config"):
             return model.config
         return None
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/init_remote_sparse_delta_baseline")
+    def init_remote_sparse_delta_baseline(
+        self,
+        *,
+        shard_rank: int = 0,
+        shard_count: int = 1,
+    ) -> None:
+        """Initialize the source-side baseline for remote sparse S3 refit."""
+        init_sparse_delta_baseline_from_iterator(
+            self._iter_params_with_optional_kv_scales(),
+            delta_tracker=self.delta_weight_transfer_tracker,
+            shard_rank=shard_rank,
+            shard_count=shard_count,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_sparse_weights_via_s3_manifest")
+    def stream_sparse_weights_via_s3_manifest(
+        self,
+        refit_urls: list[str],
+        *,
+        api_key_env_var: Optional[str] = None,
+        timeout_s: float = 600.0,
+        shard_rank: int = 0,
+        shard_count: int = 1,
+    ) -> dict[str, Any]:
+        """Upload vLLM refit payloads to S3 and post receiver manifests."""
+        return stream_sparse_delta_payloads_via_s3_manifest(
+            self._iter_params_with_optional_kv_scales(),
+            delta_tracker=self.delta_weight_transfer_tracker,
+            refit_urls=refit_urls,
+            api_key_env_var=api_key_env_var,
+            timeout_s=timeout_s,
+            shard_rank=shard_rank,
+            shard_count=shard_count,
+        )
+
+    def finish_remote_sparse_delta_sync(self, *, succeeded: bool) -> None:
+        tracker = self.delta_weight_transfer_tracker
+        if tracker is None:
+            raise RuntimeError("Sparse delta tracker is not initialized.")
+        if succeeded:
+            tracker.on_sync_succeeded()
+        else:
+            tracker.on_sync_failed()
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
