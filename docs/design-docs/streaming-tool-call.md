@@ -509,6 +509,30 @@ Set `STREAMING_TOOL_CALL=0` for baseline and `STREAMING_TOOL_CALL=1` for the
 enabled arm. The launcher adds `-streamtool` to the default enabled run name and
 overrides both the vLLM and Gym copies of the feature flag.
 
+For a full run with real training and in-flight weight refit, use the wrapper:
+
+```bash
+bash examples/swe_bench/run_streaming_tool_call_full.sh
+```
+
+It defaults to one training step at the exact 16-node reproduction shape
+(`NUM_VLLM_REPLICAS=32`, 8 generation nodes, 8 training nodes, and 64
+rollouts). Useful overrides are:
+
+```bash
+# Smallest valid full-training shape: 8 total nodes and 32 rollouts.
+NUM_VLLM_REPLICAS=16 bash examples/swe_bench/run_streaming_tool_call_full.sh
+
+# Use the recipe's uncapped training duration.
+MAX_NUM_STEPS=all bash examples/swe_bench/run_streaming_tool_call_full.sh
+
+# Submit the matching non-streaming full baseline.
+STREAMING_TOOL_CALL=0 bash examples/swe_bench/run_streaming_tool_call_full.sh
+
+# Validate derived resources without submitting.
+DRY_RUN=1 bash examples/swe_bench/run_streaming_tool_call_full.sh
+```
+
 ## Performance Acceptance Criteria
 
 The feature should not be enabled by default until all of these proposed gates
