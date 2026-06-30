@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 from wandb import Histogram, Table
 
+from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
     DatumSpec,
     FlatMessagesType,
@@ -55,6 +56,75 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def _add_r3_fallback_metrics(
+    gen_metrics: dict[str, float | int],
+    generation_outputs: BatchedDataDict,
+) -> None:
+    missing = generation_outputs.get("r3_routed_experts_missing_routes")
+    if missing is None:
+        return
+
+    missing_cpu = missing.detach().cpu()
+    expected = generation_outputs.get("r3_routed_experts_expected_routes")
+    actual = generation_outputs.get("r3_routed_experts_actual_routes")
+    expected_cpu = expected.detach().cpu() if expected is not None else None
+    actual_cpu = actual.detach().cpu() if actual is not None else None
+
+    missing_routes = int(missing_cpu.sum().item())
+    fallback_samples = int((missing_cpu > 0).sum().item())
+    expected_routes = int(expected_cpu.sum().item()) if expected_cpu is not None else 0
+    actual_routes = int(actual_cpu.sum().item()) if actual_cpu is not None else 0
+    gen_metrics["r3/routed_experts_fallback_samples"] = fallback_samples
+    gen_metrics["r3/routed_experts_fallback_token_routes"] = missing_routes
+    gen_metrics["r3/routed_experts_expected_token_routes"] = expected_routes
+    gen_metrics["r3/routed_experts_actual_token_routes"] = actual_routes
+    gen_metrics["r3/routed_experts_fallback_token_route_fraction"] = (
+        float(missing_routes / expected_routes) if expected_routes > 0 else 0.0
+    )
+
+
+def _attach_routed_experts_to_message_log_prefix(
+    message_log: list[dict],
+    routed_experts: torch.Tensor,
+) -> int:
+    """Attach routed-expert slices to existing messages and return prefix length."""
+    cursor = 0
+    for msg in message_log:
+        token_ids = msg.get("token_ids")
+        if not isinstance(token_ids, torch.Tensor):
+            continue
+        msg_len = int(token_ids.shape[0])
+        msg["routed_experts"] = routed_experts[cursor : cursor + msg_len]
+        cursor += msg_len
+    return cursor
+
+
+def _find_routed_experts_template(message_log: list[dict]) -> Optional[torch.Tensor]:
+    for msg in message_log:
+        routed_experts = msg.get("routed_experts")
+        if isinstance(routed_experts, torch.Tensor):
+            return routed_experts
+    return None
+
+
+def _dummy_routed_experts_for_tokens(
+    token_ids: torch.Tensor,
+    template: torch.Tensor,
+) -> torch.Tensor:
+    if template.dim() != 3:
+        raise ValueError(
+            "routed_experts messages must have shape [tokens, layers, topk], "
+            f"got {tuple(template.shape)}"
+        )
+    topk = template.shape[2]
+    default_route = torch.arange(topk, dtype=template.dtype, device=template.device)
+    return (
+        default_route.view(1, 1, topk)
+        .expand(int(token_ids.shape[0]), template.shape[1], topk)
+        .clone()
+    )
 
 
 class EffortLevelsConfig(BaseModel, extra="allow"):
@@ -214,6 +284,19 @@ def generate_responses(
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
+        if "routed_experts" in generation_outputs:
+            routed_experts = generation_outputs["routed_experts"][i]
+            prefix_length = _attach_routed_experts_to_message_log_prefix(
+                batch["message_log"][i], routed_experts
+            )
+            if prefix_length != int(input_length.item()):
+                raise RuntimeError(
+                    "message_log token length does not match generation input_length "
+                    f"({prefix_length} != {int(input_length.item())})."
+                )
+            assistant_message["routed_experts"] = routed_experts[
+                input_length:total_length
+            ]
 
         batch["message_log"][i].append(assistant_message)
 
@@ -222,6 +305,7 @@ def generate_responses(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+    _add_r3_fallback_metrics(gen_metrics, generation_outputs)
 
     # Add response_truncated to gen_metrics for use by caller
     if response_truncated is not None:
@@ -247,16 +331,35 @@ async def generate_responses_async(
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
-    # Check if this is vLLM with async_engine enabled
-    use_async_generation = (
-        hasattr(policy_generation, "cfg")
-        and "vllm_cfg" in policy_generation.cfg
-        and policy_generation.cfg["vllm_cfg"]["async_engine"]
-        and hasattr(policy_generation, "generate_async")
-    )
+    # Check if this is a supported inference engine with async generation enabled.
+    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``; vLLM and
+    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag.
+    vllm_cfg = getattr(policy_generation, "cfg", None)
+    sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
+    generation_config = vllm_cfg or sglang_cfg or {}
+    backend = generation_config.get("backend", "")
 
-    assert use_async_generation, (
-        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
+    if backend == "sglang":
+        use_async_generation = bool(generation_config.get("use_async_rollouts", False))
+    elif backend == "vllm":
+        use_async_generation = bool(
+            generation_config.get("vllm_cfg", {}).get("async_engine", False)
+        )
+    elif backend == "megatron":
+        use_async_generation = bool(
+            generation_config.get("mcore_generation_config", {}).get(
+                "async_engine", False
+            )
+        )
+    else:
+        use_async_generation = False
+
+    assert use_async_generation and hasattr(policy_generation, "generate_async"), (
+        "Async generation is not enabled. For SGLang, set "
+        "policy.generation.use_async_rollouts=True. For vLLM, set "
+        "policy.generation.vllm_cfg.async_engine=True. For Megatron, set "
+        "policy.generation.mcore_generation_config.async_engine=True. The "
+        "generation backend must also implement generate_async."
     )
 
     # Use async generation with per-sample streaming
@@ -316,6 +419,19 @@ async def generate_responses_async(
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
+        if "routed_experts" in generation_outputs:
+            routed_experts = generation_outputs["routed_experts"][i]
+            prefix_length = _attach_routed_experts_to_message_log_prefix(
+                batch["message_log"][i], routed_experts
+            )
+            if prefix_length != int(input_length.item()):
+                raise RuntimeError(
+                    "message_log token length does not match generation input_length "
+                    f"({prefix_length} != {int(input_length.item())})."
+                )
+            assistant_message["routed_experts"] = routed_experts[
+                input_length:total_length
+            ]
 
         batch["message_log"][i].append(assistant_message)
 
@@ -324,6 +440,7 @@ async def generate_responses_async(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+    _add_r3_fallback_metrics(gen_metrics, generation_outputs)
     # Attach worker metadata if present (async vLLM path)
     if "gen_leader_worker_idx" in generation_outputs:
         # generation_outputs carries this as a 1-length list per row; convert to int
@@ -394,7 +511,9 @@ def calculate_rewards(
         future_to_indices[future] = indices
 
     results = ray.get(futures)
-    all_rewards = []
+    all_rewards: list = []  # list of per-sample scalars/tensors (single-reward envs)
+    all_dict_rewards: dict[str, list] | None = None  # for dict-based multi-reward envs
+    is_dict_rewards = False
     all_env_observations = []
     all_terminateds = []
     all_next_stop_strings = []
@@ -413,15 +532,26 @@ def calculate_rewards(
             terminateds,
             answers,
         ) = result
+
+        is_dict_rewards = isinstance(task_rewards, dict)
+
         if next_stop_strings is None:
-            next_stop_strings = [None] * len(task_rewards)
+            next_stop_strings = [None] * len(terminateds)
         if answers is None:
-            answers = [None] * len(task_rewards)
+            answers = [None] * len(terminateds)
+
+        # Initialize dict-reward accumulator on first encounter (outside inner loop).
+        if is_dict_rewards and all_dict_rewards is None:
+            all_dict_rewards = {name: [] for name in task_rewards}
 
         # Store results with their original indices
         for i, idx in enumerate(indices):
             all_indices_order.append(idx)
-            all_rewards.append(task_rewards[i])
+            if is_dict_rewards:
+                for name in task_rewards:
+                    all_dict_rewards[name].append(task_rewards[name][i])  # type: ignore
+            else:
+                all_rewards.append(task_rewards[i])
             all_env_observations.append(env_observations[i])
             all_terminateds.append(terminateds[i])
             all_next_stop_strings.append(next_stop_strings[i])
@@ -433,8 +563,17 @@ def calculate_rewards(
         range(len(all_indices_order)), key=lambda k: all_indices_order[k]
     )
 
-    # Stack rewards: each element may be scalar (single-reward env) or 1d (multi-reward env).
-    if len(all_rewards) > 0 and isinstance(all_rewards[0], torch.Tensor):
+    # Build rewards: dict-based for multi-reward envs, tensor for single-reward.
+    if all_dict_rewards is not None:
+        assert len(all_rewards) == 0, (
+            "Mixing dict-based and scalar rewards across environments is not supported. "
+            "All environments must return the same reward format (all dict or all scalar)."
+        )
+        rewards: torch.Tensor | dict[str, torch.Tensor] = {
+            name: torch.stack([vals[i] for i in sorted_indices])
+            for name, vals in all_dict_rewards.items()
+        }
+    elif len(all_rewards) > 0 and isinstance(all_rewards[0], torch.Tensor):
         rewards = torch.stack([all_rewards[i] for i in sorted_indices])
     else:
         rewards = torch.tensor([all_rewards[i] for i in sorted_indices])
@@ -485,9 +624,8 @@ def run_multi_turn_rollout(
     active_indices = torch.arange(batch_size)
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
 
-    # Multi_rewards: number of components inferred from first env_output (1 for single-reward envs)
-    number_of_rewards: int | None = None
-    multi_rewards: torch.Tensor | None = None
+    # Multi-reward accumulator: dict of {name: Tensor[B]} for multi-reward envs (e.g. GDPO), None for single-reward.
+    multi_rewards: dict[str, torch.Tensor] | None = None
 
     # Initialize stop_strings from the initial batch if present
     current_stop_strings = current_batch.get("stop_strings", [None] * batch_size)
@@ -576,23 +714,20 @@ def run_multi_turn_rollout(
         # Calculate rewards and get environment feedback
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
 
-        # Infer number of reward components on first turn (supports single- and multi-reward envs)
-        if number_of_rewards is None:
-            if env_output.rewards.ndim >= 2:
-                number_of_rewards = int(env_output.rewards.shape[1])
-                multi_rewards = torch.zeros(
-                    batch_size, number_of_rewards, dtype=torch.float32
-                )
-            else:
-                number_of_rewards = 1
-                # multi_rewards left None: GRPO uses total_reward only; multi_rewards unused
-
-        # Accumulate rewards: env may return shape (N,) or (N, K)
-        if number_of_rewards > 1:
+        # Accumulate rewards: env returns dict[str, Tensor] for multi-reward, Tensor for single-reward.
+        if isinstance(env_output.rewards, dict):
+            # Initialize accumulators on first encounter
+            if multi_rewards is None:
+                multi_rewards = {
+                    name: torch.zeros(batch_size, dtype=torch.float32)
+                    for name in env_output.rewards
+                }
             # this assert is to infer the type of multi_rewards for pyrefly
             assert multi_rewards is not None
-            multi_rewards[active_indices] += env_output.rewards
-            total_rewards[active_indices] += env_output.rewards.sum(dim=1)
+            reward_dict: dict[str, torch.Tensor] = multi_rewards
+            for name, r in env_output.rewards.items():
+                reward_dict[name][active_indices] += r
+            total_rewards[active_indices] += sum(env_output.rewards.values())
         else:
             total_rewards[active_indices] += env_output.rewards
 
@@ -626,11 +761,18 @@ def run_multi_turn_rollout(
                 # Record truncation
                 sample_truncated[active_indices[i]] = True
 
-            tokenized_env_obs_message = {
+            tokenized_env_obs_message: dict[str, Any] = {
                 "role": env_output.observations[i]["role"],
                 "content": env_obs_content,
                 "token_ids": tokenized_obs,
             }
+            routed_template = _find_routed_experts_template(
+                current_batch["message_log"][global_idx]
+            )
+            if routed_template is not None:
+                tokenized_env_obs_message["routed_experts"] = (
+                    _dummy_routed_experts_for_tokens(tokenized_obs, routed_template)
+                )
             current_batch["message_log"][global_idx].append(tokenized_env_obs_message)
 
             # Record token usage - environment
@@ -671,11 +813,10 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
-    # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
+    # Expose per-component rewards for multi-reward envs (e.g. GDPO advantage calculation).
     if multi_rewards is not None:
-        num_reward_components = multi_rewards.shape[1]
-        for i in range(num_reward_components):
-            current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
+        for name, reward_tensor in multi_rewards.items():
+            current_batch[name] = reward_tensor
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -806,9 +947,7 @@ async def run_sample_multi_turn_rollout(
 
     # Sample-level metrics
     total_reward = 0.0
-    reward_acc_list: list[
-        float
-    ] = []  # per-component rewards, length set on first multi-reward
+    reward_acc_dict: dict[str, float] = {}  # per-component reward accumulators (named)
     multi_reward_seen = False
     turn_count = 0
     token_count = 0
@@ -889,15 +1028,14 @@ async def run_sample_multi_turn_rollout(
         env_output = await asyncio.to_thread(
             calculate_rewards, sample_batch, task_to_env
         )
-        # Update total reward and optional per-reward signals (reward1, reward2, ... rewardN)
-        if env_output.rewards.ndim == 2 and env_output.rewards.shape[1] >= 1:
+        # Update total reward and optional per-component reward signals.
+        if isinstance(env_output.rewards, dict):
             multi_reward_seen = True
-            n = env_output.rewards.shape[1]
-            if len(reward_acc_list) == 0:
-                reward_acc_list = [0.0] * n
-            total_reward += float(env_output.rewards[0].sum().item())
-            for j in range(n):
-                reward_acc_list[j] += float(env_output.rewards[0, j].item())
+            for name, r in env_output.rewards.items():
+                reward_acc_dict[name] = reward_acc_dict.get(name, 0.0) + float(
+                    r[0].item()
+                )
+            total_reward += sum(float(r[0].item()) for r in env_output.rewards.values())
         else:
             total_reward += float(env_output.rewards[0].item())
         # Check termination
@@ -918,11 +1056,16 @@ async def run_sample_multi_turn_rollout(
                 tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
             truncated = True
 
-        env_message = {
+        env_message: dict[str, Any] = {
             "role": env_output.observations[0]["role"],
             "content": env_obs_content,
             "token_ids": tokenized_obs,
         }
+        routed_template = _find_routed_experts_template(current_message_log)
+        if routed_template is not None:
+            env_message["routed_experts"] = _dummy_routed_experts_for_tokens(
+                tokenized_obs, routed_template
+            )
         current_message_log.append(env_message)
 
         # Update token counts
@@ -950,8 +1093,8 @@ async def run_sample_multi_turn_rollout(
         "idx": sample_idx,
     }
     if multi_reward_seen:
-        for j in range(len(reward_acc_list)):
-            final_sample_state[f"reward{j + 1}"] = torch.tensor(reward_acc_list[j])
+        for name, acc in reward_acc_dict.items():
+            final_sample_state[name] = torch.tensor(acc)
 
     # Sample metrics
     sample_metrics = {
@@ -1075,19 +1218,14 @@ def run_async_multi_turn_rollout(
             }
         )
 
-        # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs for GDPO advantage calculation.
-        # Collect all reward component keys from any sample state (samples may come from different envs).
+        # Expose per-component rewards for multi-reward envs (GDPO advantage calculation).
+        # Collect named reward keys (e.g. "reward/correctness") from sample states.
         reward_component_keys = sorted(
             set(
                 k
                 for state in final_sample_states
-                for k in state
-                if isinstance(k, str)
-                and k.startswith("reward")
-                and len(k) > 6
-                and k[6:].isdigit()
-            ),
-            key=lambda k: int(k[6:]),
+                for k in get_gdpo_reward_component_keys(state)
+            )
         )
         for key in reward_component_keys:
             # Stack per-sample values; use 0.0 for samples that did not have this component (e.g. single-reward env)
@@ -1218,7 +1356,14 @@ def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    if "vllm_cfg" in policy_generation.cfg:
+        engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    elif "mcore_generation_config" in policy_generation.cfg:
+        engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
+            "max_model_len"
+        ]
+    else:
+        engine_max_model_len = policy_generation.cfg["max_total_sequence_length"]
     if max_seq_len is not None and max_seq_len > engine_max_model_len:
         warnings.warn(
             f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
@@ -1287,7 +1432,18 @@ def run_async_nemo_gym_rollout(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        if "vllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
+                "max_model_len"
+            ]
+        elif "mcore_generation_config" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg[
+                "mcore_generation_config"
+            ]["max_model_len"]
+        else:
+            max_total_tokens_per_sample = policy_generation.cfg[
+                "max_total_sequence_length"
+            ]
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],

@@ -29,82 +29,62 @@ from tensordict import TensorDict
 
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
-from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-from ._rollout_shapes import mooncake_available
 
-# ── loud-skip helpers ─────────────────────────────────────────────────────────
+def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 
-# ── fixtures ──────────────────────────────────────────────────────────────────
+    put_calls = []
+    clear_calls = []
 
+    def fake_put(**kwargs):
+        put_calls.append(kwargs)
 
-@pytest.fixture
-def tq_client():
-    import ray
+    def fake_clear(**kwargs):
+        clear_calls.append(kwargs)
 
-    if not ray.is_initialized():
-        ray.init(local_mode=False, include_dashboard=False)
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", fake_put)
+    monkeypatch.setattr(tq_adapter.tq, "kv_clear", fake_clear)
 
-    client = build_data_plane_client(
-        {
-            "enabled": True,
-            "impl": "transfer_queue",
-            "backend": "simple",
-            "storage_capacity": 1024,
-            "num_storage_units": 1,
-            "claim_meta_poll_interval_s": 0.5,
-            "global_segment_size": 8589934592,  # 8 GiB (only read by mooncake_cpu)
-            "local_buffer_size": 1073741824,  # 1 GiB (only read by mooncake_cpu)
-        }
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client.register_partition(
+        partition_id="obj-backend",
+        fields=["msg_log"],
+        num_samples=8,
+        consumer_tasks=["read"],
     )
-    yield client
-    client.close()
-
-
-@pytest.fixture(
-    scope="module",
-    params=["simple", "mooncake_cpu"],
-    ids=["simple", "mooncake_cpu"],
-)
-def tq_client_backends(request):
-    """Parametrized fixture over simple and mooncake_cpu backends.
-
-    mooncake_cpu is skipped when the mooncake wheel is not installed.
-    Set NEMO_RL_REQUIRE_MOONCAKE=1 to promote the skip to a loud failure.
-
-    Module-scoped to dodge mooncake's close→re-init race (stale C++ mount
-    registry); safe because each test uses a distinct ``partition_id``.
-    """
-    backend = request.param
-    if backend == "mooncake_cpu" and not mooncake_available():
-        pytest.skip(
-            "mooncake not installed — skipping mooncake_cpu backend "
-            "(set NEMO_RL_REQUIRE_MOONCAKE=1 to fail loud)"
-        )
-
-    import ray
-
-    if not ray.is_initialized():
-        ray.init(local_mode=False, include_dashboard=False)
-
-    client = build_data_plane_client(
-        {
-            "enabled": True,
-            "impl": "transfer_queue",
-            "backend": backend,
-            "storage_capacity": 1024,
-            "num_storage_units": 1,
-            "claim_meta_poll_interval_s": 0.5,
-            "global_segment_size": 8589934592,  # 8 GiB
-            "local_buffer_size": 1073741824,  # 1 GiB
-        }
+    client.register_partition(
+        partition_id="obj-backend",
+        fields=["msg_log"],
+        num_samples=8,
+        consumer_tasks=["read"],
     )
-    yield client
-    client.close()
+
+    assert len(put_calls) == 2
+    schema_keys = [call["keys"][0] for call in put_calls]
+    assert len(set(schema_keys)) == 2
+    assert all(key.startswith("__schema__:obj-backend:") for key in schema_keys)
+    assert [call["partition_id"] for call in put_calls] == [
+        "obj-backend",
+        "obj-backend",
+    ]
+    assert [list(call["fields"].keys()) for call in put_calls] == [
+        ["msg_log"],
+        ["msg_log"],
+    ]
+    assert clear_calls == [
+        {"keys": [schema_keys[0]], "partition_id": "obj-backend"},
+        {"keys": [schema_keys[1]], "partition_id": "obj-backend"},
+    ]
+
+
+# ``tq_client`` (simple) and ``tq_client_backends`` (parametrized over
+# simple + mooncake_cpu) are session-scoped fixtures provided by
+# ``tests/unit/data_plane/conftest.py``. See that file for the rationale.
 
 
 def test_smoke_round_trip(tq_client) -> None:

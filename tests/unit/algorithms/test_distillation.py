@@ -339,6 +339,86 @@ def test_exit_on_timeout(mock_components, capsys):
             )
 
 
+def test_non_colocated_offloads_student_optimizer_before_teacher_inference(
+    mock_components,
+):
+    """Student optimizer state must be offloaded before the teacher is onloaded.
+
+    In non-colocated mode the refit path no longer offloads the student
+    optimizer, so it stays on the train GPUs, and the training loop must
+    offload it (offload_before_refit) before each teacher prepare_for_lp_inference
+    call, otherwise the teacher top-k forward OOMs once optimizer state
+    materializes after the first training step.
+    """
+    mock_components["master_config"].distillation["max_num_steps"] = 2
+    assert not mock_components["master_config"].policy["generation"]["colocated"][
+        "enabled"
+    ]
+
+    # Reparent the relevant child mocks onto one manager to record global call order.
+    manager = MagicMock()
+    manager.attach_mock(
+        mock_components["student_policy"].offload_before_refit, "student_offload"
+    )
+    manager.attach_mock(
+        mock_components["teacher_policy"].prepare_for_lp_inference, "teacher_prep"
+    )
+
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _default_distillation_save_state(),
+        mock_components["master_config"],
+    )
+
+    # student_generation is None so refit never runs; every offload_before_refit
+    # call comes from the teacher-inference prep path, once per step, and must
+    # immediately precede the teacher onload.
+    call_names = [name for name, _, _ in manager.mock_calls]
+    assert call_names == [
+        "student_offload",
+        "teacher_prep",
+        "student_offload",
+        "teacher_prep",
+    ]
+
+
+def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
+    mock_components,
+):
+    """In colocated mode refit already offloads the student; the loop must not."""
+    mock_components["master_config"].distillation["max_num_steps"] = 2
+    mock_components["master_config"].policy["generation"]["colocated"]["enabled"] = True
+
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _default_distillation_save_state(),
+        mock_components["master_config"],
+    )
+
+    assert mock_components["teacher_policy"].prepare_for_lp_inference.call_count == 2
+    mock_components["student_policy"].offload_before_refit.assert_not_called()
+
+
 def test_validate_function(mock_components):
     """Test independent validation function to ensure validation logic correctness."""
     # Run validation
@@ -434,6 +514,126 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert val_metrics["score"] == 0.5
     assert "full_result_debug" not in val_metrics
     assert isinstance(validation_timings, dict)
+
+
+def test_validate_logs_data_when_logger_provided(mock_components):
+    """Test that validation data is logged to JSONL when logger is provided."""
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test1",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "response1",
+                        "token_ids": torch.tensor([4, 5, 6]),
+                    },
+                ],
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+
+    mock_logger = MagicMock()
+    logged_data = {}
+
+    def capture_log(data, filename):
+        logged_data["data"] = data
+        logged_data["filename"] = filename
+
+    mock_logger.log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
+
+    master_config = mock_components["master_config"]
+    master_config.distillation["val_batch_size"] = 1
+    master_config.logger["num_val_samples_to_print"] = 1
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation._should_use_nemo_gym", return_value=False
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation._should_use_async_rollouts",
+            return_value=False,
+        ),
+        patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
+    ):
+        val_metrics, timing = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=5,
+            master_config=master_config,
+            logger=mock_logger,
+        )
+
+    mock_logger.log_batched_dict_as_jsonl.assert_called_once()
+    assert logged_data["filename"] == "val_data_step5.jsonl"
+    assert "content" in logged_data["data"]
+    assert "rewards" in logged_data["data"]
+
+
+def test_validate_works_without_logger(mock_components):
+    """Test that validation works when logger is None (backward compat)."""
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test1",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "response1",
+                        "token_ids": torch.tensor([4, 5, 6]),
+                    },
+                ],
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+
+    master_config = mock_components["master_config"]
+    master_config.logger["num_val_samples_to_print"] = 1
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation._should_use_nemo_gym", return_value=False
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation._should_use_async_rollouts",
+            return_value=False,
+        ),
+        patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
+    ):
+        val_metrics, timing = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=5,
+            master_config=master_config,
+            logger=None,
+        )
+
+    assert "accuracy" in val_metrics
+    assert "avg_length" in val_metrics
 
 
 def test_check_vocab_equality_pass(monkeypatch):

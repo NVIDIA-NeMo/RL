@@ -15,8 +15,12 @@
 from collections import defaultdict
 from typing import Any, Optional
 
+import torch
+
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+
+R3_MISSING_ROUTE_SENTINEL = -1
 
 
 def format_prompt_for_vllm_generation(
@@ -93,6 +97,99 @@ def format_prompt_for_vllm_generation(
             prompts.append(_get_regular_prompt(i))
 
     return prompts if return_all else prompts[0]
+
+
+def pad_and_align_routed_expert_indices(
+    request_output: Any,
+    completion_output: Any,
+    *,
+    valid_length: int,
+    padded_length: int,
+    device: torch.device,
+    require_complete_routed_experts: bool = False,
+    allow_missing_routed_experts_fallback: bool = True,
+    return_stats: bool = False,
+) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], dict[str, int]]:
+    """Return full-sequence-aligned routed experts as ``[S, L, topk]`` int32."""
+    routed = getattr(completion_output, "routed_experts", None)
+    prompt_routed = getattr(request_output, "prompt_routed_experts", None)
+
+    if prompt_routed is not None:
+        prompt_routed = torch.as_tensor(prompt_routed, dtype=torch.int32, device=device)
+    if routed is not None:
+        routed = torch.as_tensor(routed, dtype=torch.int32, device=device)
+
+    if prompt_routed is not None and routed is not None:
+        routed = torch.cat((prompt_routed, routed), dim=0)
+    elif prompt_routed is not None:
+        routed = prompt_routed
+
+    expected_routes = min(max(valid_length - 1, 0), padded_length)
+    stats = {
+        "actual_routes": 0,
+        "expected_routes": expected_routes,
+        "missing_routes": 0,
+        "surplus_routes": 0,
+    }
+
+    if routed is None:
+        return (None, stats) if return_stats else None
+    if routed.dim() != 3:
+        raise ValueError(
+            "vLLM routed_experts must have shape [tokens, num_moe_layers, topk], "
+            f"got {tuple(routed.shape)}"
+        )
+
+    stats["actual_routes"] = int(routed.shape[0])
+    stats["missing_routes"] = max(expected_routes - int(routed.shape[0]), 0)
+    stats["surplus_routes"] = max(int(routed.shape[0]) - (expected_routes + 1), 0)
+    if (
+        require_complete_routed_experts
+        and stats["missing_routes"] > 0
+        and not allow_missing_routed_experts_fallback
+    ):
+        # This has only been observed rarely with vLLM prefix caching plus
+        # chunked prefill: a small number of samples can omit routed-expert
+        # rows even though most requests are complete. Keep
+        # tools/model_diagnostics/6.vllm_routed_experts_completeness.py as a
+        # standalone reproducer for upstream vLLM bug reports.
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned incomplete routed_experts for router replay: "
+            f"routes={routed.shape[0]}, expected_at_least={expected_routes}, "
+            f"valid_length={valid_length}, padded_length={padded_length}, "
+            f"num_cached_tokens={num_cached_tokens}. This usually means the "
+            "generation backend did not return routed experts for every "
+            "non-final token in the prompt+response sequence."
+        )
+    max_allowed_routes = expected_routes + 1
+    if require_complete_routed_experts and routed.shape[0] > max_allowed_routes:
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned too many routed_experts routes for router replay: "
+            f"routes={routed.shape[0]}, expected={expected_routes}, "
+            f"max_allowed={max_allowed_routes}, valid_length={valid_length}, "
+            f"padded_length={padded_length}, num_cached_tokens={num_cached_tokens}. "
+            "Router replay allows at most one surplus final-token route."
+        )
+
+    default_route = torch.arange(
+        routed.shape[2],
+        dtype=torch.int32,
+        device=device,
+    )
+    full = (
+        default_route.view(1, 1, -1)
+        .expand(padded_length, routed.shape[1], routed.shape[2])
+        .clone()
+    )
+    full = full.to(dtype=torch.int32)
+    routes_to_copy = min(expected_routes, routed.shape[0])
+    if routes_to_copy > 0:
+        full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
+    if stats["missing_routes"] > 0:
+        full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
+    return (full, stats) if return_stats else full
 
 
 def aggregate_spec_decode_counters(

@@ -27,6 +27,7 @@ def configure_generation_config(
     tokenizer: TokenizerType,
     is_eval: bool = False,
     has_refit_draft_weights: bool = False,
+    trains_mtp: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
     # tokenizer setting
@@ -46,16 +47,23 @@ def configure_generation_config(
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
-        if speculative_config:
-            # Speculative decoding needs real startup weights unless the draft
-            # weights will be pushed into vLLM during the initial refit.
-            if not is_eval and not has_refit_draft_weights:
+        if speculative_config and not is_eval and not has_refit_draft_weights:
+            # Speculative decoding needs real draft weights at startup, since the
+            # draft is not covered by the initial refit.
+            if speculative_config.get("method") not in ("deepseek_mtp", "mtp"):
+                # Non-MTP methods (e.g. Eagle) must read the drafter's real
+                # weights from the checkpoint, so load everything.
                 warnings.warn(
                     "Speculative decoding is enabled without draft refit sync. "
                     "Setting vllm_cfg['load_format'] to 'auto' so the drafter does "
                     "not start from dummy weights."
                 )
                 config["vllm_cfg"]["load_format"] = "auto"
+
+        # MTP draft weights arrive via refit if the trainer trains the MTP layer.
+        # If the trainer does not train the MTP layer, the weights need to be
+        # loaded from the checkpoint.
+        config["_mtp_weights_from_refit"] = trains_mtp
 
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:
