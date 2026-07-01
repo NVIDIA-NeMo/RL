@@ -1163,6 +1163,16 @@ def _apply_message_level_advantage_penalties(
     if invalid_neg_adv is None and malformed_neg_adv is None:
         return
 
+    # ``advantages`` comes from adv_estimator.compute_advantage() as an
+    # ``advantages.expand(mask.shape)`` view (stride-0, multiple logical elements
+    # share one memory cell). That is fine for the read-only loss, but the
+    # per-message in-place writes below ("advantages[i, span] = neg_adv") need a
+    # tensor with its own storage, otherwise torch raises "more than one element
+    # of the written-to tensor refers to a single memory location". Materialize
+    # once here (only when a penalty is actually configured, so the no-penalty
+    # path stays zero-copy).
+    train_data["advantages"] = train_data["advantages"].contiguous()
+
     if log_config:
         print(
             f"Invalid tool call advantage: {invalid_neg_adv}",
