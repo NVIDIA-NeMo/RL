@@ -1,0 +1,17 @@
+# TransferQueue-enabled variant of distillation_math.yaml.
+# Uses the same model/data defaults and selects the TQ distillation trainer
+# through examples/run_distillation.py when data_plane.enabled=true.
+defaults: distillation_math.yaml
+
+checkpointing:
+    checkpoint_dir: "checkpoints/distillation-tq-${policy.model_name}"
+
+logger:
+    log_dir: "logs/distillation-tq"
+    wandb:
+        name: "distillation-tq-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    tensorboard:
+        log_dir: "tb_logs-distillation-tq-${data.train.dataset_name}"
+
+data_plane:
+    enabled: true

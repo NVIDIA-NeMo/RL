@@ -282,3 +282,18 @@ cluster:
     master_port_range_low: 25000
     master_port_range_high: 28000
     segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
+
+# TransferQueue-mediated data plane for on-policy distillation.
+# Off by default; set enabled=true to keep teacher top-k logits in TQ
+# instead of returning them to the driver.
+data_plane:
+    enabled: false
+    impl: transfer_queue
+    backend: "simple"
+    storage_capacity: 1000000
+    num_storage_units: 2
+    claim_meta_poll_interval_s: 0.5
+    global_segment_size: 549755813888
+    local_buffer_size: 68719476736
+    # observability:
+    #   enabled: false

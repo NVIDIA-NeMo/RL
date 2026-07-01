@@ -30,6 +30,18 @@ from nemo_rl.utils.config import (
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
+def _select_trainer(master_config: MasterConfig):
+    """Pick the distillation trainer based on ``data_plane.enabled``."""
+    dp_cfg = master_config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.algorithms.distillation_sync import distillation_train_sync
+
+        print("🚀 Running on-policy distillation training (TransferQueue)")
+        return distillation_train_sync
+    print("🚀 Running on-policy distillation training (legacy)")
+    return distillation_train
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -86,6 +98,17 @@ def main() -> None:
         val_task_to_env,
     ) = setup_response_data(tokenizer, config.data, config.env)
 
+    _dp_cfg = config.data_plane or {}
+    if _dp_cfg.get("enabled", False):
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def _make_student_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+
+        _student_policy_factory = _make_student_policy
+    else:
+        _student_policy_factory = None
+
     (
         student_policy,
         teacher_policy,
@@ -98,9 +121,16 @@ def main() -> None:
         checkpointer,
         distillation_state,
         master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    ) = setup(
+        config,
+        tokenizer,
+        dataset,
+        val_dataset,
+        student_policy_factory=_student_policy_factory,
+    )
 
-    distillation_train(
+    trainer = _select_trainer(master_config)
+    trainer(
         student_policy,
         teacher_policy,
         student_generation,

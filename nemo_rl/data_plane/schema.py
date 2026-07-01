@@ -29,27 +29,50 @@ INPUT_IDS = "input_ids"
 INPUT_LENGTHS = "input_lengths"
 SAMPLE_MASK = "sample_mask"
 META_IDX = "meta_idx"
+TOKEN_MASK = "token_mask"
+TEACHER_TOPK_LOGITS = "teacher_topk_logits"
+TEACHER_TOPK_INDICES = "teacher_topk_indices"
 
 # Tensor fields in the train partition. Rollout writes the input
 # subset on first put; later stages add prev_logprobs /
 # reference_policy_logprobs (workers) and advantages (driver).
 DP_TRAIN_FIELDS = (
-    "input_ids",
-    "input_lengths",
+    INPUT_IDS,
+    INPUT_LENGTHS,
     "generation_logprobs",
     "prev_logprobs",
     "reference_policy_logprobs",
     "advantages",
-    "token_mask",
-    "sample_mask",
+    TOKEN_MASK,
+    SAMPLE_MASK,
 )
 
 # Subset fetched by logprob / ref-logprob workers.
 LP_SEED_FIELDS = (
-    "input_ids",
-    "input_lengths",
-    "token_mask",
-    "sample_mask",
+    INPUT_IDS,
+    INPUT_LENGTHS,
+    TOKEN_MASK,
+    SAMPLE_MASK,
+)
+
+# Fixed fields used by TQ-mediated on-policy distillation training.
+# Runtime model-input extras (for example model-specific multimodal
+# tensors) are discovered separately and appended by the trainer before
+# partition registration.
+DISTILLATION_TRAIN_FIELDS = (
+    INPUT_IDS,
+    INPUT_LENGTHS,
+    TOKEN_MASK,
+    SAMPLE_MASK,
+    TEACHER_TOPK_LOGITS,
+    TEACHER_TOPK_INDICES,
+)
+
+# Minimal teacher inference seed fields. Runtime model-input extras are
+# appended by distillation_sync before teacher dispatch.
+TEACHER_TOPK_SEED_FIELDS = (
+    INPUT_IDS,
+    INPUT_LENGTHS,
 )
 
 # Fields requested for KV-scale calibration. Positive include-list:

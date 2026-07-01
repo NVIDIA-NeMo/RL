@@ -77,6 +77,15 @@ class BatchedDataDict(UserDict, Generic[DictT]):
     ADDITIONAL_OPTIONAL_KEY_TENSORS = [
         "token_type_ids",  # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
         "mm_token_type_ids",  # specific to qwen2.5-vl (transformers>=5.3): tells model which tokens are text(0)/image(1)/video(2) for 3D RoPE position encoding
+        "pixel_values",
+        "image_grid_thw",
+        "video_grid_thw",
+        "pixel_attention_mask",
+        "patch_attention_mask",
+        "image_sizes",
+        "image_flags",
+        "input_features",
+        "feature_attention_mask",
     ]
 
     def __init__(self, *args, **kwargs):
