@@ -58,24 +58,12 @@ def build_data_plane_client(
     if obs.get("enabled", False):
         from nemo_rl.data_plane.observability import (
             MetricsDataPlaneClient,
-            get_or_create_sink,
             make_ray_sink_callback,
         )
 
         # Point ``on_event`` at the cluster-wide sink so every process's
-        # puts/gets/clears aggregate into one wandb view. ``on_bytes_freed``
-        # keeps the sink's ``bytes_outstanding`` in step with the local
-        # per-key ledger's exact freed count.
+        # puts/gets aggregate into one wandb view.
         on_event = obs.get("callback") or make_ray_sink_callback()
-        sink = get_or_create_sink()
-
-        def _on_bytes_freed(freed: int) -> None:
-            sink.record_bytes_freed.remote(freed)
-
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
-        client = MetricsDataPlaneClient(  # type: ignore[bad-argument-type]
-            client,
-            on_event=on_event,
-            on_bytes_freed=_on_bytes_freed,
-        )
+        client = MetricsDataPlaneClient(client, on_event=on_event)  # type: ignore[bad-argument-type]
     return client
