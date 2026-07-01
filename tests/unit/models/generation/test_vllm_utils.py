@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import math
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -21,8 +23,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
+    attach_routed_experts_to_chat_response_choices,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
+    model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
 )
 
@@ -378,6 +382,161 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
             device=torch.device("cpu"),
             require_complete_routed_experts=True,
         )
+
+
+def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        prompt_routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+        outputs=[
+            SimpleNamespace(
+                index=1,
+                token_ids=[201, 202],
+                routed_experts=torch.tensor([[[31]], [[32]]], dtype=torch.int32),
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[200],
+                routed_experts=torch.tensor([[[30]]], dtype=torch.int32),
+            ),
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+    )
+
+    assert response.choices[0].message.routed_experts == [
+        [[10]],
+        [[11]],
+        [[30]],
+        [[0]],
+    ]
+    assert response.choices[1].message.routed_experts == [
+        [[10]],
+        [[11]],
+        [[31]],
+        [[32]],
+        [[0]],
+    ]
+
+
+def test_attach_routed_experts_to_chat_response_choices_requires_routed_experts():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        outputs=[SimpleNamespace(index=0, token_ids=[200])],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match="did not include routed_experts"):
+        attach_routed_experts_to_chat_response_choices(
+            response,
+            final_res,
+            device=torch.device("cpu"),
+        )
+
+
+def test_attach_routed_experts_to_chat_response_choices_warns_on_missing_routes():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[200, 201],
+                routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+    logger = MagicMock()
+
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+        logger=logger,
+    )
+
+    logger.warning.assert_called_once_with(
+        "R3 router replay fallback: vLLM returned incomplete "
+        "routed_experts for chat choice_idx=%d, "
+        "missing_token_routes=%d, actual_routes=%d, "
+        "expected_routes=%d. Megatron will use its own router "
+        "for those missing token routes.",
+        0,
+        2,
+        2,
+        4,
+    )
+    assert response.choices[0].message.routed_experts == [
+        [[10]],
+        [[11]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+        [[0]],
+    ]
+
+
+def test_attach_routed_experts_to_chat_response_choices_raises_for_unmatched_choice():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        outputs=[
+            SimpleNamespace(
+                index=1,
+                token_ids=[200],
+                routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match=r"missing_choice_indices=\[0\]"):
+        attach_routed_experts_to_chat_response_choices(
+            response,
+            final_res,
+            device=torch.device("cpu"),
+        )
+
+
+def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
+    routed_experts = [[[1]], [[2]]]
+
+    class Response:
+        choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(routed_experts=routed_experts),
+            )
+        ]
+
+        def model_dump(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello",
+                        }
+                    }
+                ]
+            }
+
+    response_dict = model_dump_chat_response_with_routed_experts(Response())
+
+    assert response_dict["choices"][0]["message"]["routed_experts"] == routed_experts
 
 
 @pytest.mark.vllm

@@ -116,13 +116,17 @@ def test_all_config_files_have_required_keys(config_file):
     if "/evals/" in config_file:
         master_config_class = EvalMasterConfig
         config_type = "eval"
-    elif (
+    elif "teachers" in config_dict or (
         "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
     ):
         # Cross-tokenizer off-policy distillation also has a top-level
         # ``distillation`` block, so it must be matched before the generic
-        # ``distillation`` branch below. ``projection_matrix_path`` is unique to
-        # the cross-tokenizer loss and disambiguates it from online distillation.
+        # ``distillation`` branch below. The multi-teacher cross-tokenizer config
+        # is identified by its top-level ``teachers`` list (online distillation
+        # uses a singular ``teacher``); the per-(student, teacher) projection path
+        # now lives on each ``teachers[i].projection_matrix_path`` rather than
+        # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
+        # as a fallback for any single-teacher config that still carries it.
         master_config_class = XTokenOffPolicyDistillationMasterConfig
         config_type = "xtoken_off_policy_distillation"
     elif "distillation" in config_dict:
