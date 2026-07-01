@@ -420,14 +420,20 @@ def test_value_worker_parallelism_equivalence(
             max_colocated_worker_groups=1,
         )
 
-        # Deterministic batch (get_values only needs input_ids + input_lengths).
         torch.manual_seed(42)
-        batch, seq_len = 8, 64
+        batch, max_seq_len = 8, 64
+        # Non-uniform input_lengths so dynamic batching actually reorders samples.
+        input_lengths = torch.randint(
+            max_seq_len // 2, max_seq_len + 1, (batch,), dtype=torch.int32
+        )
+        attention_mask = (
+            torch.arange(max_seq_len)[None, :] < input_lengths[:, None]
+        ).to(torch.float32)
         data = BatchedDataDict(
             {
-                "input_ids": torch.randint(0, 151000, (batch, seq_len)),
-                "input_lengths": torch.full((batch,), seq_len, dtype=torch.int32),
-                "attention_mask": torch.ones(batch, seq_len),
+                "input_ids": torch.randint(0, 151000, (batch, max_seq_len)),
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
             }
         )
 
@@ -455,7 +461,12 @@ def test_value_worker_parallelism_equivalence(
         )
         values_feat = feat.get_values(data)["values"].detach().cpu()
 
-        torch.testing.assert_close(values_feat, values_ref, rtol=1e-3, atol=1e-3)
+        # Padded positions can differ legitimately (the packed-path unpack
+        # zero-fills them; the unpacked path runs the model on padding).
+        mask = attention_mask.bool()
+        torch.testing.assert_close(
+            values_feat[mask], values_ref[mask], rtol=1e-3, atol=1e-3
+        )
     finally:
         if ref is not None:
             ref.shutdown()

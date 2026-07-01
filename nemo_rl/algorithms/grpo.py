@@ -496,6 +496,7 @@ def setup(
             base_urls=base_urls,
             invalid_tool_call_patterns=invalid_tool_call_patterns,
             thinking_tags=thinking_tags,
+            require_routed_experts=router_replay_enabled(policy_config),
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}
@@ -2335,7 +2336,15 @@ def grpo_train(
                         policy_generation.clear_logger_metrics()
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if _should_use_nemo_gym(master_config):
-                        generation_config = master_config.policy["generation"]
+                        # configure_generation_config auto-fills stop_token_ids from the EOS
+                        # token, but run_async_nemo_gym_rollout asserts these are unset because
+                        # NeMo-Gym manages its own stop criteria. Clear them here so the
+                        # assertion reflects user intent (null in YAML) rather than the auto-fill.
+                        generation_config = {
+                            **master_config.policy["generation"],
+                            "stop_token_ids": None,
+                            "stop_strings": None,
+                        }
                         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,

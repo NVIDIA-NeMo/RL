@@ -77,6 +77,9 @@ class NemoGymConfig(TypedDict):
     thinking_tags: NotRequired[
         List[str] | None
     ]  # Thinking tags to check for malformed usage
+    require_routed_experts: NotRequired[
+        bool
+    ]  # Require Gym output items to carry R3 routed_experts
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -343,15 +346,48 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
             generation_token_ids = output_item_dict.pop("generation_token_ids")
             generation_log_probs = output_item_dict.pop("generation_log_probs")
+            routed_experts_raw = output_item_dict.pop("routed_experts", None)
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
-            nemo_rl_message_log.append(
-                {
-                    "role": "user",
-                    "content": "",
-                    "token_ids": torch.tensor(new_prompt_token_ids),
-                }
-            )
+            routed_experts = None
+            if routed_experts_raw is not None:
+                routed_experts = torch.as_tensor(routed_experts_raw, dtype=torch.int32)
+                if routed_experts.dim() != 3:
+                    raise ValueError(
+                        "NeMo Gym returned routed_experts with invalid shape. "
+                        "Expected [tokens, num_moe_layers, topk], got "
+                        f"{tuple(routed_experts.shape)}."
+                    )
+                expected_tokens = len(prompt_token_ids) + len(generation_token_ids)
+                if routed_experts.shape[0] < expected_tokens:
+                    raise ValueError(
+                        "NeMo Gym returned too few routed_experts rows for a "
+                        "trainable output item: "
+                        f"routes={routed_experts.shape[0]}, expected_at_least="
+                        f"{expected_tokens}."
+                    )
+            elif self.cfg.get("require_routed_experts", False):
+                raise ValueError(
+                    "policy.router_replay.enabled=true requires NeMo Gym output "
+                    "items to include routed_experts, but the field was missing. "
+                    "Make sure the Gym repo includes routed_experts propagation "
+                    "and the NeMo-RL vLLM OpenAI-compatible server is configured "
+                    "with enable_return_routed_experts."
+                )
+
+            prompt_start = len(seen_token_ids)
+            prompt_end = len(prompt_token_ids)
+            generation_start = prompt_end
+            generation_end = prompt_end + len(generation_token_ids)
+
+            user_message = {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor(new_prompt_token_ids),
+            }
+            if routed_experts is not None:
+                user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
+            nemo_rl_message_log.append(user_message)
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
             # the call was invalid and never executed — flag it so training can penalize it.
@@ -365,16 +401,19 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 )
             )
 
-            nemo_rl_message_log.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "token_ids": torch.tensor(generation_token_ids),
-                    "generation_logprobs": torch.tensor(generation_log_probs),
-                    "is_invalid_tool_call": is_invalid_tool_call,
-                    "has_malformed_thinking": has_malformed_thinking,
-                }
-            )
+            assistant_message = {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor(generation_token_ids),
+                "generation_logprobs": torch.tensor(generation_log_probs),
+                "is_invalid_tool_call": is_invalid_tool_call,
+                "has_malformed_thinking": has_malformed_thinking,
+            }
+            if routed_experts is not None:
+                assistant_message["routed_experts"] = routed_experts[
+                    generation_start:generation_end
+                ]
+            nemo_rl_message_log.append(assistant_message)
 
             seen_token_ids.extend(new_prompt_token_ids)
             seen_token_ids.extend(generation_token_ids)
