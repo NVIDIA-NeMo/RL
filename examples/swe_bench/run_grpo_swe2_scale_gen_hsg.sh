@@ -236,10 +236,12 @@ export BASE_LOG_DIR="${BASE_LOG_DIR:-${SNAPSHOT_DIR}/logs/qwen3_30b_swe_scale}"
 mkdir -p "${BASE_LOG_DIR}"
 
 # ========================= Environment variables =========================
-if [ -f "${HOME}/script/export_env_vars.sh" ]; then
-  # shellcheck disable=SC1090
-  source "${HOME}/script/export_env_vars.sh"
-fi
+# Credentials are NOT sourced here. Before running, export your own (e.g. in your
+# shell or a personal env script you source yourself):
+#   HF_HOME=...            # HuggingFace cache dir
+#   HF_TOKEN=...           # HuggingFace token (used for HUGGINGFACE_TOKEN below)
+#   WANDB_API_KEY=...      # Weights & Biases API key
+#   GITHUB_TOKEN=... GITLAB_TOKEN=...   # optional, for git-dep rate limits
 export HUGGINGFACE_TOKEN="${HUGGINGFACE_TOKEN:-${HF_TOKEN}}"
 export GITLAB_TOKEN="${GITLAB_TOKEN:-}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
