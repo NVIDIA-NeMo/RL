@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -166,7 +166,13 @@ class PolicyInterface(ABC):
 class ColocatablePolicyInterface(PolicyInterface):
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
         pass
 
@@ -218,7 +224,11 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
         pass
 

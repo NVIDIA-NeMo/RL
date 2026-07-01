@@ -773,6 +773,11 @@ def print_performance_metrics(
     if colocated_inference:
         training_num_gpus = total_num_gpus
         generation_num_gpus = total_num_gpus
+    elif master_config.policy["generation"].get("backend") == "dynamo":
+        # Dynamo inference runs in an external DGD, outside the Ray cluster
+        # described by cluster.{num_nodes,gpus_per_node}.
+        training_num_gpus = total_num_gpus
+        generation_num_gpus = 0
     else:
         generation_num_nodes = (
             master_config.policy["generation"]["colocated"]["resources"]["num_nodes"]
@@ -817,7 +822,7 @@ def print_performance_metrics(
     )
     generation_tokens_per_sec_per_gpu = (
         total_num_tokens / generation_time / generation_num_gpus
-        if generation_time > 0
+        if generation_time > 0 and generation_num_gpus > 0
         else 0
     )
 
