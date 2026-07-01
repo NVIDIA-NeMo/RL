@@ -27,6 +27,7 @@ policy:
     vllm_kwargs:
       compilation_config:
         backend: eager
+        custom_ops: ["all", "-rotary_embedding"]
 data:
   train:
     dataset_name: DeepScaler
