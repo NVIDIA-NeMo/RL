@@ -603,6 +603,39 @@ def test_r3_trace_forward_verifier_records_actual_replayed_topk(tmp_path, monkey
 
 
 @pytest.mark.mcore
+def test_missing_route_fallback_patch_is_idempotent_inside_r3_trace_verifier(
+    tmp_path, monkeypatch
+):
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron import router_replay
+    from nemo_rl.utils.r3_trace import r3_trace_stage
+
+    monkeypatch.setenv("NRL_R3_TRACE", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_VERIFY_FORWARD", "1")
+    monkeypatch.setenv("NRL_R3_TRACE_DIR", str(tmp_path))
+    RouterReplay.clear_global_router_replay_instances()
+
+    try:
+        router_replay._install_missing_route_fallback_patch()
+        assert getattr(
+            RouterReplay.get_replay_topk,
+            router_replay._MISSING_ROUTE_FALLBACK_PATCH_ATTR,
+            False,
+        )
+
+        with r3_trace_stage("unit-forward"):
+            assert getattr(
+                RouterReplay.get_replay_topk,
+                router_replay._MISSING_ROUTE_FALLBACK_PATCH_ATTR,
+                False,
+            )
+            router_replay._install_missing_route_fallback_patch()
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_mcore_moe_replay_backward_recompute_matches_parameter_grads(tmp_path):
     import torch.distributed as dist
