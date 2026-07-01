@@ -9,5 +9,9 @@ policy:
   generation:
     vllm_cfg:
       gpu_memory_utilization: 0.6
+    vllm_kwargs:
+      compilation_config:
+        cudagraph_capture_sizes: null
 cluster:
   num_nodes: 32
+  segment_size: 16
