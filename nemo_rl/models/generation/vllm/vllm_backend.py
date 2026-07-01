@@ -476,6 +476,8 @@ class VllmInternalWorkerExtension:
         return params
 
     def _checkpoint_engine_weight_layout(self) -> VllmWeightLayout:
+        from vllm.model_executor.models.utils import get_pp_missing_layer_names
+
         expert_params: dict[str, VllmExpertParamLayout] = {}
         for name, param in self._get_named_parameters().items():
             if not name.endswith((".w13_weight", ".w2_weight")):
@@ -545,7 +547,12 @@ class VllmInternalWorkerExtension:
                 "local_expert_ids": local_expert_ids,
             }
 
-        return expert_params
+        return {
+            "expert_params": expert_params,
+            "missing_weight_prefixes": get_pp_missing_layer_names(
+                self.model_runner.model
+            ),
+        }
 
     def _local_expert_id(self, param: torch.nn.Parameter, expert_id: int) -> int:
         weight_loader = getattr(param, "weight_loader", None)

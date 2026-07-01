@@ -261,7 +261,7 @@ def _expert_param(shape, owner):
 
 
 @pytest.mark.vllm
-def test_checkpoint_engine_weight_layout_reports_ep_ownership():
+def test_checkpoint_engine_weight_layout_reports_ep_and_pp_ownership(monkeypatch):
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtension,
     )
@@ -280,14 +280,19 @@ def test_checkpoint_engine_weight_layout_reports_ep_ownership():
             ]
         )
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.models.utils.get_pp_missing_layer_names",
+        lambda model: ["model.layers.1."],
+    )
 
     layout = ext._checkpoint_engine_weight_layout()
 
-    assert layout["model.layers.0.mlp.experts.w13_weight"] == {
+    assert layout["expert_params"]["model.layers.0.mlp.experts.w13_weight"] == {
         "tp_rank": 0,
         "tp_size": 1,
         "local_expert_ids": [1, 3],
     }
+    assert layout["missing_weight_prefixes"] == ["model.layers.1."]
 
 
 @pytest.mark.vllm
@@ -304,7 +309,6 @@ def test_checkpoint_engine_weight_layout_rejects_shuffled_backend():
             named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
         )
     )
-
     with pytest.raises(ValueError, match="canonical unquantized Triton"):
         ext._checkpoint_engine_weight_layout()
 
@@ -324,7 +328,6 @@ def test_checkpoint_engine_weight_layout_rejects_transposed_experts():
             named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
         )
     )
-
     with pytest.raises(ValueError, match="canonical expert-weight orientation"):
         ext._checkpoint_engine_weight_layout()
 

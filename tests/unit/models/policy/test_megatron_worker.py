@@ -154,7 +154,7 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     assert torch.allclose(scale_fn(), torch.tensor(1.0))
 
 
-def test_checkpoint_engine_weight_iterator_filters_for_vllm_ep_owner():
+def test_checkpoint_engine_weight_iterator_filters_for_vllm_layout():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
@@ -167,17 +167,21 @@ def test_checkpoint_engine_weight_iterator_filters_for_vllm_ep_owner():
         ("model.layers.0.mlp.experts.0.gate_proj.weight", remote_expert),
         ("model.layers.0.mlp.experts.1.gate_proj.weight", local_expert),
         ("model.layers.0.self_attn.q_proj.weight", dense_weight),
+        ("model.layers.1.self_attn.q_proj.weight", dense_weight),
     ]
     worker._iter_params_with_optional_kv_scales = lambda kv_scales=None: iter(weights)
     worker.checkpoint_engine = SimpleNamespace(
         shard_hf_weights=True,
         next_agent="rollout",
         target_weight_layout={
-            "model.layers.0.mlp.experts.w13_weight": {
-                "tp_rank": 0,
-                "tp_size": 1,
-                "local_expert_ids": [1],
-            }
+            "expert_params": {
+                "model.layers.0.mlp.experts.w13_weight": {
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "local_expert_ids": [1],
+                }
+            },
+            "missing_weight_prefixes": ["model.layers.1."],
         },
     )
 

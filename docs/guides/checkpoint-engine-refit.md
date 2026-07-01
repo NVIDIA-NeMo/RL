@@ -47,7 +47,7 @@ Key settings:
 | `update_weights_bucket_megabytes` | Reusable transfer-buffer size per participating worker. Start with `2048`; tune only after measuring. |
 | `device` | `cuda` uses GPU RDMA buffers. `cpu` uses host-pinned buffers and is mainly a fallback. |
 | `cleanup_after_load` | Set `false` to avoid extra `torch.cuda.empty_cache()` overhead after each refit when memory is stable. |
-| `shard_hf_weights` | Megatron/vLLM MoE optimization that sends each worker only its destination-local expert weights. |
+| `shard_hf_weights` | Omits weights absent from each vLLM PP stage and sends destination-local MoE expert shards for TP/EP. |
 | `backend_init_params` | NIXL backend parameters such as UCX peer error handling, device lists, and UCX engine config. |
 
 The built-in NIXL topology is paired policy-to-rollout transfer, so allocate at
@@ -108,11 +108,13 @@ policy:
           shard_hf_weights: true
 ```
 
-With `shard_hf_weights`, each vLLM worker reports its live expert layout during
-checkpoint-engine setup. For tensor-parallel MoE, the source sends that TP
-rank's slice of every expert. For expert-parallel MoE, the source sends complete
-experts only to ranks that own them, followed by any intra-expert TP slice
-reported by vLLM. Any static ownership map reported by vLLM is supported.
+With `shard_hf_weights`, each vLLM worker reports its live destination layout
+during checkpoint-engine setup. For pipeline parallelism, the source omits
+every weight that vLLM marks as absent from the destination stage. For
+tensor-parallel MoE, the source sends that TP rank's slice of every expert. For
+expert-parallel MoE, the source sends complete experts only to ranks that own
+them, followed by any intra-expert TP slice reported by vLLM. Any static
+ownership map reported by vLLM is supported.
 Dynamic expert load balancing and redundant experts are not supported because
 ownership can change after metadata exchange. The direct-copy load path accepts
 only unquantized Triton expert storage; FP8 and backends that transpose or
@@ -126,8 +128,9 @@ multiple buffers are reassembled on CPU before that standard loader to limit
 peak GPU memory.
 
 When vLLM EP is larger than TP, NeMo RL currently requires `async_engine: false`.
-Do not enable `shard_hf_weights` for non-MoE models or models whose HF expert
-names do not map to vLLM `w13_weight` and `w2_weight` parameters.
+For non-MoE models, `shard_hf_weights` only applies pipeline-stage filtering.
+Expert sharding requires HF expert names that map to vLLM `w13_weight` and
+`w2_weight` parameters.
 
 Avoid `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for CUDA-buffer NIXL
 refit unless that workload has been explicitly validated with it.

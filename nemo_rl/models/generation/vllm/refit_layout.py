@@ -27,7 +27,9 @@ class VllmExpertParamLayout(TypedDict):
     local_expert_ids: list[int] | None
 
 
-VllmWeightLayout = dict[str, VllmExpertParamLayout]
+class VllmWeightLayout(TypedDict):
+    expert_params: dict[str, VllmExpertParamLayout]
+    missing_weight_prefixes: list[str]
 
 
 @dataclass(frozen=True)
@@ -71,17 +73,22 @@ def select_hf_weight_for_vllm_target(
     *,
     target_layout: VllmWeightLayout,
 ) -> torch.Tensor | None:
-    """Return the destination-local expert weight, or ``None`` if not owned.
+    """Return the destination-local weight, or ``None`` if not owned.
 
-    vLLM tensor-parallel MoE layers shard every expert tensor. Expert-parallel
-    layers instead place complete experts on selected ranks, so their live
-    ownership map must be used rather than applying another TP slice.
+    Pipeline stages omit complete parameter prefixes. Within an owned stage,
+    tensor-parallel MoE layers shard every expert tensor while expert-parallel
+    layers place complete experts on selected ranks.
     """
+    if any(
+        name.startswith(prefix) for prefix in target_layout["missing_weight_prefixes"]
+    ):
+        return None
+
     expert_weight = parse_hf_expert_weight(name)
     if expert_weight is None:
         return tensor
 
-    param_layout = target_layout.get(expert_weight.parameter_name)
+    param_layout = target_layout["expert_params"].get(expert_weight.parameter_name)
     if param_layout is None:
         # A missing expert parameter belongs to another pipeline stage.
         return None

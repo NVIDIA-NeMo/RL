@@ -210,12 +210,13 @@ rank, so production runs should allocate at least as many policy workers as
 rollout workers for this backend.
 
 When sharded HF refit is enabled, rollout metadata also contains the actual
-vLLM expert layout for that worker. Each expert parameter reports whether vLLM
-uses expert placement, its local global-expert IDs, and any remaining TP
-coordinate. The paired policy worker uses this destination manifest to either
-slice every expert for TP or filter complete experts for EP before filling NIXL
-buckets. This avoids deriving vLLM EP ownership from Ray/global rank ordering
-and also skips expert layers owned by other pipeline stages.
+vLLM destination layout for that worker. Each expert parameter reports whether
+vLLM uses expert placement, its local global-expert IDs, and any remaining TP
+coordinate. The layout also includes the missing-layer prefixes that vLLM uses
+for pipeline-parallel loading. The paired policy worker drops weights absent from
+the destination stage, then slices experts for TP or filters complete experts
+for EP before filling NIXL buckets. This avoids deriving vLLM ownership from
+Ray/global rank ordering.
 
 `device` controls the staged transfer-buffer device:
 

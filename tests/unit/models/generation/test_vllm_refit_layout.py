@@ -23,16 +23,19 @@ from nemo_rl.models.generation.vllm.refit_layout import (
 
 def _layout(*, tp_rank=0, tp_size=1, local_expert_ids=None):
     return {
-        "model.layers.0.mlp.experts.w13_weight": {
-            "tp_rank": tp_rank,
-            "tp_size": tp_size,
-            "local_expert_ids": local_expert_ids,
+        "expert_params": {
+            "model.layers.0.mlp.experts.w13_weight": {
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
+                "local_expert_ids": local_expert_ids,
+            },
+            "model.layers.0.mlp.experts.w2_weight": {
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
+                "local_expert_ids": local_expert_ids,
+            },
         },
-        "model.layers.0.mlp.experts.w2_weight": {
-            "tp_rank": tp_rank,
-            "tp_size": tp_size,
-            "local_expert_ids": local_expert_ids,
-        },
+        "missing_weight_prefixes": [],
     }
 
 
@@ -126,6 +129,26 @@ def test_select_hf_weight_leaves_non_expert_weights_unchanged():
     )
 
     assert selected is weight
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.layers.1.self_attn.q_proj.weight",
+        "model.layers.1.mlp.experts.0.gate_proj.weight",
+    ],
+)
+def test_select_hf_weight_skips_weights_absent_from_destination_stage(name):
+    layout = _layout(local_expert_ids=[0])
+    layout["missing_weight_prefixes"] = ["model.layers.1."]
+
+    selected = select_hf_weight_for_vllm_target(
+        name,
+        torch.ones(4, 4),
+        target_layout=layout,
+    )
+
+    assert selected is None
 
 
 def test_select_hf_weight_skips_experts_absent_from_destination_stage():
