@@ -352,6 +352,8 @@ async def generate_responses_async(
                 "async_engine", False
             )
         )
+    elif backend == "dynamo":
+        use_async_generation = True
     else:
         use_async_generation = False
 
@@ -359,7 +361,8 @@ async def generate_responses_async(
         "Async generation is not enabled. For SGLang, set "
         "policy.generation.use_async_rollouts=True. For vLLM, set "
         "policy.generation.vllm_cfg.async_engine=True. For Megatron, set "
-        "policy.generation.mcore_generation_config.async_engine=True. The "
+        "policy.generation.mcore_generation_config.async_engine=True, or use "
+        "the Dynamo backend. The "
         "generation backend must also implement generate_async."
     )
 
