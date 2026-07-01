@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
+from threading import Thread
 from typing import Any
 
 import pytest
@@ -11,6 +12,9 @@ from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallPrefixMismatchError,
     StreamingToolCallSessionClosedError,
     StreamingToolCallSessionNotFoundError,
+)
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorkerImpl,
 )
 
 
@@ -224,6 +228,40 @@ async def test_pause_invalidates_and_blocks_admission_until_resume() -> None:
     await manager.resume()
     await manager.start(session_id="two", prompt_token_ids=[2])
     assert manager.active_session_count == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_pauses_sessions_on_manager_owner_loop() -> None:
+    owner_loop = asyncio.new_event_loop()
+
+    def run_owner_loop() -> None:
+        asyncio.set_event_loop(owner_loop)
+        owner_loop.run_forever()
+
+    owner_thread = Thread(target=run_owner_loop)
+    owner_thread.start()
+
+    async def create_active_manager() -> StreamingToolCallPrefillManager:
+        manager = _make_manager(_FakeEngine())
+        manager.bind_to_current_loop()
+        await manager.start(session_id="session", prompt_token_ids=[1])
+        return manager
+
+    try:
+        manager_future = asyncio.run_coroutine_threadsafe(
+            create_active_manager(), owner_loop
+        )
+        manager = manager_future.result(timeout=1)
+        worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+        worker.streaming_tool_call_manager = manager
+
+        assert await worker._pause_streaming_tool_call_sessions() == 1
+        assert manager.active_session_count == 0
+    finally:
+        owner_loop.call_soon_threadsafe(owner_loop.stop)
+        owner_thread.join(timeout=1)
+        assert not owner_thread.is_alive()
+        owner_loop.close()
 
 
 @pytest.mark.asyncio
