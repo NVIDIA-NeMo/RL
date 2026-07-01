@@ -43,9 +43,9 @@ set -e
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/examples/swe_bench/grpo_qwen3_30b_async_swe_hsg.yaml}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${REPO_ROOT}/results}"
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/blends/balanced_language.jsonl}"
-VAL_DATA_PATH="${VAL_DATA_PATH:-/lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/swe_public_datasets_val_swebench.jsonl}"
-DEFAULT_MODEL_PATH="/lustre/fsw/portfolios/llmservice/users/igitman/hf_models/Qwen3-30B-A3B-Thinking-2507"
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/lustre/fsw/portfolios/nemotron/users/ruit/evolution_rl/test_assets/qwen-30B/data/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl}"
+VAL_DATA_PATH="${VAL_DATA_PATH:-/lustre/fsw/portfolios/nemotron/users/ruit/evolution_rl/test_assets/qwen-30B/data/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl}"
+DEFAULT_MODEL_PATH="/lustre/fsw/portfolios/nemotron/users/ruit/evolution_rl/test_assets/qwen-30B/bihu/qwen3-30b-thinking-swe1-async-age1-pps64-gpp8-gbs512-lr1e-06/step_230_hf"
 MODEL_PATH="${1:-${MODEL_PATH:-${DEFAULT_MODEL_PATH}}}"
 
 # ================ Container and mount config ================
