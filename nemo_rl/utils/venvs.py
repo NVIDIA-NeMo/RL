@@ -30,6 +30,78 @@ DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 logger = logging.getLogger(__name__)
 
 
+def _reconcile_cutlass_cu13(venv_path: str, venv_name: str) -> None:
+    # Workaround for the nvidia-cutlass-dsl packaging bug where the -libs-base and
+    # -libs-cu13 component wheels write DIVERGENT content to the SAME paths under
+    # nvidia_cutlass_dsl/ (the _cutlass_ir .so, MLIR bindings, and CuTe-DSL .py
+    # sources). Last-writer-wins, and under uv the install order is racy, so the
+    # venv can end up a non-deterministic mix of both variants.
+    # cuDNN-frontend 1.25.0's cutedsl DeepSeek-Sparse-Attention path needs the
+    # -libs-cu13 API (normalize_field_to_ir_name present, atom_tma_partition
+    # target_tensors, nvvm.atomicrmw without a leading `res` arg); the -libs-base
+    # side breaks it. This forces the CuTe-DSL tree to single-provenance -libs-cu13.
+    # vLLM does the OPPOSITE (strips [cu13] -> base) for its own kernels, so this
+    # only runs for venvs matching NRL_CUTLASS_CU13_VENV_SUBSTR (default "megatron")
+    # and never touches the vLLM generation venv (which wants base).
+    # Upstream (packaging bug, still OPEN):
+    #   https://github.com/NVIDIA/cutlass/issues/3170
+    #   https://github.com/NVIDIA/cutlass/issues/3259
+    # Opt-in via NRL_FORCE_CUTLASS_CU13=1. Idempotent; best-effort (never fails the
+    # build -- if it can't reconcile, the run fails loudly later at the cuDNN import).
+    import glob
+
+    if os.environ.get("NRL_FORCE_CUTLASS_CU13", "") not in ("1", "true", "True"):
+        return
+    substr = os.environ.get("NRL_CUTLASS_CU13_VENV_SUBSTR", "megatron")
+    if substr and substr not in venv_name:
+        return
+
+    def _is_cu13(cutlass_dir: str) -> bool:
+        common = os.path.join(cutlass_dir, "cute", "nvgpu", "common.py")
+        opsgen = os.path.join(cutlass_dir, "_mlir", "dialects", "_nvvm_ops_gen.py")
+        try:
+            with open(common) as fh:
+                has_norm = "def normalize_field_to_ir_name" in fh.read()
+            with open(opsgen) as fh:
+                no_res = "def atomicrmw(op, ptr, a" in fh.read()
+            return has_norm and no_res
+        except OSError:
+            return False
+
+    try:
+        sps = glob.glob(os.path.join(venv_path, "lib", "python*", "site-packages"))
+        if not sps:
+            return
+        dst = os.path.join(sps[0], "nvidia_cutlass_dsl", "python_packages", "cutlass")
+        if not os.path.isdir(dst):
+            return  # no CuTe-DSL in this venv; nothing to reconcile
+        if _is_cu13(dst):
+            logger.info(f"[cutlass-cu13] {venv_name}: already single-provenance cu13; skipping")
+            return
+        uv_cache = os.environ.get("UV_CACHE_DIR", os.path.expanduser("~/.cache/uv"))
+        src = None
+        pattern = os.path.join(uv_cache, "archive-v0", "*", "nvidia_cutlass_dsl_libs_cu13*.dist-info")
+        for di in glob.glob(pattern):
+            cand = os.path.join(os.path.dirname(di), "nvidia_cutlass_dsl", "python_packages", "cutlass")
+            if os.path.isdir(cand) and _is_cu13(cand):
+                src = cand
+                break
+        if src is None:
+            logger.warning(
+                f"[cutlass-cu13] {venv_name}: no pristine -libs-cu13 CuTe-DSL tree found under "
+                f"{uv_cache}; leaving venv as-is (cuDNN DSA may fail). "
+                "See https://github.com/NVIDIA/cutlass/issues/3170"
+            )
+            return
+        try:
+            subprocess.run(["rsync", "-a", src + "/", dst + "/"], check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            subprocess.run(f"cp -a {shlex.quote(src)}/. {shlex.quote(dst)}/", shell=True, check=True)
+        logger.info(f"[cutlass-cu13] {venv_name}: reconciled CuTe-DSL tree to -libs-cu13 from {src}")
+    except Exception as e:  # best-effort: never break venv creation
+        logger.warning(f"[cutlass-cu13] {venv_name}: reconcile skipped due to {e!r}")
+
+
 @lru_cache(maxsize=None)
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
@@ -99,6 +171,11 @@ def create_local_venv(
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
     subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
+
+    # cutlass-dsl -libs-base/-libs-cu13 divergence workaround (NVIDIA/cutlass#3170, #3259):
+    # force the CuTe-DSL install to single-provenance -libs-cu13 for cuDNN DSA
+    # venvs (opt-in via NRL_FORCE_CUTLASS_CU13; no-op otherwise).
+    _reconcile_cutlass_cu13(venv_path, venv_name)
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
