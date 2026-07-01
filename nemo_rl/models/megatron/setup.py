@@ -82,18 +82,21 @@ def _patch_hf_config_double_instantiation():
     global _HF_CONFIG_PATCHED
     if _HF_CONFIG_PATCHED:
         return
-    _HF_CONFIG_PATCHED = True
 
-    try:
-        from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
-            Qwen3OmniMoeTalkerCodePredictorConfig,
-            Qwen3OmniMoeTalkerConfig,
-            Qwen3OmniMoeTalkerTextConfig,
-        )
-    except ImportError:
-        return
+    import transformers
 
-    _original_post_init = Qwen3OmniMoeTalkerConfig.__post_init__
+    assert transformers.__version__ < "5.9.0", (
+        f"transformers {transformers.__version__} detected. "
+        "The Qwen3OmniMoeTalkerConfig monkey-patch was written for <5.9.0. "
+        "Check if the upstream __post_init__ double-instantiation bug is fixed "
+        "and remove this patch if so."
+    )
+
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeTalkerCodePredictorConfig,
+        Qwen3OmniMoeTalkerConfig,
+        Qwen3OmniMoeTalkerTextConfig,
+    )
 
     def _safe_post_init(self, **kwargs):
         if self.code_predictor_config is None:
@@ -109,6 +112,7 @@ def _patch_hf_config_double_instantiation():
         super(Qwen3OmniMoeTalkerConfig, self).__post_init__(**kwargs)
 
     Qwen3OmniMoeTalkerConfig.__post_init__ = _safe_post_init
+    _HF_CONFIG_PATCHED = True
 
 try:
     from megatron.core.distributed import (
