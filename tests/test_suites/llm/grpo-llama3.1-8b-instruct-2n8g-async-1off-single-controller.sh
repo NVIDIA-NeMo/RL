@@ -14,17 +14,16 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo.py \
+uv run examples/run_grpo_single_controller.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
-    grpo.val_period=-1 \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=sc-yukih \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=false \
+    checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG
