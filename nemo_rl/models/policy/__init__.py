@@ -446,6 +446,10 @@ class PolicyConfig(TypedDict):
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
+    # When True, enable BF16 true-on-policy numeric matching. This enables
+    # Megatron batch-invariant mode and BF16 parity patches for supported
+    # generation backends. Recommended default: false.
+    bf16_true_on_policy: NotRequired[bool]
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float]

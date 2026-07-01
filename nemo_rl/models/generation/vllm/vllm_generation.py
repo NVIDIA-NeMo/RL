@@ -46,6 +46,12 @@ from nemo_rl.models.generation.vllm.utils import (
 
 logger = logging.getLogger(__name__)
 
+G_VLLM_TRUE_ON_POLICY_FORWARDED_ENV_VARS = (
+    "NEMO_RL_VLLM_TRUE_ON_POLICY_PATCH_COMPONENTS",
+    "VLLM_BATCH_INVARIANT",
+    "NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES",
+)
+
 
 class VllmGeneration(GenerationInterface):
     @staticmethod
@@ -84,6 +90,7 @@ class VllmGeneration(GenerationInterface):
         name_prefix: str = "vllm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         defer_model_load: bool = False,
+        bf16_true_on_policy: bool = False,
     ):
         """Initialize a vLLM policy with distributed workers.
 
@@ -98,10 +105,13 @@ class VllmGeneration(GenerationInterface):
             name_prefix: Prefix for Ray actor names
             workers_per_node: Workers per node override
             defer_model_load: If True, defer model loading for overlapped init
+            bf16_true_on_policy: If True, enable BF16 true-on-policy parity
+                patches in vLLM.
         """
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load
+        self.bf16_true_on_policy = bf16_true_on_policy
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -192,12 +202,24 @@ class VllmGeneration(GenerationInterface):
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
+        worker_builder_kwargs: dict[str, Any] = {}
+        if self.bf16_true_on_policy:
+            worker_builder_kwargs["extra_env_vars"] = list(
+                G_VLLM_TRUE_ON_POLICY_FORWARDED_ENV_VARS
+            )
         if self.cfg["vllm_cfg"]["async_engine"]:
+            worker_builder_kwargs["defer_model_load"] = defer_model_load
             worker_builder = RayWorkerBuilder(
-                worker_cls, config, defer_model_load=defer_model_load
+                worker_cls,
+                config,
+                **worker_builder_kwargs,
             )
         else:
-            worker_builder = RayWorkerBuilder(worker_cls, config)
+            worker_builder = RayWorkerBuilder(
+                worker_cls,
+                config,
+                **worker_builder_kwargs,
+            )
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
@@ -205,6 +227,16 @@ class VllmGeneration(GenerationInterface):
         # Scoped to this generation config so it does not impact other test cases.
         for k, v in self.cfg["vllm_cfg"].get("env_vars", {}).items():
             env_vars[str(k)] = str(v)
+        if self.bf16_true_on_policy:
+            top_components = os.environ.get(
+                "NEMO_RL_VLLM_TRUE_ON_POLICY_PATCH_COMPONENTS"
+            )
+            if top_components is not None:
+                env_vars["NEMO_RL_VLLM_TRUE_ON_POLICY_PATCH_COMPONENTS"] = (
+                    top_components
+                )
+            env_vars["VLLM_BATCH_INVARIANT"] = "1"
+            env_vars["NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES"] = "1"
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
@@ -525,6 +557,19 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
+
+    def install_true_on_policy_patches(
+        self,
+        *,
+        bf16_true_on_policy: bool,
+    ) -> list[dict[str, Any]]:
+        """Install BF16 true-on-policy patches on vLLM model workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "install_true_on_policy_patches",
+            bf16_true_on_policy=bf16_true_on_policy,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
 
     def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
         """Collect raw spec decode counters from workers."""
