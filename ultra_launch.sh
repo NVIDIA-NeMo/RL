@@ -76,6 +76,8 @@ set -euo pipefail
 : "${CONTAINER:?CONTAINER is required (NGC image URI or .sqsh path)}"
 : "${SANDBOX_CONTAINER:?SANDBOX_CONTAINER is required (nemo-skills sandbox image)}"
 : "${PERSISTENT_CACHE:?PERSISTENT_CACHE is required (Lustre dir for vLLM/Triton/Inductor caches)}"
+UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${PERSISTENT_CACHE}/uv-python}"
+export UV_PYTHON_INSTALL_DIR
 : "${SLURM_PARTITION:?SLURM_PARTITION is required}"
 : "${SLURM_ACCOUNT:?SLURM_ACCOUNT is required}"
 # Judge models are recipe-specific. Most teachers (student RLVR, IFBench, RLHF,
@@ -304,6 +306,7 @@ export RAY_LOG_SYNC_FREQUENCY="${RAY_LOG_SYNC_FREQUENCY:-60}"
 
 CODE_ROOT="/opt/nemo-rl"
 VLLM_ENV_SOURCE="source /opt/nemo-rl/3rdparty/vllm/nemo-rl.env && "
+PYTHON_RUNNER="${PYTHON_RUNNER:-uv run}"
 
 # =============================================================================
 # Persistent cache directories
@@ -438,9 +441,10 @@ fi
 # =============================================================================
 # Container mounts
 # =============================================================================
-# By default, nemo_rl (Python package) and examples/configs (YAML configs) from
-# the code snapshot are overlaid into the container. Everything else uses the
-# container's built-in code at /opt/nemo-rl.
+# By default, the project metadata, nemo_rl (Python package), and
+# examples/configs (YAML configs) from the code snapshot are overlaid into the
+# container. Everything else uses the container's built-in code at
+# /opt/nemo-rl.
 #
 # To overlay additional components (e.g. a local Megatron-LM checkout), pass
 # EXTRA_MOUNTS as a comma-separated list of host:container pairs:
@@ -448,6 +452,8 @@ fi
 #   EXTRA_MOUNTS="/path/to/Megatron-LM:/opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM" bash ultra_launch.sh
 #
 # Container paths for reference:
+#   /opt/nemo-rl/pyproject.toml                                      — project dependencies
+#   /opt/nemo-rl/uv.lock                                             — resolved dependencies
 #   /opt/nemo-rl/nemo_rl                                              — Python package
 #   /opt/nemo-rl/examples/configs                                     — YAML configs
 #   /opt/nemo-rl/3rdparty/Megatron-LM-workspace/Megatron-LM           — Megatron-LM
@@ -463,6 +469,14 @@ _append_mount() {
   fi
 }
 
+if [[ -f "${OVERLAY_SOURCE}/pyproject.toml" ]]; then
+  _append_mount "${OVERLAY_SOURCE}/pyproject.toml:/opt/nemo-rl/pyproject.toml"
+  echo "  Mount: pyproject.toml → /opt/nemo-rl/pyproject.toml"
+fi
+if [[ -f "${OVERLAY_SOURCE}/uv.lock" ]]; then
+  _append_mount "${OVERLAY_SOURCE}/uv.lock:/opt/nemo-rl/uv.lock"
+  echo "  Mount: uv.lock → /opt/nemo-rl/uv.lock"
+fi
 if [[ -d "${OVERLAY_SOURCE}/nemo_rl" ]]; then
   _append_mount "${OVERLAY_SOURCE}/nemo_rl:/opt/nemo-rl/nemo_rl"
   echo "  Mount: nemo_rl → /opt/nemo-rl/nemo_rl"
@@ -509,6 +523,48 @@ fi
 # then seed fresh from Lustre.
 # =============================================================================
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
+if [ ! -x /opt/nemo_rl_venv/bin/python ] && [ -x /usr/bin/python3.12 ]; then
+  ln -sfn /usr/bin/python3.12 /opt/nemo_rl_venv/bin/python
+  echo "[PYTHON] Repaired /opt/nemo_rl_venv/bin/python with /usr/bin/python3.12"
+fi
+
+PYTHON_HEADER_DIR=\$(printf '%s\n' "${UV_PYTHON_INSTALL_DIR}"/cpython-3.12.*-linux-aarch64-gnu/include/python3.12 | sort -V | tail -n 1)
+if [ ! -f "\$PYTHON_HEADER_DIR/Python.h" ]; then
+  echo "ERROR: shared Python headers do not exist under ${UV_PYTHON_INSTALL_DIR}" >&2
+  exit 1
+fi
+if [ ! -e /usr/include/python3.12 ]; then
+  ln -s "\$PYTHON_HEADER_DIR" /usr/include/python3.12
+elif [ ! -f /usr/include/python3.12/Python.h ]; then
+  echo "ERROR: /usr/include/python3.12 exists without Python.h" >&2
+  exit 1
+fi
+
+# Component environments resolve dependencies from the mounted branch. Keep the
+# Ray daemons and driver on that same version before the cluster starts.
+if [ "${NRL_ALIGN_PROJECT_RAY:-true}" = "true" ]; then
+  PROJECT_RAY_VERSION=\$(sed -n 's/^[[:space:]]*"ray\[default\]==\([^"]*\)".*/\1/p' /opt/nemo-rl/pyproject.toml | head -n 1)
+  if [ -z "\$PROJECT_RAY_VERSION" ]; then
+    echo "ERROR: could not read the Ray pin from /opt/nemo-rl/pyproject.toml" >&2
+    exit 1
+  fi
+
+  CURRENT_RAY_VERSION=\$(/opt/nemo_rl_venv/bin/python -c 'import ray; print(ray.__version__)' 2>/dev/null || true)
+  if [ "\$CURRENT_RAY_VERSION" != "\$PROJECT_RAY_VERSION" ]; then
+    UV_BIN=\$(command -v uv || true)
+    if [ -z "\$UV_BIN" ]; then
+      echo "ERROR: uv is required to align Ray \$CURRENT_RAY_VERSION -> \$PROJECT_RAY_VERSION" >&2
+      exit 1
+    fi
+    echo "[RAY] Aligning root runtime \$CURRENT_RAY_VERSION -> \$PROJECT_RAY_VERSION"
+    UV_CACHE_DIR=${PERSISTENT_CACHE}/uv "\$UV_BIN" pip install \
+      --python /opt/nemo_rl_venv/bin/python \
+      "ray[default]==\$PROJECT_RAY_VERSION"
+  else
+    echo "[RAY] Root runtime already matches project pin \$PROJECT_RAY_VERSION"
+  fi
+fi
+
 command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
 echo "[CACHE SEED] Clearing stale /tmp caches and seeding from Lustre..."
 WARM_SEED="${NRL_VLLM_CACHE_SEED_DIR}"
@@ -560,6 +616,10 @@ export SETUP_COMMAND
 # =============================================================================
 TRAIN_CMD="cd ${CODE_ROOT} && date ; \
 ${VLLM_ENV_SOURCE}\
+NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-} \
+NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR:-} \
+UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR} \
+NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS:-false} \
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 WANDB_INIT_TIMEOUT=300 \
@@ -578,7 +638,7 @@ NRL_WG_USE_RAY_REF=1 \
 HF_HOME=${HF_HOME:-} \
 HF_TOKEN=${HF_TOKEN:-} \
 NRL_USE_FASTOKENS=${NRL_USE_FASTOKENS:-1} \
-uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
+${PYTHON_RUNNER} ./examples/nemo_gym/run_grpo_nemo_gym.py \
 --config ${CONFIG_PATH} \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
