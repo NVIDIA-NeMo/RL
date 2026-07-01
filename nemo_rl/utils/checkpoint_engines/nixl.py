@@ -254,7 +254,6 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         rollout_world_size: int,
         metadata: list[NixlAgentMetadata],
     ) -> None:
-        self.worker_rank = worker_rank
         self._disconnect_peers()
         source_to_rollout = {
             _source_rank_for_rollout(
@@ -279,7 +278,6 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         rollout_world_size: int,
         metadata: list[NixlAgentMetadata],
     ) -> None:
-        self.rollout_rank = rollout_rank
         self._disconnect_peers()
         source_rank = _source_rank_for_rollout(
             rollout_rank,

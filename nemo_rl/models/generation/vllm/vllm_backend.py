@@ -18,7 +18,7 @@ import time
 import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import zmq
@@ -126,6 +126,7 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 class VllmInternalWorkerExtension:
     checkpoint_engine: "CheckpointEngine"
+    _nrl_named_parameters: dict[str, torch.nn.Parameter]
 
     def init_collective(
         self,
@@ -524,10 +525,16 @@ class VllmInternalWorkerExtension:
                         f"vLLM reports EP for {name} without an expert ownership map."
                     )
                 logical_num_experts = int(
-                    getattr(owner, "logical_num_experts", expert_map.numel())
+                    cast(
+                        int,
+                        getattr(owner, "logical_num_experts", expert_map.numel()),
+                    )
                 )
                 global_num_experts = int(
-                    getattr(owner, "global_num_experts", logical_num_experts)
+                    cast(
+                        int,
+                        getattr(owner, "global_num_experts", logical_num_experts),
+                    )
                 )
                 if global_num_experts != logical_num_experts:
                     raise RuntimeError(

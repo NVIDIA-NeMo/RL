@@ -22,7 +22,6 @@ from typing import AsyncGenerator, Optional
 
 import requests
 import torch
-
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -33,6 +32,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer import enums as transformer_enums
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import unwrap_model
+
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -283,6 +283,7 @@ class MegatronGenerationMixin:
         from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
             start_text_gen_server,
         )
+
         from nemo_rl.distributed.virtual_cluster import (
             _get_free_port_local,
             _get_node_ip_local,

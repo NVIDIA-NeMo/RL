@@ -82,7 +82,7 @@ class CheckpointEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def receive_weight_batches(
+    def receive_weight_batches(
         self,
     ) -> AsyncGenerator[list[tuple[str, torch.Tensor]], None]:
         """Yield ``(name, tensor)`` batches on the generation side."""

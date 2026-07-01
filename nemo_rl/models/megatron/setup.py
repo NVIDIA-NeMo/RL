@@ -21,8 +21,6 @@ import warnings
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
-from transformers import PreTrainedTokenizerBase
-
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.model_provider import get_model
 from megatron.bridge.peft.lora import LoRA
@@ -63,6 +61,8 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer import enums as transformer_enums
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from transformers import PreTrainedTokenizerBase
+
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
 
 try:

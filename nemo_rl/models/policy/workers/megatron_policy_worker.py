@@ -22,8 +22,6 @@ from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
-from transformers import PreTrainedTokenizerBase
-
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
@@ -42,6 +40,8 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config
+from transformers import PreTrainedTokenizerBase
+
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
