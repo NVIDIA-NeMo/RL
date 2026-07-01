@@ -438,9 +438,14 @@ Depending on your data shape, you may want to change these values."""
             # Eventually we can maybe be smarter about this, but this is functional for now.
 
             # Note that NeMo-Gym will only return token ids on "assistant" messages and not other message types.
+<<<<<<< HEAD
             if not isinstance(output_item_dict, dict):
                 continue
             if "generation_token_ids" not in output_item_dict:
+=======
+            # Also skip if generation_token_ids is present but empty, e.g. all-EOS generation stripped to [] — torch.tensor([]) defaults to float32 and breaks batch dtype consistency.
+            if "generation_token_ids" not in output_item_dict or not output_item_dict["generation_token_ids"]:
+>>>>>>> 1c171adc5 (fix empty gen token case)
                 continue
 
             _prompt_ids = output_item_dict["prompt_token_ids"]
