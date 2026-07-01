@@ -341,6 +341,13 @@ policy:
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
+      # Use triton MoE backend (matches the reference Qwen3-30B SWE configs
+      # examples/nemo_gym/grpo_qwen3_30ba3b_thinking_swe{1,2}.yaml). The default
+      # flashinfer MoE backend uses a fused/quantized expert weight layout
+      # (trtllm_bf16_moe) that does not match the megatron weight-refit broadcast,
+      # which hangs broadcast_weights_for_collective. triton uses the standard
+      # expert layout that the refit broadcast expects.
+      moe_backend: triton
       compilation_config:
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
 

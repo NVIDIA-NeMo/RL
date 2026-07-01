@@ -41,7 +41,7 @@ set -e
 
 # ============================ Paths ============================
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/test_assets/qwen-30B/grpo_qwen3_30b_async_swe.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/examples/swe_bench/grpo_qwen3_30b_async_swe_hsg.yaml}"
 CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${REPO_ROOT}/results}"
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-/lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/blends/balanced_language.jsonl}"
 VAL_DATA_PATH="${VAL_DATA_PATH:-/lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/swe_public_datasets_val_swebench.jsonl}"
@@ -51,8 +51,11 @@ MODEL_PATH="${1:-${MODEL_PATH:-${DEFAULT_MODEL_PATH}}}"
 # ================ Container and mount config ================
 # GB200 (aarch64) baked image: apptainer + /opt/nemo_rl_venv with --extra mcore
 # (sm_100), built by test_assets/SWE/build_swe_bench_combined.sh.
-# export CONTAINER=${CONTAINER:-/lustre/fsw/portfolios/nemotron/users/ruit/enroot-images/ruit-swe_bench-6dc8fabea-aarch64-060426-mcore-apptainer.squashfs}
-export CONTAINER=${CONTAINER:-/lustre/fsw/portfolios/nemotron/users/ruit/enroot-images/nemo-rl:nightly-062326.squashfs}
+# Baked image: nightly-063026 + /opt/gym_venvs (gym server venvs prebuilt) so gym
+# spinup hits skip_venv_if_present and does NOT concurrently build venvs (which
+# deadlocks on the uv cache lock). Built by test_assets/SWE/build_swe_bench_combined.sh.
+# Older non-baked images (e.g. nightly-062326) WILL hang at gym spinup — do not use.
+export CONTAINER=${CONTAINER:-/lustre/fsw/portfolios/nemotron/users/ruit/enroot-images/nemo-rl:nightly-063026-gymvenvs.squashfs}
 GYM_CODE="${REPO_ROOT}/3rdparty/Gym-workspace/Gym"
 export MOUNTS="/lustre:/lustre,$PWD:$PWD,${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 
