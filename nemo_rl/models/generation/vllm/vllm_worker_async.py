@@ -21,7 +21,8 @@ import time
 import uuid
 import warnings
 from dataclasses import asdict
-from typing import Any, AsyncGenerator, Optional, cast
+from collections.abc import Callable, Coroutine
+from typing import Any, AsyncGenerator, Optional, TypeVar, cast
 
 import ray
 import torch
@@ -56,6 +57,9 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
+
+
+StreamingToolCallManagerResult = TypeVar("StreamingToolCallManagerResult")
 
 
 class StreamingToolCallPrefillRequest(BaseModel):
@@ -975,7 +979,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     status_code=503,
                     detail="streaming tool-call prefill is not enabled",
                 )
+            manager.bind_to_current_loop()
             return manager
+
+        @app.on_event("startup")
+        async def bind_streaming_tool_call_manager() -> None:
+            manager = getattr(self, "streaming_tool_call_manager", None)
+            if manager is not None:
+                manager.bind_to_current_loop()
 
         @app.post("/v1/streaming_tool_call/start")
         async def start_streaming_tool_call(
@@ -1142,6 +1153,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         else:
             thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
+
+        if self.streaming_tool_call_manager is not None:
+            startup_deadline = time.monotonic() + 30
+            while not server.started:
+                if not thread.is_alive():
+                    raise RuntimeError("vLLM HTTP server exited during startup")
+                if time.monotonic() >= startup_deadline:
+                    server.should_exit = True
+                    raise TimeoutError(
+                        "vLLM HTTP server did not start within 30 seconds"
+                    )
+                time.sleep(0.01)
 
         return thread, base_url, server
 
@@ -1569,22 +1592,55 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    async def _run_streaming_tool_call_manager_operation(
+        self,
+        operation: Callable[
+            [StreamingToolCallPrefillManager],
+            Coroutine[Any, Any, StreamingToolCallManagerResult],
+        ],
+    ) -> StreamingToolCallManagerResult:
+        """Run a manager operation on the HTTP server's event loop."""
+        manager = self.streaming_tool_call_manager
+        assert manager is not None
+        owner_loop = manager.event_loop
+        if owner_loop is None or owner_loop.is_closed():
+            raise RuntimeError("streaming tool-call HTTP event loop is not available")
+
+        if owner_loop is asyncio.get_running_loop():
+            return await operation(manager)
+
+        operation_coro = operation(manager)
+        try:
+            concurrent_future = asyncio.run_coroutine_threadsafe(
+                operation_coro, owner_loop
+            )
+        except Exception:
+            operation_coro.close()
+            raise
+        return await asyncio.wrap_future(concurrent_future)
+
     async def _invalidate_streaming_tool_call_sessions(self) -> int:
         manager = getattr(self, "streaming_tool_call_manager", None)
         if manager is None:
             return 0
-        return await manager.invalidate_all()
+        return await self._run_streaming_tool_call_manager_operation(
+            lambda active_manager: active_manager.invalidate_all()
+        )
 
     async def _pause_streaming_tool_call_sessions(self) -> int:
         manager = getattr(self, "streaming_tool_call_manager", None)
         if manager is None:
             return 0
-        return await manager.pause_and_invalidate()
+        return await self._run_streaming_tool_call_manager_operation(
+            lambda active_manager: active_manager.pause_and_invalidate()
+        )
 
     async def _resume_streaming_tool_call_sessions(self) -> None:
         manager = getattr(self, "streaming_tool_call_manager", None)
         if manager is not None:
-            await manager.resume()
+            await self._run_streaming_tool_call_manager_operation(
+                lambda active_manager: active_manager.resume()
+            )
 
     async def update_weights_via_ipc_zmq_async(
         self,

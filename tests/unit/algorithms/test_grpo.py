@@ -1797,6 +1797,76 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
 
 
+def test_refit_policy_generation_pauses_streaming_before_collective(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = []
+
+    class DummyVllmGeneration:
+        def pause_streaming_tool_call_sessions(self):
+            calls.append("pause")
+
+        def update_weights_from_collective(self):
+            calls.append("inference_collective")
+            return [True]
+
+        def resume_streaming_tool_call_sessions(self):
+            calls.append("resume")
+
+    class DummyPolicy:
+        def broadcast_weights_for_collective(self, kv_scales):
+            calls.append("training_collective")
+            return [True]
+
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", DummyVllmGeneration)
+    monkeypatch.setattr(grpo_mod.ray, "get", lambda values: values)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummyVllmGeneration(),
+        colocated_inference=False,
+    )
+
+    assert calls == [
+        "pause",
+        "training_collective",
+        "inference_collective",
+        "resume",
+    ]
+
+
+def test_refit_policy_generation_does_not_start_collective_if_pause_fails(
+    monkeypatch,
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = []
+
+    class DummyVllmGeneration:
+        def pause_streaming_tool_call_sessions(self):
+            calls.append("pause")
+            raise RuntimeError("pause failed")
+
+        def resume_streaming_tool_call_sessions(self):
+            calls.append("resume")
+
+    class DummyPolicy:
+        def broadcast_weights_for_collective(self, kv_scales):
+            calls.append("training_collective")
+            return [True]
+
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", DummyVllmGeneration)
+
+    with pytest.raises(RuntimeError, match="pause failed"):
+        grpo_mod.refit_policy_generation(
+            policy=DummyPolicy(),
+            policy_generation=DummyVllmGeneration(),
+            colocated_inference=False,
+        )
+
+    assert calls == ["pause", "resume"]
+
+
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):
@@ -2385,6 +2455,37 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         "policy.get_logprobs was called even though force_on_policy_ratio=True. "
         "This indicates a regression of PR #2177."
     )
+
+
+def test_async_grpo_train_propagates_training_failure(mock_grpo_components):
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    mock_grpo_components["policy"].train.side_effect = RuntimeError("training failed")
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        pytest.raises(RuntimeError, match="training failed"),
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            None,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
