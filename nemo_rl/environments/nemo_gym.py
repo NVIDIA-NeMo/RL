@@ -383,7 +383,9 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             user_message = {
                 "role": "user",
                 "content": "",
-                "token_ids": torch.tensor(new_prompt_token_ids),
+                # Some JSON proxy paths promote integral IDs to floats.
+                # Pin the embedding input dtype at the NeMo-RL boundary.
+                "token_ids": torch.tensor(new_prompt_token_ids, dtype=torch.long),
             }
             if routed_experts is not None:
                 user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
@@ -404,8 +406,10 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             assistant_message = {
                 "role": "assistant",
                 "content": "",
-                "token_ids": torch.tensor(generation_token_ids),
-                "generation_logprobs": torch.tensor(generation_log_probs),
+                "token_ids": torch.tensor(generation_token_ids, dtype=torch.long),
+                "generation_logprobs": torch.tensor(
+                    generation_log_probs, dtype=torch.float32
+                ),
                 "is_invalid_tool_call": is_invalid_tool_call,
                 "has_malformed_thinking": has_malformed_thinking,
             }
