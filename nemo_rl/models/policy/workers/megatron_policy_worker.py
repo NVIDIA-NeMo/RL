@@ -578,7 +578,6 @@ class MegatronPolicyWorkerImpl(
             saved_extra_state = None
             reenable_forward_pre_hook_after_eval = False
 
-        torch.distributed.barrier()  # pragma: no cover
         torch.cuda.synchronize()  # pragma: no cover
         _train_t0 = time.perf_counter()  # pragma: no cover
 
