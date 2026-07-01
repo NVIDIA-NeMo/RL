@@ -7,9 +7,8 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=4
-GPUS_PER_NODE=4
-SEGMENT_SIZE=4     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment (keeps MoE EP intra-rack, #2937). Matches cluster.segment_size in the yaml.
+NUM_NODES=2
+GPUS_PER_NODE=8
 STEPS_PER_RUN=1
 MAX_STEPS=1
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
