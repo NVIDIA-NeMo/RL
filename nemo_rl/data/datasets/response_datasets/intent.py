@@ -36,7 +36,6 @@ import os
 import zipfile
 from typing import Any
 
-import numpy as np
 from huggingface_hub import snapshot_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -164,11 +163,6 @@ def _resolve_video_path(snapshot_dir: str, relpath: str) -> str | None:
     if os.path.isfile(candidate):
         return candidate
     return None
-
-
-def _load_audio_from_video(video_path: str, sampling_rate: int = 16000) -> np.ndarray:
-    """Decode the audio track of a video file as a 1-D float32 array."""
-    return load_audio_from_file(video_path, sampling_rate=sampling_rate)
 
 
 def _read_manifest(snapshot_dir: str, manifest_filename: str) -> list[dict[str, Any]]:
@@ -347,7 +341,7 @@ class IntentDataset(RawDataset):
         instruction = _TYPE_TEMPLATE.get(data["problem_type"], "")
         options_text = _format_options(data.get("options"))
         prompt_text = f"{data['problem']}{options_text}{instruction}"
-        audio_array = _load_audio_from_video(data["video_path"])
+        audio_array = load_audio_from_file(data["video_path"])
         user_content = [
             {"type": "video", "video": data["video_path"]},
             {"type": "audio", "audio": audio_array},
