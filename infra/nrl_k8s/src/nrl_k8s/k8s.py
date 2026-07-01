@@ -258,6 +258,34 @@ def get_rayjob(name: str, namespace: str) -> dict[str, Any] | None:
         raise
 
 
+def wait_for_rayjob_raycluster_name(
+    rayjob_name: str,
+    namespace: str,
+    *,
+    timeout_s: int = 120,
+    poll_s: int = 2,
+) -> str:
+    """Poll the RayJob's ``.status.rayClusterName`` until KubeRay populates it.
+
+    KubeRay creates the RayCluster (with an auto-suffixed name) shortly after
+    the RayJob is applied, then writes the cluster's name to the RayJob
+    status. Callers need that name to look up the cluster's UID for things
+    like ownerReferences. Typical settle time is a few seconds.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        obj = get_rayjob(rayjob_name, namespace)
+        if obj is not None:
+            cluster_name = (obj.get("status") or {}).get("rayClusterName")
+            if cluster_name:
+                return cluster_name
+        time.sleep(poll_s)
+    raise TimeoutError(
+        f"RayJob {rayjob_name} in {namespace} never populated "
+        f".status.rayClusterName after {timeout_s}s"
+    )
+
+
 def wait_for_rayjob_terminal(
     name: str,
     namespace: str,
@@ -711,5 +739,6 @@ __all__ = [
     "wait_for_deployment_ready",
     "wait_for_raycluster_gone",
     "wait_for_raycluster_ready",
+    "wait_for_rayjob_raycluster_name",
     "wait_for_rayjob_terminal",
 ]
