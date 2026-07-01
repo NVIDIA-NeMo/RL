@@ -524,6 +524,31 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_future_target_weight_matching(self):
+        """Test that sampling can use trajectories intended for a future step."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectory = {
+            "batch": {"data": "for_future_step"},
+            "rollout_metrics": {"reward": 1.0},
+        }
+        ray.get(
+            buffer.add.remote(trajectory, weight_version=1, target_weight_version=3)
+        )
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=2,
+                max_age_steps=1,
+            )
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "for_future_step"
+
+        ray.kill(buffer)
+
     def test_replay_buffer_get_existing_target_weights(self):
         """Test getting existing target weight versions."""
         buffer = ReplayBuffer.remote(max_size=10)

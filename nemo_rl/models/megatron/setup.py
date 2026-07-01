@@ -777,6 +777,20 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
         "use_fused_weighted_squared_relu"
     ]
+    # Optional first/last-layer BF16 precision overrides (used by FP8 recipes to
+    # keep boundary layers in BF16).
+    if "first_last_layers_bf16" in config["megatron_cfg"]:
+        model_cfg.first_last_layers_bf16 = config["megatron_cfg"][
+            "first_last_layers_bf16"
+        ]
+    if "num_layers_at_start_in_bf16" in config["megatron_cfg"]:
+        model_cfg.num_layers_at_start_in_bf16 = config["megatron_cfg"][
+            "num_layers_at_start_in_bf16"
+        ]
+    if "num_layers_at_end_in_bf16" in config["megatron_cfg"]:
+        model_cfg.num_layers_at_end_in_bf16 = config["megatron_cfg"][
+            "num_layers_at_end_in_bf16"
+        ]
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")

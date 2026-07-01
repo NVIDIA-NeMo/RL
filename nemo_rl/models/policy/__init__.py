@@ -325,6 +325,11 @@ class MegatronConfig(TypedDict):
     gradient_accumulation_fusion: NotRequired[bool]
     # Enable fused weighted squared ReLU when the architecture supports it.
     use_fused_weighted_squared_relu: NotRequired[bool]
+    # Keep the first/last transformer layers in BF16 (used by FP8 recipes to
+    # preserve precision at the model boundaries).
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
     # When True, uses chunked linear cross-entropy fusion loss to compute loss
     # directly from hidden states, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak

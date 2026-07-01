@@ -134,6 +134,8 @@ class GenerationConfig(TypedDict):
     _pad_token_id: NotRequired[int]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
+    # Internal GRPO validation-only sampling config used by OpenAI-compatible generation servers.
+    _validation_generation: NotRequired[dict[str, float] | None]
 
 
 class GenerationDatumSpec(TypedDict):

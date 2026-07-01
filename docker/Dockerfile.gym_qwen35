@@ -1,0 +1,184 @@
+# syntax=docker/dockerfile:1
+# Overlay the Qwen3.5 SWE/NeMo-Gym pieces on top of a NeMo-RL image built from
+# this branch with main's docker/Dockerfile (release stage).
+#
+# Step 1 — build the base image from this checkout (submodules must be
+# initialized: git submodule update --init --recursive):
+#   docker buildx build \
+#     --platform linux/amd64 \
+#     --build-context nemo-rl=. \
+#     --build-arg NEMO_GYM_PREFETCH_CONFIGS=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml \
+#     -t <registry>/nemo-rl:qwen35-base \
+#     -f docker/Dockerfile .
+#
+# Step 2 — overlay the Gym patches and SWE-agent frameworks:
+#   docker buildx build \
+#     --platform linux/amd64 \
+#     --build-arg BASE_IMAGE=<registry>/nemo-rl:qwen35-base \
+#     -t <registry>/nemo-rl:qwen35-gym \
+#     -f docker/Dockerfile.gym_qwen35 .
+#
+# The SWE-agent setup block clones external repos during the build and
+# therefore requires network egress.
+
+ARG BASE_IMAGE=nvcr.io/nvidia/nemo-rl:qwen35-base
+FROM ${BASE_IMAGE}
+
+ARG TARGETARCH
+
+USER root
+WORKDIR /opt/nemo-rl
+
+ENV NRL_CONTAINER=1
+ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
+
+# Patches first: the config COPYs happen later so that editing
+# qwen_35/configs/*.yaml does not invalidate the expensive SWE-agent setup
+# layer below.
+COPY docker/gym/mlperf-gym.patch /tmp/mlperf-gym.patch
+COPY docker/gym/qwen35-gym-vllm-model.patch /tmp/qwen35-gym-vllm-model.patch
+
+# Apptainer is installed by main's Dockerfile custom-setup by default; keep a
+# guarded install so this overlay also works on bases built without it.
+RUN <<"EOF" bash -exu -o pipefail
+if ! command -v apptainer >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        software-properties-common
+    add-apt-repository -y ppa:apptainer/ppa
+    apt-get update
+    apt-get install -y --no-install-recommends apptainer
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+fi
+ln -sf "$(command -v apptainer)" /usr/bin/singularity
+EOF
+
+# MLPerf SWE-agent fixes for the Gym workspace:
+# - shared base_results_dir support for multinode Ray runs
+# - OpenHands model-server preflight
+# - R2E-Gym dependency repair (optional docker/openai/rich imports)
+RUN <<"EOF" bash -exu
+cd /opt/nemo-rl/3rdparty/Gym-workspace/Gym
+if git apply --check /tmp/mlperf-gym.patch; then
+    git apply /tmp/mlperf-gym.patch
+elif git apply --reverse --check /tmp/mlperf-gym.patch; then
+    echo "mlperf-gym.patch is already applied"
+else
+    git apply --check /tmp/mlperf-gym.patch
+fi
+EOF
+
+# Qwen 3.5 vLLM model-server fix: keep reasoning text in content for assistant
+# messages that carry tool_calls (the Qwen3.5 chat template omits
+# reasoning_content there, which breaks token contiguity).
+RUN <<"EOF" bash -exu
+cd /opt/nemo-rl/3rdparty/Gym-workspace/Gym
+if git apply --check /tmp/qwen35-gym-vllm-model.patch; then
+    git apply /tmp/qwen35-gym-vllm-model.patch
+elif git apply --reverse --check /tmp/qwen35-gym-vllm-model.patch; then
+    echo "qwen35-gym-vllm-model.patch is already applied"
+else
+    git apply --check /tmp/qwen35-gym-vllm-model.patch
+fi
+EOF
+
+# SWE-agent frameworks used by the OpenHands/R2E SWE environments. These clone
+# external repos and download miniforge/uv during the build (network egress
+# required). SWEBENCH_COMMIT=HEAD entries are upstream moving targets.
+RUN <<"EOF" bash -exu -o pipefail
+SWE_AGENTS_DIR=/opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_openhands_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    MINIFORGE_DIR="${SETUP_DIR}/miniforge3" \
+    OPENHANDS_DIR="${SETUP_DIR}/OpenHands" \
+    AGENT_FRAMEWORK_REPO="https://github.com/sdevare-nv/nv-OpenHands.git" \
+    AGENT_FRAMEWORK_COMMIT="0d766ad06b2be64a42e6f0175b9ebcc4a06599d9" \
+        "${SWE_AGENTS_DIR}/setup_scripts/openhands.sh"
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_swebench_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    UV_DIR="${SETUP_DIR}/uv" \
+    PYTHON_DIR="${SETUP_DIR}/python" \
+    SWEBENCH_DIR="${SETUP_DIR}/SWE-bench" \
+    SWEBENCH_REPO="https://github.com/HeyyyyyyG/SWE-bench.git" \
+    SWEBENCH_COMMIT="HEAD" \
+        "${SWE_AGENTS_DIR}/setup_scripts/swebench.sh"
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_swebench_multilingual_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    UV_DIR="${SETUP_DIR}/uv" \
+    PYTHON_DIR="${SETUP_DIR}/python" \
+    SWEBENCH_DIR="${SETUP_DIR}/SWE-bench_Multilingual" \
+    SWEBENCH_REPO="https://github.com/Kipok/SWE-bench.git" \
+    SWEBENCH_COMMIT="HEAD" \
+        "${SWE_AGENTS_DIR}/setup_scripts/swebench_multilingual.sh"
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_r2e_gym_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    UV_DIR="${SETUP_DIR}/uv" \
+    PYTHON_DIR="${SETUP_DIR}/python" \
+    R2E_GYM_DIR="${SETUP_DIR}/R2E-Gym" \
+    EVAL_HARNESS_REPO="https://github.com/sdevare-nv/nv-R2E-Gym.git" \
+    EVAL_HARNESS_COMMIT="local-eval" \
+        "${SWE_AGENTS_DIR}/setup_scripts/r2e_gym.sh"
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_rebench_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    REBENCH_DIR="${SETUP_DIR}/SWE-rebench-V2" \
+        "${SWE_AGENTS_DIR}/setup_scripts/swe_rebench.sh"
+EOF
+
+# Ensure the Qwen3.5 recipe files are present even when the base image was not
+# built from this branch. COPYs are idempotent when the base already has them.
+# Placed after the SWE setup so config edits reuse the cached layers above.
+COPY qwen_35/ /opt/nemo-rl/qwen_35/
+COPY examples/nemo_gym/launch_qwen35_nemo_gym_multinode_training.sh /opt/nemo-rl/examples/nemo_gym/launch_qwen35_nemo_gym_multinode_training.sh
+
+# Pre-bake the Gym server venvs (no-op for venvs the base image already
+# prefetched; skip_venv_if_present is set in the config). Uses main's native
+# examples/nemo_gym/prefetch_venvs.py and vLLM cu-wheel override, mirroring
+# main's docker/Dockerfile gym prefetch step. Pass an empty
+# NEMO_GYM_PREFETCH_CONFIGS to skip (e.g. when the base image already
+# prefetched the same configs).
+ARG NEMO_GYM_PREFETCH_CONFIGS=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml
+ARG NEMO_GYM_CUDA=cu130
+ARG NEMO_GYM_VLLM_VERSION=0.20.0
+RUN <<"EOF" bash -exu -o pipefail
+if [[ -z "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
+    echo "NEMO_GYM_PREFETCH_CONFIGS is empty; skipping gym venv prefetch."
+    exit 0
+fi
+UV_OVERRIDE_ARGS=()
+if [[ -n "${NEMO_GYM_VLLM_VERSION:-}" ]]; then
+    case "${TARGETARCH:-amd64}" in
+        arm64) WHEEL_ARCH=aarch64 ;;
+        *) WHEEL_ARCH=x86_64 ;;
+    esac
+    GYM_VLLM_OVERRIDE=/tmp/gym-vllm-override.txt
+    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s+%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
+        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_CUDA}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    UV_OVERRIDE_ARGS=(UV_OVERRIDE="${GYM_VLLM_OVERRIDE}")
+fi
+
+env \
+    UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
+    UV_LINK_MODE=hardlink \
+    "${UV_OVERRIDE_ARGS[@]}" \
+    uv run python examples/nemo_gym/prefetch_venvs.py ${NEMO_GYM_PREFETCH_CONFIGS}
+
+rm -f "${GYM_VLLM_OVERRIDE:-}"
+EOF
+
+RUN chmod +x /opt/nemo-rl/examples/nemo_gym/launch_qwen35_nemo_gym_multinode_training.sh && \
+    python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint

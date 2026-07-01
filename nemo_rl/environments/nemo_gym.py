@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
+import aiohttp
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -272,12 +275,44 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_results = []
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        print(
+                            f"  [nemo_gym] WARNING: rollout failed ({type(e).__name__}: {e}); "
+                            "will back-fill as a zero-reward trajectory instead of aborting the batch.",
+                            flush=True,
+                        )
+                        continue
+                    except Exception as e:
+                        # This response content comes from https://github.com/NVIDIA-NeMo/Gym/blob/30f498b1e994679cebcfacfa4ac630190d0e171f/nemo_gym/server_utils.py#L233
+                        if hasattr(e, "response_content"):
+                            print("EXCEPTION RESULT", e.response_content, file=sys.stderr)
+                        raise
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
-                    )
+                    try:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_result, tokenizer
+                        )
+                    except Exception as e:
+                        print(
+                            f"  [nemo_gym] WARNING: failed to postprocess rollout "
+                            f"{nemo_gym_row.get('_rowidx', '<unknown>')} "
+                            f"({type(e).__name__}: {e}); "
+                            "will back-fill as a zero-reward trajectory.",
+                            flush=True,
+                        )
+                        fallback_result = (
+                            nemo_gym_result
+                            if isinstance(nemo_gym_result, dict)
+                            else None
+                        )
+                        nemo_rl_result = self._zero_reward_nemo_rl_result(
+                            tokenizer,
+                            fallback_result,
+                            reason=f"postprocess_failed:{type(e).__name__}: {e}",
+                        )
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
                 nemo_rl_results.append(nemo_rl_result)
@@ -305,16 +340,76 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_sort_results = [None] * nemo_gym_num_rows
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
             nemo_rl_sort_results[rowidx] = result
+        num_failed = sum(1 for r in nemo_rl_sort_results if r is None)
+        if num_failed:
+            print(
+                f"  [nemo_gym] WARNING: back-filling {num_failed}/{nemo_gym_num_rows} failed "
+                "rollout(s) as zero-reward trajectories (batch counts preserved).",
+                flush=True,
+            )
+            for i in range(nemo_gym_num_rows):
+                if nemo_rl_sort_results[i] is None:
+                    nemo_rl_sort_results[i] = self._zero_reward_nemo_rl_result(
+                        tokenizer, reason="rollout_failed"
+                    )
         nemo_rl_results = nemo_rl_sort_results
 
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")
         total_time = timing_metrics.pop("_run_rollouts_total")
+        # The postprocess timer label never fires when every rollout failed at
+        # `await task` and was back-filled, so default it to 0 rather than crash.
         timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-            100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+            100
+            * timing_metrics.get(f"{timer_prefix}/postprocess_results", 0.0)
+            / total_time
         )
 
         return nemo_rl_results, timing_metrics
+
+    def _zero_reward_nemo_rl_result(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        nemo_gym_result: dict | None = None,
+        reason: str | None = None,
+    ) -> dict:
+        fallback_token = (
+            tokenizer.pad_token_id
+            if tokenizer.pad_token_id is not None
+            else (tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0)
+        )
+        if nemo_gym_result is None:
+            nemo_gym_result = {}
+
+        response = nemo_gym_result.get("response")
+        if not isinstance(response, dict):
+            response = {}
+            nemo_gym_result["response"] = response
+        if not isinstance(response.get("output"), list):
+            response["output"] = []
+        nemo_gym_result["reward"] = 0.0
+        if reason:
+            nemo_gym_result["nemo_rl_fallback_reason"] = reason
+
+        message_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor(
+                    [fallback_token, fallback_token], dtype=torch.int64
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([fallback_token], dtype=torch.int64),
+            },
+        ]
+        return {
+            "message_log": message_log,
+            "input_message_log": message_log[:1],
+            "full_result": nemo_gym_result,
+        }
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
@@ -323,15 +418,25 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
+        response_output = nemo_gym_result.get("response", {}).get("output")
+        if not isinstance(response_output, list):
+            return self._zero_reward_nemo_rl_result(
+                tokenizer,
+                nemo_gym_result,
+                reason=f"malformed_response_output:{type(response_output).__name__}",
+            )
+
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
-        for output_item_dict in nemo_gym_result["response"]["output"]:
+        for output_item_dict in response_output:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
             # Eventually we can maybe be smarter about this, but this is functional for now.
 
             # Note that NeMo-Gym will only return token ids on "assistant" messages and not other message types.
+            if not isinstance(output_item_dict, dict):
+                continue
             if "generation_token_ids" not in output_item_dict:
                 continue
 
@@ -438,17 +543,37 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
-            prompt_token_ids = tokenizer.apply_chat_template(
-                input_messages, tokenize=True
+            input_messages = nemo_gym_result.get("responses_create_params", {}).get(
+                "input"
             )
-            raise ValueError(
+            try:
+                if input_messages is None:
+                    prompt_len_str = "<unknown>"
+                else:
+                    prompt_token_ids = tokenizer.apply_chat_template(
+                        input_messages, tokenize=True
+                    )
+                    prompt_len_str = f"{len(prompt_token_ids)} tokens"
+            except Exception as e:
+                prompt_len_str = (
+                    f"<unknown - apply_chat_template failed: {type(e).__name__}: {e}>"
+                )
+            output_item_types = [
+                o.get("type") if isinstance(o, dict) else type(o).__name__
+                for o in response_output
+            ]
+            print(
                 f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
+                f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
+                f"so vLLM rejected the request before any tokens could be generated; "
+                f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
+                f"  Prompt length: {prompt_len_str}.\n"
+                f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
+                "  Treating this rollout as a masked zero-reward trajectory instead of aborting the batch.",
+                flush=True,
+            )
+            return self._zero_reward_nemo_rl_result(
+                tokenizer, nemo_gym_result, reason="no_generation_data"
             )
 
         return {

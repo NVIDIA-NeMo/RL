@@ -102,10 +102,11 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     ) -> Optional[dict[str, Any]]:
         """Sample per-prompt trajectory groups intended for the current training step.
 
-        Only returns trajectories with target_weight_version == current_weight_version.
-        If insufficient trajectories are available, returns None to stall training
-        until the remaining trajectories are generated. This ensures no trajectory
-        loses its last chance to be used for its intended training step.
+        Only returns trajectories with target_weight_version >= current_weight_version,
+        so trajectories staged for a future step may be consumed early instead of
+        stalling. If insufficient trajectories are available, returns None to stall
+        training until the remaining trajectories are generated. This ensures no
+        trajectory loses its last chance to be used for its intended training step.
 
         Returns:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
@@ -168,7 +169,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             intended_indices = [
                 i
                 for i in valid_indices
-                if self.target_weight_versions[i] == current_weight_version
+                if self.target_weight_versions[i] >= current_weight_version
             ]
 
             print(
@@ -199,8 +200,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 f"✅ Selected counts by generation weight-version: {Counter(sampled_weights)}"
             )
             print(f"📊 Average trajectory age: {avg_trajectory_age:.2f} steps")
+            sampled_targets = Counter(
+                self.target_weight_versions[i] for i in selected
+            )
             print(
-                f"🎯 All selected trajectories target step {current_weight_version} (100% target match)"
+                f"🎯 Selected trajectory targets for step {current_weight_version}: "
+                f"{dict(sampled_targets)}"
             )
 
             # Remove selected items in reverse order to maintain correct indices

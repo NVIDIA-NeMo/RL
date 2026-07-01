@@ -5,7 +5,6 @@
 #SBATCH --job-name=JOB_NAME
 #SBATCH --partition=PARTITION
 #SBATCH --time=1:0:0
-#SBATCH --dependency=singleton
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -123,6 +122,9 @@ fi
 
 # Create logs directory
 BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
+# Working directory inside the containers; override when the submit dir is not
+# the repo root (e.g. launching from a shared scripts directory).
+CONTAINER_WORKDIR=${CONTAINER_WORKDIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
 
@@ -151,7 +153,7 @@ COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
-COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+COMMON_SRUN_ARGS+=" --container-workdir=$CONTAINER_WORKDIR"
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
@@ -376,6 +378,8 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 source $LOG_DIR/topology_probe.sh
 
 cat <<EOFINNER | tee /launch-head.sh
+ray stop --force || true
+rm -rf /tmp/ray/session_latest /tmp/ray/session_[0-9]* || true
 ray start --head \
     --disable-usage-stats \
     --resources="\$RAY_RESOURCES" \
@@ -488,6 +492,8 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 source $LOG_DIR/topology_probe.sh
 
 cat <<EOFINNER | tee /launch-worker.sh
+ray stop --force || true
+rm -rf /tmp/ray/session_latest /tmp/ray/session_[0-9]* || true
 ray start --address "$ip_head" \
           --disable-usage-stats \
           --resources="\$RAY_RESOURCES" \
@@ -604,7 +610,7 @@ echo "All workers connected!"
 # We can now launch a job on this cluster
 # We do so by launching a driver process on the physical node that the head node is on
 # This driver process is responsible for launching a job on the Ray cluster
-CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
+CONTAINER_CWD=$CONTAINER_WORKDIR
 if [[ -n "$COMMAND" ]]; then
   srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
 else

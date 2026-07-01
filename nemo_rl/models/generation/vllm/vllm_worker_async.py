@@ -50,6 +50,10 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
 
+_NEMO_RL_REQUEST_TYPE_METADATA_KEY = "_nemo_rl_request_type"
+_NEMO_RL_VALIDATION_REQUEST_TYPE = "validation"
+_NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY = "_validation_generation"
+
 
 def _replace_prefix_tokens(
     tokenizer,
@@ -758,6 +762,45 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         generation_config = self.cfg
 
+        def _pop_nemo_rl_request_type(request) -> str | None:
+            chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+            assert isinstance(chat_template_kwargs, dict), (
+                "Chat completion request chat_template_kwargs must be a dict."
+            )
+
+            request_type = chat_template_kwargs.pop(
+                _NEMO_RL_REQUEST_TYPE_METADATA_KEY, None
+            )
+            if request_type is not None:
+                request.chat_template_kwargs = chat_template_kwargs
+            return request_type
+
+        def _is_validation_request(request) -> bool:
+            request_type = _pop_nemo_rl_request_type(request)
+            if request_type is not None:
+                assert request_type == _NEMO_RL_VALIDATION_REQUEST_TYPE, (
+                    f"Unsupported NeMo RL request type: {request_type!r}."
+                )
+                return True
+
+            validation_generation = generation_config.get(
+                _NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY
+            )
+            if validation_generation is None:
+                return False
+
+            if (
+                validation_generation["temperature"] == generation_config["temperature"]
+                and validation_generation["top_p"] == generation_config["top_p"]
+            ):
+                return False
+
+            request_top_p = 1.0 if request.top_p is None else request.top_p
+            return (
+                request.temperature == validation_generation["temperature"]
+                and request_top_p == validation_generation["top_p"]
+            )
+
         # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
         @app.post("/v1/chat/completions")
         async def create_chat_completion(
@@ -770,10 +813,20 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             )
             request.top_k = -1
 
-            # The request sampling params need to exactly match those as are set in NeMo RL.
-            # If they do not match, the inference will be off policy and destroy training stability.
-            assert request.temperature == generation_config["temperature"]
-            assert request.top_p == generation_config["top_p"]
+            # Training requests must match the NeMo RL policy config exactly —
+            # a mismatch means off-policy inference and destroys training stability.
+            # Validation requests are metric-only and may use validation_generation params.
+            if not _is_validation_request(request):
+                expected_temperature = generation_config["temperature"]
+                expected_top_p = generation_config["top_p"]
+                assert request.temperature == expected_temperature, (
+                    f"policy request temperature mismatch: got {request.temperature}, "
+                    f"expected {expected_temperature}."
+                )
+                assert request.top_p == expected_top_p, (
+                    f"policy request top_p mismatch: got {request.top_p}, "
+                    f"expected {expected_top_p}."
+                )
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -1422,17 +1475,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             worker_result = worker_results[0]
 
             if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                # Weight-update failures must abort the step: silently continuing
+                # would train against stale generation weights (off-policy drift).
+                raise RuntimeError(
+                    f"Worker failed to update weights. Result: {worker_result}"
                 )
-                return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
             traceback.print_exc()
-            return False
+            raise
 
     async def update_weights_from_collective_async(self) -> bool:
         """Async version of update_weights_from_collective."""
@@ -1458,17 +1512,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             worker_result = worker_results[0]
 
             if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                # Weight-update failures must abort the step: silently continuing
+                # would train against stale generation weights (off-policy drift).
+                raise RuntimeError(
+                    f"Worker failed to update weights. Result: {worker_result}"
                 )
-                return False
             return True
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
 
             traceback.print_exc()
-            return False
+            raise
 
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""
