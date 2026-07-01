@@ -1,6 +1,0 @@
-defaults: ../../../../examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
-
-cluster:
-  gpus_per_node: 8
-  num_nodes: 2
-  segment_size: null
