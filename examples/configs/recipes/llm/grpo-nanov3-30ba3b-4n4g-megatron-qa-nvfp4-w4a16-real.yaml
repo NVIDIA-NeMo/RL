@@ -45,6 +45,9 @@ policy:
       - '*.layers.32.*'
       - '*.layers.41.*'
     vllm_cfg:
+      # Keep vLLM conservative because the full-parameter Nano3 policy and
+      # reference model are colocated on these GPUs. With TP=4, this leaves
+      # refit headroom while providing ample KV cache for the 2K smoke workload.
       gpu_memory_utilization: 0.35
       enable_prefix_caching: false
     vllm_kwargs:

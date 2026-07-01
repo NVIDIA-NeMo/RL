@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""vLLM ModelOpt NVFP4 patches for rollout weight reloads."""
+"""vLLM ModelOpt NVFP4 patches for rollout weight reloads.
+
+These patches target vLLM 0.20.0 internals. Revalidate the imported APIs,
+method signatures, and tensor layouts whenever vLLM is upgraded.
+"""
 
 from typing import Any
 
