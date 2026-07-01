@@ -71,7 +71,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.observability import log_snapshot
+from nemo_rl.data_plane.observability import log_cluster_snapshot
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -1284,9 +1284,13 @@ def grpo_train_sync(
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
-            # Surface payload / storage size from the data-plane client
-            # when observability is enabled. No-op otherwise.
-            log_snapshot(logger, getattr(policy, "dp_client", None), total_steps + 1)
+            # Surface cluster-wide payload / storage size from the
+            # data-plane sink actor when observability is enabled.
+            # Sums puts/gets/clears from every process (driver, rollout
+            # actor, all policy workers), so the panels reflect actual
+            # dataplane throughput rather than only driver-side
+            # bookkeeping. No-op when the sink doesn't exist.
+            log_cluster_snapshot(logger, total_steps + 1)
             logger.log_metrics(
                 timing_metrics,
                 total_steps + 1,
