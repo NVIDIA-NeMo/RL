@@ -467,6 +467,11 @@ The following planned observability is not implemented yet:
   invalidation behavior is covered.
 - Close cancels an in-flight manager append without waiting for engine output.
 - Engine failures reach the waiting append, and stability holdback is enforced.
+- A worker lifecycle call from a second asyncio loop is marshalled to the
+  manager's HTTP-server loop before active sessions are cancelled and awaited.
+- Refit preparation failure prevents training and inference weight-transfer
+  collectives from starting, and async training failures propagate to the
+  process after actor cleanup.
 
 ### Implemented OpenHands and Gym tests
 
@@ -488,6 +493,9 @@ resumable request, append and acknowledge prefill chunks, close it, and continue
 through the unchanged normal final model call. They also verify that disabled
 metrics remain zero and that streaming failures fail open.
 
+The full-workload run below additionally covers five async training steps and
+five in-flight refits with active streaming sessions.
+
 ### Remaining tests
 
 - Report final APC cached-token reuse for a controlled prompt.
@@ -495,8 +503,8 @@ metrics remain zero and that streaming failures fail open.
   deterministic baseline within existing tolerances.
 - Add true incremental-encoding tests for Unicode and BPE split boundaries if
   incremental tokenizer state is implemented.
-- Exercise async training, in-flight refit, cache reset, sleep/wake, and shutdown
-  under active sessions.
+- Exercise cache reset, sleep/wake, and shutdown under active sessions in a live
+  workload.
 - Run larger repeated accuracy and throughput comparisons.
 
 ### Reproducing the end-to-end smoke
@@ -615,6 +623,71 @@ streaming sessions, abort or cleanup requests can additionally race vLLM
 endpoint shutdown and log `ConnectionRefusedError` after reward processing.
 The measured jobs still exited successfully, but shutdown ordering should be
 cleaned up before default enablement.
+
+### Full-workload refit failure and fix
+
+Two reference-aligned, streaming-enabled full workloads reproduced the same
+weight-refit failure:
+
+- Slurm `13268983` failed during its second refit.
+- Slurm `13274929`
+  ([W&B `jf1wcicz`](https://wandb.ai/nvidia/swe-benchmark/runs/jf1wcicz))
+  completed seven training steps and failed during the eighth refit.
+
+In both runs, active streaming sessions were created by FastAPI on the Uvicorn
+server thread. Ray invoked the generation worker's weight-update coroutine on a
+different asyncio loop. The refit path cancelled the Uvicorn-owned tasks and
+then passed them to `asyncio.gather` on the Ray loop, which raised `Future ...
+attached to a different loop`. The training ranks had already entered their
+weight-broadcast collectives, while that vLLM worker never entered the matching
+collective. NCCL watchdogs timed out after 600 seconds and terminated the
+Megatron workers.
+
+The implementation now binds the manager to the Uvicorn loop and marshals
+worker lifecycle operations to that loop with `asyncio.run_coroutine_threadsafe`.
+Refit also performs a streaming-session pause barrier before launching any
+training or inference collective. A barrier failure resumes admission and exits
+without entering NCCL. These operations occur only during model lifecycle
+transitions, so they add no per-token or per-chunk work to the generation hot
+path.
+
+The reference-aligned regression workload then passed with the fix. Slurm
+`13278330`
+([W&B `0y1rovpi`](https://wandb.ai/nvidia/swe-benchmark/runs/0y1rovpi))
+ran the 16-node, 128-GPU, 32-vLLM-replica, temperature-1.0 recipe for five
+training steps with streaming enabled. It completed with exit code `0:0` in
+1:13:27. Every step crossed the pre-refit pause barrier and completed its
+weight synchronization:
+
+| Step | Average reward | Loss | Total step time | Weight sync |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.0312 | 0.0721 | 107.44 s | 1.06 s |
+| 2 | 0.2500 | 0.1262 | 747.32 s | 1.04 s |
+| 3 | 0.2500 | 0.0525 | 609.64 s | 1.09 s |
+| 4 | 0.0781 | 0.0905 | 830.40 s | 1.05 s |
+| 5 | 0.0000 | 0.0000 | 509.38 s | 0.99 s |
+
+The run had no streaming-manager cross-loop exception, NCCL watchdog timeout,
+or fatal async-loop error. After `Async GRPO training complete!`, NeMo Gym
+logged one cross-loop `ClientSession.close()` warning during teardown; its
+trace is the pre-existing process-global aiohttp cleanup issue described above,
+not the streaming-manager refit path. The run also encountered six of the
+non-terminal 131,073-token context overflows described below. This workload
+validates the refit failure fix, but is not a paired streaming-on/off accuracy or
+throughput comparison.
+
+The runs exposed two additional non-terminal issues:
+
+- Seven normal `/v1/chat/completions` requests reached 131,073 input tokens for
+  a 131,072-token model. Prefix preservation can retain a full-length prior
+  generation and append the chat template's EOS suffix. Gym converts the 400
+  response to an empty assistant result, but budget-aware termination or
+  compaction is still needed to avoid the quality loss without truncating
+  authoritative model tokens.
+- Async GRPO caught fatal loop exceptions and printed completion, allowing the
+  wrapper and W&B run to appear successful. Fatal training-loop and initial
+  generation-preparation failures now clean up the collector and replay buffer
+  and then propagate to the process.
 
 ## Implementation Phases
 

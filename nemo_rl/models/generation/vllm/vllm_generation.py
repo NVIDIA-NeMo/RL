@@ -949,6 +949,38 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    def pause_streaming_tool_call_sessions(self) -> None:
+        """Pause admission and cancel active streaming prefill sessions."""
+        streaming_config = self.cfg["vllm_cfg"].get("streaming_tool_call")
+        if (
+            not self.cfg["vllm_cfg"]["async_engine"]
+            or streaming_config is None
+            or not streaming_config["enabled"]
+        ):
+            return
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "_pause_streaming_tool_call_sessions",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def resume_streaming_tool_call_sessions(self) -> None:
+        """Resume admission for streaming prefill sessions."""
+        streaming_config = self.cfg["vllm_cfg"].get("streaming_tool_call")
+        if (
+            not self.cfg["vllm_cfg"]["async_engine"]
+            or streaming_config is None
+            or not streaming_config["enabled"]
+        ):
+            return
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "_resume_streaming_tool_call_sessions",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:

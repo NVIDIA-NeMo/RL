@@ -122,6 +122,25 @@ class StreamingToolCallPrefillManager:
         self._accepting_sessions = True
         self._total_dummy_tokens = 0
         self._total_prefill_tokens = 0
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def event_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Return the event loop that owns session tasks and synchronization."""
+        return self._event_loop
+
+    def bind_to_current_loop(self) -> None:
+        """Bind manager state to the current event loop exactly once."""
+        current_loop = asyncio.get_running_loop()
+        if self._event_loop is None:
+            self._event_loop = current_loop
+        elif self._event_loop is not current_loop:
+            raise RuntimeError(
+                "streaming tool-call manager used from a non-owner event loop"
+            )
+
+    def _assert_owner_loop(self) -> None:
+        self.bind_to_current_loop()
 
     @property
     def active_session_count(self) -> int:
@@ -151,6 +170,7 @@ class StreamingToolCallPrefillManager:
         The first candidate therefore cannot prove any stable prefix by itself.
         Prefill starts after a later candidate establishes a common prefix.
         """
+        self._assert_owner_loop()
         await self.expire_stale_sessions()
         async with self._lock:
             if not self._accepting_sessions:
@@ -204,6 +224,7 @@ class StreamingToolCallPrefillManager:
         sequence_no: int,
     ) -> StreamingToolCallAppendResult:
         """Observe a tokenization and prefill only its proven stable prefix."""
+        self._assert_owner_loop()
         session = self._get_session(session_id)
         async with session.append_lock:
             self._raise_if_unavailable(session)
@@ -298,6 +319,7 @@ class StreamingToolCallPrefillManager:
         self, *, session_id: str, final_prompt_token_ids: list[int]
     ) -> StreamingToolCallCloseResult:
         """Validate the final prefix and cancel speculative work without waiting."""
+        self._assert_owner_loop()
         async with self._lock:
             session = self._sessions.pop(session_id, None)
         if session is None:
@@ -317,6 +339,7 @@ class StreamingToolCallPrefillManager:
 
     async def abort(self, *, session_id: str) -> bool:
         """Cancel a session if present and return whether it existed."""
+        self._assert_owner_loop()
         async with self._lock:
             session = self._sessions.pop(session_id, None)
         if session is None:
@@ -326,6 +349,7 @@ class StreamingToolCallPrefillManager:
 
     async def invalidate_all(self) -> int:
         """Cancel every session, for example before a model weight update."""
+        self._assert_owner_loop()
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
@@ -335,6 +359,7 @@ class StreamingToolCallPrefillManager:
 
     async def pause_and_invalidate(self) -> int:
         """Atomically stop admission and cancel every active session."""
+        self._assert_owner_loop()
         async with self._lock:
             self._accepting_sessions = False
             sessions = list(self._sessions.values())
@@ -348,11 +373,13 @@ class StreamingToolCallPrefillManager:
 
     async def resume(self) -> None:
         """Allow new sessions after a model lifecycle transition completes."""
+        self._assert_owner_loop()
         async with self._lock:
             self._accepting_sessions = True
 
     async def expire_stale_sessions(self) -> int:
         """Cancel sessions that have not made progress within the configured TTL."""
+        self._assert_owner_loop()
         cutoff = time.monotonic() - self._session_ttl_seconds
         async with self._lock:
             stale_ids = [
@@ -369,6 +396,7 @@ class StreamingToolCallPrefillManager:
 
     async def wait_for_cleanup(self) -> None:
         """Yield once so cancellation reaches session tasks in tests and shutdown."""
+        self._assert_owner_loop()
         await asyncio.sleep(0)
 
     def _get_session(self, session_id: str) -> _StreamingToolCallSession:
