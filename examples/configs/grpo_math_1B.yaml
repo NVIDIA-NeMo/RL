@@ -59,8 +59,8 @@ reward_penalties:
   penalize_unwanted_tokens: false
   penalize_malformed_think_tag: false
   # Optional model/tokenizer-specific token IDs. Add token IDs that should
-  # be penalized when emitted by the model under unwanted
-  # Think tags are inferred only if each tag encodes
+  # be penalized when emitted by the model. Unwanted token IDs must be
+  # specified explicitly; think-tag IDs are inferred when each tag encodes
   # to one token. Example: {unwanted: [2], think_open: 12, think_close: 13}
   token_ids: null
 

@@ -1351,14 +1351,6 @@ def _get_reward_penalty_config_value(
     if isinstance(reward_penalty_config, dict):
         return reward_penalty_config.get(key)
 
-    model_extra = getattr(reward_penalty_config, "model_extra", None)
-    if isinstance(model_extra, dict) and key in model_extra:
-        return model_extra[key]
-
-    pydantic_extra = getattr(reward_penalty_config, "__pydantic_extra__", None)
-    if isinstance(pydantic_extra, dict) and key in pydantic_extra:
-        return pydantic_extra[key]
-
     return getattr(reward_penalty_config, key, None)
 
 
@@ -1367,14 +1359,7 @@ def _get_reward_penalty_token_id(
     key: str,
 ) -> int | None:
     token_ids = _get_reward_penalty_config_value(reward_penalty_config, "token_ids")
-    if token_ids is None:
-        return None
-
-    if isinstance(token_ids, dict):
-        value = token_ids.get(key)
-    else:
-        value = getattr(token_ids, key, None)
-
+    value = _get_reward_penalty_config_value(token_ids, key)
     if value is None:
         return None
     return int(value)
@@ -1395,14 +1380,7 @@ def _get_reward_penalty_token_ids(
     key: str,
 ) -> list[int] | None:
     token_ids = _get_reward_penalty_config_value(reward_penalty_config, "token_ids")
-    if token_ids is None:
-        return None
-
-    if isinstance(token_ids, dict):
-        value = token_ids.get(key)
-    else:
-        value = getattr(token_ids, key, None)
-
+    value = _get_reward_penalty_config_value(token_ids, key)
     if value is None:
         return None
     if isinstance(value, int):
@@ -1487,14 +1465,15 @@ def resolve_reward_penalty_config(
             if not explicit_close:
                 inferred_close = _infer_single_token_id(tokenizer, tags[1])
 
-            if explicit_open or explicit_close:
+            if (
+                explicit_open
+                or explicit_close
+                or (inferred_open is not None and inferred_close is not None)
+            ):
                 if inferred_open is not None:
                     token_ids["think_open"] = inferred_open
                 if inferred_close is not None:
                     token_ids["think_close"] = inferred_close
-            elif inferred_open is not None and inferred_close is not None:
-                token_ids["think_open"] = inferred_open
-                token_ids["think_close"] = inferred_close
 
     if token_ids:
         resolved["token_ids"] = token_ids
