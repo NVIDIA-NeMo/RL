@@ -20,11 +20,12 @@ passed to :func:`nrl_k8s.config.load_recipe_with_infra` as an override.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import click
 import yaml
@@ -305,6 +306,7 @@ def check(
     with ``-o``. Use ``--manifests-only`` for a multi-document YAML stream
     that can be piped to ``kubectl apply -f -``.
     """
+    from . import dgd as dgd_mod
     from .manifest import (
         build_compute_domain_manifest,
         build_deployment_manifest,
@@ -343,6 +345,13 @@ def check(
         svc = build_service_for_deployment(dep_spec, loaded.infra)
         if svc is not None:
             all_manifests.append(svc)
+
+    for _key, dgd_spec in loaded.infra.dynamo.items():
+        all_manifests.append(
+            dgd_mod.build_dgd_manifest(
+                dgd_spec, loaded.infra, loaded.infra_source_path.parent
+            )
+        )
 
     if manifests_only:
         stream = "\n---\n".join(
@@ -484,6 +493,29 @@ def _print_check_summary(
         click.echo("-------------")
         for m in dra:
             click.echo(f"  {m['kind']}: {m['metadata']['name']}")
+
+    dgds = by_kind.get("DynamoGraphDeployment", [])
+    if dgds:
+        # Match each rendered DGD back to its infra.dynamo entry by name so we
+        # can show the per-spec readyTimeoutS. The keys in infra.dynamo are
+        # arbitrary labels chosen by the recipe author (`serving`, etc.); fall
+        # back to the manifest name when no match is found.
+        dgd_specs_by_name: dict[str, tuple[str, Any]] = {}
+        for k, spec in loaded.infra.dynamo.items():
+            if spec.name:
+                dgd_specs_by_name[spec.name] = (k, spec)
+        click.echo("")
+        click.echo("DYNAMO")
+        click.echo("------")
+        for m in dgds:
+            name = m["metadata"]["name"]
+            services = (m.get("spec") or {}).get("services") or {}
+            key, spec = dgd_specs_by_name.get(name, (name, None))
+            ready_to = spec.readyTimeoutS if spec is not None else "—"
+            click.echo(
+                f"  {key}: {name} (services={list(services.keys())}, "
+                f"readyTimeoutS={ready_to})"
+            )
 
 
 def _print_block(text: str, *, indent: str = "  ") -> None:
@@ -753,6 +785,7 @@ def _run_rayjob(
     cli_wait: bool | None,
 ) -> None:
     """``nrl-k8s run --rayjob`` path. KubeRay owns the RayCluster lifecycle."""
+    from . import dgd as dgd_mod
     from . import k8s, orchestrate
     from . import submit as submit_mod
     from .rayjob import build_rayjob_manifest
@@ -772,6 +805,15 @@ def _run_rayjob(
 
     if dry_run:
         click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
+        # Render any declared DGDs too so the user sees the full ephemeral
+        # bring-up plan. Owner refs aren't filled in (no UID yet on a dry-run);
+        # the live path stamps them at apply time.
+        for dgd_key, dgd_spec in loaded.infra.dynamo.items():
+            click.echo("---")
+            dgd_manifest = dgd_mod.build_dgd_manifest(
+                dgd_spec, loaded.infra, loaded.infra_source_path.parent
+            )
+            click.echo(yaml.safe_dump(dgd_manifest, sort_keys=False).rstrip())
         return
 
     if not submit_mod.is_in_cluster():
@@ -781,13 +823,88 @@ def _run_rayjob(
     _check_head_svc_collision(job_name, namespace, creating="rayjob")
 
     orchestrate.ensure_dra_resources("training", loaded, log=click.echo)
+
+    # DGDs go up BEFORE the RayJob: KubeRay starts submitting the driver
+    # entrypoint as soon as the RayCluster head is Ready, but the gym's
+    # first request races whatever inference resources we asked for. By
+    # ensuring DGDs are already serving before the RayJob is applied,
+    # the entrypoint can hit the frontend immediately. We back-fill the
+    # ownerReference pointing at the RayCluster once it exists (see below)
+    # so K8s GC still cascades when the RayCluster is shut down.
+    created_dgd_names: list[str] = []
+    for dgd_key in loaded.infra.dynamo:
+        try:
+            result = orchestrate.ensure_dgd(
+                dgd_key, loaded, log=click.echo, owner_ref=None
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Roll back DGDs created by this invocation. Reused DGDs belong to
+            # an existing lifecycle and must remain untouched.
+            for stranded in created_dgd_names:
+                click.echo(
+                    f"[dynamo] rolling back DGD {stranded} after apply failure",
+                    err=True,
+                )
+                with contextlib.suppress(Exception):
+                    dgd_mod.delete_dgd(stranded, namespace)
+            _explain_and_exit(exc, context=f"dynamo.{dgd_key} apply failed")
+        else:
+            if result.created:
+                created_dgd_names.append(result.name)
+
     click.echo(f"[run --rayjob] applying RayJob {job_name} in {namespace}")
     try:
         k8s.apply_rayjob(manifest, namespace)
-    except ApiException as exc:
-        _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
     except Exception as exc:  # noqa: BLE001
+        # RayJob never made it — clean up the DGDs we just stood up so
+        # the next attempt isn't blocked by a stale name collision.
+        for stranded in created_dgd_names:
+            click.echo(
+                f"[dynamo] rolling back DGD {stranded} after RayJob apply failure",
+                err=True,
+            )
+            with contextlib.suppress(Exception):
+                dgd_mod.delete_dgd(stranded, namespace)
         _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
+
+    # Back-fill the ownerReference only on DGDs created for this RayJob.
+    # Reused DGDs may be persistent or shared and must not be adopted by an
+    # ephemeral RayCluster.
+    if created_dgd_names:
+        click.echo(
+            f"[run --rayjob] waiting for RayJob {job_name} to spawn its RayCluster ..."
+        )
+        try:
+            rc_name = k8s.wait_for_rayjob_raycluster_name(job_name, namespace)
+        except TimeoutError as exc:
+            _explain_and_exit(exc, context=f"rayjob {job_name} RayCluster lookup")
+        rc_obj = k8s.get_raycluster(rc_name, namespace)
+        rc_uid = (rc_obj or {}).get("metadata", {}).get("uid")
+        if not rc_uid:
+            _cli_error(
+                f"RayCluster {rc_name} has no metadata.uid yet; cannot anchor "
+                f"DGD ownerReferences. Try again in a few seconds."
+            )
+        owner = dgd_mod.build_owner_reference(
+            api_version="ray.io/v1",
+            kind="RayCluster",
+            name=rc_name,
+            uid=rc_uid,
+        )
+        for dgd_name in created_dgd_names:
+            try:
+                dgd_mod.patch_dgd_owner_ref(dgd_name, namespace, owner)
+            except ApiException as exc:
+                # Non-fatal: the DGD is serving and the RayJob is running.
+                # Worst case the user has to `kubectl delete dgd <name>`
+                # after the run if cascade-delete didn't fire. Surface
+                # loudly so it's not silently lost.
+                click.echo(
+                    f"[dynamo] warning: failed to back-fill ownerRef on DGD "
+                    f"{dgd_name} (status={exc.status}); cascade-delete on "
+                    f"RayCluster shutdown will not fire — clean up manually.",
+                    err=True,
+                )
 
     job_id_cmd = f"$(kubectl get rayjob {job_name} -n {namespace} -o jsonpath='{{.status.jobId}}')"
     click.echo(
@@ -958,6 +1075,8 @@ def _resolve_targets(loaded: LoadedConfig, targets: tuple[str, ...]):
                 results.append(("kuberay", role, spec))
         for key, spec in loaded.infra.deployments.items():
             results.append(("deployment", key, spec))
+        for key, spec in loaded.infra.dynamo.items():
+            results.append(("dynamo", key, spec))
         return results
 
     results = []
@@ -977,9 +1096,15 @@ def _resolve_targets(loaded: LoadedConfig, targets: tuple[str, ...]):
             if spec is None:
                 _cli_error(f"deployments.{key} is not defined in the recipe")
             results.append(("deployment", key, spec))
+        elif kind == "dynamo":
+            spec = loaded.infra.dynamo.get(key)
+            if spec is None:
+                _cli_error(f"dynamo.{key} is not defined in the recipe")
+            results.append(("dynamo", key, spec))
         else:
             _cli_error(
-                f"unknown resource kind: {kind!r} (expected 'kuberay' or 'deployments')"
+                f"unknown resource kind: {kind!r} "
+                f"(expected 'kuberay', 'deployments', or 'dynamo')"
             )
     return results
 
@@ -1020,6 +1145,7 @@ def cluster_up(
     brings up just the training RayCluster. With ``--target deployments.nemo_skills``,
     brings up just that Deployment.
     """
+    from . import dgd as dgd_mod
     from . import orchestrate
     from .manifest import build_deployment_manifest, build_raycluster_manifest
 
@@ -1033,6 +1159,10 @@ def cluster_up(
         for kind, key, spec in targets:
             if kind == "kuberay":
                 manifest = build_raycluster_manifest(spec, loaded.infra, role=key)
+            elif kind == "dynamo":
+                manifest = dgd_mod.build_dgd_manifest(
+                    spec, loaded.infra, loaded.infra_source_path.parent
+                )
             else:
                 manifest = build_deployment_manifest(spec, loaded.infra)
             click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
@@ -1060,6 +1190,8 @@ def cluster_up(
                         log=click.echo,
                         repo_root=Path.cwd(),
                     )
+            elif kind == "dynamo":
+                orchestrate.ensure_dgd(key, loaded, log=click.echo, wait_ready=wait)
             else:
                 orchestrate.ensure_deployment(key, loaded, log=click.echo)
         except ApiException as exc:
@@ -1112,6 +1244,8 @@ def cluster_down(
                 k8s.wait_for_raycluster_gone(spec.name, namespace)
             click.echo(f"RayCluster {spec.name} deleted.")
             orchestrate.delete_dra_resources(key, loaded, log=click.echo)
+        elif kind == "dynamo":
+            orchestrate.delete_dgd(key, loaded, log=click.echo)
         else:
             click.echo(f"deleting Service {spec.name} in {namespace} ...")
             k8s.delete_service(spec.name, namespace)
