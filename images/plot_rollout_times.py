@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 """Rollout-time plots for the Ultra recipes.
 
 Per-step timing/rollout/run_rollouts (s) from each rlvr1 run's ray-driver.log,

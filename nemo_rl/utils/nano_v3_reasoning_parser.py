@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 import logging
 
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager

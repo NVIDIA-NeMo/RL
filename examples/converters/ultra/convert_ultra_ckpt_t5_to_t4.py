@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 """Convert a Nemotron-3 Ultra checkpoint from the transformers v5 layout to the v4 layout.
 
 The Ultra checkpoints published on Hugging Face target **transformers v5**: the

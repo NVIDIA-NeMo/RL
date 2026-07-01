@@ -178,6 +178,57 @@ modeling files (`configuration_nemotron_h.py` / `modeling_nemotron_h.py` in `exa
 automatically (the default `--runtime-source`); pass `--runtime-source <dir>` to
 override.
 
+## LoRA training and inference
+
+Ultra can also be trained with Megatron LoRA/PEFT. The starter recipe is:
+
+```bash
+examples/configs/recipes/llm/grpo-ultra-6n4g-megatron-lora.yaml
+```
+
+The recipe uses 4 GB200 training nodes plus 2 non-colocated vLLM generation
+nodes. During RL training, vLLM does **not** serve a separate PEFT adapter.
+Instead, NeMo RL exports the Megatron policy with the LoRA deltas merged into
+the base weights before each vLLM refit. This keeps rollout generation on the
+same plain-model weight-update path used by full-weight training while reducing
+the trainable parameter count on the Megatron side.
+
+For post-training serving, convert the adapter-only Megatron DCP checkpoint to a
+Hugging Face PEFT adapter:
+
+```bash
+python examples/converters/convert_megatron_lora_dcp_to_hf_ultra.py \
+  --dcp-dir /path/to/checkpoints/step_10/policy/weights/iter_0000000 \
+  --output-dir /path/to/hf_lora_adapter_step10 \
+  --base-model-name-or-path /path/to/ultra_sft_checkpoint_v4 \
+  --rank 16 \
+  --alpha 32 \
+  --overwrite
+```
+
+The converter writes `adapter_model.safetensors` and `adapter_config.json`. It
+is Ultra-specific: it maps Megatron-Bridge attention adapter keys to PEFT
+`q_proj`, `k_proj`, `v_proj`, and `o_proj` keys, and splits Ultra's fused QKV
+LoRA-B tensor into separate q/k/v tensors for vLLM validation.
+
+Serve the converted adapter with a vLLM build that supports Ultra:
+
+```bash
+vllm serve /path/to/ultra_sft_checkpoint_v4 \
+  --served-model-name nvidia/nemotron-3-ultra \
+  --tensor-parallel-size 8 \
+  --distributed-executor-backend ray \
+  --trust-remote-code \
+  --dtype bfloat16 \
+  --enable-lora \
+  --max-lora-rank 16 \
+  --lora-modules dapo-lora=/path/to/hf_lora_adapter_step10 \
+  --reasoning-parser-plugin /path/to/ultra_sft_checkpoint_v4/ultra_v3_reasoning_parser.py \
+  --reasoning-parser ultra_v3 \
+  --compilation-config '{"pass_config": {"fuse_allreduce_rms": false}}' \
+  --port 8000
+```
+
 ## Build the sandbox container
 
 Several [Gym](https://github.com/NVIDIA-NeMo/Gym) environments used during

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 """Reset all worker state across a Ray cluster.
 
 Kills all Ray actors (GPU and CPU-only), removes placement groups, kills
