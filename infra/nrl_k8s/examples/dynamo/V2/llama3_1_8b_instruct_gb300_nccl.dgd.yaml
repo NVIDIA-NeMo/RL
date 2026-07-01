@@ -1,0 +1,112 @@
+# DynamoGraphDeployment example for meta-llama/Llama-3.1-8B-Instruct on GB300.
+#
+# Used by the V2 Megatron + Dynamo NCCL smoke. The vLLM worker exposes
+# Dynamo's RL endpoint and uses vLLM's native NCCL weight-transfer backend.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: llama3-1-8b-instruct-gb300-nccl
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-nemorl-nomx-f6d44eba
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+          env:
+            - name: HF_HOME
+              value: /mnt/rl-workspace/${user:}/hf-cache
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: ${user:}-secrets
+      resources:
+        requests:
+          gpu: "1"
+          memory: "96Gi"
+        limits:
+          gpu: "1"
+          memory: "192Gi"
+      extraPodSpec:
+        securityContext:
+          runAsUser: 0
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-nemorl-nomx-f6d44eba
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - meta-llama/Llama-3.1-8B-Instruct
+            - --served-model-name
+            - meta-llama/Llama-3.1-8B-Instruct
+            - --enable-rl
+            - --weight-transfer-config
+            - '{"backend":"nccl"}'
+            - --tensor-parallel-size
+            - "1"
+            - --dtype
+            - bfloat16
+            - --gpu-memory-utilization
+            - "0.8"
+            - --max-model-len
+            - "4096"
+            - --max-num-seqs
+            - "16"
+            - --max-num-batched-tokens
+            - "8192"
+            - --enforce-eager
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+            - name: HF_HOME
+              value: /mnt/rl-workspace/${user:}/hf-cache
+            - name: NCCL_DEBUG
+              value: WARN
+            - name: NCCL_MNNVL_ENABLE
+              value: "0"

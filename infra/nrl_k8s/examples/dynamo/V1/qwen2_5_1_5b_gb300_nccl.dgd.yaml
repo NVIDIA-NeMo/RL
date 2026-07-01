@@ -1,0 +1,108 @@
+# DynamoGraphDeployment example for Qwen/Qwen2.5-1.5B on GB300, NCCL-enabled.
+#
+# Used by the math 1B k8s V1 exemplar. The Dynamo image includes token-id
+# completions support plus the native vLLM NCCL weight-transfer support.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen2-5-1-5b-gb300-nccl
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-nemorl-nomx-f6d44eba
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+          env:
+            - name: HF_HOME
+              value: /mnt/rl-workspace/${user:}/hf-cache
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: ${user:}-secrets
+      resources:
+        requests:
+          gpu: "1"
+          memory: "64Gi"
+        limits:
+          gpu: "1"
+          memory: "128Gi"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-nemorl-nomx-f6d44eba
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen2.5-1.5B
+            - --served-model-name
+            - Qwen/Qwen2.5-1.5B
+            - --enable-rl
+            - --weight-transfer-config
+            - '{"backend":"nccl"}'
+            - --tensor-parallel-size
+            - "1"
+            - --dtype
+            - bfloat16
+            - --gpu-memory-utilization
+            - "0.6"
+            - --max-model-len
+            - "512"
+            - --max-num-seqs
+            - "32"
+            - --max-num-batched-tokens
+            - "2048"
+            - --enforce-eager
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+            - name: HF_HOME
+              value: /mnt/rl-workspace/${user:}/hf-cache
+            - name: NCCL_MNNVL_ENABLE
+              value: "0"
