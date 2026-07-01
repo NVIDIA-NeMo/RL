@@ -448,6 +448,14 @@ class LossPostProcessor:
         if pack_sequences and packed_seq_params is not None:
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
             if fuse_loss:
+                # The fused path prepares loss via prepare_packed_loss_input and
+                # cannot honor a custom prepare_fn (e.g. the value model's); guard
+                # rather than silently bypass it.
+                assert self.prepare_fn is None, (
+                    "sequence_packing.fuse_loss=true does not support a custom "
+                    "prepare_fn (e.g. the value model's value-specific prep). "
+                    "Disable fuse_loss for the value model."
+                )
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = partial(
                     prepare_packed_loss_input,
