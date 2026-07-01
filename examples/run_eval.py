@@ -54,12 +54,15 @@ def setup_data(tokenizer, data_config, env_configs, is_multimodal=False):
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
 
-    # Mirrors nemo_rl/data/utils.py: use data_config.env_name to select the
-    # env config block and the registered environment class.
+    # Mirrors nemo_rl/data/utils.py: multimodal datasets use the registered
+    # "vlm" environment class.  The config block key may match env_name
+    # (daily_omni → env.vlm) or differ (mmau → env.mmau); fall back to
+    # the first key when env_name is not present in env_configs.
     env_key = next(iter(env_configs))
     env_name = data_config.get("env_name", env_key)
     registered_env_name = "vlm" if is_multimodal else env_name
-    env = create_env(env_name=registered_env_name, env_config=env_configs[env_name])
+    env_cfg_key = env_name if env_name in env_configs else env_key
+    env = create_env(env_name=registered_env_name, env_config=env_configs[env_cfg_key])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
