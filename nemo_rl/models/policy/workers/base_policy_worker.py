@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,13 @@ class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        nccl_peer: str = "nemo",
     ) -> None:
         """Initialize the collective communication.
 
@@ -35,6 +41,7 @@ class AbstractPolicyWorker:
             port: Port for the process group
             world_size: Total world size (train_world_size + inference_world_size)
             train_world_size: Number of training workers (used in inference cluster)
+            nccl_peer: NCCL initialization protocol used by the inference workers
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
@@ -42,7 +49,7 @@ class AbstractPolicyWorker:
             master_address=ip, port=port, rank=self.rank, world_size=world_size
         )
         device = torch.cuda.current_device()
-        self.model_update_group.init_nccl_communicator(device=device)
+        self.model_update_group.init_nccl_communicator(device=device, peer=nccl_peer)
 
     def is_alive(self) -> bool:
         """Check if the worker is alive."""

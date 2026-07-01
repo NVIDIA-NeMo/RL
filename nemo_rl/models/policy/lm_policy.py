@@ -368,7 +368,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return results
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
         """Initialize the collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -377,6 +383,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             port=port,
             world_size=world_size,
             train_world_size=train_world_size,
+            nccl_peer=nccl_peer,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
@@ -1036,12 +1043,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
 
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
     ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
