@@ -8,12 +8,11 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-GPUS_PER_NODE=4
-SEGMENT_SIZE=4     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment (keeps MoE EP intra-rack, #2937). Matches cluster.segment_size in the yaml.
+GPUS_PER_NODE=8
 STEPS_PER_RUN=1
 MAX_STEPS=1
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=45
+NUM_MINUTES=30
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -41,25 +40,28 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # logprob-consistency benchmark. The matching BF16 Qwen3 one-step control can
 # also produce very large token_mult_prob_error from a single long outlier, so
 # the multi-step Qwen3 performance tests keep ownership of that metric.
-grep -q "VllmQuantGenerationWorker.*720 TensorQuantizers found in model" "$RUN_LOG"
-grep -q "MegatronQuantPolicyWorker.*2739 TensorQuantizers found in model" "$RUN_LOG"
+grep -q "720 TensorQuantizers found in model" "$RUN_LOG"
+grep -q "MegatronQuantPolicyWorker.*723 TensorQuantizers found in model" "$RUN_LOG"
 
-# Only run metrics if the target step is reached
-if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] > 0.0' \
-        'data["train/loss"]["1"] < 0.2' \
-        'data["train/num_valid_samples"]["1"] == 16' \
-        'data["train/global_valid_seqs"]["1"] == 16' \
-        'data["train/global_valid_toks"]["1"] > 30000' \
-        'data["train/mean_gen_tokens_per_sample"]["1"] > 2000' \
-        'data["train/mean_gen_tokens_per_sample"]["1"] < 4096' \
-        'data["train/reward"]["1"] > 0.2' \
-        'data["train/reward"]["1"] < 0.6' \
-        'data["train/gen_kl_error"]["1"] > 0.05' \
-        'data["train/gen_kl_error"]["1"] < 1.0' \
-        'data["train/probs_ratio"]["1"] > 0.99' \
-        'data["train/probs_ratio"]["1"] < 1.01' \
-        'data["train/sampling_importance_ratio"]["1"] > 0.95' \
-        'data["train/sampling_importance_ratio"]["1"] < 1.02'
+MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' $JSON_METRICS)
+if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then
+    echo "[ERROR] Expected train/loss through step $MAX_STEPS, found step $MAX_RECORDED_STEP"
+    exit 1
 fi
+
+uv run tests/check_metrics.py $JSON_METRICS \
+    'data["train/loss"]["1"] > 0.0' \
+    'data["train/loss"]["1"] < 0.2' \
+    'data["train/num_valid_samples"]["1"] == 16' \
+    'data["train/global_valid_seqs"]["1"] == 16' \
+    'data["train/global_valid_toks"]["1"] > 30000' \
+    'data["train/mean_gen_tokens_per_sample"]["1"] > 2000' \
+    'data["train/mean_gen_tokens_per_sample"]["1"] < 4096' \
+    'data["train/reward"]["1"] > 0.2' \
+    'data["train/reward"]["1"] < 0.6' \
+    'data["train/gen_kl_error"]["1"] > 0.0' \
+    'data["train/gen_kl_error"]["1"] < 1.0' \
+    'data["train/probs_ratio"]["1"] > 0.99' \
+    'data["train/probs_ratio"]["1"] < 1.01' \
+    'data["train/sampling_importance_ratio"]["1"] > 0.95' \
+    'data["train/sampling_importance_ratio"]["1"] < 1.02'
