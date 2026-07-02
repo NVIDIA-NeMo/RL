@@ -341,6 +341,24 @@ class DTensorPolicyWorkerImpl(
             )
         dp_size = world_size // tp_size // cp_size
         sequence_parallel_enabled = self.cfg["dtensor_cfg"]["sequence_parallel"]
+
+        # Validate make_sequence_length_divisible_by against CP/TP constraints
+        make_seq_div_by = self.cfg["make_sequence_length_divisible_by"]
+        minimum_pad_factor = 1
+        if cp_size > 1:
+            minimum_pad_factor *= cp_size * 2
+        if tp_size > 1 and sequence_parallel_enabled:
+            minimum_pad_factor *= tp_size
+        if make_seq_div_by % minimum_pad_factor != 0:
+            raise ValueError(
+                f"make_sequence_length_divisible_by ({make_seq_div_by}) is not a multiple "
+                f"of the minimum pad factor ({minimum_pad_factor}).\n"
+                f"Please set make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
+                f"    - If CP is enabled (cp_size > 1), the minimum pad factor includes `cp_size * 2`.\n"
+                f"    - If TP+SP is enabled (tp_size > 1 and sequence_parallel), it includes `tp_size`.\n"
+                f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
+            )
+
         assert world_size == dp_size * tp_size * cp_size, (
             f"World size({world_size}) must equal to dp_size({dp_size}) * tp_size({tp_size}) * cp_size({cp_size}) to use DTensor"
         )

@@ -178,6 +178,7 @@ def create_test_config(
             },
         },
         "max_grad_norm": 1.0,
+        "make_sequence_length_divisible_by": cp * 2 if cp > 1 else 1,
     }
     if automodel_kwargs is not None:
         config["dtensor_cfg"]["automodel_kwargs"] = automodel_kwargs
