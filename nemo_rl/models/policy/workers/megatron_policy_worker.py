@@ -89,6 +89,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -731,6 +732,8 @@ class MegatronPolicyWorkerImpl(
                     ).param_sync_func = self._first_train_step_param_sync_func
                     self._first_train_step_param_sync_func = None
                     self._first_train_step_forward_pre_hook_disabled = False
+
+                warn_if_inf_grad_norm(grad_norm)
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
