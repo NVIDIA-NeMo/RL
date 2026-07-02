@@ -37,6 +37,7 @@ from nemo_rl.environments.vlm_environment import VLMEnvConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.utils.logger import Logger, LoggerConfig
 
 # ===============================================================================
 # Configuration
@@ -64,6 +65,9 @@ class MasterConfig(BaseModel, extra="allow"):
     data: EvalDataConfigType
     env: _PassThroughEnvConfig
     cluster: ClusterConfig
+    # Optional logging config. When present with wandb_enabled, run_eval.py
+    # builds a Logger and each benchmark's aggregate score is logged to W&B.
+    logger: LoggerConfig | None = None
 
 
 # ===============================================================================
@@ -277,7 +281,7 @@ def eval_cons_k(
     return cons_k_score
 
 
-def run_env_eval(vllm_generation, dataloader, env, master_config):
+def run_env_eval(vllm_generation, dataloader, env, master_config, logger=None):
     """Main entry point for running evaluation using environment.
 
     Generates model responses and evaluates them by env.
@@ -287,6 +291,8 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         dataloader: Data loader with evaluation samples.
         env: Environment that scores responses.
         master_config: Configuration settings.
+        logger: Optional Logger; when provided, the aggregate benchmark score is
+            logged to its backends (e.g. W&B) under the ``eval/`` prefix.
     """
     generation_config = master_config.generation
     backend = generation_config.get("backend", "")
@@ -423,6 +429,36 @@ async def _run_env_eval_impl(
     if evaluation_data and save_path is not None:
         _save_evaluation_data_to_json(evaluation_data, master_config, save_path)
 
+    # Persist the aggregate score so the multi-benchmark runner can collect it
+    # into a single summary.json (the per-sample JSON above stores raw rewards
+    # but not the computed metric).
+    dataset_size = len(dataloader.dataset)
+    if save_path is not None:
+        _save_results_summary(
+            master_config,
+            score,
+            dataset_size,
+            metric,
+            k_value,
+            num_tests_per_prompt,
+            save_path,
+        )
+
+    # Log the aggregate score to W&B / other backends if a logger was provided.
+    if logger is not None:
+        average_score = score / dataset_size if dataset_size else 0.0
+        dataset_name = master_config.data["dataset_name"]
+        metric_label = f"{metric[:-1]}{k_value}"
+        logger.log_metrics(
+            {
+                f"{dataset_name}/{metric_label}": average_score,
+                f"{dataset_name}/score_sum": score,
+                f"{dataset_name}/dataset_size": dataset_size,
+            },
+            step=0,
+            prefix="eval",
+        )
+
     # Print results
     _print_results(
         master_config,
@@ -511,6 +547,50 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
         json.dump(data_to_save, f, indent=2)
 
     print(f"\n✓ Evaluation data saved to: {eval_data_path}")
+
+
+def _save_results_summary(
+    master_config,
+    score,
+    dataset_size,
+    metric,
+    k_value,
+    num_tests_per_prompt,
+    save_path,
+):
+    """Save the aggregate benchmark score to results.json.
+
+    Mirrors the score printed by _print_results (average over the dataset) so the
+    multi-benchmark runner can merge every benchmark's number into one summary
+    without re-deriving the metric from per-sample rewards.
+
+    Args:
+        master_config: Configuration dictionary.
+        score: Summed metric across the dataset (as returned by eval_pass_k /
+            eval_cons_k).
+        dataset_size: Number of prompts evaluated (denominator for the average).
+        metric: Metric name, e.g. "pass@k" or "cons@k".
+        k_value: The k in pass@k / cons@k.
+        num_tests_per_prompt: Samples drawn per prompt.
+        save_path: Directory to write results.json into.
+    """
+    os.makedirs(save_path, exist_ok=True)
+    average_score = score / dataset_size if dataset_size else 0.0
+    summary = {
+        "model_name": master_config.generation["model_name"],
+        "dataset_name": master_config.data["dataset_name"],
+        # e.g. "pass@k" + k_value=1 -> "pass@1", matching _print_results.
+        "metric": f"{metric[:-1]}{k_value}",
+        "k_value": k_value,
+        "num_tests_per_prompt": num_tests_per_prompt,
+        "score": average_score,
+        "score_sum": score,
+        "dataset_size": dataset_size,
+    }
+    results_path = os.path.join(save_path, "results.json")
+    with open(results_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\n✓ Results summary saved to: {results_path}")
     print(f"  Total samples: {len(evaluation_data)}")
     print(f"  File size: {os.path.getsize(eval_data_path) / 1024 / 1024:.2f} MB")
 

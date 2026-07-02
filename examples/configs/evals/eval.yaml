@@ -53,3 +53,23 @@ env:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+
+# Logging. Off by default so a bare `run_eval.py` needs no W&B credentials; the
+# multi-benchmark runner (run_multibench_eval.sh) turns wandb on and sets an
+# "_eval"-suffixed run name per benchmark. run_eval.py disables wandb gracefully
+# if wandb_enabled is true but WANDB_API_KEY is not set.
+logger:
+  log_dir: "logs"
+  wandb_enabled: false
+  swanlab_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: false
+  wandb:
+    project: "nemo-rl-evals"
+    name: "eval"
+    # group is set per run by run_multibench_eval.sh to group a suite's benchmarks
+    tags: ["eval"]
+  gpu_monitoring:
+    collection_interval: 10.0
+    flush_interval: 10.0

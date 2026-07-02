@@ -29,6 +29,7 @@ from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
+from nemo_rl.utils.logger import Logger
 
 
 def parse_args():
@@ -98,6 +99,26 @@ def main():
     print("Final config:")
     pprint.pprint(config)
 
+    # Build a logger if a logger config with wandb is present. Evals are marked
+    # with an "_eval" run-name suffix so they are easy to spot in W&B. If wandb
+    # is enabled but no API key is available, disable it rather than crashing the
+    # whole benchmark suite.
+    logger = None
+    logger_cfg = getattr(config, "logger", None)
+    if logger_cfg is not None and logger_cfg.get("wandb_enabled"):
+        if os.environ.get("WANDB_API_KEY"):
+            wandb_cfg = logger_cfg.setdefault("wandb", {})
+            run_name = wandb_cfg.get("name") or "eval"
+            if not run_name.endswith("_eval"):
+                run_name = f"{run_name}_eval"
+            wandb_cfg["name"] = run_name
+            logger = Logger(logger_cfg)
+        else:
+            print(
+                "⚠️ logger.wandb_enabled is true but WANDB_API_KEY is not set; "
+                "skipping W&B logging for this eval."
+            )
+
     # Init ray
     init_ray()
 
@@ -128,6 +149,7 @@ def main():
         dataloader,
         env,
         master_config,
+        logger=logger,
     )
 
 

@@ -1,0 +1,61 @@
+# Evaluation config: NVIDIA Nemotron-3 Nano 30B-A3B (30B-total / 3B-active MoE, reasoning model)
+#
+# This is a *base* config: model + sampling + cluster settings. It defaults to
+# the MATH-500 benchmark so it is runnable standalone, but the intended use is
+# the multi-benchmark runner, which overrides data.dataset_name / prompt_file /
+# env.math.verifier_type / eval.save_path per benchmark:
+#
+#   examples/configs/evals/run_multibench_eval.sh \
+#     examples/configs/evals/nemotron3_nano_30b_eval.yaml nemotron3_nano_30b
+#
+# Standalone (single benchmark) example:
+#   uv run python examples/run_eval.py \
+#     --config examples/configs/evals/nemotron3_nano_30b_eval.yaml \
+#     data.dataset_name=aime2024 eval.num_tests_per_prompt=16 \
+#     eval.save_path=results/evals/nemotron3_nano_30b/aime2024
+defaults: "eval.yaml"
+
+eval:
+  metric: "pass@k"
+  k_value: 1
+  # avg pass@1 over N samples; set per-benchmark by the runner (AIME needs more
+  # samples because it only has 30 problems). Overridden per benchmark.
+  num_tests_per_prompt: 1
+  save_path: null # set by the runner per benchmark
+
+generation:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+  # Reasoning-model sampling. Verify against the model card and adjust if the
+  # recommended values differ.
+  temperature: 0.6
+  top_p: 0.95
+  top_k: -1 # -1 disables top-k
+  vllm_cfg:
+    # 30B MoE on a full 8xH200 node; TP=8 maximizes KV-cache room for the long
+    # reasoning traces. Lower to 4 if you want to leave GPUs free.
+    tensor_parallel_size: 8
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    # Long context for reasoning outputs. max_new_tokens inherits this from eval.yaml.
+    max_model_len: 32768
+    # Lowered from 0.9 for warm-up headroom, and enforce_eager=true skips CUDA
+    # graph capture, which is where the first launch's vLLM worker crashed
+    # (ActorDiedError during compile_or_warm_up_model). Revisit once it runs.
+    gpu_memory_utilization: 0.85
+    enforce_eager: true
+
+tokenizer:
+  name: ${generation.model_name}
+  # Use the model's native chat template. For a reasoning model this typically
+  # enables thinking by default; toggle via chat_template_kwargs or a system
+  # prompt per the model card if you need to control it.
+  chat_template: "default"
+  chat_template_kwargs: null
+
+data:
+  prompt_file: "examples/prompts/cot.txt"
+  dataset_name: "math500" # default; overridden per benchmark by the runner
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
