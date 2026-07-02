@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import pytest
 import torch
@@ -695,6 +695,106 @@ def test_get_first_index_that_differs():
     assert get_first_index_that_differs("hello world", "hello") == 5
     assert get_first_index_that_differs("hi1", "hello2") == 1
     assert get_first_index_that_differs("hello2", "hi1") == 1
+
+
+class _DummyReasoningTokenizer:
+    """Minimal tokenizer to reproduce #2821/#2844 behaviors in unit tests."""
+
+    bos_token = None
+    eos_token = "</s>"
+
+    def apply_chat_template(
+        self,
+        messages,
+        add_generation_prompt=False,
+        tokenize=False,
+        add_special_tokens=False,
+        **kwargs,
+    ):
+        assert not tokenize
+        out = ""
+        for idx, m in enumerate(messages):
+            role = m["role"]
+            content = m["content"]
+            if role == "user":
+                out += f"<|user|>{content}"
+            elif role == "assistant":
+                # Keep <think> only on latest assistant turn (#2821 repro).
+                if idx == len(messages) - 1:
+                    out += f"<|assistant|>{content}"
+                else:
+                    out += f"<|assistant|>{content.replace('<think></think>', '')}"
+
+        if add_generation_prompt:
+            out += "<|assistant|>\n"
+        return out
+
+    def _encode(self, text: str) -> list[int]:
+        # Toy sentencepiece behavior for #2844 repro:
+        # standalone "The" -> 900, in-context "\nThe" -> 901
+        ids: list[int] = []
+        i = 0
+        while i < len(text):
+            if i == 0 and text.startswith("The", i):
+                ids.append(900)
+                i += 3
+                continue
+            if text.startswith("\nThe", i):
+                ids.append(10)  # '\n'
+                ids.append(901)
+                i += 4
+                continue
+            ids.append(ord(text[i]) + 1000)
+            i += 1
+        return ids
+
+    def __call__(self, text, return_tensors="pt", add_special_tokens=False, **kwargs):
+        ids = self._encode(text)
+        return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+
+def test_get_formatted_message_log_no_duplication_for_non_monotonic_reasoning_template():
+    tokenizer = _DummyReasoningTokenizer()
+    task_data_spec = TaskDataSpec(task_name="test")
+    msgs = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "<think></think>ANSWER1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "<think></think>ANSWER2"},
+    ]
+
+    out = get_formatted_message_log(
+        msgs,
+        tokenizer,
+        task_data_spec,
+        add_bos_token=False,
+        add_eos_token=False,
+        add_generation_prompt=False,
+    )
+    full = "".join(cast(str, m["content"]) for m in out)
+    assert full.count("ANSWER1") == 1
+    assert full.count("ANSWER2") == 1
+
+
+def test_get_formatted_message_log_uses_context_tokenization_for_assistant_leading_token():
+    tokenizer = _DummyReasoningTokenizer()
+    task_data_spec = TaskDataSpec(task_name="test")
+    msgs = [
+        {"role": "user", "content": "What is 6 times 7?"},
+        {"role": "assistant", "content": "The answer is 42."},
+    ]
+
+    out = get_formatted_message_log(
+        msgs,
+        tokenizer,
+        task_data_spec,
+        add_bos_token=False,
+        add_eos_token=False,
+        add_generation_prompt=True,
+    )
+    assistant_ids = cast(torch.Tensor, out[-1]["token_ids"])
+    # Must use in-context token (901), not standalone chunk token (900).
+    assert assistant_ids[0].item() == 901
 
 
 def test_message_log_to_flat_messages_with_packed_images() -> None:

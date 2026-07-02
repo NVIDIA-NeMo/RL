@@ -426,6 +426,26 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
+def _get_longest_suffix_prefix_overlap(prev: str, cur: str) -> int:
+    """Find max overlap where suffix(prev) == prefix(cur)."""
+    max_overlap = min(len(prev), len(cur))
+    for k in range(max_overlap, 0, -1):
+        if prev[-k:] == cur[:k]:
+            return k
+    return 0
+
+
+def _get_longest_token_suffix_prefix_overlap(
+    prev_ids: list[int], cur_ids: list[int]
+) -> int:
+    """Find max overlap where suffix(prev_ids) == prefix(cur_ids)."""
+    max_overlap = min(len(prev_ids), len(cur_ids))
+    for k in range(max_overlap, 0, -1):
+        if prev_ids[-k:] == cur_ids[:k]:
+            return k
+    return 0
+
+
 def get_formatted_message_log(
     message_log: LLMMessageLogType,
     tokenizer: TokenizerType,
@@ -452,6 +472,8 @@ def get_formatted_message_log(
     """
     new_message_log: LLMMessageLogType = []
     prev_formatted_message = ""
+    accumulated_text = ""
+    accumulated_token_ids: list[int] = []
     message_log_strs: list[dict[str, str]] = cast(
         list[dict[str, str]], message_log
     )  # we just use the str:str parts here
@@ -537,8 +559,12 @@ def get_formatted_message_log(
             formatted_message,
         )
 
-        ## pull out the chunk corresponding to the current message
-        message_chunk = formatted_message[prev_message_len_no_eos:]
+        # Drop overlap with already-emitted text (for non-monotonic templates).
+        raw_message_chunk = formatted_message[prev_message_len_no_eos:]
+        overlap = _get_longest_suffix_prefix_overlap(
+            accumulated_text, raw_message_chunk
+        )
+        message_chunk = raw_message_chunk[overlap:]
 
         # Debug: Print each message turn separately
         if debug:
@@ -600,9 +626,22 @@ def get_formatted_message_log(
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
         if len(media_cur_message) == 0:
-            new_message["token_ids"] = tokenizer(
-                text=message_chunk, return_tensors="pt", add_special_tokens=False
+            # Tokenize in accumulated context, then keep only newly appended ids.
+            context_text = accumulated_text + message_chunk
+            context_ids = tokenizer(
+                text=context_text, return_tensors="pt", add_special_tokens=False
             )["input_ids"][0]
+            context_ids_list = cast(list[int], context_ids.tolist())
+            token_overlap = _get_longest_token_suffix_prefix_overlap(
+                accumulated_token_ids, context_ids_list
+            )
+            new_ids = context_ids_list[token_overlap:]
+            new_message["token_ids"] = torch.tensor(
+                new_ids,
+                dtype=context_ids.dtype,
+                device=context_ids.device,
+            )
+            accumulated_token_ids = context_ids_list
         else:
             # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
             media_kwargs = {}
@@ -661,6 +700,7 @@ def get_formatted_message_log(
                     new_message["content"].append(item)
 
         new_message_log.append(new_message)
+        accumulated_text += message_chunk
         prev_formatted_message = formatted_message
 
     return new_message_log
