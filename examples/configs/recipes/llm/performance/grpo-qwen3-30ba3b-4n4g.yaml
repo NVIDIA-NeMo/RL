@@ -36,9 +36,12 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 1
+      env_vars:
+        VLLM_USE_FLASHINFER_MOE_FP16: '0'
+        VLLM_USE_FLASHINFER_MOE_FP8: '0'
     vllm_kwargs:
-      # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible,
-      # change to triton to keep same behavior as vLLM 0.17.
+      # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible
+      # for Qwen3 MoE weight updates; use Triton for stable load/refit behavior.
       moe_backend: triton
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g

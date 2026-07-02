@@ -1868,15 +1868,23 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    combine_wakeup_tags = os.getenv(
+        "NRL_VLLM_WAKEUP_COMBINED_TAGS", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.suspend_for_refit()
 
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy.offload_before_refit()
-    # Colocated inference needs to prepare for generation.
+    # Colocated inference supports optional combined wakeup tags to reduce
+    # refit/wakeup synchronization instability.
+    if colocated_inference:
+        wakeup_tags = ["weights", "kv_cache"] if combine_wakeup_tags else ["weights"]
+        policy_generation.prepare_for_generation(tags=wakeup_tags)
     # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
+    elif isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["weights"])
 
     if (
@@ -1960,9 +1968,10 @@ def refit_policy_generation(
 
     if colocated_inference:
         policy.offload_after_refit()
-    # Colocated inference needs to prepare for generation.
-    # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
+        if not combine_wakeup_tags:
+            policy_generation.prepare_for_generation(tags=["kv_cache"])
+    # Megatron non-colocated inference needs to restore generation mode after refit.
+    elif isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
     if isinstance(policy_generation, MegatronGeneration):

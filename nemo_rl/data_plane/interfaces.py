@@ -39,7 +39,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from tensordict import TensorDict
+try:
+    from tensordict import TensorDict
+except ModuleNotFoundError:
+    # Some policy-worker environments do not need data-plane tensor codecs.
+    # Keep interfaces importable so non-data-plane paths can proceed.
+    TensorDict = Any  # type: ignore[misc,assignment]
 
 
 class DataPlaneConfig(TypedDict):

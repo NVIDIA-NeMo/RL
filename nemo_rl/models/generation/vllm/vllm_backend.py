@@ -14,6 +14,7 @@
 import gc
 import re
 import traceback
+from functools import wraps
 from typing import Any
 
 import torch
@@ -92,6 +93,93 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    @staticmethod
+    def _get_fused_moe_shard_dim_mode() -> str:
+        try:
+            from vllm.model_executor.layers.fused_moe import layer as moe_layer
+        except Exception:
+            return "dim1"
+        return getattr(moe_layer, "_nrl_shard_dim_mode", "dim1")
+
+    @staticmethod
+    def _set_fused_moe_shard_dim_mode(mode: str) -> None:
+        try:
+            from vllm.model_executor.layers.fused_moe import layer as moe_layer
+        except Exception:
+            return
+        setattr(moe_layer, "_nrl_shard_dim_mode", mode)
+
+    @staticmethod
+    def _patch_fused_moe_shard_dim_compat() -> None:
+        """Patch vLLM fused-MoE loader for shard_dim compatibility.
+
+        Some vLLM 0.20.x builds can pass shard_dim values that follow 2D
+        conventions (0/1) into 3D expert tensors, while the downstream loader
+        expects 3D conventions (1/2). This adapter keeps behavior unchanged for
+        valid inputs and remaps legacy values only for the failing 3D case.
+        """
+        try:
+            from vllm.model_executor.layers.fused_moe import layer as moe_layer
+        except Exception:
+            return
+
+        if getattr(moe_layer, "_nrl_shard_dim_compat_patched", False):
+            return
+
+        setattr(moe_layer, "_nrl_shard_dim_mode", "dim1")
+
+        patched = 0
+        for _, cls in vars(moe_layer).items():
+            if not isinstance(cls, type) or "_get_hidden_dim" not in cls.__dict__:
+                continue
+            raw_attr = cls.__dict__["_get_hidden_dim"]
+            is_staticmethod = isinstance(raw_attr, staticmethod)
+            original = (
+                raw_attr.__func__
+                if is_staticmethod
+                else getattr(cls, "_get_hidden_dim")
+            )
+            if getattr(original, "_nrl_shard_dim_compat_wrapper", False):
+                continue
+
+            if is_staticmethod:
+
+                @wraps(original)
+                def wrapped_static(shard_dim, expert_data_ndim, _orig=original):
+                    if expert_data_ndim == 3 and shard_dim == 0:
+                        # vLLM 0.20 fused-MoE expects hidden dims 1/2 for 3D
+                        # tensors; older call sites may still pass 0. The exact
+                        # mapping can vary across kernels, so keep a runtime mode
+                        # and allow retry-based fallback.
+                        mode = getattr(moe_layer, "_nrl_shard_dim_mode", "dim1")
+                        shard_dim = 1 if mode == "dim1" else 2
+                    return _orig(shard_dim, expert_data_ndim)
+
+                wrapped_static._nrl_shard_dim_compat_wrapper = True  # type: ignore[attr-defined]
+                setattr(cls, "_get_hidden_dim", staticmethod(wrapped_static))
+            else:
+
+                @wraps(original)
+                def wrapped_bound(self, shard_dim, expert_data_ndim, _orig=original):
+                    if expert_data_ndim == 3 and shard_dim == 0:
+                        # vLLM 0.20 fused-MoE expects hidden dims 1/2 for 3D
+                        # tensors; older call sites may still pass 0. The exact
+                        # mapping can vary across kernels, so keep a runtime mode
+                        # and allow retry-based fallback.
+                        mode = getattr(moe_layer, "_nrl_shard_dim_mode", "dim1")
+                        shard_dim = 1 if mode == "dim1" else 2
+                    return _orig(self, shard_dim, expert_data_ndim)
+
+                wrapped_bound._nrl_shard_dim_compat_wrapper = True  # type: ignore[attr-defined]
+                setattr(cls, "_get_hidden_dim", wrapped_bound)
+            patched += 1
+
+        if patched > 0:
+            setattr(moe_layer, "_nrl_shard_dim_compat_patched", True)
+            print(
+                f"[vllm-compat] Applied fused-MoE shard_dim compatibility patch to {patched} classes."
+            )
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -327,6 +415,8 @@ class VllmInternalWorkerExtension:
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
+        # Apply one-time compatibility patch before loading fused-MoE weights.
+        self._patch_fused_moe_shard_dim_compat()
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(policy_weights, self.model_runner)
         else:
@@ -392,8 +482,27 @@ class VllmInternalWorkerExtension:
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
 
-                # Load weights into the model
-                self._load_weights(weights)
+                # Load weights into the model. For fused-MoE shard_dim=0, some
+                # builds require dim1 mapping while others require dim2.
+                # Retry once with alternate mapping on known shape mismatch.
+                try:
+                    self._load_weights(weights)
+                except RuntimeError as load_err:
+                    msg = str(load_err)
+                    can_retry = (
+                        "The size of tensor a" in msg
+                        and "must match the size of tensor b" in msg
+                    )
+                    if not can_retry:
+                        raise
+                    current_mode = self._get_fused_moe_shard_dim_mode()
+                    fallback_mode = "dim2" if current_mode == "dim1" else "dim1"
+                    self._set_fused_moe_shard_dim_mode(fallback_mode)
+                    print(
+                        "[vllm-compat] Fused-MoE shape mismatch while loading "
+                        f"weights; retrying with shard_dim mode {fallback_mode}."
+                    )
+                    self._load_weights(weights)
 
                 torch.cuda.current_stream().synchronize()
 
