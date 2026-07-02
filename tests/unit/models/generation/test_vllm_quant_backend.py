@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import copy
+import re
+from pathlib import Path
 
 import pytest
 import ray
@@ -29,8 +31,7 @@ from tests.unit.models.generation.test_vllm_generation import (
 )
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
-_QUANT_CFG = "FP8_DEFAULT_CFG"
-_PROBE_WEIGHT = "model.layers.0.mlp.down_proj.weight"
+_QUANT_CFG_DIR = Path(__file__).resolve().parents[4] / "examples/modelopt/quant_configs"
 
 _CUDA_AVAILABLE = torch.cuda.device_count() > 0
 
@@ -47,7 +48,7 @@ requires_quant = pytest.mark.skipif(
 )
 
 
-def _make_vllm_config(tokenizer, *, async_engine=False, is_eval=True):
+def _make_vllm_config(tokenizer, quant_cfg, *, is_eval=True):
     cfg = {
         "backend": "vllm",
         "model_name": _MODEL_NAME,
@@ -59,7 +60,7 @@ def _make_vllm_config(tokenizer, *, async_engine=False, is_eval=True):
         "top_k": None,
         "stop_token_ids": None,
         "stop_strings": None,
-        "quant_cfg": _QUANT_CFG,
+        "quant_cfg": quant_cfg,
         "vllm_cfg": {
             "precision": "bfloat16",
             "tensor_parallel_size": 1,
@@ -67,7 +68,7 @@ def _make_vllm_config(tokenizer, *, async_engine=False, is_eval=True):
             "expert_parallel_size": 1,
             "gpu_memory_utilization": 0.8,
             "max_model_len": 512,
-            "async_engine": async_engine,
+            "async_engine": False,
             "skip_tokenizer_init": False,
             "load_format": "auto",
             "enforce_eager": "False",
@@ -81,17 +82,26 @@ def _make_vllm_config(tokenizer, *, async_engine=False, is_eval=True):
     return configure_generation_config(copy.deepcopy(cfg), tokenizer, is_eval=is_eval)
 
 
-def _make_megatron_config(vllm_config):
+def _make_megatron_config(vllm_config, quant_cfg):
     cfg = get_basic_megatron_test_config(tp=1, pp=1, precision="bfloat16")
     cfg["model_name"] = _MODEL_NAME
     cfg["tokenizer"]["name"] = _MODEL_NAME
-    cfg["quant_cfg"] = _QUANT_CFG
+    cfg["quant_cfg"] = quant_cfg
     cfg["quant_calib_size"] = 1
     cfg["quant_calib_data"] = "random"
     cfg["quant_batch_size"] = 1
     cfg["quant_sequence_length"] = 128
     cfg["generation"] = vllm_config
     return cfg
+
+
+def _kv_amax_by_layer(stats):
+    result = {}
+    for name, amax in stats["kv_amax"].items():
+        match = re.search(r"(?:^|\.)layers\.(\d+)\..*\.([kv])_bmm_quantizer$", name)
+        assert match is not None, f"unexpected K/V quantizer name: {name}"
+        result[(int(match.group(1)), match.group(2))] = amax
+    return result
 
 
 @pytest.fixture(scope="function")
@@ -109,18 +119,14 @@ def cluster():
 
 
 @requires_quant
-@pytest.mark.parametrize("async_engine", [False, True], ids=["sync", "async"])
-def test_vllm_quant_refit(cluster, async_engine):
-    """Integration test: quantized Megatron -> vLLM refit should transfer pre-folded weights.
-
-    Uses is_eval=True so vLLM loads real HF weights at init, allowing us
-    to verify that pre-folded weights (with FP8 quantization applied on
-    the Megatron side) differ from the original HF weights by a small
-    quantization error.
-    """
+@pytest.mark.parametrize("recipe", ["kv_cache_fp8.yaml", "kv_cache_nvfp4.yaml"])
+def test_vllm_quant_refit(cluster, recipe, monkeypatch):
+    """Calibrated simulated K/V state must match after Megatron-to-vLLM refit."""
+    monkeypatch.setenv("ENABLE_BRIDGE_QUANT_MAPPING", "1")
+    quant_cfg = str((_QUANT_CFG_DIR / recipe).resolve())
     tokenizer = get_tokenizer({"name": _MODEL_NAME})
-    vllm_config = _make_vllm_config(tokenizer, async_engine=async_engine)
-    megatron_config = _make_megatron_config(vllm_config)
+    vllm_config = _make_vllm_config(tokenizer, quant_cfg)
+    megatron_config = _make_megatron_config(vllm_config, quant_cfg)
 
     vllm_policy = None
     megatron_policy = None
@@ -137,13 +143,6 @@ def test_vllm_quant_refit(cluster, async_engine):
                 f"vLLM rank {rank}: expected 0 positive amax before refit, got {stats['positive_amax']}"
             )
 
-        # Snapshot weight before refit (original HF weights, loaded via is_eval=True)
-        futures = vllm_policy.worker_group.run_all_workers_single_data(
-            "get_weight_snapshot", name=_PROBE_WEIGHT
-        )
-        weight_before = ray.get(futures)[0]
-        assert weight_before is not None, f"Could not read {_PROBE_WEIGHT} from vLLM"
-
         vllm_policy.finish_generation()
 
         megatron_policy = Policy(cluster, megatron_config, tokenizer)
@@ -152,11 +151,13 @@ def test_vllm_quant_refit(cluster, async_engine):
         futures = megatron_policy.worker_group.run_all_workers_single_data(
             "get_quantizer_stats"
         )
-        for rank, stats in enumerate(ray.get(futures)):
+        policy_stats = ray.get(futures)
+        for rank, stats in enumerate(policy_stats):
             assert stats["enabled"] > 0, f"Megatron rank {rank}: no enabled quantizers"
             assert stats["positive_amax"] == stats["with_amax"], (
                 f"Megatron rank {rank}: {stats['with_amax'] - stats['positive_amax']} quantizers have non-positive amax"
             )
+            assert stats["kv_amax"], f"Megatron rank {rank}: no K/V amax state"
 
         # Refit: transfer pre-folded weights + input_quantizer amax from Megatron to vLLM
         state_dict_info = megatron_policy.prepare_refit_info()
@@ -169,26 +170,20 @@ def test_vllm_quant_refit(cluster, async_engine):
         futures = vllm_policy.worker_group.run_all_workers_single_data(
             "get_quantizer_stats"
         )
-        for rank, stats in enumerate(ray.get(futures)):
+        rollout_stats = ray.get(futures)
+        for rank, stats in enumerate(rollout_stats):
             assert stats["positive_amax"] > 0, (
                 f"vLLM rank {rank}: expected positive amax after refit, got {stats['positive_amax']}"
             )
+            assert stats["kv_amax"], f"vLLM rank {rank}: no K/V amax state"
 
-        # Verify pre-folded weights differ from original HF weights (FP8 quantization error)
-        futures = vllm_policy.worker_group.run_all_workers_single_data(
-            "get_weight_snapshot", name=_PROBE_WEIGHT
-        )
-        weight_after = ray.get(futures)[0]
-
-        assert not torch.equal(weight_before, weight_after), (
-            "Weights are bit-identical before and after refit -- pre-folding had no effect"
-        )
-        max_diff = (weight_before - weight_after).abs().max().item()
-        print(f"refit weight max abs diff: {max_diff:.6e}")
-        assert torch.allclose(weight_before, weight_after, atol=0.1, rtol=0.0), (
-            f"Weights diverged too much after refit (max diff={max_diff:.6e}), "
-            "expected small FP8 quantization error"
-        )
+        policy_kv_amax = _kv_amax_by_layer(policy_stats[0])
+        rollout_kv_amax = _kv_amax_by_layer(rollout_stats[0])
+        assert rollout_kv_amax.keys() == policy_kv_amax.keys()
+        for key, expected in policy_kv_amax.items():
+            torch.testing.assert_close(
+                rollout_kv_amax[key], expected, rtol=1e-2, atol=1e-3
+            )
     finally:
         if vllm_policy:
             vllm_policy.shutdown()

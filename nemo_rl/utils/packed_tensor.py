@@ -80,11 +80,11 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     tensor = (
                         post_iter_func(next(iterator))
                         .contiguous()
+                        .reshape(-1)
                         .view(torch.uint8)
-                        .view(-1)
                     )
                     packing_tensor_list[buffer_idx].append(tensor)
-                    packing_tensor_sizes[buffer_idx] += tensor.view(torch.uint8).numel()
+                    packing_tensor_sizes[buffer_idx] += tensor.numel()
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Pack the tensors and call broadcast collective
@@ -133,11 +133,25 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
         packed_tensor_sizes = list(map(lambda x: x[4], meta_data_list))
         unpacked_tensor = packed_tensor.split_with_sizes(packed_tensor_sizes)
 
-        # unpacked_list = List[(name, torch.Tensor.view(dtype).view(*shape))]
+        def restore_tensor(
+            tensor: torch.Tensor, shape: torch.Size | list[int], dtype: torch.dtype
+        ) -> torch.Tensor:
+            """Restore dtype and shape for a tensor from the packed byte stream.
+
+            Unlike the 512-byte-aligned IPC/ZMQ refit path, packed collective
+            refit adds no padding between tensors. Scalar GEMM or K/V amax can
+            therefore leave the next mixed-dtype slice unaligned. Cloning moves
+            only such slices to offset zero; passing ``torch.Size`` also restores
+            scalar shape ``[]`` without calling ``view()`` with no arguments.
+            """
+            if tensor.storage_offset() % dtype.itemsize:
+                tensor = tensor.clone()
+            return tensor.view(dtype).view(torch.Size(shape))
+
         unpacked_list = [
             (
                 meta_data_list[i][0],
-                tensor.view(meta_data_list[i][2]).view(*meta_data_list[i][1]),
+                restore_tensor(tensor, meta_data_list[i][1], meta_data_list[i][2]),
             )
             for i, tensor in enumerate(unpacked_tensor)
         ]

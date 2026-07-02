@@ -41,31 +41,38 @@ if os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1":
 
 
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
+    _QUANT_AMAX_SUFFIXES = (
+        "input_quantizer._amax",
+        "k_bmm_quantizer._amax",
+        "v_bmm_quantizer._amax",
+    )
+
     def _is_real_quant_model(self) -> bool:
         return os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1"
 
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):
-        """Temporarily patches model.named_parameters() to also yield input_quantizer buffers.
+        """Temporarily expose activation-quantizer amax buffers as parameters.
 
-        Weights arrive pre-folded from the Megatron side, so only input_quantizer
-        amax buffers need to be loaded. Weight quantizer buffers are skipped.
+        Weights arrive pre-folded from the Megatron side, so weight-quantizer
+        buffers are skipped. Input and KV-cache amax values use the same vLLM
+        weight-loading path.
         """
         original_named_parameters = model.named_parameters
-        # input_quantizer buffers we attached a weight_loader to and must
-        # clean up on exit; pre-existing loaders (if any) are left untouched.
+        quant_amax_suffixes = self._QUANT_AMAX_SUFFIXES
         patched_quantizer_buffers = []
 
-        def input_amax_loader(param, loaded_weight, *args, **kwargs):
+        def amax_loader(param, loaded_weight, *args, **kwargs):
+            # Input amax may fan in; K/V amax is fixed after calibration.
             param.copy_(torch.max(param, loaded_weight))
 
         def new_named_parameters(self, *args, **kwargs):
             yield from original_named_parameters(*args, **kwargs)
             for name, buf in self.named_buffers(*args, **kwargs):
-                if "input_quantizer" not in name:
+                if not name.endswith(quant_amax_suffixes):
                     continue
                 if not hasattr(buf, "weight_loader"):
-                    buf.weight_loader = input_amax_loader
+                    buf.weight_loader = amax_loader
                     patched_quantizer_buffers.append(buf)
                 yield name, buf
 
@@ -78,7 +85,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 del buf.weight_loader
 
     def _load_weights(self, weights):
-        """Load pre-folded weights and input_quantizer amax buffers.
+        """Load pre-folded weights and activation-quantizer amax buffers.
 
         Weights arrive already folded from the Megatron side (weight_quantizer
         applied during export), so no fold_weight step is needed here.
@@ -122,12 +129,29 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 return None
             return super()._load_weights(weights)
 
+        # MBridge exports K/V amax with the HF-semantic attention path, such as
+        # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers
+        # on vLLM's inner Attention module, whose runtime path contains ``.attn``.
+        # Insert only that ModelOpt-owned path segment here; the normal vLLM
+        # loader still owns model-specific HF mapping and PP-local filtering.
+        remapped_weights = []
+        for name, weight in weights:
+            for suffix in self._QUANT_AMAX_SUFFIXES:
+                if (
+                    "_bmm_quantizer" in suffix
+                    and name.endswith(suffix)
+                    and not name.endswith(f".attn.{suffix}")
+                ):
+                    name = f"{name[: -len(suffix)]}attn.{suffix}"
+                    break
+            remapped_weights.append((name, weight))
+
         with ExitStack() as contexts:
             for _, child in self.model_runner.model.named_children():
                 contexts.enter_context(
                     self._patch_named_parameters_to_include_buffers(child)
                 )
-            return super()._load_weights(weights)
+            return super()._load_weights(remapped_weights)
 
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update weights through CUDA IPC."""
@@ -219,8 +243,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         enabled = 0
         with_amax = 0
         positive_amax = 0
+        kv_amax = {}
         model = self.model_runner.model
-        for _, module in model.named_modules():
+        for name, module in model.named_modules():
             if isinstance(module, TensorQuantizer):
                 total += 1
                 if module.is_enabled:
@@ -229,9 +254,12 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                         with_amax += 1
                         if (module.amax > 0).all():
                             positive_amax += 1
+                        if name.endswith(("k_bmm_quantizer", "v_bmm_quantizer")):
+                            kv_amax[name] = module.amax.detach().cpu().clone()
         return {
             "total": total,
             "enabled": enabled,
             "with_amax": with_amax,
             "positive_amax": positive_amax,
+            "kv_amax": kv_amax,
         }
