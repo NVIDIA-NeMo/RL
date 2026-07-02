@@ -26,9 +26,8 @@ from pathlib import Path
 import pytest
 import yaml
 from click.testing import CliRunner
-from nrl_k8s import cli
+from nrl_k8s import cli, orchestrate
 from nrl_k8s import config as cfg_mod
-from nrl_k8s import orchestrate
 
 # =============================================================================
 # Fixtures
