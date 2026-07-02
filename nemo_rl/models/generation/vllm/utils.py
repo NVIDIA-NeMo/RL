@@ -70,7 +70,7 @@ def format_prompt_for_vllm_generation(
                 continue
             # init prompt dict
             prompt_dict = {"prompt": msg}
-            # collect multi_modal_data from images and audios
+            # collect multi_modal_data from images, audios, and videos
             multi_modal_data = {}
             images = data.get("vllm_images", None)
             if images is not None and len(images[i]) > 0:
@@ -81,6 +81,11 @@ def format_prompt_for_vllm_generation(
             if audios is not None and len(audios[i]) > 0:
                 multi_modal_data["audio"] = (
                     audios[i][0] if len(audios[i]) == 1 else audios[i]
+                )
+            videos = data.get("vllm_videos", None)
+            if videos is not None and len(videos[i]) > 0:
+                multi_modal_data["video"] = (
+                    videos[i][0] if len(videos[i]) == 1 else videos[i]
                 )
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
