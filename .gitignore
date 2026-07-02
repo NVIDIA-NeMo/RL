@@ -41,9 +41,14 @@ results/
 code_snapshots*/
 .cache/
 
+# Claude Code local files — ignore everything (skills are local-only)
+.claude/
+# Local operational skills (launch-skypilot, etc.) — local-only, not committed
+skills/
+
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
 
-# Claude Code review memory (local only)
-.claude/review-memory/
+# Local secrets — never commit
+.env

@@ -7,7 +7,7 @@ NeMo-RL is an RLHF training framework built on Ray and PyTorch (FSDP2 / Megatron
 Coding guidelines and operational procedures are organized as Claude skills in
 two locations:
 
-- `skills/` — customer-facing operational skills (launch-nemo-rl, auto-research, brev-etiquette, docs)
+- `skills/` — operational skills (launch-skypilot, launch-nemo-rl, auto-research, brev-etiquette, docs)
 - `.agents/contributor-skills/` — contributor-facing development guidelines (testing, linting, CI/CD, review, etc.)
 
 All skills are symlinked into `.claude/skills/` for unified discovery.
@@ -39,6 +39,18 @@ When reviewing code, follow these principles:
 - **Compare new components to their nearest internal analog.** A new worker group, estimator, or config block should mirror the established pattern (backend dispatch, override hooks, guards, typing, return shape) or justify diverging.
 - It is perfectly acceptable to have nothing to comment on. Say "LGTM" if so.
 
-## Kubernetes / nrl-k8s
+## Launching training (SkyPilot — this fork's default)
 
-For launching, monitoring, stopping, and debugging NeMo-RL recipes on Kubernetes, see the skill at @skills/launch-nemo-rl/SKILL.md.
+This fork trains via **SkyPilot managed jobs** on a Teleport hyperpod H200
+cluster, driven by `skypilot/launch.sh <recipe>`. For any request to run,
+launch, submit, monitor, or stop an experiment/recipe here, use the
+**launch-skypilot** skill (@skills/launch-skypilot/SKILL.md) — it is the default
+launch path. Never use interactive `sky launch`; only `sky jobs launch` (which
+the script calls).
+
+## Kubernetes / nrl-k8s (not used in this setup)
+
+The upstream `nrl-k8s` Kubernetes path (`kubectl`, `RayJob`/`RayCluster`) is
+documented in @skills/launch-nemo-rl/SKILL.md. Only use it when the user
+explicitly asks about `nrl-k8s`/Kubernetes — otherwise launches go through
+launch-skypilot above.
