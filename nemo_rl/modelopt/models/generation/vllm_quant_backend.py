@@ -20,6 +20,7 @@ from contextlib import ExitStack, contextmanager
 import torch
 import vllm  # noqa: F401
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+from vllm.model_executor.models.utils import is_pp_missing_parameter
 
 from nemo_rl.modelopt.utils import (
     iter_quant_ignore_name_candidates,
@@ -94,34 +95,47 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         self,
         name: str,
         named_buffers: dict[str, torch.Tensor],
-    ) -> tuple[str, torch.Tensor]:
+    ) -> tuple[str, torch.Tensor] | None:
         suffix = self._get_fake_quant_kv_amax_suffix(name)
         if suffix is None:
             raise RuntimeError(f"Unsupported fake-quant KV amax key '{name}'")
 
-        prefix = name[: -len(suffix)]
-        prefix_variants = {prefix}
-        layer_marker = ".layers."
-        root, marker, layer_path = prefix.partition(layer_marker)
-        if marker and root == "backbone":
-            prefix_variants.add(f"model{layer_marker}{layer_path}")
+        model = self.model_runner.model
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        mapped_names = mapper.apply_list([name]) if mapper is not None else [name]
+        if len(mapped_names) != 1:
+            raise RuntimeError(
+                f"Expected vLLM hf_to_vllm_mapper to produce exactly one name "
+                f"for required fake-quant KV amax '{name}', got {mapped_names}"
+            )
 
-        for candidate in tuple(prefix_variants):
-            if candidate.endswith(".attn"):
-                prefix_variants.add(candidate.removesuffix(".attn"))
-            else:
-                prefix_variants.add(candidate + ".attn")
+        mapped_name = mapped_names[0]
+        if is_pp_missing_parameter(mapped_name, model):
+            return None
 
-        candidate_names = [candidate + suffix for candidate in prefix_variants]
+        mapped_suffix = self._get_fake_quant_kv_amax_suffix(mapped_name)
+        if mapped_suffix is None:
+            raise RuntimeError(
+                f"vLLM hf_to_vllm_mapper changed required fake-quant KV amax "
+                f"'{name}' to unsupported name '{mapped_name}'"
+            )
+
+        prefix = mapped_name[: -len(mapped_suffix)]
+        candidate_names = {mapped_name}
+        if not prefix.endswith(".attn"):
+            candidate_names.add(f"{prefix}.attn{mapped_suffix}")
+
         matches = [
             (candidate_name, named_buffers[candidate_name])
-            for candidate_name in candidate_names
+            for candidate_name in sorted(candidate_names)
             if candidate_name in named_buffers
         ]
         if len(matches) != 1:
-            found = [candidate_name for candidate_name, _ in matches] or ["<none>"]
             raise RuntimeError(
-                f"Expected exactly one fake-quant KV amax buffer for '{name}', found {found}"
+                f"Expected exactly one fake-quant KV amax buffer for '{name}' "
+                f"after vLLM mapping to '{mapped_name}'; candidates "
+                f"{sorted(candidate_names)}, matches "
+                f"{[candidate_name for candidate_name, _ in matches]}"
             )
         return matches[0]
 
@@ -156,24 +170,25 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         self,
         weights: list[tuple[str, torch.Tensor]],
     ) -> list[tuple[str, torch.Tensor]]:
-        named_buffers = dict(self.model_runner.model.named_buffers())
         filtered = []
+        kv_amax_weights = []
         for name, weight in weights:
             if self._get_fake_quant_kv_amax_suffix(name) is None:
                 filtered.append((name, weight))
                 continue
-            destination_name, destination = self._resolve_fake_quant_kv_amax_buffer(
-                name, named_buffers
-            )
+            kv_amax_weights.append((name, weight))
+
+        if not kv_amax_weights:
+            return weights
+
+        named_buffers = dict(self.model_runner.model.named_buffers())
+        for name, weight in kv_amax_weights:
+            resolved = self._resolve_fake_quant_kv_amax_buffer(name, named_buffers)
+            if resolved is None:
+                continue
+            destination_name, destination = resolved
             self._copy_fake_quant_kv_amax(name, weight, destination_name, destination)
         return filtered
-
-    @staticmethod
-    def _uses_constant_amax(quantizer: TensorQuantizer) -> bool:
-        return bool(
-            getattr(quantizer, "_use_constant_amax", False)
-            or getattr(quantizer, "use_constant_amax", False)
-        )
 
     def _iter_fake_quant_kv_quantizers(self):
         for name, module in self.model_runner.model.named_modules():
@@ -183,26 +198,19 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 continue
             if not name.endswith(self._FAKE_QUANT_KV_QUANTIZER_SUFFIXES):
                 continue
-            if self._uses_constant_amax(module):
+            if module._use_constant_amax:
                 continue
             yield name, module
 
-    @staticmethod
-    def _get_quantizer_amax(quantizer: TensorQuantizer) -> torch.Tensor | None:
-        amax = getattr(quantizer, "_amax", None)
-        if amax is None:
-            amax = getattr(quantizer, "amax", None)
-        return amax
-
     def _reset_fake_quant_kv_amax(self) -> None:
         for _, module in self._iter_fake_quant_kv_quantizers():
-            amax = self._get_quantizer_amax(module)
+            amax = module.amax
             if amax is not None:
                 amax.fill_(-1)
 
     def _validate_fake_quant_kv_amax(self) -> None:
         for name, module in self._iter_fake_quant_kv_quantizers():
-            amax = self._get_quantizer_amax(module)
+            amax = module.amax
             if amax is None:
                 raise RuntimeError(
                     f"Missing fake-quant KV quantizer _amax for '{name}' after refit"
