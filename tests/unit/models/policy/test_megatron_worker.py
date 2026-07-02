@@ -154,6 +154,47 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     assert torch.allclose(scale_fn(), torch.tensor(1.0))
 
 
+def test_checkpoint_engine_weight_iterator_filters_for_vllm_layout():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    local_expert = torch.arange(16).reshape(4, 4)
+    remote_expert = local_expert + 100
+    dense_weight = torch.ones(4, 4)
+    weights = [
+        ("model.layers.0.mlp.experts.0.gate_proj.weight", remote_expert),
+        ("model.layers.0.mlp.experts.1.gate_proj.weight", local_expert),
+        ("model.layers.0.self_attn.q_proj.weight", dense_weight),
+        ("model.layers.1.self_attn.q_proj.weight", dense_weight),
+    ]
+    worker._iter_params_with_optional_kv_scales = lambda kv_scales=None: iter(weights)
+    worker.checkpoint_engine = SimpleNamespace(
+        shard_hf_weights=True,
+        next_agent="rollout",
+        target_weight_layout={
+            "expert_params": {
+                "model.layers.0.mlp.experts.w13_weight": {
+                    "tp_rank": 0,
+                    "tp_size": 1,
+                    "local_expert_ids": [1],
+                }
+            },
+            "missing_weight_prefixes": ["model.layers.1."],
+        },
+    )
+
+    selected = list(worker._checkpoint_engine_weight_iterator())
+
+    assert [name for name, _tensor in selected] == [
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+    ]
+    assert selected[0][1] is local_expert
+    assert selected[1][1] is dense_weight
+
+
 def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
     source_path = (
         Path(__file__).parents[4]

@@ -29,7 +29,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer import enums as transformer_enums
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import unwrap_model
 
@@ -175,9 +175,12 @@ class MegatronGenerationMixin:
         )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
-            self.model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
-                mcore_generation_config["inference_cuda_graph_scope"]
-            ]
+            scope = mcore_generation_config["inference_cuda_graph_scope"]
+            self.model.config.inference_cuda_graph_scope = (
+                transformer_enums.InferenceCudaGraphScope[scope]
+                if hasattr(transformer_enums, "InferenceCudaGraphScope")
+                else scope
+            )
 
         self.inference_context = DynamicInferenceContext(
             self.model.config, inference_config

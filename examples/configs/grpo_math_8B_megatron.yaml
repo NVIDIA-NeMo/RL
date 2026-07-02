@@ -72,6 +72,22 @@ policy:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
+    # Optional: NIXL/UCX checkpoint-engine refit for non-colocated vLLM
+    # generation. Streams Megatron policy weights directly to generation workers
+    # instead of the NCCL collective path. Requires a Megatron policy, the vLLM
+    # generation backend, and policy.generation.colocated.enabled=false. Disabled
+    # by default; see docs/guides/checkpoint-engine-refit.md.
+    checkpoint_engine:
+      enabled: false
+      backend: nixl  # built-in backend, or a "module:ClassName" plugin path
+      update_weights_bucket_megabytes: 2048  # reusable per-worker transfer buffer
+      engine_kwargs:
+        nixl:
+          device: cuda  # "cuda" for GPU buffers, "cpu" for host-pinned fallback
+          cleanup_after_load: false
+          # shard_hf_weights: false  # Megatron/vLLM MoE expert-sharded refit
+          backend_name: UCX
+          backend_init_params: null  # set UCX/NIXL backend params here if needed
 
 cluster:
   gpus_per_node: 8

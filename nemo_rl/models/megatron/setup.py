@@ -58,7 +58,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
-from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
+from megatron.core.transformer import enums as transformer_enums
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
@@ -840,11 +840,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         for _nvte_var in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
             os.environ.pop(_nvte_var, None)
         try:
-            model_cfg.attention_backend = AttnBackend[attention_backend]
+            model_cfg.attention_backend = transformer_enums.AttnBackend[
+                attention_backend
+            ]
         except KeyError:
             raise ValueError(
                 f"Invalid attention backend: {attention_backend}. "
-                f"Available backends are: {list(AttnBackend.__members__.keys())}"
+                "Available backends are: "
+                f"{list(transformer_enums.AttnBackend.__members__.keys())}"
             )
 
     # These overrides need to be applied before the workers spawn.
@@ -855,9 +858,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         if model_cfg.cuda_graph_impl != "none":
             model_cfg.use_te_rng_tracker = True
         if "inference_cuda_graph_scope" in config["megatron_cfg"]:
-            model_cfg.inference_cuda_graph_scope = InferenceCudaGraphScope[
-                config["megatron_cfg"]["inference_cuda_graph_scope"]
-            ]
+            scope = config["megatron_cfg"]["inference_cuda_graph_scope"]
+            model_cfg.inference_cuda_graph_scope = (
+                transformer_enums.InferenceCudaGraphScope[scope]
+                if hasattr(transformer_enums, "InferenceCudaGraphScope")
+                else scope
+            )
 
     # Use the graph-safe TE RNG tracker for either training graphs or inference graphs.
     if "generation" in config and config["generation"] is not None:
@@ -1006,7 +1012,6 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
-
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,

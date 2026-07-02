@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import os
 from contextlib import contextmanager
 from importlib.util import find_spec
+from typing import Any
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -167,6 +170,50 @@ def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
     logger.info("Successfully patched llama_eagle3 lm_head ownership.")
 
 
+def _patch_vllm_worker_nixl_preinit(
+    checkpoint_engine_config: dict[str, Any] | None,
+) -> None:  # pragma: no cover
+    if not (
+        checkpoint_engine_config
+        and checkpoint_engine_config["enabled"]
+        and checkpoint_engine_config["backend"] == "nixl"
+    ):
+        return
+
+    from nemo_rl.utils.checkpoint_engines.nixl import resolve_nixl_backend_kwargs
+
+    nixl_kwargs = checkpoint_engine_config["engine_kwargs"]["nixl"]
+    backend_name, backend_init_params = resolve_nixl_backend_kwargs(nixl_kwargs)
+    old_snippet = (
+        "        with set_current_vllm_config(self.vllm_config):\n"
+        "            # To make vLLM config available during worker initialization\n"
+        "            self.worker = worker_class(**kwargs)"
+    )
+    new_snippet = (
+        "        from nemo_rl.models.generation.vllm.vllm_backend import "
+        "maybe_preinit_nixl_for_vllm_worker\n"
+        "\n"
+        "        maybe_preinit_nixl_for_vllm_worker(\n"
+        f"            self, backend_name={backend_name!r}, "
+        f"backend_init_params={backend_init_params!r}\n"
+        "        )\n"
+        "\n"
+        "        with set_current_vllm_config(self.vllm_config):\n"
+        "            # To make vLLM config available during worker initialization\n"
+        "            self.worker = worker_class(**kwargs)"
+    )
+
+    with _locked_file_patch(_get_vllm_file("v1/worker/worker_base.py")) as (
+        content,
+        write_back,
+    ):
+        if old_snippet not in content:
+            return
+
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+
 def _patch_vllm_hermes_tool_parser_thread_safety(logger) -> None:
     """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
 
@@ -283,7 +330,10 @@ def _patch_vllm_hermes_tool_parser_thread_safety(logger) -> None:
 
 
 def _apply_vllm_patches(
-    py_executable: str, *, extra_env_vars: list[str] | None = None
+    py_executable: str,
+    *,
+    extra_env_vars: list[str] | None = None,
+    checkpoint_engine_config: dict[str, Any] | None = None,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     from vllm.logger import init_logger
@@ -293,5 +343,6 @@ def _apply_vllm_patches(
     _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
     patch_logger.info("Successfully patched vllm _init_workers_ray.")
 
+    _patch_vllm_worker_nixl_preinit(checkpoint_engine_config)
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)

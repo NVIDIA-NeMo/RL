@@ -45,6 +45,7 @@ from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
+    resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
@@ -990,6 +991,15 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 train_world_size,
             ),
         )
+
+    async def checkpoint_engine_rpc_async(
+        self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
+    ) -> Any:  # pragma: no cover
+        result = await self.llm.collective_rpc(checkpoint_method, args=method_args)
+        result = await resolve_collective_rpc_result(result)
+        if checkpoint_method == "update_weights_from_checkpoint_engine":
+            return all(item for item in result if item is not None)
+        return result
 
     async def generate_async(
         self,

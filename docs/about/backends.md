@@ -18,3 +18,6 @@ NeMo RL supports multiple generation/rollout backends to accommodate different m
 
 For detailed information on backend selection, configuration, and examples, see the [Generation Backends documentation](../design-docs/generation.md).
 
+For large non-colocated vLLM refits, NeMo RL can update generation workers
+through the [NIXL checkpoint-engine refit path](../guides/checkpoint-engine-refit.md)
+instead of the NCCL collective update path.

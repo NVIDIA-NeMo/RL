@@ -53,6 +53,10 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationRefitMixin,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.refit_layout import (
+    VllmWeightLayout,
+    select_hf_weight_for_vllm_target,
+)
 from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -87,7 +91,10 @@ from nemo_rl.models.policy.interfaces import (
     ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
-from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.base_policy_worker import (
+    AbstractPolicyWorker,
+    maybe_preinit_nixl_checkpoint_engine,
+)
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -270,6 +277,7 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -1352,6 +1360,34 @@ class MegatronPolicyWorkerImpl(
             rank=self.rank,
             worker_name=str(self),
         )
+
+    def _checkpoint_engine_weight_iterator(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        base_iter = self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+        checkpoint_engine = getattr(self, "checkpoint_engine", None)
+        if not bool(getattr(checkpoint_engine, "shard_hf_weights", False)):
+            return base_iter
+
+        if getattr(checkpoint_engine, "next_agent", None) is None:
+            return base_iter
+
+        target_weight_layout = cast(
+            VllmWeightLayout,
+            checkpoint_engine.target_weight_layout,
+        )
+
+        def sharded_iter() -> Iterator[tuple[str, torch.Tensor]]:
+            for name, tensor in base_iter:
+                selected_tensor = select_hf_weight_for_vllm_target(
+                    name,
+                    tensor,
+                    target_layout=target_weight_layout,
+                )
+                if selected_tensor is not None:
+                    yield name, selected_tensor
+
+        return sharded_iter()
 
     @torch.no_grad()
     def broadcast_weights_for_collective(

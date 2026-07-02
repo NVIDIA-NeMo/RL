@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import concurrent.futures
 import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -28,6 +30,7 @@ from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
+    resolve_collective_rpc_result,
 )
 
 
@@ -602,3 +605,46 @@ def test_compute_spec_decode_metrics():
     assert math.isclose(metrics["vllm/spec_acceptance_length"], 3.4, rel_tol=1e-6)
     # acceptance_rate = accepted / draft_tokens = 240 / 300 = 0.8
     assert math.isclose(metrics["vllm/spec_acceptance_rate"], 0.8, rel_tol=1e-6)
+
+
+def test_resolve_collective_rpc_result_passes_through_plain_values():
+    assert asyncio.run(resolve_collective_rpc_result(7)) == 7
+    assert asyncio.run(resolve_collective_rpc_result("x")) == "x"
+
+
+def test_resolve_collective_rpc_result_unwraps_awaitables():
+    async def make() -> int:
+        async def inner() -> int:
+            return 42
+
+        # An awaitable that itself resolves to another awaitable.
+        return inner()
+
+    assert asyncio.run(resolve_collective_rpc_result(make())) == 42
+
+
+def test_resolve_collective_rpc_result_unwraps_concurrent_future():
+    async def run():
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        future.set_result("done")
+        return await resolve_collective_rpc_result(future)
+
+    assert asyncio.run(run()) == "done"
+
+
+def test_resolve_collective_rpc_result_preserves_list_and_tuple_shape():
+    async def run():
+        async def coro(v):
+            return v
+
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        future.set_result("f")
+        # Nested mix of awaitables, futures, and plain values; list outer,
+        # tuple inner — shapes must be preserved.
+        nested = [coro(1), (future, coro(2)), 3]
+        return await resolve_collective_rpc_result(nested)
+
+    result = asyncio.run(run())
+    assert result == [1, ("f", 2), 3]
+    assert isinstance(result, list)
+    assert isinstance(result[1], tuple)

@@ -86,13 +86,26 @@ from nemo_rl.models.policy.utils import (
     get_runtime_env_for_policy_worker,
     resolve_model_class,
 )
-from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.base_policy_worker import (
+    AbstractPolicyWorker,
+    DTensorCheckpointEngineSendMixin,
+    maybe_preinit_nixl_checkpoint_engine,
+)
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+def dtensor_params_generator(
+    model: nn.Module, target_dtype: torch.dtype
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield local contiguous tensors from a DTensor-backed model state dict."""
+    for name, tensor in model.state_dict().items():
+        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        yield name, full_tensor.to(target_dtype, non_blocking=True).contiguous()
 
 
 def _attach_context_parallel_hooks(model: nn.Module) -> None:
@@ -166,7 +179,10 @@ def get_cpu_state_dict(
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerImpl(
-    TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
+    TQWorkerMixin,
+    DTensorCheckpointEngineSendMixin,
+    AbstractPolicyWorker,
+    ColocatablePolicyInterface,
 ):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -191,7 +207,7 @@ class DTensorPolicyWorkerImpl(
     def __init__(
         self,
         config: PolicyConfig,
-        tokenizer: AutoTokenizer,
+        tokenizer: Optional[AutoTokenizer] = None,
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
@@ -200,6 +216,17 @@ class DTensorPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorker."""
+        if tokenizer is None:
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            use_processor = config["tokenizer"].get("use_processor", False)
+            result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
+            if use_processor:
+                processor = result
+                tokenizer = result.tokenizer
+            else:
+                tokenizer = result
+
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
@@ -331,7 +358,7 @@ class DTensorPolicyWorkerImpl(
         # Some model configs (e.g. Gemma3 in transformers v5) don't have pad_token_id
         # as a direct attribute. Use getattr to handle missing attribute gracefully.
         if getattr(self.model.config, "pad_token_id", None) is None:
-            self.model.config.pad_token_id = tokenizer.pad_token_id
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
 
         tp_size = self.cfg["dtensor_cfg"]["tensor_parallel_size"]
         cp_size = self.cfg["dtensor_cfg"]["context_parallel_size"]
@@ -391,6 +418,7 @@ class DTensorPolicyWorkerImpl(
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.device_mesh = device_mesh
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
@@ -1839,29 +1867,23 @@ class DTensorPolicyWorkerImpl(
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(),
+            params_generator=dtensor_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
         )
+
+    def _checkpoint_engine_weight_iterator(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+        return dtensor_params_generator(self.model, self.dtype)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(

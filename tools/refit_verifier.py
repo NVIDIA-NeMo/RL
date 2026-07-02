@@ -166,6 +166,7 @@ def setup_configs(args, tokenizer):
         "learning_rate": 0.0001,
         "logprob_batch_size": 1,
         "generation": {
+            "backend": "vllm",
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": None,
@@ -226,6 +227,9 @@ def setup_configs(args, tokenizer):
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "allgather",
+            "moe_shared_expert_overlap": False,
             "pipeline_dtype": "bfloat16",
             "train_iters": 1,
             "bias_activation_fusion": False,
@@ -239,7 +243,7 @@ def setup_configs(args, tokenizer):
                 "lr": 5.0e-6,
                 "min_lr": 5.0e-7,
                 "weight_decay": 0.01,
-                "bf16": False,
+                "bf16": True,
                 "fp16": False,
                 "params_dtype": "float32",
                 # Adam optimizer settings
