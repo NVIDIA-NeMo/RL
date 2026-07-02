@@ -960,3 +960,139 @@ class TestGetTrainContext:
             sequence_dim,
         ], "sequence_dim should be replicated for each buffer"
         assert len(call_kwargs["cp_seq_dims"]) == 3
+
+
+@pytest.fixture(scope="module")
+def one_gpu_virtual_cluster():
+    cluster = RayVirtualCluster(
+        name="test_1gpu",
+        bundle_ct_per_node_list=[1],
+        use_gpus=True,
+        num_gpus_per_node=1,
+        max_colocated_worker_groups=1,
+    )
+    yield cluster
+    cluster.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.automodel
+@pytest.mark.timeout(360)
+def test_dtensor_v2_reference_policy_ignores_resume_checkpoint(
+    one_gpu_virtual_cluster,
+    tiny_llama_model_path,
+):
+    """Regression test for https://github.com/NVIDIA-NeMo/RL/issues/2955.
+
+    The KL reference policy must be snapshotted from the BASE (model_name)
+    weights and stay fixed for the whole run: on a resume it must NOT track the
+    checkpoint being loaded. Before the fix, the v2 dtensor worker snapshotted
+    the reference after the resume checkpoint had been applied, so every
+    restart silently reset the reference to the current policy and zeroed the
+    KL penalty.
+
+    Uses reference-policy logprobs on a fixed batch as the observable: they are
+    computed from ``reference_model_state_dict`` via ``use_reference_model()``,
+    so they fingerprint which weights the reference actually holds.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        checkpointing_config = {
+            "enabled": True,
+            "checkpoint_dir": tmpdir,
+            "metric_name": None,
+            "higher_is_better": False,
+            "keep_top_k": 2,
+            "save_period": 30,
+            "checkpoint_must_save_by": None,
+            "save_optimizer": True,
+        }
+
+        config = create_test_config(
+            model_name=tiny_llama_model_path,
+            tp=1,
+            cp=1,
+            dtensor_v2=True,
+            checkpointing=checkpointing_config,
+        )
+        # Large steps so training visibly moves the policy away from the base
+        # weights within a few optimizer steps.
+        config["optimizer"]["kwargs"]["lr"] = 1e-2
+
+        logprob_data = create_test_batch(mode="logprob")
+
+        policy = Policy(
+            tokenizer=get_tokenizer(config["tokenizer"]),
+            config=config,
+            init_optimizer=True,
+            init_reference_model=True,
+            cluster=one_gpu_virtual_cluster,
+            name_prefix="lm_policy_ref_provenance",
+        )
+        try:
+            # Fingerprint of the base (initial-policy) weights.
+            policy.prepare_for_lp_inference()
+            base_logprobs = policy.get_logprobs(logprob_data)["logprobs"]
+
+            # Perturb the policy away from the base weights, then checkpoint it.
+            train_data = create_test_batch(mode="train")
+            loss_fn = SimpleLossFn()
+            policy.prepare_for_training()
+            for _ in range(3):
+                policy.train(train_data, loss_fn)
+            policy.finish_training()
+
+            policy.save_checkpoint(
+                weights_path=os.path.join(tmpdir, "policy", "weights"),
+                optimizer_path=os.path.join(tmpdir, "policy", "optimizer"),
+                checkpointing_cfg=checkpointing_config,
+            )
+
+            policy.prepare_for_lp_inference()
+            trained_logprobs = policy.get_logprobs(logprob_data)["logprobs"]
+
+            drift = (trained_logprobs - base_logprobs).abs().max().item()
+            assert drift > 0.05, (
+                f"training barely moved the policy (max |dlogprob|={drift:.2e}); "
+                "the provenance assertions below would be vacuous"
+            )
+
+            policy.shutdown()
+            policy = None
+
+            # Resume from the checkpoint with a reference model requested.
+            weights_path, optimizer_path = CheckpointManager.get_resume_paths(tmpdir)
+            policy = Policy(
+                tokenizer=get_tokenizer(config["tokenizer"]),
+                config=config,
+                init_optimizer=True,
+                init_reference_model=True,
+                cluster=one_gpu_virtual_cluster,
+                name_prefix="lm_policy_ref_provenance_resumed",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+            )
+
+            policy.prepare_for_lp_inference()
+            resumed_logprobs = policy.get_logprobs(logprob_data)["logprobs"]
+            ref_logprobs = policy.get_reference_policy_logprobs(logprob_data)[
+                "reference_logprobs"
+            ]
+
+            # Sanity: the resume actually loaded the trained weights.
+            assert torch.allclose(resumed_logprobs, trained_logprobs, atol=5e-3), (
+                "resumed policy logprobs do not match the checkpointed policy; "
+                "checkpoint load failed, cannot test reference provenance"
+            )
+
+            d_ref_base = (ref_logprobs - base_logprobs).abs().max().item()
+            d_ref_resumed = (ref_logprobs - resumed_logprobs).abs().max().item()
+
+            # The point of #2955: on resume, the reference must still be the BASE
+            # policy, not the checkpoint that was just loaded into the model.
+            assert d_ref_base < 5e-3 and d_ref_base < 0.1 * d_ref_resumed, (
+                f"reference policy tracks the resumed checkpoint (#2955): "
+                f"max|ref-base|={d_ref_base:.3e}, max|ref-resumed|={d_ref_resumed:.3e}"
+            )
+        finally:
+            if policy is not None:
+                policy.shutdown()
