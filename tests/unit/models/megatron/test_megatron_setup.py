@@ -2448,7 +2448,13 @@ class TestForceSyncOptimizerFp32FromModel:
         monkeypatch.setattr(stub_mod, "HybridDeviceOptimizer", hdo_cls, raising=False)
 
     def _make_distrib_opt(
-        self, hdo_cls, *, param_start=0, param_end=4, shard_is_none=False, with_hdo_attrs=True
+        self,
+        hdo_cls,
+        *,
+        param_start=0,
+        param_end=4,
+        shard_is_none=False,
+        with_hdo_attrs=True,
     ):
         """Build a fake distributed optimizer wrapping a HybridDeviceOptimizer.
 
@@ -2544,7 +2550,9 @@ class TestForceSyncOptimizerFp32FromModel:
             pass
 
         self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
-        fake = self._make_distrib_opt(_HybridDeviceOptimizer, param_start=2, param_end=4)
+        fake = self._make_distrib_opt(
+            _HybridDeviceOptimizer, param_start=2, param_end=4
+        )
 
         setup_mod._force_sync_optimizer_fp32_from_model(
             fake.distrib_opt, model=MagicMock()
@@ -2607,9 +2615,7 @@ class TestForceSyncOptimizerFp32FromModel:
         a = self._make_distrib_opt(_HybridDeviceOptimizer)
         b = self._make_distrib_opt(_HybridDeviceOptimizer)
 
-        chained = SimpleNamespace(
-            chained_optimizers=[a.distrib_opt, b.distrib_opt]
-        )
+        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
 
         setup_mod._force_sync_optimizer_fp32_from_model(chained, model=MagicMock())
 
