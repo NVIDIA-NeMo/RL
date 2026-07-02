@@ -2,6 +2,9 @@ defaults: "../stage2_swe1.yaml"
 
 policy:
   generation_batch_size: 32
+  megatron_cfg:
+    expert_model_parallel_size: 16
+    context_parallel_size: 8
   generation:
     colocated:
       resources:
