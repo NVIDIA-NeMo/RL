@@ -1385,6 +1385,83 @@ def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
             assert torch.equal(routed_packed[0, pad_pos, layer], expected_route)
 
 
+@pytest.mark.mcore
+def test_hybridep_padding_mask_uses_cp_local_layout_for_cp2():
+    """HybridEP fake-token mask must match the CP-local model input layout."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+    from nemo_rl.models.megatron.data import (
+        _get_packed_seq_padding_mask,
+        _pad_packed_seq_for_hybridep,
+        _shard_packed_seq_on_this_cp_rank,
+    )
+
+    cp_rank = 0
+    cp_size = 2
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32)
+    input_ids = torch.tensor([[11, 12, 13, 0, 21, 22, 23, 24, 25, 0, 0, 0]])
+    input_ids_cp_sharded = torch.cat(
+        (
+            _get_tokens_on_this_cp_rank(input_ids[:, 0:4], cp_rank, cp_size, seq_dim=1),
+            _get_tokens_on_this_cp_rank(input_ids[:, 4:12], cp_rank, cp_size, seq_dim=1),
+        ),
+        dim=1,
+    )
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        qkv_format="thd",
+        total_tokens=input_ids_cp_sharded.shape[1],
+    )
+
+    (
+        padded_input_ids,
+        padded_input_ids_cp_sharded,
+        padded_seq_params,
+        padded_cu_seqlens,
+    ) = _pad_packed_seq_for_hybridep(
+        input_ids=input_ids,
+        input_ids_cp_sharded=input_ids_cp_sharded,
+        packed_seq_params=packed_seq_params,
+        cu_seqlens_padded=cu_seqlens_padded,
+        pad_packed_seq_to_multiple_of=8,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+    )
+    full_padding_mask = _get_packed_seq_padding_mask(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_padded=padded_cu_seqlens,
+        total_tokens=padded_input_ids.shape[1],
+    )
+    cp_padding_mask = _shard_packed_seq_on_this_cp_rank(
+        full_padding_mask,
+        padded_cu_seqlens,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        seq_dim=1,
+    )
+
+    assert padded_input_ids.shape == (1, 16)
+    assert padded_input_ids_cp_sharded.shape == (1, 8)
+    assert cp_padding_mask.shape == padded_input_ids_cp_sharded.shape
+    assert padded_seq_params.total_tokens == padded_input_ids_cp_sharded.shape[1]
+    assert int(padded_cu_seqlens[-1]) == padded_input_ids.shape[1]
+
+    # The original valid tokens should remain unmasked on the CP-local layout;
+    # every CP-local fake row from individual/HybridEP padding must be masked.
+    assert torch.equal(
+        padded_input_ids_cp_sharded[~cp_padding_mask],
+        torch.tensor([11, 21, 22, 23], dtype=padded_input_ids_cp_sharded.dtype),
+    )
+    assert bool(torch.all(padded_input_ids_cp_sharded[cp_padding_mask] == 0))
+
+
 GET_PACK_SEQUENCE_PARAMETERS_TEST_ACTOR_FQN = f"{GetPackSequenceParametersTestActor.__module__}.GetPackSequenceParametersTestActor"
 
 
