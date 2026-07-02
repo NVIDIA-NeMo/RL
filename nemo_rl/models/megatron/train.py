@@ -80,7 +80,7 @@ def model_forward(
     defer_fp32_logits: Optional[bool] = False,
     mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
-    use_linear_ce_fusion_loss: bool = False,
+    use_fused_linear_logprobs: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -94,7 +94,8 @@ def model_forward(
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
         mtp_loss_mask: MTP loss mask to exclude prompt tokens from MTP loss (optional)
         straggler_timer: Straggler detector for profiling the forward pass
-        use_linear_ce_fusion_loss: Whether to use linear CE fusion loss
+        use_fused_linear_logprobs: Whether to compute logprobs with the fused
+            chunked linear cross-entropy kernel (directly from hidden states)
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -116,7 +117,7 @@ def model_forward(
 
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
-    if use_linear_ce_fusion_loss:
+    if use_fused_linear_logprobs:
         additional_kwargs["labels"] = input_ids_cp_sharded
         # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
         # GPTModel.forward signatures do not accept it.
@@ -162,7 +163,7 @@ def forward_with_post_processing_fn(
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
-    use_linear_ce_fusion_loss: bool = False,
+    use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
@@ -224,7 +225,7 @@ def forward_with_post_processing_fn(
                 defer_fp32_logits=defer_fp32_logits,
                 mtp_loss_mask=mtp_loss_mask,
                 straggler_timer=straggler_timer,
-                use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
+                use_fused_linear_logprobs=use_fused_linear_logprobs,
             )
     except Exception:
         # The forward above armed the router-replay action (set_router_replay_forward);
@@ -309,7 +310,7 @@ def megatron_forward_backward(
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
-    use_linear_ce_fusion_loss: bool = False,
+    use_fused_linear_logprobs: bool = False,
     use_router_replay: bool = False,
     router_replay_train: bool = False,
 ) -> Any:
@@ -348,7 +349,7 @@ def megatron_forward_backward(
         straggler_timer=straggler_timer,
         draft_model=draft_model,
         enable_hidden_capture=enable_hidden_capture,
-        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
+        use_fused_linear_logprobs=use_fused_linear_logprobs,
         use_router_replay=use_router_replay,
         router_replay_train=router_replay_train,
     )
@@ -503,11 +504,11 @@ class LogprobsPostProcessor:
         self,
         cfg: PolicyConfig,
         sampling_params: Optional[TrainingSamplingParams] = None,
-        use_linear_ce_fusion: bool = False,
+        use_fused_linear_logprobs: bool = False,
     ):
         self.cfg = cfg
         self.sampling_params = sampling_params
-        self.use_linear_ce_fusion = use_linear_ce_fusion
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
 
     def __call__(
         self,
@@ -532,7 +533,7 @@ class LogprobsPostProcessor:
         original_seq_length = unpacked_input_ids.shape[1]
 
         def processor_fn_inner(output_tensor):
-            if self.use_linear_ce_fusion:
+            if self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif self.cfg["sequence_packing"]["enabled"]:

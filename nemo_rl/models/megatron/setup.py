@@ -637,8 +637,8 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         assert config["sequence_packing"]["enabled"], (
             "Sequence Packing must be enabled to use Context Parallelism with MCore."
         )
-        assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
-            "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
+        assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
+            "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
         )
 
 
@@ -1007,6 +1007,21 @@ def _create_megatron_config(
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
 
+    # Fused linear logprobs run the decoder but read output_layer.weight directly
+    # instead of calling output_layer.forward(). Megatron's distributed-optimizer
+    # overlap_param_gather prefetch chain assumes every param-gather bucket
+    # (including the output layer) is consumed by a module forward; skipping it
+    # leaves a stale param_gather_handle and trips
+    #   assert self.param_gather_handle is None  (param_and_grad_buffer.py)
+    # on the next iteration, so the two are mutually exclusive.
+    if config["megatron_cfg"].get("use_fused_linear_logprobs", False):
+        assert not overlap_param_gather, (
+            "use_fused_linear_logprobs is incompatible with overlap_param_gather: "
+            "the fused forward bypasses output_layer.forward(), leaving a stale "
+            "param_gather_handle in the distributed-optimizer prefetch chain. "
+            "Set policy.megatron_cfg.distributed_data_parallel_config."
+            "overlap_param_gather=false."
+        )
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -1293,9 +1308,9 @@ def setup_model_and_optimizer(
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
-    if policy_cfg["megatron_cfg"].get("use_linear_ce_fusion_loss", False):
+    if policy_cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
         patch_gpt_model_forward_for_linear_ce_fusion(
-            chunk_size=policy_cfg["megatron_cfg"]["linear_ce_fusion_chunk_size"]
+            chunk_size=policy_cfg["megatron_cfg"]["fused_linear_logprobs_chunk_size"]
         )
     model = get_model(
         megatron_cfg.model,
