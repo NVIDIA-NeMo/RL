@@ -178,6 +178,14 @@ class ColocatablePolicyInterface(PolicyInterface):
     def offload_after_refit(self) -> None:
         pass
 
+    def offload_to_cpu(self) -> None:
+        """Offload to CPU to free GPU memory; alias for :meth:`offload_after_refit`.
+
+        Concrete (not abstract) so colocatable workers that implement only
+        :meth:`offload_after_refit` stay instantiable.
+        """
+        self.offload_after_refit()
+
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass

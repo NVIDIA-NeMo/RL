@@ -380,12 +380,30 @@ class LossPostProcessor:
         cp_normalize: bool = True,
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
+        prepare_fn: Optional[Callable[..., Any]] = None,
     ):
+        """Build a per-microbatch loss post-processor for the Megatron train loop.
+
+        Args:
+            loss_fn: Loss function to wrap.
+            cfg: Policy(-like) config; supplies sequence_packing / logprob_chunk_size.
+            num_microbatches: Microbatch count, used to counteract Megatron's
+                per-microbatch loss averaging.
+            cp_normalize: Whether to divide the loss by the context-parallel size.
+            sampling_params: Optional temperature / top-k/p for logprob losses.
+            draft_model: Optional EAGLE draft model for distillation.
+            prepare_fn: Optional override for the default ``prepare_loss_input``.
+                Must accept ``(logits, data, loss_fn, vocab_parallel_rank,
+                vocab_parallel_group, context_parallel_group)`` and return
+                ``(loss_input, data)``; value models pass one that right-shifts
+                and CP-all-gathers the scalar value-head output.
+        """
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.num_microbatches = num_microbatches
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
+        self.prepare_fn = prepare_fn
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -413,20 +431,31 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
-        # wrap prepare_loss_input with sampling_params and optional d2t mapping
+        # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-        prepare_loss_input_wrapped = partial(
-            prepare_loss_input,
-            sampling_params=self.sampling_params,
-            d2t=self.d2t,
-            chunk_size=logprob_chunk_size,
-        )
+        if self.prepare_fn is not None:
+            prepare_loss_input_wrapped = self.prepare_fn
+        else:
+            prepare_loss_input_wrapped = partial(
+                prepare_loss_input,
+                sampling_params=self.sampling_params,
+                d2t=self.d2t,
+                chunk_size=logprob_chunk_size,
+            )
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
             if fuse_loss:
+                # The fused path prepares loss via prepare_packed_loss_input and
+                # cannot honor a custom prepare_fn (e.g. the value model's); guard
+                # rather than silently bypass it.
+                assert self.prepare_fn is None, (
+                    "sequence_packing.fuse_loss=true does not support a custom "
+                    "prepare_fn (e.g. the value model's value-specific prep). "
+                    "Disable fuse_loss for the value model."
+                )
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = partial(
                     prepare_packed_loss_input,
