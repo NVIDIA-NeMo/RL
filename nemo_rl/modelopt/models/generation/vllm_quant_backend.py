@@ -140,7 +140,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 if (
                     "_bmm_quantizer" in suffix
                     and name.endswith(suffix)
-                    and not name.endswith(f"attn.{suffix}")
+                    and not name.endswith(f".attn.{suffix}")
                 ):
                     name = f"{name[: -len(suffix)]}attn.{suffix}"
                     break
