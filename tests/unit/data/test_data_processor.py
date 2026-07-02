@@ -25,13 +25,7 @@ abspath = os.path.abspath(__file__)
 sys.path.append("/".join(abspath.split("/")[:-4]))
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.datasets.eval_datasets import (
-    AIMEDataset,
-    GPQADataset,
-    MathDataset,
-    MMLUDataset,
-)
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
 from nemo_rl.data.datasets.response_datasets import (
     DeepScalerDataset,
     OpenMathInstruct2Dataset,
@@ -254,20 +248,28 @@ def system_prompt_file(request):
     ],
 )
 @pytest.mark.parametrize(
-    "dataset_cls",
+    "data_config",
     [
-        AIMEDataset,
-        GPQADataset,
-        MathDataset,
-        MMLUDataset,
+        {
+            "dataset_name": "AIME2024",
+            "processor": "math_hf_data_processor",
+            "repeat": 1,
+        },
+        {"dataset_name": "gpqa", "processor": "multichoice_qa_processor"},
+        {"dataset_name": "math", "processor": "math_data_processor"},
+        {"dataset_name": "mmlu", "processor": "multichoice_qa_processor"},
     ],
 )
 @pytest.mark.parametrize(
     "system_prompt_file", [system_prompt_file, None], indirect=True
 )
-def test_eval_math_hf_data_processor(tokenizer_name, dataset_cls, system_prompt_file):
-    # Initialize dataset
-    data = dataset_cls()
+def test_eval_response_data_processor(tokenizer_name, data_config, system_prompt_file):
+    data_config = {
+        **data_config,
+        "prompt_file": f"{os.path.dirname(abspath)}/../../../examples/prompts/cot.txt",
+        "system_prompt_file": system_prompt_file,
+    }
+    data = load_response_dataset(data_config)
 
     # Setup tokenizer
     tokenizer = get_tokenizer(
@@ -277,17 +279,10 @@ def test_eval_math_hf_data_processor(tokenizer_name, dataset_cls, system_prompt_
         )
     )
 
-    # Configure task specification
-    math_task_spec = TaskDataSpec(
-        task_name="math",
-        prompt_file=f"{os.path.dirname(abspath)}/../../../examples/prompts/cot.txt",
-        system_prompt_file=system_prompt_file,
-    )
-
     dataset = AllTaskProcessedDataset(
-        dataset=data.rekeyed_ds,
+        dataset=data.dataset,
         tokenizer=tokenizer,
-        default_task_data_spec=math_task_spec,
+        default_task_data_spec=data.task_spec,
         task_data_processors=data.processor,
         max_seq_length=128,
     )

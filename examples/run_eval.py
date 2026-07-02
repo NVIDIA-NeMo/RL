@@ -22,8 +22,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
-from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
+from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
@@ -50,9 +49,7 @@ def parse_args():
 def setup_data(tokenizer, data_config, env_configs, is_multimodal=False):
     print("Setting up data...")
 
-    # load dataset
-    base_dataset = load_eval_dataset(data_config)
-    rekeyed_ds = base_dataset.rekeyed_ds
+    base_dataset = load_response_dataset(data_config)
 
     # Mirrors nemo_rl/data/utils.py: use data.env_name to look up the env
     # config block and determine the registered environment class.
@@ -62,7 +59,7 @@ def setup_data(tokenizer, data_config, env_configs, is_multimodal=False):
     env = create_env(env_name=registered_env_name, env_config=env_configs[env_name])
 
     dataset = AllTaskProcessedDataset(
-        dataset=rekeyed_ds,
+        dataset=base_dataset.dataset,
         tokenizer=tokenizer,
         default_task_data_spec=base_dataset.task_spec,
         task_data_processors=base_dataset.processor,
@@ -102,8 +99,11 @@ def main():
     # Init ray
     init_ray()
 
-    # Setup tokenizer — get_tokenizer handles both text-only and multimodal
-    is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
+    # Setup tokenizer — get_tokenizer handles both text-only and multimodal.
+    # vlm_hf_data_processor is the only multimodal processor in
+    # PROCESSOR_REGISTRY, so multimodal eval configs (mmau, daily-omni) must
+    # set data.processor to it.
+    is_multimodal = config.data.get("processor") == "vlm_hf_data_processor"
     tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
     config.generation = configure_generation_config(
         config.generation, tokenizer, is_eval=True

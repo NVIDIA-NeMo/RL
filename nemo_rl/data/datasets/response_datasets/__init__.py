@@ -30,13 +30,18 @@ from nemo_rl.data.datasets.response_datasets.general_conversations_dataset impor
     GeneralConversationsJsonlDataset,
 )
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
+from nemo_rl.data.datasets.response_datasets.gpqa import GPQADataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.intent import (
     IntentBenchDataset,
     IntentTrainDataset,
 )
+from nemo_rl.data.datasets.response_datasets.math import MathDataset
+from nemo_rl.data.datasets.response_datasets.mmau import MMAUDataset
 from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
+from nemo_rl.data.datasets.response_datasets.mmlu import MMLUDataset
+from nemo_rl.data.datasets.response_datasets.mmlu_pro import MMLUProDataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
     NemotronCascade2SFTMathDataset,
@@ -70,7 +75,30 @@ DATASET_REGISTRY = {
     "DeepScaler": DeepScalerDataset,
     "GSM8K": GSM8KDataset,
     "geometry3k": Geometry3KDataset,
+    "gpqa": partial(GPQADataset, variant="main"),
+    "gpqa_diamond": partial(GPQADataset, variant="diamond"),
     "mmpr-tiny": MMPRTinyDataset,
+    "math": partial(MathDataset, variant="math_test"),
+    "math500": partial(MathDataset, variant="math_500_test"),
+    "mmau": MMAUDataset,
+    "TwinkStart/MMAU": MMAUDataset,
+    "mmlu": partial(MMLUDataset, language="EN-US"),
+    "mmlu_AR-XY": partial(MMLUDataset, language="AR-XY"),
+    "mmlu_BN-BD": partial(MMLUDataset, language="BN-BD"),
+    "mmlu_DE-DE": partial(MMLUDataset, language="DE-DE"),
+    "mmlu_EN-US": partial(MMLUDataset, language="EN-US"),
+    "mmlu_ES-LA": partial(MMLUDataset, language="ES-LA"),
+    "mmlu_FR-FR": partial(MMLUDataset, language="FR-FR"),
+    "mmlu_HI-IN": partial(MMLUDataset, language="HI-IN"),
+    "mmlu_ID-ID": partial(MMLUDataset, language="ID-ID"),
+    "mmlu_IT-IT": partial(MMLUDataset, language="IT-IT"),
+    "mmlu_JA-JP": partial(MMLUDataset, language="JA-JP"),
+    "mmlu_KO-KR": partial(MMLUDataset, language="KO-KR"),
+    "mmlu_PT-BR": partial(MMLUDataset, language="PT-BR"),
+    "mmlu_ZH-CN": partial(MMLUDataset, language="ZH-CN"),
+    "mmlu_SW-KE": partial(MMLUDataset, language="SW-KE"),
+    "mmlu_YO-NG": partial(MMLUDataset, language="YO-NG"),
+    "mmlu_pro": MMLUProDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "intent-train": IntentTrainDataset,
     "intent-bench": IntentBenchDataset,
@@ -142,10 +170,15 @@ __all__ = [
     "GSM8KDataset",
     "DeepScalerDataset",
     "Geometry3KDataset",
+    "GPQADataset",
     "HelpSteer3Dataset",
     "IntentBenchDataset",
     "IntentTrainDataset",
+    "MathDataset",
+    "MMAUDataset",
     "MMPRTinyDataset",
+    "MMLUDataset",
+    "MMLUProDataset",
     "NemoGymDataset",
     "NemotronCascade2SFTMathDataset",
     "OasstDataset",
