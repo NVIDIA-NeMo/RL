@@ -323,6 +323,35 @@ class TestSelectSegmentNodes:
         assert set(selected) | set(remaining) == set(topo.keys())
         assert len(set(selected) & set(remaining)) == 0  # no overlap
 
+    def test_unknown_domain_nodes_excluded_from_selection(self):
+        # Regression: nodes with no NVLink-domain info (UNKNOWN, topo_rank -1)
+        # must never be selected. They sort first (rank -1), so a naive selection
+        # would pick them and emit a {"unknown": 0.001} placement-group constraint
+        # that ray.sub never registers as a resource -> unschedulable bundle.
+        # This happens on heterogeneous / partial-probe clusters (e.g. a GPU-less
+        # or unprobed head node).
+        topo = _make_topology(
+            {
+                NVLINK_DOMAIN_UNKNOWN: [TOPO_RANK_UNKNOWN, TOPO_RANK_UNKNOWN],
+                "domain_A": [0, 1],
+                "domain_B": [2, 3],
+            }
+        )
+        selected, remaining = select_segment_nodes(topo, segment_size=2, num_nodes=4)
+        selected_domains = {topo[n][0] for n in selected}
+        assert NVLINK_DOMAIN_UNKNOWN not in selected_domains
+        assert selected_domains == {"domain_A", "domain_B"}
+        # The unknown nodes (e.g. a GPU-less head) fall through to remaining.
+        assert {topo[n][0] for n in remaining} == {NVLINK_DOMAIN_UNKNOWN}
+        assert set(selected) | set(remaining) == set(topo.keys())
+
+    def test_unknown_domain_only_raises_instead_of_unschedulable_pg(self):
+        # If every node is UNKNOWN there is no real domain to pin to, so we must
+        # raise rather than emit an unschedulable {"unknown": ...} constraint.
+        topo = _make_topology({NVLINK_DOMAIN_UNKNOWN: [TOPO_RANK_UNKNOWN] * 4})
+        with pytest.raises(ResourceInsufficientError, match="Cannot form"):
+            select_segment_nodes(topo, segment_size=2, num_nodes=4)
+
 
 # ---------------------------------------------------------------------------
 # 5. The 40-node / 5-domain scenario: training + inference placement
