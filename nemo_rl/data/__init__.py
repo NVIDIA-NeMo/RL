@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, NotRequired, TypedDict, Union
+from typing import NotRequired, TypedDict
 
 
 class ResponseDatasetConfig(TypedDict):
@@ -74,152 +74,13 @@ class DataConfig(TypedDict):
     default: NotRequired[ResponseDatasetConfig | PreferenceDatasetConfig | None]
 
 
-# ===============================================================================
-# Eval Dataset Configs
-# ===============================================================================
-# These configs correspond to the eval datasets in data/datasets/eval_datasets/
-# Note: TypedDict doesn't allow narrowing types in child classes, so each config
-# is defined independently with common fields repeated.
-
-
-class MMLUEvalDataConfig(TypedDict):
-    """Config for MMLU and multilingual MMLU datasets.
-
-    Supports dataset_name: "mmlu" or "mmlu_{language}" where language is one of:
-    AR-XY, BN-BD, DE-DE, EN-US, ES-LA, FR-FR, HI-IN, ID-ID, IT-IT, JA-JP,
-    KO-KR, PT-BR, ZH-CN, SW-KE, YO-NG
-    """
+class EvalDataConfig(ResponseDatasetConfig):
+    """Response-dataset configuration extended with eval-only settings."""
 
     max_input_seq_length: int
-    dataset_name: Literal[
-        "mmlu",
-        "mmlu_AR-XY",
-        "mmlu_BN-BD",
-        "mmlu_DE-DE",
-        "mmlu_EN-US",
-        "mmlu_ES-LA",
-        "mmlu_FR-FR",
-        "mmlu_HI-IN",
-        "mmlu_ID-ID",
-        "mmlu_IT-IT",
-        "mmlu_JA-JP",
-        "mmlu_KO-KR",
-        "mmlu_PT-BR",
-        "mmlu_ZH-CN",
-        "mmlu_SW-KE",
-        "mmlu_YO-NG",
-    ]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-
-
-class MMLUProEvalDataConfig(TypedDict):
-    """Config for MMLU Pro dataset."""
-
-    max_input_seq_length: int
-    dataset_name: Literal["mmlu_pro"]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-
-
-class AIMEEvalDataConfig(TypedDict):
-    """Config for AIME datasets."""
-
-    max_input_seq_length: int
-    dataset_name: Literal[
-        "AIME2024",
-        "AIME2025",
-        "AIME2026",
-        "aime2024",
-        "aime2025",
-        "aime2026",
-    ]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-    processor: NotRequired[str]
     repeat: NotRequired[int]
+    include_single_letter_instruction: NotRequired[bool]
 
 
-class GPQAEvalDataConfig(TypedDict):
-    """Config for GPQA datasets."""
-
-    max_input_seq_length: int
-    dataset_name: Literal["gpqa", "gpqa_diamond"]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-
-
-class MathEvalDataConfig(TypedDict):
-    """Config for Math datasets."""
-
-    max_input_seq_length: int
-    dataset_name: Literal["math", "math500"]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-
-
-class LocalMathEvalDataConfig(TypedDict):
-    """Config for local math datasets loaded from files.
-
-    dataset_name can be a URL or local file path.
-    Requires additional fields: problem_key, solution_key, file_format, split.
-    """
-
-    max_input_seq_length: int
-    dataset_name: str  # URL or file path
-    problem_key: str
-    solution_key: str
-    file_format: Literal["csv", "json"]
-    split: NotRequired[str | None]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-
-
-class MMAUEvalDataConfig(TypedDict):
-    """Config for MMAU (Massive Multitask Audio Understanding) datasets."""
-
-    max_input_seq_length: int
-    dataset_name: Literal["mmau", "TwinkStart/MMAU"]
-    split: NotRequired[str | None]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-    env_name: NotRequired[str]
-
-
-class DailyOmniEvalDataConfig(TypedDict):
-    """Config for the Daily-Omni audio-visual eval dataset.
-
-    Mirrors the MMAU multimodal schema but with its own ``dataset_name`` literal
-    so the eval-config union resolves daily-omni unambiguously. Kept as a
-    ``TypedDict`` for consistency with the other (still v1) eval-data configs in
-    this union, whose consumers access the resolved config by key
-    (``config.data["dataset_name"]``).
-
-    Fields:
-        max_input_seq_length: Max prompt length passed to the generation backend.
-        dataset_name: Must be ``"daily-omni"``.
-        split: HuggingFace split to load.
-        prompt_file: Optional prompt template path.
-        system_prompt_file: Optional system prompt path.
-        env_name: Reward/eval environment name (e.g. ``"vlm"``).
-    """
-
-    max_input_seq_length: int
-    dataset_name: Literal["daily-omni"]
-    split: NotRequired[str | None]
-    prompt_file: NotRequired[str | None]
-    system_prompt_file: NotRequired[str | None]
-    env_name: NotRequired[str]
-
-
-# Union type for all eval dataset configs
-EvalDataConfigType = Union[
-    MMLUEvalDataConfig,
-    MMLUProEvalDataConfig,
-    AIMEEvalDataConfig,
-    GPQAEvalDataConfig,
-    MathEvalDataConfig,
-    MMAUEvalDataConfig,
-    DailyOmniEvalDataConfig,
-    LocalMathEvalDataConfig,
-]
+# Backward-compatible public type name. Eval now uses the response dataset schema.
+EvalDataConfigType = EvalDataConfig
