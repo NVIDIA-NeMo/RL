@@ -415,13 +415,13 @@ env:
 logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
-  wandb_enabled: false
+  wandb_enabled: true
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
-    project: "grpo-dev"
+    project: "nemo-rl"
     name: "grpo-dev-logger"
   swanlab:
     project: "grpo-dev"

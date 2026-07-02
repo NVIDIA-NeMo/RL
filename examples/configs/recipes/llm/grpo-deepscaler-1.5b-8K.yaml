@@ -40,4 +40,4 @@ env:
 logger:
   monitor_gpus: false
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: 1
