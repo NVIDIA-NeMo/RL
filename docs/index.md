@@ -121,6 +121,13 @@ Configure offline and online Eagle3 draft-model workflows to accelerate rollout 
 Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
 :::
 
+:::{grid-item-card} {octicon}`device-camera-video` Audio-Visual Intent GRPO
+:link: guides/grpo-audio-visual
+:link-type: doc
+
+Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and evaluate on Daily-Omni, following HumanOmniV2's joint audio-visual setup.
+:::
+
 :::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
 :link: guides/swe-rl-qwen3
 :link-type: doc
@@ -271,6 +278,7 @@ guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
+guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
 guides/eval.md
