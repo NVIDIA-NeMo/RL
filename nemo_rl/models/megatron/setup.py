@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import hashlib
 import json
 import os
@@ -54,7 +55,7 @@ from megatron.bridge.training.setup import (
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
-from megatron.bridge.utils.instantiate_utils import InstantiationMode
+from megatron.bridge.utils.instantiate_utils import InstantiationMode, target_allowlist
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -205,15 +206,45 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
+def _get_distributed_timeout_minutes(config: Optional[dict[str, Any]]) -> Optional[int]:
+    """Return an optional Megatron distributed timeout in minutes."""
+    if config is None:
+        return None
+
+    megatron_cfg = config.get("megatron_cfg", {}) or {}
+    raw_timeout = megatron_cfg.get("distributed_timeout_minutes")
+    if raw_timeout is None:
+        raw_timeout = (megatron_cfg.get("distributed_init_config") or {}).get(
+            "distributed_timeout_minutes"
+        )
+    if raw_timeout is None:
+        return None
+    if isinstance(raw_timeout, bool):
+        raise TypeError("distributed_timeout_minutes must be a positive integer")
+
+    timeout_minutes = int(raw_timeout)
+    if timeout_minutes <= 0:
+        raise ValueError("distributed_timeout_minutes must be positive")
+    return timeout_minutes
+
+
+def setup_distributed(config: Optional[dict[str, Any]] = None) -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    # Pin the communicator to the correct GPU explicitly.
+    local_rank = int(os.environ["LOCAL_RANK"])
+    init_kwargs: dict[str, Any] = {
+        "backend": "nccl",
+        "device_id": torch.device(f"cuda:{local_rank}"),
+    }
+    timeout_minutes = _get_distributed_timeout_minutes(config)
+    if timeout_minutes is not None:
+        init_kwargs["timeout"] = datetime.timedelta(minutes=timeout_minutes)
+    torch.distributed.init_process_group(**init_kwargs)
 
 
 def validate_and_set_config(
@@ -321,6 +352,69 @@ def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
     """Return a short stable hash for hf_config_overrides."""
     canonical = _canonicalize_hf_config_overrides(overrides)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+_KIMI_K25_PROVIDER_TARGET = (
+    "megatron.bridge.models.kimi_vl.kimi_k25_vl_provider.KimiK25VLModelProvider"
+)
+_KIMI_DYNAMIC_VISION_TARGET_PREFIX = "transformers_modules."
+_KIMI_DYNAMIC_VISION_TARGET_SUFFIX = (
+    ".configuration_kimi_k25.KimiK25VisionConfig"
+)
+
+
+def _normalize_optimizer_dtype_config(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Convert YAML/CLI optimizer dtype strings before building OptimizerConfig."""
+    dtype_map = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "torch.float32": torch.float32,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "torch.float16": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "torch.bfloat16": torch.bfloat16,
+    }
+    normalized = dict(optimizer_cfg)
+    for key in (
+        "params_dtype",
+        "main_params_dtype",
+        "main_grads_dtype",
+        "exp_avg_dtype",
+        "exp_avg_sq_dtype",
+    ):
+        value = normalized.get(key)
+        if isinstance(value, str):
+            normalized[key] = dtype_map.get(value, dtype_map.get(value.lower(), value))
+    return normalized
+
+
+def _allow_kimi_dynamic_vision_config_target(pretrained_run_config: str) -> None:
+    """Allow the exact Kimi HF dynamic vision config target in generated configs."""
+    try:
+        from omegaconf import OmegaConf
+    except ImportError:
+        return
+
+    loaded = OmegaConf.load(pretrained_run_config)
+    model_target = str(OmegaConf.select(loaded, "model._target_") or "")
+    vision_target = str(OmegaConf.select(loaded, "model.vision_config._target_") or "")
+    hf_model_id = str(OmegaConf.select(loaded, "model.hf_model_id") or "")
+    architectures = OmegaConf.select(loaded, "model.hf_config.architectures") or []
+
+    if not (
+        model_target == _KIMI_K25_PROVIDER_TARGET
+        or "Kimi-K2" in hf_model_id
+        or "KimiK25ForConditionalGeneration" in architectures
+    ):
+        return
+
+    if (
+        vision_target.startswith(_KIMI_DYNAMIC_VISION_TARGET_PREFIX)
+        and vision_target.endswith(_KIMI_DYNAMIC_VISION_TARGET_SUFFIX)
+    ):
+        target_allowlist.add_exact(vision_target)
 
 
 def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
@@ -519,6 +613,7 @@ def setup_model_config(
         _patch_hf_config_double_instantiation()
 
         try:
+            _allow_kimi_dynamic_vision_config_target(pretrained_run_config)
             cfg_from_pretrained = ConfigContainer.from_yaml(
                 pretrained_run_config, mode=InstantiationMode.STRICT
             )
@@ -926,6 +1021,22 @@ def _create_checkpoint_config(
     )
 
 
+def _create_distributed_init_config(config: PolicyConfig) -> Optional[DistributedInitConfig]:
+    """Create a Bridge distributed init config when recipe overrides are present."""
+    megatron_cfg = config["megatron_cfg"]
+    dist_kwargs = dict(megatron_cfg.get("distributed_init_config") or {})
+    timeout_minutes = _get_distributed_timeout_minutes(config)
+    if timeout_minutes is not None:
+        dist_kwargs["distributed_timeout_minutes"] = timeout_minutes
+    if "use_gloo_process_groups" in megatron_cfg:
+        dist_kwargs["use_gloo_process_groups"] = megatron_cfg[
+            "use_gloo_process_groups"
+        ]
+    if not dist_kwargs:
+        return None
+    return DistributedInitConfig(**dist_kwargs)
+
+
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     """Validate training configuration."""
     assert "train_iters" in config["megatron_cfg"], (
@@ -988,6 +1099,10 @@ def _create_megatron_config(
     fp8_param_enabled: bool = False,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    tokenizer_hf_kwargs = {}
+    if config.get("tokenizer", {}).get("trust_remote_code", False):
+        tokenizer_hf_kwargs["trust_remote_code"] = True
+
     # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
     # only valid when fp8 is enabled, fp8_param=True, and recipe is mxfp8. Mcore's
     # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
@@ -1000,7 +1115,7 @@ def _create_megatron_config(
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
-        **config["megatron_cfg"]["optimizer"],
+        **_normalize_optimizer_dtype_config(config["megatron_cfg"]["optimizer"]),
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
@@ -1021,24 +1136,17 @@ def _create_megatron_config(
             "overlap_param_gather=false."
         )
 
-    dist_cfg = DistributedInitConfig()
-    if "use_gloo_process_groups" in config["megatron_cfg"]:
-        dist_cfg.use_gloo_process_groups = config["megatron_cfg"][
-            "use_gloo_process_groups"
-        ]
-
-    return ConfigContainer(
-        model=model_cfg,
-        checkpoint=checkpoint_config,
-        logger=LoggerConfig(logging_level=0),
-        dist=dist_cfg,
-        train=TrainingConfig(
+    container_kwargs = {
+        "model": model_cfg,
+        "checkpoint": checkpoint_config,
+        "logger": LoggerConfig(logging_level=0),
+        "train": TrainingConfig(
             micro_batch_size=1,  # ignored
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
-        optimizer=OptimizerConfig(**optimizer_kwargs),
-        ddp=DistributedDataParallelConfig(
+        "optimizer": OptimizerConfig(**optimizer_kwargs),
+        "ddp": DistributedDataParallelConfig(
             check_for_nan_in_grad=True,
             grad_reduce_in_fp32=config["megatron_cfg"][
                 "distributed_data_parallel_config"
@@ -1059,13 +1167,19 @@ def _create_megatron_config(
             reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
             fp8_param_gather=fp8_param_enabled,
         ),
-        scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
-        dataset=None,
-        tokenizer=TokenizerConfig(
+        "scheduler": SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
+        "dataset": None,
+        "tokenizer": TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",
             tokenizer_model=hf_model_name,
+            hf_tokenizer_kwargs=tokenizer_hf_kwargs,
         ),
-    )
+    }
+    dist_config = _create_distributed_init_config(config)
+    if dist_config is not None:
+        container_kwargs["dist"] = dist_config
+
+    return ConfigContainer(**container_kwargs)
 
 
 def _create_draft_pre_wrap_hook(
@@ -1209,8 +1323,11 @@ def setup_model_and_optimizer(
     # Tokenizer
     if megatron_cfg.tokenizer.hf_tokenizer_kwargs is None:
         megatron_cfg.tokenizer.hf_tokenizer_kwargs = {}
-    megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
+    if policy_cfg.get("tokenizer", {}).get("trust_remote_code", False):
+        megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
+        megatron_cfg.tokenizer.trust_remote_code = True
     megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] = True
+    megatron_cfg.tokenizer.tokenizer_hf_no_use_fast = False
     build_tokenizer(
         megatron_cfg.tokenizer,
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by

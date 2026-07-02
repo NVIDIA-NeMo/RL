@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import gc
 import re
 import traceback
+import types
 from typing import Any
 
 import torch
@@ -23,6 +25,7 @@ from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
+    unpack_ipc_refit_payload_entry,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
@@ -46,6 +49,982 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
     return re.sub(
         r"vision_tower\.(?!vision_model\.)", "vision_tower.vision_model.", key
     )
+
+
+_KIMI_K25_ARCHITECTURES = {"KimiK25ForConditionalGeneration"}
+
+_KIMI_EXPERT_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.+\.mlp\.experts)\."
+    r"(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight_packed|weight_scale|weight_shape)$"
+)
+
+
+def _is_kimi_k25_architecture(architectures: Any) -> bool:
+    return any(
+        str(architecture) in _KIMI_K25_ARCHITECTURES
+        for architecture in architectures or []
+    )
+
+
+def _source_shape_tuple(
+    source_shape: torch.Tensor | None,
+    source_packed: torch.Tensor,
+) -> tuple[int, int]:
+    if source_shape is not None:
+        values = source_shape.detach().int().cpu().tolist()
+        if len(values) >= 2:
+            return int(values[0]), int(values[1])
+    return int(source_packed.shape[0]), int(source_packed.shape[1] * 8)
+
+
+def _interleave_tp_chunks(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    tp_size: int,
+) -> torch.Tensor:
+    if first.ndim != 2 or second.ndim != 2:
+        raise ValueError(
+            "Expected 2D Kimi expert scale tensors for TP interleave, "
+            f"got {tuple(first.shape)} and {tuple(second.shape)}"
+        )
+    if first.shape[0] != second.shape[0]:
+        raise ValueError(
+            "Expected matching Kimi expert scale rows for TP interleave, "
+            f"got {tuple(first.shape)} and {tuple(second.shape)}"
+        )
+    tp_size = max(1, tp_size)
+    if tp_size == 1:
+        return torch.cat([first, second], dim=1).contiguous()
+    if first.shape[1] % tp_size != 0 or second.shape[1] % tp_size != 0:
+        raise ValueError(
+            "Kimi expert scale columns are not divisible by TP="
+            f"{tp_size}: {tuple(first.shape)} and {tuple(second.shape)}"
+        )
+
+    first_chunk = first.shape[1] // tp_size
+    second_chunk = second.shape[1] // tp_size
+    chunks = []
+    for rank in range(tp_size):
+        chunks.append(
+            torch.cat(
+                (
+                    first[:, rank * first_chunk : (rank + 1) * first_chunk],
+                    second[:, rank * second_chunk : (rank + 1) * second_chunk],
+                ),
+                dim=1,
+            )
+        )
+    return torch.cat(chunks, dim=1).contiguous()
+
+
+def _vllm_marlin_moe_module() -> Any:
+    return __import__(
+        "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe",
+        fromlist=["marlin_moe_permute_scales"],
+    )
+
+
+def _vllm_gptq_marlin_moe_repack_op(module: Any) -> Any:
+    candidates = [module]
+    module_ops = getattr(module, "ops", None)
+    if module_ops is not None:
+        candidates.append(module_ops)
+
+    for module_name in (
+        "vllm._custom_ops",
+        "vllm.model_executor.layers.fused_moe.fused_marlin_moe",
+        "vllm.model_executor.layers.quantization.utils.marlin_utils",
+    ):
+        try:
+            candidates.append(
+                __import__(module_name, fromlist=["gptq_marlin_moe_repack"])
+            )
+        except Exception:
+            continue
+
+    for candidate in candidates:
+        op = getattr(candidate, "gptq_marlin_moe_repack", None)
+        if op is not None:
+            return op
+
+    candidate_names = ", ".join(
+        getattr(candidate, "__name__", type(candidate).__name__)
+        for candidate in candidates
+    )
+    raise RuntimeError(
+        "Could not resolve vLLM gptq_marlin_moe_repack op from candidates: "
+        f"{candidate_names}"
+    )
+
+
+def _vllm_marlin_moe_permute_scales_op(module: Any) -> Any:
+    op = getattr(module, "marlin_moe_permute_scales", None)
+    if op is not None:
+        return op
+
+    for module_name in (
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_wna16_marlin",
+        "vllm.model_executor.layers.fused_moe.fused_marlin_moe",
+    ):
+        try:
+            candidate = __import__(module_name, fromlist=["marlin_moe_permute_scales"])
+        except Exception:
+            continue
+        op = getattr(candidate, "marlin_moe_permute_scales", None)
+        if op is not None:
+            return op
+
+    raise RuntimeError("Could not resolve vLLM marlin_moe_permute_scales op")
+
+
+def _repack_kimi_expert_for_vllm_marlin(
+    preprocessed_packed: torch.Tensor,
+    target: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    if preprocessed_packed.ndim != 2:
+        raise ValueError(
+            f"Expected 2D preprocessed packed tensor for {name}, "
+            f"got {tuple(preprocessed_packed.shape)}"
+        )
+    module = _vllm_marlin_moe_module()
+    device = target.device
+    packed = preprocessed_packed.to(device=device, dtype=torch.int32).unsqueeze(0)
+    g_idx_sort_indices = torch.empty((1, 0), dtype=torch.int32, device=device)
+    repack_op = _vllm_gptq_marlin_moe_repack_op(module)
+    repacked = repack_op(
+        packed,
+        g_idx_sort_indices,
+        packed.shape[1] * 8,
+        packed.shape[2],
+        4,
+        is_a_8bit=False,
+    )[0].contiguous()
+    if tuple(repacked.shape) != tuple(target.shape):
+        raise ValueError(
+            f"Kimi expert refit packed shape mismatch for {name}: "
+            f"candidate={tuple(repacked.shape)} target={tuple(target.shape)}"
+        )
+    return repacked
+
+
+def _permute_kimi_expert_scales_for_vllm_marlin(
+    scale: torch.Tensor,
+    target: torch.Tensor,
+    proj: str,
+    name: str,
+) -> torch.Tensor:
+    if scale.ndim != 2:
+        raise ValueError(f"Expected 2D scale tensor for {name}, got {tuple(scale.shape)}")
+    module = _vllm_marlin_moe_module()
+    scales = scale.to(device=target.device, dtype=target.dtype).unsqueeze(0)
+    if proj == "w13_fused_gate_up":
+        size_k = int(scales.shape[2] * 2)
+    elif proj == "down_proj":
+        size_k = int(scales.shape[1] * 32)
+    else:
+        raise ValueError(f"Unsupported Kimi expert scale projection {proj} for {name}")
+    permute_scales = _vllm_marlin_moe_permute_scales_op(module)
+    permuted = permute_scales(
+        s=scales,
+        size_k=size_k,
+        size_n=int(scales.shape[2]),
+        group_size=32,
+        is_a_8bit=False,
+    )[0].contiguous()
+    if tuple(permuted.shape) != tuple(target.shape):
+        raise ValueError(
+            f"Kimi expert refit scale shape mismatch for {name}: "
+            f"candidate={tuple(permuted.shape)} target={tuple(target.shape)}"
+        )
+    return permuted
+
+
+def _get_vllm_tp_rank_and_size(vllm_config: Any | None = None) -> tuple[int, int]:
+    try:
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
+    except Exception:
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() % tp_size, tp_size
+        return 0, tp_size
+
+
+def _copy_refit_tensor_(dst: torch.Tensor, src: torch.Tensor, name: str) -> None:
+    if tuple(dst.shape) != tuple(src.shape):
+        raise RuntimeError(
+            f"Kimi refit shape mismatch for {name}: "
+            f"target={tuple(dst.shape)} source={tuple(src.shape)}"
+        )
+    dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+
+
+def _copy_kimi_expert_weight_shape_if_present(
+    target_tensors: dict[str, torch.Tensor],
+    name: str,
+    local_expert: int,
+    shape: tuple[int, int],
+) -> int:
+    target = target_tensors.get(name)
+    if target is None:
+        return 0
+    target_slice = target[local_expert] if target.ndim > 1 else target
+    source = torch.tensor(shape, device=target_slice.device, dtype=target_slice.dtype)
+    _copy_refit_tensor_(target_slice, source, f"{name}[{local_expert}]")
+    return 1
+
+
+def _merge_kimi_expert_proj_maps(
+    cached: dict[str, dict[str, torch.Tensor | None]] | None,
+    current: dict[str, dict[str, torch.Tensor | None]] | None,
+) -> dict[str, dict[str, torch.Tensor | None]]:
+    merged: dict[str, dict[str, torch.Tensor | None]] = {}
+    for proj_map in (cached or {}, current or {}):
+        for proj, kind_map in proj_map.items():
+            merged.setdefault(proj, {}).update(kind_map)
+    return merged
+
+
+def _cache_kimi_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.detach().cpu().contiguous()
+
+
+def _kimi_proj_map_has_required_tensor(
+    proj_map: dict[str, dict[str, torch.Tensor | None]],
+) -> bool:
+    return any(
+        kind in {"weight_packed", "weight_scale"}
+        for kind_map in proj_map.values()
+        for kind in kind_map
+    )
+
+
+def _kimi_expert_refit_missing_required(
+    proj_map: dict[str, dict[str, torch.Tensor | None]],
+) -> list[str]:
+    return [
+        proj
+        for proj in ("gate_proj", "up_proj", "down_proj")
+        if proj not in proj_map
+        or proj_map[proj].get("weight_packed") is None
+        or proj_map[proj].get("weight_scale") is None
+    ]
+
+
+def _finalize_kimi_expert_refit(model: torch.nn.Module) -> None:
+    cache = getattr(model, "_kimi_expert_refit_cache", None) or {}
+    stale_shape_only = [
+        group_key
+        for group_key, proj_map in cache.items()
+        if not _kimi_proj_map_has_required_tensor(proj_map)
+    ]
+    for group_key in stale_shape_only:
+        cache.pop(group_key, None)
+
+    if cache:
+        samples = []
+        for (prefix, expert_id), proj_map in list(cache.items())[:5]:
+            missing = ",".join(_kimi_expert_refit_missing_required(proj_map))
+            present = ",".join(
+                f"{proj}:{'/'.join(sorted(kind_map))}"
+                for proj, kind_map in sorted(proj_map.items())
+            )
+            samples.append(
+                f"{prefix}.{expert_id} missing=[{missing}] present=[{present}]"
+            )
+        raise RuntimeError(
+            "Kimi expert refit ended with incomplete local expert groups: "
+            f"count={len(cache)} samples={samples}"
+        )
+
+    updated = int(getattr(model, "_kimi_expert_refit_projection_updates", 0))
+    if updated:
+        local_experts = int(getattr(model, "_kimi_expert_refit_local_experts", 0))
+        groups_seen = int(getattr(model, "_kimi_expert_refit_groups_seen", 0))
+        shape_updates = int(getattr(model, "_kimi_expert_refit_shape_updates", 0))
+        print(
+            "Kimi expert refit complete: "
+            f"groups_seen={groups_seen} local_experts={local_experts} "
+            f"projection_updates={updated} shape_updates={shape_updates} "
+            f"stale_shape_only={len(stale_shape_only)}",
+            flush=True,
+        )
+
+
+def _apply_kimi_expert_refit_in_place(
+    weights: list[tuple[str, torch.Tensor]],
+    model: torch.nn.Module,
+) -> tuple[list[tuple[str, torch.Tensor]], int]:
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+    target_tensors = dict(buffers)
+    target_tensors.update(params)
+
+    grouped: dict[tuple[str, int], dict[str, dict[str, torch.Tensor | None]]] = {}
+    kept: list[tuple[str, torch.Tensor]] = []
+    for key, tensor in weights:
+        match = _KIMI_EXPERT_WEIGHT_RE.match(key)
+        if match is None:
+            kept.append((key, tensor))
+            continue
+        group_key = (match.group("prefix"), int(match.group("expert")))
+        grouped.setdefault(group_key, {}).setdefault(match.group("proj"), {})[
+            match.group("kind")
+        ] = tensor
+
+    if not grouped:
+        return kept, 0
+
+    setattr(
+        model,
+        "_kimi_expert_refit_groups_seen",
+        int(getattr(model, "_kimi_expert_refit_groups_seen", 0)) + len(grouped),
+    )
+
+    cache = getattr(model, "_kimi_expert_refit_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(model, "_kimi_expert_refit_cache", cache)
+
+    updated = 0
+    shape_updates = 0
+    local_experts = 0
+    processed_group_keys: set[tuple[str, int]] = set()
+    current_or_cached_group_keys = set(cache) | set(grouped)
+    with torch.no_grad():
+        for prefix, expert_id in list(current_or_cached_group_keys):
+            group_key = (prefix, expert_id)
+            proj_map = _merge_kimi_expert_proj_maps(
+                cache.get(group_key),
+                grouped.get(group_key),
+            )
+            expert_map = buffers.get(prefix + "._expert_map")
+            if expert_map is None or expert_id >= expert_map.numel():
+                cache.pop(group_key, None)
+                continue
+            local_expert = int(expert_map[expert_id].item())
+            if local_expert < 0:
+                cache.pop(group_key, None)
+                continue
+
+            missing = _kimi_expert_refit_missing_required(proj_map)
+            if missing:
+                continue
+
+            gate = proj_map["gate_proj"]
+            up = proj_map["up_proj"]
+            down = proj_map["down_proj"]
+            gate_packed = gate["weight_packed"]
+            gate_scale = gate["weight_scale"]
+            up_packed = up["weight_packed"]
+            up_scale = up["weight_scale"]
+            down_packed = down["weight_packed"]
+            down_scale = down["weight_scale"]
+            if not (
+                isinstance(gate_packed, torch.Tensor)
+                and isinstance(gate_scale, torch.Tensor)
+                and isinstance(up_packed, torch.Tensor)
+                and isinstance(up_scale, torch.Tensor)
+                and isinstance(down_packed, torch.Tensor)
+                and isinstance(down_scale, torch.Tensor)
+            ):
+                raise RuntimeError(f"Invalid Kimi expert tensor group for {prefix}.{expert_id}")
+
+            gate_shape = gate.get("weight_shape")
+            up_shape = up.get("weight_shape")
+            down_shape = down.get("weight_shape")
+            gate_shape_t = gate_shape if isinstance(gate_shape, torch.Tensor) else None
+            up_shape_t = up_shape if isinstance(up_shape, torch.Tensor) else None
+            down_shape_t = down_shape if isinstance(down_shape, torch.Tensor) else None
+            gate_dense_shape = _source_shape_tuple(gate_shape_t, gate_packed)
+            up_dense_shape = _source_shape_tuple(up_shape_t, up_packed)
+            down_dense_shape = _source_shape_tuple(down_shape_t, down_packed)
+
+            w13_packed = params[prefix + ".w13_weight_packed"][local_expert]
+            w13_scale = params[prefix + ".w13_weight_scale"][local_expert]
+            w2_packed = params[prefix + ".w2_weight_packed"][local_expert]
+            w2_scale = params[prefix + ".w2_weight_scale"][local_expert]
+            source_device = w13_packed.device
+            gate_packed = gate_packed.to(device=source_device, non_blocking=True)
+            gate_scale = gate_scale.to(device=source_device, non_blocking=True)
+            up_packed = up_packed.to(device=source_device, non_blocking=True)
+            up_scale = up_scale.to(device=source_device, non_blocking=True)
+            down_packed = down_packed.to(device=source_device, non_blocking=True)
+            down_scale = down_scale.to(device=source_device, non_blocking=True)
+
+            w13_preprocessed = (
+                torch.cat((gate_packed, up_packed), dim=0).t().contiguous()
+            )
+            w13_refit_packed = _repack_kimi_expert_for_vllm_marlin(
+                w13_preprocessed,
+                w13_packed,
+                prefix + f".w13_weight_packed[{local_expert}]",
+            )
+
+            w13_scale_interleaved = _interleave_tp_chunks(
+                gate_scale.t().contiguous(),
+                up_scale.t().contiguous(),
+                tp_size=1,
+            )
+            w13_refit_scale = _permute_kimi_expert_scales_for_vllm_marlin(
+                w13_scale_interleaved,
+                w13_scale,
+                "w13_fused_gate_up",
+                prefix + f".w13_weight_scale[{local_expert}]",
+            )
+
+            w2_refit_packed = _repack_kimi_expert_for_vllm_marlin(
+                down_packed.t().contiguous(),
+                w2_packed,
+                prefix + f".w2_weight_packed[{local_expert}]",
+            )
+
+            w2_refit_scale = _permute_kimi_expert_scales_for_vllm_marlin(
+                down_scale.t().contiguous(),
+                w2_scale,
+                "down_proj",
+                prefix + f".w2_weight_scale[{local_expert}]",
+            )
+
+            _copy_refit_tensor_(
+                w13_packed,
+                w13_refit_packed,
+                prefix + f".w13_weight_packed[{local_expert}]",
+            )
+            _copy_refit_tensor_(
+                w13_scale,
+                w13_refit_scale,
+                prefix + f".w13_weight_scale[{local_expert}]",
+            )
+            _copy_refit_tensor_(
+                w2_packed,
+                w2_refit_packed,
+                prefix + f".w2_weight_packed[{local_expert}]",
+            )
+            _copy_refit_tensor_(
+                w2_scale,
+                w2_refit_scale,
+                prefix + f".w2_weight_scale[{local_expert}]",
+            )
+            shape_updates += _copy_kimi_expert_weight_shape_if_present(
+                target_tensors,
+                prefix + ".w13_weight_shape",
+                local_expert,
+                (gate_dense_shape[0] + up_dense_shape[0], gate_dense_shape[1]),
+            )
+            shape_updates += _copy_kimi_expert_weight_shape_if_present(
+                target_tensors,
+                prefix + ".w2_weight_shape",
+                local_expert,
+                down_dense_shape,
+            )
+            updated += 2
+            local_experts += 1
+            processed_group_keys.add(group_key)
+            cache.pop(group_key, None)
+
+    for group_key, current_proj_map in grouped.items():
+        if group_key in processed_group_keys:
+            continue
+        prefix, expert_id = group_key
+        expert_map = buffers.get(prefix + "._expert_map")
+        if expert_map is None or expert_id >= expert_map.numel():
+            cache.pop(group_key, None)
+            continue
+        local_expert = int(expert_map[expert_id].item())
+        if local_expert < 0:
+            cache.pop(group_key, None)
+            continue
+        if not _kimi_proj_map_has_required_tensor(current_proj_map):
+            continue
+
+        cached_proj_map = cache.setdefault(group_key, {})
+        for proj, kind_map in current_proj_map.items():
+            cached_kind_map = cached_proj_map.setdefault(proj, {})
+            for kind, tensor in kind_map.items():
+                cached_kind_map[kind] = _cache_kimi_tensor(tensor)
+
+    if updated:
+        setattr(
+            model,
+            "_kimi_expert_refit_projection_updates",
+            int(getattr(model, "_kimi_expert_refit_projection_updates", 0))
+            + updated,
+        )
+        setattr(
+            model,
+            "_kimi_expert_refit_local_experts",
+            int(getattr(model, "_kimi_expert_refit_local_experts", 0)) + local_experts,
+        )
+        setattr(
+            model,
+            "_kimi_expert_refit_shape_updates",
+            int(getattr(model, "_kimi_expert_refit_shape_updates", 0)) + shape_updates,
+        )
+
+    return kept, updated
+
+
+def _raise_if_kimi_expert_weights_reach_generic_loader(
+    weights: list[tuple[str, torch.Tensor]],
+) -> None:
+    leaked = [key for key, _ in weights if ".mlp.experts." in key]
+    if leaked:
+        samples = ",".join(leaked[:8])
+        raise RuntimeError(
+            "Kimi expert refit guard: generic vLLM load received "
+            f"{len(leaked)} routed expert tensors after expert refit filtering. "
+            f"samples={samples}"
+        )
+
+
+def _kimi_nonexpert_name_variants(key: str) -> list[str]:
+    variants = [key]
+    if key.startswith("language_model."):
+        variants.append(key[len("language_model.") :])
+    else:
+        variants.append("language_model." + key)
+    if key.startswith("model."):
+        variants.append("language_model." + key)
+    if key.startswith("language_model.model."):
+        variants.append(key[len("language_model.") :])
+    if key.startswith("layers."):
+        variants.append("model." + key)
+        variants.append("language_model.model." + key)
+    return list(dict.fromkeys(variants))
+
+
+def _kimi_target_tensors(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    target_tensors = dict(model.named_parameters())
+    target_tensors.update(dict(model.named_buffers()))
+    return target_tensors
+
+
+def _resolve_kimi_nonexpert_target(
+    target_tensors: dict[str, torch.Tensor],
+    key: str,
+) -> tuple[str | None, torch.Tensor | None]:
+    for target_name in _kimi_nonexpert_name_variants(key):
+        target = target_tensors.get(target_name)
+        if target is not None:
+            return target_name, target
+    return None, None
+
+
+def _mark_kimi_nonexpert_refit_target_loaded(
+    model: torch.nn.Module,
+    target_name: str,
+) -> None:
+    loaded = getattr(model, "_kimi_nonexpert_refit_loaded_targets", None)
+    if loaded is None:
+        loaded = set()
+        setattr(model, "_kimi_nonexpert_refit_loaded_targets", loaded)
+    loaded.add(target_name)
+
+
+def _is_kimi_vision_or_mm_key(key: str) -> bool:
+    return key.startswith(("vision_tower.", "mm_projector.", "multi_modal_projector."))
+
+
+def _get_kimi_nonexpert_fusion_cache(
+    model: torch.nn.Module,
+) -> dict[str, dict[str, torch.Tensor]]:
+    cache = getattr(model, "_kimi_nonexpert_fusion_refit_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(model, "_kimi_nonexpert_fusion_refit_cache", cache)
+    return cache
+
+
+def _prepare_row_shard_for_kimi_nonexpert(
+    tensor: torch.Tensor,
+    target: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor | None:
+    if tuple(tensor.shape) == tuple(target.shape):
+        return tensor.contiguous()
+    if tensor.ndim != 2 or target.ndim != 2 or tp_size <= 1:
+        return None
+    if tensor.shape[0] != target.shape[0] * tp_size:
+        return None
+    if tensor.shape[1] != target.shape[1]:
+        return None
+    row_start = tp_rank * target.shape[0]
+    return tensor[row_start : row_start + target.shape[0]].contiguous()
+
+
+def _prepare_col_shard_for_kimi_nonexpert(
+    tensor: torch.Tensor,
+    target: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor | None:
+    if tuple(tensor.shape) == tuple(target.shape):
+        return tensor.contiguous()
+    if tensor.ndim != 2 or target.ndim != 2 or tp_size <= 1:
+        return None
+    if tensor.shape[0] != target.shape[0]:
+        return None
+    if tensor.shape[1] != target.shape[1] * tp_size:
+        return None
+    col_start = tp_rank * target.shape[1]
+    return tensor[:, col_start : col_start + target.shape[1]].contiguous()
+
+
+def _is_kimi_vocab_parallel_weight(key: str) -> bool:
+    return key.endswith(("model.embed_tokens.weight", "lm_head.weight"))
+
+
+def _is_kimi_mla_projection_weight(key: str) -> bool:
+    return key.endswith(
+        (
+            ".self_attn.q_b_proj.weight",
+            ".self_attn.kv_b_proj.weight",
+            ".self_attn.o_proj.weight",
+        )
+    )
+
+
+def _prepare_mla_projection_weight_for_kimi_nonexpert(
+    key: str,
+    tensor: torch.Tensor,
+    target: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+) -> torch.Tensor | None:
+    if key.endswith((".self_attn.q_b_proj.weight", ".self_attn.kv_b_proj.weight")):
+        return _prepare_row_shard_for_kimi_nonexpert(tensor, target, tp_rank, tp_size)
+    if key.endswith(".self_attn.o_proj.weight"):
+        return _prepare_col_shard_for_kimi_nonexpert(tensor, target, tp_rank, tp_size)
+    return None
+
+
+def _kimi_two_source_fusion_spec(
+    key: str,
+) -> tuple[str, str, tuple[str, str], str] | None:
+    if key.endswith(".self_attn.q_a_proj.weight"):
+        return (
+            key[: -len(".q_a_proj.weight")] + ".fused_qkv_a_proj.weight",
+            "q_a",
+            ("q_a", "kv_a"),
+            "row_full",
+        )
+    if key.endswith(".self_attn.kv_a_proj_with_mqa.weight"):
+        return (
+            key[: -len(".kv_a_proj_with_mqa.weight")] + ".fused_qkv_a_proj.weight",
+            "kv_a",
+            ("q_a", "kv_a"),
+            "row_full",
+        )
+    if key.endswith(".mlp.shared_experts.gate_proj.weight"):
+        return (
+            key[: -len(".gate_proj.weight")] + ".gate_up_proj.weight",
+            "gate",
+            ("gate", "up"),
+            "row_shard",
+        )
+    if key.endswith(".mlp.shared_experts.up_proj.weight"):
+        return (
+            key[: -len(".up_proj.weight")] + ".gate_up_proj.weight",
+            "up",
+            ("gate", "up"),
+            "row_shard",
+        )
+    if (
+        ".mlp.experts." not in key
+        and ".mlp.shared_experts." not in key
+        and key.endswith(".mlp.gate_proj.weight")
+    ):
+        return (
+            key[: -len(".gate_proj.weight")] + ".gate_up_proj.weight",
+            "gate",
+            ("gate", "up"),
+            "row_shard",
+        )
+    if (
+        ".mlp.experts." not in key
+        and ".mlp.shared_experts." not in key
+        and key.endswith(".mlp.up_proj.weight")
+    ):
+        return (
+            key[: -len(".up_proj.weight")] + ".gate_up_proj.weight",
+            "up",
+            ("gate", "up"),
+            "row_shard",
+        )
+    return None
+
+
+def _prepare_kimi_two_source_fusion(
+    key: str,
+    tensor: torch.Tensor,
+    target_tensors: dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[bool, bool]:
+    spec = _kimi_two_source_fusion_spec(key)
+    if spec is None:
+        return False, False
+
+    target_key, part_name, ordered_parts, shard_mode = spec
+    target_name, target = _resolve_kimi_nonexpert_target(target_tensors, target_key)
+    if target is None or target_name is None:
+        return True, False
+
+    cache = _get_kimi_nonexpert_fusion_cache(model)
+    entry = cache.setdefault(target_name, {})
+    entry[part_name] = tensor.detach().cpu().contiguous()
+    if not all(part in entry for part in ordered_parts):
+        return True, False
+
+    fused = torch.cat([entry[part] for part in ordered_parts], dim=0)
+    if shard_mode == "row_shard":
+        prepared = _prepare_row_shard_for_kimi_nonexpert(
+            fused, target, tp_rank, tp_size
+        )
+    else:
+        prepared = fused.contiguous() if tuple(fused.shape) == tuple(target.shape) else None
+    if prepared is None:
+        shapes = {part: tuple(entry[part].shape) for part in ordered_parts}
+        raise RuntimeError(
+            "Kimi fused non-expert refit shape mismatch for "
+            f"{target_name}: parts={shapes} fused={tuple(fused.shape)} "
+            f"target={tuple(target.shape)} mode={shard_mode} "
+            f"rank={tp_rank}/{tp_size}"
+        )
+
+    _copy_refit_tensor_(target, prepared, target_name)
+    _mark_kimi_nonexpert_refit_target_loaded(model, target_name)
+    cache.pop(target_name, None)
+    return True, True
+
+
+def _prepare_kimi_single_source_fused_nonexpert(
+    key: str,
+    tensor: torch.Tensor,
+    target_tensors: dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[bool, bool]:
+    del model
+    if (
+        key.endswith(".mlp.shared_experts.down_proj.weight")
+        or (
+            ".mlp.experts." not in key
+            and ".mlp.shared_experts." not in key
+            and key.endswith(".mlp.down_proj.weight")
+        )
+    ):
+        target_name, target = _resolve_kimi_nonexpert_target(target_tensors, key)
+        if target is None or target_name is None:
+            return True, False
+        prepared = _prepare_col_shard_for_kimi_nonexpert(
+            tensor, target, tp_rank, tp_size
+        )
+        if prepared is None:
+            raise RuntimeError(
+                "Kimi sharded non-expert refit shape mismatch for "
+                f"{target_name}: source={tuple(tensor.shape)} "
+                f"target={tuple(target.shape)} rank={tp_rank}/{tp_size}"
+            )
+        _copy_refit_tensor_(target, prepared, target_name)
+        return True, True
+    return False, False
+
+
+def _finalize_kimi_nonexpert_fusion_refit(model: torch.nn.Module) -> None:
+    cache = getattr(model, "_kimi_nonexpert_fusion_refit_cache", None) or {}
+    if not cache:
+        return
+    samples = [
+        f"{target_name}:parts={sorted(parts)}"
+        for target_name, parts in list(cache.items())[:8]
+    ]
+    raise RuntimeError(
+        "Kimi fused non-expert refit ended with incomplete source groups: "
+        f"count={len(cache)} samples={samples}"
+    )
+
+
+def _apply_kimi_nonexpert_refit_in_place(
+    weights: list[tuple[str, torch.Tensor]],
+    model: torch.nn.Module,
+    vllm_config: Any,
+) -> tuple[list[tuple[str, torch.Tensor]], dict[str, int]]:
+    target_tensors = _kimi_target_tensors(model)
+    kept: list[tuple[str, torch.Tensor]] = []
+    counts = {
+        "exact": 0,
+        "vocab": 0,
+        "mla": 0,
+        "fused": 0,
+        "vision_or_mm": 0,
+    }
+    tp_rank, tp_size = _get_vllm_tp_rank_and_size(vllm_config)
+
+    with torch.no_grad():
+        for key, tensor in weights:
+            if ".mlp.experts." in key or key.startswith("draft."):
+                kept.append((key, tensor))
+                continue
+            if _is_kimi_vision_or_mm_key(key):
+                counts["vision_or_mm"] += 1
+                continue
+
+            target_name, target = _resolve_kimi_nonexpert_target(target_tensors, key)
+            if (
+                target is not None
+                and target_name is not None
+                and tuple(target.shape) == tuple(tensor.shape)
+            ):
+                _copy_refit_tensor_(target, tensor, target_name)
+                _mark_kimi_nonexpert_refit_target_loaded(model, target_name)
+                counts["exact"] += 1
+                continue
+
+            if _is_kimi_vocab_parallel_weight(key) and target is not None:
+                prepared = _prepare_row_shard_for_kimi_nonexpert(
+                    tensor, target, tp_rank, tp_size
+                )
+                if prepared is not None and target_name is not None:
+                    _copy_refit_tensor_(target, prepared, target_name)
+                    _mark_kimi_nonexpert_refit_target_loaded(model, target_name)
+                    counts["vocab"] += 1
+                    continue
+
+            if _is_kimi_mla_projection_weight(key) and target is not None:
+                prepared = _prepare_mla_projection_weight_for_kimi_nonexpert(
+                    key, tensor, target, tp_rank, tp_size
+                )
+                if prepared is not None and target_name is not None:
+                    _copy_refit_tensor_(target, prepared, target_name)
+                    _mark_kimi_nonexpert_refit_target_loaded(model, target_name)
+                    counts["mla"] += 1
+                    continue
+
+            handled, copied = _prepare_kimi_two_source_fusion(
+                key, tensor, target_tensors, model, tp_rank, tp_size
+            )
+            if handled:
+                if copied:
+                    counts["fused"] += 1
+                continue
+
+            handled, copied = _prepare_kimi_single_source_fused_nonexpert(
+                key, tensor, target_tensors, model, tp_rank, tp_size
+            )
+            if handled:
+                if copied:
+                    counts["fused"] += 1
+                continue
+
+            kept.append((key, tensor))
+
+    return kept, counts
+
+
+def _is_kimi_moe_process_weights_target(obj: Any) -> bool:
+    cls = type(obj)
+    module_name = getattr(cls, "__module__", "")
+    class_name = getattr(cls, "__name__", "")
+    return (
+        class_name == "CompressedTensorsWNA16MarlinMoEMethod"
+        or (
+            "compressed_tensors_moe" in module_name
+            and "MoE" in class_name
+            and hasattr(obj, "process_weights_after_loading")
+        )
+    )
+
+
+def _kimi_noop_moe_process_weights_after_loading(self, layer):
+    if not getattr(_kimi_noop_moe_process_weights_after_loading, "_kimi_logged", False):
+        print(
+            "Skipping Kimi MoE process_weights_after_loading after live refit.",
+            flush=True,
+        )
+        setattr(_kimi_noop_moe_process_weights_after_loading, "_kimi_logged", True)
+    return None
+
+
+@contextlib.contextmanager
+def _skip_kimi_moe_process_weights_after_refit(
+    model: torch.nn.Module | None = None,
+):
+    """Bypass MoE post-load processing for Kimi tensors already written in Marlin layout."""
+    class_patches: list[tuple[Any, Any]] = []
+    instance_patches: list[tuple[Any, Any]] = []
+    module_names = (
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe",
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_wna16_marlin",
+    )
+    class_name = "CompressedTensorsWNA16MarlinMoEMethod"
+    for module_name in module_names:
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            cls = getattr(module, class_name, None)
+            original = (
+                getattr(cls, "process_weights_after_loading", None) if cls else None
+            )
+            if cls is not None and original is not None:
+                setattr(
+                    cls,
+                    "process_weights_after_loading",
+                    _kimi_noop_moe_process_weights_after_loading,
+                )
+                class_patches.append((cls, original))
+        except Exception:
+            continue
+
+    seen_instances: set[int] = set()
+    if model is not None:
+        for module in model.modules():
+            candidates = [
+                module,
+                getattr(module, "quant_method", None),
+                getattr(getattr(module, "runner", None), "quant_method", None),
+            ]
+            for candidate in candidates:
+                if candidate is None or id(candidate) in seen_instances:
+                    continue
+                seen_instances.add(id(candidate))
+                original = getattr(candidate, "process_weights_after_loading", None)
+                if original is None or not _is_kimi_moe_process_weights_target(
+                    candidate
+                ):
+                    continue
+                setattr(
+                    candidate,
+                    "process_weights_after_loading",
+                    types.MethodType(
+                        _kimi_noop_moe_process_weights_after_loading, candidate
+                    ),
+                )
+                instance_patches.append((candidate, original))
+
+    try:
+        yield
+    finally:
+        for candidate, original in instance_patches:
+            setattr(candidate, "process_weights_after_loading", original)
+        for cls, original in class_patches:
+            setattr(cls, "process_weights_after_loading", original)
 
 
 def _read_mtp_layer_weights_from_checkpoint(
@@ -310,6 +1289,11 @@ class VllmInternalWorkerExtension:
         )
         return True
 
+    def _is_kimi_k25_model(self) -> bool:
+        return _is_kimi_k25_architecture(
+            self.model_runner.vllm_config.model_config.architectures
+        )
+
     def _load_weights(self, weights):
         """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
 
@@ -326,7 +1310,33 @@ class VllmInternalWorkerExtension:
             for idx, (key, weight) in enumerate(weights):
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
+        if self._is_kimi_k25_model():
+            weights, expert_updates = _apply_kimi_expert_refit_in_place(
+                weights, self.model_runner.model
+            )
+            weights, nonexpert_counts = _apply_kimi_nonexpert_refit_in_place(
+                weights,
+                self.model_runner.model,
+                self.model_runner.vllm_config,
+            )
+            if expert_updates or any(nonexpert_counts.values()):
+                logged = getattr(self, "_kimi_refit_log_count", 0)
+                if logged < 8:
+                    print(
+                        "Loaded Kimi K2.6 live-refit tensors in-place: "
+                        f"expert_updates={expert_updates} "
+                        f"nonexpert={nonexpert_counts}",
+                        flush=True,
+                    )
+                setattr(self, "_kimi_refit_log_count", logged + 1)
+
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
+        if self._is_kimi_k25_model():
+            _raise_if_kimi_expert_weights_reach_generic_loader(policy_weights)
+            if not policy_weights:
+                self._load_draft_weights(draft_weights)
+                return
+
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(policy_weights, self.model_runner)
         else:
@@ -358,22 +1368,39 @@ class VllmInternalWorkerExtension:
                     )
 
                     with set_current_vllm_config(self.model_runner.vllm_config):
-                        process_weights_after_loading(
-                            self.model_runner.model, self.model_config, self.device
-                        )
+                        if self._is_kimi_k25_model():
+                            _finalize_kimi_expert_refit(self.model_runner.model)
+                            _finalize_kimi_nonexpert_fusion_refit(
+                                self.model_runner.model
+                            )
+                            with _skip_kimi_moe_process_weights_after_refit(
+                                self.model_runner.model
+                            ):
+                                process_weights_after_loading(
+                                    self.model_runner.model,
+                                    self.model_config,
+                                    self.device,
+                                )
+                        else:
+                            process_weights_after_loading(
+                                self.model_runner.model,
+                                self.model_config,
+                                self.device,
+                            )
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
-                ipc_handle, list_keys, used_bytes = payload
+                ipc_handle, payload_entries, used_bytes = payload
                 buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
 
                 weight = None
                 weights = []
                 offset = 0
-                for key in list_keys:
-                    shape, dtype = self.state_dict_info[key]  # pyrefly
-                    if isinstance(shape, list):
-                        shape = torch.Size(shape)
+                for entry in payload_entries:
+                    key, shape, dtype = unpack_ipc_refit_payload_entry(
+                        entry,
+                        self.state_dict_info,
+                    )
 
                     # Get the weight from the buffer
                     size_in_bytes = dtype.itemsize * shape.numel()

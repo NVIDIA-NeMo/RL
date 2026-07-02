@@ -295,7 +295,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         self.rank = get_rank_safe()
 
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
 
         # Step 2: Validate and setup model paths
         # Value config uses the same model_name field as policy config.

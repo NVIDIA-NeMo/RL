@@ -156,6 +156,13 @@ Parameter-efficient fine-tuning with LoRA: backend support, DTensor vs Megatron 
 Extend a model's context window with YaRN RoPE scaling on the Megatron backend for SFT, GRPO, and other workflows.
 :::
 
+:::{grid-item-card} {octicon}`cpu` Kimi K2.6
+:link: guides/kimi-k2-6
+:link-type: doc
+
+Run Kimi K2.6 with Megatron Core training, vLLM rollout, and live weight refit.
+:::
+
 :::{grid-item-card} {octicon}`git-compare` Cross-Tokenizer Distillation
 :link: guides/xtoken-off-policy-distillation
 :link-type: doc
@@ -287,6 +294,7 @@ guides/async-grpo.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
+guides/kimi-k2-6.md
 guides/xtoken-off-policy-distillation.md
 guides/router-replay.md
 guides/muon-optimizer.md

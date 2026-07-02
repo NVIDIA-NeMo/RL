@@ -275,7 +275,7 @@ class MegatronPolicyWorkerImpl(
         self.rank = get_rank_safe()
 
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -1168,6 +1168,8 @@ class MegatronPolicyWorkerImpl(
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         self.refit_param_info_mcore = self._calculate_refit_param_info()
+        if self._ipc_refit_metadata_in_payload():
+            return {}
 
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
@@ -1176,6 +1178,15 @@ class MegatronPolicyWorkerImpl(
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
+
+    def _ipc_refit_metadata_in_payload(self) -> bool:
+        generation_cfg = self.cfg.get("generation", None)
+        if generation_cfg is None or generation_cfg.get("backend") != "vllm":
+            return False
+        vllm_cfg = generation_cfg.get("vllm_cfg", {})
+        if "ipc_refit_metadata_in_payload" not in vllm_cfg:
+            return False
+        return bool(vllm_cfg["ipc_refit_metadata_in_payload"])
 
     def _collect_mtp_metrics(self, metrics: dict[str, Any]) -> None:
         """Add Multi-Token Prediction metrics to ``metrics`` when MTP is enabled.
@@ -1351,6 +1362,7 @@ class MegatronPolicyWorkerImpl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            metadata_in_payload=self._ipc_refit_metadata_in_payload(),
         )
 
     @torch.no_grad()

@@ -105,6 +105,37 @@ class IPCProtocol(Enum):
     ACK = "ack"
 
 
+IPCRefitPayloadEntry = str | tuple[str, tuple[int, ...], torch.dtype]
+
+
+def make_ipc_refit_payload_entry(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    metadata_in_payload: bool,
+) -> IPCRefitPayloadEntry:
+    """Return a refit payload key entry with optional tensor metadata."""
+    if not metadata_in_payload:
+        return name
+    return (name, tuple(tensor.shape), tensor.dtype)
+
+
+def unpack_ipc_refit_payload_entry(
+    entry: IPCRefitPayloadEntry,
+    state_dict_info: dict[str, Any],
+) -> tuple[str, torch.Size, torch.dtype]:
+    """Resolve a refit payload entry into tensor name, shape, and dtype."""
+    if isinstance(entry, tuple):
+        name, shape, dtype = entry
+    else:
+        name = entry
+        shape, dtype = state_dict_info[name]
+
+    if not isinstance(shape, torch.Size):
+        shape = torch.Size(shape)
+    return name, shape, dtype
+
+
 # TODO: Replace this hard-coded map with a generic plugin-registration
 # hook on ``Policy`` (e.g. a ``worker_cls_overrides`` registry populated by
 # ``nemo_rl.modelopt`` on import) so core has no knowledge of ModelOpt-specific
@@ -359,7 +390,13 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
+    *,
+    metadata_in_payload: bool = False,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -376,7 +413,12 @@ def stream_weights_via_ipc_zmq_impl(
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
 
-    def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
+    def send_buffer_group_overlap(
+        buffer,
+        param_entries: list[IPCRefitPayloadEntry],
+        used_bytes: int,
+        await_recv: bool,
+    ) -> bool:
         """Send a group of parameters and return new pending_recv state."""
         # Synchronize before getting IPC handle to ensure data is ready
         torch.cuda.current_stream().synchronize()
@@ -385,8 +427,10 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        # Payload tuple: (cuda_ipc_handle, param_names, used_bytes)
-        payload = (cuda_ipc_handle, param_names, used_bytes)
+        # Payload tuple: (cuda_ipc_handle, param entries, used_bytes). When
+        # metadata_in_payload is enabled each entry is (name, shape, dtype);
+        # otherwise entries are plain names resolved from prepared metadata.
+        payload = (cuda_ipc_handle, param_entries, used_bytes)
         zmq_socket.send_pyobj(payload)
         return True  # pending_recv = True
 
@@ -416,7 +460,7 @@ def stream_weights_via_ipc_zmq_impl(
     current_buffer: torch.Tensor | None = None
 
     used_bytes = 0
-    param_names = []
+    param_entries: list[IPCRefitPayloadEntry] = []
     await_recv = False
     count_of_groups = 0
 
@@ -439,22 +483,28 @@ def stream_weights_via_ipc_zmq_impl(
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
                 await_recv = send_buffer_group_overlap(
-                    current_buffer, param_names, used_bytes, await_recv
+                    current_buffer, param_entries, used_bytes, await_recv
                 )
                 count_of_groups += 1
 
                 # Switch buffers for ping-pong double buffering
                 current_buffer = buffer_b if current_buffer is buffer_a else buffer_a
-                used_bytes, param_names = 0, []
+                used_bytes, param_entries = 0, []
 
             # Pack tensor into current buffer
-            param_names.append(name)
+            param_entries.append(
+                make_ipc_refit_payload_entry(
+                    name,
+                    tensor,
+                    metadata_in_payload=metadata_in_payload,
+                )
+            )
             used_bytes = pack_tensor(current_buffer, tensor, used_bytes)
 
         # Send remaining tensors
-        if param_names:
+        if param_entries:
             await_recv = send_buffer_group_overlap(
-                current_buffer, param_names, used_bytes, await_recv
+                current_buffer, param_entries, used_bytes, await_recv
             )
             count_of_groups += 1
 
