@@ -129,6 +129,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 return None
             return super()._load_weights(weights)
 
+        # MBridge exports K/V amax with the HF-semantic attention path, such as
+        # ``self_attn.k_bmm_quantizer._amax``. ModelOpt installs these quantizers
+        # on vLLM's inner Attention module, whose runtime path contains ``.attn``.
+        # Insert only that ModelOpt-owned path segment here; the normal vLLM
+        # loader still owns model-specific HF mapping and PP-local filtering.
         remapped_weights = []
         for name, weight in weights:
             for suffix in self._QUANT_AMAX_SUFFIXES:
