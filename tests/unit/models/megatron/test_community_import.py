@@ -16,8 +16,7 @@
 
 import importlib
 import sys
-from types import ModuleType
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 
 def _ensure_package(monkeypatch, name: str) -> ModuleType:
@@ -54,9 +53,7 @@ def _load_community_import_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "megatron.bridge", megatron_bridge)
     megatron_transformer = ModuleType("megatron.core.transformer")
     megatron_transformer.ModuleSpec = type("ModuleSpec", (), {})
-    monkeypatch.setitem(
-        sys.modules, "megatron.core.transformer", megatron_transformer
-    )
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer", megatron_transformer)
 
     # Stub MegatronConfig type import.
     nemo_policy = ModuleType("nemo_rl.models.policy")
@@ -77,7 +74,9 @@ def _install_torch_strategy_module(monkeypatch, strategy_cls):
     strategy_module = ModuleType("megatron.core.dist_checkpointing.strategies.torch")
     strategy_module.TorchDistSaveShardedStrategy = strategy_cls
     monkeypatch.setitem(
-        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", strategy_module
+        sys.modules,
+        "megatron.core.dist_checkpointing.strategies.torch",
+        strategy_module,
     )
 
 
