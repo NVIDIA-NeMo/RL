@@ -202,6 +202,17 @@ mcore = [
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
 ]
+# TRT-LLM is built from source in docker/Dockerfile (the wheel is not on PyPI for
+# cp313/cu13/aarch64). The wheel is copied to /opt/trtllm_wheels/ during the build
+# and discovered by uv via UV_FIND_LINKS. This extra declares tensorrt-llm itself
+# plus the runtime deps it needs at import time.
+trtllm = [
+  # Platform marker is injected at build time by tools/build-custom-trtllm.sh
+  # (via tomlkit) so uv lock only requires the wheel for the current build platform.
+  "tensorrt-llm==1.3.0rc21",
+  "mpi4py",
+  "nvidia-cutlass-dsl-libs-base==4.5.0",
+]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext==0.6.0",
@@ -255,6 +266,10 @@ test = [
 ]
 
 [tool.uv.sources]
+# tensorrt-llm is built from source during docker build and copied to /opt/trtllm_wheels/.
+# uv discovers it via UV_FIND_LINKS=/opt/trtllm_wheels (set in Dockerfile ENV).
+# No path source here — UV_FIND_LINKS is a wheel directory, not a package directory.
+# The [[tool.uv.dependency-metadata]] entry below provides metadata for lock resolution.
 megatron-core = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM", editable = true }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace", editable = true }
@@ -448,6 +463,22 @@ conflicts = [
     { extra = "vllm" },
     { extra = "mcore" },
   ],
+  [
+    { extra = "trtllm" },
+    { extra = "vllm" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "automodel" },
+  ],
+  [
+    { extra = "trtllm" },
+    { extra = "mcore" },
+  ],
 ]
 
 
@@ -513,6 +544,41 @@ name = "nv-grouped-gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
+
+[[tool.uv.dependency-metadata]]
+name = "tensorrt-llm"
+# Version matches TRT-LLM nemorl branch (github.com/NVIDIA/TensorRT-LLM@nemorl).
+# Declare requires-dist so uv can resolve the dep graph without building the wheel
+# at lock time (wheel is only available inside the Docker container).
+# Sourced from requirements.txt on the nemorl branch.
+version = "1.3.0rc21"
+# Minimal requires-dist for uv dep-graph resolution at lock time.
+# Only include deps that don't conflict with other NeMo RL extras.
+# Strict version pins from trtllm (e.g. transformers==5.5.4, xgrammar==0.1.32)
+# are intentionally omitted — trtllm runs in an isolated role venv where those
+# pins are satisfied independently.
+# Sourced from requirements.txt on github.com/NVIDIA/TensorRT-LLM@nemorl.
+requires-dist = [
+  "mpi4py",
+  "numpy>=2.0.0,<2.4",
+  "torch>=2.11.0",
+  "nvidia-modelopt>=0.37.0",
+  "transformers==5.5.4",
+  "accelerate>=1.7.0",
+  "sentencepiece>=0.1.99",
+  "onnx>=1.21.0",
+  "cuda-python>=13",
+  "nvidia-cutlass-dsl-libs-base==4.5.0",
+  "mistral-common>=1.10.0",
+  "lark",
+  "colored",
+  "psutil",
+  "pydantic>=2.9.1",
+  "omegaconf",
+  "pyzmq",
+  "uvicorn",
+  "einops",
+]
 
 [[tool.uv.dependency-metadata]]
 name = "megatron-bridge"

@@ -20,7 +20,7 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 # Parse command line arguments
 GIT_URL=${1:-https://github.com/NVIDIA/TensorRT-LLM.git}
-GIT_REF=${2:-v1.3.0rc15}
+GIT_REF=${2:-v1.3.0rc20}
 MODELOPT_GIT_URL=${3:-https://github.com/NVIDIA/TensorRT-Model-Optimizer.git}
 MODELOPT_GIT_REF=${4:-0.37.0}
 
@@ -29,6 +29,12 @@ if [[ -e "$BUILD_DIR" ]]; then
   echo "[ERROR] $BUILD_DIR already exists. Please remove or move it before running this script."
   exit 1
 fi
+
+# Directory where the built wheel is exported for uv to discover.
+# Prefer UV_FIND_LINKS (set in Dockerfile ENV) so this script and uv always agree
+# on the wheel location. Fall back to WHEEL_OUTPUT_DIR, then /opt/trtllm_wheels.
+WHEEL_OUTPUT_DIR=${UV_FIND_LINKS:-/opt/trtllm_wheels}
+mkdir -p "$WHEEL_OUTPUT_DIR"
 
 echo "Building TensorRT-LLM from:"
 echo "  TRT-LLM Git URL: $GIT_URL"
@@ -112,15 +118,50 @@ python3 scripts/build_wheel.py \
     -a "80-real;90-real;100-real" \
     -G Ninja \
     --clean \
-    --use_ccache \
     --nvrtc_dynamic_linking \
     -D "ENABLE_UCX=OFF"
 
-# Install the freshly built wheel. --no-deps because the venv already has
-# everything; --force-reinstall in case a previous run left a partial install.
-echo "Installing TensorRT-LLM wheel..."
-python3 -m pip install --no-deps --force-reinstall "$BUILD_DIR"/build/tensorrt_llm-*.whl
+# Copy the wheel to WHEEL_OUTPUT_DIR so uv can discover it via UV_FIND_LINKS.
+# The Dockerfile will run `uv lock --upgrade-package tensorrt-llm` + `uv sync --extra trtllm`
+# after this script to install tensorrt-llm into the uv-managed venv.
+echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."
+cp "$BUILD_DIR"/build/tensorrt_llm-*.whl "$WHEEL_OUTPUT_DIR/"
+
+# Remove source tree and build artifacts to reclaim disk space.
+echo "Cleaning up TensorRT-LLM source and build artifacts..."
+rm -rf "$BUILD_DIR"
+
+echo "Updating pyproject.toml: injecting platform_machine marker for tensorrt-llm..."
+cd "$REPO_ROOT"
+uv run --no-project --with tomlkit python - <<'PY'
+from pathlib import Path
+from tomlkit import parse, dumps
+import platform
+
+arch = platform.machine()  # 'aarch64' or 'x86_64'
+pyproject_path = Path("pyproject.toml")
+doc = parse(pyproject_path.read_text())
+
+trtllm_list = doc["project"]["optional-dependencies"]["trtllm"]
+
+# Rebuild the list: replace the tensorrt-llm entry with a platform-specific marker,
+# idempotently (strip any existing marker first).
+new_items = []
+for item in trtllm_list:
+    s = str(item).strip()
+    if s.startswith("tensorrt-llm"):
+        base = s.split(";")[0].strip()
+        new_items.append(f'{base} ; platform_machine == "{arch}"')
+    else:
+        new_items.append(item)
+
+trtllm_list.clear()
+for it in new_items:
+    trtllm_list.append(it)
+
+pyproject_path.write_text(dumps(doc))
+print(f"[INFO] tensorrt-llm entry updated with platform_machine == '{arch}'")
+PY
 
 echo "Build completed successfully!"
-echo "TRT-LLM source is available at: $BUILD_DIR"
-echo "TRT-LLM wheel installed in: $(python3 -c 'import tensorrt_llm, os; print(os.path.dirname(tensorrt_llm.__file__))')"
+echo "TRT-LLM wheel copied to: ${WHEEL_OUTPUT_DIR}"
