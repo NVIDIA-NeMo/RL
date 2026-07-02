@@ -51,6 +51,8 @@ class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
     entity: NotRequired[str]
+    group: NotRequired[str]
+    tags: NotRequired[list[str]]
 
 
 class SwanlabConfig(TypedDict):
@@ -119,6 +121,12 @@ class LoggerInterface(ABC):
     def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
         """Log a matplotlib figure."""
         pass
+
+    def log_table(
+        self, columns: list[str], rows: list[list[Any]], step: int, name: str
+    ) -> None:
+        """Log a table of sample rows. No-op for backends without table support."""
+        return
 
 
 class TensorboardLogger(LoggerInterface):
@@ -392,6 +400,23 @@ class WandbLogger(LoggerInterface):
             step: Global step value
         """
         self.run.log({name: figure}, step=step)
+
+    def log_table(
+        self, columns: list[str], rows: list[list[Any]], step: int, name: str
+    ) -> None:
+        """Log a table of sample rows to wandb as a wandb.Table.
+
+        Args:
+            columns: Column headers.
+            rows: Row values, each a list aligned with ``columns``.
+            step: Global step value.
+            name: Panel name for the table in the W&B UI.
+        """
+        try:
+            table = wandb.Table(columns=columns, data=rows)
+            self.run.log({name: table}, step=step)
+        except Exception as e:
+            print(f"Warning: Failed to log table '{name}' to W&B: {e}")
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to wandb.
@@ -1037,6 +1062,22 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_hyperparams(params)
+
+    def log_table(
+        self, columns: list[str], rows: list[list[Any]], step: int, name: str
+    ) -> None:
+        """Log a table of sample rows to all enabled backends.
+
+        Backends without table support (everything but W&B) no-op.
+
+        Args:
+            columns: Column headers.
+            rows: Row values, each a list aligned with ``columns``.
+            step: Global step value.
+            name: Panel name for the table.
+        """
+        for logger in self.loggers:
+            logger.log_table(columns, rows, step, name)
 
     def log_batched_dict_as_jsonl(
         self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str
