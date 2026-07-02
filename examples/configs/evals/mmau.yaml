@@ -43,6 +43,7 @@ data:
   prompt_file: null
   system_prompt_file: null
   dataset_name: "TwinkStart/MMAU"
+  processor: "vlm_hf_data_processor"
   split: "v05.15.25"
   env_name: vlm
 

@@ -69,9 +69,10 @@ uv run python examples/run_eval.py --config examples/configs/evals/gpqa_eval.yam
 # Run evaluation script with a local dataset where the problem and solution keys are "Question" and "Answer" respectively.
 uv run python examples/run_eval.py \
     --config examples/configs/evals/local_eval.yaml \
-    data.dataset_name=/path/to/local/dataset \
-    data.problem_key=Question \
-    data.solution_key=Answer
+    data.dataset_name=ResponseDataset \
+    data.data_path=/path/to/local/dataset \
+    data.input_key=Question \
+    data.output_key=Answer
 
 # Override specific config values via command line
 # Example: Evaluation of DeepScaleR-1.5B-Preview on MATH-500 using 8 GPUs
@@ -106,9 +107,11 @@ score=0.1000 (3.0/30)
 ## List of currently supported benchmarks
 
 - [AIME-2024, AIME-2025, and AIME-2026](../../nemo_rl/data/datasets/response_datasets/aime.py): the corresponding `data.dataset_name` values are `"AIME2024"`, `"AIME2025"`, and `"AIME2026"`.
-- [GPQA and GPQA-diamond](../../nemo_rl/data/datasets/eval_datasets/gpqa.py): the corresponding `data.dataset_name` are `"gpqa"` and `"gpqa_diamond"`.
-- [MATH and MATH-500](../../nemo_rl/data/datasets/eval_datasets/math.py): the corresponding `data.dataset_name` are `"math"` and `"math500"`.
-- [MMLU](../../nemo_rl/data/datasets/eval_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU), a total of 14 languages. When `data.dataset_name` is set to `mmlu`, the English version is used. If one wants to run evaluation on another language, `data.dataset_name` should be set to `mmlu_{language}` where `language` is one of following 14 values, `["AR-XY", "BN-BD", "DE-DE", "ES-LA", "FR-FR", "HI-IN", "ID-ID", "IT-IT", "JA-JP", "KO-KR", "PT-BR", "ZH-CN", "SW-KE", "YO-NG"]`.
-- [MMLU-Pro](../../nemo_rl/data/datasets/eval_datasets/mmlu_pro.py): the corresponding `data.dataset_name` is `"mmlu_pro"`.
+- [GPQA and GPQA-diamond](../../nemo_rl/data/datasets/response_datasets/gpqa.py): the corresponding `data.dataset_name` values are `"gpqa"` and `"gpqa_diamond"`.
+- [MATH and MATH-500](../../nemo_rl/data/datasets/response_datasets/math.py): the corresponding `data.dataset_name` values are `"math"` and `"math500"`.
+- [MMLU](../../nemo_rl/data/datasets/response_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU). When `data.dataset_name` is set to `mmlu`, the English version is used. For another language, set `data.dataset_name` to `mmlu_{language}`, where `language` is one of `["AR-XY", "BN-BD", "DE-DE", "EN-US", "ES-LA", "FR-FR", "HI-IN", "ID-ID", "IT-IT", "JA-JP", "KO-KR", "PT-BR", "ZH-CN", "SW-KE", "YO-NG"]`.
+- [MMLU-Pro](../../nemo_rl/data/datasets/response_datasets/mmlu_pro.py): the corresponding `data.dataset_name` is `"mmlu_pro"`.
+- [MMAU](../../nemo_rl/data/datasets/response_datasets/mmau.py): the corresponding `data.dataset_name` values are `"mmau"` and `"TwinkStart/MMAU"`.
+- [Daily-Omni](../../nemo_rl/data/datasets/response_datasets/daily_omni.py): the corresponding `data.dataset_name` is `"daily-omni"`.
 
-Response datasets such as AIME are listed in the [response dataset registry](../../nemo_rl/data/datasets/response_datasets/__init__.py). The remaining eval-only datasets are handled by [load_eval_dataset](../../nemo_rl/data/datasets/eval_datasets/__init__.py).
+Evaluation and training use the same response dataset registry. More details can be found in [load_response_dataset](../../nemo_rl/data/datasets/response_datasets/__init__.py).

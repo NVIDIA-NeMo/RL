@@ -12,38 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Math dataset and its variants."""
+"""MATH response dataset and its variants."""
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from datasets import load_dataset
 
-from nemo_rl.data import processors
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-class MathDataset:
+class MathDataset(RawDataset):
     def __init__(
         self,
         variant: Literal["math_test", "math_500_test"] = "math_test",
-        prompt_file: Optional[str] = None,
-        system_prompt_file: Optional[str] = None,
+        **kwargs,
     ):
-        ds = load_dataset(
+        self.task_name = variant
+
+        dataset = load_dataset(
             "csv",
             data_files=f"https://openaipublic.blob.core.windows.net/simple-evals/{variant}.csv",
             split="train",
         )
-        self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
-        self.task_spec = TaskDataSpec(
-            task_name=f"{variant}",
-            prompt_file=prompt_file,
-            system_prompt_file=system_prompt_file,
+        self.dataset = dataset.map(
+            self._rekey,
+            remove_columns=dataset.column_names,
         )
-        self.processor = processors.math_data_processor
+        self.val_dataset = None
 
-    def _rekey(self, data: dict[str, Any]):
+    def _rekey(self, data: dict[str, Any]) -> dict[str, Any]:
         return {
             "problem": data["Question"],
             "expected_answer": data["Answer"],
+            "task_name": self.task_name,
         }
