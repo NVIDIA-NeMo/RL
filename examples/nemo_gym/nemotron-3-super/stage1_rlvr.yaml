@@ -380,6 +380,7 @@ env:
               enable_multithread_load: true
               num_threads: 112
             compilation_config:
+              cudagraph_mode: NONE  # vllm v0.2 workaround
               cudagraph_capture_sizes: [1,2,4,8,16,32]
           debug: false
 
