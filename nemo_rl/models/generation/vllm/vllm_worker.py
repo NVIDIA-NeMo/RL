@@ -55,13 +55,22 @@ from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
-from nemo_rl.utils.weight_transfer_s3_manifest import (
+from nemo_rl.utils.weight_transfer_remote_sparse import (
     G_VLLM_REFIT_API_KEY_HEADER,
     G_VLLM_REFIT_FLUSH_PATH,
     G_VLLM_REFIT_S3_MANIFEST_PATH,
     download_s3_refit_payload,
     merge_vllm_refit_receiver_timing,
     vllm_refit_api_key,
+)
+from nemo_rl.utils.weight_transfer_zmq import (
+    G_VLLM_REFIT_CHECKSUM_HEADER,
+    G_VLLM_REFIT_PAYLOAD_HEADER,
+    G_VLLM_REFIT_PRODUCER_HEADER,
+    G_VLLM_REFIT_TRANSFER_HEADER,
+    G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
+    ZmqSparseRefitServer,
+    decode_zmq_sparse_payload,
 )
 
 G_REFIT_APPLY_QUEUE_DEPTH_ENV = "NRL_REFIT_APPLY_QUEUE_DEPTH"
@@ -211,6 +220,7 @@ class BaseVllmGenerationWorker:
         self._refit_apply_pending_payloads: list[bytes] = []
         self._refit_apply_payload_count = 0
         self._refit_apply_batch_count = 0
+        self._refit_seen_payloads: dict[tuple[str, int, int], str] = {}
         self._refit_workers_share_node = False
         self._refit_apply_queue_depth = int(
             os.getenv(G_REFIT_APPLY_QUEUE_DEPTH_ENV) or 2
@@ -226,6 +236,8 @@ class BaseVllmGenerationWorker:
         self.refit_server_base_url: str | None = None
         self.refit_server: Any | None = None
         self.refit_server_thread: threading.Thread | None = None
+        self.zmq_refit_server: ZmqSparseRefitServer | None = None
+        self.zmq_refit_server_address: str | None = None
 
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
@@ -629,15 +641,28 @@ class BaseVllmGenerationWorker:
     def _enqueue_sparse_payload_apply(
         self,
         payload: bytes,
+        payload_key: tuple[str, int, int] | None = None,
+        checksum: str | None = None,
     ) -> dict[str, Any]:
         completed: list[Future[dict[str, Any]]] = []
         with self._refit_apply_queue_lock:
+            if payload_key is not None:
+                assert checksum is not None
+                seen_checksum = self._refit_seen_payloads.get(payload_key)
+                if seen_checksum is not None:
+                    if seen_checksum != checksum:
+                        raise ValueError(
+                            "A sparse refit payload ID was reused with different data."
+                        )
+                    return {"ok": True, "payloads": 0, "duplicate": True}
             while self._refit_apply_futures and (
                 self._refit_apply_futures[0].done()
                 or len(self._refit_apply_futures) >= self._refit_apply_queue_depth
             ):
                 completed.append(self._refit_apply_futures.popleft())
             response = self._collect_refit_apply_results(completed)
+            if payload_key is not None:
+                self._refit_seen_payloads[payload_key] = checksum
             self._refit_apply_pending_payloads.append(payload)
             self._refit_apply_payload_count += 1
             if len(self._refit_apply_pending_payloads) == self._refit_apply_batch_size:
@@ -695,6 +720,8 @@ class BaseVllmGenerationWorker:
             self._refit_apply_payload_count = 0
             self._refit_apply_batch_count = 0
         response = self._collect_refit_apply_results(futures, synchronize=True)
+        with self._refit_apply_queue_lock:
+            self._refit_seen_payloads.clear()
         response.update(
             payloads=payload_count,
             batches=batch_count,
@@ -735,6 +762,31 @@ class BaseVllmGenerationWorker:
         result.update(payloads=1, receiver_s3_download_s=download_s)
         return result
 
+    async def _apply_zmq_payload(self, raw_request: Any) -> dict[str, Any]:
+        headers = raw_request.headers
+        transfer_id = headers.get(G_VLLM_REFIT_TRANSFER_HEADER, "")
+        producer_id = int(headers.get(G_VLLM_REFIT_PRODUCER_HEADER, "-1"))
+        payload_id = int(headers.get(G_VLLM_REFIT_PAYLOAD_HEADER, "-1"))
+        checksum = headers.get(G_VLLM_REFIT_CHECKSUM_HEADER, "")
+        if not transfer_id or producer_id < 0 or payload_id < 0 or not checksum:
+            raise ValueError("Missing or invalid ZeroMQ sparse refit payload headers.")
+        compressed = await raw_request.body()
+        started = time.perf_counter()
+        payload = await asyncio.to_thread(
+            decode_zmq_sparse_payload,
+            compressed,
+            checksum,
+        )
+        decode_s = time.perf_counter() - started
+        result = await asyncio.to_thread(
+            self._enqueue_sparse_payload_apply,
+            payload,
+            (transfer_id, producer_id, payload_id),
+            checksum,
+        )
+        result["receiver_zmq_decode_s"] = decode_s
+        return result
+
     def _setup_vllm_refit_api_server(self, app: Any) -> None:
         from fastapi import Request
         from fastapi.responses import JSONResponse
@@ -764,6 +816,23 @@ class BaseVllmGenerationWorker:
                 status_code=200 if result.get("ok") is True else 500,
             )
 
+        async def respond_zmq(raw_request: Request) -> JSONResponse:
+            if (
+                token is not None
+                and raw_request.headers.get(G_VLLM_REFIT_API_KEY_HEADER) != token
+            ):
+                return JSONResponse(
+                    content={"ok": False, "error": "unauthorized"}, status_code=403
+                )
+            try:
+                result = await self._apply_zmq_payload(raw_request)
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+            return JSONResponse(
+                content=result,
+                status_code=200 if result.get("ok") is True else 500,
+            )
+
         @app.post(G_VLLM_REFIT_S3_MANIFEST_PATH)
         async def apply_s3_manifest_refit(raw_request: Request) -> JSONResponse:
             return await respond(raw_request)
@@ -771,6 +840,10 @@ class BaseVllmGenerationWorker:
         @app.post(G_VLLM_REFIT_FLUSH_PATH)
         async def flush_sparse_delta_refit(raw_request: Request) -> JSONResponse:
             return await respond(raw_request, flush=True)
+
+        @app.post(G_VLLM_REFIT_ZMQ_PAYLOAD_PATH)
+        async def apply_zmq_sparse_refit(raw_request: Request) -> JSONResponse:
+            return await respond_zmq(raw_request)
 
     def report_refit_server_base_url(self) -> str | None:
         return self.refit_server_base_url
@@ -820,6 +893,36 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.refit_server = server
         self.refit_server_thread = thread
         print(f"Starting vLLM refit server on {self.refit_server_base_url}", flush=True)
+
+    def start_zmq_sparse_refit_relay(self, refit_urls: list[str]) -> str:
+        if self.zmq_refit_server is not None:
+            assert self.zmq_refit_server_address is not None
+            return self.zmq_refit_server_address
+        port = self.cfg["vllm_cfg"].get(
+            "zmq_refit_server_port"
+        ) or _get_free_port_local(
+            self.cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
+            self.cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
+        )
+        self.zmq_refit_server = ZmqSparseRefitServer(
+            refit_urls,
+            bind_address=f"tcp://0.0.0.0:{port}",
+            api_key_env_var=self.cfg["vllm_cfg"].get("http_refit_api_key_env_var"),
+            timeout_s=float(os.getenv("NRL_REFIT_ZMQ_TIMEOUT_S") or 600.0),
+        )
+        self.zmq_refit_server.start()
+        self.zmq_refit_server_address = f"tcp://{_get_node_ip_local()}:{port}"
+        print(
+            f"Starting vLLM ZeroMQ refit relay on {self.zmq_refit_server_address}",
+            flush=True,
+        )
+        return self.zmq_refit_server_address
+
+    def stop_zmq_sparse_refit_relay(self) -> None:
+        if self.zmq_refit_server is not None:
+            self.zmq_refit_server.close()
+        self.zmq_refit_server = None
+        self.zmq_refit_server_address = None
 
     def init_collective(
         self,
@@ -1289,6 +1392,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            self.stop_zmq_sparse_refit_relay()
             if self.refit_server is not None:
                 self.refit_server.should_exit = True
 

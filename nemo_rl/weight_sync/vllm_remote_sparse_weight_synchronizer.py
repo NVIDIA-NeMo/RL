@@ -12,31 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""S3 manifest weight synchronizer for remote non-colocated vLLM refit."""
+"""Shared S3/ZeroMQ sparse synchronizer for remote non-colocated vLLM refit."""
 
 import time
+import uuid
 from contextlib import nullcontext
 from typing import Any
 
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.weight_transfer_s3_manifest import flush_vllm_refit_urls
+from nemo_rl.utils.weight_transfer_remote_sparse import flush_vllm_refit_urls
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
-class VllmS3SparseWeightSynchronizer(WeightSynchronizer):
+class _VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
     def __init__(
         self,
         policy: Any,
         generation: Any,
         *,
+        transport: str,
         api_key_env_var: str | None = None,
         request_timeout_s: float = 600.0,
     ) -> None:
         self._policy = policy
         self._generation = generation
+        self._transport = transport
         self._refit_urls: list[str] = []
+        self._refit_addresses: list[str] = []
         self._api_key_env_var = api_key_env_var
         self._request_timeout_s = request_timeout_s
         self._stale = True
@@ -58,22 +62,28 @@ class VllmS3SparseWeightSynchronizer(WeightSynchronizer):
             if self._baseline_commit_refs is not None:
                 ray.get(self._baseline_commit_refs)
                 self._baseline_commit_refs = None
-            flush_success = self._generation.invalidate_kv_cache()
-            if not flush_success:
-                print("vLLM KV cache invalidation failed before S3 weight update.")
+            if not self._generation.invalidate_kv_cache():
+                print(
+                    f"vLLM KV cache invalidation failed before {self._transport} "
+                    "weight update."
+                )
 
             if self._baseline_init_refs is not None:
                 ray.get(self._baseline_init_refs)
                 self._baseline_init_refs = None
             succeeded = False
             try:
-                results = ray.get(
-                    self._policy.stream_sparse_weights_via_s3_manifest(
-                        self._refit_urls,
-                        api_key_env_var=self._api_key_env_var,
-                        timeout_s=self._request_timeout_s,
-                    )
+                transfer_id = uuid.uuid4().hex
+                refs = self._policy.stream_remote_sparse_weights(
+                    self._transport,
+                    self._refit_urls
+                    if self._transport == "s3"
+                    else self._refit_addresses,
+                    transfer_id=transfer_id,
+                    api_key_env_var=self._api_key_env_var,
+                    timeout_s=self._request_timeout_s,
                 )
+                results = ray.get(refs)
                 payloads = sum(int(result["payloads"]) for result in results)
                 if payloads:
                     started = time.perf_counter()
@@ -83,8 +93,8 @@ class VllmS3SparseWeightSynchronizer(WeightSynchronizer):
                         timeout_s=self._request_timeout_s,
                     )
                     print(
-                        "REFIT_S3_GLOBAL_FLUSH "
-                        f"payloads={payloads} "
+                        f"REFIT_{self._transport.upper()}_GLOBAL_COMMIT "
+                        f"transfer_id={transfer_id} payloads={payloads} "
                         f"seconds={time.perf_counter() - started:.3f}",
                         flush=True,
                     )
@@ -103,11 +113,17 @@ class VllmS3SparseWeightSynchronizer(WeightSynchronizer):
         self._stale = True
 
     def init_communicator(self) -> None:
-        self._baseline_init_refs = self._policy.init_remote_sparse_delta_baseline()
+        self._baseline_init_refs = self._policy.init_remote_sparse_delta_baseline(
+            self._transport
+        )
         self._refit_urls = self._generation.report_refit_server_base_urls()
-        if not self._refit_urls:
+        if self._transport == "zmq":
+            self._refit_addresses = self._generation.start_zmq_sparse_refit_relays()
+        if not self._refit_urls or (
+            self._transport == "zmq" and not self._refit_addresses
+        ):
             raise ValueError(
-                "vLLM S3 sparse refit requires expose_http_refit_server=true."
+                f"vLLM {self._transport} sparse refit endpoints are missing."
             )
         self._stale = False
 
@@ -116,7 +132,20 @@ class VllmS3SparseWeightSynchronizer(WeightSynchronizer):
             self._baseline_commit_refs or []
         ):
             ray.cancel(ref, force=False)
+        if self._transport == "zmq":
+            self._generation.stop_zmq_sparse_refit_relays()
         self._baseline_init_refs = None
         self._baseline_commit_refs = None
         self._refit_urls = []
+        self._refit_addresses = []
         self._stale = True
+
+
+class VllmS3SparseWeightSynchronizer(_VllmRemoteSparseWeightSynchronizer):
+    def __init__(self, policy: Any, generation: Any, **kwargs: Any) -> None:
+        super().__init__(policy, generation, transport="s3", **kwargs)
+
+
+class VllmZmqSparseWeightSynchronizer(_VllmRemoteSparseWeightSynchronizer):
+    def __init__(self, policy: Any, generation: Any, **kwargs: Any) -> None:
+        super().__init__(policy, generation, transport="zmq", **kwargs)

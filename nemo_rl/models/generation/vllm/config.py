@@ -45,6 +45,8 @@ class VllmSpecificArgs(TypedDict):
     http_refit_api_key_env_var: NotRequired[str | None]
     # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
     http_refit_server_port: NotRequired[int | None]
+    # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
+    zmq_refit_server_port: NotRequired[int | None]
     # These kwargs are passed to the vllm.LLM HTTP server Chat Completions endpoint config. Typically this will include things like tool parser, chat template, etc
     http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
     # Miscellaneous top level vLLM HTTP server arguments.
@@ -68,8 +70,8 @@ class VllmDeltaCompressionConfig(TypedDict):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
-    # Null uses the existing NCCL refit; "vllm_s3_sparse" uses S3 sparse deltas.
-    refit_transport: NotRequired[Literal["vllm_s3_sparse"] | None]
+    # Null uses NCCL; remote sparse refit supports S3 or ZeroMQ value planes.
+    refit_transport: NotRequired[Literal["vllm_s3_sparse", "vllm_zmq_sparse"] | None]
     delta_compression: NotRequired[VllmDeltaCompressionConfig | None]
 
     # quantization config

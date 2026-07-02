@@ -941,6 +941,26 @@ class VllmGeneration(GenerationInterface):
         )
         return [url for url in ray.get(futures) if url]
 
+    def start_zmq_sparse_refit_relays(self) -> list[str]:
+        """Start one ZeroMQ relay per vLLM replica and return TCP addresses."""
+        refit_urls = self.report_refit_server_base_urls()
+        futures = self.worker_group.run_all_workers_single_data(
+            "start_zmq_sparse_refit_relay",
+            refit_urls=refit_urls,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return [address for address in ray.get(futures) if address]
+
+    def stop_zmq_sparse_refit_relays(self) -> None:
+        if not self.worker_group or not self.worker_group.workers:
+            return
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "stop_zmq_sparse_refit_relay",
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+        )
+
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""
         if not self.worker_group or not self.worker_group.workers:

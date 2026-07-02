@@ -19,7 +19,7 @@ import sys
 import threading
 import types
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -173,6 +173,7 @@ def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
     worker._refit_apply_pending_payloads = []
     worker._refit_apply_payload_count = 0
     worker._refit_apply_batch_count = 0
+    worker._refit_seen_payloads = {}
     worker._refit_apply_queue_depth = 2
     worker._refit_apply_batch_size = 3
     worker.llm = MagicMock()
@@ -205,6 +206,55 @@ def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
     assert response["batches"] == 2
     assert sum(result.get("receiver_total_s", 0.0) for result in responses) == 5.0
     worker.llm.collective_rpc.assert_called_once_with("synchronize_device", args=())
+
+
+def test_sparse_refit_queue_deduplicates_transactional_payloads() -> None:
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    worker._refit_apply_queue_lock = threading.Lock()
+    worker._refit_apply_executor = ThreadPoolExecutor(max_workers=1)
+    worker._refit_apply_futures = deque()
+    worker._refit_apply_pending_payloads = []
+    worker._refit_apply_payload_count = 0
+    worker._refit_apply_batch_count = 0
+    worker._refit_seen_payloads = {}
+    worker._refit_apply_queue_depth = 2
+    worker._refit_apply_batch_size = 2
+    worker.llm = MagicMock()
+    worker.update_weights_from_serialized_sparse_payloads = MagicMock(
+        return_value={"ok": True, "payloads": 1}
+    )
+    key = ("transfer", 0, 1)
+    try:
+        assert worker._enqueue_sparse_payload_apply(b"payload", key, "checksum")["ok"]
+        duplicate = worker._enqueue_sparse_payload_apply(b"payload", key, "checksum")
+        assert duplicate == {"ok": True, "payloads": 0, "duplicate": True}
+        with pytest.raises(ValueError, match="reused with different data"):
+            worker._enqueue_sparse_payload_apply(b"other", key, "different")
+        response = worker._flush_queued_sparse_payloads()
+    finally:
+        worker._refit_apply_executor.shutdown(wait=True)
+
+    assert response["payloads"] == 1
+    assert worker._refit_seen_payloads == {}
+
+
+def test_sparse_refit_queue_does_not_deduplicate_failed_enqueue() -> None:
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    failed = Future()
+    failed.set_exception(RuntimeError("prior apply failed"))
+    worker._refit_apply_queue_lock = threading.Lock()
+    worker._refit_apply_futures = deque([failed])
+    worker._refit_apply_pending_payloads = []
+    worker._refit_seen_payloads = {}
+    worker._refit_apply_queue_depth = 2
+
+    with pytest.raises(RuntimeError, match="prior apply failed"):
+        worker._enqueue_sparse_payload_apply(
+            b"payload", ("transfer", 0, 1), "checksum"
+        )
+
+    assert worker._refit_seen_payloads == {}
+    assert worker._refit_apply_pending_payloads == []
 
 
 def test_sparse_refit_batch_uses_one_collective_rpc(tmp_path: Path) -> None:
@@ -547,6 +597,17 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
 def test_configure_generation_config_uses_real_s3_delta_baseline():
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["refit_transport"] = "vllm_s3_sparse"
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_uses_real_zmq_delta_baseline():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = "vllm_zmq_sparse"
 
     configured = configure_generation_config(
         vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
