@@ -597,6 +597,8 @@ def setup_model_config(
         weights_path,
         optimizer_path,
         load_main_params_from_ckpt,
+        overrides=config["megatron_cfg"].get("checkpoint"),
+        hf_model_name=hf_model_name,
     )
 
     # Validate training configuration
@@ -912,9 +914,19 @@ def _create_checkpoint_config(
     weights_path: Optional[str],
     optimizer_path: Optional[str],
     load_main_params_from_ckpt: bool = False,
+    overrides: Optional[dict[str, Any]] = None,
+    hf_model_name: Optional[str] = None,
 ) -> CheckpointConfig:
-    """Create checkpoint configurations."""
-    return CheckpointConfig(
+    """Create checkpoint configurations.
+
+    `overrides` (from `policy.megatron_cfg.checkpoint`) is applied field-by-field
+    onto the CheckpointConfig, so callers can opt into megatron-bridge checkpoint
+    features NeMo-RL doesn't surface explicitly (e.g. inline HF export via
+    `also_save_hf_checkpoint`). When HF export is requested without an explicit
+    `hf_source_path`, it defaults to `hf_model_name` (the config/tokenizer
+    template megatron-bridge needs to build the AutoBridge).
+    """
+    ckpt = CheckpointConfig(
         save_interval=100,
         save=weights_path,
         load=weights_path,
@@ -926,6 +938,21 @@ def _create_checkpoint_config(
         load_rng=False,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
+    for key, value in (overrides or {}).items():
+        if hasattr(ckpt, key):
+            setattr(ckpt, key, value)
+        else:
+            warnings.warn(
+                f"Ignoring unknown megatron_cfg.checkpoint override '{key}'.",
+                stacklevel=2,
+            )
+    if (
+        getattr(ckpt, "also_save_hf_checkpoint", False)
+        and not getattr(ckpt, "hf_source_path", None)
+        and hf_model_name
+    ):
+        ckpt.hf_source_path = hf_model_name
+    return ckpt
 
 
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
