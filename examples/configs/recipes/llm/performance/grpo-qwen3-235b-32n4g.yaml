@@ -11,4 +11,3 @@ policy:
       gpu_memory_utilization: 0.6
 cluster:
   num_nodes: 32
-  segment_size: 16
