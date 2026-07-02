@@ -11,7 +11,8 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  # ensures divisibility by 2*TP*CP (required for context parallel load balancing)
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
   optimizer: null
   scheduler: null
 
@@ -23,7 +24,8 @@ value:
     enabled: false
   megatron_cfg:
     enabled: true
-  make_sequence_length_divisible_by: ${value.megatron_cfg.tensor_model_parallel_size}
+  # ensures divisibility by 2*TP*CP (required for context parallel load balancing)
+  make_sequence_length_divisible_by: ${mul:${mul:${value.megatron_cfg.tensor_model_parallel_size}, ${value.megatron_cfg.context_parallel_size}}, 2}
   optimizer: null
   scheduler: null
 

@@ -387,6 +387,24 @@ def validate_and_prepare_config(
             "Refer to https://github.com/NVIDIA/NeMo-RL/blob/main/docs/model-quirks.md#context-parallel-with-fsdp2 for more details."
         )
 
+    # Validate make_sequence_length_divisible_by against CP/TP constraints
+    # (mirrors the Megatron-side check in _get_pack_sequence_parameters_for_megatron)
+    make_seq_div_by = config["make_sequence_length_divisible_by"]
+    minimum_pad_factor = 1
+    if cp_size > 1:
+        minimum_pad_factor *= cp_size * 2
+    if tp_size > 1 and sequence_parallel_enabled:
+        minimum_pad_factor *= tp_size
+    if make_seq_div_by % minimum_pad_factor != 0:
+        raise ValueError(
+            f"make_sequence_length_divisible_by ({make_seq_div_by}) is not a multiple "
+            f"of the minimum pad factor ({minimum_pad_factor}).\n"
+            f"Please set make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
+            f"    - If CP is enabled (cp_size > 1), the minimum pad factor includes `cp_size * 2`.\n"
+            f"    - If TP+SP is enabled (tp_size > 1 and sequence_parallel), it includes `tp_size`.\n"
+            f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
+        )
+
     if sequence_parallel_enabled and tp_size == 1:
         print(
             "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. "
