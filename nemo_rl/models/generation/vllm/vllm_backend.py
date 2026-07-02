@@ -149,6 +149,12 @@ class VllmInternalWorkerExtension:
 
         return get_device_uuid(self.device.index)
 
+    def report_node_hostname(self) -> str:
+        """Return the host shared by worker processes on this node."""
+        import socket
+
+        return socket.gethostname()
+
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""
         return f"ipc:///tmp/{self.report_device_id()}.sock"
@@ -1021,11 +1027,20 @@ class VllmInternalWorkerExtension:
         synchronize: bool = True,
     ) -> dict[str, Any]:
         """Apply one serialized sparse-delta payload received from S3."""
+        return self._load_and_apply_sparse_payload(
+            io.BytesIO(serialized_payload), synchronize
+        )
+
+    def _load_and_apply_sparse_payload(
+        self,
+        source: str | io.BytesIO,
+        synchronize: bool,
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         payload = cast(
             sparse_codec.TensorPayload,
             torch.load(
-                io.BytesIO(serialized_payload),
+                source,
                 map_location="cpu",
                 weights_only=True,
             ),
@@ -1035,6 +1050,33 @@ class VllmInternalWorkerExtension:
         result["receiver_deserialize_s"] = deserialize_s
         result["receiver_total_s"] = time.perf_counter() - started
         return result
+
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_sparse_payload_files"
+    )
+    def update_weights_from_sparse_payload_files(
+        self,
+        *payload_paths: str,
+        synchronize: bool = True,
+    ) -> dict[str, Any]:
+        """Apply sparse payloads in FIFO order with one final sync."""
+        if not payload_paths:
+            raise ValueError("A sparse refit batch must contain at least one payload.")
+        started = time.perf_counter()
+        deserialize_s = 0.0
+        sparse_apply_s = 0.0
+        for path in payload_paths:
+            result = self._load_and_apply_sparse_payload(path, synchronize=False)
+            deserialize_s += float(result["receiver_deserialize_s"])
+            sparse_apply_s += float(result["receiver_sparse_apply_s"])
+        if synchronize and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        return {
+            "ok": True,
+            "receiver_deserialize_s": deserialize_s,
+            "receiver_sparse_apply_s": sparse_apply_s,
+            "receiver_total_s": time.perf_counter() - started,
+        }
 
     def _apply_sparse_request(
         self,

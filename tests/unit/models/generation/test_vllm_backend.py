@@ -118,6 +118,45 @@ def _assert_sparse_plan(
 
 
 @pytest.mark.vllm
+def test_serialized_sparse_payload_batch_preserves_order(tmp_path) -> None:
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.device = torch.device("cpu")
+    payloads = [
+        (torch.tensor([index]), torch.tensor([float(index)]), {"index": index})
+        for index in range(3)
+    ]
+    paths = [tmp_path / f"{index}.pt" for index in range(3)]
+    for path, payload in zip(paths, payloads, strict=True):
+        torch.save(payload, path)
+    applied: list[tuple[Any, bool]] = []
+
+    def apply(payload: Any, *, synchronize: bool) -> dict[str, Any]:
+        applied.append((payload, synchronize))
+        return {
+            "ok": True,
+            "receiver_sparse_apply_s": 2.0,
+        }
+
+    ext._apply_sparse_request = apply
+    result = ext.update_weights_from_sparse_payload_files(
+        *(str(path) for path in paths), synchronize=False
+    )
+
+    assert [item[0][2]["index"] for item in applied] == [0, 1, 2]
+    assert all(
+        torch.equal(item[0][1], payload[1])
+        for item, payload in zip(applied, payloads, strict=True)
+    )
+    assert all(not synchronize for _, synchronize in applied)
+    assert result["receiver_deserialize_s"] >= 0.0
+    assert result["receiver_sparse_apply_s"] == 6.0
+
+
+@pytest.mark.vllm
 def test_direct_sparse_delta_placement() -> None:
     qkv_name = "model.layers.0.self_attn.qkv_proj.weight"
     qkv_target = _attach_tensor_attrs(torch.zeros(8, 2), output_dim=0)
