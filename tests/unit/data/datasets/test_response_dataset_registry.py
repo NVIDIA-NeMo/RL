@@ -126,6 +126,30 @@ def test_load_response_dataset_builtin_registry_present():
     assert "ResponseDataset" in RESPONSE_REGISTRY
 
 
+def test_eval_datasets_are_available_from_response_registry():
+    expected_names = {
+        "AIME2024",
+        "AIME2025",
+        "AIME2026",
+        "gpqa",
+        "gpqa_diamond",
+        "math",
+        "math500",
+        "mmlu",
+        "mmlu_ZH-CN",
+        "mmlu_pro",
+        "mmau",
+        "TwinkStart/MMAU",
+        "daily-omni",
+    }
+    assert expected_names <= RESPONSE_REGISTRY.keys()
+
+
+@pytest.mark.parametrize("name", ["aime2024", "aime2025", "aime2026"])
+def test_legacy_lowercase_aime_names_are_removed(name):
+    assert name not in RESPONSE_REGISTRY
+
+
 def test_load_response_dataset_uses_external_class(stub_module):
     config = {
         "dataset_name": f"{stub_module}.StubResponseDataset",

@@ -9,6 +9,7 @@ generation:
 data:
   prompt_file: "examples/prompts/gpqa.txt"
   dataset_name: "gpqa"
+  processor: "multichoice_qa_processor"
 
 env:
   math:

@@ -7,6 +7,7 @@ generation:
 data:
   prompt_file: "examples/prompts/mmlu.txt"
   dataset_name: "mmlu"
+  processor: "multichoice_qa_processor"
 
 env:
   math:

@@ -12,35 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPQA dataset and its variants."""
+"""GPQA response dataset and its variants."""
 
 import random
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from datasets import load_dataset
 
-from nemo_rl.data import processors
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-class GPQADataset:
+class GPQADataset(RawDataset):
     def __init__(
         self,
         variant: Literal["diamond", "main"] = "diamond",
-        prompt_file: Optional[str] = None,
-        system_prompt_file: Optional[str] = None,
+        seed: int | None = None,
+        **kwargs,
     ):
-        ds = load_dataset("Idavidrein/gpqa", f"gpqa_{variant}", split="train")
-        self._rng = random.Random()
-        self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
-        self.task_spec = TaskDataSpec(
-            task_name=f"GPQA_{variant}",
-            prompt_file=prompt_file,
-            system_prompt_file=system_prompt_file,
-        )
-        self.processor = processors.multichoice_qa_processor
+        self.task_name = f"GPQA_{variant}"
+        self._rng = random.Random(seed)
 
-    def _rekey(self, data: dict[str, Any]):
+        dataset = load_dataset("Idavidrein/gpqa", f"gpqa_{variant}", split="train")
+        self.dataset = dataset.map(
+            self._rekey,
+            remove_columns=dataset.column_names,
+        )
+        self.val_dataset = None
+
+    def _rekey(self, data: dict[str, Any]) -> dict[str, Any]:
         choices = [
             data["Correct Answer"],
             data["Incorrect Answer 1"],
@@ -60,4 +59,5 @@ class GPQADataset:
                 D=choices[3],
             ),
             "answer": correct_answer,
+            "task_name": self.task_name,
         }
