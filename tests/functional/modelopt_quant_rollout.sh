@@ -60,7 +60,7 @@ run_quant_rollout_case() {
 
     cd "$PROJECT_ROOT"
     NRL_MEGATRON_CHECKPOINT_DIR="$megatron_cache_dir" \
-    uv run --extra modelopt --group test \
+    uv run --no-sync --extra modelopt --group test \
         coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PROJECT_ROOT/nemo_rl" \
         "$PROJECT_ROOT/examples/run_grpo.py" \
         --config "$PROJECT_ROOT/examples/modelopt/qa_grpo_math_megatron.yaml" \
@@ -96,9 +96,9 @@ run_quant_rollout_case() {
         "$@" \
         2>&1 | tee "$run_log"
 
-    uv run --extra modelopt --group test tests/json_dump_tb_logs.py "$log_dir" --output_path "$metrics_json"
+    uv run --no-sync --extra modelopt --group test tests/json_dump_tb_logs.py "$log_dir" --output_path "$metrics_json"
 
-    uv run --extra modelopt --group test tests/check_metrics.py "$metrics_json" \
+    uv run --no-sync --extra modelopt --group test tests/check_metrics.py "$metrics_json" \
         "data[\"train/gen_kl_error\"][\"1\"] < $gen_kl_error_step1_max" \
         "max(data[\"train/token_mult_prob_error\"]) < $token_mult_prob_error_max"
 
@@ -109,7 +109,6 @@ run_quant_rollout_case() {
         assert_not_grep "VLLM_QUANT_CFG" "$run_log"
     else
         assert_grep "FakeQuantWorker" "$run_log"
-        assert_grep "VLLM_QUANT_CFG" "$run_log"
         assert_not_grep "Detected ModelOpt NVFP4 checkpoint" "$run_log"
     fi
 }

@@ -160,7 +160,11 @@ def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
         )
         or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
@@ -209,7 +213,11 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
         "quantize",
         lambda model_arg, cfg, forward_loop: calls.append(forward_loop) or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
@@ -255,7 +263,11 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
         )
         or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,

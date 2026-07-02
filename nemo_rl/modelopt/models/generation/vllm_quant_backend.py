@@ -22,7 +22,6 @@ import vllm  # noqa: F401
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
 from nemo_rl.modelopt.utils import (
-    iter_quant_ignore_name_candidates,
     matches_quant_ignore_pattern,
 )
 from nemo_rl.models.generation.vllm.vllm_backend import VllmInternalWorkerExtension
@@ -88,33 +87,12 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 self.model_runner.vllm_config.model_config.hf_config.quantization_config
             )
             ignore_patterns = quant_config.get("ignore", []) or []
-            # Built lazily on first use: only the rare ignored, floating-point
-            # weights (typically just lm_head) need a parameter lookup, so most
-            # refit chunks skip the full named_parameters() scan entirely.
-            params = None
             filtered = []
             for name, weight in weights:
                 suffix = name.rsplit(".", 1)[-1]
                 ignored = matches_quant_ignore_pattern(name, ignore_patterns)
                 if ignored and suffix in {"weight_scale", "weight_scale_2"}:
                     continue
-
-                if ignored and suffix == "weight" and weight.is_floating_point():
-                    if params is None:
-                        params = dict(self.model_runner.model.named_parameters())
-                    copied = False
-                    for candidate in iter_quant_ignore_name_candidates(name):
-                        param = params.get(candidate)
-                        if param is not None and tuple(param.shape) == tuple(
-                            weight.shape
-                        ):
-                            param.data.copy_(
-                                weight.to(device=param.device, dtype=param.dtype)
-                            )
-                            copied = True
-                            break
-                    if copied:
-                        continue
 
                 filtered.append((name, weight))
             weights = filtered

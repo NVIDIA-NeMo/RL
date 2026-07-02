@@ -13,29 +13,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""vLLM ModelOpt NVFP4 patches for dense rollout weight reloads."""
+"""vLLM ModelOpt NVFP4 patches for rollout weight reloads.
+
+These patches target vLLM 0.20.0 internals. Revalidate the imported APIs,
+method signatures, and tensor layouts whenever vLLM is upgraded.
+"""
+
+from typing import Any
 
 import torch
 from torch.nn import Parameter
 
 _DENSE_HF_PARAMS = ("weight", "weight_scale", "weight_scale_2")
+_MOE_HF_PARAMS = (
+    "w13_weight",
+    "w13_weight_scale",
+    "w13_weight_scale_2",
+    "w13_input_scale",
+    "w2_weight",
+    "w2_weight_scale",
+    "w2_weight_scale_2",
+    "w2_input_scale",
+)
+_MOE_INPUT_SCALE_PARAMS = ("w13_input_scale", "w2_input_scale")
+_MOE_MARLIN_TENSOR_PARAMS = _MOE_HF_PARAMS[:3] + _MOE_HF_PARAMS[4:7]
 _MODELOPT_W4A16_QUANT_MODES = frozenset({"w4a16_nvfp4", "nvfp4_w4a16"})
 _MODELOPT_W4A16_ATTR = "_nrl_weight_only_w4a16"
+_MODELOPT_W4A16_MOE_MARLIN_TILE_N = 64
+_MODELOPT_PARAM_META_ATTR = "_nrl_modelopt_param_meta"
+_MODELOPT_WEIGHT_LOADERS_ATTR = "_nrl_modelopt_weight_loaders"
+_MODELOPT_RELOAD_PARAM_ATTRS = ("quant_method",)
 _ORIGINAL_NVFP4_CONFIG_FROM_CONFIG_ATTR = "_nrl_original_from_config"
 _ORIGINAL_LINEAR_APPLY_ATTR = "_nrl_original_apply"
+_ORIGINAL_FUSED_MOE_INIT_ATTR = "_nrl_original_init"
+_ORIGINAL_FUSED_MOE_ROUNDUP_SIZES_ATTR = "_nrl_original_maybe_roundup_sizes"
+_ORIGINAL_FUSED_MOE_PROCESS_WEIGHTS_ATTR = "_nrl_original_process_weights_after_loading"
+_ORIGINAL_KV_CACHE_PROCESS_WEIGHTS_ATTR = (
+    "_nrl_original_kv_cache_process_weights_after_loading"
+)
+_MODELOPT_PROCESS_WEIGHTS_CALL_COUNT_ATTR = "_nrl_process_weights_call_count"
+_MODELOPT_PROCESSED_TENSOR_REFS_ATTR = "_nrl_modelopt_processed_tensor_refs"
 
 
 def _unwrap_vllm_model(model: torch.nn.Module) -> torch.nn.Module:
     return model.model if hasattr(model, "model") else model
 
 
-def _canonicalize_nvfp4_weight_scale(layer: torch.nn.Module) -> None:
-    weight_scale = layer.weight_scale
-    scale = weight_scale.data.to(torch.float32).abs().to(weight_scale.dtype)
-    weight_scale.data.copy_(scale)
+def _canonicalize_nvfp4_scale_parameter(
+    layer: torch.nn.Module,
+    param_name: str,
+) -> None:
+    param = getattr(layer, param_name)
+    scale = param.data.to(torch.float32).abs().to(param.dtype)
+    param.data.copy_(scale)
 
 
-def _requests_w4a16_modelopt_config(config: dict) -> bool:
+def _canonicalize_dense_nvfp4_weight_scale(layer: torch.nn.Module) -> None:
+    _canonicalize_nvfp4_scale_parameter(layer, "weight_scale")
+
+
+def _canonicalize_moe_nvfp4_weight_scales(layer: torch.nn.Module) -> None:
+    _canonicalize_nvfp4_scale_parameter(layer, "w13_weight_scale")
+    _canonicalize_nvfp4_scale_parameter(layer, "w2_weight_scale")
+
+
+def _requests_w4a16_modelopt_config(config: dict[str, Any]) -> bool:
     quant_mode = config.get("quant_mode")
     if (
         isinstance(quant_mode, str)
@@ -49,11 +91,40 @@ def _requests_w4a16_modelopt_config(config: dict) -> bool:
     return isinstance(nested, dict) and _requests_w4a16_modelopt_config(nested)
 
 
-def _is_w4a16_modelopt_quant_config(quant_config) -> bool:
+def _is_w4a16_modelopt_quant_config(quant_config: object) -> bool:
     return bool(getattr(quant_config, _MODELOPT_W4A16_ATTR, False))
 
 
-def _modelopt_nvfp4_config_from_config(cls, *args, **kwargs):
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _is_w4a16_marlin_moe_quant_method(quant_method: object) -> bool:
+    backend = getattr(quant_method, "nvfp4_backend", None)
+    return (
+        quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoE"
+        and _is_w4a16_modelopt_quant_config(getattr(quant_method, "quant_config", None))
+        and getattr(backend, "value", backend) == "MARLIN"
+    )
+
+
+def _stash_original(cls: type, attr: str, value: object) -> None:
+    if not hasattr(cls, attr):
+        setattr(cls, attr, value)
+
+
+def _require_fp4_marlin_supported() -> None:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        is_fp4_marlin_supported,
+    )
+
+    if not is_fp4_marlin_supported():
+        raise RuntimeError(
+            "ModelOpt NVFP4 W4A16 rollout requires vLLM FP4 Marlin support."
+        )
+
+
+def _modelopt_nvfp4_config_from_config(cls, *args: Any, **kwargs: Any) -> object:
     original_from_config = getattr(cls, _ORIGINAL_NVFP4_CONFIG_FROM_CONFIG_ATTR)
     quant_config = original_from_config(*args, **kwargs)
 
@@ -66,7 +137,10 @@ def _modelopt_nvfp4_config_from_config(cls, *args, **kwargs):
     return quant_config
 
 
-def _convert_nvfp4_linear_kernel_format(quant_method, layer: torch.nn.Module) -> None:
+def _convert_nvfp4_linear_kernel_format(
+    quant_method: object,
+    layer: torch.nn.Module,
+) -> None:
     kernel = getattr(quant_method, "kernel", None)
     if kernel is not None:
         kernel.process_weights_after_loading(layer)
@@ -79,23 +153,21 @@ def _convert_nvfp4_linear_kernel_format(quant_method, layer: torch.nn.Module) ->
     convert_to_nvfp4_linear_kernel_format(quant_method.backend, layer)
 
 
-def _convert_w4a16_linear_kernel_format(layer: torch.nn.Module) -> None:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-        prepare_fp4_layer_for_marlin,
-    )
+def _capture_modelopt_param_reload_meta(
+    layer: torch.nn.Module,
+    param_names: tuple[str, ...],
+) -> None:
+    param_meta = getattr(layer, _MODELOPT_PARAM_META_ATTR, None)
+    if param_meta is None:
+        param_meta = {}
+        setattr(layer, _MODELOPT_PARAM_META_ATTR, param_meta)
+    weight_loaders = getattr(layer, _MODELOPT_WEIGHT_LOADERS_ATTR, None)
+    if weight_loaders is None:
+        weight_loaders = {}
+        setattr(layer, _MODELOPT_WEIGHT_LOADERS_ATTR, weight_loaders)
 
-    prepare_fp4_layer_for_marlin(layer)
-
-
-def _capture_modelopt_dense_param_reload_meta(layer: torch.nn.Module) -> None:
-    if not hasattr(layer, "_nrl_modelopt_param_meta"):
-        layer._nrl_modelopt_param_meta = {}
-        layer._nrl_modelopt_weight_loaders = {}
-    elif not hasattr(layer, "_nrl_modelopt_weight_loaders"):
-        layer._nrl_modelopt_weight_loaders = {}
-
-    for param_name in _DENSE_HF_PARAMS:
-        if param_name in layer._nrl_modelopt_param_meta:
+    for param_name in param_names:
+        if param_name in param_meta:
             continue
         param = getattr(layer, param_name)
         meta = {
@@ -108,14 +180,50 @@ def _capture_modelopt_dense_param_reload_meta(layer: torch.nn.Module) -> None:
             meta["input_dim"] = param._input_dim
         if hasattr(param, "_output_dim"):
             meta["output_dim"] = param._output_dim
-        layer._nrl_modelopt_param_meta[param_name] = meta
+        attrs = {
+            attr: getattr(param, attr)
+            for attr in _MODELOPT_RELOAD_PARAM_ATTRS
+            if hasattr(param, attr)
+        }
+        if attrs:
+            meta["attrs"] = attrs
+        param_meta[param_name] = meta
         if hasattr(param, "weight_loader"):
-            layer._nrl_modelopt_weight_loaders[param_name] = param.weight_loader
+            weight_loaders[param_name] = param.weight_loader
+
+
+def _is_first_modelopt_process_weights_call(layer: torch.nn.Module) -> bool:
+    count = getattr(layer, _MODELOPT_PROCESS_WEIGHTS_CALL_COUNT_ATTR, 0)
+    setattr(layer, _MODELOPT_PROCESS_WEIGHTS_CALL_COUNT_ATTR, count + 1)
+    return count == 0
+
+
+def _set_or_update_processed_tensor_ref(
+    layer: torch.nn.Module,
+    param_name: str,
+    data: torch.Tensor,
+    is_first_call: bool,
+) -> None:
+    refs = getattr(layer, _MODELOPT_PROCESSED_TENSOR_REFS_ATTR, None)
+    if refs is None:
+        refs = {}
+        setattr(layer, _MODELOPT_PROCESSED_TENSOR_REFS_ATTR, refs)
+
+    ref = refs.get(param_name)
+    if is_first_call or ref is None:
+        setattr(layer, param_name, Parameter(data, requires_grad=False))
+        refs[param_name] = getattr(layer, param_name).data
+        return
+
+    ref.copy_(data)
+    setattr(layer, param_name, Parameter(ref, requires_grad=False))
 
 
 def _modelopt_dense_process_w4a16_weights(self, layer: torch.nn.Module) -> None:
     """Convert dense ModelOpt NVFP4 W4A16 weights for Marlin weight-only GEMM."""
-    _capture_modelopt_dense_param_reload_meta(layer)
+    _require_fp4_marlin_supported()
+    _capture_modelopt_param_reload_meta(layer, _DENSE_HF_PARAMS)
+    is_first_call = _is_first_modelopt_process_weights_call(layer)
 
     weight_global_scale = layer.weight_scale_2.max().to(torch.float32)
     layer.weight_global_scale = Parameter(weight_global_scale, requires_grad=False)
@@ -130,8 +238,19 @@ def _modelopt_dense_process_w4a16_weights(self, layer: torch.nn.Module) -> None:
         if hasattr(layer, attr):
             delattr(layer, attr)
 
-    _canonicalize_nvfp4_weight_scale(layer)
-    _convert_w4a16_linear_kernel_format(layer)
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        prepare_fp4_layer_for_marlin,
+    )
+
+    _canonicalize_dense_nvfp4_weight_scale(layer)
+    prepare_fp4_layer_for_marlin(layer)
+    for param_name in ("weight", "weight_scale", "weight_global_scale"):
+        _set_or_update_processed_tensor_ref(
+            layer,
+            param_name,
+            getattr(layer, param_name).data,
+            is_first_call=is_first_call,
+        )
 
 
 def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
@@ -140,7 +259,7 @@ def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
         _modelopt_dense_process_w4a16_weights(self, layer)
         return
 
-    _capture_modelopt_dense_param_reload_meta(layer)
+    _capture_modelopt_param_reload_meta(layer, _DENSE_HF_PARAMS)
 
     input_global_scale = torch.ones(
         (),
@@ -162,7 +281,6 @@ def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
         requires_grad=False,
     )
 
-    _canonicalize_nvfp4_weight_scale(layer)
     _convert_nvfp4_linear_kernel_format(self, layer)
 
 
@@ -195,17 +313,309 @@ def _modelopt_dense_apply(
     return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 
-def prepare_modelopt_for_weight_reload(model, device=None) -> None:
-    """Prepare a dense ModelOpt-vLLM model for one weight reload cycle."""
+def _modelopt_moe_init(self, quant_config: object, moe_config: object) -> None:
+    if not _is_w4a16_modelopt_quant_config(quant_config):
+        original_init = getattr(type(self), _ORIGINAL_FUSED_MOE_INIT_ATTR)
+        original_init(self, quant_config, moe_config)
+        return
+
+    try:
+        from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+            FusedMoEMethodBase,
+        )
+    except ImportError:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoEMethodBase
+
+    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import MarlinExperts
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
+
+    _require_fp4_marlin_supported()
+    FusedMoEMethodBase.__init__(self, moe_config)
+    self.__dict__.update(
+        quant_config=quant_config,
+        allow_flashinfer=False,
+        cutlass_nvfp4_supported=False,
+        flashinfer_moe_backend=None,
+        use_marlin=True,
+        backend="marlin",
+        nvfp4_backend=NvFp4MoeBackend.MARLIN,
+        experts_cls=MarlinExperts,
+        use_global_sf=False,
+    )
+
+
+def _modelopt_moe_maybe_roundup_sizes(
+    self,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    act_dtype: torch.dtype,
+    moe_parallel_config: object,
+) -> tuple[int, int]:
+    """Round W4A16 MoE intermediate shards to Marlin's FP4 tile size."""
+    original_roundup = getattr(type(self), _ORIGINAL_FUSED_MOE_ROUNDUP_SIZES_ATTR)
+    hidden_size, intermediate_size_per_partition = original_roundup(
+        self,
+        hidden_size,
+        intermediate_size_per_partition,
+        act_dtype,
+        moe_parallel_config,
+    )
+
+    if _is_w4a16_marlin_moe_quant_method(self):
+        tile = _MODELOPT_W4A16_MOE_MARLIN_TILE_N
+        intermediate_size_per_partition = (
+            _ceil_div(
+                intermediate_size_per_partition,
+                tile,
+            )
+            * tile
+        )
+
+    return hidden_size, intermediate_size_per_partition
+
+
+def _zero_modelopt_moe_padding(layer: torch.nn.Module) -> None:
+    moe_config = getattr(layer, "moe_config", None)
+    padded_size = getattr(moe_config, "intermediate_size_per_partition", None)
+    unpadded_size = getattr(
+        moe_config,
+        "intermediate_size_per_partition_unpadded",
+        padded_size,
+    )
+    if (
+        not isinstance(padded_size, int)
+        or not isinstance(unpadded_size, int)
+        or padded_size <= unpadded_size
+    ):
+        return
+
+    tp_rank = getattr(layer, "tp_rank", None)
+    tp_size = getattr(layer, "tp_size", None)
+    if isinstance(tp_rank, int) and isinstance(tp_size, int) and tp_size > 0:
+        full_unpadded_size = unpadded_size * tp_size
+        valid_size = max(
+            0,
+            min(padded_size, full_unpadded_size - padded_size * tp_rank),
+        )
+    else:
+        valid_size = unpadded_size
+    if valid_size >= padded_size:
+        return
+
+    quant_config = getattr(layer, "quant_config", None)
+    group_size = getattr(quant_config, "group_size", None)
+    if not isinstance(group_size, int) or group_size <= 0:
+        raise RuntimeError(
+            "Missing or invalid ModelOpt NVFP4 group_size for padded MoE reload"
+        )
+    with torch.no_grad():
+        for param_name in ("w13_weight", "w13_weight_scale"):
+            tensor = getattr(layer, param_name).data
+            if tensor.ndim >= 2:
+                for shard_start in range(0, tensor.shape[1], padded_size):
+                    start = shard_start + valid_size
+                    end = min(shard_start + padded_size, tensor.shape[1])
+                    if start < end:
+                        tensor.narrow(1, start, end - start).zero_()
+        for tensor, start, end in (
+            (
+                layer.w2_weight.data,
+                _ceil_div(valid_size, 2),
+                _ceil_div(padded_size, 2),
+            ),
+            (
+                layer.w2_weight_scale.data,
+                _ceil_div(valid_size, group_size),
+                _ceil_div(padded_size, group_size),
+            ),
+        ):
+            if start < end and tensor.ndim > 2 and start < tensor.shape[2]:
+                tensor.narrow(2, start, min(end, tensor.shape[2]) - start).zero_()
+
+
+def _modelopt_moe_process_w4a16_marlin_weights(
+    self,
+    layer: torch.nn.Module,
+    is_first_call: bool,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        convert_to_nvfp4_moe_kernel_format,
+        make_nvfp4_moe_kernel,
+    )
+
+    w13_weight_scale_2 = layer.w13_weight_scale_2.data
+    if w13_weight_scale_2.dim() == 2:
+        w13_weight_scale_2 = w13_weight_scale_2[:, 0]
+    layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
+
+    _canonicalize_moe_nvfp4_weight_scales(layer)
+
+    (
+        w13,
+        w13_scale,
+        w13_scale_2,
+        _a13_scale,
+        w2,
+        w2_scale,
+        w2_scale_2,
+        _a2_scale,
+    ) = convert_to_nvfp4_moe_kernel_format(
+        nvfp4_backend=self.nvfp4_backend,
+        layer=layer,
+        w13=layer.w13_weight.data,
+        w13_scale=layer.w13_weight_scale.data,
+        w13_scale_2=layer.w13_weight_scale_2.data,
+        a13_scale=None,
+        w2=layer.w2_weight.data,
+        w2_scale=layer.w2_weight_scale.data,
+        w2_scale_2=layer.w2_weight_scale_2.data,
+        a2_scale=None,
+        is_act_and_mul=self.moe.is_act_and_mul,
+    )
+
+    for param_name, data in zip(
+        _MOE_MARLIN_TENSOR_PARAMS,
+        (w13, w13_scale, w13_scale_2, w2, w2_scale, w2_scale_2),
+        strict=True,
+    ):
+        _set_or_update_processed_tensor_ref(
+            layer,
+            param_name,
+            data,
+            is_first_call=is_first_call,
+        )
+
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+
+    moe_quant_config = self.get_fused_moe_quant_config(layer)
+    if moe_quant_config is None:
+        raise RuntimeError("ModelOpt NVFP4 MoE quant config is missing")
+    self.moe_quant_config = moe_quant_config
+    if self.experts_cls is None:
+        raise RuntimeError("ModelOpt NVFP4 MoE experts class is missing")
+    routing_tables = (
+        layer._maybe_init_expert_routing_tables()
+        if hasattr(layer, "_maybe_init_expert_routing_tables")
+        else None
+    )
+    self.moe_kernel = make_nvfp4_moe_kernel(
+        moe_quant_config=moe_quant_config,
+        moe_config=self.moe,
+        experts_cls=self.experts_cls,
+        shared_experts=getattr(layer, "shared_experts", None),
+        routing_tables=routing_tables,
+    )
+    self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+
+def _modelopt_kv_cache_process_weights(self, layer: torch.nn.Module) -> None:
+    """Update KV-cache quantization scales without deleting reload parameters."""
+    from vllm.platforms import current_platform
+
+    def copy_scalar(dst: torch.Tensor, value: float | torch.Tensor) -> None:
+        if isinstance(value, torch.Tensor):
+            dst.copy_(value.to(device=dst.device, dtype=dst.dtype))
+        else:
+            dst.fill_(value)
+
+    if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+        if layer.k_scale > 0.0 and layer.v_scale > 0.0:
+            k_scale = layer.k_scale.to("cpu").tolist()
+            v_scale = layer.v_scale.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
+            k_scale = 1.0
+            v_scale = 1.0
+        else:
+            scale_to_duplicate = max(layer.k_scale, layer.v_scale)
+            k_scale = scale_to_duplicate.to("cpu").tolist()
+            v_scale = scale_to_duplicate.to("cpu").tolist()
+            if current_platform.is_fp8_fnuz():
+                k_scale *= 2
+                v_scale *= 2
+
+        if not isinstance(k_scale, float) or not isinstance(v_scale, float):
+            raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
+
+        if layer.q_scale < 0.0:
+            copy_scalar(layer._q_scale, k_scale)
+            layer._q_scale_float = k_scale
+
+        copy_scalar(layer._k_scale, k_scale)
+        copy_scalar(layer._v_scale, v_scale)
+        layer._k_scale_float = k_scale
+        layer._v_scale_float = v_scale
+
+    if layer.q_scale > 0.0:
+        q_scale = layer.q_scale
+        if current_platform.is_fp8_fnuz():
+            q_scale *= 2
+        layer.calculate_kv_scales = False
+    else:
+        q_scale = 1.0
+    if layer.prob_scale > 0.0:
+        prob_scale = layer.prob_scale
+        if current_platform.is_fp8_fnuz():
+            prob_scale *= 2
+    else:
+        prob_scale = 1.0
+
+    def is_singleton_float(value: float | torch.Tensor) -> bool:
+        return isinstance(value, float) or (
+            isinstance(value, torch.Tensor)
+            and value.numel() == 1
+            and value.is_floating_point()
+        )
+
+    if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
+        raise ValueError("Only support per-tensor scaling factor for fp8 Q/prob")
+
+    copy_scalar(layer._q_scale, q_scale)
+    layer._q_scale_float = (
+        q_scale.item() if isinstance(q_scale, torch.Tensor) else q_scale
+    )
+    copy_scalar(layer._prob_scale, prob_scale)
+
+
+def _modelopt_moe_process_weights(self, layer: torch.nn.Module) -> None:
+    """Convert MoE ModelOpt NVFP4 weights after initial load or refit."""
+    if not _is_w4a16_marlin_moe_quant_method(self):
+        original_process_weights = getattr(
+            type(self),
+            _ORIGINAL_FUSED_MOE_PROCESS_WEIGHTS_ATTR,
+        )
+        original_process_weights(self, layer)
+        return
+
+    _capture_modelopt_param_reload_meta(layer, _MOE_HF_PARAMS)
+    is_first_call = _is_first_modelopt_process_weights_call(layer)
+    _zero_modelopt_moe_padding(layer)
+    _modelopt_moe_process_w4a16_marlin_weights(
+        self,
+        layer,
+        is_first_call=is_first_call,
+    )
+
+
+def prepare_modelopt_for_weight_reload(
+    model: torch.nn.Module,
+    device: torch.device | str | None = None,
+) -> None:
+    """Prepare a ModelOpt-vLLM model for one weight reload cycle."""
     inner_model = _unwrap_vllm_model(model)
     for module in inner_model.modules():
-        layer_meta = getattr(module, "_nrl_modelopt_param_meta", None)
+        layer_meta = getattr(module, _MODELOPT_PARAM_META_ATTR, None)
         if layer_meta is None:
             continue
+        weight_loaders = getattr(module, _MODELOPT_WEIGHT_LOADERS_ATTR, {})
         for param_name, meta in layer_meta.items():
             param = getattr(module, param_name, None)
-            weight_loader = module._nrl_modelopt_weight_loaders.get(param_name)
+            weight_loader = weight_loaders.get(param_name)
             param_class = meta["param_class"]
+            default_to_one = param_name in _MOE_INPUT_SCALE_PARAMS
             if (
                 param is None
                 or tuple(param.shape) != tuple(meta["shape"])
@@ -223,6 +633,8 @@ def prepare_modelopt_for_weight_reload(model, device=None) -> None:
                     dtype=meta["dtype"],
                     device=device or meta["device"],
                 )
+                if default_to_one:
+                    data.fill_(1.0)
                 if param_class is not Parameter and weight_loader is not None:
                     kwargs = {"data": data, "weight_loader": weight_loader}
                     if "input_dim" in meta:
@@ -234,16 +646,33 @@ def prepare_modelopt_for_weight_reload(model, device=None) -> None:
                     replacement = Parameter(data, requires_grad=False)
                     if weight_loader is not None:
                         replacement.weight_loader = weight_loader
+                for attr, value in meta.get("attrs", {}).items():
+                    setattr(replacement, attr, value)
                 setattr(module, param_name, replacement)
+            elif default_to_one:
+                # W4A16 exports do not stream MoE activation scales. Reset to
+                # the neutral scale before loading; W4A8 streams overwrite it.
+                param.data.fill_(1.0)
 
 
-def modelopt_process_weights_after_loading(model) -> None:
-    """Run vLLM ModelOpt post-load processing for dense quantized layers."""
+def modelopt_process_weights_after_loading(model: torch.nn.Module) -> None:
+    """Run vLLM ModelOpt post-load processing for quantized layers."""
     actual_model = _unwrap_vllm_model(model)
 
     for module in actual_model.modules():
+        scheme = getattr(module, "scheme", None)
+        if (
+            scheme is not None
+            and getattr(type(scheme), "process_weights_after_loading", None)
+            is _modelopt_kv_cache_process_weights
+        ):
+            scheme.process_weights_after_loading(module)
+
         quant_method = getattr(module, "quant_method", None)
-        if quant_method.__class__.__name__ == "ModelOptNvFp4LinearMethod":
+        if quant_method.__class__.__name__ in (
+            "ModelOptNvFp4LinearMethod",
+            "ModelOptNvFp4FusedMoE",
+        ):
             quant_method.process_weights_after_loading(module)
 
 
@@ -251,7 +680,7 @@ _patched = False
 
 
 def apply_modelopt_nvfp4_patches() -> None:
-    """Patch vLLM's dense ModelOpt NVFP4 method for rollout refits."""
+    """Patch vLLM's ModelOpt NVFP4 methods for rollout refits."""
     global _patched
 
     if _patched:
@@ -262,23 +691,63 @@ def apply_modelopt_nvfp4_patches() -> None:
         ModelOptNvFp4LinearMethod,
     )
 
-    if not hasattr(ModelOptNvFp4Config, _ORIGINAL_NVFP4_CONFIG_FROM_CONFIG_ATTR):
-        setattr(
-            ModelOptNvFp4Config,
-            _ORIGINAL_NVFP4_CONFIG_FROM_CONFIG_ATTR,
-            ModelOptNvFp4Config._from_config,
+    try:
+        from vllm.model_executor.layers.quantization.kv_cache import (
+            BaseKVCacheMethod,
         )
+    except ImportError:
+        BaseKVCacheMethod = None
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptNvFp4FusedMoE,
+        )
+    except ImportError:
+        ModelOptNvFp4FusedMoE = None
+
+    _stash_original(
+        ModelOptNvFp4Config,
+        _ORIGINAL_NVFP4_CONFIG_FROM_CONFIG_ATTR,
+        ModelOptNvFp4Config._from_config,
+    )
     ModelOptNvFp4Config._from_config = classmethod(_modelopt_nvfp4_config_from_config)
 
-    if not hasattr(ModelOptNvFp4LinearMethod, _ORIGINAL_LINEAR_APPLY_ATTR):
-        setattr(
-            ModelOptNvFp4LinearMethod,
-            _ORIGINAL_LINEAR_APPLY_ATTR,
-            ModelOptNvFp4LinearMethod.apply,
-        )
+    _stash_original(
+        ModelOptNvFp4LinearMethod,
+        _ORIGINAL_LINEAR_APPLY_ATTR,
+        ModelOptNvFp4LinearMethod.apply,
+    )
     ModelOptNvFp4LinearMethod.process_weights_after_loading = (
         _modelopt_dense_process_weights
     )
     ModelOptNvFp4LinearMethod.apply = _modelopt_dense_apply
+    if ModelOptNvFp4FusedMoE is not None:
+        moe_patches = {
+            "__init__": (_ORIGINAL_FUSED_MOE_INIT_ATTR, _modelopt_moe_init),
+            "process_weights_after_loading": (
+                _ORIGINAL_FUSED_MOE_PROCESS_WEIGHTS_ATTR,
+                _modelopt_moe_process_weights,
+            ),
+        }
+        if hasattr(ModelOptNvFp4FusedMoE, "maybe_roundup_sizes"):
+            moe_patches["maybe_roundup_sizes"] = (
+                _ORIGINAL_FUSED_MOE_ROUNDUP_SIZES_ATTR,
+                _modelopt_moe_maybe_roundup_sizes,
+            )
+        for method_name, (original_attr, replacement) in moe_patches.items():
+            _stash_original(
+                ModelOptNvFp4FusedMoE,
+                original_attr,
+                getattr(ModelOptNvFp4FusedMoE, method_name),
+            )
+            setattr(ModelOptNvFp4FusedMoE, method_name, replacement)
+    if BaseKVCacheMethod is not None:
+        _stash_original(
+            BaseKVCacheMethod,
+            _ORIGINAL_KV_CACHE_PROCESS_WEIGHTS_ATTR,
+            BaseKVCacheMethod.process_weights_after_loading,
+        )
+        BaseKVCacheMethod.process_weights_after_loading = (
+            _modelopt_kv_cache_process_weights
+        )
 
     _patched = True

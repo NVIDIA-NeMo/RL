@@ -21,10 +21,11 @@ import pytest
 import torch
 
 from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
-    _canonicalize_nvfp4_weight_scale,
     _convert_nvfp4_linear_kernel_format,
     _modelopt_dense_apply,
     _modelopt_dense_process_weights,
+    _modelopt_kv_cache_process_weights,
+    _zero_modelopt_moe_padding,
     apply_modelopt_nvfp4_patches,
     modelopt_process_weights_after_loading,
     prepare_modelopt_for_weight_reload,
@@ -94,6 +95,33 @@ def _install_fake_modelopt_tensor_quantizer(monkeypatch):
     ].tensor_quantizer = tensor_quantizer_module
 
 
+def _make_real_quant_extension(backend, model, ignore):
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension.model_runner = types.SimpleNamespace(
+        model=model,
+        vllm_config=types.SimpleNamespace(
+            model_config=types.SimpleNamespace(
+                hf_config=types.SimpleNamespace(quantization_config={"ignore": ignore})
+            )
+        ),
+    )
+    return extension
+
+
+def _patch_real_quant_load(monkeypatch, backend, forwarded=None):
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: True,
+    )
+    if forwarded is not None:
+        monkeypatch.setattr(
+            backend.VllmInternalWorkerExtension,
+            "_load_weights",
+            lambda self, weights: forwarded.extend(weights) or "loaded",
+        )
+
+
 def test_w4a16_real_quant_config_keeps_weight_only_default():
     cfg = build_vllm_modelopt_nvfp4_config()
 
@@ -122,9 +150,14 @@ def test_w4a16_real_quant_config_keeps_weight_only_default():
 
 
 def test_real_quant_config_allows_explicit_ignore_override():
-    cfg = build_vllm_modelopt_nvfp4_config(ignore=["lm_head"])
+    ignore = ["lm_head", "*.mixer.in_proj*"]
+    cfg = build_vllm_modelopt_nvfp4_config(ignore=ignore)
 
-    assert cfg["ignore"] == ["lm_head"]
+    assert cfg["ignore"] == ignore
+    assert matches_quant_ignore_pattern(
+        "model.layers.0.mixer.in_proj.weight",
+        cfg["ignore"],
+    )
 
 
 def test_default_ignore_patterns_match_expected_layers():
@@ -381,7 +414,7 @@ def test_vllm_modelopt_backend_applies_real_quant_patch_on_import(monkeypatch):
     assert calls == ["patched"]
 
 
-def test_real_quant_load_weights_copies_ignored_float_weights(monkeypatch):
+def test_real_quant_load_weights_forwards_ignored_float_weights(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
     class TinyModel(torch.nn.Module):
@@ -391,34 +424,9 @@ def test_real_quant_load_weights_copies_ignored_float_weights(monkeypatch):
             self.keep = torch.nn.Linear(2, 2, bias=False)
 
     model = TinyModel()
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(
-        model=model,
-        vllm_config=types.SimpleNamespace(
-            model_config=types.SimpleNamespace(
-                hf_config=types.SimpleNamespace(
-                    quantization_config={"ignore": ["lm_head"]}
-                )
-            )
-        ),
-    )
-
     forwarded = []
-
-    def fake_base_load_weights(self, weights):
-        forwarded.extend(weights)
-        return "loaded"
-
-    monkeypatch.setattr(
-        backend.VllmQuantInternalWorkerExtension,
-        "_is_real_quant_model",
-        lambda self: True,
-    )
-    monkeypatch.setattr(
-        backend.VllmInternalWorkerExtension,
-        "_load_weights",
-        fake_base_load_weights,
-    )
+    extension = _make_real_quant_extension(backend, model, ["lm_head"])
+    _patch_real_quant_load(monkeypatch, backend, forwarded)
 
     ignored_weight = torch.full_like(model.lm_head.weight, 7.0)
     kept_weight = torch.full_like(model.keep.weight, 3.0)
@@ -434,76 +442,37 @@ def test_real_quant_load_weights_copies_ignored_float_weights(monkeypatch):
         == "loaded"
     )
 
-    torch.testing.assert_close(model.lm_head.weight, ignored_weight)
-    assert [name for name, _ in forwarded] == ["keep.weight"]
-    torch.testing.assert_close(forwarded[0][1], kept_weight)
+    assert [name for name, _ in forwarded] == ["lm_head.weight", "keep.weight"]
+    torch.testing.assert_close(forwarded[0][1], ignored_weight)
+    torch.testing.assert_close(forwarded[1][1], kept_weight)
 
 
-def test_real_quant_load_weights_returns_when_only_ignored_weights(monkeypatch):
+def test_real_quant_load_weights_returns_when_only_ignored_scales(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     model = torch.nn.Module()
     model.lm_head = torch.nn.Linear(2, 2, bias=False)
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(
-        model=model,
-        vllm_config=types.SimpleNamespace(
-            model_config=types.SimpleNamespace(
-                hf_config=types.SimpleNamespace(
-                    quantization_config={"ignore": ["lm_head"]}
-                )
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        backend.VllmQuantInternalWorkerExtension,
-        "_is_real_quant_model",
-        lambda self: True,
-    )
+    extension = _make_real_quant_extension(backend, model, ["lm_head"])
+    _patch_real_quant_load(monkeypatch, backend)
 
     assert (
         extension._load_weights(
             [
-                ("lm_head.weight", torch.full_like(model.lm_head.weight, 1.5)),
                 ("lm_head.weight_scale", torch.ones(1)),
                 ("lm_head.weight_scale_2", torch.ones(1)),
             ]
         )
         is None
     )
-    torch.testing.assert_close(
-        model.lm_head.weight,
-        torch.full_like(model.lm_head.weight, 1.5),
-    )
 
 
-def test_real_quant_load_weights_forwards_ignored_shape_mismatch(monkeypatch):
+def test_real_quant_load_weights_forwards_ignored_weights_to_vllm_loader(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
     model = torch.nn.Module()
     model.lm_head = torch.nn.Linear(2, 2, bias=False)
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(
-        model=model,
-        vllm_config=types.SimpleNamespace(
-            model_config=types.SimpleNamespace(
-                hf_config=types.SimpleNamespace(
-                    quantization_config={"ignore": ["lm_head"]}
-                )
-            )
-        ),
-    )
     forwarded = []
-
-    monkeypatch.setattr(
-        backend.VllmQuantInternalWorkerExtension,
-        "_is_real_quant_model",
-        lambda self: True,
-    )
-    monkeypatch.setattr(
-        backend.VllmInternalWorkerExtension,
-        "_load_weights",
-        lambda self, weights: forwarded.extend(weights) or "loaded",
-    )
+    extension = _make_real_quant_extension(backend, model, ["lm_head"])
+    _patch_real_quant_load(monkeypatch, backend, forwarded)
 
     mismatched = torch.ones(1, dtype=model.lm_head.weight.dtype)
 
@@ -935,21 +904,6 @@ def test_resolve_quant_cfg_rejects_recipe_without_quant_cfg(monkeypatch):
         resolve_quant_cfg("missing-quant-cfg")
 
 
-def test_vllm_reload_canonicalizes_nvfp4_scales_before_kernel_conversion():
-    layer = torch.nn.Module()
-    layer.weight_scale = torch.nn.Parameter(
-        torch.tensor([[1.0, -2.0], [-0.5, 4.0]]),
-        requires_grad=False,
-    )
-
-    _canonicalize_nvfp4_weight_scale(layer)
-
-    torch.testing.assert_close(
-        layer.weight_scale,
-        torch.tensor([[1.0, 2.0], [0.5, 4.0]]),
-    )
-
-
 def test_prepare_modelopt_for_weight_reload_restores_deleted_dense_params():
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(torch.ones(2, 2), requires_grad=False)
@@ -1047,20 +1001,60 @@ def test_prepare_modelopt_for_weight_reload_restores_plain_parameter_loader():
     torch.testing.assert_close(layer.weight, torch.ones(2, 2))
 
 
-def test_modelopt_process_weights_after_loading_runs_dense_quant_method():
+def test_modelopt_process_weights_after_loading_runs_modelopt_quant_methods():
     calls = []
 
     class ModelOptNvFp4LinearMethod:
         def process_weights_after_loading(self, layer):
             calls.append(layer)
 
+    class ModelOptNvFp4FusedMoE:
+        def process_weights_after_loading(self, layer):
+            calls.append(layer)
+
     model = torch.nn.Module()
-    model.layer = torch.nn.Module()
-    model.layer.quant_method = ModelOptNvFp4LinearMethod()
+    model.dense_layer = torch.nn.Module()
+    model.dense_layer.quant_method = ModelOptNvFp4LinearMethod()
+    model.moe_layer = torch.nn.Module()
+    model.moe_layer.quant_method = ModelOptNvFp4FusedMoE()
 
     modelopt_process_weights_after_loading(model)
 
-    assert calls == [model.layer]
+    assert calls == [model.dense_layer, model.moe_layer]
+
+
+def test_modelopt_process_weights_after_loading_runs_patched_kv_scheme(monkeypatch):
+    platforms = types.ModuleType("vllm.platforms")
+    platforms.current_platform = types.SimpleNamespace(is_fp8_fnuz=lambda: False)
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
+
+    class BaseKVCacheMethod:
+        process_weights_after_loading = _modelopt_kv_cache_process_weights
+
+    model = torch.nn.Module()
+    model.kv_layer = torch.nn.Module()
+    model.kv_layer.scheme = BaseKVCacheMethod()
+    model.kv_layer.kv_cache_dtype = "fp8"
+    model.kv_layer.calculate_kv_scales = False
+    model.kv_layer.k_scale = torch.tensor(2.0)
+    model.kv_layer.v_scale = torch.tensor(3.0)
+    model.kv_layer.q_scale = torch.tensor(4.0)
+    model.kv_layer.prob_scale = torch.tensor(5.0)
+    model.kv_layer._k_scale = torch.zeros(())
+    model.kv_layer._v_scale = torch.zeros(())
+    model.kv_layer._q_scale = torch.zeros(())
+    model.kv_layer._prob_scale = torch.zeros(())
+
+    modelopt_process_weights_after_loading(model)
+
+    torch.testing.assert_close(model.kv_layer._k_scale, torch.tensor(2.0))
+    torch.testing.assert_close(model.kv_layer._v_scale, torch.tensor(3.0))
+    torch.testing.assert_close(model.kv_layer._q_scale, torch.tensor(4.0))
+    torch.testing.assert_close(model.kv_layer._prob_scale, torch.tensor(5.0))
+    assert model.kv_layer._k_scale_float == 2.0
+    assert model.kv_layer._v_scale_float == 3.0
+    assert model.kv_layer._q_scale_float == 4.0
+    assert model.kv_layer.calculate_kv_scales is False
 
 
 def test_apply_modelopt_nvfp4_patches_updates_vllm_method(monkeypatch):
@@ -1160,7 +1154,7 @@ def test_modelopt_dense_process_uses_vllm_kernel_api():
     layer.weight._output_dim = 0
     layer.weight.weight_loader = lambda param, loaded_weight: None
     layer.weight_scale = torch.nn.Parameter(
-        torch.tensor([[1.0, -2.0], [-0.5, 4.0]]),
+        torch.tensor([[1.0, 2.0], [0.5, 4.0]]),
         requires_grad=False,
     )
     layer.weight_scale_2 = torch.nn.Parameter(torch.tensor([2.0]), requires_grad=False)
@@ -1219,6 +1213,7 @@ def test_modelopt_dense_process_w4a16_uses_marlin_weight_only(monkeypatch):
         calls.append(("apply", kwargs))
         return "out"
 
+    marlin_utils.is_fp4_marlin_supported = lambda: True
     marlin_utils.prepare_fp4_layer_for_marlin = fake_prepare
     marlin_utils.apply_fp4_marlin_linear = fake_apply
     monkeypatch.setitem(
@@ -1230,7 +1225,7 @@ def test_modelopt_dense_process_w4a16_uses_marlin_weight_only(monkeypatch):
     layer = torch.nn.Module()
     layer.weight = torch.nn.Parameter(torch.ones(2, 1), requires_grad=False)
     layer.weight_scale = torch.nn.Parameter(
-        torch.tensor([[1.0, -2.0], [-0.5, 4.0]]),
+        torch.tensor([[1.0, 2.0], [0.5, 4.0]]),
         requires_grad=False,
     )
     layer.weight_scale_2 = torch.nn.Parameter(torch.tensor([2.0]), requires_grad=False)
@@ -1256,14 +1251,52 @@ def test_modelopt_dense_process_w4a16_uses_marlin_weight_only(monkeypatch):
     assert result == "out"
     assert calls[0] == ("prepare", layer)
     assert calls[1][0] == "apply"
+    assert calls[1][1]["weight_global_scale"] is layer.weight_global_scale
     assert not hasattr(layer, "input_scale")
     assert not hasattr(layer, "input_global_scale")
     assert not hasattr(layer, "alpha")
     assert not hasattr(layer, "input_global_scale_inv")
     assert not hasattr(layer, "weight_scale_2")
     torch.testing.assert_close(layer.weight_global_scale, torch.tensor(2.0))
+    assert set(layer._nrl_modelopt_processed_tensor_refs) == {
+        "weight",
+        "weight_scale",
+        "weight_global_scale",
+    }
+
+
+def test_zero_modelopt_moe_padding_uses_tp_rank_valid_size():
+    def make_layer(tp_rank: int):
+        layer = torch.nn.Module()
+        layer.moe_config = types.SimpleNamespace(
+            intermediate_size_per_partition=512,
+            intermediate_size_per_partition_unpadded=464,
+        )
+        layer.quant_config = types.SimpleNamespace(group_size=16)
+        layer.tp_rank = tp_rank
+        layer.tp_size = 4
+        layer.w13_weight = torch.nn.Parameter(torch.ones(1, 512, 1))
+        layer.w13_weight_scale = torch.nn.Parameter(torch.ones(1, 512, 1))
+        layer.w2_weight = torch.nn.Parameter(torch.ones(1, 1, 256))
+        layer.w2_weight_scale = torch.nn.Parameter(torch.ones(1, 1, 32))
+        return layer
+
+    rank0 = make_layer(tp_rank=0)
+    _zero_modelopt_moe_padding(rank0)
+    torch.testing.assert_close(rank0.w13_weight, torch.ones_like(rank0.w13_weight))
+    torch.testing.assert_close(rank0.w2_weight, torch.ones_like(rank0.w2_weight))
     torch.testing.assert_close(
-        layer.weight_scale,
-        torch.tensor([[1.0, 2.0], [0.5, 4.0]]),
+        rank0.w2_weight_scale,
+        torch.ones_like(rank0.w2_weight_scale),
     )
-    assert calls[1][1]["weight_global_scale"] is layer.weight_global_scale
+
+    rank3 = make_layer(tp_rank=3)
+    _zero_modelopt_moe_padding(rank3)
+    assert torch.all(rank3.w13_weight[:, :320] == 1)
+    assert torch.all(rank3.w13_weight[:, 320:] == 0)
+    assert torch.all(rank3.w13_weight_scale[:, :320] == 1)
+    assert torch.all(rank3.w13_weight_scale[:, 320:] == 0)
+    assert torch.all(rank3.w2_weight[:, :, :160] == 1)
+    assert torch.all(rank3.w2_weight[:, :, 160:] == 0)
+    assert torch.all(rank3.w2_weight_scale[:, :, :20] == 1)
+    assert torch.all(rank3.w2_weight_scale[:, :, 20:] == 0)

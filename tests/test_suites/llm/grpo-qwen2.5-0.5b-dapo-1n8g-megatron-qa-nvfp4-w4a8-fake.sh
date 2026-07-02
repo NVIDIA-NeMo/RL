@@ -67,7 +67,6 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'max(data["train/token_mult_prob_error"]) < 1.06'
 
     grep -q "FakeQuantWorker" "$RUN_LOG"
-    grep -q "VLLM_QUANT_CFG" "$RUN_LOG"
     ! grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
 
     # Clean up checkpoint directory after successful run to save space.

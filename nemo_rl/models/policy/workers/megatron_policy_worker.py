@@ -22,6 +22,8 @@ from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
+from transformers import PreTrainedTokenizerBase
+
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
@@ -40,8 +42,6 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config
-from transformers import PreTrainedTokenizerBase
-
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -1365,9 +1365,6 @@ class MegatronPolicyWorkerImpl(
             src=0,
             post_iter_func=lambda x: x[1],
         )
-
-    def _use_real_quant_refit(self) -> bool:
-        return False
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
