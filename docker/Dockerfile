@@ -18,32 +18,10 @@
 #   To skip custom setup:
 #     docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile ...
 #
-# Optional build args to skip vLLM, SGLang, or TRT-LLM dependencies:
+# Optional build args to skip vLLM or SGLang dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
-#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM (from-source) build
-#
-# TRT-LLM-only build (smallest+fastest path for the cp313/cu13/aarch64 trtllm
-# integration — skips the unrelated vLLM + SGLang from-source steps):
-#     docker buildx build \
-#       -f docker/Dockerfile \
-#       --build-arg SKIP_VLLM_BUILD=1 \
-#       --build-arg SKIP_SGLANG_BUILD=1 \
-#       --build-context nemo-rl=. \
-#       --target release \
-#       --tag <registry>/nemo-rl-trtllm:latest \
-#       --push \
-#       .
-#
-# The TRT-LLM stage clones https://github.com/NVIDIA/TensorRT-LLM @ v1.3.0rc15
-# (default — override with --build-arg BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF)
-# and builds the wheel via tools/build-custom-trtllm.sh (~30-60 min on a single
-# Blackwell node; longer on x86). Modelopt 0.37 is built alongside (override via
-# BUILD_CUSTOM_TRTLLM_MODELOPT_URL / _REF). Expect ~1.5-2h total wall time end-to-end.
-#
-# After the docker build completes, convert the image to a SLURM-friendly .sqsh
-# (Lyris / enroot users) with:
-#     enroot import -o nemo-rl-py313-trtllm.sqsh docker://<registry>/nemo-rl-trtllm:latest
+#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -179,6 +157,11 @@ ENV CUDA_HOME=/usr/local/cuda
 ## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
+# Directory where the from-source TRT-LLM wheel is placed after build-custom-trtllm.sh.
+# uv discovers the wheel here via UV_FIND_LINKS at lock + sync time, and at runtime
+# when create_local_venv builds role venvs for TrtllmGenerationWorker.
+ENV UV_FIND_LINKS=/opt/trtllm_wheels
+
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
@@ -201,6 +184,8 @@ elif [ -n "$SEED_KEY" ]; then
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
 fi
 
+# Create UV_FIND_LINKS dir early so uv doesn't fail before trtllm wheel is built.
+mkdir -p "$UV_FIND_LINKS"
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
@@ -210,7 +195,24 @@ fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
     bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL:-} ${BUILD_CUSTOM_FLASHINFER_REF:-}
 fi
-# uv sync has a more reliable resolver than simple uv pip install which can fail
+
+# TRT-LLM is always custom-built from source (no PyPI wheel for cp313/cu13/aarch64 or x86_64).
+# Build the wheel BEFORE any uv sync so that UV_FIND_LINKS contains the platform-specific
+# wheel when uv validates all environment splits in the lock. This makes the build
+# work on both aarch64 (GB200) and x86_64 without hardcoding a platform marker.
+if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    # Activate venv so the script's `python3 -m pip ...` calls land in /opt/nemo_rl_venv.
+    source /opt/nemo_rl_venv/bin/activate
+    bash tools/build-custom-trtllm.sh \
+        "${BUILD_CUSTOM_TRTLLM_URL:-https://github.com/shuyixiong/TensorRT-LLM.git}" \
+        "${BUILD_CUSTOM_TRTLLM_REF:-nemorl}" \
+        "${BUILD_CUSTOM_TRTLLM_MODELOPT_URL:-https://github.com/NVIDIA/TensorRT-Model-Optimizer.git}" \
+        "${BUILD_CUSTOM_TRTLLM_MODELOPT_REF:-0.37.0}"
+    deactivate
+    # Wheel is now in /opt/trtllm_wheels/. Update uv.lock with the real platform wheel
+    # so uv sync --locked can validate all environment splits correctly.
+    uv lock --upgrade-package tensorrt-llm
+fi
 
 # Sync each training + inference backend one at a time (since they may conflict)
 # to warm the uv cache, then at the end just sync the default dependencies.
@@ -228,20 +230,8 @@ uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
-
-# TRT-LLM is always custom-built from source (no cp313/cu13/aarch64 wheel on PyPI).
-# Sync the [trtllm] extra to bring in runtime deps (mpi4py, nvidia-cutlass-dsl-libs-base),
-# then build + install the TRT-LLM wheel via tools/build-custom-trtllm.sh.
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra trtllm --no-install-project
-    # Activate venv so the script's `python3 -m pip ...` calls land in /opt/nemo_rl_venv.
-    source /opt/nemo_rl_venv/bin/activate
-    bash tools/build-custom-trtllm.sh \
-        "${BUILD_CUSTOM_TRTLLM_URL:-https://github.com/NVIDIA/TensorRT-LLM.git}" \
-        "${BUILD_CUSTOM_TRTLLM_REF:-v1.3.0rc15}" \
-        "${BUILD_CUSTOM_TRTLLM_MODELOPT_URL:-https://github.com/NVIDIA/TensorRT-Model-Optimizer.git}" \
-        "${BUILD_CUSTOM_TRTLLM_MODELOPT_REF:-0.37.0}"
-    deactivate
 fi
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
