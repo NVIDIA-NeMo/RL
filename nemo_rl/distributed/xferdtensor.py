@@ -14,8 +14,8 @@
 
 """XferDTensor: cross-mesh DTensor reshard for disaggregated refit.
 
-The public entry point ``xferdtensor()`` dispatches to the real ``nccl.xfer``
-reshard op (``XdtensorRedistribute``) when it is available and not overridden
+The public entry point ``xferdtensor()`` dispatches to the real
+``nccl.m2n.reshard`` op when it is available and not overridden
 by ``NRL_XFERDTENSOR_GOLDEN``, otherwise to the broadcast-based
 ``xferdtensor_golden`` reference in this file.  Both share the canonical
 7-argument signature, so callers are identical on either path.
@@ -34,17 +34,15 @@ import torch
 from torch.distributed._tensor import Shard
 
 try:
-    from nccl.xfer.api import (
-        XdtensorRedistribute as _XdtensorRedistribute,
-    )  # pyrefly: ignore[import-error]
+    from nccl.m2n import (  # pyrefly: ignore[import-error]
+        reshard as _reshard,
+    )
 except ImportError:
-    # Golden-only containers (e.g. nemo_rl.v0.6.0 without the nccl4py xfer
+    # Golden-only containers (e.g. nemo_rl.v0.6.0 without the nccl4py M2N
     # integration) don't ship the real reshard op; xferdtensor() then falls
     # back to the broadcast-based golden implementation below.
-    _XdtensorRedistribute = None
-    logging.warning(
-        "XdtensorRedistribute not found, falling back to golden implementation"
-    )
+    _reshard = None
+    logging.warning("nccl.m2n.reshard not found, falling back to golden implementation")
 
 # Log the selected reshard path once per process (real op vs golden fallback).
 _XFERDTENSOR_PATH_LOGGED = False
@@ -81,7 +79,7 @@ class DTensorRef:
 
 
 # ===========================================================
-#  NCCL-Xfer-reshard API call
+#  NCCL M2N reshard API call
 # ===========================================================
 
 
@@ -101,23 +99,20 @@ def _use_golden_api() -> bool:
     )
 
 
-def _to_xfer_mesh(mesh):
-    """Build an ``nccl.xfer.mesh.Mesh`` from a MeshInfo/DeviceMesh rank grid.
+def _use_golden_v2() -> bool:
+    """Whether ``NRL_XFERDTENSOR_GOLDEN_V2`` selects the performant golden path.
 
-    ``Mesh.from_ranks`` derives the 2-D mesh dims from the grid shape (a 1-D
-    grid maps to dims ``(N, 1)`` like PyTorch) and validates the row-major
-    contiguous rank interval ``ncclXferMesh_t`` requires.  Passing the grid
-    (not a flattened list) preserves the 2-D (e.g. DP x TP) structure the
-    placements index into.
+    Routes the reshard through the grouped-P2P ``xferdtensor_golden_v2``
+    (point-to-point re-partition + sub-comm broadcast) instead of the
+    full-broadcast ``xferdtensor_golden`` — same 7-arg signature, faster reshard.
+    Implies the golden path (bypasses the real ``nccl.m2n`` op entirely).
     """
-    from nccl.xfer.mesh import Mesh  # pyrefly: ignore[import-error]
-
-    rank_tensor = getattr(mesh, "mesh", None)
-    if rank_tensor is None:
-        rank_tensor = getattr(mesh, "_mesh", None)
-    if rank_tensor is None:
-        raise ValueError("mesh does not expose its rank tensor (.mesh/._mesh)")
-    return Mesh.from_ranks(rank_tensor)
+    return os.environ.get("NRL_XFERDTENSOR_GOLDEN_V2", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def xferdtensor(
@@ -131,32 +126,50 @@ def xferdtensor(
 ):
     """Public XferDTensor entry point used by all external callers.
 
-    Calls the real ``nccl.xfer`` reshard op (``XdtensorRedistribute``) when it
-    is available and not overridden by ``NRL_XFERDTENSOR_GOLDEN``; otherwise
+    Calls ``nccl.m2n.reshard`` when it is available and not overridden by
+    ``NRL_XFERDTENSOR_GOLDEN``; otherwise
     forwards to the broadcast-based golden reference.  External callers are
     unchanged either way.
 
     Each rank holds only ONE side (train ranks own the src shard, gen ranks the
     dst shard), so ``src_tensor`` or ``dst_tensor`` is ``None`` on every rank;
     the real op accepts a one-sided ``None`` and derives the absent side's local
-    shape from the present side's global shape + mesh/placements.  PyTorch
+    shape from the present side's local shape + mesh/placements.  PyTorch
     Shard/Replicate placements are passed through directly.
     """
     global _XFERDTENSOR_PATH_LOGGED
-    use_golden = _use_golden_api() or _XdtensorRedistribute is None
+    use_golden_v2 = _use_golden_v2()
+    use_golden = use_golden_v2 or _use_golden_api() or _reshard is None
     if not _XFERDTENSOR_PATH_LOGGED:
-        path = (
-            "golden (broadcast)"
-            if use_golden
-            else "real nccl.xfer XdtensorRedistribute"
-        )
+        if not use_golden:
+            path = "real nccl.m2n.reshard"
+        elif use_golden_v2:
+            path = "golden_v2 (grouped-P2P)"
+        else:
+            path = "golden (broadcast)"
         print(
             f"[xferdtensor] reshard path: {path} "
-            f"(real_op_available={_XdtensorRedistribute is not None}, "
-            f"force_golden={_use_golden_api()})",
+            f"(real_op_available={_reshard is not None}, "
+            f"force_golden={_use_golden_api()}, golden_v2={use_golden_v2})",
             flush=True,
         )
         _XFERDTENSOR_PATH_LOGGED = True
+
+    if use_golden_v2:
+        # Grouped-P2P reshard (no full broadcast); same 7-arg contract.
+        from nemo_rl.distributed.xferdtensor_golden_v2 import (
+            xferdtensor_golden_v2,
+        )
+
+        return xferdtensor_golden_v2(
+            src_tensor,
+            src_mesh,
+            src_placement,
+            dst_tensor,
+            dst_mesh,
+            dst_placement,
+            process_group,
+        )
 
     if use_golden:
         return xferdtensor_golden(
@@ -172,13 +185,13 @@ def xferdtensor(
     src_local = src_tensor._local_tensor if src_tensor is not None else None
     dst_local = dst_tensor._local_tensor if dst_tensor is not None else None
 
-    _XdtensorRedistribute(  # pyrefly: ignore[not-callable]
+    _reshard(  # pyrefly: ignore[not-callable]
         src_local,
         dst_local,
         process_group.nccl_communicator,
-        src_mesh=_to_xfer_mesh(src_mesh),  # pyrefly: ignore[bad-argument-type]
+        src_mesh=src_mesh.mesh.tolist(),
         src_placements=src_placement,
-        dst_mesh=_to_xfer_mesh(dst_mesh),  # pyrefly: ignore[bad-argument-type]
+        dst_mesh=dst_mesh.mesh.tolist(),
         dst_placements=dst_placement,
     )
 
@@ -325,9 +338,9 @@ def xferdtensor_golden(
     region reconstructs the full tensor.
 
     This is the canonical 7-argument signature matching the real
-    ``nccl.xfer.api.XdtensorRedistribute`` op.  Callers must wrap raw tensors in
-    ``DTensorRef`` so that ``.shape`` reports the global shape and
-    ``._local_tensor`` holds the local shard.
+    ``nccl.m2n.reshard`` op.  Callers must wrap raw tensors in ``DTensorRef`` so
+    that ``.shape`` reports the global shape and ``._local_tensor`` holds the
+    local shard.
     """
     rank = process_group.rank
     src_ranks = _flatten_mesh_ranks(src_mesh)
