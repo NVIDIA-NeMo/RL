@@ -31,6 +31,23 @@ from nemo_rl.utils.config import (
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
+def _select_trainer(master_config: MasterConfig):
+    """Pick the synchronous trainer based on ``data_plane.enabled``.
+
+    Mirrors ``run_grpo.py`` so the VLM launcher routes through the same
+    TransferQueue-backed sibling trainer (``grpo_train_sync``) when the
+    data plane is enabled, and otherwise uses the legacy ``grpo_train``.
+    """
+    dp_cfg = master_config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+        print("🚀 Running synchronous VLM GRPO training (TransferQueue)")
+        return grpo_train_sync
+    print("🚀 Running synchronous VLM GRPO training (legacy)")
+    return grpo_train
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
@@ -104,6 +121,20 @@ def main() -> None:
         val_task_to_env,
     ) = setup_response_data(processor, config.data, config.env, is_vlm=True)
 
+    # Pick the policy factory at the launcher level so the legacy trainer
+    # stays data-plane-agnostic (architectural invariant — see
+    # tests/data_plane/unit/test_architecture_invariants.py).
+    _dp_cfg = config.data_plane or {}
+    if _dp_cfg.get("enabled", False):
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def _make_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+
+        _policy_factory = _make_policy
+    else:
+        _policy_factory = None  # setup() defaults to plain Policy
+
     (
         policy,
         policy_generation,
@@ -118,9 +149,17 @@ def main() -> None:
         master_config,
         _teacher_worker_groups,
         _alias_to_group_alias,
-    ) = setup(config, tokenizer, dataset, val_dataset, processor=processor)
+    ) = setup(
+        config,
+        tokenizer,
+        dataset,
+        val_dataset,
+        processor=processor,
+        policy_factory=_policy_factory,
+    )
 
-    grpo_train(
+    trainer = _select_trainer(master_config)
+    trainer(
         policy,
         policy_generation,
         dataloader,
