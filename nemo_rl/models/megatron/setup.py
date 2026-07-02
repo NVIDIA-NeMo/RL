@@ -1323,9 +1323,8 @@ def setup_model_and_optimizer(
     # Tokenizer
     if megatron_cfg.tokenizer.hf_tokenizer_kwargs is None:
         megatron_cfg.tokenizer.hf_tokenizer_kwargs = {}
-    if policy_cfg.get("tokenizer", {}).get("trust_remote_code", False):
-        megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
-        megatron_cfg.tokenizer.trust_remote_code = True
+    megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
+    megatron_cfg.tokenizer.trust_remote_code = True
     megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] = True
     megatron_cfg.tokenizer.tokenizer_hf_no_use_fast = False
     build_tokenizer(

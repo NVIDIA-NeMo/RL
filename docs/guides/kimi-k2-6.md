@@ -53,6 +53,12 @@ non-expert projections, and packed routed-expert tensors. Vision tower and
 multimodal projector tensors are intentionally not part of these text-only
 recipes.
 
+For Kimi K2.6 vLLM rollout, keep
+`policy.generation.vllm_cfg.max_model_len` divisible by 128. vLLM's
+FlashInfer MLA backend rejects KV-cache block counts that are not aligned this
+way. When overriding smoke lengths, round the total cap up; for example,
+`704` input tokens plus `512` generated tokens should use `1280`, not `1216`.
+
 ## Generation Smoke
 
 Use the standalone generation smoke before running GRPO. It loads the Kimi

@@ -144,3 +144,12 @@ def test_preflight_rejects_wrong_parallelism(smoke: Any) -> None:
 
     with pytest.raises(ValueError, match="Unexpected policy parallelism"):
         smoke._validate_preflight(summary)
+
+
+def test_preflight_rejects_unaligned_kimi_mla_max_model_len(smoke: Any) -> None:
+    config = deepcopy(_minimal_kimi_config())
+    config["policy"]["generation"]["vllm_cfg"]["max_model_len"] = 1216
+    summary = smoke._preflight_summary(config)
+
+    with pytest.raises(ValueError, match="multiple of 128"):
+        smoke._validate_preflight(summary)

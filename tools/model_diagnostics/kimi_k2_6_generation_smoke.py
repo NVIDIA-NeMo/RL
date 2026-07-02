@@ -40,6 +40,7 @@ DEFAULT_PROMPTS = [
     "Write one clear sentence about why the moon appears bright at night.",
     "Solve 2 + 3 and answer with a short sentence.",
 ]
+KIMI_FLASHINFER_MLA_MAX_MODEL_LEN_MULTIPLE = 128
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -129,6 +130,9 @@ def _preflight_summary(master_config: dict[str, Any]) -> dict[str, Any]:
         ),
         "max_new_tokens": generation.get("max_new_tokens"),
         "max_model_len": vllm.get("max_model_len"),
+        "max_num_batched_tokens": generation.get("vllm_kwargs", {}).get(
+            "max_num_batched_tokens"
+        ),
     }
 
 
@@ -163,6 +167,15 @@ def _validate_preflight(summary: dict[str, Any]) -> None:
         )
     if summary["vllm_parallelism"] != {"tp": 8, "pp": 1, "ep": 64}:
         raise ValueError(f"Unexpected vLLM parallelism: {summary['vllm_parallelism']}")
+
+    max_model_len = int(summary["max_model_len"])
+    if max_model_len % KIMI_FLASHINFER_MLA_MAX_MODEL_LEN_MULTIPLE != 0:
+        raise ValueError(
+            "Kimi K2.6 vLLM FlashInfer MLA requires max_model_len to be a "
+            f"multiple of {KIMI_FLASHINFER_MLA_MAX_MODEL_LEN_MULTIPLE}; "
+            f"got {max_model_len}. Round smoke sequence caps up, e.g. "
+            "704 input + 512 output -> 1280."
+        )
 
 
 def validate_generated_texts(

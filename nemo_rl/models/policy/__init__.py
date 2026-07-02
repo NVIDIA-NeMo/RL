@@ -374,6 +374,8 @@ class DraftConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
+    # Whether Hugging Face tokenizer loading may execute remote model code.
+    trust_remote_code: NotRequired[bool]
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]

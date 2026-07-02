@@ -2172,6 +2172,7 @@ class TestSetupModelAndOptimizer:
         mock_megatron_cfg.model.vocab_size = 32000
         mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
         mock_megatron_cfg.model.tensor_model_parallel_size = 1
+        mock_megatron_cfg.tokenizer.hf_tokenizer_kwargs = None
         # Enable param gather overlap
         mock_megatron_cfg.ddp.overlap_param_gather = True
         mock_megatron_cfg.ddp.align_param_gather = True
@@ -2210,6 +2211,13 @@ class TestSetupModelAndOptimizer:
         call_kwargs = mock_get_model.call_args[1]
         # Check that pre_wrap_hook is not empty when freeze_moe_router is True
         assert len(call_kwargs.get("pre_wrap_hook", [])) > 0
+
+        assert mock_megatron_cfg.tokenizer.hf_tokenizer_kwargs[
+            "trust_remote_code"
+        ] is True
+        assert mock_megatron_cfg.tokenizer.trust_remote_code is True
+        assert mock_megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] is True
+        assert mock_megatron_cfg.tokenizer.tokenizer_hf_no_use_fast is False
 
         assert result.param_sync_func == mock_model_chunk.start_param_sync
 
