@@ -34,30 +34,20 @@ run_test() {
     fi
 }
 
-# Megatron Inference currently hits an IMA on Blackwell tests.
-# TODO: remove this guard once the upstream dependency is bumped.
-megatron_generation_supported() {
-    if command -v nvidia-smi &> /dev/null; then
-        local compute_cap
-        compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 2>/dev/null | tr -d '. ' || true)
-        if [[ "${compute_cap:-0}" -ge 100 ]]; then
-            echo "WARNING: Skipping Blackwell x Megatron Inference tests"
-            return 1
-        fi
-    fi
-    return 0
-}
+run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
+# DISABLED: Non-colocated NVSHMEM refit path fails to initialize on the GB200 runner.
+# NVSHMEM aborts during preinit_nvshmem_collective with `cuMemCreate failed (status 800,
+# CUDA_ERROR_NOT_SUPPORTED)` -> `nvshmem common init failed` (NVSHMEMError status 7). This is a
+# GB200 environment/driver limitation (cuMem VMM allocation path unsupported), not a test bug; it
+# reproduces consistently on rerun. Re-enable once the GB200 CI image supports the NVSHMEM cuMem path.
+# run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
+run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
+run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
+run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
+# DISABLED: Megatron Inference returns unmasked logprobs
+# run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
+run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
 
-if megatron_generation_supported; then
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
-    # DISABLED: Megatron Inference returns unmasked logprobs
-    # run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
-    run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
-fi
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

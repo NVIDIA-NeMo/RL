@@ -769,7 +769,10 @@ jobs:
           - script: L1_Functional_Tests_Megatron_3
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Megatron_4
-            runner: ${{ vars.GB200_RUNNER }}
+            # Routed to the dedicated 1-runner/node IMEX scale set so the non-colocated
+            # NVSHMEM refit (cuMemCreate CU_MEM_HANDLE_TYPE_FABRIC) gets an IMEX channel
+            # (/dev/nvidia-caps-imex-channels/channel0). vars.GB200_RUNNER (2/node) can't.
+            runner: nemo-ci-gcp-gpu-x2-imex
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_SGLang
