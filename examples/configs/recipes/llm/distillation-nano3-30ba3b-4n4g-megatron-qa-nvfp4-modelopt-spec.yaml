@@ -14,14 +14,14 @@ policy:
     scheduler:
       lr_warmup_iters: 1
   generation:
-    vllm_cfg:
-      tensor_parallel_size: 8
     vllm_kwargs:
       tokenizer: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 logger:
-  log_dir: logs/distillation-nano3-30ba3b-4n8g-megatron-qa-nvfp4-modelopt-spec
+  log_dir: logs/distillation-nano3-30ba3b-4n4g-megatron-qa-nvfp4-modelopt-spec
   wandb:
     project: nemo-rl
-    name: distillation-nano3-30ba3b-4n8g-megatron-qa-nvfp4-modelopt-spec
+    name: distillation-nano3-30ba3b-4n4g-megatron-qa-nvfp4-modelopt-spec
   tensorboard:
-    log_dir: tb_logs-distillation-nano3-30ba3b-4n8g-megatron-qa-nvfp4-modelopt-spec
+    log_dir: tb_logs-distillation-nano3-30ba3b-4n4g-megatron-qa-nvfp4-modelopt-spec
+cluster:
+  gpus_per_node: 4

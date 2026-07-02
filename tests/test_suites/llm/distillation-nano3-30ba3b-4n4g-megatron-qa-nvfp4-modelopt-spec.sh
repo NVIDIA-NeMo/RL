@@ -8,11 +8,11 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-GPUS_PER_NODE=8
+GPUS_PER_NODE=4
 STEPS_PER_RUN=1
 MAX_STEPS=1
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=30
+NUM_MINUTES=45
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
