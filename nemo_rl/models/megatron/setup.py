@@ -101,8 +101,12 @@ def _patch_hf_config_double_instantiation():
     def _safe_post_init(self, **kwargs):
         if self.code_predictor_config is None:
             self.code_predictor_config = Qwen3OmniMoeTalkerCodePredictorConfig()
-        elif not isinstance(self.code_predictor_config, Qwen3OmniMoeTalkerCodePredictorConfig):
-            self.code_predictor_config = Qwen3OmniMoeTalkerCodePredictorConfig(**self.code_predictor_config)
+        elif not isinstance(
+            self.code_predictor_config, Qwen3OmniMoeTalkerCodePredictorConfig
+        ):
+            self.code_predictor_config = Qwen3OmniMoeTalkerCodePredictorConfig(
+                **self.code_predictor_config
+            )
 
         if self.text_config is None:
             self.text_config = Qwen3OmniMoeTalkerTextConfig()
@@ -113,6 +117,7 @@ def _patch_hf_config_double_instantiation():
 
     Qwen3OmniMoeTalkerConfig.__post_init__ = _safe_post_init
     _HF_CONFIG_PATCHED = True
+
 
 try:
     from megatron.core.distributed import (
