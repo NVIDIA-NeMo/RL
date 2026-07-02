@@ -39,10 +39,10 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
         'max(data["train/gen_kl_error"]) < 0.003' \
         'max(data["train/reward"]) > -0.9'
 
-    grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
-    grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
-    ! grep -q "FakeQuantWorker" "$RUN_LOG"
-    ! grep -q "VLLM_QUANT_CFG" "$RUN_LOG"
+    if ! grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"; then echo "ERROR: VllmQuantInternalWorkerExtension not found in real-quant run" >&2; exit 1; fi
+    if ! grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"; then echo "ERROR: 'Detected ModelOpt NVFP4 checkpoint' not found in real-quant run" >&2; exit 1; fi
+    if grep -q "FakeQuantWorker" "$RUN_LOG"; then echo "ERROR: FakeQuantWorker unexpectedly present in real-quant run" >&2; exit 1; fi
+    if grep -q "VLLM_QUANT_CFG" "$RUN_LOG"; then echo "ERROR: VLLM_QUANT_CFG unexpectedly present in real-quant run" >&2; exit 1; fi
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
