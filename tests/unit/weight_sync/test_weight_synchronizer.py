@@ -34,6 +34,9 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
+from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
+    VllmZmqSparseWeightSynchronizer,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -214,6 +217,39 @@ class TestIPCWeightSynchronizer:
         sync = IPCWeightSynchronizer(policy, gen)
         with pytest.raises(ValueError, match="must be > 0"):
             sync._compute_buffer_size()
+
+
+class TestVllmZmqSparseWeightSynchronizer:
+    @patch(
+        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
+    )
+    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
+    def test_initializes_streams_commits_and_updates_baseline(self, mock_ray, flush):
+        baseline_ref = MagicMock()
+        stream_ref = MagicMock()
+        commit_ref = MagicMock()
+        policy = MagicMock()
+        policy.init_remote_sparse_delta_baseline.return_value = [baseline_ref]
+        policy.stream_remote_sparse_weights.return_value = [stream_ref]
+        policy.finish_remote_sparse_delta_sync.return_value = [commit_ref]
+        generation = MagicMock()
+        generation.report_refit_server_base_urls.return_value = ["http://receiver"]
+        generation.start_zmq_sparse_refit_relays.return_value = ["tcp://relay:19090"]
+        generation.invalidate_kv_cache.return_value = True
+        mock_ray.get.side_effect = [None, [{"payloads": 3}]]
+        sync = VllmZmqSparseWeightSynchronizer(policy, generation)
+
+        sync.init_communicator()
+        sync.sync_weights()
+
+        policy.init_remote_sparse_delta_baseline.assert_called_once_with("zmq")
+        generation.start_zmq_sparse_refit_relays.assert_called_once_with()
+        policy.stream_remote_sparse_weights.assert_called_once()
+        flush.assert_called_once_with(
+            ["http://receiver"], api_key_env_var=None, timeout_s=600.0
+        )
+        policy.finish_remote_sparse_delta_sync.assert_called_once_with(True)
+        assert not sync.is_stale
 
 
 # ---------------------------------------------------------------------------

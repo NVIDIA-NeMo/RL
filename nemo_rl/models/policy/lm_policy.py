@@ -912,6 +912,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def init_remote_sparse_delta_baseline(
+        self, transport: str = "s3"
+    ) -> list[ray.ObjectRef]:
+        """Initialize source-side sparse-delta baselines for remote refit."""
+        return self._run_remote_sparse_refit_workers(
+            "init_remote_sparse_delta_baseline",
+            transport=transport,
+        )
+
     def finish_inference(self) -> None:
         """Offload policy model to CPU after inference."""
         futures = self.worker_group.run_all_workers_single_data("finish_inference")
@@ -1033,6 +1042,45 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "set_rollout_num_gpus_per_engine",
                 num_gpus_per_engine=num_gpus_per_engine,
             )
+        )
+
+    def stream_remote_sparse_weights(
+        self,
+        transport: str,
+        targets: list[str],
+        *,
+        transfer_id: str = "",
+        api_key_env_var: Optional[str] = None,
+        timeout_s: float = 600.0,
+    ) -> list[ray.ObjectRef]:
+        """Stream sparse deltas through the selected remote value plane."""
+        return self._run_remote_sparse_refit_workers(
+            "stream_remote_sparse_weights",
+            transport=transport,
+            targets=targets,
+            transfer_id=transfer_id,
+            api_key_env_var=api_key_env_var,
+            timeout_s=timeout_s,
+        )
+
+    def finish_remote_sparse_delta_sync(self, succeeded: bool) -> list[ray.ObjectRef]:
+        return self.worker_group.run_all_workers_single_data(
+            "finish_remote_sparse_delta_sync", succeeded=succeeded
+        )
+
+    def _run_remote_sparse_refit_workers(
+        self,
+        method_name: str,
+        **common_kwargs: Any,
+    ) -> list[ray.ObjectRef]:
+        worker_count = len(self.worker_group.workers)
+        return self.worker_group.run_all_workers_multiple_data(
+            method_name,
+            common_kwargs={
+                **common_kwargs,
+                "shard_count": worker_count,
+            },
+            shard_rank=list(range(worker_count)),
         )
 
     def broadcast_weights_for_collective(

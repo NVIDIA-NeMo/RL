@@ -16,9 +16,13 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 import types
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -37,6 +41,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
+    VllmGenerationWorkerImpl,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -157,6 +163,147 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
 
     assert _resolve_enable_prefix_caching({}) is False
+
+
+def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    worker._refit_apply_queue_lock = threading.Lock()
+    worker._refit_apply_executor = ThreadPoolExecutor(max_workers=1)
+    worker._refit_apply_futures = deque()
+    worker._refit_apply_pending_payloads = []
+    worker._refit_apply_payload_count = 0
+    worker._refit_apply_batch_count = 0
+    worker._refit_seen_payloads = {}
+    worker._refit_apply_queue_depth = 2
+    worker._refit_apply_batch_size = 3
+    worker.llm = MagicMock()
+    applied: list[tuple[tuple[bytes, ...], bool]] = []
+
+    def apply(payloads: tuple[bytes, ...], synchronize: bool) -> dict[str, Any]:
+        applied.append((payloads, synchronize))
+        return {
+            "ok": True,
+            "payloads": len(payloads),
+            "receiver_total_s": float(len(payloads)),
+        }
+
+    worker.update_weights_from_serialized_sparse_payloads = apply
+    try:
+        responses = [
+            worker._enqueue_sparse_payload_apply(payload)
+            for payload in (b"0", b"1", b"2", b"3", b"4")
+        ]
+        response = worker._flush_queued_sparse_payloads()
+        responses.append(response)
+    finally:
+        worker._refit_apply_executor.shutdown(wait=True)
+
+    assert applied == [
+        ((b"0", b"1", b"2"), False),
+        ((b"3", b"4"), False),
+    ]
+    assert response["payloads"] == 5
+    assert response["batches"] == 2
+    assert sum(result.get("receiver_total_s", 0.0) for result in responses) == 5.0
+    worker.llm.collective_rpc.assert_called_once_with("synchronize_device", args=())
+
+
+def test_sparse_refit_queue_deduplicates_transactional_payloads() -> None:
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    worker._refit_apply_queue_lock = threading.Lock()
+    worker._refit_apply_executor = ThreadPoolExecutor(max_workers=1)
+    worker._refit_apply_futures = deque()
+    worker._refit_apply_pending_payloads = []
+    worker._refit_apply_payload_count = 0
+    worker._refit_apply_batch_count = 0
+    worker._refit_seen_payloads = {}
+    worker._refit_apply_queue_depth = 2
+    worker._refit_apply_batch_size = 2
+    worker.llm = MagicMock()
+    worker.update_weights_from_serialized_sparse_payloads = MagicMock(
+        return_value={"ok": True, "payloads": 1}
+    )
+    key = ("transfer", 0, 1)
+    try:
+        assert worker._enqueue_sparse_payload_apply(b"payload", key, "checksum")["ok"]
+        duplicate = worker._enqueue_sparse_payload_apply(b"payload", key, "checksum")
+        assert duplicate == {"ok": True, "payloads": 0, "duplicate": True}
+        with pytest.raises(ValueError, match="reused with different data"):
+            worker._enqueue_sparse_payload_apply(b"other", key, "different")
+        response = worker._flush_queued_sparse_payloads()
+    finally:
+        worker._refit_apply_executor.shutdown(wait=True)
+
+    assert response["payloads"] == 1
+    assert worker._refit_seen_payloads == {}
+
+
+def test_sparse_refit_queue_does_not_deduplicate_failed_enqueue() -> None:
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    failed = Future()
+    failed.set_exception(RuntimeError("prior apply failed"))
+    worker._refit_apply_queue_lock = threading.Lock()
+    worker._refit_apply_futures = deque([failed])
+    worker._refit_apply_pending_payloads = []
+    worker._refit_seen_payloads = {}
+    worker._refit_apply_queue_depth = 2
+
+    with pytest.raises(RuntimeError, match="prior apply failed"):
+        worker._enqueue_sparse_payload_apply(
+            b"payload", ("transfer", 0, 1), "checksum"
+        )
+
+    assert worker._refit_seen_payloads == {}
+    assert worker._refit_apply_pending_payloads == []
+
+
+def test_sparse_refit_batch_uses_one_collective_rpc(tmp_path: Path) -> None:
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    staged_payloads: list[bytes] = []
+
+    def collective_rpc(method, args, kwargs):
+        assert method == "update_weights_from_sparse_payload_files"
+        staged_payloads.extend(Path(path).read_bytes() for path in args)
+        assert kwargs == {"synchronize": False}
+        return [{"ok": True, "receiver_total_s": 1.0}]
+
+    worker.llm = MagicMock(collective_rpc=MagicMock(side_effect=collective_rpc))
+    worker._refit_workers_share_node = True
+    worker._refit_batch_staging_dir = str(tmp_path)
+    payloads = (b"0", b"1", b"2")
+
+    response = worker.update_weights_from_serialized_sparse_payloads(
+        payloads, synchronize=False
+    )
+
+    assert staged_payloads == list(payloads)
+    assert not list(tmp_path.iterdir())
+    worker.llm.collective_rpc.assert_called_once()
+    assert response == {"ok": True, "receiver_total_s": 1.0, "payloads": 3}
+
+
+def test_sparse_refit_batch_falls_back_across_nodes() -> None:
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker._refit_workers_share_node = False
+    worker.llm = MagicMock(
+        collective_rpc=MagicMock(return_value=[{"ok": True, "receiver_total_s": 1.0}])
+    )
+
+    response = worker.update_weights_from_serialized_sparse_payloads((b"0", b"1", b"2"))
+
+    calls = worker.llm.collective_rpc.call_args_list
+    assert [call.args[0] for call in calls] == [
+        "update_weights_from_serialized_sparse_payload",
+        "update_weights_from_serialized_sparse_payload",
+        "update_weights_from_serialized_sparse_payload",
+        "synchronize_device",
+    ]
+    assert [call.kwargs["args"] for call in calls[:3]] == [
+        (b"0", False),
+        (b"1", False),
+        (b"2", False),
+    ]
+    assert response == {"ok": True, "receiver_total_s": 3.0, "payloads": 3}
 
 
 basic_lora_test_config: LoRAConfig = {
@@ -443,6 +590,28 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
             is_eval=False,
             has_refit_draft_weights=False,
         )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_uses_real_s3_delta_baseline():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = "vllm_s3_sparse"
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_uses_real_zmq_delta_baseline():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = "vllm_zmq_sparse"
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
 
     assert configured["vllm_cfg"]["load_format"] == "auto"
 

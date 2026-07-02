@@ -19,6 +19,7 @@
 import contextlib
 import json
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -72,6 +73,237 @@ def _patch_vllm_postload(monkeypatch):
         process_weights,
     )
     return process_weights
+
+
+def _attach_tensor_attrs(tensor: torch.Tensor, **attrs: object) -> torch.Tensor:
+    for name, value in attrs.items():
+        setattr(tensor, name, value)
+    return tensor
+
+
+def _make_sparse_delta_extension(
+    parameter_name: str,
+    target: torch.Tensor,
+    module: object,
+    module_name: str | None = None,
+) -> Any:
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.rank = 1
+    ext._direct_sparse_delta_targets = {parameter_name: target}
+    ext._direct_sparse_delta_modules = {
+        module_name or parameter_name.rsplit(".", 1)[0]: module
+    }
+    ext._direct_sparse_delta_plan_cache = {}
+    return ext
+
+
+def _assert_sparse_plan(
+    ext: Any,
+    plan: Any,
+    source_locations: list[int],
+    expected_locations: list[int],
+    expected_values: list[float],
+) -> None:
+    assert plan is not None
+    values = torch.arange(len(source_locations), dtype=torch.float32)
+    locations, values = ext._local_sparse_delta_update_inputs(
+        torch.tensor(source_locations), values, plan
+    )
+    assert locations.tolist() == expected_locations
+    assert values.tolist() == expected_values
+
+
+@pytest.mark.vllm
+def test_serialized_sparse_payload_batch_preserves_order(tmp_path) -> None:
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.device = torch.device("cpu")
+    payloads = [
+        (torch.tensor([index]), torch.tensor([float(index)]), {"index": index})
+        for index in range(3)
+    ]
+    paths = [tmp_path / f"{index}.pt" for index in range(3)]
+    for path, payload in zip(paths, payloads, strict=True):
+        torch.save(payload, path)
+    applied: list[tuple[Any, bool]] = []
+
+    def apply(payload: Any, *, synchronize: bool) -> dict[str, Any]:
+        applied.append((payload, synchronize))
+        return {
+            "ok": True,
+            "receiver_sparse_apply_s": 2.0,
+        }
+
+    ext._apply_sparse_request = apply
+    result = ext.update_weights_from_sparse_payload_files(
+        *(str(path) for path in paths), synchronize=False
+    )
+
+    assert [item[0][2]["index"] for item in applied] == [0, 1, 2]
+    assert all(
+        torch.equal(item[0][1], payload[1])
+        for item, payload in zip(applied, payloads, strict=True)
+    )
+    assert all(not synchronize for _, synchronize in applied)
+    assert result["receiver_deserialize_s"] >= 0.0
+    assert result["receiver_sparse_apply_s"] == 6.0
+
+
+@pytest.mark.vllm
+def test_direct_sparse_delta_placement() -> None:
+    qkv_name = "model.layers.0.self_attn.qkv_proj.weight"
+    qkv_target = _attach_tensor_attrs(torch.zeros(8, 2), output_dim=0)
+    ext = _make_sparse_delta_extension(
+        qkv_name,
+        qkv_target,
+        SimpleNamespace(
+            tp_rank=1,
+            num_kv_head_replicas=2,
+            _get_shard_offset_mapping=lambda shard: {"q": 0, "k": 4, "v": 6}[shard],
+            _get_shard_size_mapping=lambda shard: {"q": 4, "k": 2, "v": 2}[shard],
+        ),
+    )
+    qkv_source = "model.layers.0.self_attn.k_proj.weight"
+    plan = ext._direct_sparse_delta_qkv_plan(
+        {"name": qkv_source, "shape": (2, 2)}, qkv_source, {qkv_name: qkv_target}
+    )
+    _assert_sparse_plan(ext, plan, [0, 1, 2, 3], [8, 9, 10, 11], [0.0, 1.0, 2.0, 3.0])
+
+    expert_name = "model.layers.0.mlp.experts.w13_weight"
+    expert_target = torch.zeros(2, 4, 2)
+    expert_module = SimpleNamespace(
+        tp_rank=1,
+        moe_config=SimpleNamespace(is_act_and_mul=False),
+        _map_global_expert_id_to_local_expert_id=lambda expert: (
+            1 if expert == 3 else -1
+        ),
+    )
+    ext = _make_sparse_delta_extension(
+        expert_name,
+        expert_target,
+        expert_module,
+    )
+    expert_source = "model.layers.0.mlp.experts.3.gate_proj.weight"
+    plan = ext._direct_sparse_delta_expert_plan(
+        {"name": expert_source, "shape": (8, 2)},
+        expert_source,
+        {expert_name: expert_target},
+    )
+    _assert_sparse_plan(
+        ext,
+        plan,
+        [6, 7, 8, 9, 14, 15],
+        [8, 9, 14, 15],
+        [2.0, 3.0, 4.0, 5.0],
+    )
+
+    expert_source = "model.layers.0.mlp.experts.3.up_proj.weight"
+    plan = ext._direct_sparse_delta_expert_plan(
+        {"name": expert_source, "shape": (8, 2)},
+        expert_source,
+        {expert_name: expert_target},
+    )
+    _assert_sparse_plan(
+        ext,
+        plan,
+        [6, 7, 8, 9, 14, 15],
+        [8, 9, 14, 15],
+        [2.0, 3.0, 4.0, 5.0],
+    )
+
+    w2_target = torch.zeros(2, 2, 4)
+    ext = _make_sparse_delta_extension(expert_name, w2_target, expert_module)
+    expert_source = "model.layers.0.mlp.experts.3.down_proj.weight"
+    plan = ext._direct_sparse_delta_expert_plan(
+        {"name": expert_source, "shape": (2, 8)},
+        expert_source,
+        {"model.layers.0.mlp.experts.w2_weight": w2_target},
+    )
+    _assert_sparse_plan(ext, plan, [3, 4, 7, 11, 15], [8, 11, 15], [1.0, 2.0, 4.0])
+
+    mamba_name = "model.layers.0.mixer.in_proj.weight"
+    mamba_target = torch.zeros(16, 1, 2)
+    ext = _make_sparse_delta_extension(
+        mamba_name,
+        mamba_target,
+        SimpleNamespace(
+            tp_size=2,
+            intermediate_size=8,
+            groups_ssm_state_size=6,
+            num_heads=4,
+        ),
+        "model.layers.0.mixer",
+    )
+    plan = ext._direct_sparse_delta_mamba2_plan(
+        {"name": mamba_name, "shape": (28, 2)},
+        mamba_name,
+        {mamba_name: mamba_target},
+    )
+    _assert_sparse_plan(
+        ext, plan, [0, 8, 25, 38, 40, 55], [0, 9, 22, 31], [1.0, 2.0, 4.0, 5.0]
+    )
+
+    mamba_target = torch.zeros(14, 2)
+    ext = _make_sparse_delta_extension(
+        mamba_name,
+        mamba_target,
+        SimpleNamespace(
+            tp_size=2,
+            intermediate_size=8,
+            groups_ssm_state_size=4,
+            num_heads=4,
+        ),
+        "model.layers.0.mixer",
+    )
+    plan = ext._direct_sparse_delta_mamba2_plan(
+        {"name": mamba_name, "shape": (28, 2)},
+        mamba_name,
+        {mamba_name: mamba_target},
+    )
+    _assert_sparse_plan(
+        ext,
+        plan,
+        [0, 8, 24, 36, 44, 52, 55],
+        [0, 8, 16, 20, 24, 27],
+        [1, 2, 3, 4, 5, 6],
+    )
+
+    shard_target = _attach_tensor_attrs(
+        torch.zeros(3, 2), output_dim=0, tp_size=2, tp_rank=1
+    )
+    ext = _make_sparse_delta_extension("down_proj.weight", shard_target, object())
+    plan = ext._direct_sparse_delta_shard_plan(
+        {"name": "down_proj.weight", "shape": (6, 2)}, shard_target
+    )
+    _assert_sparse_plan(
+        ext,
+        plan,
+        [0, 1, 6, 7, 10, 11],
+        [0, 1, 4, 5],
+        [2.0, 3.0, 4.0, 5.0],
+    )
+
+    shared_target = _attach_tensor_attrs(
+        torch.zeros(3, 2), output_dim=0, input_dim=1, tp_size=2, tp_rank=1
+    )
+    ext = _make_sparse_delta_extension("down_proj.weight", shared_target, object())
+    plan = ext._direct_sparse_delta_shard_plan(
+        {"name": "down_proj.weight", "shape": (3, 4)}, shared_target
+    )
+    _assert_sparse_plan(
+        ext,
+        plan,
+        [0, 1, 2, 3, 6, 7, 10, 11],
+        [0, 1, 2, 3, 4, 5],
+        [2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+    )
 
 
 @pytest.mark.vllm
