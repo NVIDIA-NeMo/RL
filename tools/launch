@@ -182,6 +182,9 @@ for SCRIPT in $SCRIPTS; do
             GRES_ARG=""
         fi
 
+        SLURM_HOURS=$((NUM_MINUTES / 60))
+        SLURM_MINS=$((NUM_MINUTES % 60))
+
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -201,7 +204,7 @@ sbatch \\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
-    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}\\
+    --time=${SLURM_HOURS}:${SLURM_MINS}:0 ${GRES_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ray.sub
 EOF
