@@ -1,0 +1,96 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  batch_multiplier: 1
+  max_rollout_turns: 1
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  val_period: 5
+  max_val_samples: 960
+  val_batch_size: 960
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 1
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 2048
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/grpo-dapomath17k-qwen3.5-35ba3b-2n8g-megatron
+  keep_top_k: 3
+  save_period: 5
+  model_save_format: null
+policy:
+  model_name: Qwen/Qwen3.5-35B-A3B-Base
+  train_micro_batch_size: 1
+  train_global_batch_size: 512
+  logprob_batch_size: 1
+  precision: "bfloat16"
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    sequence_parallel: true
+    expert_model_parallel_size: 16
+    moe_token_dispatcher_type: allgather
+    apply_rope_fusion: false
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+      weight_decay: 0.1
+    scheduler:
+      lr_warmup_iters: 5
+      lr_warmup_init: 1.0e-8
+      lr_decay_style: constant
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 2048
+    vllm_cfg:
+      max_model_len: 4096
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.6
+      enforce_eager: true
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  monitor_gpus: false
+  num_val_samples_to_print: 2
+  wandb:
+    project: nemorl-dapo-qwen35
+    name: grpo-dapomath17k-qwen3.5-35ba3b-2n8g-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
