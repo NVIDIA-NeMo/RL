@@ -60,4 +60,3 @@ releases:
   chart: oci://registry.k8s.io/jobset/charts/jobset
   version: 0.11.1
   wait: true
-

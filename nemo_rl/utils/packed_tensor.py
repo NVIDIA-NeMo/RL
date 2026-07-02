@@ -19,6 +19,9 @@ from typing import Any, List, Tuple
 
 import torch
 
+VLLM_PACKED_BUFFER_SIZE_BYTES = 1024**3
+VLLM_PACKED_NUM_BUFFERS = 2
+
 
 @lru_cache(maxsize=1)
 def get_target_packed_tensor_size():
@@ -36,7 +39,15 @@ def get_num_buffers():
     return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
-def packed_broadcast_producer(iterator, group, src, post_iter_func):
+def packed_broadcast_producer(
+    iterator,
+    group,
+    src,
+    post_iter_func,
+    *,
+    buffer_size_bytes: int | None = None,
+    num_buffers: int | None = None,
+):
     """Broadcast a list of tensors in a packed manner.
 
     Args:
@@ -44,14 +55,20 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
         group: process group (vllm PyNcclCommunicator)
         src: source rank (0 in current implementation)
         post_iter_func: function to apply to each tensor before packing, should return a tensor
+        buffer_size_bytes: packed-buffer target. Uses the NeMo-RL default when unset.
+        num_buffers: number of alternating CUDA buffers. Uses the default when unset.
 
     Returns:
         None
 
     """
-    target_packed_tensor_size = get_target_packed_tensor_size()
+    target_packed_tensor_size = (
+        get_target_packed_tensor_size()
+        if buffer_size_bytes is None
+        else buffer_size_bytes
+    )
 
-    num_buffers = get_num_buffers()
+    num_buffers = get_num_buffers() if num_buffers is None else num_buffers
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
