@@ -41,7 +41,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.utils.k8s import is_in_kubernetes, read_pod_namespace
 
-
 LOGGER = logging.getLogger(__name__)
 
 _HTTP_MAX_ATTEMPTS = 3

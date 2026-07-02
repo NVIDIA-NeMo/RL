@@ -24,7 +24,6 @@ from nccl.core import SUM
 from nccl.core.communicator import Communicator
 from nccl.core.utils import UniqueId, get_unique_id
 
-
 _NEMO_UNIQUE_ID_KEY = "nccl_unique_id"
 _VLLM_UNIQUE_ID_KEY = "broadcast_from/0/0"
 _VLLM_NCCL_MODULE = "vllm.distributed.device_communicators.pynccl_wrapper"
