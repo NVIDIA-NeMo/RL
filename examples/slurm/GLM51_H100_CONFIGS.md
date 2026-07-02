@@ -55,4 +55,10 @@ policy.generation.max_new_tokens=2048
   CP/TP as a discriminator.
 - **20L @131k needs > 4 nodes** (does not fit non-colocated on 4).
 
-## Perf @131k (4L): cuDNN ~6.5s/step steady (stable) vs tilelang ~10.5s (bimodal — per-shape JIT recompile spikes).
+## Perf @131k (4L) — apples-to-apples
+cuDNN ~6.5s/step steady (stable) vs tilelang ~10.5s (bimodal — per-shape JIT recompile spikes).
+Both runs used IDENTICAL parallelism: TP4 / **CP2** / EP8 / PP1, same seq-len (131k) and gen config;
+only `dsa_kernel_backend` differs (cuDNN job 13303113, tilelang job 13303495).
+NOTE: the **CP4** override appears only in the **20L scale-up** run above (needed to fit 90GB @131k on 5 nodes) —
+it is NOT part of the 4L perf comparison. There is no cuDNN 20L counterpart (cuDNN 20L hits the DSA IMA),
+so no perf comparison exists at 20L.
