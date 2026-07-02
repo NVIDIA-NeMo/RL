@@ -523,7 +523,8 @@ def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatc
 
     child = torch.nn.Module()
     child.weight = torch.nn.Parameter(torch.ones(1))
-    child.register_buffer("input_quantizer_amax", torch.tensor([1.0]))
+    child.input_quantizer = torch.nn.Module()
+    child.input_quantizer.register_buffer("_amax", torch.tensor([1.0]))
     child.register_buffer("weight_quantizer_amax", torch.tensor([2.0]))
     child.attn = torch.nn.Module()
     child.attn.k_bmm_quantizer = torch.nn.Module()
@@ -538,8 +539,8 @@ def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatc
         assert [name for name, _ in weights] == ["child.attn.k_bmm_quantizer._amax"]
         params = dict(child.named_parameters())
         seen_names.extend(params)
-        params["input_quantizer_amax"].weight_loader(
-            params["input_quantizer_amax"],
+        params["input_quantizer._amax"].weight_loader(
+            params["input_quantizer._amax"],
             torch.tensor([3.0]),
         )
         params["attn.k_bmm_quantizer._amax"].weight_loader(
@@ -565,12 +566,12 @@ def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatc
     )
 
     assert "weight" in seen_names
-    assert "input_quantizer_amax" in seen_names
+    assert "input_quantizer._amax" in seen_names
     assert "attn.k_bmm_quantizer._amax" in seen_names
     assert "weight_quantizer_amax" not in seen_names
-    assert not hasattr(child.input_quantizer_amax, "weight_loader")
+    assert not hasattr(child.input_quantizer._amax, "weight_loader")
     assert not hasattr(child.attn.k_bmm_quantizer._amax, "weight_loader")
-    torch.testing.assert_close(child.input_quantizer_amax, torch.tensor([3.0]))
+    torch.testing.assert_close(child.input_quantizer._amax, torch.tensor([3.0]))
     torch.testing.assert_close(
         child.attn.k_bmm_quantizer._amax,
         torch.tensor([4.0]),

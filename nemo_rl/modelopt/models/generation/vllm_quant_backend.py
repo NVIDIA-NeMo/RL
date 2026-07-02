@@ -41,9 +41,10 @@ if os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1":
 
 
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
-    _FAKE_QUANT_KV_AMAX_SUFFIXES = (
-        ".k_bmm_quantizer._amax",
-        ".v_bmm_quantizer._amax",
+    _QUANT_AMAX_SUFFIXES = (
+        "input_quantizer._amax",
+        "k_bmm_quantizer._amax",
+        "v_bmm_quantizer._amax",
     )
 
     def _is_real_quant_model(self) -> bool:
@@ -58,7 +59,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         weight-loading path.
         """
         original_named_parameters = model.named_parameters
-        kv_amax_suffixes = self._FAKE_QUANT_KV_AMAX_SUFFIXES
+        quant_amax_suffixes = self._QUANT_AMAX_SUFFIXES
         patched_quantizer_buffers = []
 
         def amax_loader(param, loaded_weight, *args, **kwargs):
@@ -68,9 +69,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         def new_named_parameters(self, *args, **kwargs):
             yield from original_named_parameters(*args, **kwargs)
             for name, buf in self.named_buffers(*args, **kwargs):
-                if "input_quantizer" not in name and not name.endswith(
-                    kv_amax_suffixes
-                ):
+                if not name.endswith(quant_amax_suffixes):
                     continue
                 if not hasattr(buf, "weight_loader"):
                     buf.weight_loader = amax_loader
@@ -132,9 +131,13 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
 
         remapped_weights = []
         for name, weight in weights:
-            for suffix in self._FAKE_QUANT_KV_AMAX_SUFFIXES:
-                if name.endswith(suffix) and not name.endswith(f".attn{suffix}"):
-                    name = f"{name[: -len(suffix)]}.attn{suffix}"
+            for suffix in self._QUANT_AMAX_SUFFIXES:
+                if (
+                    "_bmm_quantizer" in suffix
+                    and name.endswith(suffix)
+                    and not name.endswith(f"attn.{suffix}")
+                ):
+                    name = f"{name[: -len(suffix)]}attn.{suffix}"
                     break
             remapped_weights.append((name, weight))
 
