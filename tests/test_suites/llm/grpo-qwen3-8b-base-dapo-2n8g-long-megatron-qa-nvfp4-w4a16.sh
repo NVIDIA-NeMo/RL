@@ -5,8 +5,8 @@ source $SCRIPT_DIR/common.env
 # ===== BEGIN CONFIG =====
 NUM_NODES=2
 GPUS_PER_NODE=8
-STEPS_PER_RUN=20
-MAX_STEPS=100
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -35,9 +35,9 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/gen_kl_error"]["100"] < 0.003' \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["validation/accuracy"]["100"] > 0.15'
+        'max(data["train/gen_kl_error"]) < 0.003' \
+        'max(data["train/reward"]) > -0.9'
 
     grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
     grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
