@@ -111,7 +111,11 @@ def _install_runtime_stubs_for_hf_import(monkeypatch):
 
 def test_prefer_nvrx_is_noop_when_strategy_import_fails(monkeypatch):
     module = _load_community_import_module(monkeypatch)
-    sys.modules.pop("megatron.core.dist_checkpointing.strategies.torch", None)
+    # Force this import to fail even if real megatron modules were preloaded by
+    # earlier tests in the same process.
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", None
+    )
 
     # Should not raise when dist-checkpoint strategy is unavailable.
     with module._prefer_nvrx_for_dist_ckpt_save():
