@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from itertools import product
 from unittest.mock import MagicMock
 
@@ -39,7 +40,7 @@ from nemo_rl.models.dtensor.parallelize import (
                 ("google/gemma-3-4b-it", _parallelize_gemma3),
                 # ("Qwen/Qwen2.5-1.5B", _parallelize_qwen), # TODO: qwen2 doesn't have q_norm and k_norm, which will cause this test to fail
                 ("Qwen/Qwen3-0.6B", _parallelize_qwen),
-                ("meta-llama/Llama-3.2-1B-Instruct", _parallelize_llama),
+                ("HuggingFaceH4/tiny-random-LlamaForCausalLM", _parallelize_llama),
             ],
             [True, False],
         )
@@ -47,7 +48,29 @@ from nemo_rl.models.dtensor.parallelize import (
 )
 def test_parallelize_plan_keys(model_name, parallelize_func, sequence_parallel):
     """Tests that the keys in the parallelization plans are valid by mocking parallel styles."""
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    hf_token = os.environ.get("HF_TOKEN")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, **({"token": hf_token} if hf_token else {})
+        )
+    except Exception as exc:
+        # Some hf_gated models require explicit access approvals. In CI, token
+        # scopes/approvals can vary across bots; skip these cases when auth
+        # does not allow access to the model.
+        msg = str(exc).lower()
+        is_auth_failure = (
+            "401" in msg
+            or "unauthorized" in msg
+            or "gated repo" in msg
+            or "access to model" in msg
+            or "you are trying to access a gated repo" in msg
+        )
+        if is_auth_failure:
+            pytest.skip(
+                f"Skipping {model_name}: missing HF auth or gated-model access."
+            )
+        raise
+
     parallel_plan = parallelize_func(model, sequence_parallel=sequence_parallel)
 
     applied_keys = set()
