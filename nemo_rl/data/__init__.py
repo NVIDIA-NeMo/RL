@@ -75,7 +75,20 @@ class DataConfig(TypedDict):
 
 
 class EvalDataConfig(ResponseDatasetConfig):
-    """Response-dataset configuration extended with eval-only settings."""
+    """Response-dataset configuration extended with eval-only settings.
+
+    Kept as a ``TypedDict`` (v1) because it extends the still-v1
+    ``ResponseDatasetConfig``; migrate both to ``BaseModel`` together.
+
+    Fields:
+        max_input_seq_length: Max prompt length passed to the generation backend.
+        repeat: Number of dataset copies to evaluate. Some response datasets
+            default higher in code for training validation (AIME uses 16), so
+            eval exemplars set 1 explicitly.
+        include_single_letter_instruction: Daily-Omni only. Set to false so the
+            eval ``prompt_file`` dictates answer formatting instead of the
+            training-only single-letter instruction.
+    """
 
     max_input_seq_length: int
     repeat: NotRequired[int]

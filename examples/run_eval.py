@@ -99,8 +99,11 @@ def main():
     # Init ray
     init_ray()
 
-    # Setup tokenizer — get_tokenizer handles both text-only and multimodal
-    is_multimodal = config.data.get("processor", "default") == "vlm_hf_data_processor"
+    # Setup tokenizer — get_tokenizer handles both text-only and multimodal.
+    # vlm_hf_data_processor is the only multimodal processor in
+    # PROCESSOR_REGISTRY, so multimodal eval configs (mmau, daily-omni) must
+    # set data.processor to it.
+    is_multimodal = config.data.get("processor") == "vlm_hf_data_processor"
     tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
     config.generation = configure_generation_config(
         config.generation, tokenizer, is_eval=True
