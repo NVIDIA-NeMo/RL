@@ -1014,6 +1014,9 @@ def grpo_train_sync(
                     "advantages/min": torch.min(response_advantages).detach().item()
                     if response_advantages.numel() > 0
                     else 0.0,
+                    "advantages/std": torch.std(response_advantages).detach().item()
+                    if response_advantages.numel() > 1
+                    else 0.0,
                     **ds_metrics,
                 }
                 if "moe_metrics" in train_results:

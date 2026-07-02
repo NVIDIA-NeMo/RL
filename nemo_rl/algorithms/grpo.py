@@ -1311,6 +1311,41 @@ def dynamic_sampling(
             # Get the prompt indices with non-zero std
             non_zero_std_mask = std != 0.0
 
+            # Research diagnostic: among the std==0 prompt groups that dynamic
+            # sampling discards, track only the "all-incorrect" ones (every
+            # completion wrong) so we can watch whether the policy starts
+            # solving previously-unsolvable prompts as training progresses.
+            # This count should trend down if the model is improving on the
+            # hard tail. "All-correct" groups (std==0, reward>0) are
+            # intentionally NOT logged, per the request.
+            num_generations = master_config.grpo["num_generations_per_prompt"]
+            # Score correctness on the same reward std was filtered on: the raw
+            # task metric (unshaped) for DAPO, otherwise the total reward.
+            correctness_reward = (
+                repeated_batch["unshaped_total_reward"]
+                if "unshaped_total_reward" in repeated_batch
+                else total_rewards
+            )
+            # std==0 => every completion in the group scored identically, so a
+            # single reward==0 sample means the whole group is all-incorrect.
+            all_incorrect_sample_mask = (~non_zero_std_mask) & (
+                correctness_reward == 0.0
+            )
+            # Samples are laid out in contiguous groups of `num_generations`;
+            # dividing the sample count by the group size recovers the number
+            # of all-incorrect prompt groups (each contributes exactly
+            # `num_generations` samples).
+            num_prompts = std.numel() // num_generations
+            num_all_incorrect_prompts = (
+                int(all_incorrect_sample_mask.sum().item()) // num_generations
+            )
+            dynamic_sampling_metrics["dynamic_sampling_num_all_incorrect_prompts"] = (
+                num_all_incorrect_prompts
+            )
+            dynamic_sampling_metrics[
+                "dynamic_sampling_frac_all_incorrect_prompts"
+            ] = (num_all_incorrect_prompts / num_prompts if num_prompts > 0 else 0.0)
+
             keep_prompt_indices = torch.arange(
                 len(non_zero_std_mask), device=std.device
             )[non_zero_std_mask].tolist()
@@ -2123,6 +2158,161 @@ def compute_and_apply_seq_logprob_error_masking(
     }
 
 
+def _training_stage(step: int, total_steps: int) -> str:
+    """Bucket a training step into an early / mid / late stage.
+
+    Oracular heuristic: split the total planned steps into even thirds. The
+    first third is ``early``, the middle third ``mid``, the final third ``late``
+    (e.g. step 50 of 100 -> ``mid``). Returns ``unknown`` when the total step
+    count is unavailable (<= 0), so the column is always populated.
+    """
+    if total_steps <= 0:
+        return "unknown"
+    frac = step / total_steps
+    if frac < 1 / 3:
+        return "early"
+    if frac < 2 / 3:
+        return "mid"
+    return "late"
+
+
+def _per_sample_advantage(
+    flat_advantages: torch.Tensor, flat_token_mask: torch.Tensor
+) -> torch.Tensor:
+    """Reduce per-token advantages to one scalar per sample.
+
+    Takes a masked mean over the valid response tokens so each rollout gets a
+    single advantage value (GRPO advantages are constant across a sample's
+    response tokens, so this recovers that value robustly even after clipping).
+    """
+    mask = flat_token_mask.float()
+    denom = mask.sum(dim=1).clamp(min=1.0)
+    return (flat_advantages.float() * mask).sum(dim=1) / denom
+
+
+def _log_rollout_sample_table(
+    logger: "Logger",
+    step: int,
+    message_logs: list[Any],
+    rewards: Any,
+    per_sample_advantages: Any,
+    max_total_steps: int = 0,
+    num_prompts: int = 3,
+    max_text_chars: int = 4000,
+) -> None:
+    """Log a readable, prompt-grouped table of training rollouts to W&B.
+
+    GRPO generates ``num_generations_per_prompt`` rollouts per prompt. Instead of
+    dumping every rollout as its own row, this collapses that structure into one
+    row per prompt: the group's total and mean reward, plus the single best and
+    single worst rollout (by reward) with their rewards and advantages, so a
+    reviewer can eyeball a good vs. bad completion for the same prompt.
+    ``num_prompts`` distinct prompts are drawn at random (seeded by ``step`` for
+    a reproducible but rotating sample).
+
+    Logged under a single fixed key ``train/rollout_samples`` so W&B renders one
+    panel and versions it by ``step``: scrub the panel's step slider to move
+    between snapshots without losing any. Every row carries a ``training_stage``
+    column (early/mid/late, see :func:`_training_stage`) plus the ``step`` so the
+    snapshot the slider is on is always legible. No-op for non-W&B backends.
+
+    Args:
+        logger: Parent Logger (``log_table`` no-ops on backends without tables).
+        step: Global training step (table step and RNG seed).
+        message_logs: Per-rollout message logs, aligned with ``rewards`` and
+            ``per_sample_advantages``.
+        rewards: Per-rollout scalar rewards (1D tensor/array/list).
+        per_sample_advantages: Per-rollout scalar advantages (1D), same order.
+        max_total_steps: Total planned training steps, used to derive the
+            training stage and the zero-pad width of the table name.
+        num_prompts: Number of distinct prompts to sample.
+        max_text_chars: Truncate prompt/completion text to this many characters.
+    """
+    if logger is None or not message_logs:
+        return
+    try:
+        rewards = np.asarray(
+            rewards.tolist() if isinstance(rewards, torch.Tensor) else rewards,
+            dtype=np.float64,
+        )
+        advantages = np.asarray(
+            per_sample_advantages.tolist()
+            if isinstance(per_sample_advantages, torch.Tensor)
+            else per_sample_advantages,
+            dtype=np.float64,
+        )
+
+        def _join(log: Any, assistant: bool) -> str:
+            text = "\n\n".join(
+                str(m.get("content", ""))
+                for m in log
+                if (m.get("role") == "assistant") == assistant
+            )
+            return text[:max_text_chars]
+
+        # Group rollout indices by their prompt text so identical prompts share a
+        # group. Grouping by text is robust to however the rollouts were laid out.
+        groups: dict[str, list[int]] = {}
+        for i, log in enumerate(message_logs):
+            if i >= len(rewards):
+                break
+            groups.setdefault(_join(log, assistant=False), []).append(i)
+
+        prompt_keys = list(groups.keys())
+        if not prompt_keys:
+            return
+        rng = np.random.RandomState(step)
+        take = min(num_prompts, len(prompt_keys))
+        chosen = rng.choice(len(prompt_keys), take, replace=False)
+
+        stage = _training_stage(step, max_total_steps)
+        columns = [
+            "step",
+            "training_stage",
+            "prompt",
+            "num_rollouts",
+            "reward_total",
+            "reward_mean",
+            "best_reward",
+            "best_advantage",
+            "best_completion",
+            "worst_reward",
+            "worst_advantage",
+            "worst_completion",
+        ]
+        rows = []
+        for k in chosen:
+            prompt = prompt_keys[int(k)]
+            idxs = groups[prompt]
+            group_rewards = rewards[idxs]
+            best = idxs[int(np.argmax(group_rewards))]
+            worst = idxs[int(np.argmin(group_rewards))]
+            rows.append(
+                [
+                    step,
+                    stage,
+                    prompt,
+                    len(idxs),
+                    float(group_rewards.sum()),
+                    float(group_rewards.mean()),
+                    float(rewards[best]),
+                    float(advantages[best]),
+                    _join(message_logs[best], assistant=True),
+                    float(rewards[worst]),
+                    float(advantages[worst]),
+                    _join(message_logs[worst], assistant=True),
+                ]
+            )
+        # Log under a single fixed key so W&B renders ONE panel and versions it by
+        # step: scrub the panel's step slider to see each snapshot. The `step` and
+        # `training_stage` columns identify which snapshot the slider is on.
+        logger.log_table(
+            columns=columns, rows=rows, step=step, name="train/rollout_samples"
+        )
+    except Exception as e:
+        print(f"  ⚠️ Error logging rollout sample table to W&B: {e}")
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -2816,6 +3006,10 @@ def grpo_train(
                     "advantages/min": torch.min(response_advantages).detach().item()
                     if response_advantages.numel() > 0
                     else 0.0,
+                    "advantages/std": torch.std(response_advantages).detach().item()
+                    if response_advantages.numel() > 1
+                    else 0.0,
+                    "reward/std": float(np.std(rewards.numpy())),
                     **ds_metrics,
                 }
                 if "moe_metrics" in train_results:
@@ -2858,6 +3052,13 @@ def grpo_train(
                         metrics[k] = np.sum(v).item()
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
+
+                # Recover the population std of the importance ratio from the
+                # globally-summed E[r] (probs_ratio) and E[r^2] (probs_ratio_sq).
+                if "probs_ratio_sq" in metrics and "probs_ratio" in metrics:
+                    ratio_var = metrics["probs_ratio_sq"] - metrics["probs_ratio"] ** 2
+                    metrics["probs_ratio_std"] = float(np.sqrt(max(0.0, ratio_var)))
+                    del metrics["probs_ratio_sq"]
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -3101,6 +3302,22 @@ def grpo_train(
                 step_finished=True,
             )
 
+            # Log a prompt-grouped sample of this step's rollouts to W&B on the
+            # validation cadence (or the final step) to keep table volume low.
+            if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+                val_at_end and is_last_step
+            ):
+                _log_rollout_sample_table(
+                    logger,
+                    step=total_steps + 1,
+                    message_logs=repeated_batch["message_log"],
+                    rewards=rewards,
+                    per_sample_advantages=_per_sample_advantage(
+                        flat_advantages, flat_token_mask
+                    ),
+                    max_total_steps=max_num_steps,
+                )
+
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
@@ -3255,6 +3472,56 @@ def validate(
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
             print("  ⚠️ Continuing validation without displaying samples...", flush=True)
+
+        # Log a stratified-random sample of validation conversations to W&B as a
+        # table (no-op for non-W&B backends). Each eval step logs its own table,
+        # so the W&B step slider shows the early/mid/late progression. We pick
+        # NUM_SAMPLE_ROWS prompts split between correct (reward > 0) and wrong
+        # completions so both sides of the model's behavior are visible, re-seeded
+        # per step for a fresh-but-reproducible draw.
+        NUM_SAMPLE_ROWS = 5
+        if logger is not None and len(all_message_logs) > 0:
+            try:
+                rng = np.random.RandomState(step)
+                correct_idx = [i for i, r in enumerate(total_rewards) if r > 0]
+                wrong_idx = [i for i, r in enumerate(total_rewards) if r <= 0]
+                n = min(NUM_SAMPLE_ROWS, len(all_message_logs))
+                take_correct = min(n // 2, len(correct_idx))
+                take_wrong = min(n - take_correct, len(wrong_idx))
+                take_correct = min(n - take_wrong, len(correct_idx))
+                selected = list(
+                    rng.choice(correct_idx, take_correct, replace=False)
+                ) + list(rng.choice(wrong_idx, take_wrong, replace=False))
+
+                # Truncate long conversations so table cells stay readable in the
+                # W&B UI (validation has no advantages, so reward per completion
+                # is the signal here).
+                MAX_TEXT_CHARS = 4000
+                sample_rows = []
+                for i in selected:
+                    message_log = all_message_logs[i]
+                    prompt = "\n\n".join(
+                        str(m.get("content", ""))
+                        for m in message_log
+                        if m.get("role") != "assistant"
+                    )[:MAX_TEXT_CHARS]
+                    completion = "\n\n".join(
+                        str(m.get("content", ""))
+                        for m in message_log
+                        if m.get("role") == "assistant"
+                    )[:MAX_TEXT_CHARS]
+                    reward = float(total_rewards[i])
+                    sample_rows.append(
+                        [step, prompt, completion, reward, reward > 0]
+                    )
+                logger.log_table(
+                    columns=["step", "prompt", "completion", "reward", "correct"],
+                    rows=sample_rows,
+                    step=step,
+                    name="validation/samples",
+                )
+            except Exception as e:
+                print(f"  ⚠️ Error logging sample table to W&B: {str(e)}")
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
@@ -4072,6 +4339,10 @@ def async_grpo_train(
                     "advantages/min": torch.min(response_advantages).detach().item()
                     if response_advantages.numel() > 0
                     else 0.0,
+                    "advantages/std": torch.std(response_advantages).detach().item()
+                    if response_advantages.numel() > 1
+                    else 0.0,
+                    "reward/std": float(np.std(rewards.numpy())),
                 }
                 if "moe_metrics" in train_results:
                     metrics.update(
@@ -4105,6 +4376,12 @@ def async_grpo_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                # Recover the population std of the importance ratio from the
+                # globally-summed E[r] (probs_ratio) and E[r^2] (probs_ratio_sq).
+                if "probs_ratio_sq" in metrics and "probs_ratio" in metrics:
+                    ratio_var = metrics["probs_ratio_sq"] - metrics["probs_ratio"] ** 2
+                    metrics["probs_ratio_std"] = float(np.sqrt(max(0.0, ratio_var)))
+                    del metrics["probs_ratio_sq"]
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
@@ -4305,6 +4582,22 @@ def async_grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
+
+            # Log a prompt-grouped sample of this step's rollouts to W&B on the
+            # validation cadence (or the final step) to keep table volume low.
+            if (val_period > 0 and (step + 1) % val_period == 0) or (
+                val_at_end and is_last_step
+            ):
+                _log_rollout_sample_table(
+                    logger,
+                    step=step + 1,
+                    message_logs=repeated_batch["message_log"],
+                    rewards=rewards,
+                    per_sample_advantages=_per_sample_advantage(
+                        flat_advantages, flat_token_mask
+                    ),
+                    max_total_steps=master_config.grpo["max_num_steps"],
+                )
 
             timer.reset()
             step += 1

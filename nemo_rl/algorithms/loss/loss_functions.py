@@ -675,6 +675,14 @@ class ClippedPGLossFn(LossFunction):
                 mask,
                 global_normalization_factor=global_valid_toks,
             ).item()
+            # Mean of squared ratios, normalized identically to probs_ratio. Summed
+            # across microbatches this yields the global E[ratio^2], so a correct
+            # population std is recoverable as sqrt(E[r^2] - E[r]^2) downstream.
+            probs_ratio_sq = masked_mean(
+                ratios.detach() ** 2,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
             probs_ratio_clamped = masked_mean(
                 ratios_clamped.detach(),
                 mask,
@@ -705,6 +713,7 @@ class ClippedPGLossFn(LossFunction):
             {
                 "loss": loss.item(),
                 "probs_ratio": probs_ratio,
+                "probs_ratio_sq": probs_ratio_sq,
                 "probs_ratio_clamped": probs_ratio_clamped,
                 "probs_ratio_min": probs_ratio_min,
                 "probs_ratio_max": probs_ratio_max,
