@@ -369,16 +369,16 @@ class DTensorPolicyWorkerImpl(
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
 
-        # torch==2.8 uses LOCAL_RANK to set the device here (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500),
-        # but CUDA_VISIBLE_DEVICES is set to only 1 gpu, so we need to temporarily set LOCAL_RANK to 0.
-        # TODO: consider changing the default LOCAL_RANK set in worker_groups.py
-        prev_local_rank = os.environ["LOCAL_RANK"]
-        os.environ["LOCAL_RANK"] = "0"
-
+        # torch==2.8 uses LOCAL_RANK to set the device here
+        # (https://github.com/pytorch/pytorch/blob/ba56102387ef21a3b04b357e5b183d48f0afefc7/torch/distributed/device_mesh.py#L500).
+        # Previously, Ray masked CUDA_VISIBLE_DEVICES to a single GPU per actor and this
+        # code had to temporarily override LOCAL_RANK=0. With PR #2252 preserving
+        # RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 in worker_groups.py, every worker
+        # sees all node-local GPUs and init_device_mesh correctly uses the real
+        # LOCAL_RANK=bundle_idx set by the worker group.
         device_mesh = torch.distributed.device_mesh.init_device_mesh(
             "cuda", (dp_size, cp_size, tp_size), mesh_dim_names=("dp", "cp", "tp")
         )
-        os.environ["LOCAL_RANK"] = prev_local_rank
 
         self.dp_cp_mesh = device_mesh[("dp", "cp")]._flatten(mesh_dim_name="dp_cp")
 
