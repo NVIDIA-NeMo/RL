@@ -200,6 +200,13 @@ class DTensorPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorker."""
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Pin this worker to its GPU's NUMA-local CPUs/memory before any CUDA
+        # init or model load (mirrors the Megatron and vLLM workers). FSDP's
+        # D2H paths — weight refit, optimizer/checkpoint offload — benefit too.
+        bind_to_gpu_numa()
+
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
