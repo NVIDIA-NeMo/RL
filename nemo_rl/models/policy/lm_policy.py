@@ -61,6 +61,28 @@ from nemo_rl.utils.timer import Timer
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
+def _aggregate_megatron_flops_metrics(
+    results: list[dict],
+    world_size: int,
+) -> dict:
+    """Aggregate FLOPS metrics from Megatron worker results.
+
+    Called when the Megatron worker returns total_flops directly (no FLOPTracker).
+    """
+    aggregated: dict = {}
+    aggregated["total_flops"] = results[0]["total_flops"]
+    aggregated["num_ranks"] = results[0].get("num_ranks", world_size)
+    if "train_elapsed_seconds" in results[0]:
+        aggregated["train_elapsed_seconds"] = results[0]["train_elapsed_seconds"]
+    try:
+        aggregated["theoretical_tflops"] = aggregated[
+            "num_ranks"
+        ] * get_theoretical_tflops(results[0]["gpu_name"], results[0]["model_dtype"])
+    except Exception as e:
+        warnings.warn(f"Error getting theoretical flops: {e}")
+    return aggregated
+
+
 class Policy(ColocatablePolicyInterface, GenerationInterface):
     def __init__(
         self,
@@ -782,6 +804,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
             except Exception as e:
                 warnings.warn(f"Error getting theoretical flops: {e}")
+        elif results and "total_flops" in results[0]:
+            aggregated_results.update(
+                _aggregate_megatron_flops_metrics(
+                    results, self.worker_group.cluster.world_size()
+                )
+            )
 
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)

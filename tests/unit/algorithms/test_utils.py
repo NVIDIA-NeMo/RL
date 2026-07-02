@@ -311,6 +311,42 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     assert "Floating Point Utilization" in out
 
 
+def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
+    """train_elapsed_seconds in train_results overrides policy_training timing for TFLOPS."""
+    master_config = _base_master_config(colocated=True)
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,  # should be ignored when train_elapsed_seconds present
+        "total_step_time": 10.0,
+        "generation": 5.0,
+        "weight_sync": 1.0,
+    }
+
+    metrics = {
+        "total_num_tokens": 8000.0,
+        "per_worker_token_counts": {0: 2000, 1: 2000, 2: 2000, 3: 2000},
+    }
+
+    # total_tflops = total_flops / train_elapsed_seconds / 1e12 = 1e15 / 2.0 / 1e12 = 500
+    # (NOT 1e15 / 4.0 / 1e12 = 250, which would use policy_training)
+    train_results = {
+        "total_flops": 1.0e15,
+        "num_ranks": 8,
+        "train_elapsed_seconds": 2.0,
+        "theoretical_tflops": 500.0,
+    }
+
+    perf = print_performance_metrics(
+        train_results, metrics, timing_metrics, master_config
+    )
+
+    assert math.isclose(perf["train_flops_per_gpu"], 500.0 / 8, rel_tol=1e-6)
+
+    out = capsys.readouterr().out
+    assert "500.00 TFLOPS" in out
+
+
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
     master_config.grpo["async_grpo"] = {"enabled": True}
