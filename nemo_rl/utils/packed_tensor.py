@@ -136,7 +136,11 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
         def restore_tensor(
             tensor: torch.Tensor, shape: torch.Size | list[int], dtype: torch.dtype
         ) -> torch.Tensor:
-            # A preceding scalar can leave this byte slice unaligned for its dtype.
+            # Unlike the 512-byte-aligned IPC/ZMQ refit path, packed collective
+            # refit adds no padding between tensors. Scalar GEMM or K/V amax can
+            # therefore leave the next mixed-dtype slice unaligned. Cloning moves
+            # only such slices to offset zero; passing torch.Size also restores
+            # scalar shape [] without calling view() with no arguments.
             if tensor.storage_offset() % dtype.itemsize:
                 tensor = tensor.clone()
             return tensor.view(dtype).view(torch.Size(shape))
