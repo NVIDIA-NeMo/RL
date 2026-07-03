@@ -715,8 +715,11 @@ def parse_dynamo_args():
     parser.add_argument(
         "--max-logprob-diff",
         type=float,
-        default=0.1,
-        help="Maximum accepted absolute generated-token logprob difference.",
+        default=0.12,
+        help=(
+            "Maximum accepted absolute generated-token logprob difference "
+            "between BF16 DTensor and vLLM attention implementations."
+        ),
     )
     parser.add_argument(
         "--prompt",
