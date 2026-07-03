@@ -14,6 +14,10 @@ grpo:
 checkpointing:
   enabled: false
 
+data:
+  train:
+    dataset_name: gsm8k
+
 policy:
   model_name: Qwen/Qwen2.5-1.5B
   tokenizer:
