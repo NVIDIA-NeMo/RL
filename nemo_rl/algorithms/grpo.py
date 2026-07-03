@@ -862,8 +862,16 @@ def setup(
 
         # When the user opts into recompute-after-refit on the megatron side,
         # override mcore's kv_cache_management_mode to "recompute" directly.
-        if "async_grpo" in grpo_config and grpo_config["async_grpo"].get(
-            "recompute_kv_cache_after_weight_updates", False
+        # Megatron GENERATION backend only (mirrors the backend guard at the
+        # init_collective site below): on vllm generation the recompute is
+        # handled by the trajectory collector's invalidate_kv_cache path, and
+        # mcore_generation_config does not exist in the config.
+        if (
+            policy_config["generation"]["backend"] == "megatron"
+            and "async_grpo" in grpo_config
+            and grpo_config["async_grpo"].get(
+                "recompute_kv_cache_after_weight_updates", False
+            )
         ):
             mcore_cfg = policy_config["generation"]["mcore_generation_config"]
             prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")

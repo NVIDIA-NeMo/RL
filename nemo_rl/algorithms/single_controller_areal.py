@@ -63,7 +63,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.models.generation.sglang import SGLangGeneration
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.logger import Logger
@@ -139,8 +139,7 @@ class SingleControllerArealActor:
         # split into minibatches of train_global_batch_size, ONE optimizer.step
         # each (num_minibatches = rl_step_samples // train_global_batch_size).
         # AReaL collects exactly num_prompts_per_step groups per step; the streaming
-        # knobs target_prompt_groups_per_step / min_prompt_groups_per_batch are NOT
-        # used on this path.
+        # knob min_prompt_groups_per_batch is NOT used on this path.
         self._num_prompt_groups_per_step: int = self._master_config.grpo[
             "num_prompts_per_step"
         ]
@@ -255,6 +254,7 @@ class SingleControllerArealActor:
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
+            "gen_tokens_per_sample": [],
         }
 
         print(
@@ -653,7 +653,7 @@ class SingleControllerArealActor:
 
         (``num_prompt_groups_per_step`` == grpo.num_prompts_per_step — the AReaL
         path collects exactly that many groups per step and does NOT use the
-        streaming knobs target_prompt_groups_per_step / min_prompt_groups_per_batch).
+        streaming knob min_prompt_groups_per_batch).
         This method computes the value and writes it back onto
         ``async_cfg.max_buffered_rollouts`` so the ``_buffer_capacity`` semaphore
         and the startup banner both use the derived (auditable) number. A
@@ -688,9 +688,8 @@ class SingleControllerArealActor:
         """Trim a tail remainder so the batch is a whole number of minibatches.
 
         The full batch is normally exactly ``rl_step_samples == k * minibatch_size``
-        (``minibatch_size == train_global_batch_size``), but the
-        ``target_prompt_groups_per_step % min_prompt_groups_per_batch`` over-claim
-        edge can leave a smaller tail; trim to the largest multiple of
+        (``minibatch_size == train_global_batch_size``), but if a claim ever
+        leaves a smaller tail, trim to the largest multiple of
         ``minibatch_size``. Each kept minibatch is then exactly ``minibatch_size``,
         which ``__init__`` already verified is a DP multiple. Returns
         ``(meta_to_train, dropped)``; the dropped tail rows already had advantages
@@ -735,8 +734,8 @@ class SingleControllerArealActor:
             or ``None`` if rollout is exhausted with nothing left to train.
         """
         # AReaL collects exactly num_prompts_per_step groups (the full RL-step
-        # batch) before training; it does NOT use the streaming knobs
-        # target_prompt_groups_per_step / min_prompt_groups_per_batch.
+        # batch) before training; it does NOT use the streaming knob
+        # min_prompt_groups_per_batch.
         target: int = self._num_prompt_groups_per_step
         claimed: list[KVBatchMeta] = []
         n = 0
@@ -752,9 +751,11 @@ class SingleControllerArealActor:
                 self._buffer_capacity.release()
 
             # Claim in-window groups (lag ≤ η). select() returns (meta|None, num).
+            # min == max == the full step: one all-or-nothing claim.
             train_meta, num = await self._sampler.select(
                 current_train_weight=self._trainer_version,
                 min_prompt_groups=self._num_prompt_groups_per_step,
+                max_prompt_groups=self._num_prompt_groups_per_step,
             )
 
             if train_meta is None:
@@ -883,6 +884,15 @@ class SingleControllerArealActor:
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
         mask = token_mask * sample_mask.unsqueeze(-1)
+
+        # Per-row generated-token counts: token_mask marks the trained
+        # (assistant) tokens, so its row sum is the generation length on the
+        # gym path. Reduced at step end into the legacy-named
+        # gen_tokens_per_sample/* metrics so wandb charts line up across the
+        # legacy and SC paths.
+        self._step_log_dict["gen_tokens_per_sample"].extend(
+            token_mask.sum(dim=-1).tolist()
+        )
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,

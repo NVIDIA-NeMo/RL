@@ -15,8 +15,9 @@
 """AReaL decoupled-PPO GRPO launcher driven by SingleControllerArealActor.
 
 Identical wiring to run_grpo_single_controller.py (same config loading,
-setup_single_controller bundle, data_plane.enabled=true requirement); it only
-swaps the orchestrator to SingleControllerArealActor, which runs the AReaL
+setup_single_controller bundle, data_plane.enabled=true requirement,
+NeMo-Gym support via env.should_use_nemo_gym); it only swaps the
+orchestrator to SingleControllerArealActor, which runs the AReaL
 two-phase decoupled-PPO train loop + interruptible refit (AREAL.md §9 P0-P4).
 Pair it with an AReaL recipe (use_importance_sampling_correction=true, the
 startup assert in single_controller_areal.py requires it).
@@ -25,6 +26,7 @@ startup assert in single_controller_areal.py requires it).
 import argparse
 import os
 import pprint
+import sys
 
 import ray
 from omegaconf import OmegaConf
@@ -36,6 +38,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -43,6 +46,12 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+
+# Drop examples/ from sys.path so examples/nemo_gym/ (no __init__.py) doesn't
+# shadow the real nemo_gym package as a namespace package.
+current_dir = os.path.dirname(os.path.abspath(__file__))
+while current_dir in sys.path:
+    sys.path.remove(current_dir)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -112,12 +121,21 @@ def main() -> None:
         has_refit_draft_weights=has_refit_draft_weights,
     )
 
+    # NeMo-Gym specific config setup.
+    if bool(config.env.get("should_use_nemo_gym")):
+        setup_nemo_gym_config(config, tokenizer)
+
     bundle = setup_single_controller(config, tokenizer)
 
     print("🚀 Launching SingleControllerArealActor")
     sc = SingleControllerArealActor.remote(master_config=config, bundle=bundle)
     result = ray.get(sc.run.remote())
     print(f"AReaL SC run complete: {result}")
+
+    # Drain env actors before vLLM shutdown to avoid race-condition 500s on
+    # in-flight requests.
+    for handle in bundle.env_handles.values():
+        ray.get(handle.shutdown.remote())
 
 
 if __name__ == "__main__":

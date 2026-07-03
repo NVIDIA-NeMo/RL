@@ -134,6 +134,12 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: optim_grads_params
     env_vars: null
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
   dynamic_batching:
     enabled: false
     train_mb_tokens: 49152
@@ -245,3 +251,22 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 8
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "simple"
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888
+  local_buffer_size: 68719476736
+
+async_rl:
+  batch_selection_strategy: staleness_window
+  max_weight_staleness_versions: 1     # η — matches the legacy async_grpo.max_trajectory_age_steps: 1
+  max_inflight_prompts: 64             # = grpo.num_prompts_per_step
+  max_buffered_rollouts: 128           # 64 * (η+1); controller re-derives anyway
+  over_sampling: false
+  force_in_order: true
+  refit_invalidate_kv_cache: true      # AReaL interruptible refit

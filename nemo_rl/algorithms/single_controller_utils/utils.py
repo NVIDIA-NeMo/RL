@@ -23,6 +23,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.rollouts import _calculate_single_metric
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -94,16 +95,25 @@ def reduce_advantage_pump_metrics(
     rewards: list[torch.Tensor],
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
-) -> dict[str, float]:
+    gen_tokens_per_sample: list[float] | None = None,
+) -> dict[str, Any]:
     """Reduce per-step accumulators from _advantage_pump into step scalars.
 
     Args:
         rewards: One tensor per advantage_pump call; each row a sample reward.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
+        gen_tokens_per_sample: Per-row generated-token counts (token_mask sums),
+            when the controller collects them. Emitted under the SAME metric
+            names as the legacy NeMo-Gym rollout path
+            (``gen_tokens_per_sample/*``, ``total_tokens_per_sample/*``,
+            ``mean_gen_tokens_per_sample``) so wandb charts line up across the
+            legacy and SC paths.
 
     Returns:
-        Dict with reward, advantages/{mean,max,min}, total_num_tokens.
+        Dict with reward, advantages/{mean,max,min}, total_num_tokens, and —
+        when ``gen_tokens_per_sample`` is provided — the legacy-named length
+        metrics above.
     """
     out: dict[str, float] = {}
     if rewards:
@@ -120,6 +130,24 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    if gen_tokens_per_sample:
+        out.update(
+            _calculate_single_metric(
+                gen_tokens_per_sample,
+                len(gen_tokens_per_sample),
+                "gen_tokens_per_sample",
+            )
+        )
+        # Alias kept for parity with the legacy path's downstream logging.
+        out["mean_gen_tokens_per_sample"] = out["gen_tokens_per_sample/mean"]
+        if sequence_lengths:
+            out.update(
+                _calculate_single_metric(
+                    sequence_lengths,
+                    len(sequence_lengths),
+                    "total_tokens_per_sample",
+                )
+            )
     return out
 
 

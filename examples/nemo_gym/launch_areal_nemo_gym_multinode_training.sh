@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,37 +13,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# AReaL variant of launch_nemo_gym_multinode_training.sh: same Slurm/ray.sub
+# flow, but the entrypoint is examples/run_grpo_areal.py
+# (SingleControllerArealActor: two-phase decoupled-PPO + interruptible refit)
+# with the SC/AReaL config examples/nemo_gym/grpo_nanov3_8n8g.yaml
+# (8 nodes: 4 vLLM async generation + 4 megatron training).
 
 # ----- PARAMETERS -----
+# WANDB_API_KEY, HF_TOKEN, EXP_NAME, NUM_ACTOR_NODES, NUM_SLURM_NODES (optional), REPO_LOCATION, CONTAINER_IMAGE_PATH, SLURM_ACCOUNT, SLURM_PARTITION
 
-EXP_NAME=${EXP_NAME:-grpo-nanov3-12B-8n8g-async-gym}
-NUM_ACTOR_NODES=${NUM_ACTOR_NODES:-8}
-NUM_SLURM_NODES=${NUM_SLURM_NODES:-8}
 REPO_LOCATION=/home/haitianj/repos/nemo-RL
+
+HF_HOME=/lustre/fsw/portfolios/coreai/users/haitianj/hf_cache
+EXP_NAME=${EXP_NAME:-grpo-nanov3-12B-8n8g-gym-areal}
+NUM_ACTOR_NODES=8
+NUM_SLURM_NODES=8
 CONTAINER_IMAGE_PATH=/lustre/fsw/portfolios/coreai/users/yukih/enroot-images/nvcr.io/nvidian/nemo-rl:29fc948-55351550.squashfs
 SLURM_ACCOUNT=coreai_dlalgo_nemorl
 SLURM_PARTITION=batch
-
-# Lustre locations (everything the job writes at runtime).
-LUSTRE_USER_DIR=/lustre/fsw/portfolios/coreai/users/haitianj
-CHECKPOINT_DIR=$LUSTRE_USER_DIR/results/$EXP_NAME
-UV_CACHE_DIR_OVERRIDE=$LUSTRE_USER_DIR/uv_cache
-HF_HOME=$LUSTRE_USER_DIR/hf_cache
-# Shared gym server venvs: must be on a filesystem visible from every node,
-# because code_gen's unit-test Ray tasks (SPREAD + py_executable) start
-# workers with this venv's python on arbitrary nodes. Pre-built serially —
-# see repair_gym_venvs.sh on lustre (parallel setup on lustre corrupts venvs).
-NEMO_GYM_VENV_DIR=$LUSTRE_USER_DIR/gym_venvs
-# Training data dumps (train_data_step*.jsonl, hundreds of MB per step),
-# W&B local files (wandb.init(dir=log_dir)), and GPU monitoring logs.
-RESULTS_DIR=$LUSTRE_USER_DIR/results/$EXP_NAME
-# ray-driver/head/worker logs (ray.sub BASE_LOG_DIR) and sbatch stdout.
-RUN_LOGS_DIR=$LUSTRE_USER_DIR/run-logs
-# policy.model_name / policy.tokenizer.name in the config live here, outside
-# the default mounts.
+# Checkpoints are large (12B Megatron + optimizer state); keep them on lustre, not $HOME.
+# (SC-path checkpointing is not wired yet; the override is inert until it is.)
+CHECKPOINT_DIR=/lustre/fsw/portfolios/coreai/users/haitianj/results/$EXP_NAME
+# policy.model_name / policy.tokenizer.name in the config live under this path,
+# which is outside the default mounts.
 MODEL_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/data/nano-v3-12b-hf
 
-mkdir -p "$RUN_LOGS_DIR"
 
 # ray.sub needs to be launched from the NeMo-RL root directory
 cd $REPO_LOCATION
@@ -55,13 +49,14 @@ cd ${REPO_LOCATION}
 HF_HOME=$HF_HOME \
 HF_TOKEN=$HF_TOKEN \
 WANDB_API_KEY=$WANDB_API_KEY \
-NEMO_GYM_VENV_DIR=$NEMO_GYM_VENV_DIR \
-uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
+NEMO_GYM_VENV_DIR=/lustre/fsw/portfolios/coreai/users/haitianj/gym_venvs \
+NRL_TQ_SKIP_ACTOR_RUNTIME_ENV=1 \
+uv run python examples/run_grpo_areal.py \
     --config examples/nemo_gym/grpo_nanov3_8n8g.yaml \
     ++cluster.num_nodes=$NUM_ACTOR_NODES \
     ++logger.wandb.name=$EXP_NAME \
-    ++logger.log_dir=$RESULTS_DIR/logs \
-    ++checkpointing.checkpoint_dir=$RESULTS_DIR \
+    ++logger.log_dir=results/$EXP_NAME \
+    ++checkpointing.checkpoint_dir=$CHECKPOINT_DIR \
     ++logger.wandb_enabled=True \
     ++logger.wandb.project=areal \
     ++logger.wandb.entity=joc \
@@ -77,16 +72,12 @@ FINAL_NUM_SLURM_NODES="${NUM_SLURM_NODES:-$NUM_ACTOR_NODES}"
 # TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: torch>=2.6 DCP load of our own trusted megatron
 # shards fails under weights_only=True (belt and suspenders with the monkeypatch in
 # nemo_rl/__init__.py).
-# BASE_LOG_DIR + --output/--error: ray and slurm logs go to lustre; ray.sub uses
-# set -e, so an unwritable stdout kills the job within seconds.
 COMMAND=$COMMAND \
 CONTAINER=$CONTAINER_IMAGE_PATH \
-MOUNTS="$REPO_LOCATION:$REPO_LOCATION,$LUSTRE_USER_DIR:$LUSTRE_USER_DIR,$MODEL_DIR:$MODEL_DIR" \
-BASE_LOG_DIR=$RUN_LOGS_DIR \
+MOUNTS="$REPO_LOCATION:$REPO_LOCATION,/lustre/fsw/portfolios/coreai/users/haitianj:/lustre/fsw/portfolios/coreai/users/haitianj,$MODEL_DIR:$MODEL_DIR" \
 NRL_IGNORE_VERSION_MISMATCH=1 \
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
 HF_HOME=$HF_HOME \
-UV_CACHE_DIR_OVERRIDE=$UV_CACHE_DIR_OVERRIDE \
 sbatch \
     --nodes=$FINAL_NUM_SLURM_NODES \
     --account=$SLURM_ACCOUNT \
@@ -94,6 +85,4 @@ sbatch \
     --time=4:0:0 \
     --job-name=$EXP_NAME \
     --gres=gpu:8 \
-    --output=$RUN_LOGS_DIR/slurm-%j.out \
-    --error=$RUN_LOGS_DIR/slurm-%j.out \
     ray.sub
