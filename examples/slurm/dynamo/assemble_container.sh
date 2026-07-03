@@ -22,7 +22,11 @@ export UV_CACHE_DIR=${ROOT}/cache/uv
 export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export NRL_CONTAINER=1
 "${UV}" sync --locked --all-groups --no-install-project
-UV_LINK_MODE=symlink "${UV}" run nemo_rl/utils/prefetch_venvs.py
+# This acceptance image runs the DTensor V1 policy plus the system-Python
+# Dynamo actor. Avoid baking unrelated vLLM/SGLang/Megatron/Automodel actor
+# environments into an already large Slurm image.
+UV_LINK_MODE=symlink "${UV}" run nemo_rl/utils/prefetch_venvs.py \
+  dtensor_policy_worker.DTensorPolicyWorker
 test -x /opt/nemo_rl_venv/bin/python
 test -x /opt/ray_venvs/nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker/bin/python
 (
