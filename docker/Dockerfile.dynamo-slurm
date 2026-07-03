@@ -14,6 +14,12 @@ SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
 RUN test "${TARGETARCH}" = "amd64"
 
+# The release image may contain uv symlinks into root's private cache. Ray
+# actors run as the Slurm user, so materialize the driver environment first.
+RUN cd /opt/nemo-rl && \
+    UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv \
+    uv sync --locked --all-groups --no-install-project --reinstall --link-mode copy
+
 # Keep Dynamo/vLLM's Python 3.12 solve separate from NeMo-RL's Python 3.13
 # environments. Install from the exact Dynamo revision that contains native
 # unpaused NeMo-RL refit support; do not mix an older wheel with a file overlay.

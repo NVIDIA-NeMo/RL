@@ -22,7 +22,7 @@ export UV_CACHE_DIR=${ROOT}/cache/uv
 export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export NRL_CONTAINER=1
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
-"${UV}" sync --locked --all-groups --no-install-project
+"${UV}" sync --locked --all-groups --no-install-project --reinstall --link-mode copy
 # This acceptance image runs the DTensor V1 policy plus the system-Python
 # Dynamo actor. Avoid baking unrelated vLLM/SGLang/Megatron/Automodel actor
 # environments into an already large Slurm image.
