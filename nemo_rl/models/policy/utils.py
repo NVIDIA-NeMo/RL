@@ -14,6 +14,7 @@
 
 import gc
 import os
+import re
 import traceback
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional
@@ -389,6 +390,40 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
     return int(((size_bytes + alignment - 1) // alignment) * alignment)
 
 
+def _nrl_truthy_env(name: str) -> bool:
+    return os.environ.get(name, "false").lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _nrl_should_skip_expert_for_ipc_refit_rank(name: str, rank: int) -> bool:
+    if not _nrl_truthy_env("KIMI_FILTER_EXPERT_REFIT_BY_EP_RANK_FOR_SMOKE"):
+        return False
+
+    match = re.search(r"(?:^|\.)mlp\.experts\.(\d+)(?:\.|$)", name)
+    if match is None:
+        return False
+
+    try:
+        num_global_experts = int(os.environ.get("KIMI_REFIT_NUM_GLOBAL_EXPERTS", "384"))
+        ep_size = int(
+            os.environ.get(
+                "KIMI_REFIT_EXPERT_PARALLEL_SIZE",
+                os.environ.get("KIMI_VLLM_EP", "1"),
+            )
+        )
+    except ValueError:
+        return False
+
+    if num_global_experts <= 0 or ep_size <= 1 or num_global_experts % ep_size != 0:
+        return False
+
+    local_experts_per_ep_rank = num_global_experts // ep_size
+    ep_rank = rank % ep_size
+    expert_id = int(match.group(1))
+    first_local_expert = ep_rank * local_experts_per_ep_rank
+    last_local_expert = first_local_expert + local_experts_per_ep_rank
+    return not (first_local_expert <= expert_id < last_local_expert)
+
+
 def stream_weights_via_ipc_zmq_impl(
     params_generator,
     buffer_size_bytes: int,
@@ -463,9 +498,25 @@ def stream_weights_via_ipc_zmq_impl(
     param_entries: list[IPCRefitPayloadEntry] = []
     await_recv = False
     count_of_groups = 0
+    count_of_skipped_params = 0
+    logged_ipc_ep_filter = False
 
     try:
         for name, tensor in params_generator:
+            if _nrl_should_skip_expert_for_ipc_refit_rank(name, rank):
+                count_of_skipped_params += 1
+                if (
+                    _nrl_truthy_env("KIMI_REFIT_STREAM_PROGRESS")
+                    and not logged_ipc_ep_filter
+                ):
+                    print(
+                        f"{worker_name}: IPC refit EP-rank filter enabled "
+                        f"rank={rank} skipped_first={name}",
+                        flush=True,
+                    )
+                    logged_ipc_ep_filter = True
+                continue
+
             # Initialize device and buffers on first tensor
             if buffer_a is None:
                 buffer_device = tensor.device
@@ -519,7 +570,9 @@ def stream_weights_via_ipc_zmq_impl(
 
         if rank == 0:
             print(
-                f"{worker_name}: Packed {count_of_groups} groups of tensors", flush=True
+                f"{worker_name}: Packed {count_of_groups} groups of tensors "
+                f"(skipped {count_of_skipped_params})",
+                flush=True,
             )
 
     except zmq.Again:

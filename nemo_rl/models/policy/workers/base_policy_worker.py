@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Any, Optional
 
 import ray
@@ -20,6 +21,17 @@ import zmq
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+
+def _zmq_timeout_ms() -> int:
+    raw_value = os.environ.get("NRL_ZMQ_TIMEOUT_MS")
+    if raw_value is None:
+        return 120000
+    try:
+        timeout_ms = int(raw_value)
+    except ValueError:
+        return 120000
+    return max(timeout_ms, 0)
 
 
 class AbstractPolicyWorker:
@@ -80,12 +92,9 @@ class AbstractPolicyWorker:
         if not hasattr(self, "zmq_socket"):
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
+            timeout_ms = _zmq_timeout_ms()
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 

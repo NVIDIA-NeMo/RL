@@ -13,6 +13,7 @@
 # limitations under the License.
 import contextlib
 import gc
+import os
 import re
 import traceback
 import types
@@ -61,6 +62,21 @@ _KIMI_EXPERT_WEIGHT_RE = re.compile(
 )
 
 
+def _is_truthy_env(name: str) -> bool:
+    return os.getenv(name, "false").lower() in {"1", "true", "yes", "on"}
+
+
+def _zmq_timeout_ms() -> int:
+    raw_value = os.environ.get("NRL_ZMQ_TIMEOUT_MS")
+    if raw_value is None:
+        return 120000
+    try:
+        timeout_ms = int(raw_value)
+    except ValueError:
+        return 120000
+    return max(timeout_ms, 0)
+
+
 def _is_kimi_k25_architecture(architectures: Any) -> bool:
     return any(
         str(architecture) in _KIMI_K25_ARCHITECTURES
@@ -77,6 +93,41 @@ def _source_shape_tuple(
         if len(values) >= 2:
             return int(values[0]), int(values[1])
     return int(source_packed.shape[0]), int(source_packed.shape[1] * 8)
+
+
+def _source_tp_shard_for_kimi_expert(
+    *,
+    proj: str,
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    shape: torch.Tensor | None,
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+    out_features, in_features = _source_shape_tuple(shape, packed)
+    tp_size = max(1, tp_size)
+    tp_rank = max(0, min(tp_rank, tp_size - 1))
+
+    if proj in {"gate_proj", "up_proj"}:
+        packed_rows = packed.shape[0] // tp_size
+        scale_rows = scale.shape[0] // tp_size
+        row_start = tp_rank * packed_rows
+        scale_row_start = tp_rank * scale_rows
+        return (
+            packed[row_start : row_start + packed_rows].contiguous(),
+            scale[scale_row_start : scale_row_start + scale_rows].contiguous(),
+            (out_features // tp_size, in_features),
+        )
+
+    packed_cols = packed.shape[1] // tp_size
+    scale_cols = scale.shape[1] // tp_size
+    col_start = tp_rank * packed_cols
+    scale_col_start = tp_rank * scale_cols
+    return (
+        packed[:, col_start : col_start + packed_cols].contiguous(),
+        scale[:, scale_col_start : scale_col_start + scale_cols].contiguous(),
+        (out_features, in_features // tp_size),
+    )
 
 
 def _interleave_tp_chunks(
@@ -574,6 +625,426 @@ def _apply_kimi_expert_refit_in_place(
         )
 
     return kept, updated
+
+
+def _finalize_kimi_proven_tp8_expert_refit(model: torch.nn.Module) -> None:
+    if not _is_truthy_env("KIMI_APPLY_PROVEN_TP8_EXPERT_REFIT"):
+        return
+
+    cache = getattr(model, "_kimi_proven_tp8_expert_refit_cache", None) or {}
+    stale_shape_only = [
+        group_key
+        for group_key, proj_map in cache.items()
+        if not _kimi_proj_map_has_required_tensor(proj_map)
+    ]
+    for group_key in stale_shape_only:
+        cache.pop(group_key, None)
+
+    if cache:
+        samples = []
+        for (prefix, expert_id), proj_map in list(cache.items())[:5]:
+            missing = ",".join(_kimi_expert_refit_missing_required(proj_map))
+            present = ",".join(
+                f"{proj}:{'/'.join(sorted(kind_map))}"
+                for proj, kind_map in sorted(proj_map.items())
+            )
+            samples.append(
+                f"{prefix}.{expert_id} missing=[{missing}] present=[{present}]"
+            )
+        raise RuntimeError(
+            "Kimi proven TP8 expert refit ended with incomplete local expert "
+            f"groups: count={len(cache)} samples={samples}"
+        )
+
+    updated = int(getattr(model, "_kimi_proven_tp8_expert_refit_projection_updates", 0))
+    if updated:
+        local_experts = int(
+            getattr(model, "_kimi_proven_tp8_expert_refit_local_experts", 0)
+        )
+        groups_seen = int(
+            getattr(model, "_kimi_proven_tp8_expert_refit_groups_seen", 0)
+        )
+        shape_updates = int(
+            getattr(model, "_kimi_proven_tp8_expert_refit_shape_updates", 0)
+        )
+        print(
+            "KIMI proven TP8 expert refit complete: "
+            f"groups_seen={groups_seen} local_experts={local_experts} "
+            f"projection_updates={updated} shape_updates={shape_updates} "
+            f"stale_shape_only={len(stale_shape_only)}",
+            flush=True,
+        )
+
+
+def _apply_kimi_proven_tp8_expert_refit_in_place(
+    weights: list[tuple[str, torch.Tensor]],
+    model: torch.nn.Module,
+    vllm_config: Any,
+) -> tuple[list[tuple[str, torch.Tensor]], int]:
+    """Apply the HF/Megatron -> vLLM Marlin TP8 mapping used by Kimi K2.6."""
+    params = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+    target_tensors = dict(buffers)
+    target_tensors.update(params)
+    tp_rank, tp_size = _get_vllm_tp_rank_and_size(vllm_config)
+    if tp_size != 8:
+        raise RuntimeError(
+            "KIMI_APPLY_PROVEN_TP8_EXPERT_REFIT=true requires vLLM TP=8, "
+            f"but this worker reports TP rank/size {tp_rank}/{tp_size}."
+        )
+    full_expert_targets = _is_truthy_env("KIMI_PROVEN_TP8_EXPERT_REFIT_FULL_TARGETS")
+
+    grouped: dict[tuple[str, int], dict[str, dict[str, torch.Tensor | None]]] = {}
+    kept: list[tuple[str, torch.Tensor]] = []
+    for key, tensor in weights:
+        match = _KIMI_EXPERT_WEIGHT_RE.match(key)
+        if match is None:
+            kept.append((key, tensor))
+            continue
+        group_key = (match.group("prefix"), int(match.group("expert")))
+        grouped.setdefault(group_key, {}).setdefault(match.group("proj"), {})[
+            match.group("kind")
+        ] = tensor
+
+    if not grouped:
+        return kept, 0
+
+    setattr(
+        model,
+        "_kimi_proven_tp8_expert_refit_groups_seen",
+        int(getattr(model, "_kimi_proven_tp8_expert_refit_groups_seen", 0))
+        + len(grouped),
+    )
+
+    if not getattr(
+        _apply_kimi_proven_tp8_expert_refit_in_place,
+        "_kimi_seen_logged",
+        False,
+    ):
+        print(
+            "KIMI proven TP8 expert refit received routed expert tensors: "
+            f"rank={tp_rank}/{tp_size} groups_in_chunk={len(grouped)}",
+            flush=True,
+        )
+        setattr(
+            _apply_kimi_proven_tp8_expert_refit_in_place,
+            "_kimi_seen_logged",
+            True,
+        )
+
+    cache = getattr(model, "_kimi_proven_tp8_expert_refit_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(model, "_kimi_proven_tp8_expert_refit_cache", cache)
+
+    updated = 0
+    shape_updates = 0
+    local_experts = 0
+    processed_group_keys: set[tuple[str, int]] = set()
+    current_or_cached_group_keys = set(cache) | set(grouped)
+    with torch.no_grad():
+        for prefix, expert_id in list(current_or_cached_group_keys):
+            group_key = (prefix, expert_id)
+            proj_map = _merge_kimi_expert_proj_maps(
+                cache.get(group_key),
+                grouped.get(group_key),
+            )
+            expert_map = buffers.get(prefix + "._expert_map")
+            if expert_map is None or expert_id >= expert_map.numel():
+                cache.pop(group_key, None)
+                continue
+            local_expert = int(expert_map[expert_id].item())
+            if local_expert < 0:
+                cache.pop(group_key, None)
+                continue
+
+            missing = _kimi_expert_refit_missing_required(proj_map)
+            if missing:
+                continue
+
+            gate = proj_map["gate_proj"]
+            up = proj_map["up_proj"]
+            down = proj_map["down_proj"]
+            gate_packed = gate["weight_packed"]
+            gate_scale = gate["weight_scale"]
+            up_packed = up["weight_packed"]
+            up_scale = up["weight_scale"]
+            down_packed = down["weight_packed"]
+            down_scale = down["weight_scale"]
+            if not (
+                isinstance(gate_packed, torch.Tensor)
+                and isinstance(gate_scale, torch.Tensor)
+                and isinstance(up_packed, torch.Tensor)
+                and isinstance(up_scale, torch.Tensor)
+                and isinstance(down_packed, torch.Tensor)
+                and isinstance(down_scale, torch.Tensor)
+            ):
+                raise RuntimeError(f"Invalid Kimi expert tensor group for {prefix}.{expert_id}")
+
+            gate_shape = gate.get("weight_shape")
+            up_shape = up.get("weight_shape")
+            down_shape = down.get("weight_shape")
+            gate_shape_t = gate_shape if isinstance(gate_shape, torch.Tensor) else None
+            up_shape_t = up_shape if isinstance(up_shape, torch.Tensor) else None
+            down_shape_t = down_shape if isinstance(down_shape, torch.Tensor) else None
+            gate_dense_shape = _source_shape_tuple(gate_shape_t, gate_packed)
+            up_dense_shape = _source_shape_tuple(up_shape_t, up_packed)
+            down_dense_shape = _source_shape_tuple(down_shape_t, down_packed)
+
+            w13_packed_full = params[prefix + ".w13_weight_packed"][local_expert]
+            w13_scale_full = params[prefix + ".w13_weight_scale"][local_expert]
+            w2_packed_full = params[prefix + ".w2_weight_packed"][local_expert]
+            w2_scale_full = params[prefix + ".w2_weight_scale"][local_expert]
+            source_device = w13_packed_full.device
+            gate_packed = gate_packed.to(device=source_device, non_blocking=True)
+            gate_scale = gate_scale.to(device=source_device, non_blocking=True)
+            up_packed = up_packed.to(device=source_device, non_blocking=True)
+            up_scale = up_scale.to(device=source_device, non_blocking=True)
+            down_packed = down_packed.to(device=source_device, non_blocking=True)
+            down_scale = down_scale.to(device=source_device, non_blocking=True)
+
+            if full_expert_targets:
+                w13_packed_param = w13_packed_full
+                w13_scale_param = w13_scale_full
+                w2_packed_param = w2_packed_full
+                w2_scale_param = w2_scale_full
+                gate_packed_shard = gate_packed
+                up_packed_shard = up_packed
+            else:
+                w13_packed_cols = w13_packed_full.shape[1] // tp_size
+                w13_scale_cols = w13_scale_full.shape[1] // tp_size
+                w2_packed_rows = w2_packed_full.shape[0] // tp_size
+                w2_scale_rows_target = w2_scale_full.shape[0] // tp_size
+                w13_packed_param = w13_packed_full[
+                    :,
+                    tp_rank * w13_packed_cols : (tp_rank + 1) * w13_packed_cols,
+                ]
+                w13_scale_param = w13_scale_full[
+                    :,
+                    tp_rank * w13_scale_cols : (tp_rank + 1) * w13_scale_cols,
+                ]
+                w2_packed_param = w2_packed_full[
+                    tp_rank * w2_packed_rows : (tp_rank + 1) * w2_packed_rows,
+                    :,
+                ]
+                w2_scale_param = w2_scale_full[
+                    tp_rank * w2_scale_rows_target : (tp_rank + 1)
+                    * w2_scale_rows_target,
+                    :,
+                ]
+
+                gate_packed_shard, _, _ = _source_tp_shard_for_kimi_expert(
+                    proj="gate_proj",
+                    packed=gate_packed,
+                    scale=gate_scale,
+                    shape=gate_shape_t,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+                up_packed_shard, _, _ = _source_tp_shard_for_kimi_expert(
+                    proj="up_proj",
+                    packed=up_packed,
+                    scale=up_scale,
+                    shape=up_shape_t,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+
+            w13_preprocessed = (
+                torch.cat((gate_packed_shard, up_packed_shard), dim=0)
+                .t()
+                .contiguous()
+            )
+            w13_packed = _repack_kimi_expert_for_vllm_marlin(
+                w13_preprocessed,
+                w13_packed_param,
+                prefix + f".w13_weight_packed[{local_expert}]",
+            )
+
+            w13_scale_interleaved = _interleave_tp_chunks(
+                gate_scale.t().contiguous(),
+                up_scale.t().contiguous(),
+                tp_size,
+            )
+            if full_expert_targets:
+                w13_scale_shard = w13_scale_interleaved
+            else:
+                w13_scale_cols = w13_scale_interleaved.shape[1] // tp_size
+                w13_scale_shard = w13_scale_interleaved[
+                    :,
+                    tp_rank * w13_scale_cols : (tp_rank + 1) * w13_scale_cols,
+                ].contiguous()
+            w13_scale = _permute_kimi_expert_scales_for_vllm_marlin(
+                w13_scale_shard,
+                w13_scale_param,
+                "w13_fused_gate_up",
+                prefix + f".w13_weight_scale[{local_expert}]",
+            )
+
+            if full_expert_targets:
+                down_packed_shard = down_packed
+            else:
+                down_packed_shard, _, _ = _source_tp_shard_for_kimi_expert(
+                    proj="down_proj",
+                    packed=down_packed,
+                    scale=down_scale,
+                    shape=down_shape_t,
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                )
+            w2_packed = _repack_kimi_expert_for_vllm_marlin(
+                down_packed_shard.t().contiguous(),
+                w2_packed_param,
+                prefix + f".w2_weight_packed[{local_expert}]",
+            )
+
+            down_scale_t = down_scale.t().contiguous()
+            if full_expert_targets:
+                w2_scale_shard = down_scale_t
+            else:
+                w2_scale_rows = down_scale_t.shape[0] // tp_size
+                w2_scale_shard = down_scale_t[
+                    tp_rank * w2_scale_rows : (tp_rank + 1) * w2_scale_rows,
+                    :,
+                ].contiguous()
+            w2_scale = _permute_kimi_expert_scales_for_vllm_marlin(
+                w2_scale_shard,
+                w2_scale_param,
+                "down_proj",
+                prefix + f".w2_weight_scale[{local_expert}]",
+            )
+
+            _copy_refit_tensor_(
+                w13_packed_param,
+                w13_packed,
+                prefix + f".w13_weight_packed[{local_expert}]",
+            )
+            _copy_refit_tensor_(
+                w13_scale_param,
+                w13_scale,
+                prefix + f".w13_weight_scale[{local_expert}]",
+            )
+            _copy_refit_tensor_(
+                w2_packed_param,
+                w2_packed,
+                prefix + f".w2_weight_packed[{local_expert}]",
+            )
+            _copy_refit_tensor_(
+                w2_scale_param,
+                w2_scale,
+                prefix + f".w2_weight_scale[{local_expert}]",
+            )
+            shape_updates += _copy_kimi_expert_weight_shape_if_present(
+                target_tensors,
+                prefix + ".w13_weight_shape",
+                local_expert,
+                (gate_dense_shape[0] + up_dense_shape[0], gate_dense_shape[1]),
+            )
+            shape_updates += _copy_kimi_expert_weight_shape_if_present(
+                target_tensors,
+                prefix + ".w2_weight_shape",
+                local_expert,
+                down_dense_shape,
+            )
+            updated += 2
+            local_experts += 1
+            processed_group_keys.add(group_key)
+            cache.pop(group_key, None)
+
+    for group_key, current_proj_map in grouped.items():
+        if group_key in processed_group_keys:
+            continue
+        prefix, expert_id = group_key
+        expert_map = buffers.get(prefix + "._expert_map")
+        if expert_map is None or expert_id >= expert_map.numel():
+            cache.pop(group_key, None)
+            continue
+        local_expert = int(expert_map[expert_id].item())
+        if local_expert < 0:
+            cache.pop(group_key, None)
+            continue
+        if not _kimi_proj_map_has_required_tensor(current_proj_map):
+            continue
+
+        cached_proj_map = cache.setdefault(group_key, {})
+        for proj, kind_map in current_proj_map.items():
+            cached_kind_map = cached_proj_map.setdefault(proj, {})
+            for kind, tensor in kind_map.items():
+                cached_kind_map[kind] = _cache_kimi_tensor(tensor)
+
+    if updated:
+        setattr(
+            model,
+            "_kimi_proven_tp8_expert_refit_projection_updates",
+            int(getattr(model, "_kimi_proven_tp8_expert_refit_projection_updates", 0))
+            + updated,
+        )
+        setattr(
+            model,
+            "_kimi_proven_tp8_expert_refit_local_experts",
+            int(getattr(model, "_kimi_proven_tp8_expert_refit_local_experts", 0))
+            + local_experts,
+        )
+        setattr(
+            model,
+            "_kimi_proven_tp8_expert_refit_shape_updates",
+            int(getattr(model, "_kimi_proven_tp8_expert_refit_shape_updates", 0))
+            + shape_updates,
+        )
+
+    if local_experts and not getattr(
+        _apply_kimi_proven_tp8_expert_refit_in_place,
+        "_kimi_proven_tp8_logged",
+        False,
+    ):
+        print(
+            "KIMI proven TP8 expert refit mapping active: "
+            f"rank={tp_rank}/{tp_size} local_experts={local_experts} "
+            f"full_expert_targets={full_expert_targets} "
+            "packed=transpose+gptq_marlin_moe_repack "
+            "scale=transpose+marlin_moe_permute_scales",
+            flush=True,
+        )
+        setattr(
+            _apply_kimi_proven_tp8_expert_refit_in_place,
+            "_kimi_proven_tp8_logged",
+            True,
+        )
+
+    return kept, updated
+
+
+def _apply_kimi_expert_refit(
+    weights: list[tuple[str, torch.Tensor]],
+    model: torch.nn.Module,
+    vllm_config: Any,
+) -> tuple[list[tuple[str, torch.Tensor]], int]:
+    if not _is_truthy_env("KIMI_APPLY_PROVEN_TP8_EXPERT_REFIT"):
+        return _apply_kimi_expert_refit_in_place(weights, model)
+    if not any(".mlp.experts." in key for key, _ in weights):
+        return weights, 0
+
+    filtered, updated = _apply_kimi_proven_tp8_expert_refit_in_place(
+        weights, model, vllm_config
+    )
+    if updated:
+        print(
+            "Applied proven Kimi TP8 Marlin expert refit tensors in-place: "
+            f"{updated} projection tensors",
+            flush=True,
+        )
+    leftovers = [(key, tensor) for key, tensor in filtered if ".mlp.experts." in key]
+    if leftovers:
+        samples = ",".join(key for key, _ in leftovers[:8])
+        print(
+            "KIMI proven TP8 expert refit consumed routed expert tensors before "
+            f"generic vLLM load: dropped_unhandled={len(leftovers)} samples={samples}",
+            flush=True,
+        )
+        filtered = [
+            (key, tensor) for key, tensor in filtered if ".mlp.experts." not in key
+        ]
+    return filtered, updated
 
 
 def _raise_if_kimi_expert_weights_reach_generic_loader(
@@ -1108,12 +1579,9 @@ class VllmInternalWorkerExtension:
             self.zmq_socket = self.zmq_context.socket(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
                 zmq.REP
             )
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
+            timeout_ms = _zmq_timeout_ms()
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
@@ -1311,8 +1779,10 @@ class VllmInternalWorkerExtension:
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
         if self._is_kimi_k25_model():
-            weights, expert_updates = _apply_kimi_expert_refit_in_place(
-                weights, self.model_runner.model
+            weights, expert_updates = _apply_kimi_expert_refit(
+                weights,
+                self.model_runner.model,
+                self.model_runner.vllm_config,
             )
             weights, nonexpert_counts = _apply_kimi_nonexpert_refit_in_place(
                 weights,
@@ -1369,18 +1839,31 @@ class VllmInternalWorkerExtension:
 
                     with set_current_vllm_config(self.model_runner.vllm_config):
                         if self._is_kimi_k25_model():
-                            _finalize_kimi_expert_refit(self.model_runner.model)
+                            if _is_truthy_env("KIMI_APPLY_PROVEN_TP8_EXPERT_REFIT"):
+                                _finalize_kimi_proven_tp8_expert_refit(
+                                    self.model_runner.model
+                                )
+                            else:
+                                _finalize_kimi_expert_refit(self.model_runner.model)
                             _finalize_kimi_nonexpert_fusion_refit(
                                 self.model_runner.model
                             )
-                            with _skip_kimi_moe_process_weights_after_refit(
-                                self.model_runner.model
-                            ):
-                                process_weights_after_loading(
-                                    self.model_runner.model,
-                                    self.model_config,
-                                    self.device,
+                            if _is_truthy_env("KIMI_SKIP_PROCESS_WEIGHTS_AFTER_REFIT"):
+                                print(
+                                    "Skipping vLLM process_weights_after_loading after "
+                                    "Kimi live refit because "
+                                    "KIMI_SKIP_PROCESS_WEIGHTS_AFTER_REFIT=true.",
+                                    flush=True,
                                 )
+                            else:
+                                with _skip_kimi_moe_process_weights_after_refit(
+                                    self.model_runner.model
+                                ):
+                                    process_weights_after_loading(
+                                        self.model_runner.model,
+                                        self.model_config,
+                                        self.device,
+                                    )
                         else:
                             process_weights_after_loading(
                                 self.model_runner.model,
