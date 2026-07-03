@@ -125,6 +125,7 @@ policy:
     moe_shared_expert_overlap: false
     moe_per_layer_logging: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
     apply_rope_fusion: false
     defer_fp32_logits: true
     optimizer:
@@ -295,8 +296,12 @@ env:
           concurrency: 128
           base_results_dir: /logs/nemo_gym/swe_agents_train
           dataset_path: ${data.train.data_path}
+          # Fallback list: entries are tried in order per instance. Covers both
+          # SIF layouts: <sif_dir>/r2egym/<id>.sif (sif_dir is the parent dir)
+          # and <sif_dir>/<id>.sif (sif_dir is the r2egym dir itself).
           container_formatter:
           - ${sif_dir}/r2egym/{instance_id}.sif
+          - ${sif_dir}/{instance_id}.sif
     swe_agents_val:
       responses_api_agents:
         swe_agents:
