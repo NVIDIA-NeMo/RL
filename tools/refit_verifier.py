@@ -750,6 +750,16 @@ def main_dynamo():
         "Managed Dynamo refit verification requires colocated.enabled=false"
     )
 
+    # Compare raw model logprobs, not backend-specific renormalization after
+    # temperature/top-k/top-p filtering. Keep the deterministic decode short so
+    # the verifier tests refit correctness rather than sampling behavior.
+    generation_config["temperature"] = 1.0
+    generation_config["top_p"] = 1.0
+    generation_config["top_k"] = None
+    generation_config["max_new_tokens"] = min(
+        int(generation_config["max_new_tokens"]), 10
+    )
+
     tokenizer = get_tokenizer(policy_config["tokenizer"])
     generation_config = configure_generation_config(generation_config, tokenizer)
     generation_config["model_name"] = policy_config["model_name"]
