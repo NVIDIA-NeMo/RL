@@ -56,7 +56,11 @@ export DYNAMO_PYTHON=/opt/dynamo_venv/bin/python
 export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export PYTHONPATH="${REPO}${PYTHONPATH:+:${PYTHONPATH}}"
 export GPUS_PER_NODE=8
+REAL_ROOT=$(readlink -f "${ROOT}")
 export MOUNTS="${ROOT}:${ROOT}"
+if [[ "${REAL_ROOT}" != "${ROOT}" ]]; then
+  MOUNTS+=",${REAL_ROOT}:${REAL_ROOT}"
+fi
 export CONTAINER
 export COMMAND="cd ${REPO} && ${RUNNER} ${OVERRIDES}"
 
