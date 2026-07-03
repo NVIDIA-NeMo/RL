@@ -152,7 +152,7 @@ vllm = [
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
-  "nvidia-cutlass-dsl[cu13]>=4.5.2",
+  "nvidia-cutlass-dsl[cu13]==4.5.2",
 ]
 sglang = [
   "sglang==0.5.12.post1",
