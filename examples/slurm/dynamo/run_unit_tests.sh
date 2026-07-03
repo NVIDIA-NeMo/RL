@@ -5,7 +5,7 @@ ROOT=${ROOT:-/lustre/fsw/portfolios/coreai/users/jothomson/nemo-rl-dynamo-slurm-
 REPO=${REPO:-${ROOT}/RL}
 TEST_TOOLS=${TEST_TOOLS:-${ROOT}/cache/test-tools}
 UV=${UV:-}
-PYTHON=${PYTHON:-/opt/ray_venvs/nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker/bin/python}
+PYTHON=${PYTHON:-/opt/nemo_rl_venv/bin/python}
 
 if [[ -z "${UV}" ]]; then
   UV=$(find /usr/local/bin /usr/bin /root/.local/bin -maxdepth 1 -type f -name uv -print -quit)
@@ -33,6 +33,7 @@ cd "${REPO}"
 "${PYTHON}" -m ruff check \
   nemo_rl/algorithms/grpo.py \
   nemo_rl/distributed/ray_actor_environment_registry.py \
+  nemo_rl/distributed/worker_groups.py \
   nemo_rl/models/generation/dynamo \
   tests/unit/algorithms/test_grpo.py \
   tests/unit/models/generation/test_dynamo_arguments.py \
