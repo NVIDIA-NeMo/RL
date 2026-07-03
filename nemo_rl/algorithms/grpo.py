@@ -3094,6 +3094,12 @@ def grpo_train(
                         "vllm_metrics_logger_interval"
                     ],
                     logger,
+                    log_scalars=master_config.policy["generation"]["vllm_cfg"].get(
+                        "vllm_metrics_log_scalars", False
+                    ),
+                    log_timeline_plots=master_config.policy["generation"][
+                        "vllm_cfg"
+                    ].get("vllm_metrics_log_timeline_plots", True),
                 )
 
             # Plot ISL/OSL/ISL+OSL histograms to wandb
@@ -4321,6 +4327,12 @@ def async_grpo_train(
                         "vllm_metrics_logger_interval"
                     ],
                     logger,
+                    log_scalars=master_config.policy["generation"]["vllm_cfg"].get(
+                        "vllm_metrics_log_scalars", False
+                    ),
+                    log_timeline_plots=master_config.policy["generation"][
+                        "vllm_cfg"
+                    ].get("vllm_metrics_log_timeline_plots", True),
                 )
 
             # Plot ISL/OSL/ISL+OSL histograms to wandb
