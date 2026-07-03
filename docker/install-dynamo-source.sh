@@ -65,3 +65,7 @@ test "$(git -C "${DYNAMO_SOURCE_DIR}" rev-parse HEAD)" = "${DYNAMO_COMMIT}"
 printf '%s\n' "${DYNAMO_COMMIT}" > /opt/dynamo_commit
 "${DYNAMO_VENV}/bin/python" -c \
   'import importlib.metadata as m, pathlib; assert m.version("ai-dynamo") == "1.3.0"; assert m.version("ai-dynamo-runtime") == "1.3.0"; assert pathlib.Path("/opt/dynamo_commit").read_text().strip() == "59358c26d0aeed19300706462b63ada25a0a6d7c"; import dynamo.vllm.handlers, vllm; print("Dynamo", m.version("ai-dynamo"), "runtime", m.version("ai-dynamo-runtime"), "vLLM", vllm.__version__)'
+
+# Cargo's target tree is build-only, metadata-heavy, and can exceed 10 GiB.
+# Keep it on the compute node while compiling and omit it from the runtime image.
+rm -rf "${CARGO_TARGET_DIR}"

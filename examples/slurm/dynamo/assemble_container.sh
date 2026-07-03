@@ -40,7 +40,6 @@ test -x /opt/ray_venvs/nemo_rl.models.policy.workers.dtensor_policy_worker.DTens
 # native runtime wheel is not yet published, so build both packages from the
 # exact checkout instead of mixing source with an older runtime wheel.
 export UV_PYTHON_INSTALL_DIR=/opt/uv-python
-export CARGO_TARGET_DIR=${ROOT}/cache/dynamo-cargo-target
 DYNAMO_COMMIT="${DYNAMO_COMMIT}" \
 DYNAMO_PYTHON_VERSION="${DYNAMO_PYTHON_VERSION}" \
 UV_BIN="${UV}" \
