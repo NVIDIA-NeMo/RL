@@ -23,9 +23,8 @@
 #   - triton==3.6.0          → nemorl base manages triton via pytorch-cu130 index
 #   - evaluate               → pulls in conflicting datasets==3.1.0 transitively
 #   - build / ninja / meson / patchelf  → build-time only, not runtime deps
-#   - StrEnum                → stdlib in Python 3.13 (enum.StrEnum)
 #   - cuda-core              → included in cuda-python>=13
-#   - openai / graphviz / polygraphy / mcp  → optional dev/test tools
+#   - graphviz / polygraphy / mcp  → optional dev/test tools
 
 [project]
 name = "tensorrt-llm"
@@ -40,8 +39,7 @@ dependencies = [
   "nvidia-modelopt>=0.37.0",
   "nvidia-nccl-cu13>=2.28.9,<=2.29.7",
   "nvidia-cuda-nvrtc",
-  "nvidia-cutlass-dsl>=4.5.0",
-  "nvidia-cutlass-dsl-libs-base==4.5.0",
+  "nvidia-cutlass-dsl[cu13]==4.5.0",
   "nvidia-ml-py>=13",
   "cuda-python>=13",
   "flash-attn-4==4.0.0b11",
@@ -92,6 +90,8 @@ dependencies = [
   "pyzmq",
   "einops",
   "aenum",
+  "strenum",
+  "llguidance>=1.3.0,<1.4.0",
   "backoff",
   "jsonschema",
   "click>=8.3.1",
@@ -105,6 +105,7 @@ dependencies = [
   "nvtx",
   "plotly",
   "matplotlib",
+  "openai",
 ]
 
 [build-system]
