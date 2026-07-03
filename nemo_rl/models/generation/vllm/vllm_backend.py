@@ -330,7 +330,22 @@ class VllmInternalWorkerExtension:
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(policy_weights, self.model_runner)
         else:
-            self.model_runner.model.load_weights(weights=policy_weights)
+            try:
+                self.model_runner.model.load_weights(weights=policy_weights)
+            except Exception:
+                # Re-run tensor-by-tensor to pinpoint which weight fails; the
+                # bulk call hides the culprit name/shape.
+                for _name, _tensor in policy_weights:
+                    try:
+                        self.model_runner.model.load_weights(weights=[(_name, _tensor)])
+                    except Exception as per_tensor_err:
+                        shape = tuple(getattr(_tensor, "shape", ()))
+                        dtype = getattr(_tensor, "dtype", None)
+                        print(
+                            f"[refit-debug] load_weights failed for '{_name}' "
+                            f"shape={shape} dtype={dtype}: {per_tensor_err}"
+                        )
+                raise
 
         self._load_draft_weights(draft_weights)
 
@@ -446,7 +461,8 @@ class VllmInternalWorkerExtension:
 
         except Exception as e:
             print(
-                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
+                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}.\n"
+                f"{traceback.format_exc()}"
             )
             return False
 

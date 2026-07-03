@@ -285,6 +285,12 @@ env:
     swe_agents_train:
       responses_api_agents:
         swe_agents:
+          # Must match the OpenHands commit baked into the image
+          # (docker/Dockerfile.gym_qwen35 AGENT_FRAMEWORK_COMMIT). The gym
+          # default (25bacbc6...) does not exist in the baked nv-OpenHands
+          # checkout, and run_infer.sh aborts on any commit switch because the
+          # runtime copies prompt templates into the checkout (dirty tree).
+          agent_framework_commit: 0d766ad06b2be64a42e6f0175b9ebcc4a06599d9
           agent_prompt_overrides:
           - user_prompt_template: responses_api_agents/swe_agents/prompts/openhands/user_prompt.j2
             system_prompt_template: responses_api_agents/swe_agents/prompts/openhands/system_prompt.j2
@@ -305,6 +311,7 @@ env:
     swe_agents_val:
       responses_api_agents:
         swe_agents:
+          agent_framework_commit: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_framework_commit}
           agent_max_turns: 30
           swebench_agent_timeout: 600
           swebench_tests_timeout: 180
