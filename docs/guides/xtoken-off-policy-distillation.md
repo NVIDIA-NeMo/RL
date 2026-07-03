@@ -243,6 +243,14 @@ Other relevant fields:
 
 ## Results — 100-step multi-teacher run
 
+```bash
+uv run python examples/run_xtoken_off_policy_distillation.py \
+    --config examples/configs/xtoken_multiteacher_off_policy_distillation.yaml \
+    teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_phi-mini_top4.pt \
+    cluster.gpus_per_node=8 \
+    cluster.num_nodes=1
+```
+
 This run distills a `meta-llama/Llama-3.2-1B` student from two teachers at
 once: `microsoft/Phi-4-mini-instruct` (a cross-tokenizer teacher, projected
 through its projection matrix) and `meta-llama/Llama-3.2-3B` (which shares the
