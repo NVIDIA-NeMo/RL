@@ -6,6 +6,9 @@ policy:
     colocated:
       resources:
         num_nodes: 4            # 4 TP8 H100 gen replicas for the 1024-trajectory step
+    vllm_cfg:
+      max_num_seqs: 16
+      gpu_memory_utilization: 0.75
 
 cluster:
   num_nodes: 20   # 16 train (TP8*CP8*PP1=64 GPUs, DP2) + 4 gen (TP8). No judges -> SBATCH=20.

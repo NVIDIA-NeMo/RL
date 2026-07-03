@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
+import numpy as np
 import torch
 from datasets import (
     Dataset,
@@ -33,6 +34,22 @@ from torch.utils.data import ConcatDataset
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
+
+
+def load_audio_from_file(path: str, sampling_rate: int = 16000) -> np.ndarray:
+    """Decode an audio file (or the audio track of a video) as a 1-D float32 array.
+
+    Uses decord's ``AudioReader`` (already a project dependency for video
+    decoding) to produce a mono waveform at the requested sampling rate.
+    """
+    import decord
+
+    reader = decord.AudioReader(path, sample_rate=sampling_rate, mono=True)
+    # Shape: (channels, T). With mono=True channels=1; squeeze to (T,).
+    audio = reader[:].asnumpy()
+    if audio.ndim > 1:
+        audio = audio[0]
+    return audio.astype(np.float32)
 
 
 def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> None:
