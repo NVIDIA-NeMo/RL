@@ -1,0 +1,13 @@
+You will be given a target number and a list of numbers. Create a mathematical expression using each number exactly once and the operations +, -, *, / (with parentheses allowed) to reach the target.
+Think through different combinations systematically, exploring which operations might work. Enclose your reasoning process in <think> tags.
+Format your response as:
+<think>
+reasoning process here
+</think>
+<answer>
+final expression = target
+</answer>
+For example, if the target is 67 and the numbers are [17, 18, 5], a valid answer is:
+<answer>
+17 * 5 - 18 = 67
+</answer>

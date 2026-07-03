@@ -1,0 +1,45 @@
+# AR GRPO on Nemotron-Labs-Diffusion-3B, training on reasoning_gym Sudoku with a held-out
+# Sudoku validation split. Binary correctness reward (1.0 correct / 0.0 otherwise).
+# Inherits policy / megatron / generation / env settings from the DeepScaleR AR config; overrides
+# only the data block (reasoning_gym dataset + processor) and the reasoning_gym env binding.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-ar-sudoku-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-ar-sudoku-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-ar-sudoku-megatron-sglang"
+
+data:
+  # Fully replace the inherited data block so no DeepScaleR / AIME split leaks in.
+  _override_: true
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  max_input_seq_length: 512
+  train:
+    dataset_name: sudoku
+    size: 5000
+    seed: 1
+  validation:
+    dataset_name: sudoku
+    size: 500
+    seed: 2
+  default:
+    prompt_file: null
+    system_prompt_file: examples/prompts/reasoning_gym_answer_tag.txt
+    processor: "reasoning_gym_data_processor"
+    env_name: "reasoning_gym"
+
+# Long run: fractional cell-accuracy reward (dense signal so it can pick up), 2048 generation.
+policy:
+  max_total_sequence_length: 2560  # 512 prompt + 2048 generation
+  generation:
+    max_new_tokens: 2048
+
+env:
+  reasoning_gym:
+    task: "sudoku"
+    binary_reward: false  # return raw reasoning_gym cell-accuracy score, not 0/1

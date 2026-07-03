@@ -53,6 +53,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "nemo_gym": {
         "actor_class_fqn": "nemo_rl.environments.nemo_gym.NemoGym",
     },
+    "reasoning_gym": {
+        "actor_class_fqn": "nemo_rl.environments.reasoning_gym_environment.ReasoningGymEnvironment",
+    },
 }
 
 

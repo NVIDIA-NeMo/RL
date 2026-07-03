@@ -28,6 +28,7 @@ dependencies = [
   "datasets>=4.0.0",
   "rich",
   "math-verify",
+  "reasoning_gym>=0.1.19",
   "accelerate>=0.26",
   "tensorboard",
   "omegaconf",

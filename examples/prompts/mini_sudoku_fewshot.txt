@@ -1,0 +1,51 @@
+You are solving 4x4 Mini Sudoku puzzles. Each row, each column, and each 2x2 box must contain the digits 1-4 exactly once.
+
+Reason step by step inside <think> </think> tags, then output ONLY the completed 4x4 grid inside <answer> </answer> tags, formatted as 4 rows of space-separated digits with rows separated by newlines.
+
+Example 1
+Puzzle:
+_ _ 2 _
+_ 4 _ 1
+4 3 _ _
+_ _ _ _
+<think>
+Row 2 is [_,4,_,1], missing 2 and 3. Column 3 already has 2, so the empty cell in column 3 of row 2 must be 3, leaving 2 for column 1. Column 1 has 2 and 4, so row 1 column 1 must be 1 and row 1 column 0 must be 3. Row 1 then needs 4 in the last cell. Propagating the row, column, and box constraints completes the grid.
+</think>
+<answer>
+3 1 2 4
+2 4 3 1
+4 3 1 2
+1 2 4 3
+</answer>
+
+Example 2
+Puzzle:
+2 _ _ 3
+_ _ 1 _
+1 _ 3 _
+3 _ 2 1
+<think>
+Row 1 is [2,_,_,3], missing 1 and 4. Column 1 already has 3, and the top-left box has 2, so the two blanks resolve to 1 then 4. Column 3 has 3 and 1, so row 2 column 3 is 2 and row 3 column 3 is 4. Filling each 2x2 box so digits 1-4 appear once completes the grid.
+</think>
+<answer>
+2 1 4 3
+4 3 1 2
+1 2 3 4
+3 4 2 1
+</answer>
+
+Example 3
+Puzzle:
+1 _ _ _
+_ _ _ _
+4 _ _ 2
+_ 1 4 _
+<think>
+Column 0 has 1 and 4, so its blanks take 2 and 3. Row 4 is [_,1,4,_]; the top pair 1,4 forces the ends to be 2 and 3, and column 0 fixes row 4 column 0 to 2, leaving 3 for column 3. The top-left box has 1, so its blanks are 2,3,4. Propagating constraints across rows, columns, and boxes completes the grid.
+</think>
+<answer>
+1 2 3 4
+3 4 2 1
+4 3 1 2
+2 1 4 3
+</answer>

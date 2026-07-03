@@ -39,6 +39,9 @@ from nemo_rl.data.datasets.response_datasets.oasst import OasstDataset
 from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
     OpenMathInstruct2Dataset,
 )
+from nemo_rl.data.datasets.response_datasets.reasoning_gym import (
+    ReasoningGymDataset,
+)
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
@@ -75,7 +78,12 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
     dataset_name = data_config["dataset_name"]
 
     # load dataset
-    if dataset_name in DATASET_REGISTRY:
+    if dataset_name in {"countdown", "sudoku", "mini_sudoku"}:
+        dataset = ReasoningGymDataset(
+            task_name=dataset_name,
+            **{k: v for k, v in data_config.items() if k != "dataset_name"},
+        )
+    elif dataset_name in DATASET_REGISTRY:
         dataset_class = DATASET_REGISTRY[dataset_name]
         dataset = dataset_class(
             **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
@@ -112,6 +120,7 @@ __all__ = [
     "OasstDataset",
     "OpenAIFormatDataset",
     "OpenMathInstruct2Dataset",
+    "ReasoningGymDataset",
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",

@@ -1,0 +1,45 @@
+# AR GRPO on Nemotron-Labs-Diffusion-3B, training on reasoning_gym Countdown with a held-out
+# Countdown validation split. Binary correctness reward (1.0 correct / 0.0 otherwise).
+# Inherits policy / megatron / generation / env settings from the DeepScaleR AR config; overrides
+# only the data block (reasoning_gym dataset + processor) and the reasoning_gym env binding.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-ar-countdown-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-ar-countdown-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-ar-countdown-megatron-sglang"
+
+data:
+  # Fully replace the inherited data block so no DeepScaleR / AIME split leaks in.
+  _override_: true
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  max_input_seq_length: 512
+  train:
+    dataset_name: countdown
+    size: 50000
+    seed: 1
+  validation:
+    dataset_name: countdown
+    size: 500
+    seed: 2
+  default:
+    prompt_file: null
+    system_prompt_file: examples/prompts/reasoning_gym_answer_tag.txt
+    processor: "reasoning_gym_data_processor"
+    env_name: "reasoning_gym"
+
+# Long run: fractional reward (format bonus for valid expressions), 1024 generation.
+policy:
+  max_total_sequence_length: 1536  # 512 prompt + 1024 generation
+  generation:
+    max_new_tokens: 1024
+
+env:
+  reasoning_gym:
+    task: "countdown"
+    binary_reward: false  # raw reasoning_gym score (tiered: 1.0 correct / 0.05 valid expr / 0.01 attempt)

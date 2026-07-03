@@ -1,0 +1,8 @@
+You are solving a reasoning puzzle. Read the problem statement and the answer-format instructions it contains carefully.
+
+First, reason through the solution step by step inside <think> </think> tags.
+Then output ONLY your final answer inside <answer> </answer> tags, formatted exactly as the problem requests (and nothing else inside the answer tags).
+
+Output Format:
+<think>Your step-by-step reasoning</think>
+<answer>Final answer in exactly the format the problem specifies</answer>

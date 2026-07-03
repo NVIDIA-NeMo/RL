@@ -1,0 +1,44 @@
+# AR GRPO on Nemotron-Labs-Diffusion-3B, Countdown following the AGRPO recipe:
+# AGRPO system prompt (instruction + think/answer format + one inline ASCII example),
+# user prompt "Target: T / Numbers: [...]", answer format "expr = target",
+# AGRPO tiered reward (1/3 valid-expr + 1/3 number-usage + 1/3 evaluates-to-target).
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-ar-countdown-agrpo-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-ar-countdown-agrpo-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-ar-countdown-agrpo"
+
+policy:
+  max_total_sequence_length: 768
+  generation:
+    max_new_tokens: 256
+
+data:
+  _override_: true
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  max_input_seq_length: 512
+  train:
+    dataset_name: countdown
+    size: 50000
+    seed: 1
+  validation:
+    dataset_name: countdown
+    size: 500
+    seed: 2
+  default:
+    prompt_file: null
+    system_prompt_file: examples/prompts/countdown_agrpo.txt
+    prompt_style: agrpo_countdown
+    processor: "reasoning_gym_data_processor"
+    env_name: "reasoning_gym"
+
+env:
+  reasoning_gym:
+    task: "countdown"
+    reward_mode: "countdown_agrpo"
