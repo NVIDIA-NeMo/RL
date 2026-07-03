@@ -49,9 +49,11 @@ fi
 "${UV_BIN}" pip install --python "${DYNAMO_VENV}/bin/python" \
   pip 'maturin[patchelf]'
 
-git clone --filter=blob:none https://github.com/ai-dynamo/dynamo.git \
-  "${DYNAMO_SOURCE_DIR}"
-git -C "${DYNAMO_SOURCE_DIR}" checkout --detach "${DYNAMO_COMMIT}"
+if [[ ! -d "${DYNAMO_SOURCE_DIR}/.git" ]]; then
+  git clone --filter=blob:none https://github.com/ai-dynamo/dynamo.git \
+    "${DYNAMO_SOURCE_DIR}"
+  git -C "${DYNAMO_SOURCE_DIR}" checkout --detach "${DYNAMO_COMMIT}"
+fi
 test "$(git -C "${DYNAMO_SOURCE_DIR}" rev-parse HEAD)" = "${DYNAMO_COMMIT}"
 
 (
