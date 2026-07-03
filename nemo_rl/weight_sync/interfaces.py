@@ -62,7 +62,7 @@ class WeightSynchronizer(ABC):
         *,
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
-    ) -> None:
+    ) -> Optional[dict[str, float]]:
         """Transfer the latest policy weights to the generation backend.
 
         This method encapsulates the full sync lifecycle:
@@ -87,6 +87,9 @@ class WeightSynchronizer(ABC):
                 **Note**: Only honored by the NCCL collective transport,
                 which forwards them to ``policy.broadcast_weights_for_collective()``.
                 IPC and HTTP transports ignore this parameter.
+
+        Returns:
+            Optional transport-specific scalar metrics for the current sync.
 
         Raises:
             RuntimeError: If the weight transfer fails.

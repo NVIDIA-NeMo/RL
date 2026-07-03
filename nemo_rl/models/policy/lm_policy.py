@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
@@ -940,10 +941,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
-    def init_remote_sparse_delta_baseline(self) -> list[ray.ObjectRef]:
-        """Initialize source-side sparse-delta baselines for remote S3 refit."""
-        return self._run_s3_refit_workers(
+    def init_remote_sparse_delta_baseline(self, transport: str) -> list[ray.ObjectRef]:
+        """Initialize source-side sparse-delta baselines for remote refit."""
+        return self._run_remote_sparse_refit_workers(
             "init_remote_sparse_delta_baseline",
+            transport=transport,
         )
 
     def finish_inference(self) -> None:
@@ -1069,17 +1071,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         )
 
-    def stream_sparse_weights_via_s3_manifest(
+    def stream_remote_sparse_weights(
         self,
-        refit_urls: list[str],
+        transport: str,
+        targets: list[str],
         *,
-        api_key_env_var: Optional[str] = None,
-        timeout_s: float = 600.0,
+        transfer_id: str,
+        api_key_env_var: Optional[str],
+        timeout_s: float,
     ) -> list[ray.ObjectRef]:
-        """Upload vLLM refit payloads to S3 and post receiver manifests."""
-        return self._run_s3_refit_workers(
-            "stream_sparse_weights_via_s3_manifest",
-            refit_urls=refit_urls,
+        """Stream sparse deltas through the selected remote value plane."""
+        return self._run_remote_sparse_refit_workers(
+            "stream_remote_sparse_weights",
+            transport=transport,
+            targets=targets,
+            transfer_id=transfer_id,
             api_key_env_var=api_key_env_var,
             timeout_s=timeout_s,
         )
@@ -1089,7 +1095,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "finish_remote_sparse_delta_sync", succeeded=succeeded
         )
 
-    def _run_s3_refit_workers(
+    def _run_remote_sparse_refit_workers(
         self,
         method_name: str,
         **common_kwargs: Any,
@@ -1193,7 +1199,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         the object is lost due to leaving a function scope. It's always recommended that the
         user calls worker_group.shutdown().
         """
-        if hasattr(self, "worker_group"):
+        if not sys.is_finalizing() and hasattr(self, "worker_group"):
             self.worker_group.shutdown(cleanup_method="shutdown")
 
     def start_gpu_profiling(self) -> None:

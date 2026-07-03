@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -73,6 +74,67 @@ def test_megatron_prepare_for_training_restores_optimizer():
 
     assert model.train_called
     assert restored_devices == ["cuda"]
+
+
+def test_remote_sparse_stream_drains_cuda_before_return(monkeypatch):
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.delta_weight_transfer_tracker = object()
+    worker._iter_params_with_optional_kv_scales = lambda: iter(())
+    result = {"payloads": 1, "changed_elements": 2, "total_elements": 3}
+    events = []
+
+    def stream(*_args, **_kwargs):
+        events.append("stream")
+        return result
+
+    monkeypatch.setattr(worker_module, "stream_sparse_delta_payloads_via_zmq", stream)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+
+    actual = worker_module.MegatronPolicyWorkerImpl.stream_remote_sparse_weights(
+        worker,
+        "zmq",
+        ["tcp://receiver:5555"],
+        transfer_id="transfer",
+        api_key_env_var=None,
+        timeout_s=1.0,
+        shard_rank=0,
+        shard_count=1,
+    )
+
+    assert actual is result
+    assert events == ["stream", "sync"]
+
+
+def test_refit_param_info_uses_mapping_pp_broadcast():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    mapping = SimpleNamespace(
+        tp_size=2,
+        ep_size=4,
+        is_expert=True,
+        broadcast_obj_from_pp_rank=Mock(return_value=192),
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.dtype = torch.bfloat16
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            param_name="decoder.layers.0.mlp.weight",
+            param_weight=torch.empty(3, 4, dtype=torch.float16),
+            mapping=mapping,
+        )
+    ]
+
+    assert worker._calculate_refit_param_info() == [
+        ("decoder.layers.0.mlp.weight", 192)
+    ]
+    mapping.broadcast_obj_from_pp_rank.assert_called_once_with(192)
 
 
 def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
