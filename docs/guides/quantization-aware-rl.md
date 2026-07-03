@@ -21,13 +21,12 @@ The following workflow + quantization recipe combinations have been validated en
 |---|---|---|---|---|
 | QA-Distillation | W4A4 | `NVFP4_DEFAULT_CFG` (NVFP4 weights + NVFP4 activations) | ✅ Converges | `examples/modelopt/qa_distillation_math_megatron.yaml` |
 | QA-GRPO | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16.yaml` (NVFP4 weights, native-dtype activations) | ✅ Converges | `examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml` |
-| QA-GRPO | W4A8 | `examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml` (NVFP4 weights, FP8 input activations) | ✅ Converges | `examples/configs/recipes/llm/grpo-qwen2.5-0.5b-dapo-1n8g-megatron-qa-nvfp4-w4a8-fake.yaml` |
 | QA-GRPO | W4A4 | `NVFP4_DEFAULT_CFG` | ⚠️ Known convergence issue | `examples/modelopt/qa_grpo_math_megatron.yaml` |
 | QA-Distillation | W4A4 | `examples/modelopt/quant_configs/nano3_nvfp4_default.yaml` | ✅ Converges | `examples/modelopt/qa_distillation_nano3_megatron.yaml` |
 | QA-GRPO | W4A16 | `NVFP4_MLP_WEIGHT_ONLY_CFG` | ✅ Smoke tested on MoE | `examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml` |
-| QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml` with `policy.generation.real_quant: true` | ✅ Converges | `examples/configs/recipes/llm/grpo-qwen2.5-0.5b-dapo-1n8g-megatron-qa-nvfp4-w4a16.yaml` |
+| QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml` with `policy.generation.real_quant: true` | ✅ Converges | `examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml` |
 
-The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The `nvfp4_w4a8_fp8.yaml` recipe uses the same NVFP4 weight format and enables FP8 e4m3 input activation fake quantization.
+The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout.
 
 ## ModelOpt Layer Spec Toggle
 
@@ -108,17 +107,15 @@ policy:
     real_quant: true
 ```
 
-The ready-to-run 1-node DAPO smoke recipe is:
+The ready-to-run 2-node DAPO long-context recipe is:
 
 ```text
-examples/configs/recipes/llm/grpo-qwen2.5-0.5b-dapo-1n8g-megatron-qa-nvfp4-w4a16.yaml
+examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml
 ```
 
-Use the matching BF16 recipe as the baseline:
-
-```text
-examples/configs/recipes/llm/grpo-qwen2.5-0.5b-dapo-1n8g-megatron.yaml
-```
+For a BF16 baseline, copy the recipe, remove `policy.quant_cfg`,
+`policy.generation.quant_cfg`, and `policy.generation.real_quant`, and use distinct
+checkpoint and log directories.
 
 ### Running the Example
 
@@ -127,15 +124,7 @@ From the repository root inside the NeMo RL container:
 ```bash
 uv run --extra mcore --extra modelopt --extra vllm \
   examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen2.5-0.5b-dapo-1n8g-megatron-qa-nvfp4-w4a16.yaml
-```
-
-For a BF16 comparison run:
-
-```bash
-uv run --extra mcore --extra vllm \
-  examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen2.5-0.5b-dapo-1n8g-megatron.yaml
+  --config examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml
 ```
 
 For Slurm, wrap the same command in `ray.sub` as shown in [Running QA-GRPO](#running-qa-grpo). Keep the W4A16 and BF16 runs separate and use distinct checkpoint directories.
@@ -146,7 +135,7 @@ Real-quant rollout is sensitive to stale Megatron conversion checkpoints. For a 
 
 ```bash
 # Training checkpoint: matches `checkpointing.checkpoint_dir` in your config.
-mv checkpoints/grpo-qwen2.5-0.5b-dapo-1n8g-w4a16 checkpoints/grpo-qwen2.5-0.5b-dapo-1n8g-w4a16.old
+mv checkpoints/grpo-qwen3-8b-base-dapo-2n-long-w4a16 checkpoints/grpo-qwen3-8b-base-dapo-2n-long-w4a16.old
 
 # Converted Megatron checkpoint: under `$NRL_MEGATRON_CHECKPOINT_DIR` if set,
 # else `$HF_HOME/nemo_rl` or `~/.cache/huggingface/nemo_rl`. The subdirectory is
@@ -188,25 +177,6 @@ For an initial sanity check, compare the first `Generation KL Error` with the BF
 | First-step W4A16 `Generation KL Error` is much higher than BF16 | Stale converted Megatron checkpoint or refit/export mismatch | Clear checkpoints and rerun; confirm packed tensors are streamed |
 | `negative scales` warning appears | Invalid or stale NVFP4 scale tensors reached vLLM | Clear checkpoints and verify `nvfp4_a16_mlp_only.yaml` is used for both policy and generation |
 | CUDA invalid argument during refit or generation | vLLM consumed malformed packed tensors or stale IPC state | Restart from a fresh job and inspect the first real-quant refit logs |
-
-## Fake-Quant NVFP4 Rollout (W4A8)
-
-W4A8 rollout is supported through the fake-quant vLLM path. The policy and vLLM workers both use a ModelOpt recipe with NVFP4 weights and FP8 input activations, while refit transfers folded weights and quantizer amax state instead of packed deployment tensors.
-
-```yaml
-policy:
-  quant_cfg: examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml
-
-  generation:
-    backend: vllm
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml
-```
-
-The ready-to-run 1-node DAPO smoke recipe is:
-
-```text
-examples/configs/recipes/llm/grpo-qwen2.5-0.5b-dapo-1n8g-megatron-qa-nvfp4-w4a8-fake.yaml
-```
 
 ## Quantization-Aware Distillation (On-Policy QAD)
 
@@ -312,6 +282,5 @@ uv run --extra mcore --extra modelopt \
 - **Generation**: Currently only vLLM is supported for generation.
 - **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
 - **Real-quant rollout**: W4A16 real rollout is supported for dense vLLM ModelOpt NVFP4 layers.
-- **W4A8 rollout**: W4A8 is supported through fake-quant rollout.
 - **Input quantization**: Only per-tensor input (activation) quantization is supported.
 - **Model support**: Dense Transformer, MoE (Mixture of Experts), and hybrid MoE/Mamba models are supported on the Megatron policy + vLLM generation path when Megatron-Bridge and ModelOpt support the model architecture and quantization recipe. MoE/Mamba support is currently covered by smoke-tested example configs rather than broad convergence guarantees.
