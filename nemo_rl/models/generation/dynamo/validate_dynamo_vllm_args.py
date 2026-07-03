@@ -23,6 +23,18 @@ def main() -> None:
     os.environ.setdefault("PYTHONHASHSEED", "0")
     if len(sys.argv) != 2:
         raise SystemExit("usage: validate_dynamo_vllm_args.py '<json argv>'")
+
+    # Parser construction evaluates vLLM device defaults. Image builds and
+    # unit preflights may run on CPU-only Slurm nodes, where a CUDA wheel leaves
+    # current_platform unspecified even though no engine will be constructed.
+    # Match Dynamo frontend's parser-only fallback without changing GPU runs.
+    import vllm.platforms
+
+    if vllm.platforms.current_platform.device_type == "":
+        from vllm.platforms.cpu import CpuPlatform
+
+        vllm.platforms.current_platform = CpuPlatform()
+
     from dynamo.vllm.args import parse_args
 
     argv = json.loads(sys.argv[1])
