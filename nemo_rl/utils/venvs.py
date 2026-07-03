@@ -76,29 +76,8 @@ def create_local_venv(
 
     logger.info(f"Creating new venv at {venv_path}")
 
-    # Resolve `uv` to an absolute path: some Ray actor processes don't see
-    # the container's image PATH (so /root/.local/bin/uv isn't reachable).
-    # Fall back to a static uv binary bind-mounted via the lustre RL dir.
-    uv_bin = shutil.which("uv")
-    if not uv_bin:
-        for candidate in (
-            "/root/.local/bin/uv",
-            "/opt/nemo_rl_venv/bin/uv",
-            "/usr/local/bin/uv",
-            os.path.join(git_root, ".uv-static"),
-        ):
-            if os.path.exists(candidate):
-                uv_bin = candidate
-                break
-    if not uv_bin:
-        raise RuntimeError(
-            f"Could not find 'uv' on PATH or common install locations "
-            f"(/root/.local/bin, /opt/nemo_rl_venv/bin, /usr/local/bin, "
-            f"{git_root}/.uv-static)"
-        )
-
     # Create the virtual environment
-    uv_venv_cmd = [uv_bin, "venv", "--allow-existing", venv_path]
+    uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
     subprocess.run(uv_venv_cmd, check=True)
 
     # Execute the command with the virtual environment
@@ -108,18 +87,14 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
-    env["PATH"] = os.path.dirname(uv_bin) + os.pathsep + env.get("PATH", "")
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
-    # If py_executable invokes bare `uv`, rewrite to the resolved uv_bin path.
-    if exec_cmd and exec_cmd[0] == "uv":
-        exec_cmd[0] = uv_bin
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run([uv_bin, "sync", "--directory", git_root], env=env, check=True)
+    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
