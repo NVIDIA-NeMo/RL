@@ -41,7 +41,7 @@ if [[ ! -x "${CARGO_HOME}/bin/cargo" ]]; then
 fi
 
 "${UV_BIN}" python install "${DYNAMO_PYTHON_VERSION}"
-"${UV_BIN}" venv --python "${DYNAMO_PYTHON_VERSION}" "${DYNAMO_VENV}"
+"${UV_BIN}" venv --clear --python "${DYNAMO_PYTHON_VERSION}" "${DYNAMO_VENV}"
 "${UV_BIN}" pip install --python "${DYNAMO_VENV}/bin/python" \
   pip 'maturin[patchelf]'
 
