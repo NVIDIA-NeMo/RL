@@ -2273,20 +2273,15 @@ def _postprocess_single_nemo_gym_group(
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
         if "vllm_cfg" in policy_generation.cfg:
-            if "vllm_cfg" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
                 "max_model_len"
             ]
+        elif "trtllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"]["max_model_len"]
         elif "mcore_generation_config" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg[
                 "mcore_generation_config"
             ]["max_model_len"]
-        else:
-            max_total_tokens_per_sample = policy_generation.cfg[
-                "max_total_sequence_length"
-            ]
-        elif "trtllm_cfg" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"]["max_model_len"]
         else:
             max_total_tokens_per_sample = policy_generation.cfg.get("max_total_sequence_length", 4096)
         all_sample_metrics = [

@@ -152,7 +152,7 @@ vllm = [
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
-  "nvidia-cutlass-dsl>=4.5.2",
+  "nvidia-cutlass-dsl[cu13]>=4.5.2",
 ]
 sglang = [
   "sglang==0.5.12.post1",
@@ -209,7 +209,6 @@ mcore = [
 trtllm = [
   "tensorrt-llm==1.3.0rc21",
   "mpi4py",
-  "nvidia-cutlass-dsl-libs-base==4.5.0",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
@@ -370,9 +369,6 @@ override-dependencies = [
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # vLLM 0.20.0 imports CUTLASS CUTE during Qwen3.5 MoE profiling.
-  # 4.5.0 has a broken cutlass.cute import path for increment_coord.
-  "nvidia-cutlass-dsl[cu13]>=4.5.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
