@@ -115,6 +115,20 @@ def _use_golden_v2() -> bool:
     )
 
 
+def _use_golden_v3() -> bool:
+    """Whether ``NRL_XFERDTENSOR_GOLDEN_V3`` selects the v3 golden path.
+
+    Routes the reshard through ``xferdtensor_golden_v3`` — same 7-arg signature.
+    Implies the golden path (bypasses the real ``nccl.m2n`` op entirely).
+    """
+    return os.environ.get("NRL_XFERDTENSOR_GOLDEN_V3", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def xferdtensor(
     src_tensor,
     src_mesh,
@@ -138,11 +152,14 @@ def xferdtensor(
     Shard/Replicate placements are passed through directly.
     """
     global _XFERDTENSOR_PATH_LOGGED
+    use_golden_v3 = _use_golden_v3()
     use_golden_v2 = _use_golden_v2()
-    use_golden = use_golden_v2 or _use_golden_api() or _reshard is None
+    use_golden = use_golden_v3 or use_golden_v2 or _use_golden_api() or _reshard is None
     if not _XFERDTENSOR_PATH_LOGGED:
         if not use_golden:
             path = "real nccl.m2n.reshard"
+        elif use_golden_v3:
+            path = "golden_v3"
         elif use_golden_v2:
             path = "golden_v2 (grouped-P2P)"
         else:
@@ -150,10 +167,27 @@ def xferdtensor(
         print(
             f"[xferdtensor] reshard path: {path} "
             f"(real_op_available={_reshard is not None}, "
-            f"force_golden={_use_golden_api()}, golden_v2={use_golden_v2})",
+            f"force_golden={_use_golden_api()}, "
+            f"golden_v2={use_golden_v2}, golden_v3={use_golden_v3})",
             flush=True,
         )
         _XFERDTENSOR_PATH_LOGGED = True
+
+    if use_golden_v3:
+        # v3 reshard; same 7-arg contract.
+        from nemo_rl.distributed.xferdtensor_golden_v3 import (
+            xferdtensor_golden_v3,
+        )
+
+        return xferdtensor_golden_v3(
+            src_tensor,
+            src_mesh,
+            src_placement,
+            dst_tensor,
+            dst_mesh,
+            dst_placement,
+            process_group,
+        )
 
     if use_golden_v2:
         # Grouped-P2P reshard (no full broadcast); same 7-arg contract.
