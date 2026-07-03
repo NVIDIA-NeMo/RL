@@ -121,47 +121,16 @@ python3 scripts/build_wheel.py \
     --nvrtc_dynamic_linking \
     -D "ENABLE_UCX=OFF"
 
-# Copy the wheel to WHEEL_OUTPUT_DIR so uv can discover it via UV_FIND_LINKS.
-# The Dockerfile will run `uv lock --upgrade-package tensorrt-llm` + `uv sync --extra trtllm`
-# after this script to install tensorrt-llm into the uv-managed venv.
+# Copy the wheel to WHEEL_OUTPUT_DIR.
+# When called from the PEP 517 backend (_backend.py), WHEEL_OUTPUT_DIR is set to
+# the wheel_directory that uv passes to build_wheel — uv then picks up the wheel
+# from there and installs it into the venv.
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."
 cp "$BUILD_DIR"/build/tensorrt_llm-*.whl "$WHEEL_OUTPUT_DIR/"
 
 # Remove source tree and build artifacts to reclaim disk space.
 echo "Cleaning up TensorRT-LLM source and build artifacts..."
 rm -rf "$BUILD_DIR"
-
-echo "Updating pyproject.toml: injecting platform_machine marker for tensorrt-llm..."
-cd "$REPO_ROOT"
-uv run --no-project --with tomlkit python - <<'PY'
-from pathlib import Path
-from tomlkit import parse, dumps
-import platform
-
-arch = platform.machine()  # 'aarch64' or 'x86_64'
-pyproject_path = Path("pyproject.toml")
-doc = parse(pyproject_path.read_text())
-
-trtllm_list = doc["project"]["optional-dependencies"]["trtllm"]
-
-# Rebuild the list: replace the tensorrt-llm entry with a platform-specific marker,
-# idempotently (strip any existing marker first).
-new_items = []
-for item in trtllm_list:
-    s = str(item).strip()
-    if s.startswith("tensorrt-llm"):
-        base = s.split(";")[0].strip()
-        new_items.append(f'{base} ; platform_machine == "{arch}"')
-    else:
-        new_items.append(item)
-
-trtllm_list.clear()
-for it in new_items:
-    trtllm_list.append(it)
-
-pyproject_path.write_text(dumps(doc))
-print(f"[INFO] tensorrt-llm entry updated with platform_machine == '{arch}'")
-PY
 
 echo "Build completed successfully!"
 echo "TRT-LLM wheel copied to: ${WHEEL_OUTPUT_DIR}"

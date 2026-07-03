@@ -157,11 +157,6 @@ ENV CUDA_HOME=/usr/local/cuda
 ## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
-# Directory where the from-source TRT-LLM wheel is placed after build-custom-trtllm.sh.
-# uv discovers the wheel here via UV_FIND_LINKS at lock + sync time, and at runtime
-# when create_local_venv builds role venvs for TrtllmGenerationWorker.
-ENV UV_FIND_LINKS=/opt/trtllm_wheels
-
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
@@ -184,8 +179,6 @@ elif [ -n "$SEED_KEY" ]; then
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
 fi
 
-# Create UV_FIND_LINKS dir early so uv doesn't fail before trtllm wheel is built.
-mkdir -p "$UV_FIND_LINKS"
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
@@ -194,24 +187,6 @@ if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
 fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
     bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL:-} ${BUILD_CUSTOM_FLASHINFER_REF:-}
-fi
-
-# TRT-LLM is always custom-built from source (no PyPI wheel for cp313/cu13/aarch64 or x86_64).
-# Build the wheel BEFORE any uv sync so that UV_FIND_LINKS contains the platform-specific
-# wheel when uv validates all environment splits in the lock. This makes the build
-# work on both aarch64 (GB200) and x86_64 without hardcoding a platform marker.
-if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    # Activate venv so the script's `python3 -m pip ...` calls land in /opt/nemo_rl_venv.
-    source /opt/nemo_rl_venv/bin/activate
-    bash tools/build-custom-trtllm.sh \
-        "${BUILD_CUSTOM_TRTLLM_URL:-https://github.com/shuyixiong/TensorRT-LLM.git}" \
-        "${BUILD_CUSTOM_TRTLLM_REF:-nemorl}" \
-        "${BUILD_CUSTOM_TRTLLM_MODELOPT_URL:-https://github.com/NVIDIA/TensorRT-Model-Optimizer.git}" \
-        "${BUILD_CUSTOM_TRTLLM_MODELOPT_REF:-0.37.0}"
-    deactivate
-    # Wheel is now in /opt/trtllm_wheels/. Update uv.lock with the real platform wheel
-    # so uv sync --locked can validate all environment splits correctly.
-    uv lock --upgrade-package tensorrt-llm
 fi
 
 # Sync each training + inference backend one at a time (since they may conflict)
@@ -231,6 +206,11 @@ uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    # The custom PEP 517 backend in 3rdparty/trtllm-workspace/_backend.py
+    # invokes tools/build-custom-trtllm.sh during this sync (≈60 min).
+    # Build coordinates are passed via env vars:
+    #   BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF
+    #   BUILD_CUSTOM_TRTLLM_MODELOPT_URL / BUILD_CUSTOM_TRTLLM_MODELOPT_REF
     uv sync --link-mode symlink --locked --extra trtllm --no-install-project
 fi
 
