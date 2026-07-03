@@ -792,6 +792,8 @@ class VllmInternalWorkerExtension:
         # Bulk reshard done.  Default: run misc now (serial, no concurrent
         # communicators).  Parallel opt-in: join the background misc broadcast.
         if not _parallel_misc:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             _run_misc_recv()
         else:
             _misc_future.result()
