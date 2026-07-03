@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import sys
 import warnings
 from collections import defaultdict
 from typing import (
@@ -905,6 +906,8 @@ class VllmGeneration(GenerationInterface):
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""
         try:
+            if self.weight_synchronizer is not None:
+                self.weight_synchronizer.shutdown()
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
         except Exception as e:
@@ -913,33 +916,45 @@ class VllmGeneration(GenerationInterface):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
-        # Choose the appropriate method based on async_engine setting
         method_name = (
             "prepare_refit_info_async"
             if self.cfg["vllm_cfg"]["async_engine"]
             else "prepare_refit_info"
         )
-
-        # Use run_all_workers_single_data to send data to all workers
-        futures = self.worker_group.run_all_workers_single_data(
-            method_name,
-            state_dict_info=state_dict_info,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-
-        # Wait for all futures to complete
-        ray.get(futures)
+        self._run_refit_workers(method_name, state_dict_info=state_dict_info)
 
     def report_refit_server_base_urls(self) -> list[str]:
         """Return base URLs for vLLM workers exposing sparse refit endpoints."""
+        return [
+            url
+            for url in self._run_refit_workers("report_refit_server_base_url")
+            if url
+        ]
+
+    def _run_refit_workers(self, method_name: str, **kwargs: Any) -> list[Any]:
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
-
-        futures = self.worker_group.run_all_workers_single_data(
-            "report_refit_server_base_url",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        return ray.get(
+            self.worker_group.run_all_workers_single_data(
+                method_name,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                **kwargs,
+            )
         )
-        return [url for url in ray.get(futures) if url]
+
+    def start_zmq_sparse_refit_relays(self, refit_urls: list[str]) -> list[str]:
+        """Start one ZeroMQ relay per vLLM replica and return TCP addresses."""
+        return [
+            address
+            for address in self._run_refit_workers(
+                "start_zmq_sparse_refit_relay", refit_urls=refit_urls
+            )
+            if address
+        ]
+
+    def stop_zmq_sparse_refit_relays(self) -> None:
+        if self.worker_group and self.worker_group.workers:
+            self._run_refit_workers("stop_zmq_sparse_refit_relay")
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""
@@ -1065,7 +1080,8 @@ class VllmGeneration(GenerationInterface):
         the object is lost due to leaving a function scope. It's always recommended that the
         user calls shutdown().
         """
-        self.shutdown()
+        if not sys.is_finalizing():
+            self.shutdown()
 
     def invalidate_kv_cache(self) -> bool:
         """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.

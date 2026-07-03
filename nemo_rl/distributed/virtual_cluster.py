@@ -1041,4 +1041,5 @@ class RayVirtualCluster:
         the cluster is lost due to leaving a function scope. It's always recommended that the
         user calls shutdown().
         """
-        self.shutdown()
+        if not sys.is_finalizing():
+            self.shutdown()

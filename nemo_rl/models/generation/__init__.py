@@ -47,7 +47,8 @@ def configure_generation_config(
         # set load_format
         config["vllm_cfg"]["load_format"] = (
             "auto"
-            if is_eval or config.get("refit_transport") == "vllm_s3_sparse"
+            if is_eval
+            or config.get("refit_transport") in ("vllm_s3_sparse", "vllm_zmq_sparse")
             else "dummy"
         )
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")

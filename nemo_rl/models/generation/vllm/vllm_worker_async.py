@@ -218,6 +218,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.llm = None
         self.vllm_device_ids = None
 
+    def _refit_collective_rpc(
+        self,
+        method: str,
+        args: tuple[Any, ...],
+    ) -> Any:
+        if self._refit_async_loop is None:
+            raise RuntimeError("The async vLLM refit server loop is not initialized.")
+        return asyncio.run_coroutine_threadsafe(
+            self.llm.collective_rpc(method, args=args), self._refit_async_loop
+        ).result()
+
     def _return_routed_experts_enabled(self) -> bool:
         engine_args = getattr(self, "llm_async_engine_args", None)
         if bool(getattr(engine_args, "enable_return_routed_experts", False)):
@@ -429,6 +440,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             await self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
             )
+        if self.cfg.get("refit_transport") is not None:
+            hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
+            self._refit_workers_share_node = len(set(hostnames)) == 1
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -438,6 +452,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
+
+    def report_refit_server_base_url(self) -> str | None:
+        if self.cfg.get("refit_transport") is None or self.base_url is None:
+            return None
+        return self.base_url.removesuffix("/v1")
 
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
@@ -910,6 +929,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         app = FastAPI()
 
         app = self._setup_vllm_openai_api_server(app)
+        if self.cfg.get("refit_transport") is not None:
+            self._setup_vllm_refit_api_server(app)
 
         ########################################
         # Server spinup
@@ -1533,6 +1554,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            self.stop_zmq_sparse_refit_relay()
+            await asyncio.to_thread(self._flush_queued_sparse_payloads)
+            self._refit_apply_executor.shutdown(wait=True)
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())

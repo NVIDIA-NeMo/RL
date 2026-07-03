@@ -41,12 +41,12 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
-    # Internal trusted endpoint for sparse delta refit payloads.
-    expose_http_refit_server: NotRequired[bool]
     # Environment variable containing the internal refit API key.
     http_refit_api_key_env_var: NotRequired[str | None]
     # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
     http_refit_server_port: NotRequired[int | None]
+    # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
+    zmq_refit_server_port: NotRequired[int | None]
     # These kwargs are passed to the vllm.LLM HTTP server Chat Completions endpoint config. Typically this will include things like tool parser, chat template, etc
     http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
     # Miscellaneous top level vLLM HTTP server arguments.
@@ -61,17 +61,15 @@ class VllmSpecificArgs(TypedDict):
 
 
 class VllmDeltaCompressionConfig(TypedDict):
-    enabled: bool
     dtype: DeltaCompressionDType
     sparse_bucket_size_bytes: int
-    baseline_mmap_dir: NotRequired[str | None]
 
 
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
-    # Null uses the existing NCCL refit; "vllm_s3_sparse" uses S3 sparse deltas.
-    refit_transport: NotRequired[Literal["vllm_s3_sparse"] | None]
+    # Null uses NCCL; remote sparse refit supports S3 or ZeroMQ value planes.
+    refit_transport: NotRequired[Literal["vllm_s3_sparse", "vllm_zmq_sparse"] | None]
     delta_compression: NotRequired[VllmDeltaCompressionConfig | None]
 
     # quantization config

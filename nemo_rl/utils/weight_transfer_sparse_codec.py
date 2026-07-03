@@ -25,6 +25,7 @@ import torch
 NamedTensor = tuple[str, torch.Tensor]
 TensorBatch = list[NamedTensor]
 TensorPayload = tuple[torch.Tensor, torch.Tensor, list[dict[str, Any]]]
+PreparedTensorPayload = tuple[TensorPayload, int, int]
 
 
 def encode_sparse_infos(
@@ -122,63 +123,106 @@ class DeltaCompressionTracker:
         self.sparse_bucket_size_bytes = int(config["sparse_bucket_size_bytes"])
         if self.sparse_bucket_size_bytes < 1:
             raise ValueError("delta_compression.sparse_bucket_size_bytes must be >= 1")
-        dtype_name = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}.get(
-            str(config["dtype"]).lower(), str(config["dtype"]).lower()
+        self.delta_dtype = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }[str(config["dtype"]).lower()]
+        self.verification_samples = int(
+            os.getenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "0")
         )
-        self.delta_dtype: torch.dtype = getattr(torch, dtype_name)
+        if self.verification_samples < 0:
+            raise ValueError("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD must be >= 0")
         self.baseline_in_memory = os.getenv("NRL_REFIT_BASELINE_IN_MEMORY") == "1"
-        self.baseline_mmap_dir = config.get("baseline_mmap_dir") or os.getenv(
-            "NRL_REFIT_BASELINE_MMAP_DIR"
-        )
+        self.baseline_mmap_dir = os.getenv("NRL_REFIT_BASELINE_MMAP_DIR")
         self.baseline: dict[str, torch.Tensor] = {}
         self._pending_updates: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self._pending_updates_lock = threading.Lock()
         self._baseline_commits: tuple[Any, ...] = ()
-        self._baseline_commit_lock = threading.Lock()
         self._baseline_commit_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="nrl-refit-baseline"
         )
 
-    def prepare_sparse_delta_payload(self, tensors: TensorBatch) -> TensorPayload:
+    def prepare_sparse_delta_payload(
+        self, tensors: TensorBatch
+    ) -> PreparedTensorPayload:
         self._wait_for_baseline_commits()
         sparse_infos = []
+        verification_sources = []
         pending_updates = {}
+        changed_elements = total_elements = 0
         for name, tensor in tensors:
             baseline = self.baseline.get(name)
             if baseline is None:
                 raise RuntimeError(f"Sparse delta baseline is missing {name!r}.")
             current = tensor.detach().cpu()
             current_flat, baseline_flat = current.view(-1), baseline.view(-1)
+            total_elements += current_flat.numel()
             locations = (current_flat != baseline_flat).nonzero().view(-1)
+            changed_elements += locations.numel()
             if locations.numel():
                 current_values = current_flat[locations]
+                baseline_values = baseline_flat[locations]
+                deltas = (current_values - baseline_values).to(self.delta_dtype)
+                expected_values = baseline_values + deltas.to(baseline.dtype)
                 sparse_infos.append(
                     (
                         name,
                         current,
                         locations,
-                        (current_values - baseline_flat[locations]).to(
-                            self.delta_dtype
-                        ),
+                        deltas,
                     )
                 )
-                pending_updates[name] = (locations, current_values)
+                if self.verification_samples:
+                    verification_sources.append((locations, deltas))
+                pending_updates[name] = (locations, expected_values)
         with self._pending_updates_lock:
             self._pending_updates.update(pending_updates)
-        return encode_sparse_infos(sparse_infos, empty_dtype=self.delta_dtype)
+        payload = encode_sparse_infos(sparse_infos, empty_dtype=self.delta_dtype)
+        if verification_sources:
+            self._add_verification_samples(payload[2], verification_sources)
+        return payload, changed_elements, total_elements
+
+    def _add_verification_samples(
+        self,
+        metadata: list[dict[str, Any]],
+        sources: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        total = sum(int(locations.numel()) for locations, _ in sources)
+        count = min(self.verification_samples, total)
+        if not count:
+            return
+
+        sample_ranks = [
+            ((2 * index + 1) * total) // (2 * count) for index in range(count)
+        ]
+        sample_index = offset = 0
+        for item, (locations, deltas) in zip(metadata, sources, strict=True):
+            end = offset + locations.numel()
+            while sample_index < count and sample_ranks[sample_index] < end:
+                local_index = sample_ranks[sample_index] - offset
+                location = int(locations[local_index])
+                item.setdefault("verification_locations", []).append(location)
+                item.setdefault("verification_deltas", []).append(
+                    float(deltas[local_index])
+                )
+                sample_index += 1
+            offset = end
 
     def on_sync_succeeded(self) -> None:
         with self._pending_updates_lock:
             pending_updates, self._pending_updates = self._pending_updates, {}
         items = list(pending_updates.items())
         workers = min(4, len(items))
-        with self._baseline_commit_lock:
-            self._baseline_commits = tuple(
-                self._baseline_commit_executor.submit(
-                    self._commit_baseline_updates, items[worker::workers]
-                )
-                for worker in range(workers)
+        self._baseline_commits = tuple(
+            self._baseline_commit_executor.submit(
+                self._commit_baseline_updates, items[worker::workers]
             )
+            for worker in range(workers)
+        )
 
     def on_sync_failed(self) -> None:
         with self._pending_updates_lock:
@@ -190,13 +234,9 @@ class DeltaCompressionTracker:
             self._baseline(name, tuple(tensor.shape), tensor.dtype).copy_(tensor)
 
     def _wait_for_baseline_commits(self) -> None:
-        with self._baseline_commit_lock:
-            commits = self._baseline_commits
-        for commit in commits:
+        for commit in self._baseline_commits:
             commit.result()
-        with self._baseline_commit_lock:
-            if self._baseline_commits == commits:
-                self._baseline_commits = ()
+        self._baseline_commits = ()
 
     def _commit_baseline_updates(
         self, updates: Iterable[tuple[str, tuple[torch.Tensor, torch.Tensor]]]
