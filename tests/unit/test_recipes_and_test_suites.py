@@ -190,6 +190,26 @@ def test_no_overlap_across_test_suites(all_test_suites):
     )
 
 
+def test_nightly_suites_match_gpus_per_node(
+    nightly_test_suite, nightly_gb200_test_suite
+):
+    for test_suite, expected_gpus_per_node in (
+        (nightly_test_suite, 8),
+        (nightly_gb200_test_suite, 4),
+    ):
+        for test_script in test_suite:
+            gpus_per_node = 8
+            with open(os.path.join(project_root, test_script)) as f:
+                for line in f:
+                    if line.startswith("GPUS_PER_NODE="):
+                        gpus_per_node = int(line.split("=", 1)[1].split()[0])
+                        break
+            assert gpus_per_node == expected_gpus_per_node, (
+                f"{test_script} requests {gpus_per_node} GPUs per node, but its "
+                f"nightly suite requires {expected_gpus_per_node}"
+            )
+
+
 def test_all_test_scripts_accounted_for_in_test_suites(all_test_suites):
     all_test_scripts_in_test_suites = set(all_test_suites)
 
