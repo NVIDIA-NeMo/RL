@@ -1358,9 +1358,27 @@ class MegatronPolicyWorkerImpl(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Broadcast the weights for collective communication."""
+
+        def _log_expert_shapes_once(iterator):
+            log_experts = not getattr(self, "_refit_expert_shapes_logged", False)
+            logged = 0
+            for name, tensor in iterator:
+                if log_experts and ".mlp.experts." in name and logged < 4:
+                    # A few representative tensors are enough to diagnose
+                    # layout mismatches on the vLLM side.
+                    logged += 1
+                    print(
+                        f"[refit-debug] sending '{name}' "
+                        f"shape={tuple(tensor.shape)} dtype={tensor.dtype}"
+                    )
+                yield name, tensor
+            self._refit_expert_shapes_logged = True
+
         # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
-            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
+            iterator=_log_expert_shapes_once(
+                self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+            ),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
