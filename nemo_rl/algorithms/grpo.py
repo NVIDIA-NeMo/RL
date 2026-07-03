@@ -22,7 +22,7 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cas
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -82,6 +82,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -155,6 +156,46 @@ class AdvEstimatorConfig(TypedDict):
     use_leave_one_out_baseline: NotRequired[bool]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
+
+
+class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
+    """Optional token IDs for reward penalties."""
+
+    unwanted: list[int] | None = None
+    think_open: int | None = None
+    think_close: int | None = None
+
+
+class RewardPenaltyConfig(BaseModel, extra="allow"):
+    """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
+
+    penalize_duplicated_reasoning: bool = False
+    penalize_empty_final_answer: bool = False
+    penalize_unwanted_tokens: bool = False
+    penalize_malformed_think_tag: bool = False
+    # Optional token IDs. token_ids.unwanted is required when
+    # penalize_unwanted_tokens is true;
+    # think-tag IDs are inferred from configured tag strings when possible.
+    token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
+
+    @model_validator(mode="after")
+    def _require_unwanted_token_ids_when_penalized(self) -> "RewardPenaltyConfig":
+        if self.penalize_unwanted_tokens and (
+            self.token_ids is None or not self.token_ids.unwanted
+        ):
+            raise ValueError(
+                "reward_penalties.token_ids.unwanted must be set when "
+                "reward_penalties.penalize_unwanted_tokens is true"
+            )
+        return self
+
+
+_REWARD_PENALTY_FLAGS = (
+    "penalize_duplicated_reasoning",
+    "penalize_empty_final_answer",
+    "penalize_unwanted_tokens",
+    "penalize_malformed_think_tag",
+)
 
 
 class GRPOConfig(TypedDict):
@@ -242,6 +283,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
@@ -459,6 +501,9 @@ def setup(
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
     enable_nemo_gym = _should_use_nemo_gym(master_config)
+    _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
     nemo_gym_actor = None
     if enable_nemo_gym:
         nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
@@ -476,7 +521,7 @@ def setup(
             nemo_gym_py_exec = create_local_venv_on_each_node(
                 nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
             )
-        nemo_gym_dict = env_configs["nemo_gym"]
+        nemo_gym_dict = dict(env_configs["nemo_gym"])
         # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
         # (where the detector reads them), not part of Gym's global config.
         invalid_tool_call_patterns = nemo_gym_dict.pop(
@@ -1507,12 +1552,34 @@ def _resolve_message_level_advantage_penalties(
     # The is_invalid_tool_call / has_malformed_thinking flags these penalties rely on
     # are only populated by the NeMo-Gym environment. Without that path the penalties
     # would silently no-op, so fail loudly instead.
-    assert _should_use_nemo_gym(master_config), (
-        "grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage require "
-        "the NeMo-Gym path (env.should_use_nemo_gym=true); they are not supported with "
-        "the native generation path."
-    )
+    if not _should_use_nemo_gym(master_config):
+        raise ValueError(
+            "grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage require "
+            "the NeMo-Gym path (env.should_use_nemo_gym=true); they are not supported with "
+            "the native generation path."
+        )
     return invalid_tool_call_advantage, malformed_thinking_advantage
+
+
+def _raise_if_reward_penalties_enabled_without_nemo_gym(
+    master_config: MasterConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Validate reward-zeroing penalties are only used with NeMo-Gym."""
+    if enable_nemo_gym:
+        return
+
+    if not any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    ):
+        return
+
+    raise ValueError(
+        "reward_penalties require the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); they are not supported with the native "
+        "generation path."
+    )
 
 
 def _apply_message_level_advantage_penalties(
@@ -2357,6 +2424,8 @@ def grpo_train(
                             max_rollout_turns=None,
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
+                            reward_penalty_config=master_config.reward_penalties,
+                            thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -3185,6 +3254,8 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
+                    reward_penalty_config=master_config.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

@@ -23,7 +23,12 @@ from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
-from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
+from nemo_rl.algorithms.grpo import (
+    MasterConfig as GRPOMasterConfig,
+)
+from nemo_rl.algorithms.grpo import (
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
@@ -154,6 +159,32 @@ def test_all_config_files_have_required_keys(config_file):
 
     # Validate the entire config using the appropriate MasterConfig
     validate_config_section(config_dict, master_config_class, config_file)
+
+
+def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
+    """Unwanted-token penalty requires explicit unwanted-token config.
+
+    Validates that token_ids.unwanted is present whenever penalize_unwanted_tokens
+    is enabled.
+    """
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids=None)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={})
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={"unwanted": []})
+
+    config = RewardPenaltyConfig(
+        penalize_unwanted_tokens=True,
+        token_ids={"unwanted": [2]},
+    )
+    assert config.token_ids is not None
+    assert config.token_ids.unwanted == [2]
 
 
 @pytest.mark.parametrize("config_file", config_files)
