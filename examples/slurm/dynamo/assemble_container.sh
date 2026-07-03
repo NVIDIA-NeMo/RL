@@ -36,16 +36,15 @@ test -x /opt/ray_venvs/nemo_rl.models.policy.workers.dtensor_policy_worker.DTens
     tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 )
 
-# Dynamo/vLLM has an independent Python solve. Install the exact source
-# revision containing native unpaused NeMo-RL refit support.
+# Dynamo/vLLM has an independent Python solve. The pinned revision's matching
+# native runtime wheel is not yet published, so build both packages from the
+# exact checkout instead of mixing source with an older runtime wheel.
 export UV_PYTHON_INSTALL_DIR=/opt/uv-python
-"${UV}" python install "${DYNAMO_PYTHON_VERSION}"
-"${UV}" venv --python "${DYNAMO_PYTHON_VERSION}" /opt/dynamo_venv
-"${UV}" pip install --python /opt/dynamo_venv/bin/python \
-  "ai-dynamo[vllm] @ git+https://github.com/ai-dynamo/dynamo.git@${DYNAMO_COMMIT}"
-export DYNAMO_COMMIT
-/opt/dynamo_venv/bin/python -c \
-  'import importlib.metadata as m,json,os; d=m.distribution("ai-dynamo"); u=json.loads(d.read_text("direct_url.json")); assert u["vcs_info"]["commit_id"] == os.environ["DYNAMO_COMMIT"]; print("ai-dynamo", d.version, u["vcs_info"]["commit_id"])'
+export CARGO_TARGET_DIR=${ROOT}/cache/dynamo-cargo-target
+DYNAMO_COMMIT="${DYNAMO_COMMIT}" \
+DYNAMO_PYTHON_VERSION="${DYNAMO_PYTHON_VERSION}" \
+UV_BIN="${UV}" \
+  /opt/nemo-rl/docker/install-dynamo-source.sh
 
 curl --fail --location --retry 3 \
   "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \

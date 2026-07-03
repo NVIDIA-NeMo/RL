@@ -17,11 +17,13 @@ RUN test "${TARGETARCH}" = "amd64"
 # Keep Dynamo/vLLM's Python 3.12 solve separate from NeMo-RL's Python 3.13
 # environments. Install from the exact Dynamo revision that contains native
 # unpaused NeMo-RL refit support; do not mix an older wheel with a file overlay.
-RUN UV_PYTHON_INSTALL_DIR=/opt/uv-python uv python install "${DYNAMO_PYTHON_VERSION}" && \
-    UV_PYTHON_INSTALL_DIR=/opt/uv-python uv venv \
-      --python "${DYNAMO_PYTHON_VERSION}" /opt/dynamo_venv && \
-    uv pip install --python /opt/dynamo_venv/bin/python \
-      "ai-dynamo[vllm] @ git+https://github.com/ai-dynamo/dynamo.git@${DYNAMO_COMMIT}"
+COPY docker/install-dynamo-source.sh /tmp/install-dynamo-source.sh
+RUN UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    UV_BIN=uv \
+    DYNAMO_COMMIT="${DYNAMO_COMMIT}" \
+    DYNAMO_PYTHON_VERSION="${DYNAMO_PYTHON_VERSION}" \
+    /tmp/install-dynamo-source.sh && \
+    rm -f /tmp/install-dynamo-source.sh
 
 RUN curl --fail --location --retry 3 \
       "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \
