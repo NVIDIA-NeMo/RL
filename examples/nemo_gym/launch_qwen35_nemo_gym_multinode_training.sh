@@ -14,7 +14,11 @@
 
 set -euo pipefail
 # Qwen 3.5-specific NeMo-Gym launcher. The container is expected to be built
-# from this branch, so no runtime source overlays are mounted.
+# from this branch. By default the host checkout's source dirs (nemo_rl/,
+# examples/, qwen_35/) are overlay-mounted over the baked container checkout so
+# local fixes take effect without an image rebuild; dependency layers
+# (pyproject.toml, uv.lock, venvs, patched 3rdparty Gym) stay baked. Set
+# NRL_SOURCE_OVERLAY=0 to run the baked sources only.
 # ----- PARAMETERS -----
 # Optional: WANDB_API_KEY, HF_TOKEN
 # Required: EXP_NAME, GPUS_PER_NODE, HF_CKPT_PATH, NEMO_GYM_SWE_TRAIN_DATA_PATH,
@@ -219,6 +223,16 @@ MOUNTS="${MOUNTS},${NEMO_GYM_SWE_SIF_DIR}:${CONTAINER_NEMO_GYM_SWE_SIF_DIR}"
 # Compatibility mount for configs that pass host-side sif_dir or include
 # absolute host-side container_formatter entries.
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_SIF_DIR}:${NEMO_GYM_SWE_SIF_DIR}"
+# Source overlay: mount the host checkout's source dirs over the baked
+# container checkout so local fixes take effect without an image rebuild.
+# 3rdparty/ is intentionally NOT overlaid (the image applies Gym patches at
+# build time that the host submodule checkout does not have).
+NRL_SOURCE_OVERLAY="${NRL_SOURCE_OVERLAY:-1}"
+if [[ "${NRL_SOURCE_OVERLAY}" == "1" ]]; then
+    for overlay_dir in nemo_rl examples qwen_35; do
+        MOUNTS="${MOUNTS},${REPO_LOCATION}/${overlay_dir}:${CONTAINER_REPO_LOCATION}/${overlay_dir}"
+    done
+fi
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
 fi
