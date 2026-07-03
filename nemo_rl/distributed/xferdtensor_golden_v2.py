@@ -1,4 +1,4 @@
-"""Performant DTensor resharding: point-to-point re-partition + sub-comm broadcast.
+"""Performant DTensor resharding with split NCCL sub-communicators.
 
 This module is intentionally **self-contained** so it can be dropped into
 another codebase as a single file.  Its only dependencies are ``torch`` and
@@ -7,7 +7,7 @@ same communicator a ``StatelessProcessGroup`` already wraps).
 
 Public API
 ----------
-``xferdtensor_golden_v2(src_tensor, src_mesh, src_placement,
+``xferdtensor_golden_perf(src_tensor, src_mesh, src_placement,
                           dst_tensor, dst_mesh, dst_placement, process_group)``
 
 Same 7-argument signature and effect as the broadcast-based reference
@@ -35,16 +35,19 @@ Duck-typed interfaces (so it works across separate ``torch.distributed`` worlds)
   * ``src_tensor`` / ``dst_tensor`` — expose ``.shape`` (global shape) and
     ``._local_tensor`` (this rank's contiguous local shard); may be ``None``
     when this rank is dst-only / src-only.
-  * ``process_group`` — exposes ``.rank`` and ``.nccl_communicator`` (an
-    nccl4py ``Communicator`` with ``.send`` / ``.recv`` / ``.split`` /
-    ``.broadcast``).
+  * ``process_group`` — exposes ``.rank`` and ``.nccl_communicator``.  The
+    communicator must provide ``.send`` / ``.recv`` / ``.split`` /
+    ``.broadcast``.
 """
 
+import weakref
 from collections import OrderedDict
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
-from torch.distributed._tensor import Shard
+from torch.distributed._tensor import Replicate, Shard
+
 
 # =========================================================================
 # Mesh / shard geometry helpers (self-contained copies)
@@ -73,6 +76,19 @@ def _get_tensor_meta(src_tensor, dst_tensor):
     return None, device
 
 
+def _local_tensor(tensor):
+    """Return a tensor-like object's local tensor without requiring DTensor."""
+    if tensor is None:
+        return None
+    local = getattr(tensor, "_local_tensor", None)
+    if local is not None:
+        return local
+    to_local = getattr(tensor, "to_local", None)
+    if callable(to_local):
+        return to_local()
+    raise ValueError("tensor does not expose `._local_tensor` or `.to_local()`.")
+
+
 def _get_mesh_coords(mesh, rank):
     mesh_tensor = _mesh_rank_tensor(mesh)
     coords = (mesh_tensor == rank).nonzero(as_tuple=False)
@@ -84,47 +100,63 @@ def _get_mesh_coords(mesh, rank):
 def _compute_shard_slices(global_shape, mesh_shape, mesh_coords, placements):
     """Slices of the global tensor owned by ``mesh_coords`` under ``placements``.
 
-    Mirrors DTensor's even-sharding split: a tensor dim sharded over one or
-    more mesh dims is cut into ``prod(mesh sizes)`` contiguous chunks (the
-    first ``remainder`` chunks get one extra element).
+    Mirrors DTensor's sequential sharding semantics.  This distinction matters
+    when more than one mesh dimension shards the same tensor dimension and the
+    global size is uneven: DTensor shards the first local chunk again, rather
+    than treating the mesh dimensions as one flattened even split.
     """
     slices = [slice(None) for _ in range(len(global_shape))]
-    shard_map = {}
+    shard_map = OrderedDict()
     for mesh_dim, placement in enumerate(placements):
         if isinstance(placement, Shard):
-            shard_map.setdefault(placement.dim, []).append(
+            tensor_dim = _normalize_shard_dim(placement.dim, len(global_shape))
+            shard_map.setdefault(tensor_dim, []).append(
                 (mesh_dim, mesh_shape[mesh_dim], mesh_coords[mesh_dim])
             )
 
     for tensor_dim, shard_info in shard_map.items():
-        shard_info.sort(key=lambda item: item[0])
-        num_chunks = 1
-        for _, size, _ in shard_info:
-            num_chunks *= size
-
-        total_size = int(global_shape[tensor_dim])
-        base = total_size // num_chunks
-        remainder = total_size % num_chunks
-        sizes = [base + 1 if i < remainder else base for i in range(num_chunks)]
-
-        strides = []
-        running = 1
-        for _, size, _ in reversed(shard_info):
-            strides.append(running)
-            running *= size
-        strides.reverse()
-
-        linear_index = 0
-        for (mesh_dim, size, coord), stride in zip(shard_info, strides):
+        start = 0
+        local_size = int(global_shape[tensor_dim])
+        for mesh_dim, size, coord in shard_info:
             if coord >= size:
                 raise ValueError(f"Invalid mesh coord {coord} for mesh dim {mesh_dim}.")
-            linear_index += coord * stride
-
-        start = sum(sizes[:linear_index])
-        end = start + sizes[linear_index]
-        slices[tensor_dim] = slice(start, end)
+            base, remainder = divmod(local_size, size)
+            relative_start = coord * base + min(coord, remainder)
+            local_size = base + int(coord < remainder)
+            start += relative_start
+        slices[tensor_dim] = slice(start, start + local_size)
 
     return slices
+
+
+def _normalize_shard_dim(dim, tensor_ndim):
+    normalized = dim + tensor_ndim if dim < 0 else dim
+    if normalized < 0 or normalized >= tensor_ndim:
+        raise ValueError(f"Shard dim {dim} is invalid for a {tensor_ndim}D tensor.")
+    return normalized
+
+
+def _validate_geometry(mesh, placements, global_shape, name):
+    mesh_tensor = _mesh_rank_tensor(mesh)
+    if len(placements) != mesh_tensor.ndim:
+        raise ValueError(
+            f"{name}_placement has {len(placements)} entries for a "
+            f"{mesh_tensor.ndim}D mesh."
+        )
+    ndim = len(global_shape)
+    for placement in placements:
+        if not isinstance(placement, (Shard, Replicate)):
+            raise NotImplementedError(
+                "xferdtensor_golden_perf supports only Shard and Replicate "
+                f"placements, got {type(placement).__name__}."
+            )
+        if isinstance(placement, Shard):
+            try:
+                _normalize_shard_dim(placement.dim, ndim)
+            except ValueError as error:
+                raise ValueError(
+                    f"{name} Shard dim {placement.dim} is invalid for a {ndim}D tensor."
+                ) from error
 
 
 def _shard_region(mesh, placement, global_shape, rank):
@@ -204,6 +236,10 @@ def _build_transfer_plan(src_region, dst_region, src_ranks):
             overlap = _intersect_regions(sreg, dreg)
             if overlap is None:
                 continue
+            # Match ``DTensor.full_tensor()`` / golden semantics exactly when a
+            # caller accidentally supplies inconsistent Replicate values: use
+            # the canonical lowest-ranked holder, unless the destination itself
+            # already owns a local copy.
             holder = rep if rep in holders else holders[0]
             phase0.append((holder, rep, overlap))
     phase0.sort(key=lambda t: (t[0], t[1], t[2]))
@@ -220,6 +256,12 @@ def _build_source_plan(src_region, dst_region, src_ranks):
       * ``consumers_of``   — ``{holder rank -> sorted[dst_ranks it feeds]}``
       * ``active_holders`` — sorted holders that feed >= 1 destination rank
     """
+    # A rank can join only one color in ncclCommSplit.  On overlapping meshes a
+    # rank may simultaneously be a holder and a consumer of another holder, so
+    # use the fully general fallback instead of constructing an invalid split.
+    if set(src_ranks).intersection(dst_region):
+        return None
+
     region_holders = OrderedDict()
     for r in src_ranks:
         region_holders.setdefault(src_region[r], []).append(r)
@@ -228,6 +270,9 @@ def _build_source_plan(src_region, dst_region, src_ranks):
 
     holder_of = {}
     consumers_of = OrderedDict()
+    holder_for_region = {
+        region: holders[0] for region, holders in region_holders.items()
+    }
     for q in sorted(dst_region):
         dreg = dst_region[q]
         overlapping = [
@@ -237,7 +282,7 @@ def _build_source_plan(src_region, dst_region, src_ranks):
         ]
         if len(overlapping) != 1:
             return None  # multi-source destination region -> not eligible
-        holder = region_holders[overlapping[0]][0]
+        holder = holder_for_region[overlapping[0]]
         holder_of[q] = holder
         consumers_of.setdefault(holder, []).append(q)
     for h in consumers_of:
@@ -250,27 +295,31 @@ def _build_source_plan(src_region, dst_region, src_ranks):
 # placements, global shape) — never the tensor data — so it is identical on
 # every pass of a refit loop.  Cache it so repeated reshards of the same shape
 # skip the per-rank ``.nonzero()`` mesh lookups and region intersection.
-_PLAN_CACHE = {}
+_PLAN_CACHE = OrderedDict()
+_PLAN_CACHE_MAX_SIZE = 1024
 # Sub-communicators (created by ncclCommSplit).  Creating them is collective and
 # not free, so cache them.  ``_SUBCOMM_CACHE`` holds the DP-replica sub-comms
 # (two-stage fallback); ``_SRC_SUBCOMM_CACHE`` holds the source-holder sub-comms
-# (single-round fast path).  Both keyed WITHOUT shape (grouping is shape-free).
+# (single-round fast path).  Keys include exact rank-membership signatures, so
+# shapes with the same grouping reuse communicators while zero/uneven shapes
+# that change grouping cannot collide.
 _SUBCOMM_CACHE = {}
 _SRC_SUBCOMM_CACHE = {}
-# One reusable side stream per device for the batched 2-stream pipeline.
-_SIDE_STREAM = {}
+# Sub-communicators must not keep transient PP process groups alive forever.
+# A weak finalizer evicts every cache entry owned by a process group when the
+# wrapper dies, avoiding communicator-pool exhaustion in long-running jobs.
+_PROCESS_GROUP_COMM_IDS = {}
+_PROCESS_GROUP_FINALIZERS = {}
 
 
-def _side_stream(device):
-    s = _SIDE_STREAM.get(device)
-    if s is None:
-        s = torch.cuda.Stream(device=device)
-        _SIDE_STREAM[device] = s
-    return s
-
-
-def _placement_sig(placement):
-    return tuple((type(p).__name__, getattr(p, "dim", None)) for p in placement)
+def _placement_sig(placement, tensor_ndim=None):
+    signature = []
+    for item in placement:
+        dim = getattr(item, "dim", None)
+        if isinstance(item, Shard) and tensor_ndim is not None:
+            dim = _normalize_shard_dim(dim, tensor_ndim)
+        signature.append((type(item).__name__, dim))
+    return tuple(signature)
 
 
 def _mesh_sig(mesh):
@@ -288,7 +337,7 @@ def _mesh_sig(mesh):
 
 
 def _plan_geometry(src_mesh, src_placement, dst_mesh, dst_placement, global_shape):
-    """Return ``(src_region, dst_region, phase0, source_plan)`` for this geometry, computing it once and caching by a data-independent signature.
+    """Return cached split-mode plans for this geometry.
 
     ``source_plan`` is the single-round source-broadcast plan (see
     ``_build_source_plan``) when eligible, else ``None`` (use the two-stage
@@ -296,14 +345,17 @@ def _plan_geometry(src_mesh, src_placement, dst_mesh, dst_placement, global_shap
     """
     key = (
         _mesh_sig(src_mesh),
-        _placement_sig(src_placement),
+        _placement_sig(src_placement, len(global_shape)),
         _mesh_sig(dst_mesh),
-        _placement_sig(dst_placement),
+        _placement_sig(dst_placement, len(global_shape)),
         tuple(int(d) for d in global_shape),
     )
     cached = _PLAN_CACHE.get(key)
     if cached is not None:
+        _PLAN_CACHE.move_to_end(key)
         return cached
+    _validate_geometry(src_mesh, src_placement, global_shape, "src")
+    _validate_geometry(dst_mesh, dst_placement, global_shape, "dst")
     src_ranks = _flatten_mesh_ranks(src_mesh)
     dst_ranks = _flatten_mesh_ranks(dst_mesh)
     src_region = {
@@ -316,7 +368,79 @@ def _plan_geometry(src_mesh, src_placement, dst_mesh, dst_placement, global_shap
     source_plan = _build_source_plan(src_region, dst_region, src_ranks)
     result = (src_region, dst_region, phase0, source_plan)
     _PLAN_CACHE[key] = result
+    if len(_PLAN_CACHE) > _PLAN_CACHE_MAX_SIZE:
+        _PLAN_CACHE.popitem(last=False)
     return result
+
+
+def _evict_comm_ids(comm_ids):
+    comm_ids = set(comm_ids)
+    for cache in (_SUBCOMM_CACHE, _SRC_SUBCOMM_CACHE):
+        for key in list(cache):
+            if key[0] in comm_ids:
+                del cache[key]
+
+
+def _finalize_process_group(process_group_id):
+    comm_ids = _PROCESS_GROUP_COMM_IDS.pop(process_group_id, ())
+    _evict_comm_ids(comm_ids)
+    _PROCESS_GROUP_FINALIZERS.pop(process_group_id, None)
+
+
+def _parent_comm_key(process_group):
+    comm = process_group.nccl_communicator
+    comm_id = id(comm)
+    process_group_id = id(process_group)
+    _PROCESS_GROUP_COMM_IDS.setdefault(process_group_id, set()).add(comm_id)
+    if process_group_id not in _PROCESS_GROUP_FINALIZERS:
+        try:
+            _PROCESS_GROUP_FINALIZERS[process_group_id] = weakref.finalize(
+                process_group, _finalize_process_group, process_group_id
+            )
+        except TypeError:
+            # Extension wrappers without weakref support are uncommon.  They
+            # can still be released explicitly with the public cache clearer.
+            pass
+    return comm_id
+
+
+def clear_xferdtensor_golden_perf_caches(process_group=None):
+    """Release cached plans/sub-communicators after outstanding work completes.
+
+    With ``process_group`` only communicator caches owned by that group are
+    evicted.  With no argument all geometry and communicator caches are reset.
+    Callers must ensure no operation using those sub-communicators is in flight.
+    """
+    if process_group is None:
+        _PLAN_CACHE.clear()
+        _SUBCOMM_CACHE.clear()
+        _SRC_SUBCOMM_CACHE.clear()
+        for finalizer in _PROCESS_GROUP_FINALIZERS.values():
+            finalizer.detach()
+        _PROCESS_GROUP_FINALIZERS.clear()
+        _PROCESS_GROUP_COMM_IDS.clear()
+        return
+
+    process_group_id = id(process_group)
+    comm_ids = _PROCESS_GROUP_COMM_IDS.pop(process_group_id, set())
+    comm = getattr(process_group, "nccl_communicator", None)
+    if comm is not None:
+        comm_ids.add(id(comm))
+    _evict_comm_ids(comm_ids)
+    finalizer = _PROCESS_GROUP_FINALIZERS.pop(process_group_id, None)
+    if finalizer is not None:
+        finalizer.detach()
+
+
+def _replica_membership_sig(dst_region):
+    return tuple(tuple(members) for members in _dst_replica_groups(dst_region).values())
+
+
+def _source_membership_sig(source_plan):
+    _holder_of, consumers_of, _active_holders = source_plan
+    return tuple(
+        (holder, tuple(consumers)) for holder, consumers in consumers_of.items()
+    )
 
 
 def _get_replica_subcomm(process_group, dst_mesh, dst_placement, global_shape):
@@ -338,18 +462,19 @@ def _get_replica_subcomm(process_group, dst_mesh, dst_placement, global_shape):
     # parameter with the same placement reuses one sub-comm.  This collapses
     # hundreds of per-shape splits into a handful (avoids exhausting NCCL's
     # communicator pool) and skips redundant collective splits.
-    key = (
-        id(comm),
-        _mesh_sig(dst_mesh),
-        _placement_sig(dst_placement),
-    )
-    if key in _SUBCOMM_CACHE:
-        return _SUBCOMM_CACHE[key]
-
     dst_region = {
         r: _shard_region(dst_mesh, dst_placement, global_shape, r)
         for r in _flatten_mesh_ranks(dst_mesh)
     }
+    key = (
+        _parent_comm_key(process_group),
+        _mesh_sig(dst_mesh),
+        _placement_sig(dst_placement, len(global_shape)),
+        _replica_membership_sig(dst_region),
+    )
+    if key in _SUBCOMM_CACHE:
+        return _SUBCOMM_CACHE[key]
+
     groups = _dst_replica_groups(dst_region)
     multi = sorted(reg for reg, members in groups.items() if len(members) > 1)
     if not multi:
@@ -371,7 +496,13 @@ def _get_replica_subcomm(process_group, dst_mesh, dst_placement, global_shape):
 
 
 def _get_source_subcomm(
-    process_group, src_mesh, src_placement, dst_mesh, dst_placement, source_plan
+    process_group,
+    src_mesh,
+    src_placement,
+    dst_mesh,
+    dst_placement,
+    source_plan,
+    global_shape,
 ):
     """Collectively split into one sub-comm per active *source holder* — each holding {the holder} ∪ {every destination rank that consumes its shard}, with the holder (lowest rank) as sub-rank 0 (the broadcast root).  Returns THIS rank's sub-comm, or ``None`` if it is idle (a duplicate source replica).
 
@@ -382,11 +513,12 @@ def _get_source_subcomm(
     comm = process_group.nccl_communicator
     rank = process_group.rank
     key = (
-        id(comm),
+        _parent_comm_key(process_group),
         _mesh_sig(src_mesh),
-        _placement_sig(src_placement),
+        _placement_sig(src_placement, len(global_shape)),
         _mesh_sig(dst_mesh),
-        _placement_sig(dst_placement),
+        _placement_sig(dst_placement, len(global_shape)),
+        _source_membership_sig(source_plan),
     )
     if key in _SRC_SUBCOMM_CACHE:
         return _SRC_SUBCOMM_CACHE[key]
@@ -423,17 +555,13 @@ def _source_prepare(
     holder_of, consumers_of, _ = source_plan
     if rank in consumers_of:
         # Active holder: broadcast our whole source shard to all consumers.
-        return src_tensor._local_tensor, None
+        return _local_tensor(src_tensor), None
     # Consumer: receive the holder's shard into a temp, then slice out our region.
     holder = holder_of[rank]
     h_region = src_region[holder]
     size = tuple(hi - lo for lo, hi in h_region)
     temp = torch.empty(size, device=device, dtype=dtype)
-    dst_local = (
-        dst_tensor._local_tensor
-        if hasattr(dst_tensor, "_local_tensor")
-        else dst_tensor.to_local()
-    )
+    dst_local = _local_tensor(dst_tensor)
     src_slice = _local_slices(dst_region[rank], h_region)
     return temp, (dst_local, temp, src_slice)
 
@@ -457,10 +585,8 @@ def xferdtensor_golden_v2(
 
     Drop-in replacement for ``xferdtensor_golden`` with the same 7-argument
     signature and effect, but only the overlapping regions between source and
-    destination shards move (no full-tensor broadcast).  Both communication
-    paths are NCCL collectives (bandwidth-optimal), adapting the C++
-    ``nccl-reshard`` idea (source broadcast + replication) to Python by
-    delegating the topology-aware pipelining to NCCL's own ``ncclBroadcast``.
+    destination shards move (no full-tensor broadcast).  Sub-communicators are
+    created with ``ncclCommSplit`` and reused across calls.
 
     * **Fast path (destination finer than source — the common refit case):**
       every destination region comes from one source shard, so each source
@@ -472,7 +598,6 @@ def xferdtensor_golden_v2(
       region to its representative replica via batched point-to-point, then (2)
       a per-replica-group sub-comm ``ncclBroadcast`` fans it out to the DP
       replicas.
-
     Plans and sub-communicators are pure geometry, cached by shape/placement,
     so a refit loop pays planning + split cost only once.
     """
@@ -485,149 +610,66 @@ def xferdtensor_golden_v2(
     sint = int(stream.cuda_stream)
     dtype = src_tensor.dtype if src_tensor is not None else dst_tensor.dtype
 
-    src_region, dst_region, phase0, source_plan = _plan_geometry(
+    src_region, dst_region, _phase0, source_plan = _plan_geometry(
         src_mesh, src_placement, dst_mesh, dst_placement, global_shape
     )
 
     if source_plan is not None:
         # Fast path: one source-holder broadcast per group (split is collective).
         sub = _get_source_subcomm(
-            process_group, src_mesh, src_placement, dst_mesh, dst_placement, source_plan
-        )
-        buf, extract = _source_prepare(
-            rank,
-            sub,
-            src_tensor,
-            dst_tensor,
-            src_region,
-            dst_region,
+            process_group,
+            src_mesh,
+            src_placement,
+            dst_mesh,
+            dst_placement,
             source_plan,
-            device,
-            dtype,
+            global_shape,
         )
-        if buf is not None:
-            sub.broadcast(sendbuf=buf, recvbuf=buf, root=0, stream=sint)
-        if extract is not None:
-            dst_local, temp, src_slice = extract
-            dst_local.copy_(temp[src_slice])
+        with torch.cuda.stream(stream):
+            buf, extract = _source_prepare(
+                rank,
+                sub,
+                src_tensor,
+                dst_tensor,
+                src_region,
+                dst_region,
+                source_plan,
+                device,
+                dtype,
+            )
+            if buf is not None:
+                sub.broadcast(sendbuf=buf, recvbuf=buf, root=0, stream=sint)
+            if extract is not None:
+                dst_local, temp, src_slice = extract
+                dst_local.copy_(temp[src_slice])
         return
 
     # General fallback: cross-mesh P2P re-partition + replica sub-comm broadcast.
     sub = _get_replica_subcomm(process_group, dst_mesh, dst_placement, global_shape)
     sends, recvs, dst_local = _plan_and_stage(
-        rank, src_tensor, src_mesh, src_placement, dst_tensor, dst_mesh, dst_placement
+        rank,
+        src_tensor,
+        src_mesh,
+        src_placement,
+        dst_tensor,
+        dst_mesh,
+        dst_placement,
+        stream=stream,
     )
-    _exchange_p2p(process_group.nccl_communicator, sends, recvs, sint)
+    _exchange_p2p(process_group.nccl_communicator, sends, recvs, stream)
     if sub is not None and dst_local is not None:
         sub.broadcast(sendbuf=dst_local, recvbuf=dst_local, root=0, stream=sint)
 
 
-def xferdtensor_golden_v2_batched(transfers, process_group, stream=None):
-    """Reshard many tensors with a 2-stream pipeline that overlaps the cross-mesh transfer with the sub-comm broadcasts.
-
-    ``transfers`` is an iterable of 6-tuples
-    ``(src_tensor, src_mesh, src_placement, dst_tensor, dst_mesh, dst_placement)``
-    — the same per-tensor arguments as :func:`xferdtensor_golden_v2`.
-
-    Resharding many small parameters one at a time leaves the GPU/NICs idle
-    between latency-bound collectives.  This pipelines across parameters on two
-    CUDA streams to hide that latency:
-
-      * **Stream A** runs the cross-mesh point-to-point re-partition (on the
-        *global* communicator).
-      * **Stream B** runs every sub-communicator ``ncclBroadcast`` (source
-        fast-path + replica replication).
-
-    A CUDA event enforces each fallback param's stage-1→stage-2 dependency, so
-    param N's replica broadcast (B) overlaps param N+1's cross-mesh P2P (A), and
-    fast-path source broadcasts (B) overlap expert stage-1 (A).
-
-    NCCL safety: each communicator's operations stay on exactly ONE stream
-    (global→A, all sub-comms→B), so there is never a concurrent same-comm use —
-    avoiding the classic multi-stream deadlock.  Every rank must pass
-    ``transfers`` in the same order so posting order matches across ranks.
-    """
-    import nccl.core as _nccl_core
-
-    rank = process_group.rank
-    comm = process_group.nccl_communicator
-    if stream is None:
-        stream = torch.cuda.current_stream()
-    stream_a = stream  # cross-mesh P2P (global comm)
-    stream_b = _side_stream(stream.device)  # sub-comm broadcasts
-    sa = int(stream_a.cuda_stream)
-    sb = int(stream_b.cuda_stream)
-
-    keepalive = []  # send/recv buffers must outlive the async NCCL ops
-    extracts = []  # (dst_local, temp, slice) fast-path consumer copies (on B)
-    used_b = False
-    for st, sm, sp, dt, dm, dp in transfers:
-        global_shape, device = _get_tensor_meta(st, dt)
-        if global_shape is None:
-            raise ValueError(
-                "Unable to infer tensor shape/device from src or dst tensor."
-            )
-        dtype = st.dtype if st is not None else dt.dtype
-        src_region, dst_region, phase0, source_plan = _plan_geometry(
-            sm, sp, dm, dp, global_shape
-        )
-
-        if source_plan is not None:
-            # Fast path: one source-holder broadcast, on stream B (no A dep).
-            sub = _get_source_subcomm(process_group, sm, sp, dm, dp, source_plan)
-            buf, extract = _source_prepare(
-                rank, sub, st, dt, src_region, dst_region, source_plan, device, dtype
-            )
-            if buf is not None:
-                sub.broadcast(sendbuf=buf, recvbuf=buf, root=0, stream=sb)
-                keepalive.append(buf)
-                used_b = True
-            if extract is not None:
-                extracts.append(extract)
-            continue
-
-        # Fallback: cross-mesh P2P on A, then replica broadcast on B (after A).
-        sub = _get_replica_subcomm(process_group, dm, dp, global_shape)
-        sends, recvs, dst_local = _plan_and_stage(rank, st, sm, sp, dt, dm, dp)
-        if sends or recvs:
-            keepalive.append((sends, recvs))
-            _nccl_core.group_start()
-            try:
-                for peer, b in sends:
-                    comm.send(b, peer, stream=sa)
-                for peer, b, _ in recvs:
-                    comm.recv(b, peer, stream=sa)
-            finally:
-                _nccl_core.group_end()
-            # Scatter staged (strided) receives into their views, on A.
-            with torch.cuda.stream(stream_a):
-                for _, b, dst_view in recvs:
-                    if dst_view is not None:
-                        dst_view.copy_(b)
-        if sub is not None and dst_local is not None:
-            # B replicates this param only after A finished its cross-mesh recv.
-            ev = torch.cuda.Event()
-            ev.record(stream_a)
-            stream_b.wait_event(ev)
-            sub.broadcast(sendbuf=dst_local, recvbuf=dst_local, root=0, stream=sb)
-            used_b = True
-
-    # Fast-path consumers slice their region out of the received holder shard (B).
-    if extracts:
-        with torch.cuda.stream(stream_b):
-            for dst_local, temp, src_slice in extracts:
-                dst_local.copy_(temp[src_slice])
-    # Make the caller's stream (A) wait for all of B's work.
-    if used_b:
-        ev = torch.cuda.Event()
-        ev.record(stream_b)
-        stream_a.wait_event(ev)
-    # ``keepalive`` holds NCCL buffers until the caller's stream is joined above.
-    del keepalive
-
-
 def _plan_and_stage(
-    rank, src_tensor, src_mesh, src_placement, dst_tensor, dst_mesh, dst_placement
+    rank,
+    src_tensor,
+    src_mesh,
+    src_placement,
+    dst_tensor,
+    dst_mesh,
+    dst_placement,
+    stream=None,
 ):
     """Compute this rank's cross-mesh (stage-0) plan, do local copies immediately, and return ``(sends, recvs, dst_local)``.
 
@@ -646,48 +688,49 @@ def _plan_and_stage(
         src_mesh, src_placement, dst_mesh, dst_placement, global_shape
     )
 
-    src_local = src_tensor._local_tensor if src_tensor is not None else None
-    if dst_tensor is not None:
-        dst_local = (
-            dst_tensor._local_tensor
-            if hasattr(dst_tensor, "_local_tensor")
-            else dst_tensor.to_local()
-        )
-    else:
-        dst_local = None
+    src_local = _local_tensor(src_tensor)
+    dst_local = _local_tensor(dst_tensor)
     my_src_region = src_region.get(rank)
     my_dst_region = dst_region.get(rank)
 
     sends, recvs = [], []
-    for holder, rep, overlap in phase0:
-        if holder == rep:
-            # Colocated (src holder is also the destination rep): local copy.
-            if rank == holder:
-                ssl = _local_slices(overlap, my_src_region)
-                dsl = _local_slices(overlap, my_dst_region)
-                dst_local[dsl].copy_(src_local[ssl])
-            continue
-        if holder == rank:
-            view = src_local[_local_slices(overlap, my_src_region)]
-            sends.append((rep, view if view.is_contiguous() else view.contiguous()))
-        elif rep == rank:
-            dst_view = dst_local[_local_slices(overlap, my_dst_region)]
-            if dst_view.is_contiguous():
-                recvs.append((holder, dst_view, None))
-            else:
-                size = tuple(hi - lo for lo, hi in overlap)
-                recvs.append(
-                    (holder, torch.empty(size, device=device, dtype=dtype), dst_view)
-                )
+    context = torch.cuda.stream(stream) if stream is not None else nullcontext()
+    with context:
+        for holder, rep, overlap in phase0:
+            if holder == rep:
+                # Colocated (src holder is also the destination rank): local copy.
+                if rank == holder:
+                    ssl = _local_slices(overlap, my_src_region)
+                    dsl = _local_slices(overlap, my_dst_region)
+                    dst_local[dsl].copy_(src_local[ssl])
+                continue
+            if holder == rank:
+                view = src_local[_local_slices(overlap, my_src_region)]
+                buf = view if view.is_contiguous() else view.contiguous()
+                sends.append((rep, buf))
+            elif rep == rank:
+                dst_view = dst_local[_local_slices(overlap, my_dst_region)]
+                if dst_view.is_contiguous():
+                    recvs.append((holder, dst_view, None))
+                else:
+                    size = tuple(hi - lo for lo, hi in overlap)
+                    recvs.append(
+                        (
+                            holder,
+                            torch.empty(size, device=device, dtype=dtype),
+                            dst_view,
+                        )
+                    )
     return sends, recvs, dst_local
 
 
-def _exchange_p2p(comm, sends, recvs, sint):
+def _exchange_p2p(comm, sends, recvs, stream):
     """Issue all cross-mesh sends/recvs in one ncclGroupStart/End, then scatter staged (strided) receives into their destination views."""
     if not sends and not recvs:
         return
     import nccl.core as _nccl_core
 
+    sint = int(stream.cuda_stream)
     _nccl_core.group_start()
     try:
         for peer, buf in sends:
@@ -696,6 +739,7 @@ def _exchange_p2p(comm, sends, recvs, sint):
             comm.recv(buf, peer, stream=sint)
     finally:
         _nccl_core.group_end()
-    for _, buf, dst_view in recvs:
-        if dst_view is not None:
-            dst_view.copy_(buf)
+    with torch.cuda.stream(stream):
+        for _, buf, dst_view in recvs:
+            if dst_view is not None:
+                dst_view.copy_(buf)
