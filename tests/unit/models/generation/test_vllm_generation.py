@@ -1901,6 +1901,40 @@ def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
     assert result == [100, 2, 77, 88]
 
 
+def test_replace_prefix_tokens_repairs_qwen_suffix_messages():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=[10, 11, 2],
+        # Rendering the assistant prefix alone changed token 11 to token 99.
+        template_prefix_token_ids=[10, 99, 2],
+        # Two messages follow that assistant turn, then the generation marker.
+        template_token_ids=[10, 11, 2, 20, 2, 30, 2, 40],
+        suffix_message_count=2,
+    )
+
+    assert result == [10, 11, 2, 20, 2, 30, 2, 40]
+
+
+def test_replace_prefix_tokens_keeps_strict_failure_without_suffix_context():
+    class _T:
+        eos_token_id = 2
+
+        def decode(self, token_ids):
+            return str(token_ids)
+
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
+            tokenizer=_T(),
+            model_prefix_token_ids=[10, 11, 2],
+            template_prefix_token_ids=[10, 99, 2],
+            template_token_ids=[10, 11, 2],
+        )
+
+
 @pytest.mark.asyncio
 async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     cluster, tokenizer

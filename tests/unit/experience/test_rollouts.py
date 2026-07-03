@@ -40,7 +40,9 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
+    _NEMO_RL_VALIDATION_REQUEST_TYPE,
     _calculate_single_metric,
+    _set_nemo_rl_request_type,
     generate_responses_async,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -66,6 +68,42 @@ from tests.unit.test_envs import (
 )
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+
+
+def test_set_nemo_rl_request_type_preserves_template_metadata():
+    params = {
+        "metadata": {
+            "chat_template_kwargs": json.dumps({"enable_thinking": False}),
+            "trace_id": "abc",
+        }
+    }
+
+    _set_nemo_rl_request_type(params, _NEMO_RL_VALIDATION_REQUEST_TYPE)
+
+    assert params["metadata"]["trace_id"] == "abc"
+    assert json.loads(params["metadata"]["chat_template_kwargs"]) == {
+        "enable_thinking": False,
+        "_nemo_rl_request_type": "validation",
+    }
+
+
+def test_set_nemo_rl_request_type_clears_stale_marker():
+    params = {
+        "metadata": {
+            "chat_template_kwargs": json.dumps(
+                {
+                    "enable_thinking": False,
+                    "_nemo_rl_request_type": "validation",
+                }
+            )
+        }
+    }
+
+    _set_nemo_rl_request_type(params, None)
+
+    assert json.loads(params["metadata"]["chat_template_kwargs"]) == {
+        "enable_thinking": False
+    }
 
 
 class TestCalculateSingleMetric:

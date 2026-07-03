@@ -90,15 +90,27 @@ require_path "NEMO_GYM_SWE_VALIDATION_DATA_PATH" "file" "This JSONL is mounted a
 require_path "NEMO_GYM_SWE_SIF_DIR" "dir" "This directory is mounted as the SWE task SIF directory inside the container."
 NEMO_GYM_SWE_TRAIN_DATA_DIR="$(dirname "${NEMO_GYM_SWE_TRAIN_DATA_PATH}")"
 NEMO_GYM_SWE_VALIDATION_DATA_DIR="$(dirname "${NEMO_GYM_SWE_VALIDATION_DATA_PATH}")"
-if ! [[ "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Error: GPUS_PER_NODE must be a positive integer." >&2
-    echo "  Current value: ${GPUS_PER_NODE}" >&2
-    exit 1
-fi
+require_positive_integer() {
+    local name="$1"
+    local value="${!name}"
+    if ! [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: ${name} must be a positive integer; got '${value}'." >&2
+        exit 1
+    fi
+}
+
+require_positive_integer GPUS_PER_NODE
 
 TRAIN_NODES="${TRAIN_NODES:-32}"
 GEN_NODES="${GEN_NODES:-32}"
 NODES="${NODES:-$((TRAIN_NODES + GEN_NODES))}"
+require_positive_integer TRAIN_NODES
+require_positive_integer GEN_NODES
+require_positive_integer NODES
+if (( NODES <= GEN_NODES )); then
+    echo "Error: NODES (${NODES}) must exceed GEN_NODES (${GEN_NODES})." >&2
+    exit 1
+fi
 CONTAINER_REPO_LOCATION="${CONTAINER_REPO_LOCATION:-/opt/nemo-rl}"
 RECIPE="${RECIPE:-qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml}"
 CONTAINER_INPUT_ROOT="${CONTAINER_INPUT_ROOT:-/inputs/nemo_gym}"
@@ -119,6 +131,13 @@ MLPERF_SUBMISSION_PLATFORM="${MLPERF_SUBMISSION_PLATFORM:-reference}"
 GRPO_SEED="${GRPO_SEED:-$(( (RANDOM << 15) | RANDOM ))}"
 echo "Using grpo.seed=${GRPO_SEED}"
 
+# Shell-quote extra Hydra overrides so values with spaces or special
+# characters survive the trip through the COMMAND heredoc.
+EXTRA_OVERRIDES=""
+if (( $# )); then
+    printf -v EXTRA_OVERRIDES ' %q' "$@"
+fi
+
 # ray.sub is submitted from the host checkout, but training runs from the
 # baked checkout inside the container.
 cd "${REPO_LOCATION}"
@@ -136,9 +155,8 @@ cd ${CONTAINER_REPO_LOCATION}
 HF_HOME=${CONTAINER_REPO_LOCATION}/.cache \
 HF_HUB_OFFLINE=1 \
 TRANSFORMERS_OFFLINE=1 \
-HF_TOKEN="${HF_TOKEN:-}" \
-WANDB_API_KEY="${WANDB_API_KEY:-}" \
-NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS="${NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS:-65535}" \
+HF_TOKEN="\${HF_TOKEN:-}" \
+WANDB_API_KEY="\${WANDB_API_KEY:-}" \
 CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH}" \
 NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR}" \
 NEMO_GYM_SWE_WORKSPACE_ROOT=/logs/nemo_gym/workspace \
@@ -162,7 +180,7 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     ++logger.log_dir=/logs \
     ++checkpointing.checkpoint_dir=/checkpoint \
     ++grpo.seed=${GRPO_SEED} \
-    $@
+    ${EXTRA_OVERRIDES:-}
 EOF
 )
 

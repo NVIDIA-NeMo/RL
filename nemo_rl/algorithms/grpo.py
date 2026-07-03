@@ -2746,11 +2746,17 @@ def grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=_stable_group_ids(
+                    # Positional grouping is only needed for agentic gym rollouts,
+                    # where per-generation prompt tokenization is non-deterministic;
+                    # keep main's token-id grouping for every other GRPO user.
+                    advantage_group_ids = prompt_ids_for_adv
+                    if _should_use_nemo_gym(master_config):
+                        advantage_group_ids = _stable_group_ids(
                             prompt_ids_for_adv,
                             master_config.grpo["num_generations_per_prompt"],
-                        ),
+                        )
+                    train_data["advantages"] = adv_estimator.compute_advantage(
+                        prompt_ids=advantage_group_ids,
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
@@ -3257,6 +3263,23 @@ def validate(
             master_config.grpo["max_val_samples"]
             // master_config.grpo["val_batch_size"]
         )
+        validation_generation_config = master_config.grpo.get("validation_generation")
+        assert validation_generation_config is None or _should_use_nemo_gym(
+            master_config
+        ), (
+            "grpo.validation_generation is only supported on the NeMo-Gym rollout path."
+        )
+        validation_generation_overrides = master_config.policy["generation"]
+        if validation_generation_config is not None:
+            # Validation-only sampling overrides (e.g. temperature 0.0 for
+            # deterministic validation). Training rollouts keep policy.generation.
+            validation_generation_overrides = dict(validation_generation_overrides)
+            validation_generation_overrides["temperature"] = (
+                validation_generation_config["temperature"]
+            )
+            validation_generation_overrides["top_p"] = validation_generation_config[
+                "top_p"
+            ]
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
@@ -3266,18 +3289,7 @@ def validate(
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
-                generation_config = master_config.policy["generation"]
-                validation_generation_config = master_config.grpo.get(
-                    "validation_generation"
-                )
-                if validation_generation_config is not None:
-                    # Validation-only sampling overrides (e.g. temperature 0.0 for
-                    # deterministic validation). Training rollouts keep policy.generation.
-                    generation_config = dict(generation_config)
-                    generation_config["temperature"] = validation_generation_config[
-                        "temperature"
-                    ]
-                    generation_config["top_p"] = validation_generation_config["top_p"]
+                generation_config = validation_generation_overrides
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
@@ -4051,11 +4063,17 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
-                    train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=_stable_group_ids(
+                    # Positional grouping is only needed for agentic gym rollouts,
+                    # where per-generation prompt tokenization is non-deterministic;
+                    # keep main's token-id grouping for every other GRPO user.
+                    advantage_group_ids = prompt_ids_for_adv
+                    if _should_use_nemo_gym(master_config):
+                        advantage_group_ids = _stable_group_ids(
                             prompt_ids_for_adv,
                             master_config.grpo["num_generations_per_prompt"],
-                        ),
+                        )
+                    train_data["advantages"] = adv_estimator.compute_advantage(
+                        prompt_ids=advantage_group_ids,
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,

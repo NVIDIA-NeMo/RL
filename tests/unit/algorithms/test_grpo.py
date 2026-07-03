@@ -32,6 +32,7 @@ from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _stable_group_ids,
     add_grpo_token_loss_masks_and_generation_logprobs,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -67,6 +68,29 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+def test_stable_group_ids_uses_contiguous_prompt_groups():
+    rendered_prompt_ids = torch.tensor(
+        [
+            [10, 11],
+            [10, 12],
+            [20, 21],
+            [20, 22],
+        ]
+    )
+
+    result = _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt=2)
+
+    assert torch.equal(result, torch.tensor([[0], [0], [1], [1]]))
+
+
+def test_stable_group_ids_falls_back_for_incomplete_group():
+    rendered_prompt_ids = torch.tensor([[10], [11], [20]])
+
+    result = _stable_group_ids(rendered_prompt_ids, num_generations_per_prompt=2)
+
+    assert result is rendered_prompt_ids
 
 
 @pytest.fixture

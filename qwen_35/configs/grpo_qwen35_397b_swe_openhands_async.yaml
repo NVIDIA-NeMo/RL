@@ -201,6 +201,9 @@ policy:
   generation:
     backend: vllm
     max_new_tokens: 65536
+    # Left-truncate over-long HTTP chat prompts instead of erroring; clamped
+    # server-side so input + output <= max_model_len.
+    truncate_prompt_tokens: 65535
     temperature: 1.0
     top_p: 1.0
     top_k: null

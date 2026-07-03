@@ -363,6 +363,8 @@ Depending on your data shape, you may want to change these values."""
             100
             * timing_metrics.get(f"{timer_prefix}/postprocess_results", 0.0)
             / total_time
+            if total_time
+            else 0.0
         )
 
         return nemo_rl_results, timing_metrics
@@ -418,7 +420,8 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
-        response_output = nemo_gym_result.get("response", {}).get("output")
+        response = nemo_gym_result.get("response")
+        response_output = response.get("output") if isinstance(response, dict) else None
         if not isinstance(response_output, list):
             return self._zero_reward_nemo_rl_result(
                 tokenizer,

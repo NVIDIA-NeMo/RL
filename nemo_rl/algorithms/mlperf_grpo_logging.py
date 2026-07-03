@@ -167,7 +167,8 @@ class MLPerfGRPOLogger:
         grpo_cfg = cfg["grpo"]
         policy_cfg = cfg["policy"]
         megatron_cfg = policy_cfg.get("megatron_cfg") or {}
-        optimizer_cfg = megatron_cfg.get("optimizer") or {}
+        # Fall back to the policy-level optimizer for non-Megatron (dtensor) runs.
+        optimizer_cfg = megatron_cfg.get("optimizer") or policy_cfg.get("optimizer") or {}
         scheduler_cfg = megatron_cfg.get("scheduler") or {}
         generation_cfg = policy_cfg.get("generation") or {}
         backend_cfg = generation_cfg.get("vllm_cfg") or {}

@@ -1,17 +1,21 @@
 diff --git a/responses_api_agents/swe_agents/app.py b/responses_api_agents/swe_agents/app.py
-index e248038b..3e16c6fb 100644
+index e248038..2ad2e92 100644
 --- a/responses_api_agents/swe_agents/app.py
 +++ b/responses_api_agents/swe_agents/app.py
-@@ -151,6 +151,8 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
+@@ -151,6 +151,12 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
      )
  
      openhands_should_log: bool = False
++    base_results_dir: Optional[Path] = Field(
++        default=None,
++        description="Directory for SWE run artifacts. Use a shared filesystem for multinode Ray runs.",
++    )
 +    openhands_preflight: bool = False
 +    openhands_preflight_timeout: int = 60
      debug: bool = False
  
  
-@@ -511,9 +513,92 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
+@@ -511,9 +517,92 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
              f'export UV_INSTALL_DIR="{self.config.r2e_gym_setup_dir}/uv" && '
              f'export UV_PYTHON_INSTALL_DIR="{self.config.r2e_gym_setup_dir}/python" && '
              f'export PATH="{self.config.r2e_gym_setup_dir}/uv/bin:$PATH" && '
@@ -106,7 +110,7 @@ index e248038b..3e16c6fb 100644
              f"    --predictions_path {self.config.output_for_eval_mounted_path} "
              f"    --instance_id {self.config.instance_id} "
              f"    --timeout {self.config.swebench_tests_timeout} "
-@@ -1088,6 +1173,67 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
+@@ -1088,6 +1177,67 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
  
              return setup_dir
  
@@ -174,7 +178,7 @@ index e248038b..3e16c6fb 100644
      def get_run_command(self) -> ExecuteContainerCommandArgs:
          data_point = self.config.problem_info
          agent_run_id = self.config.agent_run_id
-@@ -1099,12 +1245,17 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
+@@ -1099,12 +1249,17 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
          with open(agent_config, "r") as f:
              config = tomlkit.parse(f.read())
  
@@ -193,7 +197,7 @@ index e248038b..3e16c6fb 100644
  
          config_str = tomlkit.dumps(config)
  
-@@ -1120,7 +1271,15 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
+@@ -1120,7 +1275,15 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
              profiling_cmd = ""
  
          if self.config.openhands_should_log:
@@ -210,7 +214,7 @@ index e248038b..3e16c6fb 100644
          else:
              log_cmd = (
                  "export LOG_LEVEL=CRITICAL && "
-@@ -1157,6 +1316,8 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
+@@ -1157,6 +1320,8 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
          else:
              camel_case_tool_names_cmd = ""
  
@@ -219,7 +223,7 @@ index e248038b..3e16c6fb 100644
          workspace_check_cmd = ""
  
          agent_main_cmd = (
-@@ -1193,6 +1354,7 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
+@@ -1193,6 +1358,7 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
              f"{crypto_fix_cmd}"
              f"{diversify_tool_names_cmd}"
              f"{camel_case_tool_names_cmd}"
@@ -227,8 +231,40 @@ index e248038b..3e16c6fb 100644
              f"echo {shlex.quote(config_str)} >{config_file_path} && "
              # f" export EVAL_OUTPUT_DIR={eval_dir_in_openhands} && "
              f"./evaluation/benchmarks/swe_bench/scripts/run_infer.sh "
+@@ -1365,7 +1531,7 @@ class RunOpenHandsAgent(BaseModel):
+     ) -> ActiveContainerCommand:
+         # Stream output to log file as it appears
+         logs_dir = self.config.persistent_dir / "apptainer_logs"
+-        logs_dir.mkdir(exist_ok=True)
++        logs_dir.mkdir(parents=True, exist_ok=True)
+         log_file_path = logs_dir / f"{self.config.instance_id}_{command.mode}.log"
+         log_file = open(log_file_path, "w")
+ 
+@@ -1638,9 +1804,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+     def model_post_init(self, context: Any) -> None:
+         run_session_id = f"{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
+         workspace_root = Path(__file__).parent
++        results_root = self.config.base_results_dir or workspace_root
++        base_results_dir = Path(results_root) / f"swebench_results_{run_session_id}"
++        base_results_dir.mkdir(parents=True, exist_ok=True)
+         self._swe_bench_wrapper_server_config = SWEBenchWrapperServerConfig(
+             run_session_id=run_session_id,
+-            base_results_dir=workspace_root / f"swebench_results_{run_session_id}",
++            base_results_dir=base_results_dir,
+             ng_global_config_dict_str=shlex.quote(OmegaConf.to_yaml(get_global_config_dict())),
+             model_server_name=self.config.model_server.name,
+             openhands_setup_dir=OpenHandsHarnessProcessor(config=self.config).setup(),
+@@ -2016,7 +2185,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+         base_mounted_dir = Path("/trajectories_mount")
+ 
+         params: SWEBenchWrapperInstanceConfig = SWEBenchWrapperInstanceConfig(
+-            **self.config.model_dump(),
++            **self.config.model_dump(exclude={"base_results_dir"}),
+             **self._swe_bench_wrapper_server_config.model_dump(),
+             problem_info=problem_info,
+             body=body,
 diff --git a/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh b/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
-index 7c00229c..fa652ae6 100755
+index 7c00229..e2b2536 100755
 --- a/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
 +++ b/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
 @@ -40,6 +40,88 @@ cd $r2e_gym_dir
@@ -320,16 +356,17 @@ index 7c00229c..fa652ae6 100755
  echo "Installing Python 3.12 to portable location..."
  uv python install 3.12
  
-@@ -52,9 +134,11 @@ uv venv --python 3.12 venv
+@@ -52,10 +134,10 @@ uv venv --python 3.12 venv
  
  echo "Installing R2E-Gym in editable mode..."
  uv pip install -p $r2e_gym_dir/venv/bin/python -e . --no-cache
-+uv pip install -p $r2e_gym_dir/venv/bin/python openai
+-
++uv pip install -p $r2e_gym_dir/venv/bin/python openai docker
 +uv pip install -p $r2e_gym_dir/venv/bin/python --reinstall cffi cryptography
- 
  echo "Verifying installation..."
 -$r2e_gym_dir/venv/bin/python -c "import r2egym; print('✓ r2egym installed successfully')"
-+$r2e_gym_dir/venv/bin/python -c "import r2egym; import kubernetes; import openai; print('✓ r2egym installed successfully')"
- 
+-
++$r2e_gym_dir/venv/bin/python -c "import docker; import kubernetes; import openai; import r2egym; print('✓ r2egym installed successfully')"
  if [ -d venv ] && [ -f venv/bin/python ]; then
      echo "✓ venv created at $(pwd)/venv"
+     echo "✓ Python version: $(venv/bin/python --version)"

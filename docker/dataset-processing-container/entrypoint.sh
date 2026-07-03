@@ -14,7 +14,8 @@
 # limitations under the License.
 set -euo pipefail
 
-docker login -u "$DOCKER_USER" -p "$DOCKER_TOKEN" "$DOCKER_REGISTRY"
+# --password-stdin keeps the token out of the process list.
+printf '%s' "$DOCKER_TOKEN" | docker login -u "$DOCKER_USER" --password-stdin "$DOCKER_REGISTRY"
 # "$*" joins all arguments into the single command string bash -c expects;
 # "$@" would drop every argument after the first.
 exec /bin/bash -c "$*"
