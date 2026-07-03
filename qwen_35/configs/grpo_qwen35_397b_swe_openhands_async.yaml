@@ -231,6 +231,16 @@ policy:
         reasoning_parser: qwen3
     vllm_kwargs:
       attention_backend: FLASH_ATTN
+      # Keep MoE weights in the standard [E, 2I, H]/[E, H, I] layout. The
+      # default (auto -> FlashInfer TRTLLM on Blackwell) converts w13/w2 into a
+      # swizzled block layout after load (swap to [w3;w1] + 4D blocking), which
+      # breaks every subsequent weight refit: the stock FusedMoE weight_loader
+      # raises 'shard_dim=0 is not a valid data dimension for a 3D tensor'
+      # against the converted params, and correct values could not be written
+      # into the swizzled layout anyway. Triton keeps kernel format == storage
+      # format, so per-step refits load correctly. Revisit if a
+      # refit-then-reconvert flow lands (perf: trtllm kernels are faster).
+      moe_backend: triton
       enable_chunked_prefill: true
       compilation_config:
         backend: inductor
