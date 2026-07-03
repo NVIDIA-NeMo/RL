@@ -18,6 +18,7 @@ cd "${REPO}"
 
 /bin/bash -n \
   docker/build-dynamo-slurm.sh \
+  docker/install-dynamo-source.sh \
   examples/slurm/dynamo/assemble_container.sh \
   examples/slurm/dynamo/build_sqsh.sub \
   examples/slurm/dynamo/launch.sh \
