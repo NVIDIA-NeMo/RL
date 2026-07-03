@@ -447,10 +447,15 @@ def generate_and_compare_logprobs(policy, vllm_inference_policy, generation_data
     print("=" * 100)
     print(megatron_input_data)
     print(vllm_logprobs_data)
-    megatron_input_data["input_ids"] = vllm_logprobs_data["output_ids"]
-    megatron_input_data["input_lengths"] = vllm_logprobs_data[
-        "unpadded_sequence_lengths"
-    ]
+    output_ids = vllm_logprobs_data["output_ids"]
+    output_lengths = vllm_logprobs_data["unpadded_sequence_lengths"]
+    megatron_input_data["input_ids"] = output_ids
+    megatron_input_data["input_lengths"] = output_lengths
+    positions = torch.arange(output_ids.shape[1]).unsqueeze(0)
+    megatron_input_data["token_mask"] = positions < output_lengths.unsqueeze(1)
+    megatron_input_data["sample_mask"] = torch.ones(
+        output_ids.shape[0], dtype=torch.bool
+    )
 
     # Get logprobs from Megatron
     policy.prepare_for_lp_inference()
