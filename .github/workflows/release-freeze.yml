@@ -43,6 +43,8 @@ jobs:
       dry-run: ${{ inputs.dry-run }}
       next-pre-release: ""
       next-dev: ""
+      use-pat: true
     secrets:
       SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
+      PAT: ${{ secrets.PAT }}
