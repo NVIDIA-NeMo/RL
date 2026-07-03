@@ -101,6 +101,14 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     group.broadcast(packed_tensors[buffer_idx], src=src)
                 break
 
+    # Drain the side streams before returning. The per-iteration synchronize
+    # above only waits on the buffer about to be REUSED; without this, the
+    # last buffer's pack + NCCL broadcast are still executing when the caller
+    # resumes and may mutate the source parameters mid-broadcast (torn
+    # weights sent to every consumer).
+    for stream in streams:
+        stream.synchronize()
+
 
 def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
     """Consume a packed tensor and unpack it into a list of tensors.
@@ -208,3 +216,15 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                         )
                     )
                 break
+
+    # Drain the side streams before returning. The per-iteration synchronize
+    # above only waits on the buffer about to be REUSED, so when the loop
+    # exits the last buffer's NCCL recv + in-place param copies (including
+    # multi-phase weight_loader transforms like mamba's A := -exp(A_log))
+    # are still executing. Returning early lets the engine resume decoding
+    # concurrently with those writes — decode kernels then read torn or
+    # mid-transform weights, which poisons the persistent mamba SSM state
+    # (whole-tail NaN generations). The sibling IPC/ZMQ path already does
+    # this (vllm_backend.py: current_stream().synchronize() after load).
+    for stream in streams:
+        stream.synchronize()
