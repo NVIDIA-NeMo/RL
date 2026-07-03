@@ -171,7 +171,18 @@ if [[ -n "${NEMO_GYM_VLLM_VERSION:-}" ]]; then
     UV_OVERRIDE_ARGS=(UV_OVERRIDE="${GYM_VLLM_OVERRIDE}")
 fi
 
+# Config inheritance resolves the complete recipe before the Gym dry run.
+# Supply inert build-time paths for recipes, such as Qwen3.5 SWE, whose
+# runtime paths normally come from the launcher environment.
+PREFETCH_INPUT_ROOT=/tmp/nemo-gym-prefetch
+mkdir -p "${PREFETCH_INPUT_ROOT}/model" "${PREFETCH_INPUT_ROOT}/sif"
+touch "${PREFETCH_INPUT_ROOT}/train.jsonl" "${PREFETCH_INPUT_ROOT}/validation.jsonl"
+
 env \
+    CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${PREFETCH_INPUT_ROOT}/model}" \
+    NEMO_GYM_SWE_TRAIN_DATA_PATH="${NEMO_GYM_SWE_TRAIN_DATA_PATH:-${PREFETCH_INPUT_ROOT}/train.jsonl}" \
+    NEMO_GYM_SWE_VALIDATION_DATA_PATH="${NEMO_GYM_SWE_VALIDATION_DATA_PATH:-${PREFETCH_INPUT_ROOT}/validation.jsonl}" \
+    NEMO_GYM_SWE_SIF_DIR="${NEMO_GYM_SWE_SIF_DIR:-${PREFETCH_INPUT_ROOT}/sif}" \
     UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
     UV_LINK_MODE=hardlink \
     "${UV_OVERRIDE_ARGS[@]}" \

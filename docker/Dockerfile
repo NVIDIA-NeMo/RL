@@ -264,6 +264,24 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
+
+# Apply the SWE/OpenHands fixes required by the multinode Qwen3.5 workload, then
+# preserve Qwen3.5 reasoning text in structured tool-call history so subsequent
+# turns retain the exact generated token prefix.
+RUN <<"EOF" bash -exu -o pipefail
+GYM_DIR=3rdparty/Gym-workspace/Gym
+for PATCH_NAME in mlperf-gym.patch qwen35-gym-vllm-model.patch; do
+    PATCH_FILE="/opt/nemo-rl/docker/gym/${PATCH_NAME}"
+    if git -C "${GYM_DIR}" apply --check "${PATCH_FILE}"; then
+        git -C "${GYM_DIR}" apply "${PATCH_FILE}"
+    elif git -C "${GYM_DIR}" apply --reverse --check "${PATCH_FILE}"; then
+        echo "${PATCH_NAME} is already applied"
+    else
+        git -C "${GYM_DIR}" apply --check "${PATCH_FILE}"
+    fi
+done
+EOF
+
 RUN <<"EOF" bash -exu
 NEGATIVE_FILTERS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
@@ -293,6 +311,16 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
     printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
         "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    # Config inheritance resolves the complete recipe before the Gym dry run.
+    # Supply inert build-time paths for recipes, such as Qwen3.5 SWE, whose
+    # runtime paths normally come from the launcher environment.
+    PREFETCH_INPUT_ROOT=/tmp/nemo-gym-prefetch
+    mkdir -p "${PREFETCH_INPUT_ROOT}/model" "${PREFETCH_INPUT_ROOT}/sif"
+    touch "${PREFETCH_INPUT_ROOT}/train.jsonl" "${PREFETCH_INPUT_ROOT}/validation.jsonl"
+    CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${PREFETCH_INPUT_ROOT}/model}" \
+    NEMO_GYM_SWE_TRAIN_DATA_PATH="${NEMO_GYM_SWE_TRAIN_DATA_PATH:-${PREFETCH_INPUT_ROOT}/train.jsonl}" \
+    NEMO_GYM_SWE_VALIDATION_DATA_PATH="${NEMO_GYM_SWE_VALIDATION_DATA_PATH:-${PREFETCH_INPUT_ROOT}/validation.jsonl}" \
+    NEMO_GYM_SWE_SIF_DIR="${NEMO_GYM_SWE_SIF_DIR:-${PREFETCH_INPUT_ROOT}/sif}" \
     UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
