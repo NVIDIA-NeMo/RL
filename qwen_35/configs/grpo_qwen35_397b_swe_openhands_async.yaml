@@ -160,13 +160,19 @@ policy:
       overlap_param_gather: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: optim_grads_params
-    # Anti-fragmentation for the ~60.76 GiB full-vocab fp32 logits transient in
-    # the last-PP-stage backward (see job 2269463 OOM: 34 GiB reserved-but-
-    # unallocated). max_split_size keeps large blocks intact at zero cost;
-    # expandable_segments:True would be stronger but slows refit weight
-    # transfer ~5x (per _clear_fp8_caches docstring), which we pay every step.
+    # Memory headroom for the training step. Job 2269463 (64-GPU shape) OOM'd
+    # on a ~60.76 GiB fp32 transient in the last-PP-stage backward; job 2269456
+    # (128-GPU benchmark shape, max_split_size_mb:512) then died at the first
+    # send_forward_recv_backward with ncclUnhandledCudaError and no Python OOM
+    # anywhere - the signature of NCCL's own cudaMalloc failing at peak memory
+    # when the reverse-direction p2p channels are first created.
+    # expandable_segments defragments the torch pool so those non-torch
+    # allocations can succeed. Note: may slow refit weight transfer (docstring
+    # in _clear_fp8_caches claims ~5x on the IPC path) - measure and revisit.
+    # NCCL_DEBUG=WARN surfaces the underlying CUDA error code if it recurs.
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      NCCL_DEBUG: "WARN"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0

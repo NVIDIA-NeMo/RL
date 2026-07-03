@@ -655,6 +655,17 @@ class MegatronPolicyWorkerImpl(
                     mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
+                    # Memory snapshot before the fwd/bwd: jobs 2269463/2269456
+                    # died here (CUDA OOM / ncclUnhandledCudaError at peak).
+                    _alloc = torch.cuda.memory_allocated() / (1024**3)
+                    _resv = torch.cuda.memory_reserved() / (1024**3)
+                    _free, _total = torch.cuda.mem_get_info()
+                    print(
+                        f"[mem-debug] rank={self.rank} before train fwd/bwd: "
+                        f"allocated={_alloc:.1f}GiB reserved={_resv:.1f}GiB "
+                        f"device_free={_free / (1024**3):.1f}GiB of {_total / (1024**3):.1f}GiB"
+                    )
+
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
                     use_router_replay = _should_use_router_replay(
