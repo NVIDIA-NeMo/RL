@@ -1285,9 +1285,36 @@ class MegatronPolicyWorkerImpl(
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
+        # Stacked 3D fused-expert exports ([num_experts, ...] gate_up_proj /
+        # down_proj) trip vLLM 0.20's fused FusedMoE load path for Qwen3.5
+        # ("shard_dim=0 is not a valid data dimension for a 3D tensor"), which
+        # kills the collective refit. Split them into per-expert 2D HF tensors
+        # (experts.{i}.{gate,up,down}_proj.weight), which vLLM loads through
+        # its standard per-expert mapping. Both prepare_refit_info and the
+        # broadcast use this same iterator, so metadata and payload agree.
+        # Disable with NRL_REFIT_SPLIT_FUSED_EXPERTS=0.
+        split_fused = os.environ.get("NRL_REFIT_SPLIT_FUSED_EXPERTS", "1") == "1"
+
+        def _maybe_split_fused_experts(name, tensor):
+            if not split_fused or tensor.ndim != 3:
+                yield name, tensor
+                return
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                prefix = name[: -len("gate_up_proj")]
+                inter = tensor.shape[1] // 2
+                for e in range(tensor.shape[0]):
+                    yield f"{prefix}{e}.gate_proj.weight", tensor[e, :inter]
+                    yield f"{prefix}{e}.up_proj.weight", tensor[e, inter:]
+            elif name.endswith(".mlp.experts.down_proj"):
+                prefix = name[: -len("down_proj")]
+                for e in range(tensor.shape[0]):
+                    yield f"{prefix}{e}.down_proj.weight", tensor[e]
+            else:
+                yield name, tensor
+
         # Yield the original parameters first.
         for name, tensor in base_iter:
-            yield name, tensor
+            yield from _maybe_split_fused_experts(name, tensor)
 
         if self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
