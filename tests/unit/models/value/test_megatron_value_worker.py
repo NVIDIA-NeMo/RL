@@ -584,6 +584,56 @@ def test_unpack_value_sequences_variable_lengths():
     torch.testing.assert_close(out, expected)
 
 
+def test_value_loss_prepare_fn_shift_and_truncate():
+    """`_value_loss_prepare_fn` (the value-model LossPostProcessor prepare_fn)
+    right-shifts the value-head output (values[t] = V(state before token t)),
+    drops a trailing singleton, and truncates to the returns length. CPU-only
+    (cp_group=None, so the CP all-gather is a no-op).
+    """
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_loss_prepare_fn,
+    )
+
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+    data = BatchedDataDict({"returns": torch.zeros(2, 3)})
+    # Right-shift by one, then truncate to the returns length (3).
+    expected = torch.tensor([[0.0, 1.0, 2.0], [0.0, 5.0, 6.0]])
+
+    out, _ = _value_loss_prepare_fn(logits, data, context_parallel_group=None)
+    torch.testing.assert_close(out["logits"], expected)
+
+    # The value head's trailing singleton [B, S, 1] is squeezed first.
+    out_3d, _ = _value_loss_prepare_fn(
+        logits.unsqueeze(-1), data, context_parallel_group=None
+    )
+    torch.testing.assert_close(out_3d["logits"], expected)
+
+
+def test_loss_post_processor_rejects_fuse_loss_with_custom_prepare_fn():
+    """The fused sequence-packing path prepares loss via
+    ``prepare_packed_loss_input`` and cannot honor a custom ``prepare_fn``. The
+    value model passes ``_value_loss_prepare_fn``, so ``fuse_loss=true`` together
+    with a custom ``prepare_fn`` must fail fast rather than silently bypass the
+    value-specific prep. CPU-only: the guard fires before any Megatron
+    parallel-state call.
+    """
+    from nemo_rl.models.megatron.train import LossPostProcessor
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_loss_prepare_fn,
+    )
+
+    loss_post_processor = LossPostProcessor(
+        loss_fn=lambda *args, **kwargs: None,
+        cfg={"sequence_packing": {"enabled": True, "fuse_loss": True}},
+        num_microbatches=1,
+        prepare_fn=_value_loss_prepare_fn,
+    )
+    # packed_seq_params only needs to be non-None; its attributes are read after
+    # the guard, so a bare sentinel suffices.
+    with pytest.raises(AssertionError, match="fuse_loss"):
+        loss_post_processor(BatchedDataDict({}), packed_seq_params=object())
+
+
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(

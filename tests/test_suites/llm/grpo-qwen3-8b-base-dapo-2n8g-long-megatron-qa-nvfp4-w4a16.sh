@@ -1,15 +1,12 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
-# ignore tensor parallel accuracy check
-export NRL_IGNORE_TP_ACCURACY_CHECK=1
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=8
-GPUS_PER_NODE=4
-SEGMENT_SIZE=8     # nodes per NVLink-domain segment; tools/launch passes it as sbatch --segment. Matches cluster.segment_size in the yaml.
-STEPS_PER_RUN=20
-MAX_STEPS=20
+NUM_NODES=2
+GPUS_PER_NODE=8
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -39,9 +36,14 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/token_mult_prob_error"]["20"] < 1.1'
+        'max(data["train/gen_kl_error"]) < 0.003' \
+        'max(data["train/reward"]) > -0.9'
+
+    if ! grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"; then echo "ERROR: VllmQuantInternalWorkerExtension not found in real-quant run" >&2; exit 1; fi
+    if ! grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"; then echo "ERROR: 'Detected ModelOpt NVFP4 checkpoint' not found in real-quant run" >&2; exit 1; fi
+    if grep -q "FakeQuantWorker" "$RUN_LOG"; then echo "ERROR: FakeQuantWorker unexpectedly present in real-quant run" >&2; exit 1; fi
+    if grep -q "VLLM_QUANT_CFG" "$RUN_LOG"; then echo "ERROR: VLLM_QUANT_CFG unexpectedly present in real-quant run" >&2; exit 1; fi
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
-
