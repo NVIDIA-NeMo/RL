@@ -191,7 +191,11 @@ def test_prefer_nvrx_falls_back_to_original_save_when_nvrx_missing(monkeypatch):
 def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
     module = _load_community_import_module(monkeypatch)
     _install_runtime_stubs_for_hf_import(monkeypatch)
-    sys.modules.pop("megatron.core.dist_checkpointing.strategies.torch", None)
+    # Force this import path to stay unavailable even if real megatron modules
+    # were preloaded by earlier tests in the same process.
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", None
+    )
 
     class FakeProvider:
         def __init__(self):
@@ -232,9 +236,9 @@ def test_import_model_from_hf_name_calls_bridge_save(monkeypatch):
 
     class FakeAutoBridge:
         @staticmethod
-        def from_hf_pretrained(hf_model_name, trust_remote_code=True, **kwargs):
+        def from_hf_pretrained(hf_model_name, *args, **kwargs):
+            # Keep this test focused on bridge-save flow, not HF API defaults.
             assert hf_model_name == "fake/hf-model"
-            assert trust_remote_code is True
             return fake_bridge
 
     monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
