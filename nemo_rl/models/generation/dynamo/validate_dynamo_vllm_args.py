@@ -11,18 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from nemo_rl.models.generation.dynamo.config import (
-    DynamoCfg,
-    DynamoConfig,
-    DynamoFrontendArgs,
-    DynamoWorkerArgs,
-)
-from nemo_rl.models.generation.dynamo.dynamo_generation import DynamoGeneration
 
-__all__ = [
-    "DynamoCfg",
-    "DynamoConfig",
-    "DynamoFrontendArgs",
-    "DynamoGeneration",
-    "DynamoWorkerArgs",
-]
+"""Validate a resolved ``dynamo.vllm`` argv without starting an engine."""
+
+import json
+import os
+import sys
+
+
+def main() -> None:
+    os.environ.setdefault("PYTHONHASHSEED", "0")
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: validate_dynamo_vllm_args.py '<json argv>'")
+    from dynamo.vllm.args import parse_args
+
+    argv = json.loads(sys.argv[1])
+    if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+        raise TypeError("resolved Dynamo argv must be a JSON list of strings")
+    parse_args(argv)
+
+
+if __name__ == "__main__":
+    main()

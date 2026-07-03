@@ -1,0 +1,28 @@
+# Argument-translation fixture matching the current Nemotron Nano v2 DGD.
+model_name: nvidia/NVIDIA-Nemotron-Nano-9B-v2
+dynamo_cfg:
+  deployment: ray
+  engine_world_size: 2
+  worker_args:
+    tool_call_parser: nemotron_deci
+    reasoning_parser: nemotron_nano
+    exclude_tools_when_tool_choice_none: true
+    enable_structural_tag: false
+    structural_tag_scope: auto
+    structural_tag_schema: auto
+    endpoint_types: [chat, completions]
+    extra_cli_args: []
+vllm_cfg:
+  tensor_parallel_size: 2
+  pipeline_parallel_size: 1
+  expert_parallel_size: 1
+  precision: bfloat16
+  gpu_memory_utilization: 0.8
+  max_model_len: 8192
+  enforce_eager: true
+vllm_kwargs:
+  compilation_config:
+    backend: eager
+  mamba_ssm_cache_dtype: float32
+  max_num_seqs: 16
+  max_num_batched_tokens: 16384

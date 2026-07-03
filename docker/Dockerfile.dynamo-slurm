@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1.7-labs
+
+ARG NEMO_RL_BASE_IMAGE
+FROM ${NEMO_RL_BASE_IMAGE}
+
+ARG TARGETARCH
+ARG DYNAMO_COMMIT=59358c26d0aeed19300706462b63ada25a0a6d7c
+ARG DYNAMO_PYTHON_VERSION=3.12.11
+ARG ETCD_VERSION=v3.5.21
+ARG NATS_VERSION=v2.11.6
+
+USER root
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+RUN test "${TARGETARCH}" = "amd64"
+
+# Keep Dynamo/vLLM's Python 3.12 solve separate from NeMo-RL's Python 3.13
+# environments. Install from the exact Dynamo revision that contains native
+# unpaused NeMo-RL refit support; do not mix an older wheel with a file overlay.
+RUN UV_PYTHON_INSTALL_DIR=/opt/uv-python uv python install "${DYNAMO_PYTHON_VERSION}" && \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python uv venv \
+      --python "${DYNAMO_PYTHON_VERSION}" /opt/dynamo_venv && \
+    uv pip install --python /opt/dynamo_venv/bin/python \
+      "ai-dynamo[vllm] @ git+https://github.com/ai-dynamo/dynamo.git@${DYNAMO_COMMIT}"
+
+RUN curl --fail --location --retry 3 \
+      "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz" \
+      --output /tmp/etcd.tgz && \
+    tar -xzf /tmp/etcd.tgz -C /tmp && \
+    install -m 0755 "/tmp/etcd-${ETCD_VERSION}-linux-amd64/etcd" /usr/local/bin/etcd && \
+    curl --fail --location --retry 3 \
+      "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.tar.gz" \
+      --output /tmp/nats.tgz && \
+    tar -xzf /tmp/nats.tgz -C /tmp && \
+    install -m 0755 "/tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server" \
+      /usr/local/bin/nats-server && \
+    rm -rf /tmp/etcd* /tmp/nats*
+
+ENV DYNAMO_PYTHON=/opt/dynamo_venv/bin/python
+
+RUN /opt/dynamo_venv/bin/python -c \
+      'import dynamo.vllm.handlers, vllm; print("Dynamo/vLLM ready", vllm.__version__)' && \
+    etcd --version && \
+    nats-server --version

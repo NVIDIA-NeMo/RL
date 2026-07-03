@@ -1,15 +1,93 @@
 # Dynamo Integration
 
-NeMo-RL can use a Kubernetes `DynamoGraphDeployment` (DGD) as its remote
-generation backend. The DGD owns the Dynamo frontend and vLLM workers. NeMo-RL
-owns training and sends updated checkpoint-format weights to those workers over
-a native vLLM NCCL weight-transfer group.
+NeMo-RL supports both an external Kubernetes `DynamoGraphDeployment` (DGD) and
+a fixed Ray-managed Dynamo deployment for Slurm. In both modes NeMo-RL owns
+training and sends updated checkpoint-format weights to vLLM over a native NCCL
+weight-transfer group.
 
 Install the Dynamo operator and `DynamoGraphDeployment` CRD in the target
 cluster before using this integration. `nrl-k8s` renders and applies DGD
 resources, but does not install cluster-scoped Dynamo components.
 
 ## Architecture
+
+`dynamo_cfg.deployment` selects the lifecycle owner:
+
+- `external` (the default) preserves the DGD behavior described below. The
+  operator owns the frontend and workers, and all Ray GPUs remain available to
+  training.
+- `ray` starts etcd and NATS on the Ray driver, reserves the configured
+  inference placement groups, launches one `dynamo.vllm` process per fixed
+  model-parallel group, and starts the frontend after the workers. This mode
+  requires `policy.generation.colocated.enabled=false`.
+
+The minimal managed configuration is:
+
+```yaml
+policy:
+  generation:
+    backend: dynamo
+    dynamo_cfg:
+      deployment: ray
+      engine_world_size: 1
+      dynamo_python: /opt/dynamo_venv/bin/python
+      startup_timeout_s: 300
+      namespace: null
+      frontend_port: 0
+      request_timeout_s: 900
+      worker_args:
+        tool_call_parser: null
+        reasoning_parser: null
+        exclude_tools_when_tool_choice_none: true
+        enable_structural_tag: false
+        structural_tag_scope: auto
+        structural_tag_schema: auto
+        custom_jinja_template: null
+        endpoint_types: [chat, completions]
+        extra_cli_args: []
+      frontend_args:
+        router_mode: round-robin
+        router_reset_states: true
+        extra_cli_args: []
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+```
+
+When `namespace` is null, managed mode derives a sanitized value from
+`SLURM_JOB_ID`. Service ports are selected automatically. Every worker receives
+a unique `DYN_SYSTEM_PORT`, and fixed membership is frozen before NCCL
+collective initialization. A dead actor, changed system URL, or changed worker
+count aborts the run.
+
+### Argument ownership
+
+| Configuration source | Responsibility |
+| --- | --- |
+| Generation fields | Request-time temperature, top-p, top-k, stops, and token limits |
+| `vllm_cfg` | Standard engine topology, dtype, memory, model length, load format, and eager mode |
+| `vllm_kwargs` | Advanced native vLLM engine arguments |
+| `dynamo_cfg.worker_args` | Dynamo chat/runtime behavior, including tool and reasoning parsers |
+| Managed runtime | Model identity, namespace, discovery, request plane, RL/refit flags, ports, and endpoints |
+| `extra_cli_args` | Exact argv escape hatch for otherwise unrepresented options |
+
+Parser defaults are deliberately null. NeMo-RL does not translate
+`vllm_cfg.http_server_serving_chat_kwargs.tool_parser` into a Dynamo parser;
+the two parser registries have different names and contracts. Managed mode
+normalizes `vllm_kwargs` underscores to hyphens, compact-JSON encodes compound
+values, omits nulls, emits explicit positive/negative boolean flags, and rejects
+duplicates or attempts to override managed and structured options. The final
+argv is validated with `dynamo.vllm.args.parse_args` in the configured Dynamo
+Python environment before the worker process starts.
+
+Inherited `DYN_*` variables are scrubbed before launch. Only manager-owned
+service settings are added back; cache/auth/logging variables, `NCCL_*`, and
+explicit non-semantic `vllm_cfg.env_vars` remain available. Resolved argv and
+relevant environment values are logged with credentials redacted.
+
+## External Kubernetes deployment
 
 The training Ray cluster and the DGD are separate Kubernetes workloads:
 

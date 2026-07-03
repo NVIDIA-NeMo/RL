@@ -312,8 +312,7 @@ def setup(
         generation_config["backend"] == "dynamo"
         and generation_config["colocated"]["enabled"]
     ), (
-        "Dynamo generation does not support colocated inference because its "
-        "workers are hosted by an external DynamoGraphDeployment. Set "
+        "Dynamo generation does not support colocated inference. Set "
         "policy.generation.colocated.enabled=false."
     )
 
@@ -465,9 +464,12 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    # Dynamo serves inference from an external DynamoGraphDeployment. It never
-    # consumes Ray-cluster GPUs and cannot be colocated with the training policy.
     is_dynamo = generation_config.get("backend") == "dynamo"
+    is_managed_dynamo = is_dynamo and (
+        generation_config.get("dynamo_cfg", {}).get("deployment", "external")
+        == "ray"
+    )
+    is_external_dynamo = is_dynamo and not is_managed_dynamo
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -580,7 +582,7 @@ def setup(
             flush=True,
         )
 
-    if is_dynamo:
+    if is_external_dynamo:
         if total_nodes == 1:
             train_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
         else:
@@ -776,6 +778,10 @@ def setup(
                     gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                         "pipeline_parallel_size", 1
                     )
+                elif generation_config["backend"] == "dynamo":
+                    gpus_per_instance = generation_config.get("dynamo_cfg", {}).get(
+                        "engine_world_size", 1
+                    )
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
@@ -844,9 +850,12 @@ def setup(
             node_resource_constraints=inference_node_resource_constraints,
         )
         if inference_node_resource_constraints is not None:
-            VllmGeneration.init_cluster_placement_groups(
-                inference_cluster, generation_config
-            )
+            if generation_config["backend"] == "vllm":
+                VllmGeneration.init_cluster_placement_groups(
+                    inference_cluster, generation_config
+                )
+            else:
+                inference_cluster.get_placement_groups()
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
             flush=True,
@@ -1179,8 +1188,8 @@ def setup(
         )
 
     elif backend == "dynamo":
-        # Dynamo owns the inference workers outside Ray. NeMo-RL only creates
-        # the HTTP generation adapter and the training policy here.
+        # External mode points at a DGD. Ray mode owns a fixed worker fleet on
+        # the inference virtual cluster.
         generation_config = cast(DynamoConfig, generation_config)
 
         def init_dynamo():

@@ -108,7 +108,68 @@ def test_dynamo_cfg_validates_defaults_and_preserves_extra_fields():
 
     assert cfg.frontend_port == 8000
     assert cfg.dyn_system_port == 9090
+    assert cfg.deployment == "external"
+    assert cfg.worker_args.tool_call_parser is None
+    assert cfg.worker_args.reasoning_parser is None
     assert cfg.model_extra == {"future_dynamo_option": "enabled"}
+
+
+def test_ray_managed_dynamo_requires_inference_cluster(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config()
+    cfg["dynamo_cfg"] = {  # type: ignore[typeddict-item]
+        "deployment": "ray",
+        "engine_world_size": 1,
+        "frontend_port": 0,
+    }
+    with pytest.raises(RuntimeError, match="requires an inference RayVirtualCluster"):
+        DynamoGeneration(cluster=None, config=cfg)
+
+
+def test_ray_managed_dynamo_owns_runtime_and_refit_workers(monkeypatch):
+    from nemo_rl.models.generation.dynamo import managed_runtime as runtime_module
+
+    calls = []
+
+    class FakeManagedRuntime:
+        frontend_url = "http://10.1.2.3:8123/v1"
+
+        def __init__(self, *, cluster, config, dynamo_cfg):
+            calls.append(("init", cluster, dynamo_cfg.deployment))
+
+        def refit_workers(self):
+            return [
+                {
+                    "instance_id": "worker-0",
+                    "system_url": "http://10.2.3.4:29000",
+                }
+            ]
+
+        def validate_workers(self, expected):
+            calls.append(("validate", expected))
+            return expected
+
+        def shutdown(self):
+            calls.append(("shutdown",))
+
+    monkeypatch.setattr(runtime_module, "ManagedDynamoRuntime", FakeManagedRuntime)
+    cfg = _base_config()
+    cfg["dynamo_cfg"] = {  # type: ignore[typeddict-item]
+        "deployment": "ray",
+        "engine_world_size": 1,
+        "frontend_port": 0,
+    }
+    cluster = object()
+    generation = DynamoGeneration(cluster=cluster, config=cfg)
+
+    assert generation.dp_openai_server_base_urls == ["http://10.1.2.3:8123/v1"]
+    assert generation.get_inference_world_size() == 1
+    assert generation._validate_refit_workers() == [
+        {"instance_id": "worker-0", "system_url": "http://10.2.3.4:29000"}
+    ]
+    assert generation.shutdown() is True
+    assert calls[0] == ("init", cluster, "ray")
+    assert calls[-1] == ("shutdown",)
 
 
 def test_dynamo_cfg_rejects_nonpositive_engine_world_size():

@@ -81,6 +81,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.dynamo import DynamoGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
@@ -695,6 +696,173 @@ def parse_sglang_args():
     return args, overrides
 
 
+def parse_dynamo_args():
+    """Parse the managed Dynamo verifier config and Hydra-style overrides."""
+    parser = argparse.ArgumentParser(
+        description="Managed Dynamo native NCCL refit and logprob verification"
+    )
+    parser.add_argument(
+        "--dynamo-config",
+        type=str,
+        required=True,
+        help="GRPO YAML using backend=dynamo and dynamo_cfg.deployment=ray.",
+    )
+    parser.add_argument(
+        "--max-logprob-diff",
+        type=float,
+        default=0.1,
+        help="Maximum accepted absolute generated-token logprob difference.",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="Here is a short introduction to me:",
+    )
+    args, overrides = parser.parse_known_args()
+    return args, overrides
+
+
+def main_dynamo():
+    """Run managed Dynamo from dummy weights, refit, and compare logprobs."""
+    args, overrides = parse_dynamo_args()
+    register_omegaconf_resolvers()
+    config = load_config(args.dynamo_config)
+    if overrides:
+        config = parse_hydra_overrides(config, overrides)
+    master_config = OmegaConf.to_container(config, resolve=True)
+
+    init_ray()
+    policy_config = master_config["policy"]
+    generation_config = policy_config["generation"]
+    cluster_config = master_config["cluster"]
+    assert generation_config["backend"] == "dynamo", (
+        "--dynamo-config requires policy.generation.backend=dynamo"
+    )
+    assert generation_config["dynamo_cfg"].get("deployment") == "ray", (
+        "Dynamo refit verification requires dynamo_cfg.deployment=ray"
+    )
+    assert not generation_config["colocated"]["enabled"], (
+        "Managed Dynamo refit verification requires colocated.enabled=false"
+    )
+
+    tokenizer = get_tokenizer(policy_config["tokenizer"])
+    generation_config = configure_generation_config(generation_config, tokenizer)
+    generation_config["model_name"] = policy_config["model_name"]
+    # A successful comparison proves the native NCCL refit replaced the dummy
+    # engine weights with the training policy's checkpoint-format weights.
+    generation_config["vllm_cfg"]["load_format"] = "dummy"
+
+    inference_resources = generation_config["colocated"]["resources"]
+    inference_gpus_per_node = int(inference_resources["gpus_per_node"])
+    total_nodes = int(cluster_config["num_nodes"])
+    total_gpus_per_node = int(cluster_config["gpus_per_node"])
+    if total_nodes == 1:
+        inference_nodes = 1
+        train_nodes = 1
+        train_gpus_per_node = total_gpus_per_node - inference_gpus_per_node
+    else:
+        inference_nodes = int(inference_resources["num_nodes"])
+        train_nodes = total_nodes - inference_nodes
+        train_gpus_per_node = total_gpus_per_node
+    if train_nodes <= 0 or train_gpus_per_node <= 0:
+        raise ValueError(
+            "Dynamo verifier requires non-empty train and inference GPU pools."
+        )
+
+    train_cluster = RayVirtualCluster(
+        name="dynamo_refit_train_cluster",
+        bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
+        use_gpus=True,
+        num_gpus_per_node=train_gpus_per_node,
+        max_colocated_worker_groups=1,
+    )
+    inference_cluster = RayVirtualCluster(
+        name="dynamo_refit_inference_cluster",
+        bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+        use_gpus=True,
+        num_gpus_per_node=inference_gpus_per_node,
+        max_colocated_worker_groups=1,
+    )
+
+    policy = None
+    policy_generation = None
+    try:
+        policy = Policy(
+            cluster=train_cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+            init_optimizer=False,
+        )
+        policy_generation = DynamoGeneration(
+            cluster=inference_cluster,
+            config=generation_config,
+            tokenizer=tokenizer,
+            tokenizer_config=policy_config.get("tokenizer"),
+        )
+
+        ip, port = train_cluster.get_master_address_and_port()
+        train_world_size = train_cluster.world_size()
+        inference_world_size = policy_generation.get_inference_world_size()
+        world_size = train_world_size + inference_world_size
+        train_refs = policy.init_collective(
+            ip,
+            port,
+            world_size,
+            train_world_size=train_world_size,
+            nccl_peer="vllm",
+        )
+        inference_refs = policy_generation.init_collective(
+            ip,
+            port,
+            world_size,
+            train_world_size=train_world_size,
+        )
+        ray.get(train_refs + inference_refs)
+
+        state_dict_info = policy.prepare_refit_info()
+        policy_generation.prepare_refit_info(state_dict_info)
+        refit_policy_generation(
+            policy,
+            policy_generation,
+            colocated_inference=False,
+        )
+
+        generation_data = prepare_input_data(args.prompt, tokenizer)
+        dynamo_data, policy_data = generate_and_compare_logprobs(
+            policy, policy_generation, generation_data
+        )
+        analyze_logprob_differences(
+            dynamo_data,
+            policy_data,
+            generation_data,
+            tokenizer,
+            args.prompt,
+        )
+        input_length = int(generation_data["input_lengths"][0].item())
+        total_length = dynamo_data["logprobs"].shape[1]
+        if total_length <= input_length:
+            raise AssertionError("Managed Dynamo verifier generated no output tokens.")
+        max_diff = torch.max(
+            torch.abs(
+                dynamo_data["logprobs"][0, input_length:total_length]
+                - policy_data["logprobs"][0, input_length:total_length]
+            )
+        ).item()
+        if max_diff > args.max_logprob_diff:
+            raise AssertionError(
+                f"Post-refit max logprob difference {max_diff} exceeds "
+                f"{args.max_logprob_diff}."
+            )
+        print(f"Managed Dynamo post-refit max logprob difference: {max_diff}")
+    finally:
+        if policy_generation is not None:
+            policy_generation.shutdown()
+        if policy is not None:
+            policy.shutdown()
+        ray.shutdown()
+
+
 def main_sglang():
     """Load the GRPO YAML config and run the SGLang weight-equality check.
 
@@ -793,6 +961,15 @@ def _is_sglang_mode() -> bool:
     return False
 
 
+def _is_dynamo_mode() -> bool:
+    import sys
+
+    return any(
+        token == "--dynamo-config" or token.startswith("--dynamo-config=")
+        for token in sys.argv[1:]
+    )
+
+
 def main_vllm():
     """VLLM weight-check flow."""
     # Parse command line arguments
@@ -843,8 +1020,10 @@ def main_vllm():
 
 
 def main():
-    """Dispatch to the sglang or vllm weight-check flow."""
-    if _is_sglang_mode():
+    """Dispatch to the Dynamo, SGLang, or vLLM weight-check flow."""
+    if _is_dynamo_mode():
+        main_dynamo()
+    elif _is_sglang_mode():
         main_sglang()
     else:
         main_vllm()

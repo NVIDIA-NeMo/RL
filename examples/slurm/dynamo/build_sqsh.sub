@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#SBATCH --account=coreai_dlalgo_nemorl
+#SBATCH --partition=cpu_short
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=240G
+#SBATCH --time=04:00:00
+#SBATCH --job-name=nemo-rl-dynamo-image
+
+set -euo pipefail
+
+ROOT=${ROOT:-/lustre/fsw/portfolios/coreai/users/jothomson/nemo-rl-dynamo-slurm-new}
+REPO=${REPO:-${ROOT}/RL}
+BASE_IMAGE=${BASE_IMAGE:-nvcr.io#nvidian/nemo-rl:nightly}
+OUTPUT=${OUTPUT:-${ROOT}/images/nemo-rl-dynamo-slurm.sqsh}
+
+export ENROOT_CACHE_PATH=${ENROOT_CACHE_PATH:-${ROOT}/cache/enroot}
+export ENROOT_DATA_PATH=${ENROOT_DATA_PATH:-${ROOT}/cache/enroot-data}
+export ENROOT_RUNTIME_PATH=${ENROOT_RUNTIME_PATH:-${ROOT}/cache/enroot-runtime}
+export ENROOT_TEMP_PATH=${ENROOT_TEMP_PATH:-${ROOT}/cache/enroot-tmp}
+mkdir -p \
+  "${ROOT}/images" \
+  "${ROOT}/cache/uv" \
+  "${ROOT}/logs" \
+  "${ENROOT_CACHE_PATH}" \
+  "${ENROOT_DATA_PATH}" \
+  "${ENROOT_RUNTIME_PATH}" \
+  "${ENROOT_TEMP_PATH}"
+if [[ -e "${OUTPUT}" ]]; then
+  echo "Refusing to overwrite existing image: ${OUTPUT}" >&2
+  exit 1
+fi
+
+export ROOT REPO
+srun \
+  --container-image="${BASE_IMAGE}" \
+  --container-remap-root \
+  --container-writable \
+  --no-container-mount-home \
+  --container-save="${OUTPUT}" \
+  --container-mounts="${ROOT}:${ROOT}" \
+  --container-workdir="${REPO}" \
+  /bin/bash examples/slurm/dynamo/assemble_container.sh
+
+test -s "${OUTPUT}"
+ls -lh "${OUTPUT}"

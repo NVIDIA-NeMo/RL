@@ -1543,6 +1543,88 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     mock_logger.assert_not_called()
 
 
+def test_ray_managed_dynamo_uses_noncolocated_resource_validation(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["backend"] = "dynamo"
+    master_config.policy["generation"]["dynamo_cfg"] = {
+        "deployment": "ray",
+        "engine_world_size": 1,
+    }
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": None, "num_nodes": None},
+    }
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["batch_multiplier"] = 1
+    master_config.cluster["num_nodes"] = 1
+    master_config.cluster["gpus_per_node"] = 8
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
+
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
+        ),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, MagicMock(), dataset, None)
+
+
+def test_external_dynamo_keeps_all_policy_gpus_without_inference_cluster(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo import setup
+
+    class ClusterCreated(Exception):
+        pass
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["backend"] = "dynamo"
+    master_config.policy["generation"]["dynamo_cfg"] = {
+        "deployment": "external",
+        "engine_world_size": 1,
+        "frontend_url": "http://dynamo.example.test/v1",
+    }
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": None, "num_nodes": None},
+    }
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["batch_multiplier"] = 1
+    master_config.cluster["num_nodes"] = 1
+    master_config.cluster["gpus_per_node"] = 8
+    master_config.data["shuffle"] = False
+    master_config.data["num_workers"] = 1
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger"),
+        patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
+        patch(
+            "nemo_rl.algorithms.grpo.RayVirtualCluster",
+            side_effect=ClusterCreated,
+        ) as mock_cluster,
+        patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
+        pytest.raises(ClusterCreated),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        setup(master_config, MagicMock(), dataset, None)
+
+    assert mock_cluster.call_count == 1
+    assert mock_cluster.call_args.kwargs["bundle_ct_per_node_list"] == [8]
+
+
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
     mock_grpo_components,
 ):

@@ -11,20 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dynamo generation and NCCL refit through a DynamoGraphDeployment.
+"""Dynamo generation and NCCL refit through external or Ray-managed Dynamo.
 
 On Kubernetes, a ``DynamoGraphDeployment`` (DGD) owns the entire inference
 stack — etcd, NATS, the dynamo frontend, and the vLLM/sglang/trtllm workers.
 This class resolves the frontend for direct generation or NeMo-Gym requests
 and coordinates native vLLM NCCL weight updates with the fixed worker fleet.
-It does not create or manage the DGD.
+On Slurm/Ray, the same adapter can own a fixed Dynamo vLLM deployment.
 """
 
 import asyncio
 import logging
 import time
 import warnings
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -42,6 +42,9 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.k8s import is_in_kubernetes, read_pod_namespace
 
 LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
 
 _HTTP_MAX_ATTEMPTS = 3
 _HTTP_RETRY_DELAY_S = 1.0
@@ -353,6 +356,7 @@ def _post_dynamo_worker_route_remote(
             f"Dynamo worker {system_url} route {route} failed: "
             f"{_format_dynamo_error(response)}"
         )
+    print(f"  [Dynamo] worker={system_url} route={route} status=ok", flush=True)
     return True
 
 
@@ -397,6 +401,10 @@ def _update_dynamo_worker_weights_remote(
                 f"Dynamo worker {system_url} RPC {engine_rpc} failed: "
                 f"{_format_dynamo_error(response)}"
             )
+        print(
+            f"  [Dynamo] worker={system_url} refit_rpc={engine_rpc} status=ok",
+            flush=True,
+        )
     return True
 
 
@@ -452,11 +460,10 @@ def _resolve_frontend_url(dynamo_cfg: DynamoCfg) -> tuple[str, bool]:
 
 
 class DynamoGeneration(GenerationInterface):
-    """Forwards rollout requests to a DynamoGraphDeployment frontend.
+    """Forward rollouts to an external or Ray-managed Dynamo frontend.
 
-    The DGD must already exist in the cluster — this class does not create or
-    wait on it. nrl-k8s is the orchestration layer that brings up the DGD and
-    waits for readiness before the training entrypoint runs.
+    External mode assumes the DGD already exists. Ray mode owns a fixed local
+    service fleet and keeps lifecycle ownership on the driver instance.
     """
 
     def __init__(
@@ -469,25 +476,15 @@ class DynamoGeneration(GenerationInterface):
         self.cfg = config
         self._dynamo_cfg = DynamoCfg.model_validate(config["dynamo_cfg"])
         dynamo_cfg = self._dynamo_cfg
-        url, requires_k8s = _resolve_frontend_url(dynamo_cfg)
-        if requires_k8s and not is_in_kubernetes():
-            raise RuntimeError(
-                "DynamoGeneration with dgd_name requires running inside a "
-                "Kubernetes pod (KUBERNETES_SERVICE_HOST is not set). "
-                "Either run inside a pod, or set "
-                "policy.generation.dynamo_cfg.frontend_url to a reachable URL."
-            )
-        self._dynamo_frontend_base_url = url
-        self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
-
         vllm_cfg = config.get("vllm_cfg") or {}
-        if vllm_cfg.get("expose_http_server"):
+        expose_http_server = bool(vllm_cfg.get("expose_http_server"))
+        tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None
+        if expose_http_server:
             if tokenizer is None:
                 raise RuntimeError(
                     "DynamoGeneration requires a tokenizer when exposing an "
                     "OpenAI-compatible rollout server."
                 )
-            tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None
             if (
                 tokenizer_config is not None
                 and "chat_template_kwargs" in tokenizer_config
@@ -499,7 +496,38 @@ class DynamoGeneration(GenerationInterface):
                         "policy.tokenizer.chat_template_kwargs must be a dictionary."
                     )
                 tokenizer_chat_template_kwargs = dict(chat_template_kwargs)
+        self._managed_runtime: Optional["ManagedDynamoRuntime"] = None
+        self._owns_managed_runtime = False
+        if dynamo_cfg.deployment == "ray":
+            from nemo_rl.models.generation.dynamo.managed_runtime import (
+                ManagedDynamoRuntime,
+            )
 
+            if cluster is None:
+                raise RuntimeError(
+                    "Dynamo deployment='ray' requires an inference RayVirtualCluster."
+                )
+            self._managed_runtime = ManagedDynamoRuntime(
+                cluster=cluster,
+                config=config,
+                dynamo_cfg=dynamo_cfg,
+            )
+            self._owns_managed_runtime = True
+            url = self._managed_runtime.frontend_url
+            requires_k8s = False
+        else:
+            url, requires_k8s = _resolve_frontend_url(dynamo_cfg)
+        if requires_k8s and not is_in_kubernetes():
+            raise RuntimeError(
+                "DynamoGeneration with dgd_name requires running inside a "
+                "Kubernetes pod (KUBERNETES_SERVICE_HOST is not set). "
+                "Either run inside a pod, or set "
+                "policy.generation.dynamo_cfg.frontend_url to a reachable URL."
+            )
+        self._dynamo_frontend_base_url = url
+        self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
+
+        if expose_http_server:
             request_timeout_s: Optional[float] = None
             if dynamo_cfg.request_timeout_s is not None:
                 request_timeout_s = dynamo_cfg.request_timeout_s
@@ -509,7 +537,15 @@ class DynamoGeneration(GenerationInterface):
                 tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
                 request_timeout_s=request_timeout_s,
             )
-            wrapper_url = self._token_wrapper_server.start()
+            try:
+                wrapper_url = self._token_wrapper_server.start()
+            except Exception:
+                if self._owns_managed_runtime and self._managed_runtime is not None:
+                    self._managed_runtime.shutdown()
+                    self._managed_runtime = None
+                    self._owns_managed_runtime = False
+                self._token_wrapper_server = None
+                raise
             self.dp_openai_server_base_urls: list[Optional[str]] = [wrapper_url]
             print(
                 "  [Dynamo] Forwarding rollout chat requests through token "
@@ -552,6 +588,17 @@ class DynamoGeneration(GenerationInterface):
             return self._refit_workers
 
         dynamo_cfg = self._dynamo_cfg
+        if dynamo_cfg.deployment == "ray":
+            if self._managed_runtime is None:
+                raise RuntimeError(
+                    "Ray-managed Dynamo refit state is only available on the "
+                    "driver instance that owns the runtime."
+                )
+            workers = self._managed_runtime.refit_workers()
+            if not workers:
+                raise RuntimeError("Ray-managed Dynamo started with no vLLM workers.")
+            self._refit_workers = workers
+            return workers
         if dynamo_cfg.dgd_name is None:
             raise RuntimeError(
                 "Dynamo NCCL weight transfer requires "
@@ -570,6 +617,10 @@ class DynamoGeneration(GenerationInterface):
     def _validate_refit_workers(self) -> list[dict[str, Any]]:
         """Fail if the fixed worker fleet changed after collective setup."""
         expected = self._get_refit_workers()
+        if self._dynamo_cfg.deployment == "ray":
+            if self._managed_runtime is None:
+                raise RuntimeError("Ray-managed Dynamo runtime is not owned here.")
+            return self._managed_runtime.validate_workers(expected)
         assert self._refit_discovery_kwargs is not None
         current = _discover_worker_instances(**self._refit_discovery_kwargs)
         expected_ids = [
@@ -592,10 +643,15 @@ class DynamoGeneration(GenerationInterface):
         return len(self._get_refit_workers()) * engine_world_size
 
     def shutdown(self) -> bool:
-        """Stop the local token wrapper; Kubernetes owns the DGD lifecycle."""
+        """Stop process-local wrappers and any driver-owned managed runtime."""
         token_wrapper_server = self._token_wrapper_server
         if token_wrapper_server is not None:
             token_wrapper_server.shutdown()
+            self._token_wrapper_server = None
+        if self._owns_managed_runtime and self._managed_runtime is not None:
+            self._managed_runtime.shutdown()
+            self._managed_runtime = None
+            self._owns_managed_runtime = False
         return True
 
     # ------------------------------------------------------------------
@@ -621,6 +677,8 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError("Pickled DynamoGeneration has no frontend URL.")
         self._dynamo_frontend_base_url = frontend_url
         self._token_wrapper_server = None
+        self._managed_runtime = None
+        self._owns_managed_runtime = False
         # Refit state is process-local; Ray copies must rediscover the worker fleet.
         self._refit_workers = None
         self._refit_discovery_kwargs = None
@@ -1045,6 +1103,17 @@ class DynamoGeneration(GenerationInterface):
                 f"train_world_size={train_world_size} + Dynamo inference "
                 f"world size={inference_world_size}."
             )
+
+        rank_offsets = [
+            train_world_size + worker_idx * engine_world_size
+            for worker_idx in range(len(workers))
+        ]
+        print(
+            f"  [Dynamo] initializing NCCL world_size={world_size} "
+            f"train_world_size={train_world_size} "
+            f"engine_world_size={engine_world_size} rank_offsets={rank_offsets}",
+            flush=True,
+        )
 
         timeout_s = self._request_timeout_s()
         return [
