@@ -53,7 +53,10 @@ fi
 
 export HF_HOME UV_CACHE_DIR_OVERRIDE BASE_LOG_DIR RESULTS_DIR
 export DYNAMO_PYTHON=/opt/dynamo_venv/bin/python
-export NEMO_RL_VENV_DIR=/opt/ray_venvs
+# The Slurm image materializes the locked all-groups NeMo-RL environment at
+# build time. Reuse it for Ray actors instead of relying on uv cache links that
+# are not portable across Enroot runtime mounts.
+export NEMO_RL_PY_EXECUTABLES_SYSTEM=1
 export PYTHONPATH="${REPO}${PYTHONPATH:+:${PYTHONPATH}}"
 export GPUS_PER_NODE=8
 REAL_ROOT=$(readlink -f "${ROOT}")

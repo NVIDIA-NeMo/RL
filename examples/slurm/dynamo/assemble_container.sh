@@ -14,22 +14,15 @@ UV=$(find /usr/local/bin /usr/bin /root/.local/bin -maxdepth 1 -type f -name uv 
 test -n "${UV}"
 
 # Replace the release image source with this branch, then resolve its locked
-# driver environment and prebuilt Ray actor environments in-place.
+# all-groups environment in-place for both the driver and Ray actors.
 rsync -a --delete --exclude=.git --exclude=.venv "${REPO}/" /opt/nemo-rl/
 cd /opt/nemo-rl
 export UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 export UV_CACHE_DIR=${ROOT}/cache/uv
-export NEMO_RL_VENV_DIR=/opt/ray_venvs
 export NRL_CONTAINER=1
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-9.0}
 "${UV}" sync --locked --all-groups --no-install-project --reinstall --link-mode copy
-# This acceptance image runs the DTensor V1 policy plus the system-Python
-# Dynamo actor. Avoid baking unrelated vLLM/SGLang/Megatron/Automodel actor
-# environments into an already large Slurm image.
-UV_LINK_MODE=symlink "${UV}" run nemo_rl/utils/prefetch_venvs.py \
-  dtensor_policy_worker.DTensorPolicyWorker
 test -x /opt/nemo_rl_venv/bin/python
-test -x /opt/ray_venvs/nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker/bin/python
 (
   cd "${REPO}"
   PYTHONPATH="${REPO}" /opt/nemo_rl_venv/bin/python \
