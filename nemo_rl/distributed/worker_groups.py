@@ -14,6 +14,7 @@
 import importlib
 import math
 import os
+import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -490,7 +491,9 @@ class RayWorkerGroup:
         # env_vars are passed through create_worker(). This reduces GCS actor
         # registrations from N_workers to N_nodes.
         unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
-        initializer_runtime_env = {"py_executable": py_executable}
+        initializer_runtime_env = {}
+        if py_executable != sys.executable:
+            initializer_runtime_env["py_executable"] = py_executable
         self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
         for pg_idx in unique_pg_indices:
             # num_cpus=0 so the initializer doesn't consume a CPU slot — it
@@ -563,8 +566,9 @@ class RayWorkerGroup:
                 # Build the worker's runtime_env with per-worker env_vars
                 runtime_env = {
                     "env_vars": worker_env_vars,
-                    "py_executable": py_executable,
                 }
+                if py_executable != sys.executable:
+                    runtime_env["py_executable"] = py_executable
                 py_venv = os.path.dirname(
                     os.path.dirname(py_executable)
                 )  # to remove the "bin/python" suffix
