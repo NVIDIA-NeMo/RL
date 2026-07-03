@@ -623,6 +623,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
                 return super().model_post_init(context)
 
+        # Bind the worker instance for use inside the serving mixins below:
+        # their methods run with `self` = the vLLM serving/render object, which
+        # has no `cfg` attribute.
+        worker_self = self
+
         class NeMoRLOpenAIServingMixin:
             @staticmethod
             def _set_max_tokens(request, max_tokens: int) -> None:
@@ -677,7 +682,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         except TypeError:
                             message["content"] = []
 
-                truncate_prompt_tokens = self.cfg.get("truncate_prompt_tokens")
+                truncate_prompt_tokens = worker_self.cfg.get("truncate_prompt_tokens")
                 if (
                     truncate_prompt_tokens is not None
                     and hasattr(request, "truncate_prompt_tokens")
@@ -830,8 +835,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
-        # belongs on the render subclass.
-        worker_self = self
+        # belongs on the render subclass (worker_self is bound above).
 
         class NeMoRLOpenAIServingChatMixin:
             async def chat_completion_full_generator(
