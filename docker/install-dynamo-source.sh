@@ -12,6 +12,10 @@ UV_BIN=${UV_BIN:-$(command -v uv)}
 export RUSTUP_HOME=${RUSTUP_HOME:-/opt/rustup}
 export CARGO_HOME=${CARGO_HOME:-/opt/cargo}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/opt/dynamo-target}
+# cudarc 0.19.3 (locked by this Dynamo revision) recognizes CUDA through
+# 13.1. It uses dynamic loading here, so compiling its API cfg for 13.1 is
+# compatible with the CUDA 13.2 runtime in current NeMo-RL images.
+export CUDARC_CUDA_VERSION=${CUDARC_CUDA_VERSION:-13010}
 export PATH="${CARGO_HOME}/bin:${DYNAMO_VENV}/bin:${PATH}"
 
 # The pinned revision is ahead of the latest published release: ai-dynamo
