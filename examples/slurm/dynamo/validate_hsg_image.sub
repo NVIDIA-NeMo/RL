@@ -16,10 +16,11 @@ CONTAINER=${CONTAINER:-${ROOT}/images/nemo-rl-dynamo-swe-hsg.sqsh}
 GYM_CODE=${GYM_CODE:-${REPO}/3rdparty/Gym-workspace/Gym}
 
 test -s "${CONTAINER}"
+export ROOT REPO
 srun \
   --container-image="${CONTAINER}" \
   --container-mounts="/lustre:/lustre,${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym" \
   --container-workdir="${REPO}" \
   --no-container-mount-home \
-  /bin/bash -lc \
+  /bin/bash -c \
   'bash examples/slurm/dynamo/validate_hsg_image.sh && bash examples/slurm/dynamo/run_unit_tests.sh'
