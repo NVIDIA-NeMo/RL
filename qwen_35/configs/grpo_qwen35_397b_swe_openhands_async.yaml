@@ -196,7 +196,14 @@ policy:
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     sequence_length_round: 64
   sequence_packing:
-    enabled: false
+    # Matches the qwen3-235B SWE sibling recipe on main. Without packing the
+    # megatron path pads every sequence in the batch to one global
+    # padded_seq_length; a single 65k rollout then makes ~95% of all tokens
+    # pad tokens, which all route to the SAME top-10 experts (frozen router,
+    # no load balancing) and blow up one EP rank's alltoall receive/GEMM
+    # buffers (~135 GiB transient + failed 24.85 GiB alloc in job 2269608 on
+    # stage-0 ranks). Packing keeps microbatches at real tokens.
+    enabled: true
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: modified_first_fit_decreasing
