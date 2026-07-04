@@ -10,10 +10,8 @@
 # build runs in the main venv context and has access to torch / CUDA headers.
 #
 # To control which fork/ref is built, set these env vars before `uv sync`:
-#   BUILD_CUSTOM_TRTLLM_URL        (default: https://github.com/shuyixiong/TensorRT-LLM.git)
-#   BUILD_CUSTOM_TRTLLM_REF        (default: nemorl)
-#   BUILD_CUSTOM_TRTLLM_MODELOPT_URL  (default: https://github.com/NVIDIA/TensorRT-Model-Optimizer.git)
-#   BUILD_CUSTOM_TRTLLM_MODELOPT_REF  (default: 0.37.0)
+#   BUILD_CUSTOM_TRTLLM_URL  (default: https://github.com/shuyixiong/TensorRT-LLM.git)
+#   BUILD_CUSTOM_TRTLLM_REF  (default: nemorl)
 #
 # Sourced from requirements.txt on github.com/shuyixiong/TensorRT-LLM@nemorl.
 # Intentional omissions from requirements.txt:
