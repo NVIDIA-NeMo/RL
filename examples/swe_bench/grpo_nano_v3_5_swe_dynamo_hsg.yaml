@@ -32,6 +32,7 @@ checkpointing:
   ft_keep_latest_k: 1
   ft_save_period: 1
   checkpoint_must_save_by: "00:03:30:00"
+  save_optimizer: true
   model_save_format: "safetensors"
   save_consolidated: false
 
