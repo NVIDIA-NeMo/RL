@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#SBATCH --account=coreai_tritoninference_triton3
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=01:00:00
+#SBATCH --job-name=nemo-rl-dynamo-swe-validate
+
+set -euo pipefail
+
+ROOT=${ROOT:-/lustre/fsw/portfolios/coreai/users/jothomson/nemo-rl-dynamo-slurm-swe}
+REPO=${REPO:-${ROOT}/RL}
+CONTAINER=${CONTAINER:-${ROOT}/images/nemo-rl-dynamo-swe-hsg.sqsh}
+GYM_CODE=${GYM_CODE:-${REPO}/3rdparty/Gym-workspace/Gym}
+
+test -s "${CONTAINER}"
+srun \
+  --container-image="${CONTAINER}" \
+  --container-mounts="/lustre:/lustre,${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym" \
+  --container-workdir="${REPO}" \
+  --no-container-mount-home \
+  /bin/bash examples/slurm/dynamo/validate_hsg_image.sh

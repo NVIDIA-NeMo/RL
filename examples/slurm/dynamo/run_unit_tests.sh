@@ -24,6 +24,7 @@ cd "${REPO}"
   examples/slurm/dynamo/build_sqsh_hsg.sub \
   examples/slurm/dynamo/launch.sh \
   examples/slurm/dynamo/run_unit_tests.sh \
+  examples/slurm/dynamo/validate_hsg_image.sub \
   examples/slurm/dynamo/validate_hsg_image.sh \
   examples/swe_bench/run_grpo_nano_v3_5_swe_dynamo_hsg_e2e.sh
 
