@@ -246,6 +246,14 @@ if [[ -d "${R2E_FIXES_DIR}" ]]; then
     R2E_UTILS_DIR="${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/swe_r2e_gym_setup/R2E-Gym/src/r2egym/agenthub/utils"
     MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/log.py:${R2E_UTILS_DIR}/log.py"
     MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/utils.py:${R2E_UTILS_DIR}/utils.py"
+    # Gym HTTP client fix: transient connection errors were retried forever,
+    # so a dead vLLM engine turned every rollout touching it into a permanent
+    # hang and the training buffer never filled (job 2273194). The patched
+    # copy caps the retry window (NEMO_GYM_TRANSIENT_RETRY_SECONDS, 120s
+    # default) and then raises so the rollout is back-filled.
+    if [[ -f "${R2E_FIXES_DIR}/server_utils.py" ]]; then
+        MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/server_utils.py:${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym/nemo_gym/server_utils.py"
+    fi
 fi
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
