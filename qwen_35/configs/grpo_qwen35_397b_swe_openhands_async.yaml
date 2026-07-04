@@ -271,6 +271,15 @@ policy:
         - 16
         - 32
         - 64
+        # The image default benchmarks combo kernels during inductor compile;
+        # first-hit dynamic-shape compiles of the 60L/512E graph then stall TP
+        # ranks past the 600s NCCL watchdog (engine deaths in jobs
+        # 2269608/2272089: allgather timeout -> EngineCore fatal). Disable the
+        # compile-time benchmarking; inductor itself stays on.
+        inductor_compile_config:
+          enable_auto_functionalized_v2: false
+          combo_kernels: false
+          benchmark_combo_kernel: false
         pass_config:
           fuse_norm_quant: false
           fuse_act_quant: false
