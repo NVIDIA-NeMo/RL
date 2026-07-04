@@ -111,14 +111,9 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         "https://github.com/shuyixiong/TensorRT-LLM.git",
     )
     git_ref = env.get("BUILD_CUSTOM_TRTLLM_REF", "nemorl")
-    modelopt_url = env.get(
-        "BUILD_CUSTOM_TRTLLM_MODELOPT_URL",
-        "https://github.com/NVIDIA/TensorRT-Model-Optimizer.git",
-    )
-    modelopt_ref = env.get("BUILD_CUSTOM_TRTLLM_MODELOPT_REF", "0.37.0")
 
     subprocess.run(
-        ["bash", str(script), git_url, git_ref, modelopt_url, modelopt_ref],
+        ["bash", str(script), git_url, git_ref],
         check=True,
         env=env,
         cwd=str(repo_root),

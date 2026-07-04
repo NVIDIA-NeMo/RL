@@ -210,7 +210,6 @@ if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     # invokes tools/build-custom-trtllm.sh during this sync (≈60 min).
     # Build coordinates are passed via env vars:
     #   BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF
-    #   BUILD_CUSTOM_TRTLLM_MODELOPT_URL / BUILD_CUSTOM_TRTLLM_MODELOPT_REF
     uv sync --link-mode symlink --locked --extra trtllm --no-install-project
 fi
 

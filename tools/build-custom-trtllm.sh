@@ -21,8 +21,6 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 # Parse command line arguments
 GIT_URL=${1:-https://github.com/NVIDIA/TensorRT-LLM.git}
 GIT_REF=${2:-v1.3.0rc20}
-MODELOPT_GIT_URL=${3:-https://github.com/NVIDIA/TensorRT-Model-Optimizer.git}
-MODELOPT_GIT_REF=${4:-0.37.0}
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty")/TensorRT-LLM
 if [[ -e "$BUILD_DIR" ]]; then
@@ -39,8 +37,6 @@ mkdir -p "$WHEEL_OUTPUT_DIR"
 echo "Building TensorRT-LLM from:"
 echo "  TRT-LLM Git URL: $GIT_URL"
 echo "  TRT-LLM Git ref: $GIT_REF"
-echo "  ModelOpt Git URL: $MODELOPT_GIT_URL"
-echo "  ModelOpt Git ref: $MODELOPT_GIT_REF"
 
 # git-lfs is required because TRT-LLM ships its `internal_cutlass_kernels`
 # static archives (~67MB on aarch64, ~66MB on x86_64) as LFS-tracked .tar.xz
@@ -65,24 +61,6 @@ if ! command -v git-lfs >/dev/null 2>&1; then
 fi
 git lfs install --skip-repo
 
-# modelopt 0.37 from source. Two things force this:
-#   (1) PyPI does not publish a cp313/aarch64 wheel for nvidia-modelopt 0.37.x
-#   (2) upstream 0.37.0 pins requires-python = ">=3.10,<3.13" in both
-#       pyproject.toml and setup.py — we patch the 3.13 ceiling.
-# TRT-LLM v1.3.0rc15's requirements.txt asks for `nvidia-modelopt[torch]~=0.37.0`,
-# which would conflict with NeMo-RL main's unpinned `nvidia-modelopt[torch]`
-# (uv resolves to 0.43.x at lock time). We install the 0.37 wheel after the
-# venv is synced so the trtllm wheel build picks up the matching version.
-echo "Building modelopt $MODELOPT_GIT_REF from source..."
-MODELOPT_SRC=$(mktemp -d)/modelopt
-git clone --depth=1 --branch "$MODELOPT_GIT_REF" "$MODELOPT_GIT_URL" "$MODELOPT_SRC"
-sed -i 's|requires-python = ">=3.10,<3.13"|requires-python = ">=3.10,<3.14"|' "$MODELOPT_SRC/pyproject.toml"
-sed -i 's|python_requires=">=3.10,<3.13"|python_requires=">=3.10,<3.14"|' "$MODELOPT_SRC/setup.py"
-MODELOPT_WHEEL_DIR=$(mktemp -d)
-python3 -m pip wheel --no-deps -w "$MODELOPT_WHEEL_DIR" "$MODELOPT_SRC"
-python3 -m pip install --no-deps --force-reinstall "$MODELOPT_WHEEL_DIR"/*.whl
-rm -rf "$MODELOPT_SRC" "$MODELOPT_WHEEL_DIR"
-
 # Clone TRT-LLM + LFS pull + submodules
 echo "Cloning TensorRT-LLM..."
 git clone --depth=1 --branch "$GIT_REF" "$GIT_URL" "$BUILD_DIR"
@@ -92,13 +70,13 @@ git lfs pull
 git submodule update --init --recursive --depth=1
 
 # requirements.txt patches:
-#   - relax modelopt pin to be compatible with our from-source 0.37 install
-#     (upstream is `~=0.37.0` which only allows 0.37.x; we want 0.37+ to also
-#     work if a newer wheel becomes available without a rebuild)
+#   - bump modelopt pin to >=0.44.0a0 to match the runtime venv version; the
+#     venv already has 0.44.0a0 installed, so the TRT-LLM wheel build picks it
+#     up directly without a separate modelopt from-source build step.
 #   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
 #     downgrading creates an unresolvable conflict in the venv.
-sed -i 's|nvidia-modelopt\[torch\]~=0\.37\.0|nvidia-modelopt[torch]>=0.37.0|' requirements.txt
+sed -i 's|nvidia-modelopt\[torch\]~=0\.37\.0|nvidia-modelopt[torch]>=0.44.0a0|' requirements.txt
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
 # cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
