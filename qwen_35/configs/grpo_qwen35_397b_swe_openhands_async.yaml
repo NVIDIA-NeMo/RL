@@ -253,7 +253,15 @@ policy:
       expert_parallel_size: 8
       gpu_memory_utilization: 0.55
       max_model_len: 65536
-      enforce_eager: false
+      # Engines kept dying at first traffic: a TP rank stalls >600s in a
+      # first-hit inductor dynamic-shape compile (persists even with
+      # combo-kernel benchmarking off), the peers' logits allgather trips the
+      # NCCL watchdog, and the whole engine dies (jobs 2269608/2272089/
+      # 2273194; vLLM re-arms TORCH_NCCL_ASYNC_ERROR_HANDLING so the launcher
+      # env cannot relax it). Eager mode removes runtime compilation
+      # entirely. Perf follow-up: re-enable compiled engines once the vLLM
+      # process-group timeout can be raised past worst-case compile times.
+      enforce_eager: true
       use_deep_gemm: false
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
