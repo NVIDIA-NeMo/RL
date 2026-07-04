@@ -736,15 +736,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
 
-    # Optional attention backend override (flash/fused/unfused/auto/local).
-    # mcore's LanguageModule derives the NVTE_*_ATTN env vars from this field.
-    if "attention_backend" in config["megatron_cfg"]:
-        from megatron.core.transformer.enums import AttnBackend
-
-        model_cfg.attention_backend = AttnBackend[
-            config["megatron_cfg"]["attention_backend"]
-        ]
-
     # Activation checkpointing
     if config["megatron_cfg"]["activation_checkpointing"]:
         granularity = config["megatron_cfg"].get("recompute_granularity", "full")
