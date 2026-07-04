@@ -38,13 +38,14 @@ test "$(uname -m)" = aarch64
 export ROOT REPO
 export MATERIALIZE_NEMO_ENV=0
 export EXPECTED_GYM_COMMIT=eddd5e98a541cc90e0ee41f1b5e9bd146b5be665
+export NEMOTRON_MODEL=/lustre/fsw/portfolios/llmservice/users/pjin/devel/nemo-rl-ultra-v3-nano-opd-dev-20260513/results/mopd_ultrav3_to_nanov3_5_repro_v5_kd_opt_full-hsg-20260524-r1/step_18/hf
 srun \
   --container-image="${BASE_IMAGE}" \
   --container-remap-root \
   --container-writable \
   --no-container-mount-home \
   --container-save="${OUTPUT}" \
-  --container-mounts="${ROOT}:${ROOT}" \
+  --container-mounts="/lustre:/lustre" \
   --container-workdir="${REPO}" \
   /bin/bash examples/slurm/dynamo/assemble_container.sh
 

@@ -10,6 +10,7 @@ ETCD_VERSION=${ETCD_VERSION:-v3.5.21}
 NATS_VERSION=${NATS_VERSION:-v2.11.6}
 MATERIALIZE_NEMO_ENV=${MATERIALIZE_NEMO_ENV:-1}
 EXPECTED_GYM_COMMIT=${EXPECTED_GYM_COMMIT:-eddd5e98a541cc90e0ee41f1b5e9bd146b5be665}
+NEMOTRON_MODEL=${NEMOTRON_MODEL:-/tmp/nemotron-nano-v3.5}
 
 case "$(uname -m)" in
   x86_64)
@@ -78,9 +79,19 @@ rm -rf /tmp/etcd* /tmp/nats*
 /opt/dynamo_venv/bin/python \
   /opt/nemo-rl/nemo_rl/models/generation/dynamo/validate_dynamo_vllm_args.py \
   '["--model","Qwen/Qwen2.5-1.5B","--served-model-name","Qwen/Qwen2.5-1.5B","--namespace","nemo-rl-build","--discovery-backend","etcd","--request-plane","tcp","--enable-rl","--weight-transfer-config","{\"backend\":\"nccl\"}","--tensor-parallel-size","1","--pipeline-parallel-size","1","--dtype","bfloat16","--endpoint-types","chat,completions"]'
+if [[ ! -f "${NEMOTRON_MODEL}/chat_template.jinja" ]]; then
+  NEMOTRON_MODEL=/tmp/nemotron-nano-v3.5
+  mkdir -p "${NEMOTRON_MODEL}"
+  printf '{# parser-only custom template fixture #}\n' \
+    > "${NEMOTRON_MODEL}/chat_template.jinja"
+fi
+NEMOTRON_VALIDATE_ARGV=$(
+  NEMOTRON_MODEL="${NEMOTRON_MODEL}" /opt/dynamo_venv/bin/python -c \
+    'import json, os; model = os.environ["NEMOTRON_MODEL"]; print(json.dumps(["--model", model, "--served-model-name", model, "--namespace", "nemo-rl-build", "--discovery-backend", "etcd", "--request-plane", "tcp", "--event-plane", "nats", "--enable-rl", "--weight-transfer-config", "{\"backend\":\"nccl\"}", "--trust-remote-code", "--seed", "0", "--tensor-parallel-size", "4", "--pipeline-parallel-size", "1", "--dtype", "bfloat16", "--kv-cache-dtype", "auto", "--gpu-memory-utilization", "0.85", "--max-model-len", "196608", "--no-enforce-eager", "--load-format", "auto", "--attention-backend", "FLASH_ATTN", "--moe-backend", "triton", "--mamba-ssm-cache-dtype", "float32", "--compilation-config", "{\"cudagraph_capture_sizes\":[1,2,4,8,16,32,64],\"pass_config\":{\"fuse_allreduce_rms\":false}}", "--dyn-tool-call-parser", "qwen3_coder", "--dyn-reasoning-parser", "nemotron_nano", "--exclude-tools-when-tool-choice-none", "--no-dyn-enable-structural-tag", "--dyn-structural-tag-scope", "auto", "--dyn-structural-tag-schema", "auto", "--custom-jinja-template", f"{model}/chat_template.jinja", "--endpoint-types", "chat,completions"]))'
+)
 /opt/dynamo_venv/bin/python \
   /opt/nemo-rl/nemo_rl/models/generation/dynamo/validate_dynamo_vllm_args.py \
-  '["--model","/models/nemotron-nano-v3.5","--served-model-name","/models/nemotron-nano-v3.5","--namespace","nemo-rl-build","--discovery-backend","etcd","--request-plane","tcp","--event-plane","nats","--enable-rl","--weight-transfer-config","{\"backend\":\"nccl\"}","--trust-remote-code","--seed","0","--tensor-parallel-size","4","--pipeline-parallel-size","1","--dtype","bfloat16","--kv-cache-dtype","auto","--gpu-memory-utilization","0.85","--max-model-len","196608","--no-enforce-eager","--load-format","auto","--attention-backend","FLASH_ATTN","--moe-backend","triton","--mamba-ssm-cache-dtype","float32","--compilation-config","{\"cudagraph_capture_sizes\":[1,2,4,8,16,32,64],\"pass_config\":{\"fuse_allreduce_rms\":false}}","--dyn-tool-call-parser","qwen3_coder","--dyn-reasoning-parser","nemotron_nano","--exclude-tools-when-tool-choice-none","--no-dyn-enable-structural-tag","--dyn-structural-tag-scope","auto","--dyn-structural-tag-schema","auto","--custom-jinja-template","/models/nemotron-nano-v3.5/chat_template.jinja","--endpoint-types","chat,completions"]'
+  "${NEMOTRON_VALIDATE_ARGV}"
 if /opt/dynamo_venv/bin/python \
   /opt/nemo-rl/nemo_rl/models/generation/dynamo/validate_dynamo_vllm_args.py \
   '["--model","Qwen/Qwen2.5-1.5B","--served-model-name","Qwen/Qwen2.5-1.5B","--namespace","nemo-rl-build","--discovery-backend","etcd","--request-plane","tcp","--enable-rl","--weight-transfer-config","{\"backend\":\"nccl\"}","--dyn-tool-call-parser","not-a-real-parser"]'; then
