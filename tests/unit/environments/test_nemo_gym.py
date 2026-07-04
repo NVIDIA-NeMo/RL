@@ -372,6 +372,62 @@ def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     assert "apply_chat_template failed" in msg
     assert "RuntimeError" in msg
     assert "['reasoning']" in msg
+def _make_noncontiguous_nemo_gym_result():
+    """Two assistant turns where turn 2's prompt breaks token-prefix contiguity.
+
+    After turn 1, seen_token_ids == [1, 2, 3]; turn 2's prompt starts with
+    [1, 99, ...] (99 != 2), e.g. a tokenization/re-render edge case in a long
+    multi-turn rollout.
+    """
+    return {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [1, 99, 3, 4],
+                    "generation_token_ids": [6],
+                    "generation_log_probs": [-0.2],
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+
+class _JoinTokenizer:
+    def batch_decode(self, batch):
+        return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+
+def test_nemo_gym_postprocess_noncontiguous_asserts_by_default():
+    class _MockSelf:
+        cfg = {}
+
+    with pytest.raises(AssertionError, match="Non-contiguous messages found"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+        )
+
+
+def test_nemo_gym_postprocess_noncontiguous_truncates_when_enabled():
+    class _MockSelf:
+        cfg = {"truncate_noncontiguous_episodes": True}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), _make_noncontiguous_nemo_gym_result(), _JoinTokenizer()
+        )
+    )
+
+    # The corrupted second turn is dropped; the contiguous first turn survives
+    # as a trainable (user prompt, assistant generation) pair.
+    assert len(result["message_log"]) == 2
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3]
 
 
 @pytest.mark.nemo_gym
