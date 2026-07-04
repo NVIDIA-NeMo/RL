@@ -102,6 +102,11 @@ policy:
     clear_cache_every_n_steps: null
   megatron_cfg:
     enabled: true
+    # Force cuDNN fused attention: TE's auto selection fell back to unfused on
+    # this stack, materializing [B,H,S,S] scores (98.45 GiB at S=65536) and
+    # OOMing every training step. With 'fused', mcore pins the NVTE_*_ATTN env
+    # and TE errors out with the rejection reason instead of falling back.
+    attention_backend: fused
     empty_unused_memory_level: 1
     train_iters: 100000
     activation_checkpointing: true
@@ -176,14 +181,13 @@ policy:
       # Jobs 2269608/2272089 OOM'd in TE's UNFUSED dot-product-attention
       # fallback (softmax.py forward_torch_softmax), which materializes the
       # full [B,H,S,S] score matrix (S=65536 -> 24.85-98.45 GiB allocs).
-      # Forbid the unfused fallback so TE either uses flash/cuDNN fused
-      # attention or fails loudly with the backend-rejection reason, and
-      # allow nondeterministic cuDNN attention algorithms (a common reason
-      # fused attention gets rejected). Debug flags log backend selection.
-      NVTE_UNFUSED_ATTN: "0"
+      # attention_backend: fused (below) makes mcore set the NVTE_*_ATTN env
+      # vars itself (raw NVTE_UNFUSED_ATTN=0 trips mcore's consistency assert,
+      # job 2272954). Nondeterministic cuDNN attention algorithms are the most
+      # common fused-attention rejection cause; debug flags log selection.
       NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
       NVTE_DEBUG: "1"
-      NVTE_DEBUG_LEVEL: "1"
+      NVTE_DEBUG_LEVEL: "2"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0
