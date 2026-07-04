@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=160G
 #SBATCH --time=01:00:00
 #SBATCH --job-name=nemo-rl-dynamo-swe-validate
 
