@@ -90,7 +90,7 @@ fi
 
 test "$(git -C "${REPO}/3rdparty/Gym-workspace/Gym" rev-parse HEAD)" = "${EXPECTED_GYM_COMMIT}"
 printf '%s\n' "${EXPECTED_GYM_COMMIT}" > /opt/nemo_gym_commit
-GYM_PYTHON=$(find /opt/gym_venvs -path '*/.venv/bin/python' -type f -print -quit)
+GYM_PYTHON=$(find /opt/gym_venvs -path '*/.venv/bin/python' -print -quit)
 test -x "${GYM_PYTHON}"
 "${GYM_PYTHON}" -c \
   'import pathlib, nemo_gym; expected = pathlib.Path("/opt/nemo-rl/3rdparty/Gym-workspace/Gym").resolve(); actual = pathlib.Path(nemo_gym.__file__).resolve(); assert actual.is_relative_to(expected), (actual, expected); print("Gym source", actual)'
