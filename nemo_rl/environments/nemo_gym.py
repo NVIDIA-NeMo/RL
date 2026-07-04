@@ -111,6 +111,14 @@ class NemoGymConfig(TypedDict):
     # Forwarded from policy.tokenizer.use_fastokens so rollout actors patch their
     # tokenizer consistently with the driver. Defaults to off when absent.
     use_fastokens: NotRequired[bool]
+    # When true, an episode whose turn breaks token-prefix contiguity (e.g. a
+    # rare tokenization/re-render edge case in a long multi-turn rollout) is
+    # truncated at the last contiguous turn: the corrupted tail is dropped and
+    # the valid prefix stays trainable (same philosophy as overlong filtering).
+    # When absent/false (default), such an episode raises the contiguity
+    # assertion below, which kills the rollout task; under async GRPO a single
+    # such episode can then stall the training step indefinitely.
+    truncate_noncontiguous_episodes: NotRequired[bool]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -371,10 +379,23 @@ Depending on your data shape, you may want to change these values."""
             ):
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not is_contiguous and self.cfg.get("truncate_noncontiguous_episodes"):
+                # Opt-in resilience: keep the contiguous prefix trainable and
+                # drop the corrupted tail (same philosophy as overlong
+                # filtering) instead of killing the rollout task — under async
+                # GRPO a single asserting episode can stall the step
+                # indefinitely.
+                print(
+                    "[nemo_gym] WARNING: non-contiguous turn; truncating episode "
+                    f"at {len(nemo_rl_message_log)} messages "
+                    f"(seen={len(seen_token_ids)} tokens); dropping corrupted tail."
+                )
+                break
+            assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
@@ -627,7 +648,7 @@ def spinup_nemo_gym_actor(
     Args:
         env_configs: The master_config.env mapping; env_configs["nemo_gym"] supplies
             the Gym global config plus NeMo-RL detection knobs (invalid_tool_call_patterns,
-            thinking_tags, num_gpu_nodes).
+            thinking_tags, truncate_noncontiguous_episodes, num_gpu_nodes).
         base_urls: Per-DP-rank OpenAI-compatible server base URLs from the generation backend.
         model_name: Served model name the Gym rollouts should target.
         enable_router_replay: Sets require_routed_experts on the NemoGymConfig.
@@ -645,6 +666,9 @@ def spinup_nemo_gym_actor(
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+    truncate_noncontiguous_episodes = nemo_gym_dict.pop(
+        "truncate_noncontiguous_episodes", False
+    )
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
     # image-baked venvs instead of rebuilding them.
@@ -663,6 +687,7 @@ def spinup_nemo_gym_actor(
         require_routed_experts=enable_router_replay,
         routed_experts_dtype=routed_experts_dtype,
         use_fastokens=use_fastokens,
+        truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
         initial_global_config_dict=nemo_gym_dict,
     )
 
