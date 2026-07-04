@@ -141,10 +141,23 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         if "max_num_tokens" in trtllm_cfg:
             llm_kwargs["max_num_tokens"] = trtllm_cfg["max_num_tokens"]
 
+        # Extract KvCacheConfig-level fields from trtllm_kwargs before
+        # spreading the rest as top-level AsyncLLM kwargs.  AsyncLLM validates
+        # its kwargs against LlmArgs.model_fields and rejects unknown keys;
+        # mamba_ssm_cache_dtype and friends live on KvCacheConfig, not LlmArgs.
+        _KV_CACHE_FIELDS = {
+            "mamba_ssm_cache_dtype",
+            "mamba_ssm_stochastic_rounding",
+            "mamba_ssm_philox_rounds",
+        }
+        extra_trtllm_kwargs = dict(self.cfg.get("trtllm_kwargs") or {})
+        kv_cache_kwargs = {k: extra_trtllm_kwargs.pop(k) for k in _KV_CACHE_FIELDS if k in extra_trtllm_kwargs}
+
         gpu_mem_util = trtllm_cfg.get("gpu_memory_utilization")
-        if gpu_mem_util is not None:
+        if gpu_mem_util is not None or kv_cache_kwargs:
             llm_kwargs["kv_cache_config"] = KvCacheConfig(
-                free_gpu_memory_fraction=gpu_mem_util,
+                **({"free_gpu_memory_fraction": gpu_mem_util} if gpu_mem_util is not None else {}),
+                **kv_cache_kwargs,
             )
 
         moe_tp = trtllm_cfg.get("moe_tensor_parallel_size")
@@ -160,9 +173,9 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
             llm_kwargs["sleep_config"] = SleepConfig()
             llm_kwargs["per_worker_gpu_share"] = 0.5
 
-        # Escape hatch: spread user-provided TRT-LLM kwargs last so they can
-        # override anything above for advanced tuning.
-        llm_kwargs.update(self.cfg.get("trtllm_kwargs") or {})
+        # Escape hatch: spread remaining user-provided TRT-LLM kwargs last so
+        # they can override anything above for advanced tuning.
+        llm_kwargs.update(extra_trtllm_kwargs)
 
         # Defer __await__ (which fires setup_async) to post_init_async so
         # AsyncLLM setup runs on the Ray actor's asyncio loop.
