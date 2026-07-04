@@ -102,11 +102,13 @@ policy:
     clear_cache_every_n_steps: null
   megatron_cfg:
     enabled: true
-    # Force cuDNN fused attention: TE's auto selection fell back to unfused on
-    # this stack, materializing [B,H,S,S] scores (98.45 GiB at S=65536) and
-    # OOMing every training step. With 'fused', mcore pins the NVTE_*_ATTN env
-    # and TE errors out with the rejection reason instead of falling back.
-    attention_backend: fused
+    # Force FlashAttention-2: TE's auto selection fell back to unfused on this
+    # stack (cuDNN fused has no hdim-256 support on sm10.3 at all), which
+    # materialized [B,H,S,S] scores (98.45 GiB at S=65536) and OOM'd every
+    # training step. flash-attn 2.8.1 handles hdim 256 on GB300 once TE's
+    # arch allowlist admits sm10.3 (patched te_dpa_utils.py bind-mounted by
+    # the launcher; verified fwd+bwd in preflight job 2274314).
+    attention_backend: flash
     empty_unused_memory_level: 1
     train_iters: 100000
     activation_checkpointing: true

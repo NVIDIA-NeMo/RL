@@ -254,6 +254,15 @@ if [[ -d "${R2E_FIXES_DIR}" ]]; then
     if [[ -f "${R2E_FIXES_DIR}/server_utils.py" ]]; then
         MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/server_utils.py:${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym/nemo_gym/server_utils.py"
     fi
+    # TE attention-backend gate fix: TE 2.15's FlashAttention-2 head_dim>192
+    # allowlist enumerates sm 8.0/9.0/10.0/12.0 but not GB300's sm10.3, so the
+    # Qwen3.5 full-attention layers (head_dim 256) fell back to unfused
+    # attention ([B,H,S,S] materialization -> the training-step OOMs).
+    # Verified empirically (preflight3b, job 2274314): with (10,3) allowed,
+    # flash-attn 2.8.1 runs hdim-256 fwd+bwd on sm103 in thd and sbhd.
+    if [[ -f "${R2E_FIXES_DIR}/te_dpa_utils.py" ]]; then
+        MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/te_dpa_utils.py:/root/.cache/uv/archive-v0/oVtZpwakETGWXnnj/transformer_engine/pytorch/attention/dot_product_attention/utils.py"
+    fi
 fi
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
