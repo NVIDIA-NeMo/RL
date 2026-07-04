@@ -21,4 +21,5 @@ srun \
   --container-mounts="/lustre:/lustre,${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym" \
   --container-workdir="${REPO}" \
   --no-container-mount-home \
-  /bin/bash examples/slurm/dynamo/validate_hsg_image.sh
+  /bin/bash -lc \
+  'bash examples/slurm/dynamo/validate_hsg_image.sh && bash examples/slurm/dynamo/run_unit_tests.sh'
