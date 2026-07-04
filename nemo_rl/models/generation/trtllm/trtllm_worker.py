@@ -53,7 +53,7 @@ class TrtllmGenerationWorkerImpl:
     def configure_worker(
         num_gpus: int | float,
         bundle_indices: Optional[tuple[int, list[int]]] = None,
-    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         # TRT-LLM with orchestrator_type="ray" creates its own internal
         # Ray actors that each need a GPU.  The outer actor therefore
         # gives up its GPU reservation.
@@ -77,7 +77,7 @@ class TrtllmGenerationWorkerImpl:
             # to TRT-LLM as ray_placement_config (instead of TRTLLM_RAY_BUNDLE_INDICES).
             init_kwargs["bundle_indices"] = bundle_indices[1]
 
-        return resources, env_vars, init_kwargs
+        return resources, env_vars, init_kwargs, {}
 
     def __repr__(self) -> str:
         return "TrtllmGenerationWorker"
@@ -368,18 +368,45 @@ class TrtllmGenerationWorkerImpl:
     #  Helpers
     # ------------------------------------------------------------------ #
 
+    def _resolve_end_id(self) -> Optional[int]:
+        """Resolve end_id from model config.json, cached after first call.
+
+        Mirrors vLLM engine which reads eos_token_id from config.json automatically
+        at startup. TRT-LLM requires it to be passed explicitly as end_id.
+        """
+        if hasattr(self, "_end_id_cache"):
+            return self._end_id_cache
+        end_id: Optional[int] = None
+        try:
+            from transformers import AutoConfig
+            hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+            eos_id = getattr(hf_config, "eos_token_id", None)
+            if eos_id is not None:
+                end_id = eos_id[0] if isinstance(eos_id, list) else eos_id
+        except Exception as e:
+            print(f"[TrtllmWorker] AutoConfig load failed: {e}", flush=True)
+        self._end_id_cache = end_id
+        return end_id
+
     def _build_sampling_params(self, *, greedy: bool):
         top_k_cfg = self.cfg["top_k"]
         top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else 0)
         temperature = 0.0 if greedy else self.cfg["temperature"]
-        stop_ids = self.cfg.get("stop_token_ids") or []
+
+        end_id = self._resolve_end_id()
+        stop_ids = list(self.cfg.get("stop_token_ids") or [])
 
         return self.TrtSamplingParams(
             temperature=temperature,
             top_p=self.cfg["top_p"],
             top_k=top_k_val,
             max_tokens=self.cfg["max_new_tokens"],
-            end_id=stop_ids[0] if stop_ids else None,
+            end_id=end_id,
+            stop_token_ids=stop_ids or None,
+            # Keep the EOS / stop token in the returned token_ids so that the
+            # response sequence matches HF / vLLM behavior. Required for
+            # logprob alignment with training-side Megatron.
+            include_stop_str_in_output=True,
             logprobs=True,
         )
 
