@@ -1,0 +1,478 @@
+# =============================================================================
+# Nemotron Nano V3.5 SWE E2E — fixed Dynamo/Slurm R1 for HSG
+# =============================================================================
+# Ported from GitLab commit 7195900. This is the smallest real-training shape:
+# two 4-GPU policy nodes plus one TP4 Ray-managed Dynamo inference node.
+#
+#   - gpus_per_node: 4
+#   - Train TP4/CP2/EP8/PP1
+#   - Dynamo/vLLM TP4/PP1
+#   - One asynchronous GRPO optimizer step
+#   - Max sequence length: 196608
+# =============================================================================
+
+# =============================================================================
+# Cluster — overridden by launch script for parallelism changes
+# =============================================================================
+cluster:
+  gpus_per_node: 4
+  num_nodes: 3
+  segment_size: 1
+
+# =============================================================================
+# Checkpointing
+# =============================================================================
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo_ultra_e2e"
+  metric_name: "val:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 3
+  ft_keep_latest_k: 1
+  ft_save_period: 1
+  checkpoint_must_save_by: "00:03:30:00"
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+# =============================================================================
+# GRPO Algorithm
+# =============================================================================
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 2
+  num_val_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_epochs: 4
+  max_num_steps: 1
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: -100
+  advantage_clip_high: 100
+  val_period: 10000
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: null
+  val_batch_size: 256
+  seed: 42
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  penalize_invalid_tool_call: true
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: true
+  malformed_thinking_advantage: -5.0
+
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+  use_best_at_k: false
+  best_at_k_k: 8
+  best_at_k_m: 1000
+
+  use_combined_training: false
+  combined_training_weight_mode: "auto"
+  combined_training_best_at_k_weight: 0.2
+  combined_training_pass_at_1_weight: 1.0
+
+  dynamic_sampling_oversample_ratio: 1.0
+  seq_logprob_error_threshold: 2
+
+# =============================================================================
+# Loss Function
+# =============================================================================
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+
+# =============================================================================
+# Policy
+# =============================================================================
+policy:
+  model_name: "/lustre/fsw/portfolios/llmservice/users/pjin/devel/nemo-rl-ultra-v3-nano-opd-dev-20260513/results/mopd_ultrav3_to_nanov3_5_repro_v5_kd_opt_full-hsg-20260524-r1/step_18/hf"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  hf_config_overrides: {}
+
+  train_global_batch_size: 2
+  train_micro_batch_size: 1
+  generation_batch_size: 2
+  logprob_batch_size: 1
+  max_total_sequence_length: 196608
+  precision: "bfloat16"
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+
+    # TP=8 spans 2 GB200 nodes (4 GPUs each) via intra-rack NVLink.
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 2
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+
+    # MoE
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_flex_dispatcher_backend: "hybridep"
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+
+    # Compute
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    # community_import.py reads megatron_cfg["gradient_accumulation_fusion"] directly
+    # (no default) on the HF->megatron conversion path; absent here it raises KeyError.
+    gradient_accumulation_fusion: false
+    defer_fp32_logits: true
+
+    # Logging
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    # MTP — disabled
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: true
+    # null disables MTP entirely (matches the upstream mtp=0 run's behavior). This
+    # checkout's hybrid model gates MTP on `mtp_num_layers is not None`
+    # (hybrid_model.py:544): 0 still enters the MTP block and asserts > 0, and 1 runs
+    # MTP forward on only the last-stage ranks (suspected cause of the EXPERT_MODEL_
+    # PARALLEL NCCL collective timeout). null makes that check False -> MTP is skipped
+    # on all ranks, no partial-rank EP collective. Requires the schema change making
+    # MegatronConfig.mtp_num_layers accept None (nemo_rl/models/policy/__init__.py).
+    mtp_num_layers: null
+    mtp_detach_heads: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-6
+      min_lr: 3.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3e-7
+      override_opt_param_scheduler: true
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    # FP8 — overridden by precision recipe in launch script
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      # NOTE: fully_parallel_{save,load}_process_group / fully_parallel_load_exchange_algo
+      # were dropped from this checkout's megatron-bridge CheckpointConfig (submodule
+      # 554c7b9); leaving them in raises InstantiationException "Unexpected config keys".
+      # Removed for the current-repo reproduction.
+
+    env_vars: null
+
+  # ---------------------------------------------------------------------------
+  # Sequence Packing
+  # ---------------------------------------------------------------------------
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+    fuse_loss: true
+
+  # Must be a multiple of minimum_pad_factor = cp_size*2*tp_size (see
+  # nemo_rl/models/megatron/data.py). With CP=16 + TP=4 + sequence_parallel that is
+  # 128; the old value (=TP=4) made get_logprobs assert and abort every training
+  # step. Formula matches examples/nemo_gym/grpo_nanov3.yaml (TP*CP*2).
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+
+  # ---------------------------------------------------------------------------
+  # Generation (Ray-managed Dynamo/vLLM) — Non-colocated, async
+  # ---------------------------------------------------------------------------
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: "dynamo"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    dynamo_cfg:
+      deployment: ray
+      engine_world_size: 4
+      dynamo_python: /opt/dynamo_venv/bin/python
+      startup_timeout_s: 1800
+      namespace: null
+      frontend_port: 0
+      request_timeout_s: 7200
+      worker_args:
+        tool_call_parser: qwen3_coder
+        reasoning_parser: nemotron_nano
+        exclude_tools_when_tool_choice_none: true
+        enable_structural_tag: false
+        structural_tag_scope: auto
+        structural_tag_schema: auto
+        custom_jinja_template: ${policy.model_name}/chat_template.jinja
+        endpoint_types: [chat, completions]
+        extra_cli_args: []
+      frontend_args:
+        router_mode: round-robin
+        router_reset_states: true
+        extra_cli_args: []
+    vllm_cfg:
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      load_format: auto
+
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      moe_backend: triton
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        pass_config:
+          fuse_allreduce_rms: false
+
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  train:
+    data_path: null   # Set by launch script
+  validation:
+    data_path: null   # Set by launch script
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+# =============================================================================
+# Environment — NeMo Gym + SWE Agents
+# =============================================================================
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    # Reuse pre-built gym venvs. With false, all 3 gym servers (policy_model,
+    # swe_agents_{train,val}) rebuild the editable nemo-gym package in parallel and
+    # contend on the same uv distribution-cache lock on Lustre; policy_model then
+    # times out (default 300s) and NemoGym spinup fails. Mirrors the qwen-30b SWE run.
+    skip_venv_if_present: true
+    num_gpu_nodes: 0
+    port_range_low: 15001
+    port_range_high: 20000
+    invalid_tool_call_patterns:
+      - "<tool_call>"
+      - "</tool_call>"
+      - "<function_call>"
+      - "</function_call>"
+    thinking_tags:
+      - "<think>"
+      - "</think>"
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}
+          swebench_agent_timeout: 3600
+          run_with_mixed_prompts: true
+          dataset_path: ${data.train.data_path}
+          apptainer_memory_limit_mb: 65536
+          container_formatter:
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swerebench/{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/nv_internal/{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/r2e_gym/{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swegym/sweb.eval.arm64.{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swebench/swe-bench.eval.arm64.{instance_id}.sif"
+            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/mercor/swebenchpro_ots/{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: ${mul:2, ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}}
+          swebench_agent_timeout: 3600
+          dataset_path: ${data.validation.data_path}
+          apptainer_memory_limit_mb: 65536
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+    use_absolute_ip: true
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "nemo-rl-dynamo-swe"
+    name: "nano-v3-5-swe-dynamo-r1"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-ultra-e2e"
+    run_name: "grpo-ultra-e2e"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+# =============================================================================
+# Effort Levels
+# =============================================================================
+effort_levels:
+  low_string: "{reasoning effort: efficient}"
+  low_weight: 0.1
+  low_penalty: 1
+  low_ub: 15000
+
+# =============================================================================
+# Token IDs (model-specific, used by token-based penalties)
+# =============================================================================
+token_ids:
+  eos: 2           # </s>
+  think_open: 12   # <think>
+  think_close: 13  # </think>
+
+# =============================================================================
+# Reward Penalties (set reward to 0 when triggered)
+# =============================================================================
+penalize_duplicated_reasoning: true   # reasoning content == final answer
+penalize_empty_final_answer: true     # last message output has empty content
+penalize_eos_token: true              # eos token appears in generation
+penalize_malformed_think_tag: true     # <think>/<\/think> count != 1 per turn

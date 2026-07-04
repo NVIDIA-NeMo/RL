@@ -21,8 +21,10 @@ cd "${REPO}"
   docker/install-dynamo-source.sh \
   examples/slurm/dynamo/assemble_container.sh \
   examples/slurm/dynamo/build_sqsh.sub \
+  examples/slurm/dynamo/build_sqsh_hsg.sub \
   examples/slurm/dynamo/launch.sh \
-  examples/slurm/dynamo/run_unit_tests.sh
+  examples/slurm/dynamo/run_unit_tests.sh \
+  examples/swe_bench/run_grpo_nano_v3_5_swe_dynamo_hsg_e2e.sh
 
 "${PYTHON}" -m pytest -q \
   tests/unit/models/generation/test_dynamo_arguments.py \

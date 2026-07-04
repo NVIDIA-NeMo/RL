@@ -43,3 +43,33 @@ The Nemotron fixture is an argument-contract test input, not a runnable
 training recipe. It preserves the DGD parser names (`nemotron_deci` and
 `nemotron_nano`), Mamba cache dtype, and advanced batching arguments without
 making those model-specific choices defaults for other models.
+
+## HSG Nemotron Nano SWE R1
+
+The aarch64 HSG build starts from Ruit's Gym-enabled image, overlays this
+checkout (including Gym `eddd5e98`), and installs the same pinned Dynamo stack
+without replacing the proven NeMo/Gym environment:
+
+```bash
+ROOT=/lustre/fsw/portfolios/coreai/users/jothomson/nemo-rl-dynamo-slurm-swe
+cd "${ROOT}/RL"
+sbatch --output="${ROOT}/logs/build-hsg-%j.out" \
+  examples/slurm/dynamo/build_sqsh_hsg.sub
+```
+
+The build validates aarch64 etcd/NATS, Dynamo 1.3.0, vLLM 0.23.0, the exact
+TP4 Nemotron Nano parser/compilation argv, and that Gym imports resolve to the
+overlaid `eddd5e98` source. It writes:
+
+```text
+images/nemo-rl-dynamo-swe-hsg.sqsh
+```
+
+Submit the fixed two-train-node plus one-inference-node, one-step E2E with:
+
+```bash
+examples/swe_bench/run_grpo_nano_v3_5_swe_dynamo_hsg_e2e.sh
+```
+
+The launcher uses account `coreai_tritoninference_triton3`, keeps caches,
+results, and logs below the HSG workspace root, and disables W&B for acceptance.

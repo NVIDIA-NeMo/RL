@@ -124,6 +124,71 @@ def test_nemotron_worker_argv_maps_dynamo_parsers_and_advanced_vllm_values() -> 
     assert "--ignored-value" not in argv
 
 
+def test_nemotron_nano_v35_swe_tp4_worker_argv() -> None:
+    model = "/models/nemotron-nano-v3.5"
+    cfg = _managed_cfg(
+        engine_world_size=4,
+        worker_args={
+            "tool_call_parser": "qwen3_coder",
+            "reasoning_parser": "nemotron_nano",
+            "custom_jinja_template": f"{model}/chat_template.jinja",
+        },
+    )
+    argv = build_dynamo_vllm_argv(
+        model_name=model,
+        namespace="nemo-rl-swe-r1",
+        seed=0,
+        vllm_cfg={
+            "precision": "bfloat16",
+            "kv_cache_dtype": "auto",
+            "tensor_parallel_size": 4,
+            "pipeline_parallel_size": 1,
+            "expert_parallel_size": 1,
+            "gpu_memory_utilization": 0.85,
+            "max_model_len": 196608,
+            "enforce_eager": False,
+            "load_format": "auto",
+            # These NeMo-RL HTTP-serving fields must never reach Dynamo.
+            "async_engine": False,
+            "expose_http_server": True,
+            "reasoning_parser_plugin": "legacy-plugin.py",
+            "http_server_serving_chat_kwargs": {"tool_parser": "nemotron_json"},
+        },
+        vllm_kwargs={
+            "attention_backend": "FLASH_ATTN",
+            "moe_backend": "triton",
+            "mamba_ssm_cache_dtype": "float32",
+            "compilation_config": {
+                "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64],
+                "pass_config": {"fuse_allreduce_rms": False},
+            },
+        },
+        dynamo_cfg=cfg,
+    )
+
+    assert _flag_value(argv, "--tensor-parallel-size") == "4"
+    assert _flag_value(argv, "--pipeline-parallel-size") == "1"
+    assert _flag_value(argv, "--dyn-tool-call-parser") == "qwen3_coder"
+    assert _flag_value(argv, "--dyn-reasoning-parser") == "nemotron_nano"
+    assert _flag_value(argv, "--custom-jinja-template") == (
+        f"{model}/chat_template.jinja"
+    )
+    assert _flag_value(argv, "--attention-backend") == "FLASH_ATTN"
+    assert _flag_value(argv, "--moe-backend") == "triton"
+    assert _flag_value(argv, "--mamba-ssm-cache-dtype") == "float32"
+    assert _flag_value(argv, "--compilation-config") == (
+        '{"cudagraph_capture_sizes":[1,2,4,8,16,32,64],'
+        '"pass_config":{"fuse_allreduce_rms":false}}'
+    )
+    assert "--no-enforce-eager" in argv
+    assert "--async-engine" not in argv
+    assert "--expose-http-server" not in argv
+    assert "--reasoning-parser-plugin" not in argv
+    assert "--http-server-serving-chat-kwargs" not in argv
+    assert "legacy-plugin.py" not in argv
+    assert "nemotron_json" not in argv
+
+
 def test_worker_argv_rejects_duplicate_and_reserved_options() -> None:
     with pytest.raises(
         ValueError, match="structured engine option --tensor-parallel-size"

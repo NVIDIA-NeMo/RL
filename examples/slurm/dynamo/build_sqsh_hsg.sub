@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#SBATCH --account=coreai_tritoninference_triton3
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=240G
+#SBATCH --time=06:00:00
+#SBATCH --job-name=nemo-rl-dynamo-swe-image
+
+set -euo pipefail
+
+ROOT=${ROOT:-/lustre/fsw/portfolios/coreai/users/jothomson/nemo-rl-dynamo-slurm-swe}
+REPO=${REPO:-${ROOT}/RL}
+BASE_IMAGE=${BASE_IMAGE:-/lustre/fsw/portfolios/nemotron/users/ruit/enroot-images/nemo-rl:nightly-063026-gymvenvs.squashfs}
+OUTPUT=${OUTPUT:-${ROOT}/images/nemo-rl-dynamo-swe-hsg.sqsh}
+
+export ENROOT_CACHE_PATH=${ENROOT_CACHE_PATH:-${ROOT}/cache/enroot}
+export ENROOT_DATA_PATH=${ENROOT_DATA_PATH:-${ROOT}/cache/enroot-data}
+export ENROOT_RUNTIME_PATH=${ENROOT_RUNTIME_PATH:-${ROOT}/cache/enroot-runtime}
+export ENROOT_TEMP_PATH=${ENROOT_TEMP_PATH:-${ROOT}/cache/enroot-tmp}
+mkdir -p \
+  "${ROOT}/images" \
+  "${ROOT}/cache/uv" \
+  "${ROOT}/logs" \
+  "${ENROOT_CACHE_PATH}" \
+  "${ENROOT_DATA_PATH}" \
+  "${ENROOT_RUNTIME_PATH}" \
+  "${ENROOT_TEMP_PATH}"
+
+if [[ -e "${OUTPUT}" ]]; then
+  echo "Refusing to overwrite existing image: ${OUTPUT}" >&2
+  exit 1
+fi
+test -s "${BASE_IMAGE}"
+test "$(uname -m)" = aarch64
+
+export ROOT REPO
+export MATERIALIZE_NEMO_ENV=0
+export EXPECTED_GYM_COMMIT=eddd5e98a541cc90e0ee41f1b5e9bd146b5be665
+srun \
+  --container-image="${BASE_IMAGE}" \
+  --container-remap-root \
+  --container-writable \
+  --no-container-mount-home \
+  --container-save="${OUTPUT}" \
+  --container-mounts="${ROOT}:${ROOT}" \
+  --container-workdir="${REPO}" \
+  /bin/bash examples/slurm/dynamo/assemble_container.sh
+
+test -s "${OUTPUT}"
+ls -lh "${OUTPUT}"
