@@ -31,6 +31,7 @@ cd "${REPO}"
   tests/unit/algorithms/test_grpo.py
 
 "${PYTHON}" -m ruff check \
+  examples/run_grpo.py \
   nemo_rl/algorithms/grpo.py \
   nemo_rl/distributed/ray_actor_environment_registry.py \
   nemo_rl/distributed/worker_groups.py \

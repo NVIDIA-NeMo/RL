@@ -155,77 +155,83 @@ def main() -> None:
         policy_factory=_policy_factory,
     )
 
-    # Check if async mode is enabled
-    if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
-        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
-        unsupported_features = [
-            "use_dynamic_sampling",
-            "reward_scaling",
-            "reward_shaping",
-        ]
+    try:
+        # Check if async mode is enabled
+        if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
+            # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+            unsupported_features = [
+                "use_dynamic_sampling",
+                "reward_scaling",
+                "reward_shaping",
+            ]
 
-        for feature in unsupported_features:
-            if feature not in config.grpo:
-                continue
+            for feature in unsupported_features:
+                if feature not in config.grpo:
+                    continue
 
-            if feature == "use_dynamic_sampling":
-                if config.grpo[feature]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
-            else:
-                if config.grpo[feature]["enabled"]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
+                if feature == "use_dynamic_sampling":
+                    if config.grpo[feature]:
+                        raise NotImplementedError(
+                            f"{feature} is not supported with async GRPO"
+                        )
+                else:
+                    if config.grpo[feature]["enabled"]:
+                        raise NotImplementedError(
+                            f"{feature} is not supported with async GRPO"
+                        )
 
-        # Async GRPO does not support multiple dataloaders
-        if config.data["use_multiple_dataloader"]:
-            raise NotImplementedError(
-                "use_multiple_dataloader is not supported with async GRPO"
+            # Async GRPO does not support multiple dataloaders
+            if config.data["use_multiple_dataloader"]:
+                raise NotImplementedError(
+                    "use_multiple_dataloader is not supported with async GRPO"
+                )
+
+            from nemo_rl.algorithms.grpo import async_grpo_train
+
+            print("🚀 Running async GRPO training")
+
+            async_config = config.grpo["async_grpo"]
+            # Run async GRPO training
+            async_grpo_train(
+                policy=policy,
+                policy_generation=policy_generation,
+                dataloader=dataloader,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                loss_fn=loss_fn,
+                task_to_env=task_to_env,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                checkpointer=checkpointer,
+                grpo_save_state=grpo_state,
+                master_config=master_config,
+                max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+                teacher_worker_groups=teacher_worker_groups,
+                alias_to_group_alias=alias_to_group_alias,
             )
-
-        from nemo_rl.algorithms.grpo import async_grpo_train
-
-        print("🚀 Running async GRPO training")
-
-        async_config = config.grpo["async_grpo"]
-        # Run async GRPO training
-        async_grpo_train(
-            policy=policy,
-            policy_generation=policy_generation,
-            dataloader=dataloader,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            loss_fn=loss_fn,
-            task_to_env=task_to_env,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            checkpointer=checkpointer,
-            grpo_save_state=grpo_state,
-            master_config=master_config,
-            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
-            teacher_worker_groups=teacher_worker_groups,
-            alias_to_group_alias=alias_to_group_alias,
-        )
-    else:
-        # Two parallel synchronous trainers (verl-style — main_ppo.py vs
-        # main_ppo_sync.py). data_plane.enabled selects which one runs.
-        trainer = _select_trainer(master_config)
-        trainer(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-        )
+        else:
+            # Two parallel synchronous trainers (verl-style — main_ppo.py vs
+            # main_ppo_sync.py). data_plane.enabled selects which one runs.
+            trainer = _select_trainer(master_config)
+            trainer(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+            )
+    finally:
+        # External Dynamo owns no service lifecycle, while managed Dynamo uses
+        # this hook to stop the frontend, workers, NATS, and etcd explicitly.
+        if config.policy["generation"]["backend"] == "dynamo":
+            policy_generation.shutdown()
 
 
 if __name__ == "__main__":
