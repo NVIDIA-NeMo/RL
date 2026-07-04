@@ -173,6 +173,17 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       NCCL_DEBUG: "WARN"
+      # Jobs 2269608/2272089 OOM'd in TE's UNFUSED dot-product-attention
+      # fallback (softmax.py forward_torch_softmax), which materializes the
+      # full [B,H,S,S] score matrix (S=65536 -> 24.85-98.45 GiB allocs).
+      # Forbid the unfused fallback so TE either uses flash/cuDNN fused
+      # attention or fails loudly with the backend-rejection reason, and
+      # allow nondeterministic cuDNN attention algorithms (a common reason
+      # fused attention gets rejected). Debug flags log backend selection.
+      NVTE_UNFUSED_ATTN: "0"
+      NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+      NVTE_DEBUG: "1"
+      NVTE_DEBUG_LEVEL: "1"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0
