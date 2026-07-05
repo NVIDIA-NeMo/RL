@@ -115,3 +115,4 @@ score=0.1000 (3.0/30)
 - [Daily-Omni](../../nemo_rl/data/datasets/response_datasets/daily_omni.py): the corresponding `data.dataset_name` is `"daily-omni"`.
 
 Evaluation and training use the same response dataset registry. More details can be found in [load_response_dataset](../../nemo_rl/data/datasets/response_datasets/__init__.py).
+Each built-in dataset selects its default data processor, so custom eval configs do not need to duplicate the `processor` field. Set it explicitly only when intentionally overriding that default.

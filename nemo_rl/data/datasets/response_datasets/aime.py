@@ -32,6 +32,8 @@ class AIMEDataset(RawDataset):
             recipes that need repeated validation should set this explicitly.
     """
 
+    default_processor = "math_hf_data_processor"
+
     def __init__(
         self,
         variant: AIMEVariant = "2024",

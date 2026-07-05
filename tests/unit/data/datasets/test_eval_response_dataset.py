@@ -14,11 +14,83 @@
 
 import random
 
+import pytest
+from datasets import Dataset
+
+from nemo_rl.data.datasets.response_datasets import (
+    is_multimodal_response_dataset,
+    load_response_dataset,
+)
+from nemo_rl.data.datasets.response_datasets.aime import AIMEDataset
+from nemo_rl.data.datasets.response_datasets import aime as aime_module
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
 from nemo_rl.data.datasets.response_datasets.gpqa import GPQADataset
 from nemo_rl.data.datasets.response_datasets.math import MathDataset
+from nemo_rl.data.datasets.response_datasets.mmau import MMAUDataset
 from nemo_rl.data.datasets.response_datasets.mmlu import MMLUDataset
 from nemo_rl.data.datasets.response_datasets.mmlu_pro import MMLUProDataset
+from nemo_rl.data.processors import PROCESSOR_REGISTRY
+
+
+@pytest.mark.parametrize(
+    ("dataset_cls", "dataset_name", "expected_processor"),
+    [
+        (AIMEDataset, "AIME2024", "math_hf_data_processor"),
+        (GPQADataset, "gpqa", "multichoice_qa_processor"),
+        (MathDataset, "math", "math_data_processor"),
+        (MMLUDataset, "mmlu", "multichoice_qa_processor"),
+        (MMLUProDataset, "mmlu_pro", "multichoice_qa_processor"),
+        (MMAUDataset, "mmau", "vlm_hf_data_processor"),
+        (DailyOmniDataset, "daily-omni", "vlm_hf_data_processor"),
+    ],
+)
+def test_eval_dataset_selects_default_processor_without_config_duplication(
+    dataset_cls, dataset_name, expected_processor
+):
+    dataset = dataset_cls.__new__(dataset_cls)
+    dataset.task_name = dataset_name
+    dataset.set_task_spec({"dataset_name": dataset_name})
+    dataset.set_processor()
+
+    assert dataset.processor is PROCESSOR_REGISTRY[expected_processor]
+
+
+def test_explicit_processor_still_overrides_dataset_default():
+    dataset = MathDataset.__new__(MathDataset)
+    dataset.task_name = "math_test"
+    dataset.set_task_spec(
+        {"dataset_name": "math", "processor": "math_hf_data_processor"}
+    )
+    dataset.set_processor()
+
+    assert dataset.processor is PROCESSOR_REGISTRY["math_hf_data_processor"]
+
+
+@pytest.mark.parametrize("name", ["mmau", "TwinkStart/MMAU", "daily-omni"])
+def test_multimodal_eval_dataset_capability(name):
+    assert is_multimodal_response_dataset(name) is True
+
+
+@pytest.mark.parametrize("name", ["AIME2024", "gpqa", "math", "mmlu_pro"])
+def test_text_eval_dataset_capability(name):
+    assert is_multimodal_response_dataset(name) is False
+
+
+def test_aime_defaults_to_one_copy_and_supports_explicit_repeat(monkeypatch):
+    source = Dataset.from_list(
+        [
+            {"problem": "problem 1", "answer": 1},
+            {"problem": "problem 2", "answer": 2},
+        ]
+    )
+    monkeypatch.setattr(aime_module, "load_dataset", lambda *args, **kwargs: source)
+
+    default_dataset = load_response_dataset({"dataset_name": "AIME2024"})
+    repeated_dataset = load_response_dataset({"dataset_name": "AIME2024", "repeat": 3})
+
+    assert len(default_dataset.dataset) == 2
+    assert len(repeated_dataset.dataset) == 6
+    assert default_dataset.processor is PROCESSOR_REGISTRY["math_hf_data_processor"]
 
 
 def test_gpqa_rekey_preserves_correct_answer():

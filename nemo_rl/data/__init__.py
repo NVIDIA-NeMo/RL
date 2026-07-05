@@ -82,9 +82,8 @@ class EvalDataConfig(ResponseDatasetConfig):
 
     Fields:
         max_input_seq_length: Max prompt length passed to the generation backend.
-        repeat: Number of dataset copies to evaluate. Some response datasets
-            default higher in code for training validation (AIME uses 16), so
-            eval exemplars set 1 explicitly.
+        repeat: Number of dataset copies to evaluate. AIME defaults to one;
+            training recipes that need repeated validation set a higher value.
         include_single_letter_instruction: Daily-Omni only. Set to false so the
             eval ``prompt_file`` dictates answer formatting instead of the
             training-only single-letter instruction.

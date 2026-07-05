@@ -38,7 +38,6 @@ tokenizer:
 data:
   prompt_file: examples/prompts/daily_omni.txt
   dataset_name: "daily-omni"
-  processor: "vlm_hf_data_processor"
   include_single_letter_instruction: false
   split: "train"
   env_name: vlm

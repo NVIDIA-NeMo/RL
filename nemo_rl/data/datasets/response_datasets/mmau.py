@@ -33,6 +33,8 @@ DEFAULT_TEMPLATE = (
 
 class MMAUDataset(RawDataset):
     task_name = "mmau"
+    default_processor = "vlm_hf_data_processor"
+    is_multimodal = True
 
     def __init__(self, split: str = "v05.15.25", **kwargs):
         dataset = load_dataset(MMAU_DATASET_NAME, split=split)

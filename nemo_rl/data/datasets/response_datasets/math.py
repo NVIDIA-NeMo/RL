@@ -22,6 +22,8 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class MathDataset(RawDataset):
+    default_processor = "math_data_processor"
+
     def __init__(
         self,
         variant: Literal["math_test", "math_500_test"] = "math_test",

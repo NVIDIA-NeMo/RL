@@ -118,8 +118,39 @@ DATASET_REGISTRY = {
 }
 
 
+def _resolve_response_dataset_factory(dataset_name: str):
+    """Resolve a built-in or external response dataset factory."""
+    if dataset_name in DATASET_REGISTRY:
+        return DATASET_REGISTRY[dataset_name]
+    if "." in dataset_name:
+        return resolve_external_dataset_class(dataset_name)
+    raise ValueError(
+        f"Unsupported {dataset_name=}. Please set dataset_name to one of: "
+        "(1) a built-in dataset name, "
+        "(2) 'ResponseDataset' to load from a local JSONL file or HuggingFace, or "
+        "(3) an importable dotted path to a dataset class "
+        "(ensure it is installed and importable from PYTHONPATH)."
+    )
+
+
+def is_multimodal_response_dataset(dataset_name: str) -> bool:
+    """Return whether a response dataset requires a multimodal processor.
+
+    Built-in and external dataset classes declare this capability through the
+    ``RawDataset.is_multimodal`` class attribute. For a ``partial`` registry
+    entry, the capability is read from the underlying dataset class.
+    """
+    dataset_factory = _resolve_response_dataset_factory(dataset_name)
+    dataset_type = (
+        dataset_factory.func
+        if isinstance(dataset_factory, partial)
+        else dataset_factory
+    )
+    return bool(getattr(dataset_type, "is_multimodal", False))
+
+
 def load_response_dataset(data_config: ResponseDatasetConfig):
-    """Loads response dataset.
+    """Load a response dataset.
 
     Resolution order for ``data_config["dataset_name"]``:
 
@@ -133,19 +164,7 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
     """
     dataset_name = data_config["dataset_name"]
 
-    # load dataset
-    if dataset_name in DATASET_REGISTRY:
-        dataset_class = DATASET_REGISTRY[dataset_name]
-    elif "." in dataset_name:
-        dataset_class = resolve_external_dataset_class(dataset_name)
-    else:
-        raise ValueError(
-            f"Unsupported {dataset_name=}. Please set dataset_name to one of: "
-            "(1) a built-in dataset name, "
-            "(2) 'ResponseDataset' to load from a local JSONL file or HuggingFace, or "
-            "(3) an importable dotted path to a dataset class "
-            "(ensure it is installed and importable from PYTHONPATH)."
-        )
+    dataset_class = _resolve_response_dataset_factory(dataset_name)
 
     dataset = dataset_class(
         **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
@@ -191,5 +210,6 @@ __all__ = [
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
+    "is_multimodal_response_dataset",
     "load_response_dataset",
 ]
