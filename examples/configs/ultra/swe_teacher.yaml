@@ -460,17 +460,14 @@ logger:
     flush_interval: 10
 
 # =============================================================================
-# Token IDs (model-specific, used by token-based penalties)
-# =============================================================================
-token_ids:
-  eos: 2           # </s>
-  think_open: 12   # <think>
-  think_close: 13  # </think>
-
-# =============================================================================
 # Reward Penalties (set reward to 0 when triggered)
 # =============================================================================
-penalize_duplicated_reasoning: true   # reasoning content == final answer
-penalize_empty_final_answer: true     # last message output has empty content
-penalize_eos_token: true              # eos token appears in generation
-penalize_malformed_think_tag: true     # <think>/<\/think> count != 1 per turn
+reward_penalties:
+  penalize_duplicated_reasoning: true   # reasoning content == final answer
+  penalize_empty_final_answer: true     # last message output has empty content
+  penalize_unwanted_tokens: true        # unwanted token appears in generation
+  penalize_malformed_think_tag: true    # <think>/<\/think> count != 1 per turn
+  token_ids:
+    unwanted: [2]       # </s>
+    think_open: 12      # <think>
+    think_close: 13     # </think>
