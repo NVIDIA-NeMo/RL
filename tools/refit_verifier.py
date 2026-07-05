@@ -726,6 +726,23 @@ def parse_dynamo_args():
         type=str,
         default="Here is a short introduction to me:",
     )
+    parser.add_argument(
+        "--initial-load-format",
+        choices=("dummy", "auto"),
+        default="dummy",
+        help=(
+            "Initial Dynamo/vLLM load format. The acceptance path uses dummy; "
+            "auto is available to diagnose direct HF loading before refit."
+        ),
+    )
+    parser.add_argument(
+        "--compare-before-refit",
+        action="store_true",
+        help=(
+            "Compare directly loaded Dynamo/vLLM weights before native NCCL refit. "
+            "Requires --initial-load-format=auto."
+        ),
+    )
     args, overrides = parser.parse_known_args()
     return args, overrides
 
@@ -744,9 +761,40 @@ def _prepare_dynamo_verifier_policy_config(policy_config: dict) -> None:
         megatron_cfg.setdefault("train_iters", 1)
 
 
+def _validate_dynamo_verifier_diagnostic_mode(
+    initial_load_format: str, compare_before_refit: bool
+) -> None:
+    """Reject a meaningless comparison against intentionally dummy weights."""
+    if compare_before_refit and initial_load_format != "auto":
+        raise ValueError(
+            "--compare-before-refit requires --initial-load-format=auto."
+        )
+
+
+def _max_generated_logprob_diff(
+    generation_data: BatchedDataDict,
+    generation_output: BatchedDataDict,
+    policy_output: BatchedDataDict,
+) -> float:
+    """Return the maximum generated-token logprob difference."""
+    input_length = int(generation_data["input_lengths"][0].item())
+    total_length = generation_output["logprobs"].shape[1]
+    if total_length <= input_length:
+        raise AssertionError("Managed Dynamo verifier generated no output tokens.")
+    return torch.max(
+        torch.abs(
+            generation_output["logprobs"][0, input_length:total_length]
+            - policy_output["logprobs"][0, input_length:total_length]
+        )
+    ).item()
+
+
 def main_dynamo():
     """Run managed Dynamo from dummy weights, refit, and compare logprobs."""
     args, overrides = parse_dynamo_args()
+    _validate_dynamo_verifier_diagnostic_mode(
+        args.initial_load_format, args.compare_before_refit
+    )
     register_omegaconf_resolvers()
     config = load_config(args.dynamo_config)
     if overrides:
@@ -781,9 +829,11 @@ def main_dynamo():
     tokenizer = get_tokenizer(policy_config["tokenizer"])
     generation_config = configure_generation_config(generation_config, tokenizer)
     generation_config["model_name"] = policy_config["model_name"]
-    # A successful comparison proves the native NCCL refit replaced the dummy
-    # engine weights with the training policy's checkpoint-format weights.
-    generation_config["vllm_cfg"]["load_format"] = "dummy"
+    # The acceptance path starts from dummy weights, so a successful post-refit
+    # comparison proves that native NCCL replaced them. Direct HF loading is a
+    # diagnostic control for separating transfer errors from backend/model
+    # numerical differences.
+    generation_config["vllm_cfg"]["load_format"] = args.initial_load_format
 
     inference_resources = generation_config["colocated"]["resources"]
     inference_gpus_per_node = int(inference_resources["gpus_per_node"])
@@ -834,6 +884,26 @@ def main_dynamo():
             tokenizer_config=policy_config.get("tokenizer"),
         )
 
+        generation_data = prepare_input_data(args.prompt, tokenizer)
+        if args.compare_before_refit:
+            direct_data, direct_policy_data = generate_and_compare_logprobs(
+                policy, policy_generation, generation_data
+            )
+            analyze_logprob_differences(
+                direct_data,
+                direct_policy_data,
+                generation_data,
+                tokenizer,
+                args.prompt,
+            )
+            direct_diff = _max_generated_logprob_diff(
+                generation_data, direct_data, direct_policy_data
+            )
+            print(
+                "Managed Dynamo direct-load max logprob difference: "
+                f"{direct_diff}"
+            )
+
         ip, port = train_cluster.get_master_address_and_port()
         train_world_size = train_cluster.world_size()
         inference_world_size = policy_generation.get_inference_world_size()
@@ -860,8 +930,8 @@ def main_dynamo():
             policy_generation,
             colocated_inference=False,
         )
+        policy_generation.invalidate_kv_cache()
 
-        generation_data = prepare_input_data(args.prompt, tokenizer)
         dynamo_data, policy_data = generate_and_compare_logprobs(
             policy, policy_generation, generation_data
         )
@@ -872,16 +942,9 @@ def main_dynamo():
             tokenizer,
             args.prompt,
         )
-        input_length = int(generation_data["input_lengths"][0].item())
-        total_length = dynamo_data["logprobs"].shape[1]
-        if total_length <= input_length:
-            raise AssertionError("Managed Dynamo verifier generated no output tokens.")
-        max_diff = torch.max(
-            torch.abs(
-                dynamo_data["logprobs"][0, input_length:total_length]
-                - policy_data["logprobs"][0, input_length:total_length]
-            )
-        ).item()
+        max_diff = _max_generated_logprob_diff(
+            generation_data, dynamo_data, policy_data
+        )
         if max_diff > args.max_logprob_diff:
             raise AssertionError(
                 f"Post-refit max logprob difference {max_diff} exceeds "

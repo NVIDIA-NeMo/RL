@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from tools.refit_verifier import _prepare_dynamo_verifier_policy_config
+import pytest
+
+from tools.refit_verifier import (
+    _prepare_dynamo_verifier_policy_config,
+    _validate_dynamo_verifier_diagnostic_mode,
+)
 
 
 def test_dynamo_verifier_supplies_required_megatron_train_iters():
@@ -29,3 +34,17 @@ def test_dynamo_verifier_preserves_explicit_megatron_train_iters():
     _prepare_dynamo_verifier_policy_config(policy_config)
 
     assert policy_config["megatron_cfg"]["train_iters"] == 17
+
+
+def test_dynamo_verifier_allows_direct_load_control():
+    _validate_dynamo_verifier_diagnostic_mode("auto", compare_before_refit=True)
+
+
+def test_dynamo_verifier_rejects_comparing_dummy_weights_before_refit():
+    with pytest.raises(
+        ValueError,
+        match="--compare-before-refit requires --initial-load-format=auto",
+    ):
+        _validate_dynamo_verifier_diagnostic_mode(
+            "dummy", compare_before_refit=True
+        )
