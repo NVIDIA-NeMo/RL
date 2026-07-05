@@ -14,3 +14,6 @@ logger:
   log_dir: "logs/grpo-nd3b-block_just_grpo-sudoku4x4-sglang"
   wandb:
     name: "grpo-nd3b-block_just_grpo-sudoku4x4-blanks-fewshot"
+
+cluster:
+  num_nodes: 8

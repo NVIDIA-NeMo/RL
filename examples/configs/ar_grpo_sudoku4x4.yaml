@@ -14,3 +14,6 @@ logger:
   log_dir: "logs/grpo-nemotron-diffusion-3b-ar-sudoku4x4-megatron-sglang"
   wandb:
     name: "grpo-nemotron-diffusion-3b-ar-sudoku4x4-blanks-fewshot"
+
+cluster:
+  num_nodes: 1  # AR is lightweight (single GPU node)

@@ -42,6 +42,3 @@ env:
   reasoning_gym:
     task: "mini_sudoku"
     reward_mode: "sudoku_blanks"
-
-cluster:
-  num_nodes: 4
