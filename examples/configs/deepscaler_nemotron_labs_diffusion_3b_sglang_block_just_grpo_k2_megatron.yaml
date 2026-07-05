@@ -22,6 +22,11 @@ policy:
     reveal_tokens_per_level: 2
 
   generation:
+    # Validation decodes at k=1 (tokens_per_step=1) for comparability with the
+    # k=1 production run; rollout/training stay k=2. block_size stays 16
+    # (structural, fixed at launch). Restored to k=2 after each val pass.
+    sglang_val_dllm_overrides:
+      tokens_per_step: 1
     sglang_cfg:
       # Must match reveal_tokens_per_level via tokens_per_step=2 (block_size/k=8
       # leftmost steps, both tokens per step scored from the same forward).
