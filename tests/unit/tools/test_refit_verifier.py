@@ -37,7 +37,9 @@ def test_dynamo_verifier_preserves_explicit_megatron_train_iters():
 
 
 def test_dynamo_verifier_allows_direct_load_control():
-    _validate_dynamo_verifier_diagnostic_mode("auto", compare_before_refit=True)
+    _validate_dynamo_verifier_diagnostic_mode(
+        "auto", compare_before_refit=True, compare_disk_reload=True
+    )
 
 
 def test_dynamo_verifier_rejects_comparing_dummy_weights_before_refit():
@@ -46,3 +48,13 @@ def test_dynamo_verifier_rejects_comparing_dummy_weights_before_refit():
         match="--compare-before-refit requires --initial-load-format=auto",
     ):
         _validate_dynamo_verifier_diagnostic_mode("dummy", compare_before_refit=True)
+
+
+def test_dynamo_verifier_requires_direct_control_for_disk_reload():
+    with pytest.raises(
+        ValueError,
+        match="--compare-disk-reload requires --compare-before-refit",
+    ):
+        _validate_dynamo_verifier_diagnostic_mode(
+            "auto", compare_before_refit=False, compare_disk_reload=True
+        )

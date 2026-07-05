@@ -82,6 +82,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoGeneration
+from nemo_rl.models.generation.dynamo.dynamo_generation import (
+    _post_dynamo_worker_route_remote,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
@@ -743,6 +746,14 @@ def parse_dynamo_args():
             "Requires --initial-load-format=auto."
         ),
     )
+    parser.add_argument(
+        "--compare-disk-reload",
+        action="store_true",
+        help=(
+            "After the direct-load comparison, reload the same HF checkpoint "
+            "through vLLM's native disk-reload RPC and compare again."
+        ),
+    )
     args, overrides = parser.parse_known_args()
     return args, overrides
 
@@ -762,11 +773,15 @@ def _prepare_dynamo_verifier_policy_config(policy_config: dict) -> None:
 
 
 def _validate_dynamo_verifier_diagnostic_mode(
-    initial_load_format: str, compare_before_refit: bool
+    initial_load_format: str,
+    compare_before_refit: bool,
+    compare_disk_reload: bool = False,
 ) -> None:
     """Reject a meaningless comparison against intentionally dummy weights."""
     if compare_before_refit and initial_load_format != "auto":
         raise ValueError("--compare-before-refit requires --initial-load-format=auto.")
+    if compare_disk_reload and not compare_before_refit:
+        raise ValueError("--compare-disk-reload requires --compare-before-refit.")
 
 
 def _max_generated_logprob_diff(
@@ -787,11 +802,49 @@ def _max_generated_logprob_diff(
     ).item()
 
 
+def _reload_managed_dynamo_from_disk(
+    policy_generation: DynamoGeneration, model_path: str
+) -> None:
+    """Reload the managed fleet from disk through vLLM's native RPC."""
+    workers = policy_generation._get_refit_workers()
+    timeout_s = policy_generation._request_timeout_s()
+
+    def post_all(route: str, payload: dict) -> None:
+        ray.get(
+            [
+                _post_dynamo_worker_route_remote.remote(
+                    system_url=worker["system_url"],
+                    route=route,
+                    payload=payload,
+                    timeout_s=timeout_s,
+                )
+                for worker in workers
+            ]
+        )
+
+    paused = False
+    try:
+        post_all("pause_generation", {})
+        paused = True
+        post_all(
+            "update_weights_from_disk",
+            {
+                "model_path": model_path,
+                "weight_version": "refit-verifier-disk-reload",
+            },
+        )
+    finally:
+        if paused:
+            post_all("resume_generation", {})
+
+
 def main_dynamo():
     """Run managed Dynamo from dummy weights, refit, and compare logprobs."""
     args, overrides = parse_dynamo_args()
     _validate_dynamo_verifier_diagnostic_mode(
-        args.initial_load_format, args.compare_before_refit
+        args.initial_load_format,
+        args.compare_before_refit,
+        args.compare_disk_reload,
     )
     register_omegaconf_resolvers()
     config = load_config(args.dynamo_config)
@@ -898,6 +951,25 @@ def main_dynamo():
                 generation_data, direct_data, direct_policy_data
             )
             print(f"Managed Dynamo direct-load max logprob difference: {direct_diff}")
+
+            if args.compare_disk_reload:
+                _reload_managed_dynamo_from_disk(
+                    policy_generation, policy_config["model_name"]
+                )
+                disk_data, disk_policy_data = generate_and_compare_logprobs(
+                    policy, policy_generation, generation_data
+                )
+                analyze_logprob_differences(
+                    disk_data,
+                    disk_policy_data,
+                    generation_data,
+                    tokenizer,
+                    args.prompt,
+                )
+                disk_diff = _max_generated_logprob_diff(
+                    generation_data, disk_data, disk_policy_data
+                )
+                print(f"Managed Dynamo disk-reload max logprob difference: {disk_diff}")
 
         ip, port = train_cluster.get_master_address_and_port()
         train_world_size = train_cluster.world_size()
