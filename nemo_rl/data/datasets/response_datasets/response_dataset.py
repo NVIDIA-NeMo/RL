@@ -39,6 +39,8 @@ class ResponseDataset(RawDataset):
         seed: Seed for train/validation split when split_validation_size > 0, default is 42
     """
 
+    default_processor = "math_hf_data_processor"
+
     def __init__(
         self,
         data_path: str,

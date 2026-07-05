@@ -22,6 +22,8 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class MMLUProDataset(RawDataset):
+    default_processor = "multichoice_qa_processor"
+
     def __init__(self, **kwargs):
         self.task_name = "MMLU-Pro"
 

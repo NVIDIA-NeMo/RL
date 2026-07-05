@@ -23,6 +23,8 @@ from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
 class GPQADataset(RawDataset):
+    default_processor = "multichoice_qa_processor"
+
     def __init__(
         self,
         variant: Literal["diamond", "main"] = "diamond",

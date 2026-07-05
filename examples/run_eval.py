@@ -22,7 +22,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    is_multimodal_response_dataset,
+    load_response_dataset,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
@@ -99,11 +103,9 @@ def main():
     # Init ray
     init_ray()
 
-    # Setup tokenizer — get_tokenizer handles both text-only and multimodal.
-    # vlm_hf_data_processor is the only multimodal processor in
-    # PROCESSOR_REGISTRY, so multimodal eval configs (mmau, daily-omni) must
-    # set data.processor to it.
-    is_multimodal = config.data.get("processor") == "vlm_hf_data_processor"
+    # Determine the tokenizer type from the dataset capability rather than from
+    # a manually synchronized name or processor allowlist.
+    is_multimodal = is_multimodal_response_dataset(config.data["dataset_name"])
     tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
     config.generation = configure_generation_config(
         config.generation, tokenizer, is_eval=True

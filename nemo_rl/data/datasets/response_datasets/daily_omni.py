@@ -33,6 +33,8 @@ class DailyOmniDataset(RawDataset):
     """
 
     task_name = "daily-omni"
+    default_processor = "vlm_hf_data_processor"
+    is_multimodal = True
 
     def __init__(
         self,

@@ -254,12 +254,11 @@ def system_prompt_file(request):
     [
         {
             "dataset_name": "AIME2024",
-            "processor": "math_hf_data_processor",
             "repeat": 1,
         },
-        {"dataset_name": "gpqa", "processor": "multichoice_qa_processor"},
-        {"dataset_name": "math", "processor": "math_data_processor"},
-        {"dataset_name": "mmlu", "processor": "multichoice_qa_processor"},
+        {"dataset_name": "gpqa"},
+        {"dataset_name": "math"},
+        {"dataset_name": "mmlu"},
     ],
 )
 @pytest.mark.parametrize(

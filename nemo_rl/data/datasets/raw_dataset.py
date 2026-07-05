@@ -24,6 +24,13 @@ from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
 class RawDataset:
+    # Dataset-specific defaults keep a registry entry usable without requiring
+    # callers to duplicate implementation details in every config. Subclasses
+    # can override these attributes while still allowing an explicit processor
+    # override through ``data_config``.
+    default_processor: str = "default"
+    is_multimodal: bool = False
+
     # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
     data_config: ResponseDatasetConfig | PreferenceDatasetConfig
     dataset: Dataset
@@ -49,7 +56,7 @@ class RawDataset:
             self.val_dataset = split_dataset["test"]
 
     def set_processor(self):
-        processor_name = "default"
+        processor_name = self.default_processor
         if "processor" in self.data_config:
             processor_name = self.data_config[
                 "processor"  # pyrefly: ignore[typed-dict-key-error]  `processor` is only required for response datasets and will be removed after data processor is refactored

@@ -45,7 +45,6 @@ data:
   prompt_file: null
   system_prompt_file: null
   dataset_name: "AIME2024"
-  processor: "math_hf_data_processor"
   repeat: 1
 
 env:
