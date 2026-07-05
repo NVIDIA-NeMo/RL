@@ -30,7 +30,9 @@ policy:
     sglang_val_dllm_overrides:
       selection_policy: confidence
       threshold: 0.9
-      block_size: 16
+      # NOTE: block_size is NOT runtime-reconfigurable in SGLang (reconfigure_dllm
+      # rejects it). It is fixed at engine init from training block_size
+      # (hf_config_overrides.block_size: 16), so validation already runs at 16.
       max_steps: 16
       # Pin val temperature to 1.0 so a changed training/rollout temperature
       # never leaks into validation inference.
