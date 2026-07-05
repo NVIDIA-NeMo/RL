@@ -373,6 +373,7 @@ env:
   nemo_gym:
     nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
+    num_gpu_nodes: 20
     # NeMo-RL-side effort shaping; stripped before forwarding to Gym.
     effort_levels:
       low_string: "{reasoning effort: efficient}"
@@ -656,17 +657,14 @@ logger:
     flush_interval: 10
 
 # =============================================================================
-# Token IDs (model-specific)
-# =============================================================================
-token_ids:
-  eos: 2
-  think_open: 12
-  think_close: 13
-
-# =============================================================================
 # Reward Penalties (set reward to 0 when triggered)
 # =============================================================================
-penalize_duplicated_reasoning: true
-penalize_empty_final_answer: true
-penalize_eos_token: true
-penalize_malformed_think_tag: true
+reward_penalties:
+  penalize_duplicated_reasoning: true
+  penalize_empty_final_answer: true
+  penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
+  token_ids:
+    unwanted: [2]
+    think_open: 12
+    think_close: 13
