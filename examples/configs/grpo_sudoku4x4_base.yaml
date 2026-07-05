@@ -31,6 +31,12 @@ data:
     system_prompt_file: examples/prompts/mini_sudoku_fewshot.txt
     processor: "reasoning_gym_data_processor"
     env_name: "reasoning_gym"
+    # Rebuild the user turn from metadata: drop reasoning_gym redundant rules +
+    # tag-free format line, and require the grid inside <answer> </answer> tags.
+    prompt_style: "sudoku_answer_tag"
+    # Emit an open <think> so the model reasons before answering (chat template
+    # defaults thinking OFF -> empty <think></think>). Applies to every sudoku run.
+    enable_thinking: true
 
 env:
   reasoning_gym:

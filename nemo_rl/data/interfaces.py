@@ -60,6 +60,11 @@ class TaskDataSpec:
 
     system_prompt_file: Optional[PathLike] = None
 
+    # When True, request the chat template's reasoning mode (open <think>) via
+    # apply_chat_template(enable_thinking=True). Default False keeps the template's
+    # thinking-off behaviour (an empty <think></think> prefill).
+    enable_thinking: bool = False
+
     def __post_init__(self) -> None:
         def load_prompt_file(
             prompt_file: Optional[PathLike],

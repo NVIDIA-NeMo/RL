@@ -91,6 +91,25 @@ class ReasoningGymDataset(RawDataset):
         if self.prompt_style == "agrpo_countdown":
             meta = json.loads(data["rg_entry"])["metadata"]
             content = f"Target: {meta['target']}\nNumbers: {meta['numbers']}"
+        elif self.prompt_style == "sudoku_answer_tag":
+            # Rebuild a minimal puzzle prompt from metadata: drop reasoning_gym's
+            # redundant rule recap (the system prompt already states the rules) and
+            # its tag-free "format as puzzle above" line, and ask explicitly for the
+            # grid inside <answer> </answer> tags (consistent with the system prompt).
+            meta = json.loads(data["rg_entry"])["metadata"]
+            puzzle = meta.get("puzzle")
+            if puzzle:
+                n = len(puzzle)
+                grid = "\n".join(
+                    " ".join(str(v) if v else "_" for v in row) for row in puzzle
+                )
+                content = (
+                    f"Solve this {n}x{n} Sudoku puzzle:\n{grid}\n\n"
+                    "Put the completed grid inside <answer> </answer> tags, "
+                    "as rows of space-separated digits."
+                )
+            else:
+                content = data["question"]
         else:
             content = data["question"]
         return {

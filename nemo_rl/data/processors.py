@@ -476,6 +476,7 @@ def reasoning_gym_data_processor(
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
+        enable_thinking=task_data_spec.enable_thinking,
     )
 
     token_ids = tokenizer(
