@@ -12,6 +12,28 @@ test "$(cat /opt/dynamo_commit)" = 59358c26d0aeed19300706462b63ada25a0a6d7c
 
 /opt/dynamo_venv/bin/python -c \
   'import importlib.metadata as m, vllm; assert m.version("ai-dynamo") == "1.3.0"; assert m.version("ai-dynamo-runtime") == "1.3.0"; assert vllm.__version__ == "0.23.0"; print("Dynamo", m.version("ai-dynamo"), "runtime", m.version("ai-dynamo-runtime"), "vLLM", vllm.__version__)'
+/opt/dynamo_venv/bin/python - <<'PY'
+import inspect
+import pathlib
+
+import torch
+
+from vllm.model_executor.model_loader.reload.meta import get_numel_loaded
+from vllm.model_executor.model_loader.weight_utils import (
+    composed_weight_loader,
+    default_weight_loader,
+)
+
+assert pathlib.Path("/opt/vllm_backports").read_text().strip() == (
+    "vllm#44814 45ffb397d1c7803a78c32846807c71d881e11189"
+)
+param = torch.empty(10)
+loader = composed_weight_loader(default_weight_loader, lambda value: value + 1)
+args = inspect.signature(loader).bind(param, torch.ones(10))
+loaded_numel, _ = get_numel_loaded(loader, args)
+assert loaded_numel == param.numel(), (loaded_numel, param.numel())
+print("vLLM NemotronH layerwise reload backport validated")
+PY
 etcd --version | grep -F 'etcd Version: 3.5.21'
 nats-server --version | grep -F 'v2.11.6'
 

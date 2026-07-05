@@ -27,6 +27,7 @@ cd "${REPO}"
   examples/slurm/dynamo/validate_hsg_image.sub \
   examples/slurm/dynamo/validate_hsg_image.sh \
   examples/swe_bench/run_grpo_nano_v3_5_swe_dynamo_hsg_e2e.sh
+test -s docker/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch
 
 "${PYTHON}" -m pytest -q \
   tests/unit/models/generation/test_dynamo_arguments.py \

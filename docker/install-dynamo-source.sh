@@ -68,9 +68,27 @@ test "$(git -C "${DYNAMO_SOURCE_DIR}" rev-parse HEAD)" = "${DYNAMO_COMMIT}"
   "${UV_BIN}" pip install --python "${DYNAMO_VENV}/bin/python" '.[vllm]'
 )
 
+# vLLM 0.23.0's layerwise reload accounting counts every copy performed by a
+# composed weight loader. NemotronH's Mamba2 A loader copies twice, which can
+# finalize the mixer before D is loaded and silently corrupt post-refit logits.
+# Backport the merged upstream fix from vLLM PR #44814 / commit 45ffb397.
+VLLM_SITE_PACKAGES=$(
+  "${DYNAMO_VENV}/bin/python" -c \
+    'import importlib.metadata as m, pathlib, vllm; assert m.version("vllm") == "0.23.0"; print(pathlib.Path(vllm.__file__).resolve().parent.parent)'
+)
+VLLM_RELOAD_PATCH=/opt/nemo-rl/docker/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch
+test -f "${VLLM_RELOAD_PATCH}"
+(
+  cd "${VLLM_SITE_PACKAGES}"
+  git apply --check "${VLLM_RELOAD_PATCH}"
+  git apply "${VLLM_RELOAD_PATCH}"
+)
+printf '%s\n' 'vllm#44814 45ffb397d1c7803a78c32846807c71d881e11189' \
+  > /opt/vllm_backports
+
 printf '%s\n' "${DYNAMO_COMMIT}" > /opt/dynamo_commit
 "${DYNAMO_VENV}/bin/python" -c \
-  'import importlib.metadata as m, pathlib; assert m.version("ai-dynamo") == "1.3.0"; assert m.version("ai-dynamo-runtime") == "1.3.0"; assert pathlib.Path("/opt/dynamo_commit").read_text().strip() == "59358c26d0aeed19300706462b63ada25a0a6d7c"; import dynamo.vllm.handlers, vllm; print("Dynamo", m.version("ai-dynamo"), "runtime", m.version("ai-dynamo-runtime"), "vLLM", vllm.__version__)'
+  'import importlib.metadata as m, pathlib; assert m.version("ai-dynamo") == "1.3.0"; assert m.version("ai-dynamo-runtime") == "1.3.0"; assert pathlib.Path("/opt/dynamo_commit").read_text().strip() == "59358c26d0aeed19300706462b63ada25a0a6d7c"; assert pathlib.Path("/opt/vllm_backports").read_text().strip() == "vllm#44814 45ffb397d1c7803a78c32846807c71d881e11189"; import dynamo.vllm.handlers, vllm; print("Dynamo", m.version("ai-dynamo"), "runtime", m.version("ai-dynamo-runtime"), "vLLM", vllm.__version__)'
 
 # Cargo's target tree is build-only, metadata-heavy, and can exceed 10 GiB.
 # Keep it on the compute node while compiling and omit it from the runtime image.
