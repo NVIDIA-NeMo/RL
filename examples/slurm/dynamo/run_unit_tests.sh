@@ -32,6 +32,8 @@ cd "${REPO}"
   tests/unit/models/generation/test_dynamo_arguments.py \
   tests/unit/models/generation/test_dynamo_managed_runtime.py \
   tests/unit/models/generation/test_dynamo_generation.py \
+  tests/unit/models/generation/test_dynamo_token_wrapper.py \
+  tests/unit/utils/test_prefix_reuse.py \
   tests/unit/algorithms/test_grpo.py
 
 "${PYTHON}" -m ruff check \
@@ -40,10 +42,13 @@ cd "${REPO}"
   nemo_rl/distributed/ray_actor_environment_registry.py \
   nemo_rl/distributed/worker_groups.py \
   nemo_rl/models/generation/dynamo \
+  nemo_rl/utils/prefix_reuse.py \
   tests/unit/algorithms/test_grpo.py \
   tests/unit/models/generation/test_dynamo_arguments.py \
   tests/unit/models/generation/test_dynamo_generation.py \
   tests/unit/models/generation/test_dynamo_managed_runtime.py \
+  tests/unit/models/generation/test_dynamo_token_wrapper.py \
+  tests/unit/utils/test_prefix_reuse.py \
   tools/refit_verifier.py
 
 "${PYTHON}" -m ruff format --check \
@@ -51,7 +56,11 @@ cd "${REPO}"
   nemo_rl/models/generation/dynamo/config.py \
   nemo_rl/models/generation/dynamo/dynamo_worker.py \
   nemo_rl/models/generation/dynamo/managed_runtime.py \
+  nemo_rl/models/generation/dynamo/token_wrapper.py \
   nemo_rl/models/generation/dynamo/worker_pool.py \
+  nemo_rl/utils/prefix_reuse.py \
   tests/unit/models/generation/test_dynamo_arguments.py \
   tests/unit/models/generation/test_dynamo_managed_runtime.py \
+  tests/unit/models/generation/test_dynamo_token_wrapper.py \
+  tests/unit/utils/test_prefix_reuse.py \
   tools/refit_verifier.py
