@@ -190,6 +190,10 @@ policy:
       NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
       NVTE_DEBUG: "1"
       NVTE_DEBUG_LEVEL: "2"
+      # Job 2274348 lost 3 worker processes on 3 nodes simultaneously during
+      # step 2 (SYSTEM_ERROR, no python traceback). Fault handler prints a
+      # traceback on SIGSEGV/SIGABRT so the next occurrence is attributable.
+      PYTHONFAULTHANDLER: "1"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0

@@ -192,6 +192,10 @@ EOF
 
 echo -e "Running command:\n$COMMAND"
 
+# Sync node-local /tmp/ray session logs to the shared log dir every 2 min so
+# worker crash tracebacks survive job teardown (consumed by ray.sub).
+export RAY_LOG_SYNC_FREQUENCY="${RAY_LOG_SYNC_FREQUENCY:-120}"
+
 # OccupiedIdleGPUsJobReaper exemption: async (non-colocated) legitimately idles its
 # training-node GPU pool while the replay buffer fills from slow SWE reward computation,
 # which otherwise trips the idle-GPU reaper. Override via SLURM_COMMENT env if needed.
