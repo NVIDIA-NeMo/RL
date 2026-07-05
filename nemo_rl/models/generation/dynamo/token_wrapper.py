@@ -180,10 +180,7 @@ def _render_suffix_after_tokenized_assistant(
     the marker's closing EOS to extract the suffix that follows the response.
     """
     marked_messages = deepcopy(messages)
-    if any(
-        _PREFIX_BOUNDARY_MARKER in str(message)
-        for message in marked_messages
-    ):
+    if any(_PREFIX_BOUNDARY_MARKER in str(message) for message in marked_messages):
         raise ValueError("Dynamo prefix boundary marker collided with request data.")
 
     marked_assistant = marked_messages[assistant_index]
