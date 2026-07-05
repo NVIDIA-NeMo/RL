@@ -942,6 +942,49 @@ def _patched_logprob_phase(policy):
             policy.get_reference_policy_logprobs.return_value = saved_rlp
 
 
+def test_async_grpo_train_propagates_training_errors_after_cleanup(
+    mock_grpo_components,
+):
+    """Async failures must fail the job after running lifecycle cleanup."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.loss_fn.reference_policy_kl_penalty = 0
+    master_config.grpo["skip_reference_policy_logprobs_calculation"] = True
+    master_config.grpo["max_num_steps"] = 1
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+
+    policy = mock_grpo_components["policy"]
+    policy.train.side_effect = RuntimeError("intentional async training failure")
+    policy_generation = _mock_policy_generation()
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, {}),
+        _patched_logprob_phase(policy),
+        pytest.raises(RuntimeError, match="intentional async training failure"),
+    ):
+        async_grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    policy_generation.shutdown.assert_called_once_with()
+    policy.shutdown.assert_called_once_with()
+
+
 @ray.remote(num_cpus=0)
 class MockEnvironment(EnvironmentInterface):
     def __init__(self, rewards: list[float]):

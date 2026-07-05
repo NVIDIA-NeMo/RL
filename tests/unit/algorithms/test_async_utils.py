@@ -1236,14 +1236,9 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
-    @pytest.mark.parametrize(
-        ("deployment", "should_wait"),
-        [("ray", False), ("external", True)],
-    )
-    def test_dynamo_prepare_for_refit_only_skips_drain_when_managed(
-        self, deployment, should_wait
-    ):
-        """Only owned Dynamo engines opt into unpaused in-flight refits."""
+    @pytest.mark.parametrize("deployment", ["ray", "external"])
+    def test_dynamo_prepare_for_refit_drains_pending_generations(self, deployment):
+        """Dynamo layerwise reload never overlaps an active generation."""
         collector = self.create_local_collector()
         collector.master_config.policy["generation"] = {
             "backend": "dynamo",
@@ -1254,10 +1249,7 @@ class TestAsyncTrajectoryCollector:
 
         collector.prepare_for_refit()
 
-        if should_wait:
-            collector.wait_for_pending_generations.assert_called_once_with()
-        else:
-            collector.wait_for_pending_generations.assert_not_called()
+        collector.wait_for_pending_generations.assert_called_once_with()
 
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""

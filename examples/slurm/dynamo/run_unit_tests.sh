@@ -36,7 +36,7 @@ test -s docker/patches/vllm-0.23.0-layerwise-reload-composed-loader.patch
   tests/unit/models/generation/test_dynamo_token_wrapper.py \
   tests/unit/utils/test_prefix_reuse.py \
   tests/unit/algorithms/test_grpo.py \
-  tests/unit/algorithms/test_async_utils.py::TestAsyncTrajectoryCollector::test_dynamo_prepare_for_refit_only_skips_drain_when_managed \
+  tests/unit/algorithms/test_async_utils.py::TestAsyncTrajectoryCollector::test_dynamo_prepare_for_refit_drains_pending_generations \
   tests/unit/tools/test_refit_verifier.py
 
 "${PYTHON}" -m ruff check \
