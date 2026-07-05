@@ -22,12 +22,30 @@ from nemo_rl.models.generation.dynamo.token_wrapper import (
 
 class _Tokenizer:
     eos_token_id = 2
+    eos_token = "<eos>"
 
     def __init__(self) -> None:
         self.calls = []
 
     def decode(self, token_ids):
         return repr(token_ids)
+
+    def encode(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        token_ids = []
+        while text:
+            if text.startswith(self.eos_token):
+                token_ids.append(self.eos_token_id)
+                text = text[len(self.eos_token) :]
+            elif text.startswith("next"):
+                token_ids.append(40)
+                text = text[len("next") :]
+            elif text.startswith("GEN"):
+                token_ids.append(99)
+                text = text[len("GEN") :]
+            else:
+                raise AssertionError(f"Unexpected text to encode: {text!r}")
+        return token_ids
 
     def apply_chat_template(
         self,
@@ -56,20 +74,39 @@ class _Tokenizer:
             }
         )
         token_ids = []
-        for message in conversation:
+        rendered = ""
+        for index, message in enumerate(conversation):
             role = message["role"]
             content = message.get("content")
             if role == "user" and content == "hello":
                 token_ids.extend([10])
+                rendered += "hello"
             elif role == "assistant" and content == "first":
-                token_ids.extend([300, self.eos_token_id])
+                # Model the Nemotron template's context-dependent history
+                # truncation: the assistant is longer when rendered alone than
+                # when a later user turn is present.
+                has_later_user = any(
+                    item["role"] == "user" for item in conversation[index + 1 :]
+                )
+                token_ids.extend(
+                    [3, self.eos_token_id]
+                    if has_later_user
+                    else [300, 301, 302, self.eos_token_id]
+                )
+                rendered += f"first{self.eos_token}"
             elif role == "user" and content == "next":
                 token_ids.extend([40])
+                rendered += "next"
+            elif role == "assistant" and isinstance(content, str):
+                token_ids.extend([777, self.eos_token_id])
+                rendered += f"{content}{self.eos_token}"
             else:
                 token_ids.extend([900])
+                rendered += "other"
         if add_generation_prompt:
             token_ids.extend([99])
-        return token_ids
+            rendered += "GEN"
+        return token_ids if tokenize else rendered
 
 
 def test_prepare_dynamo_chat_completion_request_first_turn() -> None:
@@ -143,7 +180,9 @@ def test_prepare_dynamo_chat_completion_request_preserves_prior_prefix() -> None
     assert "generation_token_ids" not in prepared["messages"][1]
     assert "generation_log_probs" not in prepared["messages"][1]
     assert tokenizer.calls[0]["add_generation_prompt"] is True
-    assert tokenizer.calls[1]["add_generation_prompt"] is False
+    assert tokenizer.calls[1]["add_generation_prompt"] is True
+    assert tokenizer.calls[0]["tokenize"] is True
+    assert tokenizer.calls[1]["tokenize"] is False
 
 
 def test_prepare_dynamo_chat_completion_request_rejects_stream() -> None:

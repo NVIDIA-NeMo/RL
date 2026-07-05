@@ -34,6 +34,8 @@ def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
 def derive_required_prefix_token_ids(messages: Iterable[Any]) -> list[int] | None:
     """Return the latest assistant prefix carried by NeMo-Gym message metadata."""
     for message in reversed(list(messages)):
+        if _get_message_field(message, "role") != "assistant":
+            continue
         prompt_token_ids = _get_message_field(message, "prompt_token_ids")
         generation_token_ids = _get_message_field(message, "generation_token_ids")
         if prompt_token_ids is None or generation_token_ids is None:

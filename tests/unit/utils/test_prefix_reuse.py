@@ -53,6 +53,23 @@ def test_derive_required_prefix_token_ids_uses_latest_message() -> None:
     assert derive_required_prefix_token_ids(messages) == [3, 4, 5]
 
 
+def test_derive_required_prefix_token_ids_ignores_non_assistant_metadata() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "prompt_token_ids": [1],
+            "generation_token_ids": [2],
+        },
+        {
+            "role": "user",
+            "prompt_token_ids": [90],
+            "generation_token_ids": [91],
+        },
+    ]
+
+    assert derive_required_prefix_token_ids(messages) == [1, 2]
+
+
 def test_messages_to_last_assistant_includes_latest_assistant_turn() -> None:
     messages = [
         {"role": "system"},

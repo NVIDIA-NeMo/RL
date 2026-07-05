@@ -21,17 +21,15 @@ from copy import deepcopy
 from typing import Any, Optional
 
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
-from nemo_rl.utils.prefix_reuse import (
-    derive_required_prefix_token_ids,
-    messages_to_last_assistant,
-    replace_prefix_tokens,
-)
+from nemo_rl.utils.prefix_reuse import derive_required_prefix_token_ids
 
 _GYM_TOKEN_METADATA_FIELDS = (
     "prompt_token_ids",
     "generation_token_ids",
     "generation_log_probs",
 )
+
+_PREFIX_BOUNDARY_MARKER = "NEMO_RL_DYNAMO_PREFIX_BOUNDARY_7F3A9C1E"
 
 
 def _coerce_token_id_list(value: Any, field_name: str) -> list[int]:
@@ -118,6 +116,150 @@ def _render_prompt_token_ids(
     )
 
 
+def _render_prompt_text(
+    *,
+    tokenizer: Any,
+    request_body: dict[str, Any],
+    messages: list[Any],
+    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    add_generation_prompt: bool,
+) -> str:
+    tools = request_body.get("tools")
+    if request_body.get("tool_choice") == "none":
+        tools = None
+
+    apply_chat_template = type(tokenizer).apply_chat_template
+    rendered = apply_chat_template(
+        tokenizer,
+        messages,
+        tools=tools,
+        documents=request_body.get("documents"),
+        chat_template=request_body.get("chat_template"),
+        add_generation_prompt=add_generation_prompt,
+        continue_final_message=bool(request_body.get("continue_final_message", False)),
+        tokenize=False,
+        return_tensors=None,
+        return_dict=False,
+        **_chat_template_kwargs(request_body, tokenizer_chat_template_kwargs),
+    )
+    if not isinstance(rendered, str):
+        raise ValueError(
+            "Dynamo token wrapper expected chat template rendering to return text."
+        )
+    return rendered
+
+
+def _latest_tokenized_assistant_index(messages: list[Any]) -> Optional[int]:
+    for index in reversed(range(len(messages))):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if (
+            message.get("prompt_token_ids") is not None
+            and message.get("generation_token_ids") is not None
+        ):
+            return index
+    return None
+
+
+def _render_suffix_after_tokenized_assistant(
+    *,
+    tokenizer: Any,
+    request_body: dict[str, Any],
+    messages: list[Any],
+    assistant_index: int,
+    tokenizer_chat_template_kwargs: Optional[dict[str, Any]],
+    add_generation_prompt: bool,
+) -> list[int]:
+    """Render only the contextual suffix following a prior model response.
+
+    Some templates rewrite earlier assistant reasoning based on later user turns.
+    Rendering only through the last assistant can therefore be longer than the
+    complete prompt and cannot identify the splice point. Keep the complete
+    conversation context, replace that assistant payload with a marker, and use
+    the marker's closing EOS to extract the suffix that follows the response.
+    """
+    marked_messages = deepcopy(messages)
+    if any(
+        _PREFIX_BOUNDARY_MARKER in str(message)
+        for message in marked_messages
+    ):
+        raise ValueError("Dynamo prefix boundary marker collided with request data.")
+
+    marked_assistant = marked_messages[assistant_index]
+    if not isinstance(marked_assistant, dict):
+        raise ValueError("Dynamo token metadata must be attached to a message object.")
+    marked_assistant["content"] = _PREFIX_BOUNDARY_MARKER
+    marked_assistant.pop("reasoning_content", None)
+    marked_assistant.pop("reasoning", None)
+    # The tool payload belongs to the prior model response. Removing it from this
+    # diagnostic render makes the marker immediately precede the assistant EOS;
+    # subsequent tool/environment messages retain the same roles and rendering.
+    marked_assistant.pop("tool_calls", None)
+
+    marked_token_ids = _render_prompt_token_ids(
+        tokenizer=tokenizer,
+        request_body=request_body,
+        messages=marked_messages,
+        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+        add_generation_prompt=add_generation_prompt,
+    )
+    marked_text = _render_prompt_text(
+        tokenizer=tokenizer,
+        request_body=request_body,
+        messages=marked_messages,
+        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+        add_generation_prompt=add_generation_prompt,
+    )
+
+    marker_pos = marked_text.find(_PREFIX_BOUNDARY_MARKER)
+    if marker_pos < 0:
+        raise ValueError(
+            "Dynamo chat template did not preserve the prefix boundary marker."
+        )
+    eos_token = getattr(tokenizer, "eos_token", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if not isinstance(eos_token, str) or eos_token_id is None:
+        raise ValueError("Dynamo token wrapper requires tokenizer EOS text and ID.")
+    suffix_pos = marked_text.find(eos_token, marker_pos + len(_PREFIX_BOUNDARY_MARKER))
+    if suffix_pos < 0:
+        raise ValueError(
+            "Dynamo chat template did not close the tokenized assistant with EOS."
+        )
+
+    suffix_text = marked_text[suffix_pos:]
+    suffix_token_ids = _coerce_token_id_list(
+        tokenizer.encode(suffix_text, add_special_tokens=False),
+        "contextual template suffix token IDs",
+    )
+    if not suffix_token_ids or suffix_token_ids[0] != eos_token_id:
+        raise ValueError("Dynamo contextual template suffix must begin with EOS.")
+    if len(suffix_token_ids) > len(marked_token_ids) or (
+        marked_token_ids[-len(suffix_token_ids) :] != suffix_token_ids
+    ):
+        raise ValueError(
+            "Dynamo contextual template suffix did not match the full prompt tokens."
+        )
+    return suffix_token_ids
+
+
+def _join_model_prefix_and_template_suffix(
+    *,
+    tokenizer: Any,
+    model_prefix_token_ids: list[int],
+    template_suffix_token_ids: list[int],
+) -> list[int]:
+    if not model_prefix_token_ids:
+        return template_suffix_token_ids
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        raise ValueError("Dynamo token wrapper requires a tokenizer EOS token ID.")
+    model_cut_end = len(model_prefix_token_ids)
+    if model_prefix_token_ids[-1] == eos_token_id:
+        model_cut_end -= 1
+    return model_prefix_token_ids[:model_cut_end] + template_suffix_token_ids
+
+
 def _validate_engine_data(response_body: dict[str, Any]) -> None:
     nvext = response_body.get("nvext")
     engine_data = nvext.get("engine_data") if isinstance(nvext, dict) else None
@@ -157,28 +299,34 @@ def prepare_dynamo_chat_completion_request(
     prepared_body["messages"] = stripped_messages
     prepared_body.pop("required_prefix_token_ids", None)
 
-    full_prompt_token_ids = _render_prompt_token_ids(
-        tokenizer=tokenizer,
-        request_body=prepared_body,
-        messages=stripped_messages,
-        tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-        add_generation_prompt=_request_add_generation_prompt(prepared_body),
-    )
-
     required_prefix_token_ids = derive_required_prefix_token_ids(messages)
-    if required_prefix_token_ids is not None:
-        prefix_prompt_token_ids = _render_prompt_token_ids(
+    add_generation_prompt = _request_add_generation_prompt(prepared_body)
+    if required_prefix_token_ids is None:
+        full_prompt_token_ids = _render_prompt_token_ids(
             tokenizer=tokenizer,
             request_body=prepared_body,
-            messages=messages_to_last_assistant(stripped_messages),
+            messages=stripped_messages,
             tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
-            add_generation_prompt=False,
+            add_generation_prompt=add_generation_prompt,
         )
-        full_prompt_token_ids = replace_prefix_tokens(
-            tokenizer,
+    else:
+        assistant_index = _latest_tokenized_assistant_index(messages)
+        if assistant_index is None:
+            raise ValueError(
+                "Dynamo prefix token metadata must be attached to an assistant message."
+            )
+        template_suffix_token_ids = _render_suffix_after_tokenized_assistant(
+            tokenizer=tokenizer,
+            request_body=prepared_body,
+            messages=stripped_messages,
+            assistant_index=assistant_index,
+            tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+            add_generation_prompt=add_generation_prompt,
+        )
+        full_prompt_token_ids = _join_model_prefix_and_template_suffix(
+            tokenizer=tokenizer,
             model_prefix_token_ids=required_prefix_token_ids,
-            template_prefix_token_ids=prefix_prompt_token_ids,
-            template_token_ids=full_prompt_token_ids,
+            template_suffix_token_ids=template_suffix_token_ids,
         )
 
     nvext = prepared_body.get("nvext")
