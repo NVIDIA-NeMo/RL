@@ -78,6 +78,11 @@ class _Tokenizer:
         for index, message in enumerate(conversation):
             role = message["role"]
             content = message.get("content")
+            for tool_call in message.get("tool_calls", []):
+                function = tool_call.get("function", tool_call)
+                arguments = function.get("arguments")
+                if arguments is not None and not isinstance(arguments, dict):
+                    raise TypeError("tool arguments must be a mapping")
             if role == "user" and content == "hello":
                 token_ids.extend([10])
                 rendered += "hello"
@@ -183,6 +188,57 @@ def test_prepare_dynamo_chat_completion_request_preserves_prior_prefix() -> None
     assert tokenizer.calls[1]["add_generation_prompt"] is True
     assert tokenizer.calls[0]["tokenize"] is True
     assert tokenizer.calls[1]["tokenize"] is False
+
+
+def test_prepare_dynamo_chat_completion_request_normalizes_prior_tool_arguments() -> (
+    None
+):
+    tokenizer = _Tokenizer()
+    body = {
+        "model": "dummy-model",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "older tool call",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": '{"command":"pwd"}',
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "malformed",
+                            "arguments": "not-json",
+                        },
+                    },
+                ],
+            },
+            {"role": "user", "content": "next"},
+            {
+                "role": "assistant",
+                "content": "first",
+                "prompt_token_ids": [10, 777, 2, 40],
+                "generation_token_ids": [31, 32, 2],
+                "generation_log_probs": [-0.1, -0.2, -0.3],
+            },
+            {"role": "user", "content": "next"},
+        ],
+    }
+
+    prepared = prepare_dynamo_chat_completion_request(body, tokenizer=tokenizer)
+
+    assert prepared["nvext"]["token_data"] == [10, 777, 2, 40, 31, 32, 2, 40, 99]
+    assert prepared["messages"][1]["tool_calls"][0]["function"]["arguments"] == (
+        '{"command":"pwd"}'
+    )
+    assert prepared["messages"][1]["tool_calls"][1]["function"]["arguments"] == (
+        "not-json"
+    )
 
 
 def test_prepare_dynamo_chat_completion_request_rejects_stream() -> None:

@@ -162,6 +162,42 @@ def _latest_tokenized_assistant_index(messages: list[Any]) -> Optional[int]:
     return None
 
 
+def _normalize_tool_arguments_for_template(
+    messages: list[Any], *, before_index: int
+) -> None:
+    """Make prior OpenAI tool calls renderable by model chat templates.
+
+    OpenAI chat messages carry ``function.arguments`` as a JSON string, while
+    the Nemotron template iterates those arguments as a mapping. Dynamo does
+    not need to re-render the preserved model prefix, but the boundary-marker
+    render still traverses older assistant turns. Normalize only that
+    diagnostic copy; the request forwarded to Dynamo retains its original
+    OpenAI payload.
+    """
+    for message in messages[:before_index]:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function", tool_call)
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                continue
+            try:
+                parsed_arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed_arguments = {}
+            function["arguments"] = (
+                parsed_arguments if isinstance(parsed_arguments, dict) else {}
+            )
+
+
 def _render_suffix_after_tokenized_assistant(
     *,
     tokenizer: Any,
@@ -182,6 +218,10 @@ def _render_suffix_after_tokenized_assistant(
     marked_messages = deepcopy(messages)
     if any(_PREFIX_BOUNDARY_MARKER in str(message) for message in marked_messages):
         raise ValueError("Dynamo prefix boundary marker collided with request data.")
+
+    _normalize_tool_arguments_for_template(
+        marked_messages, before_index=assistant_index
+    )
 
     marked_assistant = marked_messages[assistant_index]
     if not isinstance(marked_assistant, dict):
