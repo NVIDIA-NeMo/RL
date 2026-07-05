@@ -2344,6 +2344,43 @@ def _log_mixed_rewards_and_advantages_information(
     metrics["advantages/mean"] = advantages.float().mean().item()
 
 
+def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
+    """Zero-valued seq-level metrics used when the prev_logprobs forward is skipped."""
+    return {
+        "max_seq_mult_prob_error": 0.0,
+        "mean_seq_mult_prob_error": 0.0,
+        "min_seq_mult_prob_error": 0.0,
+        "max_seq_mult_prob_error_after_mask": 0.0,
+        "mean_seq_mult_prob_error_after_mask": 0.0,
+        "min_seq_mult_prob_error_after_mask": 0.0,
+        "num_masked_seqs_by_logprob_error": 0,
+        "masked_correct_pct": 0.0,
+    }
+
+
+def _resolve_logprob_skip_flags(
+    master_config: MasterConfig,
+) -> tuple[bool, Any, Optional[float]]:
+    """Return (skip_prev, skip_ref, seq_logprob_error_threshold); warn on incompatible combos."""
+    seq_logprob_error_threshold = master_config.grpo.get(
+        "seq_logprob_error_threshold", None
+    )
+    skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
+    if (
+        master_config.loss_fn.force_on_policy_ratio
+        and seq_logprob_error_threshold is not None
+    ):
+        warnings.warn(
+            "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
+            "Computing prev_logprobs anyway for seq-level error masking."
+        )
+    return (
+        skip_prev_logprobs,
+        master_config.grpo.get("skip_reference_policy_logprobs_calculation"),
+        seq_logprob_error_threshold,
+    )
+
+
 def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
@@ -2937,24 +2974,11 @@ def grpo_train(
                     metrics_logging_data["content"] = flat_messages["content"]
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
-                # Skip prev_logprobs computation when force_on_policy_ratio=True
-                # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
-                seq_logprob_error_threshold = master_config.grpo.get(
-                    "seq_logprob_error_threshold", None
-                )
-                force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
-                # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
-                if force_on_policy_ratio and seq_logprob_error_threshold is not None:
-                    warnings.warn(
-                        "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
-                        "Computing prev_logprobs anyway for seq-level error masking."
-                    )
-
-                # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
-                skip_reference_logprobs = master_config.grpo.get(
-                    "skip_reference_policy_logprobs_calculation"
-                )
+                (
+                    skip_prev_logprobs,
+                    skip_reference_logprobs,
+                    seq_logprob_error_threshold,
+                ) = _resolve_logprob_skip_flags(master_config)
 
                 if not (skip_prev_logprobs and skip_reference_logprobs):
                     print("▶ Preparing for logprob inference...", flush=True)
@@ -3018,17 +3042,7 @@ def grpo_train(
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = {
-                        "max_seq_mult_prob_error": 0.0,
-                        "mean_seq_mult_prob_error": 0.0,
-                        "min_seq_mult_prob_error": 0.0,
-                        "max_seq_mult_prob_error_after_mask": 0.0,
-                        "mean_seq_mult_prob_error_after_mask": 0.0,
-                        "min_seq_mult_prob_error_after_mask": 0.0,
-                        "num_masked_seqs_by_logprob_error": 0,
-                        "masked_correct_pct": 0.0,
-                    }
+                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
@@ -4342,25 +4356,11 @@ def async_grpo_train(
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)
-                # Skip prev_logprobs computation when force_on_policy_ratio=True
-                # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
-                seq_logprob_error_threshold = master_config.grpo.get(
-                    "seq_logprob_error_threshold", None
-                )
-                force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
-
-                # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
-                if force_on_policy_ratio and seq_logprob_error_threshold is not None:
-                    warnings.warn(
-                        "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
-                        "Computing prev_logprobs anyway for seq-level error masking."
-                    )
-
-                # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
-                skip_reference_logprobs = master_config.grpo.get(
-                    "skip_reference_policy_logprobs_calculation"
-                )
+                (
+                    skip_prev_logprobs,
+                    skip_reference_logprobs,
+                    seq_logprob_error_threshold,
+                ) = _resolve_logprob_skip_flags(master_config)
 
                 if not (skip_prev_logprobs and skip_reference_logprobs):
                     print("▶ Preparing for logprob inference...", flush=True)
@@ -4396,17 +4396,7 @@ def async_grpo_train(
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
-                    # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    seq_logprob_error_metrics = {
-                        "max_seq_mult_prob_error": 0.0,
-                        "mean_seq_mult_prob_error": 0.0,
-                        "min_seq_mult_prob_error": 0.0,
-                        "max_seq_mult_prob_error_after_mask": 0.0,
-                        "mean_seq_mult_prob_error_after_mask": 0.0,
-                        "min_seq_mult_prob_error_after_mask": 0.0,
-                        "num_masked_seqs_by_logprob_error": 0,
-                        "masked_correct_pct": 0.0,
-                    }
+                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
                     seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,

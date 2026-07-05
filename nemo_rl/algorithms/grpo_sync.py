@@ -51,6 +51,8 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
+    _placeholder_seq_logprob_error_metrics,
+    _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
     compute_and_apply_seq_logprob_error_masking,
@@ -777,9 +779,16 @@ def grpo_train_sync(
                 baseline_for_log = baseline.clone()
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
-                print("▶ Preparing for logprob inference...", flush=True)
-                with timer.time("logprob_inference_prep"):
-                    policy.prepare_for_lp_inference()
+                (
+                    skip_prev_logprobs,
+                    skip_reference_logprobs,
+                    seq_logprob_error_threshold,
+                ) = _resolve_logprob_skip_flags(master_config)
+
+                if not (skip_prev_logprobs and skip_reference_logprobs):
+                    print("▶ Preparing for logprob inference...", flush=True)
+                    with timer.time("logprob_inference_prep"):
+                        policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -791,11 +800,14 @@ def grpo_train_sync(
                     # batched fetch to avoid double-shipping the per-token
                     # tensor through Ray's plasma store on top of the TQ
                     # writeback.
-                    policy.get_logprobs_from_meta(meta, timer=timer)
-                    compute_ref = not master_config.grpo.get(
-                        "skip_reference_policy_logprobs_calculation"
-                    )
-                    if compute_ref:
+                    if not skip_prev_logprobs:
+                        policy.get_logprobs_from_meta(meta, timer=timer)
+                    else:
+                        print(
+                            "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                            flush=True,
+                        )
+                    if not skip_reference_logprobs:
                         policy.get_reference_policy_logprobs_from_meta(
                             meta,
                             timer=timer,
@@ -805,23 +817,41 @@ def grpo_train_sync(
                     # for masking / advantage. Bulk (input_ids, multimodal,
                     # output_ids, attention_mask, position_ids) stays in
                     # TQ — workers will fetch it via ``train_presharded``.
+                    select_fields = ["generation_logprobs", "token_mask"]
+                    if not skip_prev_logprobs:
+                        select_fields.append("prev_logprobs")
+                    if not skip_reference_logprobs:
+                        select_fields.append("reference_policy_logprobs")
                     extras_bdd = policy.read_from_dataplane(
                         meta,
-                        select_fields=[
-                            "prev_logprobs",
-                            "generation_logprobs",
-                            "token_mask",
-                            *(["reference_policy_logprobs"] if compute_ref else []),
-                        ],
+                        select_fields=select_fields,
                         pad_value_dict=_pad_dict,
                     )
-                    prev_logprobs = extras_bdd["prev_logprobs"]
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
+                    if skip_prev_logprobs:
+                        # Train workers fetch prev_logprobs via
+                        # train_presharded (it's in DP_TRAIN_FIELDS), so the
+                        # column must exist in TQ even when the forward was
+                        # skipped.
+                        prev_logprobs = torch.zeros_like(generation_logprobs)
+                        policy.write_to_dataplane(
+                            meta,
+                            fields={"prev_logprobs": prev_logprobs},
+                        )
+                    else:
+                        prev_logprobs = extras_bdd["prev_logprobs"]
                     reference_policy_logprobs = (
-                        extras_bdd["reference_policy_logprobs"] if compute_ref else None
+                        extras_bdd["reference_policy_logprobs"]
+                        if not skip_reference_logprobs
+                        else None
                     )
 
+                # Seq-level logprob error metrics/masking require real prev_logprobs
+                if skip_prev_logprobs:
+                    sample_mask = loss_multiplier
+                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                else:
                     sample_mask, seq_logprob_error_metrics = (
                         _compute_seq_logprob_error_metrics(
                             token_mask=token_mask,
@@ -829,9 +859,7 @@ def grpo_train_sync(
                             prev_logprobs=prev_logprobs,
                             generation_logprobs=generation_logprobs,
                             rewards=rewards,
-                            seq_logprob_error_threshold=master_config.grpo[
-                                "seq_logprob_error_threshold"
-                            ],
+                            seq_logprob_error_threshold=seq_logprob_error_threshold,
                         )
                     )
 
