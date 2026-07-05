@@ -36,8 +36,9 @@
 # stay [N, S] with no scalar plumbing, identical reduction to curr. The per-row
 # mask seed is shared across prev/reference/training (set in grpo.py) so the ratio
 # is valid; it resamples every step. Two forwards on every rank -> DP-uniform. The
-# logprob (prev/ref) path microbatches by logprob_batch_size (set to 1 below so it
-# always divides the per-rank logprob batch); it is no-grad and independent of K.
+# logprob (prev/ref) path microbatches by logprob_batch_size (set to 2 below; requires
+# an even per-rank logprob batch, which holds for the current prompt/generation/node
+# counts); it is no-grad and independent of K.
 #
 # Inherits the CoupledGRPO config for the shared diffusion-model / SGLang setup
 # and only swaps the policy worker, the logprob estimator, and the loss to the
@@ -49,6 +50,20 @@ defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron.ya
 policy:
   worker_cls_fqn: "nemo_rl.models.policy.workers.espo_megatron_policy_worker.ESPOMegatronPolicyWorker"
 
+  # Training block_size 16 (matches the bs16 decoding). Overriding the model
+  # block_size re-runs the one-time HF->mcore conversion under a separate cache
+  # path (same as BlockJustGRPO; bjg's bs16 cache may be reused).
+  hf_config_overrides:
+    block_size: 16
+
+  # block_size-16 CONFIDENCE decoding for training rollouts. Validation decode is
+  # inherited from the diffugrpo base sglang_val_dllm_overrides (confidence @ bs16),
+  # so no explicit override needed here. Model (hf_config_overrides) and ELBO
+  # (logprob_estimation.block_size) are also set to 16 -> ESPO is fully block_size 16.
+  generation:
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/coupled_confidence_dllm_bs16.yaml"
+
   logprob_estimation:
     # Fully replace the inherited CoupledGRPO logprob_estimation block (drops its
     # coupled-only keys, e.g. verify_gen_kl_with_sglang_mask) instead of merging.
@@ -57,7 +72,7 @@ policy:
     mask_token_id: 100
     # Block size used to build the noisy layout AND to factor the ELBO; matches
     # the model's block_size (Nemotron-Labs-Diffusion-3B = 32).
-    block_size: 32
+    block_size: 16
     exclude_mask_token_from_logits: true
     # Per-sample masking ratio bounds (CoupledGRPO default; ablate full range).
     mask_ratio_min: 0.2
@@ -79,7 +94,7 @@ policy:
   train_micro_batch_size: 2
   # logprob (prev/ref) microbatch size; 1 always divides the per-rank logprob batch
   # (no-grad, independent of training K).
-  logprob_batch_size: 1
+  logprob_batch_size: 2
 
 loss_fn:
   # Route B sequence-level ESPO: one ratio per sequence on the [N,1] ELBO scalar.

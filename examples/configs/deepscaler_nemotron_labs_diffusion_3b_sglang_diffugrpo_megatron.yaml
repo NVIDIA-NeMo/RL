@@ -30,6 +30,11 @@ policy:
     sglang_val_dllm_overrides:
       selection_policy: confidence
       threshold: 0.9
+      block_size: 16
+      max_steps: 16
+      # Pin val temperature to 1.0 so a changed training/rollout temperature
+      # never leaks into validation inference.
+      temperature: 1.0
     sglang_cfg:
       max_running_requests: 4
       disable_cuda_graph: true
