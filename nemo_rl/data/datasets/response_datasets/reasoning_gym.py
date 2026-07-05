@@ -34,8 +34,13 @@ class ReasoningGymDataset(RawDataset):
 
     Args:
         task_name: reasoning_gym task name, also used as the NeMo-RL task name.
-        size: Number of procedurally generated samples.
+        size: Number of procedurally generated (distinct) samples.
         seed: Seed for the reasoning_gym generator.
+        repeat: Number of times to repeat the (distinct) dataset, default is 1.
+            Set on the validation split to compute avg@k: each of the `size`
+            distinct problems is duplicated `repeat` times, and the validation
+            loop draws one stochastic sample per copy, so the mean reward is an
+            avg@`repeat` estimate. Mirrors AIME2024Dataset's `repeat`.
     """
 
     def __init__(
@@ -43,6 +48,7 @@ class ReasoningGymDataset(RawDataset):
         task_name: str,
         size: int = 5000,
         seed: int = 42,
+        repeat: int = 1,
         system_prompt_file: str | None = None,
         prompt_style: str | None = None,
         **kwargs,
@@ -76,6 +82,10 @@ class ReasoningGymDataset(RawDataset):
             self.format_data,
             remove_columns=self.dataset.column_names,
         )
+
+        # Duplicate each distinct problem `repeat` times for avg@k validation.
+        if repeat > 1:
+            self.dataset = self.dataset.repeat(repeat)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         if self.prompt_style == "agrpo_countdown":

@@ -1,0 +1,41 @@
+# Shared 4x4 Mini Sudoku task settings (blanks-only reward + few-shot), inherited by the
+# per-algorithm sudoku configs (ESPO, Block JustGRPO). NOT runnable on its own -- it is a
+# fragment listed as the SECOND parent in those configs' `defaults:` list, so it overrides
+# the algorithm base's data/env/task while keeping model/generation/loss from the algorithm.
+grpo:
+  val_at_start: true      # measure validation baseline before any training step
+  max_val_samples: 2048   # >= validation size(256) * repeat(4) so no avg@4 samples are dropped
+
+policy:
+  max_total_sequence_length: 1536
+  generation:
+    max_new_tokens: 512     # divisible by block_size 16 and 32
+
+data:
+  _override_: true          # replace the algorithm base's math (DeepScaleR) data block entirely
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  max_input_seq_length: 1024
+  train:
+    dataset_name: mini_sudoku
+    size: 50000
+    seed: 1
+  validation:
+    dataset_name: mini_sudoku
+    size: 256
+    seed: 2
+    repeat: 4               # avg@4: each of the 256 distinct puzzles is sampled 4x (1024 val gens)
+  default:
+    prompt_file: null
+    system_prompt_file: examples/prompts/mini_sudoku_fewshot.txt
+    processor: "reasoning_gym_data_processor"
+    env_name: "reasoning_gym"
+
+env:
+  reasoning_gym:
+    task: "mini_sudoku"
+    reward_mode: "sudoku_blanks"
+
+cluster:
+  num_nodes: 4

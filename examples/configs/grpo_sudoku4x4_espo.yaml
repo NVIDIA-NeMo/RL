@@ -1,0 +1,16 @@
+# ESPO (block-aware coupled GRPO) on Nemotron-Labs-Diffusion-3B, 4x4 Mini Sudoku.
+# Two parents: (1) the ESPO algorithm base (policy/coupled generation, num_mc_samples=2,
+# block_size 16, microbatch sizing) and (2) grpo_sudoku4x4_base.yaml (shared task settings:
+# mini_sudoku blanks-only reward, few-shot prompt, gen 512, avg@4 validation). The second
+# parent overrides the algorithm base's data/env; this file only sets output paths.
+defaults:
+  - deepscaler_nemotron_labs_diffusion_3b_sglang_espo_block_aware_coupled_megatron_bs16.yaml
+  - grpo_sudoku4x4_base.yaml
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-espo-sudoku4x4-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-espo-sudoku4x4-sglang"
+  wandb:
+    name: "grpo-nd3b-espo-sudoku4x4-blanks-fewshot"
