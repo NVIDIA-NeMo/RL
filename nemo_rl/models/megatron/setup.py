@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import hashlib
 import json
 import os
@@ -159,8 +160,18 @@ def setup_distributed() -> None:
     destroy_parallel_state()
     # Pin the communicator to the correct GPU explicitly.
     local_rank = int(os.environ["LOCAL_RANK"])
+    # The default 10-minute NCCL watchdog kills ranks that wait on peers stuck
+    # in transient first-hit stalls (e.g. triton JIT of GDN kernels for new
+    # packed-sequence shapes): observed as coordinated SIGABRTs
+    # ("Terminating the process after attempting to dump debug info") during
+    # step-2 collectives in jobs 2274348/2280396. Sub-process-groups inherit
+    # the default group's timeout, so raising it here covers TP/PP/EP/DP
+    # groups too. True hangs remain bounded by the SLURM walltime.
+    timeout_minutes = int(os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60"))
     torch.distributed.init_process_group(
-        "nccl", device_id=torch.device(f"cuda:{local_rank}")
+        "nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+        timeout=datetime.timedelta(minutes=timeout_minutes),
     )
 
 
