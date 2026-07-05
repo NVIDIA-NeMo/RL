@@ -3971,6 +3971,43 @@ def async_grpo_train(
         )
 
         if current_step_ready:
+            # Guard against the checkpoint-resume pipeline deadlock.
+            #
+            # When resuming from a checkpoint, the replay buffer snapshot may
+            # already contain a complete batch for `step` (e.g. 8 trajectories
+            # targeting step 30).  Breaking here immediately causes the main
+            # loop to consume those trajectories, run one training step, and
+            # refit the weights.  After refit the collector's
+            # _calculate_target_weights takes the non-initial branch and
+            # returns [weight_version+1, ...], skipping the just-refitted
+            # step entirely — that step's trajectories are never generated and
+            # training stalls forever.
+            #
+            # Fix: before breaking, ensure the lookahead step (step+1) is also
+            # ready.  The collector's initial branch already covers
+            # [start_step, start_step+max_age], so it will fill the lookahead
+            # while we wait here.  Once both are ready, consuming step and
+            # refitting is safe: step+1 is already in the buffer and the
+            # collector moves on to step+2 normally.
+            max_num_steps = master_config.grpo["max_num_steps"]
+            need_lookahead = (
+                max_trajectory_age_steps > 0 and step + 1 < max_num_steps
+            )
+            if need_lookahead:
+                next_step_ready = ray.get(
+                    replay_buffer.has_complete_batch.remote(
+                        step + 1, num_prompts_per_step, max_trajectory_age_steps
+                    )
+                )
+                if not next_step_ready:
+                    print(
+                        f"  Pipeline barrier: step {step} ready but "
+                        f"step {step + 1} not yet — waiting for lookahead fill "
+                        f"to prevent resume deadlock"
+                    )
+                    wait_iterations += 1
+                    time.sleep(1.0)
+                    continue
             break
 
         trajectories_needed = ray.get(

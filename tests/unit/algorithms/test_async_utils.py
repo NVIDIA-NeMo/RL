@@ -1009,6 +1009,67 @@ class TestReplayBuffer:
         os.unlink(checkpoint_path)
         ray.kill(buffer2)
 
+    def test_resume_deadlock_precondition_detectable(self):
+        """Regression: restored buffer can expose the async-GRPO resume deadlock.
+
+        After PR #2651 introduced replay-buffer checkpointing, resuming from a
+        checkpoint where target N is complete but target N+1 is absent caused an
+        async-GRPO deadlock:
+
+          1. Startup wait sees has_complete_batch(N) == True and breaks immediately.
+          2. Training consumes all target-N trajectories and triggers a refit.
+          3. Collector's post-refit target window becomes [N+2, ...] (skipping N+1).
+          4. Training waits for target N+1, which nobody generates — stall forever.
+
+        The fix is a startup pipeline barrier: before breaking, also require
+        has_complete_batch(N+1) to be True (or N+1 >= max_steps).  This test
+        constructs the exact precondition state — current step complete, lookahead
+        absent — to ensure it remains detectable and to document the expected
+        buffer readiness values that the barrier logic branches on.
+        """
+        num_prompts = 8
+        resume_step = 30
+        max_age = 1
+
+        # Build a pre-checkpoint buffer: 8 trajectories for target 30, none for 31.
+        buffer1 = ReplayBuffer.remote(max_size=20)
+        for _ in range(num_prompts):
+            ray.get(
+                buffer1.add.remote(
+                    {"batch": {"data": "x"}, "rollout_metrics": {}},
+                    weight_version=resume_step - 1,
+                    target_weight_version=resume_step,
+                )
+            )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        # Restore at step 30, simulating a checkpoint resume.
+        buffer2 = ReplayBuffer.remote(max_size=20)
+        ray.get(
+            buffer2.load_state_dict.remote(
+                state,
+                num_prompts_per_step=num_prompts,
+                current_training_step=resume_step,
+                max_age_steps=max_age,
+            )
+        )
+
+        # Step 30 is complete — this is what makes the broken startup return early.
+        assert ray.get(
+            buffer2.has_complete_batch.remote(resume_step, num_prompts, max_age)
+        ), "target step must be complete after restore"
+
+        # Step 31 is absent — this is the deadlock precondition.
+        # The startup pipeline barrier must detect this and continue waiting
+        # instead of breaking, giving the collector time to generate step 31.
+        assert not ray.get(
+            buffer2.has_complete_batch.remote(resume_step + 1, num_prompts, max_age)
+        ), "lookahead step must be absent; barrier should block here"
+
+        ray.kill(buffer2)
+
 
 class TestReplayBufferNew:
     """Tests for ReplayBufferNew: staleness-window sampling via _evict + sample."""
