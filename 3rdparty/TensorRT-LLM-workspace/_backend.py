@@ -16,19 +16,22 @@ pyproject.toml so this backend runs inside the main venv and has access
 to torch, ninja, cmake, and the CUDA toolkit.
 
 Build coordinates (git URL / ref) are read from environment variables;
-see 3rdparty/trtllm-workspace/pyproject.toml for the full list.
+see 3rdparty/TensorRT-LLM-workspace/pyproject.toml for the full list.
 """
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import tomllib
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Constants — must stay in sync with 3rdparty/trtllm-workspace/pyproject.toml
+# Constants — must stay in sync with 3rdparty/TensorRT-LLM-workspace/pyproject.toml
 # ---------------------------------------------------------------------------
 _HERE = Path(__file__).parent.resolve()
 _PYPROJECT = _HERE / "pyproject.toml"
@@ -41,9 +44,35 @@ NAME: str = _META["project"]["name"].replace("-", "_")   # tensorrt_llm
 DIST_NAME: str = _META["project"]["name"]                # tensorrt-llm
 REQUIRES: list[str] = _META["project"].get("dependencies", [])
 
-# Tag used in prepare_metadata — pure-Python so uv lock works on any platform.
-# The real wheel built by build_wheel carries the true platform tag.
+def _wheel_platform_tag() -> str:
+    """Return the real wheel tag for the current interpreter, e.g. cp313-cp313-linux_aarch64.
+
+    Used only for the cache key — NOT for prepare_metadata_for_build_wheel, which
+    must report py3-none-any so that uv lock succeeds on both x86_64 and aarch64.
+    """
+    py = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    machine = platform.machine()  # aarch64 | x86_64
+    return f"{py}-{py}-linux_{machine}"
+
+# py3-none-any is intentional: prepare_metadata_for_build_wheel is called by
+# uv lock, which resolves for both x86_64 and aarch64. A platform-specific tag
+# here would make tensorrt-llm appear incompatible with one of the two arches
+# and break the lock. The real platform tag is used only inside _wheel_cache_dir.
 _METADATA_WHEEL_TAG = "py3-none-any"
+
+
+def _wheel_cache_dir(base: str, git_url: str, git_ref: str) -> Path:
+    """Return a per-(url, ref, version, platform) cache subdirectory under *base*.
+
+    Using a content-addressed subdir means different commits never collide,
+    and a stale wheel from a previous ref is never accidentally reused.
+    The cache key uses the real platform tag (not py3-none-any) so aarch64 and
+    x86_64 wheels built in separate Docker runs never overwrite each other.
+    """
+    key = hashlib.sha256(
+        f"{git_url}|{git_ref}|{VERSION}|{_wheel_platform_tag()}".encode()
+    ).hexdigest()[:16]
+    return Path(base) / key
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +104,7 @@ def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     )
     (dist_info / "WHEEL").write_text(
         "Wheel-Version: 1.0\n"
-        f"Generator: trtllm-workspace-backend\n"
+        f"Generator: TensorRT-LLM-workspace-backend\n"
         "Root-Is-Purelib: false\n"
         f"Tag: {_METADATA_WHEEL_TAG}\n",
         encoding="utf-8",
@@ -95,22 +124,38 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         raise FileNotFoundError(f"Build script not found: {script}")
 
     env = os.environ.copy()
+    git_url = env.get(
+        "BUILD_CUSTOM_TRTLLM_URL",
+        "https://github.com/NVIDIA/TensorRT-LLM.git",
+    )
+    git_ref = env.get("BUILD_CUSTOM_TRTLLM_REF", "bf2ef86f9a2652132b11773d4041e292c553c142")
 
-    # build-custom-trtllm.sh sets WHEEL_OUTPUT_DIR=${UV_FIND_LINKS:-/opt/trtllm_wheels}.
-    # It reads UV_FIND_LINKS, not a WHEEL_OUTPUT_DIR env var.  Point UV_FIND_LINKS
-    # at the directory uv passed us so the cp step lands where we expect to glob.
-    env["UV_FIND_LINKS"] = str(wheel_directory)
+    # Our own cache keyed by (git_url, git_ref, version, platform_tag).
+    # uv's built-in build cache misses across venvs for no-build-isolation
+    # packages because its cache key incorporates the build-environment hash.
+    # We bypass that by always building into TRTLLM_WHEEL_CACHE_DIR (a stable
+    # path that persists across all venv sync calls in the same Docker build),
+    # then copying the result into wheel_directory for uv to consume.
+    cache_base = env.get("TRTLLM_WHEEL_CACHE_DIR", "/opt/trtllm_wheels")
+    cache_dir = _wheel_cache_dir(cache_base, git_url, git_ref)
+
+    cached = sorted(glob.glob(str(cache_dir / "tensorrt_llm-*.whl")))
+    if cached:
+        src = cached[-1]
+        dst = os.path.join(str(wheel_directory), Path(src).name)
+        shutil.copy2(src, dst)
+        print(f"[trtllm-backend] Cache hit — reusing wheel: {src}", flush=True)
+        return Path(dst).name
+
+    # Cache miss: build directly into cache_dir so the result is immediately
+    # cached for subsequent venv syncs without a separate copy step.
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    env["WHEEL_OUTPUT_DIR"] = str(cache_dir)
 
     # Make `python3` inside the shell script resolve to the same Python that
     # uv is using for the build (the venv Python, not the system one).
     venv_bin = str(Path(sys.executable).parent)
     env["PATH"] = f"{venv_bin}:{env.get('PATH', os.defpath)}"
-
-    git_url = env.get(
-        "BUILD_CUSTOM_TRTLLM_URL",
-        "https://github.com/shuyixiong/TensorRT-LLM.git",
-    )
-    git_ref = env.get("BUILD_CUSTOM_TRTLLM_REF", "nemorl")
 
     subprocess.run(
         ["bash", str(script), git_url, git_ref],
@@ -119,15 +164,18 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         cwd=str(repo_root),
     )
 
-    wheels = sorted(
-        glob.glob(os.path.join(str(wheel_directory), "tensorrt_llm-*.whl"))
-    )
+    wheels = sorted(glob.glob(str(cache_dir / "tensorrt_llm-*.whl")))
     if not wheels:
         raise RuntimeError(
-            f"No tensorrt_llm-*.whl found in {wheel_directory} after build. "
+            f"No tensorrt_llm-*.whl found in {cache_dir} after build. "
             "Check the build-custom-trtllm.sh output above for errors."
         )
-    return Path(wheels[-1]).name
+
+    # Copy from cache_dir into wheel_directory so uv can find and install it.
+    dst = os.path.join(str(wheel_directory), Path(wheels[-1]).name)
+    shutil.copy2(wheels[-1], dst)
+    print(f"[trtllm-backend] Wheel built and cached to: {cache_dir}", flush=True)
+    return Path(dst).name
 
 
 def build_sdist(sdist_directory, config_settings=None):

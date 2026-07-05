@@ -4266,7 +4266,6 @@ sglang = [
     { name = "transformers", version = "5.6.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 trtllm = [
-    { name = "mpi4py", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "tensorrt-llm", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 vllm = [
@@ -4405,8 +4404,11 @@ requires-dist = [
     { name = "mistral-common", marker = "extra == 'automodel'", specifier = ">=1.11.0" },
     { name = "mlflow", specifier = ">=3.13.0" },
     { name = "mooncake-transfer-engine-cuda13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==0.3.10.post2" },
+<<<<<<< HEAD
     { name = "mpi4py", marker = "extra == 'trtllm'" },
 >>>>>>> 6088d98d8 (Custom build wheel)
+=======
+>>>>>>> 62c627771 (Rename trtllm workspace)
     { name = "nccl4py", marker = "sys_platform != 'darwin'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
@@ -4457,7 +4459,7 @@ requires-dist = [
     { name = "sympy", specifier = ">=1.14.0" },
     { name = "tensorboard" },
     { name = "tensordict" },
-    { name = "tensorrt-llm", marker = "extra == 'trtllm'", directory = "3rdparty/trtllm-workspace" },
+    { name = "tensorrt-llm", marker = "extra == 'trtllm'", directory = "3rdparty/TensorRT-LLM-workspace" },
     { name = "tiktoken" },
     { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "timm" },
@@ -7597,7 +7599,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/67/25/085bcc297237bfea5
 [[package]]
 name = "tensorrt-llm"
 version = "1.3.0rc21"
-source = { directory = "3rdparty/trtllm-workspace" }
+source = { directory = "3rdparty/TensorRT-LLM-workspace" }
 dependencies = [
     { name = "accelerate", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "aenum", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
