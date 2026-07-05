@@ -212,6 +212,23 @@ export MOUNTS="/lustre:/lustre,${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/G
 
 export COMMAND="cd ${REPO_ROOT} && \
 trap 'touch ${RUN_LOG_DIR}/\${SLURM_JOB_ID}-logs/ENDED 2>/dev/null || true' EXIT && \
+( \
+  set +e; \
+  gym_jq=${GYM_CODE}/responses_api_agents/swe_agents/swe_openhands_setup/miniforge3/bin/jq; \
+  gym_conda=${GYM_CODE}/responses_api_agents/swe_agents/swe_openhands_setup/miniforge3/bin/conda; \
+  gym_mamba=${GYM_CODE}/responses_api_agents/swe_agents/swe_openhands_setup/miniforge3/bin/mamba; \
+  while [[ ! -x \"\${gym_conda}\" || ! -x \"\${gym_mamba}\" || ! -f \"\${gym_jq}\" ]]; do \
+    [[ -f ${RUN_LOG_DIR}/\${SLURM_JOB_ID}-logs/ENDED ]] && exit 0; \
+    sleep 2; \
+  done; \
+  if ! \"\${gym_jq}\" --version >/dev/null 2>&1; then \
+    gym_jq_tmp=\${gym_jq}.arm64.\$\$; \
+    curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-arm64 -o \"\${gym_jq_tmp}\" && \
+      chmod +x \"\${gym_jq_tmp}\" && \
+      mv \"\${gym_jq_tmp}\" \"\${gym_jq}\" && \
+      \"\${gym_jq}\" --version; \
+  fi \
+) >/tmp/nemo_rl_gym_jq_fix.log 2>&1 & \
 OMP_NUM_THREADS=16 \
 RAY_DEDUP_LOGS=1 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
