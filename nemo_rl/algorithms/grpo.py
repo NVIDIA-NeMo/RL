@@ -3971,24 +3971,13 @@ def async_grpo_train(
         )
 
         if current_step_ready:
-            # Guard against the checkpoint-resume pipeline deadlock.
-            #
-            # When resuming from a checkpoint, the replay buffer snapshot may
-            # already contain a complete batch for `step` (e.g. 8 trajectories
-            # targeting step 30).  Breaking here immediately causes the main
-            # loop to consume those trajectories, run one training step, and
-            # refit the weights.  After refit the collector's
-            # _calculate_target_weights takes the non-initial branch and
-            # returns [weight_version+1, ...], skipping the just-refitted
-            # step entirely — that step's trajectories are never generated and
-            # training stalls forever.
-            #
-            # Fix: before breaking, ensure the lookahead step (step+1) is also
-            # ready.  The collector's initial branch already covers
-            # [start_step, start_step+max_age], so it will fill the lookahead
-            # while we wait here.  Once both are ready, consuming step and
-            # refitting is safe: step+1 is already in the buffer and the
-            # collector moves on to step+2 normally.
+            # Keep the async pipeline one step ahead before entering training.
+      
+            # A restored buffer may already contain `step`, allowing startup to
+            # consume it before the collector generates `step + 1`. After refit,
+            # the collector advances to targets starting at `step + 2`, leaving
+            # `step + 1` permanently missing. Wait for the initial collector,
+            # whose range includes both steps, to complete the lookahead first.
             max_num_steps = master_config.grpo["max_num_steps"]
             need_lookahead = (
                 max_trajectory_age_steps > 0 and step + 1 < max_num_steps
