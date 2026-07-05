@@ -1236,6 +1236,31 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    @pytest.mark.parametrize(
+        ("deployment", "should_wait"),
+        [("ray", False), ("external", True)],
+    )
+    def test_dynamo_prepare_for_refit_only_skips_drain_when_managed(
+        self, deployment, should_wait
+    ):
+        """Only owned Dynamo engines opt into unpaused in-flight refits."""
+        collector = self.create_local_collector()
+        collector.master_config.policy["generation"] = {
+            "backend": "dynamo",
+            "dynamo_cfg": {"deployment": deployment},
+        }
+        collector.master_config.grpo["async_grpo"][
+            "in_flight_weight_updates"
+        ] = True
+        collector.wait_for_pending_generations = mock.MagicMock()
+
+        collector.prepare_for_refit()
+
+        if should_wait:
+            collector.wait_for_pending_generations.assert_called_once_with()
+        else:
+            collector.wait_for_pending_generations.assert_not_called()
+
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""
         buffer = ReplayBuffer.remote(max_size=10)

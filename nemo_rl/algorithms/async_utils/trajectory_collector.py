@@ -486,6 +486,16 @@ class AsyncTrajectoryCollector:
             is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
                 "async_engine", False
             )
+        elif backend == "dynamo":
+            # Ray-managed Dynamo owns an asynchronous vLLM engine and its native
+            # NCCL update transaction is launched with allow_unpaused=True.  It
+            # can therefore refit while already-issued requests drain on their
+            # existing KV caches.  Keep external Dynamo's existing drain-before-
+            # refit behavior because NeMo-RL does not own or validate that
+            # deployment's service lifecycle.
+            is_async_engine = (
+                generation_cfg.get("dynamo_cfg", {}).get("deployment") == "ray"
+            )
         else:
             is_async_engine = False
         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(

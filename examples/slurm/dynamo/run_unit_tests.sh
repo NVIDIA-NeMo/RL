@@ -34,7 +34,8 @@ cd "${REPO}"
   tests/unit/models/generation/test_dynamo_generation.py \
   tests/unit/models/generation/test_dynamo_token_wrapper.py \
   tests/unit/utils/test_prefix_reuse.py \
-  tests/unit/algorithms/test_grpo.py
+  tests/unit/algorithms/test_grpo.py \
+  tests/unit/algorithms/test_async_utils.py::TestAsyncTrajectoryCollector::test_dynamo_prepare_for_refit_only_skips_drain_when_managed
 
 "${PYTHON}" -m ruff check \
   examples/run_grpo.py \
@@ -44,6 +45,7 @@ cd "${REPO}"
   nemo_rl/models/generation/dynamo \
   nemo_rl/utils/prefix_reuse.py \
   tests/unit/algorithms/test_grpo.py \
+  tests/unit/algorithms/test_async_utils.py \
   tests/unit/models/generation/test_dynamo_arguments.py \
   tests/unit/models/generation/test_dynamo_generation.py \
   tests/unit/models/generation/test_dynamo_managed_runtime.py \
@@ -63,4 +65,5 @@ cd "${REPO}"
   tests/unit/models/generation/test_dynamo_managed_runtime.py \
   tests/unit/models/generation/test_dynamo_token_wrapper.py \
   tests/unit/utils/test_prefix_reuse.py \
+  tests/unit/algorithms/test_async_utils.py \
   tools/refit_verifier.py
