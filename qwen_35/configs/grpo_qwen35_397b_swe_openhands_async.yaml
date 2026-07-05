@@ -69,12 +69,22 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: true
 checkpointing:
-  enabled: false
+  # Enabled so convergence runs can chain across SLURM walltime windows:
+  # window A trains steps 1..N and saves, window B (same EXP_NAME ->
+  # same mounted /checkpoint dir) auto-resumes from the latest step_* and
+  # trains N+1..2N (grpo.max_num_steps is an ABSOLUTE cumulative count).
+  # save_period=5 aligns saves right after val@5/@10 so every checkpoint
+  # carries the val metric; keep_top_k large so the LATEST checkpoint is
+  # never pruned away (resume picks the highest step dir, not the best).
+  # save_optimizer=false keeps saves at ~0.8 TB (bf16 weights only) at the
+  # cost of Adam moments resetting at window boundaries - acceptable for
+  # evidence runs; set true (~5.5 TB/save) for bit-clean continuation.
+  enabled: true
   checkpoint_dir: results/grpo-qwen35-397b-swe-openhands
   metric_name: val:total_reward/mean
   higher_is_better: true
-  keep_top_k: 2
-  save_period: 1000000
+  keep_top_k: 100
+  save_period: 5
   checkpoint_must_save_by: null
   save_optimizer: false
 policy:
