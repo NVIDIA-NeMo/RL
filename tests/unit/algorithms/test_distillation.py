@@ -178,6 +178,7 @@ def mock_components():
             },
             "checkpointing": {
                 "enabled": False,
+                "resume_if_exists": True,
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
                 "metric_name": None,
@@ -858,7 +859,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
         ),
     ):
         # Configure mocks to skip checkpoint loading
-        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_checkpointer.return_value.resolve_training_start_checkpoint.return_value = None
         setup(master_config, tokenizer, dataset, None)
 
 
@@ -974,7 +975,7 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         patch.object(distil_mod, "get_nemo_gym_venv_dir") as mock_uv_venv_dir,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
-        mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+        mock_ckpt_mgr.return_value.resolve_training_start_checkpoint.return_value = None
         mock_ckpt_mgr.return_value.get_resume_paths.return_value = (None, None)
         mock_ray.get = MagicMock(return_value=None)
 
@@ -1162,7 +1163,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         ),
         patch.object(distil_mod, "ray") as mock_ray,
     ):
-        mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+        mock_ckpt_mgr.return_value.resolve_training_start_checkpoint.return_value = None
         mock_ckpt_mgr.return_value.get_resume_paths.return_value = (None, None)
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
         mock_ray.get.return_value = None
@@ -1214,7 +1215,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         "data": {},
         "env": {"should_use_nemo_gym": True, "nemo_gym": {}},
         "logger": {"log_dir": "/tmp/logs"},
-        "checkpointing": {"enabled": False},
+        "checkpointing": {"enabled": False, "resume_if_exists": True},
         "cluster": {},
     }
     tokenizer = MagicMock()
@@ -1349,5 +1350,5 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
         ),
     ):
         # Configure mocks to skip checkpoint loading
-        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_checkpointer.return_value.resolve_training_start_checkpoint.return_value = None
         setup(master_config, tokenizer, dataset, None)

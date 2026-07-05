@@ -75,6 +75,7 @@ value_loss_fn:
 
 checkpointing:
   enabled: true
+  resume_if_exists: true
   checkpoint_dir: "results/ppo_dapo"
   metric_name: "val:accuracy"
   higher_is_better: true

@@ -263,6 +263,7 @@ def mock_grpo_components():
             ),
             "checkpointing": {
                 "enabled": False,
+                "resume_if_exists": True,
                 "checkpoint_must_save_by": None,
                 "save_period": 10,
             },
@@ -752,8 +753,9 @@ class StubReplayBuffer:
         """Return a mock that reports whether the current step can train."""
         mock = MagicMock()
         mock.remote = MagicMock(
-            side_effect=lambda _target_step, num_prompts_per_step, *_args: self._size
-            >= num_prompts_per_step
+            side_effect=lambda _target_step, num_prompts_per_step, *_args: (
+                self._size >= num_prompts_per_step
+            )
         )
         return mock
 
@@ -1624,7 +1626,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
         ),
     ):
         # Configure mocks to skip checkpoint loading
-        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_checkpointer.return_value.resolve_training_start_checkpoint.return_value = None
         setup(master_config, tokenizer, dataset, None)
 
 
@@ -1667,7 +1669,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
         ),
     ):
         # Configure mocks to skip checkpoint loading
-        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_checkpointer.return_value.resolve_training_start_checkpoint.return_value = None
         setup(master_config, tokenizer, dataset, None)
 
 
@@ -1688,7 +1690,7 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
             pass
 
     class DummyCheckpointer:
-        def get_latest_checkpoint_path(self):
+        def resolve_training_start_checkpoint(self):
             return None
 
         def load_training_info(self, _path):

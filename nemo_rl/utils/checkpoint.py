@@ -85,6 +85,9 @@ class CheckpointingConfig(TypedDict):
 
     Attributes:
     enabled (bool): Whether checkpointing is enabled.
+    resume_if_exists (bool): Whether to resume from an existing root checkpoint
+        if one exists. If False, existing root step_* checkpoints are moved
+        under run_<N>/ and training starts from scratch.
     checkpoint_dir (PathLike): Directory where checkpoints will be saved.
     metric_name (str | None): Name of the metric to use for determining best checkpoints.
         Must be of the form "val:<metric_name>" or "train:<metric_name>" to indicate whether
@@ -104,6 +107,7 @@ class CheckpointingConfig(TypedDict):
     """
 
     enabled: bool
+    resume_if_exists: bool
     checkpoint_dir: PathLike
     metric_name: str | None
     higher_is_better: bool
@@ -151,6 +155,8 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
+        self.enabled = config["enabled"]
+        self.resume_if_exists = config["resume_if_exists"]
         self.checkpoint_dir = Path(config["checkpoint_dir"])
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
@@ -171,6 +177,45 @@ class CheckpointManager:
         self._pending_checkpoint_path: Optional[Path] = None
         self._finalize_error: Optional[Exception] = None
         self._delete_executor = ThreadPoolExecutor(max_workers=1)
+
+    def _get_next_run_archive_dir(self) -> Path:
+        """Get the next run_<N> directory for archiving root checkpoints."""
+        run_indices: list[int] = []
+        for path in self.checkpoint_dir.glob("run_*"):
+            match = re.fullmatch(r"run_(\d+)", path.name)
+            if match:
+                run_indices.append(int(match.group(1)))
+        return self.checkpoint_dir / f"run_{max(run_indices, default=-1) + 1}"
+
+    def _archive_root_checkpoints(self, step_dirs: list[Path]) -> Path:
+        """Archive active root checkpoints under the next run_<N> directory."""
+        archive_dir = self._get_next_run_archive_dir()
+        archive_dir.mkdir(parents=True, exist_ok=False)
+
+        for step_dir in step_dirs:
+            step_dir.rename(archive_dir / step_dir.name)
+
+        return archive_dir
+
+    def resolve_training_start_checkpoint(self) -> Optional[str]:
+        """Resolve the checkpoint path to resume from at training startup."""
+        if not self.enabled:
+            return None
+
+        step_dirs = _get_root_step_dirs(self.checkpoint_dir)
+        if len(step_dirs) == 0:
+            return None
+
+        if self.resume_if_exists:
+            return str(step_dirs[-1])
+
+        archive_dir = self._archive_root_checkpoints(step_dirs)
+        print(
+            f"Archived {len(step_dirs)} checkpoint(s) from {self.checkpoint_dir} to {archive_dir} "
+            "because checkpointing.resume_if_exists is false. Starting from scratch.",
+            flush=True,
+        )
+        return None
 
     @staticmethod
     def get_resume_paths(
@@ -537,13 +582,7 @@ class CheckpointManager:
         Returns:
             Optional[str]: Path to the latest checkpoint, or None if no checkpoints exist.
         """
-        # find checkpoint directory with highest step number
-        step_dirs = [
-            x
-            for x in glob.glob(str(self.checkpoint_dir / "step_*"))
-            if re.fullmatch(r"step_\d+", Path(x).name)
-        ]
-        step_dirs.sort(key=lambda x: int(Path(x).name.split("_")[1]))
+        step_dirs = _get_root_step_dirs(self.checkpoint_dir)
         if len(step_dirs) == 0:
             return None
         return str(step_dirs[-1])
@@ -581,12 +620,7 @@ def _load_checkpoint_history(
     """
     checkpoint_history: list[tuple[int, PathLike, dict[str, Any]]] = []
 
-    # Find all step directories
-    step_dirs = [
-        x
-        for x in glob.glob(str(checkpoint_dir / "step_*"))
-        if re.fullmatch(r"step_\d+", Path(x).name)
-    ]
+    step_dirs = _get_root_step_dirs(checkpoint_dir)
 
     for step_dir in step_dirs:
         info_file = Path(step_dir) / "training_info.json"
@@ -597,3 +631,14 @@ def _load_checkpoint_history(
                 checkpoint_history.append((step, step_dir, info))
 
     return checkpoint_history
+
+
+def _get_root_step_dirs(checkpoint_dir: Path) -> list[Path]:
+    """Get active root step_<N> checkpoint directories sorted by step number."""
+    step_dirs = [
+        Path(x)
+        for x in glob.glob(str(checkpoint_dir / "step_*"))
+        if re.fullmatch(r"step_\d+", Path(x).name)
+    ]
+    step_dirs.sort(key=lambda path: int(path.name.split("_")[1]))
+    return step_dirs

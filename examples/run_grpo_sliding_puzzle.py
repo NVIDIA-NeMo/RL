@@ -269,6 +269,7 @@ def main():
             logger,
             checkpointer,
             grpo_state,
+            _last_checkpoint_path,
             master_config,
             _teacher_worker_groups,
             _alias_to_group_alias,

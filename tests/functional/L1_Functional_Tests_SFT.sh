@@ -37,6 +37,7 @@ run_test() {
 run_test fast uv run --no-sync bash ./tests/functional/sft.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_avlm.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
+run_test      uv run --no-sync bash ./tests/functional/sft_resume_if_exists_false.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
