@@ -45,6 +45,4 @@ def test_dynamo_verifier_rejects_comparing_dummy_weights_before_refit():
         ValueError,
         match="--compare-before-refit requires --initial-load-format=auto",
     ):
-        _validate_dynamo_verifier_diagnostic_mode(
-            "dummy", compare_before_refit=True
-        )
+        _validate_dynamo_verifier_diagnostic_mode("dummy", compare_before_refit=True)

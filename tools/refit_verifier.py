@@ -766,9 +766,7 @@ def _validate_dynamo_verifier_diagnostic_mode(
 ) -> None:
     """Reject a meaningless comparison against intentionally dummy weights."""
     if compare_before_refit and initial_load_format != "auto":
-        raise ValueError(
-            "--compare-before-refit requires --initial-load-format=auto."
-        )
+        raise ValueError("--compare-before-refit requires --initial-load-format=auto.")
 
 
 def _max_generated_logprob_diff(
@@ -899,10 +897,7 @@ def main_dynamo():
             direct_diff = _max_generated_logprob_diff(
                 generation_data, direct_data, direct_policy_data
             )
-            print(
-                "Managed Dynamo direct-load max logprob difference: "
-                f"{direct_diff}"
-            )
+            print(f"Managed Dynamo direct-load max logprob difference: {direct_diff}")
 
         ip, port = train_cluster.get_master_address_and_port()
         train_world_size = train_cluster.world_size()
