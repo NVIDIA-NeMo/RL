@@ -15,7 +15,11 @@ ENTRYPOINT=${ENTRYPOINT:-${REPO_ROOT}/examples/nemo_gym/run_grpo_nemo_gym.py}
 RAY_SUB=${RAY_SUB:-${REPO_ROOT}/ray.sub}
 GYM_CODE=${GYM_CODE:-${REPO_ROOT}/3rdparty/Gym-workspace/Gym}
 
-MODEL_PATH=${MODEL_PATH:-/lustre/fsw/portfolios/llmservice/users/pjin/devel/nemo-rl-ultra-v3-nano-opd-dev-20260513/results/mopd_ultrav3_to_nanov3_5_repro_v5_kd_opt_full-hsg-20260524-r1/step_18/hf}
+MODEL_SOURCE_PATH=${MODEL_SOURCE_PATH:-/lustre/fsw/portfolios/llmservice/users/pjin/devel/nemo-rl-ultra-v3-nano-opd-dev-20260513/results/mopd_ultrav3_to_nanov3_5_repro_v5_kd_opt_full-hsg-20260524-r1/step_18/hf}
+# Dynamo's Rust model-registration path requires strict JSON, while the source
+# Transformers config uses the non-standard JSON token `Infinity`. Keep the
+# shared checkpoint immutable and present a lightweight, strict-JSON overlay.
+MODEL_PATH=${MODEL_PATH:-${ROOT}/models/nemotron-nano-v3.5-swe-dynamo}
 TRAIN_PATH=${TRAIN_PATH:-/lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/blends/large_root_cause_curriculum_with_mercor_ots_plus_singlefile_swerebench_overlap_fix.jsonl}
 VAL_PATH=${VAL_PATH:-/lustre/fsw/portfolios/llmservice/users/sdevare/repos/ultra/datasets/swe/swe_public_datasets_val_swebench.jsonl}
 SIF_DIR=${SIF_DIR:-/lustre/fsw/portfolios/llmservice/users/sdevare/images}
@@ -80,10 +84,42 @@ require_path() {
   fi
 }
 
+prepare_model_overlay() {
+  if [[ "${MODEL_PATH}" == "${MODEL_SOURCE_PATH}" ]]; then
+    return
+  fi
+
+  mkdir -p "${MODEL_PATH}"
+  while IFS= read -r -d '' source_file; do
+    ln -sfn "${source_file}" "${MODEL_PATH}/$(basename "${source_file}")"
+  done < <(find "${MODEL_SOURCE_PATH}" -mindepth 1 -maxdepth 1 ! -name config.json -print0)
+
+  local config_tmp="${MODEL_PATH}/config.json.tmp.$$"
+  sed 's/Infinity/1.7976931348623157e308/g' \
+    "${MODEL_SOURCE_PATH}/config.json" > "${config_tmp}"
+  mv "${config_tmp}" "${MODEL_PATH}/config.json"
+
+  python3 - "${MODEL_PATH}/config.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    json.load(
+        config_file,
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"non-standard JSON constant: {value}")
+        ),
+    )
+PY
+}
+
 require_path "${CONFIG_PATH}" config
 require_path "${ENTRYPOINT}" entrypoint
 require_path "${RAY_SUB}" ray.sub
 require_path "${GYM_CODE}/nemo_gym/__init__.py" "Gym checkout"
+require_path "${MODEL_SOURCE_PATH}/config.json" "source model"
+require_path "${MODEL_SOURCE_PATH}/chat_template.jinja" "source model chat template"
+prepare_model_overlay
 require_path "${MODEL_PATH}/config.json" model
 require_path "${MODEL_PATH}/chat_template.jinja" "model chat template"
 require_path "${TRAIN_PATH}" "training dataset"
@@ -238,6 +274,7 @@ echo "  nodes: train=${NUM_TRAIN_NODES}, inference=${NUM_GEN_NODES}, total=${TOT
 echo "  train: TP=${TP}, CP=${CP}, EP=${EP}; inference: TP=${VLLM_TP}"
 echo "  batch: PPS=${PPS}, GPP=${GPP}, GBS=${GBS}; max_length=${MAX_LENGTH}"
 echo "  model: ${MODEL_PATH}"
+echo "  source model: ${MODEL_SOURCE_PATH}"
 echo "  image: ${CONTAINER}"
 echo "  logs:  ${RUN_LOG_DIR}"
 
