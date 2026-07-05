@@ -6,6 +6,8 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+import json
+
 import pytest
 
 from nemo_rl.models.generation.dynamo.config import DynamoCfg
@@ -37,6 +39,30 @@ class _FakeWorker:
 class _FakeReservation:
     def __init__(self):
         self.cleanup_process_group = _RemoteMethod(True)
+
+
+class _FakeProcess:
+    returncode = None
+
+    @staticmethod
+    def poll():
+        return None
+
+
+class _FakeHttpResponse:
+    status = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self):
+        return json.dumps(self._payload).encode()
 
 
 def test_namespace_defaults_to_sanitized_slurm_job_id(monkeypatch) -> None:
@@ -204,3 +230,65 @@ def test_runtime_startup_failure_cleans_up_worker_pool(monkeypatch) -> None:
 
     assert calls == ["etcd", "nats", "init", "start", "shutdown"]
     assert runtime._pool is None
+
+
+def test_runtime_waits_for_frontend_model_route_after_registrations(
+    monkeypatch,
+) -> None:
+    runtime = object.__new__(ManagedDynamoRuntime)
+    runtime._frontend_port = 8000
+    runtime._frontend_process = _FakeProcess()
+    runtime._namespace = "nemo-rl-test"
+    runtime._config = {"model_name": "org/model"}
+    runtime._dynamo_cfg = DynamoCfg.model_validate(
+        {
+            "deployment": "ray",
+            "engine_world_size": 1,
+            "startup_timeout_s": 5,
+        }
+    )
+    health_payload = {
+        "instances": [
+            {
+                "namespace": "nemo-rl-test",
+                "component": "backend",
+                "endpoint": "generate",
+                "instance_id": "worker-0",
+            },
+            {
+                "namespace": "nemo-rl-test",
+                "component": "backend",
+                "endpoint": "rl",
+                "instance_id": "worker-0",
+            },
+        ]
+    }
+    responses = [
+        health_payload,
+        {"object": "list", "data": []},
+        health_payload,
+        {"object": "list", "data": [{"id": "org/model"}]},
+    ]
+    urls = []
+
+    def fake_urlopen(url, timeout):
+        urls.append(url)
+        return _FakeHttpResponse(responses.pop(0))
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep",
+        lambda _: None,
+    )
+
+    runtime._wait_for_frontend(expected_workers=1)
+
+    assert urls == [
+        "http://127.0.0.1:8000/health",
+        "http://127.0.0.1:8000/v1/models",
+        "http://127.0.0.1:8000/health",
+        "http://127.0.0.1:8000/v1/models",
+    ]

@@ -277,9 +277,12 @@ class ManagedDynamoRuntime:
         )
 
     def _wait_for_frontend(self, expected_workers: int) -> None:
-        url = f"http://127.0.0.1:{self._frontend_port}/health"
+        health_url = f"http://127.0.0.1:{self._frontend_port}/health"
+        models_url = f"http://127.0.0.1:{self._frontend_port}/v1/models"
+        expected_model = str(self._config["model_name"])
         deadline = time.monotonic() + self._dynamo_cfg.startup_timeout_s
         last_counts = (0, 0)
+        last_models: set[str] = set()
         while time.monotonic() < deadline:
             if (
                 self._frontend_process is not None
@@ -289,7 +292,7 @@ class ManagedDynamoRuntime:
                     f"Dynamo frontend exited with code {self._frontend_process.returncode}."
                 )
             try:
-                with urllib.request.urlopen(url, timeout=5) as response:
+                with urllib.request.urlopen(health_url, timeout=5) as response:
                     payload = json.loads(response.read())
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
                 time.sleep(1)
@@ -315,6 +318,29 @@ class ManagedDynamoRuntime:
                 last_counts == (expected_workers, expected_workers)
                 and generate_ids == rl_ids
             ):
+                # /health reflects discovery registrations before the frontend's
+                # model watcher has necessarily installed its OpenAI routes. Do
+                # not expose frontend_url until the served model is visible;
+                # otherwise an immediate /v1/completions request can race with
+                # watcher setup and receive a transient 404.
+                try:
+                    with urllib.request.urlopen(models_url, timeout=5) as response:
+                        models_payload = json.loads(response.read())
+                except (
+                    urllib.error.URLError,
+                    TimeoutError,
+                    json.JSONDecodeError,
+                ):
+                    time.sleep(1)
+                    continue
+                last_models = {
+                    str(model["id"])
+                    for model in models_payload.get("data", [])
+                    if isinstance(model, dict) and model.get("id") is not None
+                }
+                if expected_model not in last_models:
+                    time.sleep(1)
+                    continue
                 print(
                     f"  [Dynamo] frontend ready with {expected_workers} generation "
                     "and RL workers",
@@ -325,7 +351,8 @@ class ManagedDynamoRuntime:
         raise RuntimeError(
             "Dynamo frontend did not observe the fixed worker fleet within "
             f"{self._dynamo_cfg.startup_timeout_s}s: expected={expected_workers}, "
-            f"last_generate={last_counts[0]}, last_rl={last_counts[1]}."
+            f"last_generate={last_counts[0]}, last_rl={last_counts[1]}, "
+            f"expected_model={expected_model!r}, last_models={sorted(last_models)!r}."
         )
 
     def refit_workers(self) -> list[dict[str, Any]]:
