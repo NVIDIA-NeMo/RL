@@ -20,7 +20,7 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 # Parse command line arguments
 GIT_URL=${1:-https://github.com/NVIDIA/TensorRT-LLM.git}
-GIT_REF=${2:-v1.3.0rc20}
+GIT_REF=${2:-bf2ef86f9a2652132b11773d4041e292c553c142}
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty")/TensorRT-LLM
 if [[ -e "$BUILD_DIR" ]]; then
@@ -28,10 +28,9 @@ if [[ -e "$BUILD_DIR" ]]; then
   exit 1
 fi
 
-# Directory where the built wheel is exported for uv to discover.
-# Prefer UV_FIND_LINKS (set in Dockerfile ENV) so this script and uv always agree
-# on the wheel location. Fall back to WHEEL_OUTPUT_DIR, then /opt/trtllm_wheels.
-WHEEL_OUTPUT_DIR=${UV_FIND_LINKS:-/opt/trtllm_wheels}
+# Directory where the built wheel is written. Set by _backend.py when called
+# via uv; defaults to /opt/trtllm_wheels when run standalone.
+WHEEL_OUTPUT_DIR=${WHEEL_OUTPUT_DIR:-/opt/trtllm_wheels}
 mkdir -p "$WHEEL_OUTPUT_DIR"
 
 echo "Building TensorRT-LLM from:"
@@ -62,8 +61,13 @@ fi
 git lfs install --skip-repo
 
 # Clone TRT-LLM + LFS pull + submodules
+# `--branch` only accepts branch/tag names, not commit hashes.
+# Use init + fetch --depth=1 <hash> to get a shallow clone at a specific commit.
 echo "Cloning TensorRT-LLM..."
-git clone --depth=1 --branch "$GIT_REF" "$GIT_URL" "$BUILD_DIR"
+git init "$BUILD_DIR"
+git -C "$BUILD_DIR" remote add origin "$GIT_URL"
+git -C "$BUILD_DIR" fetch --depth=1 origin "$GIT_REF"
+git -C "$BUILD_DIR" checkout FETCH_HEAD
 cd "$BUILD_DIR"
 echo "Fetching LFS objects (internal_cutlass_kernels archives)..."
 git lfs pull
@@ -99,10 +103,6 @@ python3 scripts/build_wheel.py \
     --nvrtc_dynamic_linking \
     -D "ENABLE_UCX=OFF"
 
-# Copy the wheel to WHEEL_OUTPUT_DIR.
-# When called from the PEP 517 backend (_backend.py), WHEEL_OUTPUT_DIR is set to
-# the wheel_directory that uv passes to build_wheel — uv then picks up the wheel
-# from there and installs it into the venv.
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."
 cp "$BUILD_DIR"/build/tensorrt_llm-*.whl "$WHEEL_OUTPUT_DIR/"
 

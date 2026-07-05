@@ -126,15 +126,12 @@ ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
 ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
-# TRT-LLM build args. Unlike vLLM/SGLang, TRT-LLM is always built from source
-# because there are no cp313/cu13/aarch64 wheels on PyPI for v1.3.0rc15. Override
-# the URL/REF if you want a different fork or tag. Modelopt 0.37 is built
-# alongside because TRT-LLM v1.3.0rc15's requirements.txt pins
-# `nvidia-modelopt[torch]~=0.37.0` and PyPI lacks a cp313 wheel for that line.
+# TensorRT-LLM does not publish a cp313 release wheel on PyPI — the official
+# releases target cp312 and below. Until an official cp313 wheel is available,
+# we must build from source.
 ARG BUILD_CUSTOM_TRTLLM_URL
 ARG BUILD_CUSTOM_TRTLLM_REF
-ARG BUILD_CUSTOM_TRTLLM_MODELOPT_URL
-ARG BUILD_CUSTOM_TRTLLM_MODELOPT_REF
+
 # Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
@@ -206,7 +203,7 @@ uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    # The custom PEP 517 backend in 3rdparty/trtllm-workspace/_backend.py
+    # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py
     # invokes tools/build-custom-trtllm.sh during this sync (≈60 min).
     # Build coordinates are passed via env vars:
     #   BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF
