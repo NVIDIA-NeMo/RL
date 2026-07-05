@@ -730,6 +730,20 @@ def parse_dynamo_args():
     return args, overrides
 
 
+def _prepare_dynamo_verifier_policy_config(policy_config: dict) -> None:
+    """Fill training-only Megatron fields required during model construction.
+
+    The GRPO setup path derives ``train_iters`` from the dataloader and run
+    limits before constructing ``Policy``.  The refit verifier intentionally
+    has no dataloader or optimizer, but Megatron still validates that the field
+    exists while building the inference-capable policy.  One scheduler step is
+    sufficient for this inference-only verifier; preserve an explicit value.
+    """
+    megatron_cfg = policy_config.get("megatron_cfg", {})
+    if megatron_cfg.get("enabled", False):
+        megatron_cfg.setdefault("train_iters", 1)
+
+
 def main_dynamo():
     """Run managed Dynamo from dummy weights, refit, and compare logprobs."""
     args, overrides = parse_dynamo_args()
@@ -741,6 +755,7 @@ def main_dynamo():
 
     init_ray()
     policy_config = master_config["policy"]
+    _prepare_dynamo_verifier_policy_config(policy_config)
     generation_config = policy_config["generation"]
     cluster_config = master_config["cluster"]
     assert generation_config["backend"] == "dynamo", (
