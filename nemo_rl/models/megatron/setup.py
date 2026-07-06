@@ -1122,6 +1122,15 @@ def setup_model_and_optimizer(
     # TODO: Freeze state.cfg
 
     megatron_cfg.dist.external_gpu_device_mapping = True
+    # initialize_megatron creates the TP/PP/EP/DP sub-groups with an EXPLICIT
+    # timeout from dist.distributed_timeout_minutes (mcore default 10), which
+    # overrides the default-group timeout set in setup_distributed(). The
+    # 10-minute NCCL watchdog kept SIGABRT'ing ranks that waited on peers in
+    # transient step-2 stalls (jobs 2274348/2280396/2282178) — keep both
+    # knobs on the same env var.
+    megatron_cfg.dist.distributed_timeout_minutes = int(
+        os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60")
+    )
     initialize_megatron(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,
