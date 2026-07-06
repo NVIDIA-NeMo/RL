@@ -43,6 +43,9 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.5
+      env_vars:
+        NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+        NRL_REFIT_NUM_BUFFERS: "1"
 
 logger:
   wandb_enabled: true
