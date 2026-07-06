@@ -920,10 +920,13 @@ def _create_checkpoint_config(
         weights_path: Path to save/load training weights.
         optimizer_path: Path to the optimizer state (None if not resuming optimizer).
         load_main_params_from_ckpt: Load optimizer main params from the checkpoint.
-        ckpt_cfg: Optional MegatronCheckpointConfig dict from YAML.
+        ckpt_cfg: MegatronCheckpointConfig dict from YAML (``megatron_cfg.checkpoint``).
+            ``async_save`` and ``ckpt_assume_constant_structure`` are required keys;
+            their defaults live in the exemplar configs (``examples/configs/*.yaml``),
+            not here.
     """
     cfg = ckpt_cfg or {}
-    async_save = cfg.get("async_save", False)
+    async_save = cfg["async_save"]
 
     # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
     # On a fresh run (no prior checkpoint), weights_path is None, so fall back to
@@ -944,7 +947,7 @@ def _create_checkpoint_config(
         fully_parallel_load=True,
         load_rng=False,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
-        ckpt_assume_constant_structure=cfg.get("ckpt_assume_constant_structure", False),
+        ckpt_assume_constant_structure=cfg["ckpt_assume_constant_structure"],
     )
     _optional_ckpt_fields = (
         "ckpt_fully_parallel_save_process_group",

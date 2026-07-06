@@ -34,9 +34,6 @@ policy:
       compilation_config:
         custom_ops: ["all", "-sequence_parallel_chunk"]
   megatron_cfg:
-    checkpoint:
-      async_save: true
-      ckpt_assume_constant_structure: true
     converter_type: Qwen3OmniMoeForConditionalGeneration
     expert_model_parallel_size: 8
     activation_checkpointing: true

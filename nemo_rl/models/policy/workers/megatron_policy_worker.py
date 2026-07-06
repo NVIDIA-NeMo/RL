@@ -2229,17 +2229,6 @@ class MegatronPolicyWorkerImpl(
             blocking=True,
         )
 
-    def terminate_async_checkpoint_worker(self):
-        """Block until any in-flight write completes, then shut down the persistent worker.
-
-        Directly closes the async queue on GlobalState, bypassing
-        maybe_finalize_async_save's early-return guard on ckpt_cfg.async_save.
-        Safe to call regardless of whether async_save is enabled.
-        """
-        async_queue = getattr(self.mcore_state, "async_calls_queue", None)
-        if async_queue is not None:
-            async_queue.close()
-
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.
 

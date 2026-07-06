@@ -3308,6 +3308,13 @@ def grpo_train(
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
 
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread would be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
+
 
 def validate(
     policy_generation: GenerationInterface,

@@ -157,6 +157,9 @@ policy:
   
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     # Compute next-token logprobs directly from hidden states with a chunked
     # linear cross-entropy fusion, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
