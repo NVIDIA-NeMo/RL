@@ -779,13 +779,16 @@ def grpo_train_sync(
                 baseline_for_log = baseline.clone()
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
-                (
-                    skip_prev_logprobs,
-                    skip_reference_logprobs,
-                    seq_logprob_error_threshold,
-                ) = _resolve_logprob_skip_flags(master_config)
+                skip_prev_logprobs, skip_reference_logprobs = (
+                    _resolve_logprob_skip_flags(master_config)
+                )
+                compute_prev = not skip_prev_logprobs
+                compute_ref = not skip_reference_logprobs
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
 
-                if not (skip_prev_logprobs and skip_reference_logprobs):
+                if compute_prev or compute_ref:
                     print("▶ Preparing for logprob inference...", flush=True)
                     with timer.time("logprob_inference_prep"):
                         policy.prepare_for_lp_inference()
@@ -800,28 +803,29 @@ def grpo_train_sync(
                     # batched fetch to avoid double-shipping the per-token
                     # tensor through Ray's plasma store on top of the TQ
                     # writeback.
-                    if not skip_prev_logprobs:
+                    #
+                    # Each ``compute_X`` guard doubles as the "add to
+                    # select_fields" gate — one flag, one branch.
+                    select_fields = ["generation_logprobs", "token_mask"]
+                    if compute_prev:
                         policy.get_logprobs_from_meta(meta, timer=timer)
+                        select_fields.append("prev_logprobs")
                     else:
                         print(
                             "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
                             flush=True,
                         )
-                    if not skip_reference_logprobs:
+                    if compute_ref:
                         policy.get_reference_policy_logprobs_from_meta(
                             meta,
                             timer=timer,
                         )
+                        select_fields.append("reference_policy_logprobs")
 
                     # Driver pulls only the per-token columns it needs
                     # for masking / advantage. Bulk (input_ids, multimodal,
                     # output_ids, attention_mask, position_ids) stays in
                     # TQ — workers will fetch it via ``train_presharded``.
-                    select_fields = ["generation_logprobs", "token_mask"]
-                    if not skip_prev_logprobs:
-                        select_fields.append("prev_logprobs")
-                    if not skip_reference_logprobs:
-                        select_fields.append("reference_policy_logprobs")
                     extras_bdd = policy.read_from_dataplane(
                         meta,
                         select_fields=select_fields,
@@ -829,20 +833,15 @@ def grpo_train_sync(
                     )
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
-                    if skip_prev_logprobs:
-                        # Driver-local placeholder for the advantage-compute
-                        # call below; not written to TQ. Train workers drop
-                        # prev_logprobs from the fetch when
-                        # loss_fn.force_on_policy_ratio is True
-                        # (see TQPolicy.train_from_meta) and the loss then
-                        # uses curr_logprobs instead.
-                        prev_logprobs = torch.zeros_like(generation_logprobs)
-                    else:
-                        prev_logprobs = extras_bdd["prev_logprobs"]
+                    # Local zeros for compute_advantage below; workers skip
+                    # fetching prev_logprobs (see TQPolicy.train_from_meta).
+                    prev_logprobs = (
+                        extras_bdd["prev_logprobs"]
+                        if compute_prev
+                        else torch.zeros_like(generation_logprobs)
+                    )
                     reference_policy_logprobs = (
-                        extras_bdd["reference_policy_logprobs"]
-                        if not skip_reference_logprobs
-                        else None
+                        extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
