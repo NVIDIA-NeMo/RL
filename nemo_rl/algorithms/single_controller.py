@@ -104,6 +104,26 @@ class SingleControllerActor:
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
+
+        # No reference model is built when reference_policy_kl_penalty == 0
+        # (setup.py's init_reference_model = reference_policy_kl_penalty > 0).
+        # AdvantageConfig defaults reference_logprobs_field to a non-None string,
+        # so the train loop would call get_reference_policy_logprobs_from_meta ->
+        # use_reference_model -> AttributeError('reference_state_dict'). Null the
+        # field so every `reference_logprobs_field is not None` gate (compute in
+        # run(), plus the field-collection sites) skips it consistently. Mirrors
+        # the non-SC grpo path, which already skips reference logprobs when
+        # kl_penalty == 0. (Fixes the SC-only crash flagged by the TODO at the
+        # compute_reference_logprobs assignment.)
+        _lf = master_config.loss_fn
+        _kl_penalty = (
+            _lf["reference_policy_kl_penalty"]
+            if isinstance(_lf, dict)
+            else getattr(_lf, "reference_policy_kl_penalty", 0)
+        )
+        if not (_kl_penalty and _kl_penalty > 0):
+            self._advantage_cfg.reference_logprobs_field = None
+
         self._dp_client = bundle.dp_client
         self._gen: Generation = bundle.gen_handle
         self._trainer: TQPolicy = bundle.trainer_handle
