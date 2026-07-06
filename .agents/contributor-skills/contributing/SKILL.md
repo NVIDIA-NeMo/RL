@@ -1,10 +1,28 @@
 ---
 name: contributing
-description: Contribution conventions for NeMo-RL. Covers PR title format, commit sign-off, and CI triggering.
-when_to_use: Opening a PR; writing a commit message; triggering CI; 'PR title format', 'sign-off', 'conventional commits', 'how do I trigger CI', during code review of PR process.
+description: Contribution and Git workflow conventions for NeMo-RL. Use when switching or checking out branches, running git switch or git checkout, synchronizing submodules, opening a PR, writing a commit message, triggering CI, or reviewing the PR process. Covers mandatory recursive submodule updates, PR title format, commit sign-off, and CI triggering.
 ---
 
 # Contributing Conventions
+
+## Branch Switching and Submodules
+
+After every successful NeMo-RL branch switch or checkout, immediately synchronize
+all registered submodules, including nested submodules, before inspecting files,
+building, testing, or launching jobs:
+
+```bash
+git submodule update --init --recursive
+git submodule status --recursive
+```
+
+Treat this as a mandatory part of `git switch` and `git checkout`, not an optional
+cleanup step. A top-level branch change updates recorded gitlinks but does not
+guarantee that submodule worktrees or their nested submodules moved to those SHAs.
+
+If Git refuses because a submodule has local changes, stop and report the dirty
+paths. Do not force checkout, clean, reset, or delete those changes without the
+user's explicit approval.
 
 ## PR Title Format
 

@@ -496,6 +496,40 @@ def test_configure_generation_config_keeps_dummy_startup_weights_for_mtp(method)
     assert configured["vllm_cfg"]["load_format"] == "dummy"
 
 
+def test_vllm_logger_metrics_preserves_all_worker_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {
+        "vllm_cfg": {
+            "enable_vllm_metrics_logger": True,
+            "async_engine": True,
+        }
+    }
+    generation.worker_group = MagicMock()
+    generation.worker_group.dp_size = 1
+    generation.worker_group.get_dp_leader_worker_idx.return_value = 0
+    future = object()
+    generation.worker_group.run_single_worker_single_data.return_value = future
+    worker_metrics = {
+        "inflight_batch_sizes": [1],
+        "num_pending_samples": [0],
+        "kv_cache_usage_perc": [0.25],
+        "generation_tokens": [100],
+        "streaming_tool_call_dummy_tokens": [3],
+        "streaming_tool_call_prefill_tokens": [40],
+        "prefix_cache_queries": [80],
+        "prefix_cache_hits": [48],
+    }
+    monkeypatch.setattr(ray, "get", lambda _: [worker_metrics])
+
+    assert generation.get_vllm_logger_metrics() == {
+        metric_name: {0: metric_values}
+        for metric_name, metric_values in worker_metrics.items()
+        if metric_values
+    }
+
+
 def get_basic_megatron_test_config(
     tp: int = 1,
     pp: int = 1,

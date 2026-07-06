@@ -33,6 +33,11 @@ class StreamingToolCallConfig(TypedDict):
             default is 8.
         min_chunk_chars: Minimum new shell-output characters before requesting
             another tokenization. The recommended default is 256.
+        snapshot_poll_interval_seconds: Interval between runtime reads of the
+            current shell-output snapshot. This should not be lower than the
+            producer's snapshot cadence. The recommended default is 0.1
+            seconds; use 0.05 seconds to match OpenHands' current producer
+            cadence when measuring admission coverage.
         flush_interval_seconds: Maximum interval between eligible partial-output
             tokenizations. The recommended default is 0.25 seconds.
         request_timeout_seconds: Maximum duration of one streaming prefill HTTP
@@ -45,6 +50,7 @@ class StreamingToolCallConfig(TypedDict):
     session_ttl_seconds: float
     stability_margin_tokens: int
     min_chunk_chars: int
+    snapshot_poll_interval_seconds: float
     flush_interval_seconds: float
     request_timeout_seconds: float
 

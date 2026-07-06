@@ -42,10 +42,14 @@
 #   NUM_VLLM_REPLICAS=64 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh
 #   NUM_VLLM_REPLICAS=64 DRY_RUN=1 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh   # print config, no submit
 #   SKIP_TRAINING=1 NUM_VLLM_REPLICAS=4 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh  # generation-only (no-op train, 1 node, R%4)
-# Optional env: SKIP_TRAINING, TRAIN_NODES, TRAIN_TP, WANDB_GROUP, EXP_SUFFIX,
-#               MODEL_PATH, CONTAINER, MAX_NUM_STEPS, SBATCH_TIME,
-#               PERSISTENT_CACHE, BASE_LOG_DIR, STREAMING_TOOL_CALL,
-#               LOG_GYM_RESPONSES
+# Optional env: SKIP_TRAINING, TRAJECTORY_COLLECTION,
+#               TRAJECTORY_COLLECTION_BATCH_SIZE, TRAIN_DATA_PATH, VAL_DATA_PATH,
+#               TRAIN_NODES, TRAIN_TP, WANDB_GROUP, EXP_SUFFIX, MODEL_PATH,
+#               CONTAINER, MAX_NUM_STEPS, SBATCH_TIME, PERSISTENT_CACHE,
+#               BASE_LOG_DIR, LOGGER_LOG_DIR, STREAMING_TOOL_CALL,
+#               LOG_GYM_RESPONSES, TEMPERATURE, TOP_P,
+#               SNAPSHOT_POLL_INTERVAL_SECONDS,
+#               VLLM_BATCH_INVARIANT, SWE_BENCH_ARTIFACT_CACHE_OFFLINE
 # Credentials are NOT sourced here — export HF_HOME / HF_TOKEN / WANDB_API_KEY yourself.
 # ============================================================================
 
@@ -57,8 +61,9 @@ set -e
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 CONFIG_FILE="${REPO_ROOT}/examples/swe_bench/grpo_qwen3_30b_async_swe.yaml"
 CHECKPOINT_ROOT="${REPO_ROOT}/results"
-TRAIN_DATA_PATH="/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
-VAL_DATA_PATH="${TRAIN_DATA_PATH}"
+DEFAULT_DATA_PATH="/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${DEFAULT_DATA_PATH}}"
+VAL_DATA_PATH="${VAL_DATA_PATH:-${TRAIN_DATA_PATH}}"
 # SWE1 step_230 HF checkpoint (exactly what dc3m70us trained from).
 DEFAULT_MODEL_PATH="/lustre/fsw/portfolios/coreai/users/bihu/repos/nemo-rl-async-swe/results/qwen3-30b-thinking-swe1-async-age1-pps64-gpp8-gbs512-lr1e-06/step_230_hf"
 MODEL_PATH="${1:-${MODEL_PATH:-${DEFAULT_MODEL_PATH}}}"
@@ -78,7 +83,12 @@ export CPUS_PER_WORKER=114
 # SKIP_TRAINING=1 -> generation-only benchmark: training is a no-op on a SINGLE node
 # (no optimizer, weights frozen, refit every step + keep-alive matmul). Training
 # parallelism must fit 1 node, so model_parallel = TP*CP*PP must divide gpus_per_node(=8).
+TRAJECTORY_COLLECTION="${TRAJECTORY_COLLECTION:-0}"
+TRAJECTORY_COLLECTION_BATCH_SIZE="${TRAJECTORY_COLLECTION_BATCH_SIZE:-64}"
 SKIP_TRAINING="${SKIP_TRAINING:-0}"
+if [ "${TRAJECTORY_COLLECTION}" = "1" ]; then
+  SKIP_TRAINING=1
+fi
 STREAMING_TOOL_CALL="${STREAMING_TOOL_CALL:-0}"
 if [ "${STREAMING_TOOL_CALL}" = "1" ]; then
   STREAMING_TOOL_CALL_ENABLED=True
@@ -207,6 +217,10 @@ MOE_ROUTER_BIAS_UPDATE_RATE="1e-3"
 
 # ======================= Generation / vLLM =======================
 TEMPERATURE="${TEMPERATURE:-1.0}"
+TOP_P="${TOP_P:-1.0}"
+VLLM_BATCH_INVARIANT="${VLLM_BATCH_INVARIANT:-0}"
+SNAPSHOT_POLL_INTERVAL_SECONDS="${SNAPSHOT_POLL_INTERVAL_SECONDS:-0.1}"
+SWE_BENCH_ARTIFACT_CACHE_OFFLINE="${SWE_BENCH_ARTIFACT_CACHE_OFFLINE:-0}"
 
 # =================== Checkpointing & validation ===================
 SAVE_PERIOD=5
@@ -225,8 +239,8 @@ WANDB_GROUP="${WANDB_GROUP:-swe-gen-scale-linear}"
 LOG_GYM_RESPONSES="${LOG_GYM_RESPONSES:-true}"
 
 # ========================= SLURM submission =========================
-SBATCH_ACCOUNT="nemotron_sw_post"
-SBATCH_PARTITION="batch"
+SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-nemotron_sw_post}"
+SBATCH_PARTITION="${SBATCH_PARTITION:-batch}"
 SBATCH_TIME="${SBATCH_TIME:-4:0:0}"
 # Optional smoke-test knob: cap training steps (appended as ++grpo.max_num_steps). Empty = use YAML default.
 MAX_NUM_STEPS="${MAX_NUM_STEPS:-}"
@@ -247,6 +261,7 @@ mkdir -p "${CHECKPOINT_DIR}"
 # ============= Unified SLURM/Ray log location =============
 export BASE_LOG_DIR="${BASE_LOG_DIR:-${SNAPSHOT_DIR}/logs/swe_bench_scale}"
 mkdir -p "${BASE_LOG_DIR}"
+LOGGER_LOG_DIR="${LOGGER_LOG_DIR:-logs}"
 
 # ========================= Environment variables =========================
 # Credentials are NOT sourced here. Export these yourself before submitting:
@@ -298,6 +313,9 @@ echo "  invariants    : samples/replica=${PER_REPLICA_SAMPLES}, batch/train-GPU=
 echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, pad=${MAKE_SEQ_DIVISIBLE_BY}"
 echo "Model: ${MODEL_PATH}"
 echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
+echo "Streaming snapshot poll interval: ${SNAPSHOT_POLL_INTERVAL_SECONDS}s"
+echo "vLLM batch invariant: ${VLLM_BATCH_INVARIANT}"
+echo "SWE-bench artifact cache offline: ${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}"
 echo "Checkpoint: ${CHECKPOINT_DIR}"
 echo "=========================================="
 
@@ -364,10 +382,12 @@ export SETUP_COMMAND
 # ================ Training command (bihu-style: uv run --frozen, no --extra mcore) ================
 export COMMAND="NRL_VLLM_USE_V1=1 \
   NRL_WG_USE_RAY_REF=1 \
+  VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT} \
   WANDB_API_KEY=${WANDB_API_KEY} \
   HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN} \
   GITHUB_TOKEN=${GITHUB_TOKEN} \
   GITLAB_TOKEN=${GITLAB_TOKEN} \
+  SWE_BENCH_ARTIFACT_CACHE_OFFLINE=${SWE_BENCH_ARTIFACT_CACHE_OFFLINE} \
   HF_HOME=${HF_HOME} \
   HF_DATASETS_CACHE=${HF_DATASETS_CACHE} \
   UV_CACHE_DIR=${UV_CACHE_DIR} \
@@ -428,11 +448,14 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   policy.megatron_cfg.empty_unused_memory_level=2 \
   policy.megatron_cfg.activation_checkpointing=True \
   policy.generation.temperature=${TEMPERATURE} \
+  policy.generation.top_p=${TOP_P} \
   policy.generation.vllm_cfg.tensor_parallel_size=${VLLM_TP} \
   policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_UTIL} \
   policy.generation.vllm_cfg.skip_tokenizer_init=False \
   policy.generation.vllm_cfg.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
   env.nemo_gym.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
+  env.nemo_gym.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
   loss_fn.reference_policy_kl_penalty=${KL} \
   loss_fn.ratio_clip_min=${CLIP_MIN} \
   loss_fn.ratio_clip_max=${CLIP_MAX} \
@@ -447,6 +470,7 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   ++checkpointing.metric_name=train:total_reward/mean \
   ++checkpointing.checkpoint_must_save_by=00:03:35:00 \
   logger.wandb_enabled=True \
+  logger.log_dir=${LOGGER_LOG_DIR} \
   logger.wandb.name=${WANDB_NAME} \
   logger.wandb.project=${WANDB_PROJ} \
   ++logger.wandb.group=${WANDB_GROUP}"
@@ -474,6 +498,14 @@ fi
 # Generation-only benchmark: no-op training (no optimizer) + disable checkpoint saving.
 if [ "${SKIP_TRAINING}" = "1" ]; then
   export COMMAND="${COMMAND} ++grpo.gen_benchmark_skip_training=true checkpointing.enabled=false"
+fi
+
+# Rollout-only evaluation. Completed batches are appended to
+# trajectory_collection.jsonl under logger.log_dir.
+if [ "${TRAJECTORY_COLLECTION}" = "1" ]; then
+  export COMMAND="${COMMAND} \
+  env.nemo_gym.is_trajectory_collection=true \
+  env.nemo_gym.trajectory_collection_batch_size=${TRAJECTORY_COLLECTION_BATCH_SIZE}"
 fi
 
 # ================ Submit job (skipped under DRY_RUN=1) ================

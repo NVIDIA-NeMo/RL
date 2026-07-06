@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import pprint
 import time
@@ -78,7 +79,7 @@ def collect_trajectories(
     logger: Logger,
     master_config: MasterConfig,
 ) -> None:
-    """Run trajectory collection."""
+    """Run trajectory collection and retain every completed Gym result."""
     # common config/state items
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_policy_generation(policy, policy_generation, colocated_inference)
@@ -87,33 +88,83 @@ def collect_trajectories(
 
     print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config.policy["generation"]
-    for val_batch in val_dataloader:
-        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-            policy_generation=policy_generation,
-            input_batch=val_batch,
-            tokenizer=tokenizer,
-            task_to_env=val_task_to_env,
-            max_seq_len=master_config.policy["max_total_sequence_length"],
-            generation_config=generation_config,
-            max_rollout_turns=None,
-            greedy=False,
+    expected_trajectories = master_config.grpo["max_val_samples"]
+    assert expected_trajectories is not None
+    seen_instance_ids: set[str] = set()
+    resolved_count = 0
+
+    try:
+        for batch_idx, val_batch in enumerate(val_dataloader):
+            nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                policy_generation=policy_generation,
+                input_batch=val_batch,
+                tokenizer=tokenizer,
+                task_to_env=val_task_to_env,
+                max_seq_len=master_config.policy["max_total_sequence_length"],
+                generation_config=generation_config,
+                max_rollout_turns=None,
+                greedy=False,
+            )
+
+            rows_to_log: list[str] = []
+            for key, value in nemo_gym_rollout_result.rollout_metrics.items():
+                if "full_result" not in key:
+                    continue
+
+                value: Table
+                data: list[list[str]] = value.data  # (n, 1)
+                rows_to_log.extend(v[0] for v in data)
+
+            if not rows_to_log:
+                raise RuntimeError(
+                    f"Trajectory batch {batch_idx} did not contain any full Gym results"
+                )
+
+            for serialized_result in rows_to_log:
+                result = json.loads(serialized_result)
+                instance_id = result["responses_create_params"]["metadata"][
+                    "instance_id"
+                ]
+                if instance_id in seen_instance_ids:
+                    raise RuntimeError(
+                        f"Duplicate trajectory for instance_id={instance_id}"
+                    )
+                seen_instance_ids.add(instance_id)
+                resolved_count += int(result["reward"] == 1)
+
+            # Append after every completed batch. This preserves earlier trajectories if a
+            # later batch or worker fails during a long evaluation.
+            logger.log_string_list_as_jsonl(rows_to_log, log_filename)
+            print(
+                f"Collected {len(seen_instance_ids)}/{expected_trajectories} "
+                f"trajectories after batch {batch_idx + 1}",
+                flush=True,
+            )
+    finally:
+        policy_generation.finish_generation()
+
+    if len(seen_instance_ids) != expected_trajectories:
+        raise RuntimeError(
+            "Trajectory collection was incomplete: "
+            f"expected {expected_trajectories}, got {len(seen_instance_ids)}"
         )
 
-        rows_to_log: list[str] = []
-        for key, value in nemo_gym_rollout_result.rollout_metrics.items():
-            if "full_result" not in key:
-                continue
-
-            value: Table
-            data: list[list[str]] = value.data  # (n, 1)
-            rows_to_log.extend(v[0] for v in data)
-
-        logger.log_string_list_as_jsonl(rows_to_log, log_filename)
-
-        # TODO: eventually as trajectory collection use cases exceed 4 hours, we can leverage the dataloader save functionality to resume
-        # And also leverage the TimeoutChecker functionality as well
-
-    policy_generation.finish_generation()
+    accuracy = resolved_count / expected_trajectories
+    logger.log_metrics(
+        {
+            "accuracy": accuracy,
+            "num_resolved": resolved_count,
+            "num_trajectories": len(seen_instance_ids),
+        },
+        step=0,
+        prefix="trajectory_collection",
+        step_finished=True,
+    )
+    print(
+        f"Trajectory collection complete: {resolved_count}/{expected_trajectories} "
+        f"resolved ({accuracy:.4%})",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -163,6 +214,23 @@ def main() -> None:
         # NeMo-Gym specific config setup.
         setup_nemo_gym_config(config, tokenizer)
 
+    is_trajectory_collection = bool(
+        config.env["nemo_gym"].pop("is_trajectory_collection", False)
+    )
+    trajectory_collection_batch_size = config.env["nemo_gym"].pop(
+        "trajectory_collection_batch_size", None
+    )
+    if trajectory_collection_batch_size is not None:
+        if not is_trajectory_collection:
+            raise ValueError(
+                "env.nemo_gym.trajectory_collection_batch_size requires "
+                "env.nemo_gym.is_trajectory_collection=true"
+            )
+        if trajectory_collection_batch_size <= 0:
+            raise ValueError(
+                "env.nemo_gym.trajectory_collection_batch_size must be positive"
+            )
+
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_nemo_gym(config)
 
@@ -184,11 +252,15 @@ The validation set you pass in will directly be used for validation with no addi
         )
 
     if val_dataset is not None:
+        val_batch_size = len(val_dataset)
+        if trajectory_collection_batch_size is not None:
+            val_batch_size = min(trajectory_collection_batch_size, len(val_dataset))
         print(
-            f"Setting `grpo.max_val_samples` and `grpo.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
+            f"Setting `grpo.max_val_samples` to {len(val_dataset)} and "
+            f"`grpo.val_batch_size` to {val_batch_size}"
         )
         config.grpo["max_val_samples"] = len(val_dataset)
-        config.grpo["val_batch_size"] = config.grpo["max_val_samples"]
+        config.grpo["val_batch_size"] = val_batch_size
 
     # Print config
     print("Final config:")
@@ -196,13 +268,6 @@ The validation set you pass in will directly be used for validation with no addi
 
     with rl_init_timer.time("ray_connect"):
         init_ray()
-
-    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
-    # before setup() so it is not forwarded into NeMo-Gym's global config (the
-    # gym actor is now created inside setup()).
-    is_trajectory_collection = (
-        config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
-    )
 
     with rl_init_timer.time("setup"):
         (

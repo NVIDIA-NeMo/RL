@@ -330,6 +330,7 @@ design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
 design-docs/streaming-tool-call.md
+design-docs/streaming-tool-call-bug-report.md
 ```
 
 ```{toctree}

@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -39,6 +40,9 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.workers.megatron_policy_worker import (
+    MegatronPolicyWorkerImpl,
+)
 from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
 
@@ -210,6 +214,35 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
     assert worker._first_train_step_param_sync_func == "sync"
     assert model_config.param_sync_func is None
     assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+def test_dp_cp_collective_warmup_runs_once() -> None:
+    """The DP-CP communicator is initialized once before training."""
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._dp_cp_collective_warmed = False
+    warmup_tensor = MagicMock()
+    dp_cp_group = MagicMock()
+
+    with (
+        patch.object(torch.cuda, "current_device", return_value=3),
+        patch.object(torch, "zeros", return_value=warmup_tensor) as zeros,
+        patch(
+            "nemo_rl.models.policy.workers.megatron_policy_worker."
+            "parallel_state.get_data_parallel_group",
+            return_value=dp_cp_group,
+        ) as get_data_parallel_group,
+        patch.object(torch.distributed, "all_reduce") as all_reduce,
+    ):
+        worker._warm_up_dp_cp_collective()
+        worker._warm_up_dp_cp_collective()
+
+    zeros.assert_called_once_with(
+        1,
+        dtype=torch.int64,
+        device=torch.device("cuda", 3),
+    )
+    get_data_parallel_group.assert_called_once_with(with_context_parallel=True)
+    all_reduce.assert_called_once_with(warmup_tensor, group=dp_cp_group)
 
 
 def create_megatron_test_config(

@@ -33,7 +33,13 @@ Review a pull request or local branch interactively, applying the project's codi
 ```bash
 git fetch origin pull/$PRNUM/head:pr-$PRNUM-review
 git checkout pr-$PRNUM-review
+git submodule update --init --recursive
+git submodule status --recursive
 ```
+
+The recursive submodule update is mandatory after checkout. If it refuses
+because a submodule has local changes, stop and report the dirty paths; do not
+force, clean, reset, or delete them without explicit user approval.
 
 ### LOCAL mode
 Already on the correct branch. Determine the merge base:
