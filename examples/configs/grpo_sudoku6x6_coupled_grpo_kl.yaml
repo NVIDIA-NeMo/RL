@@ -1,0 +1,20 @@
+# CoupledGRPO 6x6 with a reference-KL anchor (k3) ENABLED, to test whether it prevents the
+# KL-free degeneration drift we observed (malformed grids + repetition loops). Inherits the
+# standard coupled 6x6 config; only turns the KL penalty on (needs reference logprobs, so the
+# skip flag is flipped to false). k3 = (r-1)-log r: unbiased, non-negative, low-variance.
+defaults: "grpo_sudoku6x6_coupled_grpo.yaml"
+
+grpo:
+  skip_reference_policy_logprobs_calculation: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01   # light anchor; the main knob to tune
+  reference_policy_kl_type: "k3"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-coupled_grpo-sudoku6x6-kl-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-coupled_grpo-sudoku6x6-kl-sglang"
+  wandb:
+    name: "grpo-nd3b-coupled_grpo-sudoku6x6-kl_k3"

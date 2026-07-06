@@ -1,0 +1,20 @@
+# ESPO 6x6 with a reference-KL anchor (k2) ENABLED, to test whether it prevents the
+# KL-free length-inflation / degeneration drift. Inherits the standard ESPO 6x6 config;
+# only turns the KL penalty on. The KL needs reference logprobs, so the skip flag is
+# flipped to false (adds a reference forward pass per step).
+defaults: "grpo_sudoku6x6_espo.yaml"
+
+grpo:
+  skip_reference_policy_logprobs_calculation: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01   # light anchor; the main knob to tune
+  reference_policy_kl_type: "k2"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-espo-sudoku6x6-kl-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-espo-sudoku6x6-kl-sglang"
+  wandb:
+    name: "grpo-nd3b-espo-sudoku6x6-kl_k2"
