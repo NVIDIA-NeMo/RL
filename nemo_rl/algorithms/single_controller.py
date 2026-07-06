@@ -136,10 +136,11 @@ class SingleControllerConfig(BaseModel, extra="allow"):
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
 
-    Owns three concurrent asyncio tasks:
+    Owns two concurrent asyncio tasks:
       - _rollout_pump: dispatches prompts to GenerationWorkerActor
-      - _train_pump:   claims DataPlane meta, trains, clears consumed rows
-      - _sync_weights: drain gate + weight synchronization
+      - _train_pump:   claims DataPlane meta, trains, clears consumed rows,
+                       then runs _sync_weights (drain gate + weight
+                       synchronization) inline after each optimizer step
 
     All other actors are passive — they expose methods and wait to be called.
     """
@@ -156,12 +157,19 @@ class SingleControllerActor:
         advantage_estimator: Any | None = None,
         logger: Any | None = None,
     ) -> None:
-        import logging as _logging
-
-        _logging.basicConfig(
-            level=_logging.INFO,
-            format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
-        )
+        # Configure the module logger only — basicConfig here would
+        # reconfigure the root logger globally for the whole Ray worker
+        # process. Skip if a handler is already attached so an embedding
+        # application's logging setup is respected.
+        if not log.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(
+                logging.Formatter(
+                    "[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s"
+                )
+            )
+            log.addHandler(handler)
+            log.setLevel(logging.INFO)
 
         self._cfg = cfg
         self._prompts = prompts
