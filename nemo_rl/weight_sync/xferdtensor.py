@@ -24,7 +24,7 @@ every path.
 
 This file also holds the golden kernel's private helpers and the
 ``DTensorRef`` wrapper callers pass as the src/dst tensor.  The ``MeshInfo``
-mesh wrapper lives in ``nccl_xfer_utils.py`` alongside the refit metadata
+mesh wrapper lives in ``nccl_reshard_utils.py`` alongside the refit metadata
 builders; ``xferdtensor_golden`` reads it only via duck typing (``.mesh``), so
 this module needs no import from there.
 """
@@ -162,7 +162,7 @@ def xferdtensor(
         # Default when the real op is absent: Python exact-transfer reshard
         # (per-overlap P2P + cached split-comm replica broadcast); same
         # 7-arg contract.
-        from nemo_rl.distributed.xferdtensor_python import (
+        from nemo_rl.weight_sync.xferdtensor_python import (
             xferdtensor_python_impl,
         )
 

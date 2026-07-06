@@ -37,7 +37,7 @@ run_test() {
 run_test      uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_topp_topk.sh
 run_test      uv run --no-sync bash ./tests/functional/vlm_grpo.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_nccl_xfer_refit.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_nccl_reshard_refit.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

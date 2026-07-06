@@ -471,4 +471,4 @@ class PolicyConfig(TypedDict):
     disable_modelopt_layer_spec: NotRequired[bool]
 
     # shard-to-shard refit for large models (experimental)
-    nccl_xfer_refit: NotRequired[bool]
+    nccl_reshard_refit: NotRequired[bool]

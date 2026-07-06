@@ -32,7 +32,7 @@ import pytest
 import torch
 from torch.distributed._tensor import Replicate, Shard
 
-from nemo_rl.distributed import xferdtensor_python as impl
+from nemo_rl.weight_sync import xferdtensor_python as impl
 
 
 class _Mesh:

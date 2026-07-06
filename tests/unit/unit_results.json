@@ -1,0 +1,10 @@
+{
+  "exit_status": 0,
+  "git_commit": "1388e0be7973f5426e55fa7278fb48409fa3ced4",
+  "start_time": "2026-07-06 11:44:37",
+  "metrics": {},
+  "gpu_types": [
+    "NVIDIA H100 80GB HBM3"
+  ],
+  "coverage": "[n/a] run with --cov=nemo_rl"
+}

@@ -19,11 +19,6 @@ from typing import Any
 import torch
 import zmq
 
-from nemo_rl.distributed.nccl_xfer_utils import (
-    HFToLocalParamMap,
-    LocalParamSpec,
-    RefitCtx,
-)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -31,6 +26,11 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.weight_sync.nccl_reshard_utils import (
+    HFToLocalParamMap,
+    LocalParamSpec,
+    RefitCtx,
+)
 
 try:
     import vllm  # noqa: F401
@@ -121,7 +121,7 @@ class VllmInternalWorkerExtension:
         torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=self.device)
 
-    def init_nccl_xfer_comm_group(
+    def init_nccl_reshard_comm_group(
         self,
         rank_prefix: int,
         pp_ips: list[str],
@@ -130,7 +130,7 @@ class VllmInternalWorkerExtension:
         train_ranks_per_stage: int,
         sub_world_size: int,
     ) -> None:
-        """Bootstrap this gen worker's nccl_xfer bulk-path comm group(s).
+        """Bootstrap this gen worker's nccl_reshard bulk-path comm group(s).
 
         One comm group per PP stage; gen workers join ALL ``pp_size`` groups
         (they need every stage's layers), created in stage order so the train
@@ -495,22 +495,22 @@ class VllmInternalWorkerExtension:
 
         return True
 
-    def prepare_nccl_xfer_refit_info(self, refit_info: dict) -> None:
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Restore per-layer param metadata and build the HF→vLLM mapping.
 
         Done once ahead of refit; the cached mapping is reused by every
-        ``nccl_xfer_refit`` call.
+        ``nccl_reshard_refit`` call.
         """
-        from nemo_rl.distributed.nccl_xfer_utils import (
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
 
-        self.nccl_xfer_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
+        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
-        # Build HFToLocalParamMap (see nccl_xfer_utils)
+        # Build HFToLocalParamMap (see nccl_reshard_utils)
         self.hf_to_local_param_map = self.build_hf_to_local_param_map(  # pyrefly: ignore[implicitly-defined-attribute]
-            self.nccl_xfer_refit_info
+            self.nccl_reshard_refit_info
         )
 
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
@@ -645,7 +645,7 @@ class VllmInternalWorkerExtension:
                         # Requires more changes to the refit logic to support.
                         # TODO: need to support TRTLLM backend in the future.
                         raise ValueError(
-                            f"nccl_xfer refit: gen MoE backend {backend!r} reorders "
+                            f"nccl_reshard refit: gen MoE backend {backend!r} reorders "
                             "w13 in a way the refit does not reproduce; run gen with "
                             "the TRITON or FlashInfer CUTLASS MoE backend."
                         )
@@ -699,11 +699,11 @@ class VllmInternalWorkerExtension:
 
         return mapping
 
-    def nccl_xfer_refit(self) -> bool:
+    def nccl_reshard_refit(self) -> bool:
         """Receive weights from training workers via xferdtensor.
 
         Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
-        built once in ``prepare_nccl_xfer_refit_info``) provides the dst buffer:
+        built once in ``prepare_nccl_reshard_refit_info``) provides the dst buffer:
         for a direct param xferdtensor receives straight into the live vLLM
         param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
         ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
@@ -712,14 +712,14 @@ class VllmInternalWorkerExtension:
         import os
         from collections import OrderedDict
 
-        from nemo_rl.distributed.xferdtensor import DTensorRef, xferdtensor
+        from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         def _recv_one_param(param_info, group):
             # Coverage guard: every bulk param must have a spec; a missing entry
             # would silently discard its weights.
             spec = self.hf_to_local_param_map.get(param_info["name"])
             assert spec is not None, (
-                f"nccl_xfer_refit: {param_info['name']!r} has no spec in "
+                f"nccl_reshard_refit: {param_info['name']!r} has no spec in "
                 "hf_to_local_param_map (would silently discard its weights)"
             )
             ctx = (
@@ -742,15 +742,15 @@ class VllmInternalWorkerExtension:
         # concurrently on their own streams.  Non-PP = single stage 0 (params
         # carry no "pp_stage" key), so this collapses to one stage / one stream.
         stage_params = OrderedDict()
-        for layer_name in self.nccl_xfer_refit_info["layer_names"]:
-            for p in self.nccl_xfer_refit_info["per_layer_params"][layer_name]:
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            for p in self.nccl_reshard_refit_info["per_layer_params"][layer_name]:
                 stage_params.setdefault(p.get("pp_stage", 0), []).append(p)
 
         num_streams = min(
             int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)
         )
 
-        # Overlapping broadcast and the nccl-xfer path refits.
+        # Overlapping broadcast and the nccl-reshard path refits.
         import concurrent.futures
 
         # The misc producer requires the worker's CUDA device setting.
@@ -764,7 +764,7 @@ class VllmInternalWorkerExtension:
         # Serialize the bulk reshard and the misc broadcast (bulk -> misc) by
         # default: running the two NCCL communicators concurrently can deadlock —
         _parallel_misc = os.environ.get(
-            "NRL_NCCL_XFER_REFIT_PARALLEL_MISC", ""
+            "NRL_NCCL_RESHARD_REFIT_PARALLEL_MISC", ""
         ).lower() in (
             "1",
             "true",
@@ -808,9 +808,9 @@ class VllmInternalWorkerExtension:
 
     def _receive_and_load_misc_params(self) -> None:
         """Receive misc params via packed_broadcast and load via vLLM."""
-        from nemo_rl.distributed.nccl_xfer_utils import _STR_TO_DTYPE
+        from nemo_rl.weight_sync.nccl_reshard_utils import _STR_TO_DTYPE
 
-        misc_meta = self.nccl_xfer_refit_info.get("misc_meta", {})
+        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
         if not misc_meta:
             return
 

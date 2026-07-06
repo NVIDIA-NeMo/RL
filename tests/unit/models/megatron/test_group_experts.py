@@ -88,7 +88,7 @@ def test_group_experts_empty_group_raises():
 # iterator; _build_expert_groups / _group_experts run for real.
 # --------------------------------------------------------------------------
 def test_build_hf_to_local_param_map_train_side():
-    from nemo_rl.distributed.nccl_xfer_utils import HFToLocalParamMap
+    from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
 
     w = object.__new__(MegatronPolicyWorkerImpl)  # no __init__ / no megatron state
     prefix = "model.layers.0.mlp.experts"
