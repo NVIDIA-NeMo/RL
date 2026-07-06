@@ -803,9 +803,6 @@ def grpo_train_sync(
                     # batched fetch to avoid double-shipping the per-token
                     # tensor through Ray's plasma store on top of the TQ
                     # writeback.
-                    #
-                    # Each ``compute_X`` guard doubles as the "add to
-                    # select_fields" gate — one flag, one branch.
                     select_fields = ["generation_logprobs", "token_mask"]
                     if compute_prev:
                         policy.get_logprobs_from_meta(meta, timer=timer)
@@ -833,8 +830,8 @@ def grpo_train_sync(
                     )
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
-                    # Local zeros for compute_advantage below; workers skip
-                    # fetching prev_logprobs (see TQPolicy.train_from_meta).
+                    # Placeholder zeros satisfying compute_advantage's
+                    # signature; not shipped to workers.
                     prev_logprobs = (
                         extras_bdd["prev_logprobs"]
                         if compute_prev
@@ -926,6 +923,7 @@ def grpo_train_sync(
                         meta,
                         loss_fn=loss_fn,
                         timer=timer,
+                        skip_prev_logprobs=skip_prev_logprobs,
                     )
 
                 if sync_kv_scales:
