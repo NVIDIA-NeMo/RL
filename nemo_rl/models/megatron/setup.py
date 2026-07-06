@@ -1131,6 +1131,10 @@ def setup_model_and_optimizer(
     megatron_cfg.dist.distributed_timeout_minutes = int(
         os.environ.get("NRL_NCCL_TIMEOUT_MINUTES", "60")
     )
+    # If a collective still times out, dump the NCCL flight-recorder trace so
+    # the stalled rank/op is identifiable post-mortem (pair with
+    # TORCH_NCCL_DEBUG_INFO_TEMP_FILE on a mounted path).
+    megatron_cfg.dist.flight_recorder_dump_on_timeout = True
     initialize_megatron(
         cfg=megatron_cfg,
         get_embedding_ranks=get_embedding_ranks,

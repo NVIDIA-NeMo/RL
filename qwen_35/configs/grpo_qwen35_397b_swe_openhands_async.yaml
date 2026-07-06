@@ -204,6 +204,9 @@ policy:
       # step 2 (SYSTEM_ERROR, no python traceback). Fault handler prints a
       # traceback on SIGSEGV/SIGABRT so the next occurrence is attributable.
       PYTHONFAULTHANDLER: "1"
+      # NCCL flight-recorder dump target on the mounted /logs dir (per-rank
+      # suffix appended) so timeout post-mortems survive job teardown.
+      TORCH_NCCL_DEBUG_INFO_TEMP_FILE: "/logs/nccl_trace"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0
