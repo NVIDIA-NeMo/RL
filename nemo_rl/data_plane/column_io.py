@@ -61,6 +61,34 @@ def round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
+def stamp_global_forward_pad_seqlen(
+    meta: KVBatchMeta,
+    *,
+    sequence_length_round: int = 1,
+) -> None:
+    """Mint ``GLOBAL_FORWARD_PAD_SEQLEN`` onto ``meta.extra_info``.
+
+    Workers and driver-side reads use this value to materialize all DP
+    slices to one forward-pass sequence length. The helper is idempotent
+    so callers can stamp before every dispatch without coordinating.
+
+    Args:
+        meta: Full-batch metadata to mutate.
+        sequence_length_round: Dynamic-batching sequence-length round.
+            ``1`` disables extra dynamic-batching alignment.
+    """
+    if not meta.sequence_lengths:
+        return
+    pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
+    target = round_up(
+        max(meta.sequence_lengths), max(pad_mult, int(sequence_length_round))
+    )
+    existing = int(meta.extra_info.get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
+    if existing >= target:
+        return
+    meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = target
+
+
 def read_columns(
     dp_client: DataPlaneClient,
     meta: KVBatchMeta,

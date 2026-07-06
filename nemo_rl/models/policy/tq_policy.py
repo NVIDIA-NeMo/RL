@@ -39,11 +39,14 @@ import ray
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
-from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
+from nemo_rl.data_plane.column_io import (
+    read_columns,
+    stamp_global_forward_pad_seqlen,
+    write_columns,
+)
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
-    GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
     fields_with_optional_routed_experts,
 )
@@ -146,6 +149,9 @@ class TQPolicy(Policy):
         self,
         num_samples: int,
         group_size: Optional[int] = None,
+        *,
+        fields: Optional[list[str]] = None,
+        consumer_tasks: Optional[list[str]] = None,
     ) -> None:
         """Register the per-step TQ partition.
 
@@ -157,14 +163,26 @@ class TQPolicy(Policy):
         Args:
             num_samples: Expected total samples this step.
             group_size: GRPO group size for balanced sampling; ``None`` disables grouping.
+            fields: Optional partition schema override. Defaults to
+                GRPO's ``DP_TRAIN_FIELDS``.
+            consumer_tasks: Optional consumer task override. Defaults to
+                GRPO's ``["prev_lp", "ref_lp", "train"]``.
         """
         self.dp_client.register_partition(
             partition_id=self.tq_partition_id,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=list(
+                fields
+                if fields is not None
+                else fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                )
             ),
             num_samples=num_samples,
-            consumer_tasks=["prev_lp", "ref_lp", "train"],
+            consumer_tasks=list(
+                consumer_tasks
+                if consumer_tasks is not None
+                else ["prev_lp", "ref_lp", "train"]
+            ),
             grpo_group_size=group_size,
         )
 
@@ -207,13 +225,11 @@ class TQPolicy(Policy):
         """
         if not meta.sequence_lengths:
             return
-        if GLOBAL_FORWARD_PAD_SEQLEN in meta.extra_info:
-            return
         _, dba = self._packing_args("train_mb_tokens")
         seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
-        pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
-        meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = round_up(
-            max(meta.sequence_lengths), max(pad_mult, seq_round)
+        stamp_global_forward_pad_seqlen(
+            meta,
+            sequence_length_round=seq_round,
         )
 
     def read_from_dataplane(
@@ -364,6 +380,8 @@ class TQPolicy(Policy):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        *,
+        fields: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """1-hop counterpart to :meth:`train`.
 
@@ -379,6 +397,8 @@ class TQPolicy(Policy):
             gbs: Global batch size; defaults to ``cfg["train_global_batch_size"]``.
             mbs: Micro batch size; defaults to ``cfg["train_micro_batch_size"]``.
             timer: Optional timer for nested ``policy_training/*`` measurements.
+            fields: Optional train fetch field override. Defaults to
+                GRPO's ``DP_TRAIN_FIELDS``.
 
         Returns:
             Aggregated training-step output dict.
@@ -388,14 +408,17 @@ class TQPolicy(Policy):
 
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
-        # Train workers fetch the full DP_TRAIN_FIELDS schema (rollout +
-        # logprob deltas + advantages + sample_mask). Caller is responsible
-        # for ensuring those columns have been written to TQ before this
-        # call (workers + driver delta-writes).
+        # Train workers fetch the requested train schema. Caller is
+        # responsible for ensuring those columns have been written to TQ
+        # before this call.
         train_meta = replace(
             meta,
-            fields=fields_with_optional_routed_experts(
-                DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+            fields=list(
+                fields
+                if fields is not None
+                else fields_with_optional_routed_experts(
+                    DP_TRAIN_FIELDS, enabled=self._router_replay_enabled
+                )
             ),
             task_name="train",
         )
