@@ -175,6 +175,11 @@ policy:
       grad_reduce_in_fp32: false
       overlap_grad_reduce: true
       overlap_param_gather: false
+      # Bug #16 fix: the per-bucket NaN grad check D2H-syncs inside the DDP
+      # grad-ready hook and deadlocked every process's second train step at
+      # this scale (see setup.py ddp config comment). NaN grads still surface
+      # via the global grad-norm in the optimizer.
+      check_for_nan_in_grad: false
       use_custom_fsdp: false
       data_parallel_sharding_strategy: optim_grads_params
     # Memory headroom for the training step. Job 2269463 (64-GPU shape) OOM'd

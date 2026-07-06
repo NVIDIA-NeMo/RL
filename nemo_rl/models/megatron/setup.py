@@ -987,7 +987,16 @@ def _create_megatron_config(
         ),
         optimizer=OptimizerConfig(**optimizer_kwargs),
         ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
+            # check_grads runs torch.isnan(grad_norm) per bucket inside the
+            # grad-ready hook (a D2H sync between grad-ready and the DP
+            # reduce-scatter enqueue). On the 397B GB200/GB300 chain this
+            # deadlocked every process's SECOND train step (128 ranks frozen
+            # in TP/EP collectives; py-spy showed 29 ranks blocked in
+            # rerun_state_machine.validate_result inside check_grads, jobs
+            # 2289258/2291300/2291765/2292043). mcore's own default is False.
+            check_for_nan_in_grad=config["megatron_cfg"][
+                "distributed_data_parallel_config"
+            ].get("check_for_nan_in_grad", True),
             grad_reduce_in_fp32=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["grad_reduce_in_fp32"],
