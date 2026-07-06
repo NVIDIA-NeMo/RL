@@ -78,7 +78,7 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
     dataset_name = data_config["dataset_name"]
 
     # load dataset
-    if dataset_name in {"countdown", "sudoku", "mini_sudoku"}:
+    if dataset_name in {"countdown", "sudoku", "mini_sudoku", "sudoku6x6"}:
         dataset = ReasoningGymDataset(
             task_name=dataset_name,
             **{k: v for k, v in data_config.items() if k != "dataset_name"},

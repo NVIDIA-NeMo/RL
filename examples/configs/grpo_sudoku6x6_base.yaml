@@ -1,0 +1,41 @@
+# Shared 6x6 Sudoku task settings (2x3 boxes, digits 1-6, blanks-only reward + few-shot),
+# inherited by the per-algorithm 6x6 configs (AR, ESPO, Block-JustGRPO). NOT runnable on
+# its own -- listed as the SECOND parent in each config's `defaults:` list, overriding the
+# algorithm base's data/env/task. 6x6 has ~28.2M valid grids (vs 288 for 4x4), too many to
+# memorize, so accuracy requires actual solving. Custom generator (dataset_name sudoku6x6).
+grpo:
+  val_at_start: true
+  max_val_samples: 2048   # >= validation size(256) * repeat(4) = 1024 avg@4 gens (matches 4x4)
+
+policy:
+  max_total_sequence_length: 1536   # ~910 few-shot prompt + 512 generation
+  generation:
+    max_new_tokens: 512             # divisible by block_size 16 and 32
+
+data:
+  _override_: true
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  max_input_seq_length: 1280        # 6x6 few-shot prompt ~910 tok
+  train:
+    dataset_name: sudoku6x6
+    size: 50000
+    seed: 1
+  validation:
+    dataset_name: sudoku6x6
+    size: 256
+    seed: 2
+    repeat: 4                       # avg@4: 256 distinct puzzles x 4 = 1024 val gens (matches 4x4)
+  default:
+    prompt_file: null
+    system_prompt_file: examples/prompts/sudoku6x6_fewshot.txt
+    processor: "reasoning_gym_data_processor"
+    env_name: "reasoning_gym"
+    prompt_style: "sudoku_answer_tag"   # rebuild user turn from metadata puzzle + <answer> ask
+    enable_thinking: true               # open <think> so the model can reason (now that it must)
+
+env:
+  reasoning_gym:
+    task: "sudoku6x6"
+    reward_mode: "sudoku_blanks"

@@ -58,7 +58,15 @@ class ReasoningGymDataset(RawDataset):
         # (AGRPO format) instead of the reasoning_gym question text.
         self.prompt_style = prompt_style
 
-        rg = reasoning_gym.create_dataset(task_name, size=size, seed=seed)
+        if task_name == "sudoku6x6":
+            # 6x6 (2x3 boxes) is not in reasoning_gym; use our standalone generator,
+            # which emits the same {question, answer, metadata:{puzzle, solution}} shape.
+            from nemo_rl.data.datasets.response_datasets.sudoku6x6_generator import (
+                generate_sudoku6x6,
+            )
+            rg = generate_sudoku6x6(size=size, seed=seed)
+        else:
+            rg = reasoning_gym.create_dataset(task_name, size=size, seed=seed)
         # The rg_entry is stored as a JSON string column because HF Datasets do not
         # round-trip nested dicts cleanly (mirrors nemo_gym_data_processor).
         rows = []
