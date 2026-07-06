@@ -31,12 +31,9 @@ maybe_gres_arg() {
   # Check if any nodes in the partition have GRES configured
   # Assumes a homogeneous allocation (not a heterogeneous job)
   if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
-    # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
-    # Some clusters append socket specs like "(S:0-3)" to the GRES string.
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
-      echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
-      exit 1
-    fi
+    # Use the recipe/launcher value. Partition-wide sinfo can report a larger
+    # node shape than the current allocation, e.g. a 4-GPU GB200 allocation on a
+    # partition that also advertises 8-GPU GRES.
     echo "--gres=gpu:${GPUS_PER_NODE}"
     return
   fi
@@ -49,10 +46,15 @@ maybe_gres_arg() {
 # User defined variables
 ########################################################
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
-CONTAINER=$CONTAINER
-MOUNTS=$MOUNTS
+CONTAINER=${CONTAINER:-}
+MOUNTS=${MOUNTS:-}
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
+RAY_CLI=${RAY_CLI:-ray}  # Override with e.g. "uv run ray" to start Ray from the repo-managed environment.
+USE_PYXIS_CONTAINER=false
+if [[ -n "$CONTAINER" ]]; then
+  USE_PYXIS_CONTAINER=true
+fi
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -77,6 +79,18 @@ fi
 # There is severe contention and performance issues with this enabled considering our dependencies are so large and occasionally
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+# If the repo stack points Triton at a specific CUDA toolkit, use the same
+# toolkit for uv-built extensions so worker venv builds match repo PyTorch.
+if [[ -z "${CUDA_HOME:-}" && "${TRITON_PTXAS_PATH:-}" == */bin/ptxas ]]; then
+  export CUDA_HOME="${TRITON_PTXAS_PATH%/bin/ptxas}"
+fi
+if [[ -n "${CUDA_HOME:-}" ]]; then
+  export CUDA_PATH="${CUDA_PATH:-$CUDA_HOME}"
+  export CUDACXX="${CUDACXX:-$CUDA_HOME/bin/nvcc}"
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+fi
 
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
@@ -109,15 +123,23 @@ MAX_WORKER_PORT=${MAX_WORKER_PORT:-11000}
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
 ########################################################
 
-# Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
-unset UV_CACHE_DIR
+# Unset UV_CACHE_DIR to avoid local cache directories interfering with the
+# container cache. For native Slurm runs, UV_CACHE_DIR_OVERRIDE is an explicit
+# request to keep uv cache traffic on node-local storage.
+if [[ -z "${UV_CACHE_DIR_OVERRIDE:-}" || "$USE_PYXIS_CONTAINER" == "true" ]]; then
+  unset UV_CACHE_DIR
+fi
 
 if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
   mkdir -p "$UV_CACHE_DIR_OVERRIDE"
-  if [[ -n $MOUNTS ]]; then
-    MOUNTS+=",$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+  if [[ "$USE_PYXIS_CONTAINER" == "true" ]]; then
+    if [[ -n $MOUNTS ]]; then
+      MOUNTS+=",$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+    else
+      MOUNTS="$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+    fi
   else
-    MOUNTS="$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"
+    export UV_CACHE_DIR="$UV_CACHE_DIR_OVERRIDE"
   fi
 fi
 
@@ -159,7 +181,7 @@ if [[ -n "$COMMAND" ]]; then
 fi
 
 # Number of GPUs per worker node
-GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+GPUS_PER_NODE=${GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-8}}
 
 # Detect GRES support and set GRES_ARG
 GRES_ARG=$(maybe_gres_arg)
@@ -170,11 +192,15 @@ else
 fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
-COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
-COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
-COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
-COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+if [[ "$USE_PYXIS_CONTAINER" == "true" ]]; then
+  COMMON_SRUN_ARGS+=" --no-container-mount-home"
+  if [[ -n "$MOUNTS" ]]; then
+    COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
+  fi
+  COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
+  COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+fi
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
@@ -426,7 +452,7 @@ ray-status-sidecar() {
   set +x
   while true; do
     sleep 10
-    units=\$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
+    units=\$($RAY_CLI status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
     # Write to a temp file, then rename. A plain '>' truncates before writing, so the
     # submit host (reading this over the shared FS from another node) could catch it
     # empty or half-written. rename is atomic: the reader always gets either the old
@@ -438,12 +464,23 @@ ray-status-sidecar() {
 }
 ray-status-sidecar &
 
+# Ensure the selected Ray CLI has synced before patching or starting daemons.
+$RAY_CLI --version
+
 # Patch nsight.py before starting Ray head
-sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+for _nsight_py in \
+  /opt/nemo_rl_venv/lib/python*/site-packages/ray/_private/runtime_env/nsight.py \
+  /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py \
+  "${UV_PROJECT_ENVIRONMENT:-.venv}"/lib/python*/site-packages/ray/_private/runtime_env/nsight.py \
+  .venv/lib/python*/site-packages/ray/_private/runtime_env/nsight.py; do
+  if [[ -e "\$_nsight_py" ]]; then
+    sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' "\$_nsight_py" || true
+  fi
+done
 
 source $LOG_DIR/topology_probe.sh
 
-# Start the head without --block. 'ray start --head' then returns as soon as the
+# Start the head without --block. '$RAY_CLI start --head' then returns as soon as the
 # GCS is listening, so we touch STARTED_RAY_HEAD only after the head is actually up.
 # Workers gate on that file, so they only try to connect once the GCS is accepting
 # connections.
@@ -452,7 +489,7 @@ while [[ \$count -lt $num_retries ]]; do
   # Clean up stale Ray state before every attempt. A timed-out attempt leaves a
   # session directory behind, and the next 'ray start --head' would otherwise hit:
   #   AssertionError: Session name ... does not match persisted value ...
-  ray stop || true
+  $RAY_CLI stop || true
   rm -rf /tmp/ray/session_* || true
 
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
@@ -460,7 +497,7 @@ while [[ \$count -lt $num_retries ]]; do
     bash "$SETUP_COMMAND_FILE"
   fi
   if cat <<EOFINNER | bash; then
-ray start --head \
+$RAY_CLI start --head \
     --disable-usage-stats \
     --resources="\$RAY_RESOURCES" \
     --node-ip-address="$head_node_ip" \
@@ -619,8 +656,19 @@ log-sync-sidecar() {
 }
 log-sync-sidecar &
 
+# Ensure the selected Ray CLI has synced before patching or starting daemons.
+$RAY_CLI --version
+
 # Patch nsight.py before starting Ray worker
-sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+for _nsight_py in \
+  /opt/nemo_rl_venv/lib/python*/site-packages/ray/_private/runtime_env/nsight.py \
+  /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py \
+  "${UV_PROJECT_ENVIRONMENT:-.venv}"/lib/python*/site-packages/ray/_private/runtime_env/nsight.py \
+  .venv/lib/python*/site-packages/ray/_private/runtime_env/nsight.py; do
+  if [[ -e "\$_nsight_py" ]]; then
+    sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' "\$_nsight_py" || true
+  fi
+done
 
 source $LOG_DIR/topology_probe.sh
 
@@ -646,7 +694,7 @@ count=0
 while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
   # Clean up stale Ray state before every attempt so a half-started raylet from a
   # previous attempt doesn't block the next one.
-  ray stop || true
+  $RAY_CLI stop || true
   rm -rf /tmp/ray/session_* || true
 
   if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
@@ -655,7 +703,7 @@ while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
   fi
   echo "[INFO] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
   cat <<EOFINNER | bash
-ray start --address "$ip_head" \
+$RAY_CLI start --address "$ip_head" \
           --disable-usage-stats \
           --resources="\$RAY_RESOURCES" \
           --min-worker-port=${MIN_WORKER_PORT} \
@@ -745,7 +793,11 @@ else
 fi
 
 # Start the Ray head.
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+HEAD_CONTAINER_NAME_ARG=""
+if [[ "$USE_PYXIS_CONTAINER" == "true" ]]; then
+  HEAD_CONTAINER_NAME_ARG="--container-name=ray-head"
+fi
+srun $COMMON_SRUN_ARGS $HEAD_CONTAINER_NAME_ARG --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
 # Start the Ray workers (all nodes except the head) with a single batched srun, so
@@ -757,7 +809,11 @@ if [[ $_num_workers -gt 0 ]]; then
   # srun -o with %t produces per-task log files; zero-pad to the worker-count
   # width so ray-worker-*.log filenames sort naturally (e.g. ray-worker-007.log).
   _task_digits=${#_num_workers}
-  srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+  WORKER_CONTAINER_NAME_ARG=""
+  if [[ "$USE_PYXIS_CONTAINER" == "true" ]]; then
+    WORKER_CONTAINER_NAME_ARG="--container-name=ray-worker"
+  fi
+  srun $COMMON_SRUN_ARGS $WORKER_CONTAINER_NAME_ARG --exact \
     --nodes=$_num_workers \
     --ntasks=$_num_workers \
     --ntasks-per-node=1 \
@@ -830,12 +886,20 @@ else
 # No args launches on the head node (node 0)
 # Args 1-N launch on worker nodes (nodes 1 through N-1)
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
+USE_PYXIS_CONTAINER=$USE_PYXIS_CONTAINER
+CONTAINER_CWD=$CONTAINER_CWD
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
-  if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+  # Empty means we are on the head node
+  if [[ "\$USE_PYXIS_CONTAINER" == "true" ]]; then
+    HEAD_ATTACH_ARGS="--no-container-mount-home --container-name=ray-head --container-workdir=\$CONTAINER_CWD"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
+    HEAD_ATTACH_ARGS="--chdir=\$CONTAINER_CWD"
+  fi
+  if [[ -n "\${COMMAND:-}" ]]; then
+    srun \$HEAD_ATTACH_ARGS $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+  else
+    srun \$HEAD_ATTACH_ARGS $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
   fi
 elif [[ $SLURM_JOB_NUM_NODES -eq 1 ]]; then
   echo "Error: Single-node mode — only the head node is available. Run without arguments."
@@ -848,11 +912,15 @@ else
     exit 1
   fi
   nodes_array=($nodes)
-  node="\${nodes_array[\$WORKER_NUM]}"
-  if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+  if [[ "\$USE_PYXIS_CONTAINER" == "true" ]]; then
+    WORKER_ATTACH_ARGS="--no-container-mount-home --container-name=ray-worker --container-workdir=\$CONTAINER_CWD"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID --pty bash
+    WORKER_ATTACH_ARGS="--chdir=\$CONTAINER_CWD"
+  fi
+  if [[ -n "\${COMMAND:-}" ]]; then
+    srun \$WORKER_ATTACH_ARGS $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+  else
+    srun \$WORKER_ATTACH_ARGS $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
   fi
 fi
 EOF

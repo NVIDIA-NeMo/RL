@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -28,6 +29,123 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 
 logger = logging.getLogger(__name__)
+
+
+def _is_truthy(value: str) -> bool:
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def _serialized_uv_sync():
+    if not _is_truthy(os.environ.get("NRL_SERIALIZE_UV_SYNC", "false")):
+        yield
+        return
+
+    import fcntl
+
+    lock_path_env = os.environ.get("NRL_UV_SYNC_LOCK_PATH")
+    lock_path = (
+        Path(lock_path_env)
+        if lock_path_env
+        else Path(git_root) / ".nemo_rl_uv_sync.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock_file:
+        logger.info("Waiting for uv sync lock at %s", lock_path)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            logger.info("Acquired uv sync lock at %s", lock_path)
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _uv_no_install_package_args() -> list[str]:
+    packages = [
+        package.strip()
+        for package in os.environ.get("NRL_UV_NO_INSTALL_PACKAGES", "").split(",")
+        if package.strip()
+    ]
+    args = []
+    for package in packages:
+        args.extend(["--no-install-package", package])
+    return args
+
+
+def _uv_sync_cmd_from_run_cmd(exec_cmd: list[str]) -> list[str]:
+    """Build the matching ``uv sync`` command for a ``uv run`` executable."""
+    sync_cmd = ["uv", "sync"]
+    seen_directory = False
+    if len(exec_cmd) >= 2 and exec_cmd[:2] == ["uv", "run"]:
+        idx = 2
+        while idx < len(exec_cmd):
+            arg = exec_cmd[idx]
+            if arg == "--":
+                break
+            if not arg.startswith("-"):
+                break
+
+            if arg in {
+                "--locked",
+                "--frozen",
+                "--all-extras",
+                "--no-dev",
+                "--no-default-groups",
+                "--all-groups",
+            }:
+                sync_cmd.append(arg)
+                idx += 1
+                continue
+
+            if arg in {
+                "--extra",
+                "--no-extra",
+                "--group",
+                "--no-group",
+                "--only-group",
+                "--directory",
+                "--project",
+            }:
+                if idx + 1 >= len(exec_cmd):
+                    break
+                sync_cmd.extend([arg, exec_cmd[idx + 1]])
+                if arg == "--directory":
+                    seen_directory = True
+                idx += 2
+                continue
+
+            if arg.startswith("--directory="):
+                seen_directory = True
+                sync_cmd.append(arg)
+                idx += 1
+                continue
+
+            if any(
+                arg.startswith(prefix)
+                for prefix in (
+                    "--extra=",
+                    "--no-extra=",
+                    "--group=",
+                    "--no-group=",
+                    "--only-group=",
+                    "--project=",
+                )
+            ):
+                sync_cmd.append(arg)
+                idx += 1
+                continue
+
+            idx += 1
+
+    if not seen_directory:
+        sync_cmd.extend(["--directory", git_root])
+    return sync_cmd
+
+
+def _uv_run_no_sync_cmd(exec_cmd: list[str]) -> list[str]:
+    if len(exec_cmd) >= 2 and exec_cmd[:2] == ["uv", "run"] and "--no-sync" not in exec_cmd:
+        return [*exec_cmd[:2], "--no-sync", *exec_cmd[2:]]
+    return exec_cmd
 
 
 @lru_cache(maxsize=None)
@@ -90,12 +208,24 @@ def create_local_venv(
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
+    uv_no_install_args = _uv_no_install_package_args()
+    if uv_no_install_args:
+        logger.info(
+            "Passing NRL_UV_NO_INSTALL_PACKAGES to uv: %s",
+            os.environ["NRL_UV_NO_INSTALL_PACKAGES"],
+        )
+    sync_cmd = [*_uv_sync_cmd_from_run_cmd(exec_cmd), *uv_no_install_args]
+    exec_cmd = _uv_run_no_sync_cmd(exec_cmd)
+
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
-    subprocess.run(exec_cmd, env=env, check=True)
+    with _serialized_uv_sync():
+        subprocess.run(sync_cmd, env=env, check=True)
+        subprocess.run(exec_cmd, env=env, check=True)
+
+    Path(venv_path, ".NEMO_RL_VENV_READY").touch()
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
@@ -114,9 +244,10 @@ def _env_builder(
     venv_path = Path(NEMO_RL_VENV_DIR) / venv_name
     python_path = venv_path / "bin" / "python"
     started_file = venv_path / "STARTED_ENV_BUILDER"
+    ready_file = venv_path / ".NEMO_RL_VENV_READY"
 
     # Skip early return if force_rebuild is True
-    if not force_rebuild and python_path.exists():
+    if not force_rebuild and python_path.exists() and ready_file.exists():
         logger.info(f"Using existing venv at {venv_path}")
         return str(python_path)
 
@@ -129,10 +260,12 @@ def _env_builder(
             f"Node {node_idx}: Another node is building {venv_name}, skipping..."
         )
         # Wait for the venv to be ready (check for python executable)
-        python_path = venv_path / "bin" / "python"
-        while not python_path.exists():
+        while started_file.exists() and not (
+            python_path.exists() and ready_file.exists()
+        ):
             time.sleep(1)
-        return str(python_path)
+        if python_path.exists() and ready_file.exists():
+            return str(python_path)
 
     # Create the venv directory if needed
     venv_path.mkdir(parents=True, exist_ok=True)

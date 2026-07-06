@@ -1,6 +1,11 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
+export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-"9.0 10.0"}
+export NRL_UV_NO_INSTALL_PACKAGES=${NRL_UV_NO_INSTALL_PACKAGES:-deep-ep,causal-conv1d,mamba-ssm}
+# Megatron-Core's editable build writes a compiled dataset helper back into the
+# source tree; serialize repo-runtime worker venv builds across 16 nodes.
+export NRL_SERIALIZE_UV_SYNC=${NRL_SERIALIZE_UV_SYNC:-true}
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=16
@@ -19,7 +24,7 @@ uv run examples/run_sft.py \
     --config $CONFIG_PATH \
     sft.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
-    logger.wandb_enabled=True \
+    logger.wandb_enabled=False \
     logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \

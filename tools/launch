@@ -23,7 +23,8 @@
 # forgotten.
 #
 # Usage:
-#   CONTAINER=... ACCOUNT=... PARTITION=... ./launch <script_path> <another_script_path> ...
+#   ACCOUNT=... PARTITION=... ./launch <script_path> <another_script_path> ...
+#   CONTAINER=... may be set when launching through a Pyxis image.
 #
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
@@ -70,7 +71,7 @@ set -eou pipefail
 
 if [[ $# -eq 0 ]]; then
     echo "Error: No script provided."
-    echo "Usage: CONTAINER=... ACCOUNT=... PARTITION=... $0 <script_path> <another_script_path> ..."
+    echo "Usage: ACCOUNT=... PARTITION=... $0 <script_path> <another_script_path> ..."
     exit 1
 fi
 
@@ -84,9 +85,10 @@ for VAR in "HF_HOME" "HF_DATASETS_CACHE"; do
     fi
 done
 
-CONTAINER=$CONTAINER
+CONTAINER=${CONTAINER:-}
 ACCOUNT=$ACCOUNT
 PARTITION=$PARTITION
+QOS=${QOS:-${NEMORL_QOS:-}}
 MOUNTS=${MOUNTS:-}
 # DRYRUN=1 prints the runs and how much compute they use
 # DRYRUN=2 additionally creates the snapshots (helpful to run a hermetic example manually or share a repro)
@@ -181,15 +183,23 @@ for SCRIPT in $SCRIPTS; do
         if [[ -n "${EXCLUDE_GRES}" ]]; then
             GRES_ARG=""
         fi
+        QOS_LINE=""
+        if [[ -n "${QOS}" ]]; then
+            QOS_LINE="    --qos=$QOS \\"
+        fi
 
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 cd \$SCRIPT_DIR
 
+# tools/launch runs the driver through uv run, so start Ray daemons from the
+# same repo-managed environment by default to avoid cluster/driver Ray skew.
+RAY_CLI="${RAY_CLI:-uv run ray}" \\
 ${EXTRA_ENV:-} \\
 HF_HOME=$HF_HOME \\
 HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
+GPUS_PER_NODE=$GPUS_PER_NODE \\
 COMMAND="uv run $rel_script ${script_args[@]}" \\
 CONTAINER=$CONTAINER \\
 MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
@@ -201,6 +211,7 @@ sbatch \\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
+$QOS_LINE
     --time=0:${NUM_MINUTES}:0 ${GRES_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ray.sub
