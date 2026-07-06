@@ -34,6 +34,7 @@ CACHE_DIR="${SWE_BENCH_ARTIFACT_CACHE_DIR:-${SWE_AGENTS_DIR}/swebench_artifact_c
 if [[ "${SWEBENCH_PREWARM_IN_SRUN:-0}" != "1" ]]; then
   PREWARM_ACCOUNT="${PREWARM_ACCOUNT:-${SBATCH_ACCOUNT:-nemotron_sw_post}}"
   PREWARM_PARTITION="${PREWARM_PARTITION:-interactive}"
+  PREWARM_GPUS="${PREWARM_GPUS:-1}"
   PREWARM_TIME="${PREWARM_TIME:-01:00:00}"
 
   exec srun \
@@ -42,6 +43,7 @@ if [[ "${SWEBENCH_PREWARM_IN_SRUN:-0}" != "1" ]]; then
     --nodes=1 \
     --ntasks=1 \
     --cpus-per-task=8 \
+    --gres="gpu:${PREWARM_GPUS}" \
     --time="${PREWARM_TIME}" \
     --immediate=60 \
     env SWEBENCH_PREWARM_IN_SRUN=1 bash "$0" "${DATASET_PATH}"
