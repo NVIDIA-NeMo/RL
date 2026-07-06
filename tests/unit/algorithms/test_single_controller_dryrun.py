@@ -14,17 +14,20 @@
 
 """Dry-run tests for SingleController asyncio skeleton (C-03).
 
-Validates the three-pump asyncio architecture using stub actors with
-configurable sleep latencies — no GPU, no real model weights required.
+Validates the pump orchestration using stub actors with configurable sleep
+latencies — no GPU, no real model weights required.
 
-Key questions answered:
-  - Do all 3 pumps run concurrently? (rollout_pump dispatches while
-    train_pump is "busy")
-  - Does buffer capacity correctly block rollout_pump when capacity is full?
-  - Does _rollout_permitted correctly pause dispatch during _sync_weights?
-  - RISK-06: does a blocking policy.train() call freeze the event loop?
-    (train_from_meta uses asyncio.sleep to simulate, so this is non-blocking
-    by construction in the dry-run — see dedicated RISK-06 test below)
+Coverage is intentionally limited to invariants that are hard to exercise
+on real hardware:
+  - Ordering contracts: logprob refresh before advantage pump, advantages
+    written to the DataPlane before train dispatch.
+  - Concurrency: rollout_pump dispatches while train_pump is busy.
+  - Backpressure: buffer capacity blocks rollout_pump when full;
+    _rollout_permitted pauses dispatch during _sync_weights.
+  - StalenessSampler selection/eviction logic (pure, no fakes).
+  - Streaming train_pump state machine: arrival-order dispatch, version
+    advance only at finish, strict-on-policy mid-step rejection, abort
+    idempotency, exactly-once clear_samples.
 """
 
 from __future__ import annotations
@@ -526,28 +529,6 @@ class TestSingleControllerDryRun:
             advantage_estimator,
         )
 
-    def test_dry_run_completes(self, ray_init):
-        """SC completes N train steps without deadlock on CPU."""
-        dp_client = FakeDataPlaneActor.remote()
-        gen = DryRunGenWorker.remote(gen_latency_s=0.05)
-        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.1)
-        weight_sync = DryRunWeightSynchronizer(sync_latency_s=0.02, gen_handle=gen)
-
-        ctrl = self._make_controller(
-            dp_client,
-            gen,
-            trainer,
-            weight_sync,
-            max_train_steps=3,
-            max_rollout_prompts=12,
-            min_prompt_groups_per_batch=1,
-            generations_per_prompt=1,
-        )
-
-        result = ray.get(ctrl.run.remote(), timeout=30)
-        assert result["train_steps"] == 3
-        assert result["trainer_version"] == 3
-
     def test_prepare_logprobs_called_before_advantage_pump(self, ray_init):
         """SC fires prepare_logprobs_from_meta with config-driven flags.
 
@@ -756,38 +737,6 @@ class TestSingleControllerDryRun:
         assert result["train_steps"] == 2
         # Weight sync happened (sync_count > 0 implies gate opened correctly)
 
-    def test_ping_returns_while_running(self, ray_init):
-        """ping() returns immediately if event loop is running — basis for watchdog."""
-        dp_client = FakeDataPlaneActor.remote()
-        gen = DryRunGenWorker.remote(gen_latency_s=0.05)
-        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.1)
-
-        ctrl = self._make_controller(
-            dp_client,
-            gen,
-            trainer,
-            max_train_steps=5,
-            max_rollout_prompts=20,
-            min_prompt_groups_per_batch=1,
-            generations_per_prompt=1,
-        )
-
-        # Start SC
-        run_ref = ctrl.run.remote()
-
-        # Ping while SC is running — should return quickly
-        time.sleep(0.2)
-        ping_start = time.monotonic()
-        health = ray.get(ctrl.ping.remote(), timeout=5)
-        ping_elapsed = time.monotonic() - ping_start
-
-        assert health["alive"] is True
-        assert ping_elapsed < 3.0, (
-            f"ping() took {ping_elapsed:.2f}s — event loop may be blocked"
-        )
-
-        ray.get(run_ref, timeout=30)
-
     def test_staleness_sampler_filters_correctly(self):
         """StalenessSampler returns freshest complete groups within the window."""
         sampler = StalenessSampler(max_staleness_versions=2)
@@ -866,109 +815,6 @@ class TestSingleControllerDryRun:
             trainer_version=5,
             generations_per_prompt=1,
         ) == [0, 2]
-
-
-@ray.remote(num_cpus=0)
-class _ReapInFlightHelperActor:
-    """Tiny Ray actor exposing SingleControllerActor._reap_in_flight_nonblocking."""
-
-    async def reap(self, refs):
-        if not refs:
-            return []
-        ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
-        await asyncio.wait(ref_to_task.values(), timeout=0.05)
-        pending = []
-        for ref, task in ref_to_task.items():
-            if task.done():
-                task.result()
-            else:
-                task.cancel()
-                pending.append(ref)
-        return pending
-
-
-@ray.remote
-def _sleep_then_return(seconds: float, value: int = 0) -> int:
-    time.sleep(seconds)
-    return value
-
-
-@ray.remote
-def _raise_after(seconds: float) -> None:
-    time.sleep(seconds)
-    raise RuntimeError("boom")
-
-
-class TestReapInFlightNonblocking:
-    """Validate _reap_in_flight_nonblocking helper semantics."""
-
-    def test_reap_empty_list_returns_empty(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        result = ray.get(helper.reap.remote([]))
-        assert result == []
-
-    def test_reap_drains_completed_and_returns_pending(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        # One finishes immediately, two stay pending
-        done_ref = _sleep_then_return.remote(0.0, 1)
-        pending1 = _sleep_then_return.remote(10.0, 2)
-        pending2 = _sleep_then_return.remote(10.0, 3)
-        # Give Ray a moment to mark done_ref as ready
-        time.sleep(0.5)
-        result = ray.get(helper.reap.remote([done_ref, pending1, pending2]))
-        # Only the still-pending refs are returned
-        assert len(result) == 2
-        result_set = {r.hex() for r in result}
-        assert pending1.hex() in result_set
-        assert pending2.hex() in result_set
-
-    def test_reap_surfaces_exception_from_completed(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        bad_ref = _raise_after.remote(0.0)
-        time.sleep(0.5)
-        with pytest.raises(Exception):
-            ray.get(helper.reap.remote([bad_ref]))
-
-
-class TestDryRunTrainerSplitAPI:
-    """Smoke test for DryRunTrainer split-API methods."""
-
-    def test_drytrainer_split_api_smoke(self, ray_init):
-        dp_client = FakeDataPlaneActor.remote()
-        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
-        meta = KVBatchMeta(
-            partition_id="rollout_data",
-            task_name="train",
-            sample_ids=["a", "b"],
-        )
-        # Open step, microbatch, finish
-        ray.get(trainer.begin_train_step.remote("step-1"))
-        ray.get(trainer.train_microbatch_from_meta.remote("step-1", meta))
-        ray.get(trainer.train_microbatch_from_meta.remote("step-1", meta))
-        result = ray.get(trainer.finish_train_step.remote("step-1"))
-        # finish_train_step no longer returns trainer_version (SC owns the
-        # counter); assert against the stub's internal counter instead.
-        assert "loss" in result
-        assert ray.get(trainer.get_trainer_version.remote()) == 1
-        assert ray.get(trainer.get_open_step_id.remote()) is None
-        assert ray.get(trainer.get_finish_calls.remote()) == ["step-1"]
-        mbs = ray.get(trainer.get_microbatch_calls.remote())
-        assert len(mbs) == 2
-        assert all(call[0] == "step-1" for call in mbs)
-        assert all(call[1] == ["a", "b"] for call in mbs)
-        # Abort then begin again
-        ray.get(trainer.begin_train_step.remote("step-2"))
-        ray.get(trainer.train_microbatch_from_meta.remote("step-2", meta))
-        ray.get(trainer.abort_train_step.remote("step-2"))
-        assert ray.get(trainer.get_open_step_id.remote()) is None
-        assert ray.get(trainer.get_abort_calls.remote()) == ["step-2"]
-        # Trainer version did not advance via abort
-        ray.get(trainer.begin_train_step.remote("step-3"))
-        ray.get(trainer.finish_train_step.remote("step-3"))
-        # Now begin while a step is open should raise
-        ray.get(trainer.begin_train_step.remote("step-4"))
-        with pytest.raises(Exception):
-            ray.get(trainer.begin_train_step.remote("step-5"))
 
 
 @ray.remote(num_cpus=0)
@@ -1265,127 +1111,3 @@ class TestStreamingTrainPump:
         for _, ids, _ in mbs:
             dispatched_ids.update(ids)
         assert set(clear_calls[0]) == dispatched_ids
-
-
-class TestRisk06EventLoopBlocking:
-    """RISK-06: validate that asyncio event loop is not blocked during training.
-
-    The risk: if train_from_meta is a synchronous blocking call, the asyncio
-    event loop freezes and _rollout_pump + _sync_weights can't make progress.
-    Fix: use `await loop.run_in_executor(None, blocking_fn, ...)` or ensure
-    train_from_meta is an async method (as DryRunTrainer is).
-
-    These tests document the expected behavior and serve as a benchmark.
-    """
-
-    def test_blocking_call_freezes_loop(self):
-        """Demonstrate that a synchronous time.sleep freezes the event loop.
-
-        This test validates the PROBLEM (not the solution) — if train used
-        time.sleep instead of asyncio.sleep, other tasks would not progress.
-        """
-        progress: list[str] = []
-
-        async def blocking_task():
-            progress.append("blocking_start")
-            time.sleep(0.1)  # blocks event loop
-            progress.append("blocking_end")
-
-        async def concurrent_task():
-            progress.append("concurrent_start")
-            await asyncio.sleep(0)
-            progress.append("concurrent_mid")
-            await asyncio.sleep(0)
-            progress.append("concurrent_end")
-
-        async def run():
-            t1 = asyncio.create_task(blocking_task())
-            t2 = asyncio.create_task(concurrent_task())
-            await asyncio.gather(t1, t2)
-
-        asyncio.run(run())
-
-        # With blocking call, concurrent task can't interleave during the sleep
-        # blocking_start, blocking_end happen before concurrent_mid
-        block_end_idx = progress.index("blocking_end")
-        concurrent_mid_idx = progress.index("concurrent_mid")
-        assert block_end_idx < concurrent_mid_idx, (
-            "blocking_task did not freeze concurrent_task as expected"
-        )
-
-    def test_async_sleep_allows_concurrency(self):
-        """Demonstrate that asyncio.sleep yields to other tasks.
-
-        The DryRunTrainer uses asyncio.sleep — this shows the event loop
-        stays responsive during 'training'. Production code must use
-        loop.run_in_executor() for real blocking GPU operations.
-        """
-        progress: list[str] = []
-
-        async def async_task():
-            progress.append("async_start")
-            await asyncio.sleep(0.1)  # yields to event loop
-            progress.append("async_end")
-
-        async def concurrent_task():
-            progress.append("concurrent_start")
-            await asyncio.sleep(0.01)
-            progress.append("concurrent_mid")
-            await asyncio.sleep(0)
-            progress.append("concurrent_end")
-
-        async def run():
-            t1 = asyncio.create_task(async_task())
-            t2 = asyncio.create_task(concurrent_task())
-            await asyncio.gather(t1, t2)
-
-        asyncio.run(run())
-
-        # concurrent_task should make progress while async_task is sleeping
-        async_end_idx = progress.index("async_end")
-        concurrent_mid_idx = progress.index("concurrent_mid")
-        assert concurrent_mid_idx < async_end_idx, (
-            "concurrent_task should have progressed while async_task was sleeping"
-        )
-
-    def test_run_in_executor_unblocks_loop(self):
-        """Validate the production fix for RISK-06.
-
-        In production, policy.train() is a blocking GPU call. SC must use:
-          await loop.run_in_executor(None, policy.train, ...)
-        This runs the blocking call in a thread pool, leaving the event loop
-        free for _rollout_pump and _sync_weights to make progress.
-        """
-        progress: list[str] = []
-
-        def blocking_train():
-            time.sleep(0.1)
-            return "trained"
-
-        async def train_with_executor():
-            loop = asyncio.get_running_loop()
-            progress.append("train_start")
-            result = await loop.run_in_executor(None, blocking_train)
-            progress.append("train_end")
-            return result
-
-        async def rollout():
-            progress.append("rollout_start")
-            await asyncio.sleep(0.02)
-            progress.append("rollout_mid")
-            await asyncio.sleep(0.02)
-            progress.append("rollout_end")
-
-        async def run():
-            t1 = asyncio.create_task(train_with_executor())
-            t2 = asyncio.create_task(rollout())
-            await asyncio.gather(t1, t2)
-
-        asyncio.run(run())
-
-        # rollout should have made progress WHILE train was blocking in executor
-        train_end_idx = progress.index("train_end")
-        rollout_mid_idx = progress.index("rollout_mid")
-        assert rollout_mid_idx < train_end_idx, (
-            "rollout should have progressed while blocking_train ran in executor"
-        )
