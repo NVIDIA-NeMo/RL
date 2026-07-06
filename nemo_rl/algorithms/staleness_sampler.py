@@ -48,11 +48,11 @@ class StalenessSampler:
         meta: KVBatchMeta,
         *,
         trainer_version: int,
-        min_prompt_groups: int,
-        generations_per_prompt: int,
+        min_groups: int,
+        group_size: int,
     ) -> Optional[list[int]]:
         eligible: list[tuple[int, int, PromptGroup]] = []
-        for group in _prompt_groups(meta, generations_per_prompt):
+        for group in _iter_groups(meta, group_size):
             if not group.committed or not group.is_complete:
                 continue
             if group.weight_version is None or group.weight_version > trainer_version:
@@ -62,11 +62,11 @@ class StalenessSampler:
                 continue
             eligible.append((lag, group.indices[0], group))
 
-        if len(eligible) < min_prompt_groups:
+        if len(eligible) < min_groups:
             return None
 
         eligible.sort(key=lambda item: (item[0], item[1]))
-        groups = [item[2] for item in eligible[:min_prompt_groups]]
+        groups = [item[2] for item in eligible[:min_groups]]
         return _flatten_group_indices(groups)
 
     def select_one_group(
@@ -74,10 +74,10 @@ class StalenessSampler:
         meta: KVBatchMeta,
         *,
         trainer_version: int,
-        generations_per_prompt: int,
+        group_size: int,
     ) -> Optional[list[int]]:
         eligible: list[tuple[int, int, PromptGroup]] = []
-        for group in _prompt_groups(meta, generations_per_prompt):
+        for group in _iter_groups(meta, group_size):
             if not group.committed or not group.is_complete:
                 continue
             if group.weight_version is None or group.weight_version > trainer_version:
@@ -98,10 +98,10 @@ class StalenessSampler:
         meta: KVBatchMeta,
         *,
         trainer_version: int,
-        generations_per_prompt: int,
+        group_size: int,
     ) -> list[int]:
         groups = []
-        for group in _prompt_groups(meta, generations_per_prompt):
+        for group in _iter_groups(meta, group_size):
             if group.weight_version is None or not group.is_complete:
                 continue
             lag = trainer_version - group.weight_version
@@ -110,15 +110,13 @@ class StalenessSampler:
         return _flatten_group_indices(groups)
 
 
-def count_prompt_groups(
+def count_groups(
     meta: KVBatchMeta,
     *,
-    generations_per_prompt: int,
+    group_size: int,
 ) -> int:
     """Count complete prompt groups represented by ``meta``."""
-    return sum(
-        1 for group in _prompt_groups(meta, generations_per_prompt) if group.is_complete
-    )
+    return sum(1 for group in _iter_groups(meta, group_size) if group.is_complete)
 
 
 def min_weight_version(meta: KVBatchMeta) -> int | None:
@@ -129,9 +127,9 @@ def min_weight_version(meta: KVBatchMeta) -> int | None:
     return min(versions) if versions else None
 
 
-def _prompt_groups(
+def _iter_groups(
     meta: KVBatchMeta,
-    generations_per_prompt: int,
+    group_size: int,
 ) -> list[PromptGroup]:
     tags = meta.tags or [{} for _ in meta.sample_ids]
     grouped: dict[str, list[int]] = {}
@@ -151,7 +149,7 @@ def _prompt_groups(
                 "expected_num_samples",
                 tag.get(
                     "expected_num_keys",
-                    tag.get("generations_per_prompt", generations_per_prompt),
+                    tag.get("generations_per_prompt", group_size),
                 ),
             )
         )
@@ -161,7 +159,7 @@ def _prompt_groups(
                 indices=indices,
                 weight_version=_weight_version(tag),
                 committed=_as_bool(tag.get("committed", True)),
-                expected_num_samples=expected or generations_per_prompt,
+                expected_num_samples=expected or group_size,
             )
         )
     groups.sort(key=lambda group: group.indices[0])

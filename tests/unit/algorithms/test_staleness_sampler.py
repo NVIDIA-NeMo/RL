@@ -62,10 +62,7 @@ def test_select_one_group_returns_none_on_empty_meta():
         sample_ids=[],
         tags=[],
     )
-    assert (
-        sampler.select_one_group(meta, trainer_version=5, generations_per_prompt=1)
-        is None
-    )
+    assert sampler.select_one_group(meta, trainer_version=5, group_size=1) is None
 
 
 def test_select_one_group_returns_only_complete_group():
@@ -75,9 +72,7 @@ def test_select_one_group_returns_only_complete_group():
             {"group_id": "g0", "weight_version": 5, "expected_num_samples": 1},
         ]
     )
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [0]
+    assert sampler.select_one_group(meta, trainer_version=5, group_size=1) == [0]
 
 
 def test_select_one_group_picks_lowest_lag_first():
@@ -90,9 +85,7 @@ def test_select_one_group_picks_lowest_lag_first():
         ]
     )
     # trainer=5: g0 lag=2, g1 lag=0, g2 lag=1 → picks g1 (index 1)
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [1]
+    assert sampler.select_one_group(meta, trainer_version=5, group_size=1) == [1]
 
 
 def test_select_one_group_tiebreak_leftmost_wins():
@@ -104,9 +97,7 @@ def test_select_one_group_tiebreak_leftmost_wins():
         ]
     )
     # Both lag=1. Tiebreak: leftmost indices[0]. g0 occupies [0,1], g1 [2,3]
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=2
-    ) == [0, 1]
+    assert sampler.select_one_group(meta, trainer_version=5, group_size=2) == [0, 1]
 
 
 def test_select_one_group_skips_incomplete_and_uncommitted():
@@ -132,9 +123,7 @@ def test_select_one_group_skips_incomplete_and_uncommitted():
         ]
     )
     # g0 occupies idx 0; g1 idx 1; g2 idx 2 → picks g2
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [2]
+    assert sampler.select_one_group(meta, trainer_version=5, group_size=1) == [2]
 
 
 def test_select_one_group_rejects_future_version():
@@ -146,9 +135,7 @@ def test_select_one_group_rejects_future_version():
         ]
     )
     # trainer=5: g0 has weight_version > trainer_version, rejected; g1 lag=1
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [1]
+    assert sampler.select_one_group(meta, trainer_version=5, group_size=1) == [1]
 
 
 def test_select_one_group_strict_on_policy():
@@ -160,18 +147,11 @@ def test_select_one_group_strict_on_policy():
         ]
     )
     # strict: only weight_version==trainer_version eligible
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [1]
+    assert sampler.select_one_group(meta, trainer_version=5, group_size=1) == [1]
     # All stale → None
     meta_stale = _meta_with_groups(
         [
             {"group_id": "g0", "weight_version": 4, "expected_num_samples": 1},
         ]
     )
-    assert (
-        sampler.select_one_group(
-            meta_stale, trainer_version=5, generations_per_prompt=1
-        )
-        is None
-    )
+    assert sampler.select_one_group(meta_stale, trainer_version=5, group_size=1) is None

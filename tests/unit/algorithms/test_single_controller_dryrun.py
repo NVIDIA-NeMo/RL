@@ -525,8 +525,8 @@ class TestSingleControllerDryRun:
         weight_sync=None,
         max_train_steps=3,
         max_rollout_prompts=12,
-        min_prompt_groups_per_batch=1,
-        generations_per_prompt=1,
+        min_groups_per_batch=1,
+        group_size=1,
         max_buffered_rollouts=4,
         max_inflight_prompts=4,
         max_weight_staleness_versions=1,
@@ -539,8 +539,8 @@ class TestSingleControllerDryRun:
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
             max_rollout_prompts=max_rollout_prompts,
-            min_prompt_groups_per_batch=min_prompt_groups_per_batch,
-            generations_per_prompt=generations_per_prompt,
+            min_groups_per_batch=min_groups_per_batch,
+            group_size=group_size,
             max_buffered_rollouts=max_buffered_rollouts,
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
@@ -584,8 +584,8 @@ class TestSingleControllerDryRun:
             trainer,
             max_train_steps=1,
             max_rollout_prompts=2,
-            min_prompt_groups_per_batch=2,
-            generations_per_prompt=1,
+            min_groups_per_batch=2,
+            group_size=1,
             advantage_policy_logprobs_field="policy_logprobs",
             advantage_reference_logprobs_field="reference_logprobs",
         )
@@ -607,8 +607,8 @@ class TestSingleControllerDryRun:
             trainer2,
             max_train_steps=1,
             max_rollout_prompts=2,
-            min_prompt_groups_per_batch=2,
-            generations_per_prompt=1,
+            min_groups_per_batch=2,
+            group_size=1,
             advantage_policy_logprobs_field="policy_logprobs",
         )
         ray.get(ctrl2.run.remote(), timeout=30)
@@ -628,8 +628,8 @@ class TestSingleControllerDryRun:
             trainer3,
             max_train_steps=1,
             max_rollout_prompts=2,
-            min_prompt_groups_per_batch=2,
-            generations_per_prompt=1,
+            min_groups_per_batch=2,
+            group_size=1,
         )
         ray.get(ctrl3.run.remote(), timeout=30)
         calls3 = trainer3.get_prepare_logprobs_calls()
@@ -654,8 +654,8 @@ class TestSingleControllerDryRun:
             trainer,
             max_train_steps=1,
             max_rollout_prompts=2,
-            min_prompt_groups_per_batch=2,
-            generations_per_prompt=1,
+            min_groups_per_batch=2,
+            group_size=1,
             advantage_enabled=True,
             advantage_estimator=DryRunAdvantageEstimator(),
         )
@@ -688,8 +688,8 @@ class TestSingleControllerDryRun:
             trainer,
             max_train_steps=2,
             max_rollout_prompts=10,
-            min_prompt_groups_per_batch=1,
-            generations_per_prompt=1,
+            min_groups_per_batch=1,
+            group_size=1,
             max_buffered_rollouts=6,
             max_inflight_prompts=6,
         )
@@ -726,8 +726,8 @@ class TestSingleControllerDryRun:
             trainer,
             max_train_steps=2,
             max_rollout_prompts=8,
-            min_prompt_groups_per_batch=1,
-            generations_per_prompt=1,
+            min_groups_per_batch=1,
+            group_size=1,
             max_buffered_rollouts=2,  # small buffer — backpressure kicks in
             max_inflight_prompts=4,
         )
@@ -763,8 +763,8 @@ class TestSingleControllerDryRun:
             weight_sync,
             max_train_steps=2,
             max_rollout_prompts=8,
-            min_prompt_groups_per_batch=1,
-            generations_per_prompt=1,
+            min_groups_per_batch=1,
+            group_size=1,
         )
 
         result = ray.get(ctrl.run.remote(), timeout=30)
@@ -780,8 +780,8 @@ class TestSingleControllerDryRun:
         indices = sampler.select_indices(
             meta,
             trainer_version=5,
-            min_prompt_groups=2,
-            generations_per_prompt=1,
+            min_groups=2,
+            group_size=1,
         )
         assert indices == [2, 1]
 
@@ -792,12 +792,12 @@ class TestSingleControllerDryRun:
         result = sampler.select_indices(
             meta,
             trainer_version=5,
-            min_prompt_groups=2,
-            generations_per_prompt=1,
+            min_groups=2,
+            group_size=1,
         )
         assert result is None
 
-    def test_staleness_sampler_requires_complete_prompt_groups(self):
+    def test_staleness_sampler_requires_complete_groups(self):
         """Staleness sampler skips incomplete prompt groups."""
         sampler = StalenessSampler(max_staleness_versions=2)
         meta = KVBatchMeta(
@@ -814,8 +814,8 @@ class TestSingleControllerDryRun:
         assert sampler.select_indices(
             meta,
             trainer_version=5,
-            min_prompt_groups=1,
-            generations_per_prompt=2,
+            min_groups=1,
+            group_size=2,
         ) == [1, 2]
 
     def test_strict_on_policy_batch_sampler_requires_exact_version(self):
@@ -827,16 +827,16 @@ class TestSingleControllerDryRun:
             sampler.select_indices(
                 meta,
                 trainer_version=5,
-                min_prompt_groups=3,
-                generations_per_prompt=1,
+                min_groups=3,
+                group_size=1,
             )
             is None
         )
         assert sampler.select_indices(
             meta,
             trainer_version=5,
-            min_prompt_groups=2,
-            generations_per_prompt=1,
+            min_groups=2,
+            group_size=1,
         ) == [1, 2]
 
     def test_strict_on_policy_batch_sampler_evicts_old_groups(self):
@@ -847,7 +847,7 @@ class TestSingleControllerDryRun:
         assert sampler.evictable_indices(
             meta,
             trainer_version=5,
-            generations_per_prompt=1,
+            group_size=1,
         ) == [0, 2]
 
 
@@ -918,9 +918,9 @@ class TestStreamingTrainPump:
         weight_sync=None,
         max_train_steps=1,
         max_rollout_prompts=4,
-        min_prompt_groups_per_batch=1,
-        target_prompt_groups_per_step=4,
-        generations_per_prompt=1,
+        min_groups_per_batch=1,
+        target_groups_per_step=4,
+        group_size=1,
         max_buffered_rollouts=8,
         max_inflight_prompts=8,
         max_weight_staleness_versions=1,
@@ -930,9 +930,9 @@ class TestStreamingTrainPump:
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
             max_rollout_prompts=max_rollout_prompts,
-            min_prompt_groups_per_batch=min_prompt_groups_per_batch,
-            target_prompt_groups_per_step=target_prompt_groups_per_step,
-            generations_per_prompt=generations_per_prompt,
+            min_groups_per_batch=min_groups_per_batch,
+            target_groups_per_step=target_groups_per_step,
+            group_size=group_size,
             max_buffered_rollouts=max_buffered_rollouts,
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
@@ -967,8 +967,8 @@ class TestStreamingTrainPump:
             prompts=prompts,
             max_train_steps=1,
             max_rollout_prompts=3,
-            target_prompt_groups_per_step=3,
-            min_prompt_groups_per_batch=1,
+            target_groups_per_step=3,
+            min_groups_per_batch=1,
         )
         result = ray.get(ctrl.run.remote(), timeout=60)
         assert result["train_steps"] == 1
@@ -993,8 +993,8 @@ class TestStreamingTrainPump:
             prompts=prompts,
             max_train_steps=1,
             max_rollout_prompts=4,
-            target_prompt_groups_per_step=4,
-            min_prompt_groups_per_batch=1,
+            target_groups_per_step=4,
+            min_groups_per_batch=1,
         )
         result = ray.get(ctrl.run.remote(), timeout=60)
         assert result["train_steps"] == 1
@@ -1043,8 +1043,8 @@ class TestStreamingTrainPump:
             prompts=prompts,
             max_train_steps=1,
             max_rollout_prompts=2,
-            target_prompt_groups_per_step=2,
-            min_prompt_groups_per_batch=1,
+            target_groups_per_step=2,
+            min_groups_per_batch=1,
             batch_selection_strategy="strict_on_policy",
             max_weight_staleness_versions=0,
         )
@@ -1072,8 +1072,8 @@ class TestStreamingTrainPump:
             prompts=prompts,
             max_train_steps=1,
             max_rollout_prompts=5,
-            target_prompt_groups_per_step=5,
-            min_prompt_groups_per_batch=1,
+            target_groups_per_step=5,
+            min_groups_per_batch=1,
         )
         result = ray.get(ctrl.run.remote(), timeout=60)
         assert result["train_steps"] == 1
@@ -1123,8 +1123,8 @@ class TestStreamingTrainPump:
             prompts=["0:0.01"],
             max_train_steps=1,
             max_rollout_prompts=0,
-            target_prompt_groups_per_step=2,
-            min_prompt_groups_per_batch=1,
+            target_groups_per_step=2,
+            min_groups_per_batch=1,
         )
         result = ray.get(ctrl.run.remote(), timeout=30)
         assert result["train_steps"] == 0
@@ -1144,8 +1144,8 @@ class TestStreamingTrainPump:
             prompts=prompts,
             max_train_steps=1,
             max_rollout_prompts=3,
-            target_prompt_groups_per_step=3,
-            min_prompt_groups_per_batch=1,
+            target_groups_per_step=3,
+            min_groups_per_batch=1,
         )
         result = ray.get(ctrl.run.remote(), timeout=60)
         assert result["train_steps"] == 1
@@ -1172,8 +1172,8 @@ class TestStreamingTrainPump:
             # Budget far above the epoch bound: epochs must be the binding
             # constraint (2 epochs x 2 prompts = 4 dispatches, not 100).
             max_rollout_prompts=100,
-            target_prompt_groups_per_step=4,
-            min_prompt_groups_per_batch=1,
+            target_groups_per_step=4,
+            min_groups_per_batch=1,
             max_num_epochs=2,
         )
         result = ray.get(ctrl.run.remote(), timeout=60)

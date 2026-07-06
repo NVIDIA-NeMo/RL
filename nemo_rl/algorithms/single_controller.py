@@ -54,7 +54,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.staleness_sampler import (
     StalenessSampler,
-    count_prompt_groups,
+    count_groups,
     min_weight_version,
 )
 from nemo_rl.data_plane import KVBatchMeta
@@ -99,11 +99,14 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     are validated at construction by pydantic — no runtime assert needed.
     """
 
-    # Staleness
+    # Staleness. A "group" is the atomic training unit: group_size
+    # samples sharing one source prompt. GRPO consumers set group_size =
+    # num generations per prompt; SFT/OPD-style consumers degenerate
+    # cleanly to group_size=1 (every sample its own group).
     max_weight_staleness_versions: int = 1
-    min_prompt_groups_per_batch: int = 2
-    target_prompt_groups_per_step: Optional[int] = None
-    generations_per_prompt: int = 4
+    min_groups_per_batch: int = 2
+    target_groups_per_step: Optional[int] = None
+    group_size: int = 4
     batch_selection_strategy: Literal[
         "strict_on_policy",
         "staleness_window",
@@ -125,7 +128,7 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     # begin / microbatch×K / finish cycle (= one opt.step) per
     # ``train_global_batch_size`` worth of samples. Number of opt.steps per
     # outer SC step is
-    # ``target_prompt_groups_per_step * generations_per_prompt // train_global_batch_size``.
+    # ``target_groups_per_step * group_size // train_global_batch_size``.
     # If None, coerced at __init__ to one mini-batch per outer step
     # (samples_per_step), preserving single-opt.step-per-outer-step behavior.
     train_global_batch_size: Optional[int] = None
@@ -134,7 +137,7 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     partition_id: str = "rollout_data"
     consumer_task_name: str = "train"
     claim_required_fields: list[str] = Field(default_factory=lambda: ["input_ids"])
-    max_claim_prompt_groups: int = 8
+    max_claim_groups: int = 8
 
     # Advantage calculation. The TQ partition column names for prompt_ids /
     # reward / token_mask / sample_mask / advantages are fixed conventions
@@ -221,12 +224,12 @@ class SingleControllerActor:
                 "Using strict_on_policy, auto setting "
                 "max_weight_staleness_versions to 0."
             )
-        if cfg.target_prompt_groups_per_step is None:
-            cfg.target_prompt_groups_per_step = cfg.min_prompt_groups_per_batch
-        if cfg.target_prompt_groups_per_step < cfg.min_prompt_groups_per_batch:
+        if cfg.target_groups_per_step is None:
+            cfg.target_groups_per_step = cfg.min_groups_per_batch
+        if cfg.target_groups_per_step < cfg.min_groups_per_batch:
             raise ValueError(
-                f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
-                f"must be >= min_prompt_groups_per_batch ({cfg.min_prompt_groups_per_batch})"
+                f"target_groups_per_step ({cfg.target_groups_per_step}) "
+                f"must be >= min_groups_per_batch ({cfg.min_groups_per_batch})"
             )
 
         # Mini-batching contract: SC opens one begin / microbatch×N / finish
@@ -234,9 +237,7 @@ class SingleControllerActor:
         # Matches the sync path's gb_idx loop in the worker (one opt.step
         # per gbs slice). When unset, coerce to a single mini-batch per
         # outer step so behavior matches the pre-mini-batch design.
-        samples_per_step = (
-            cfg.target_prompt_groups_per_step * cfg.generations_per_prompt
-        )
+        samples_per_step = cfg.target_groups_per_step * cfg.group_size
         if cfg.train_global_batch_size is None:
             cfg.train_global_batch_size = samples_per_step
         if cfg.train_global_batch_size <= 0:
@@ -246,16 +247,16 @@ class SingleControllerActor:
             )
         if samples_per_step % cfg.train_global_batch_size != 0:
             raise ValueError(
-                f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
-                f"* generations_per_prompt ({cfg.generations_per_prompt}) "
+                f"target_groups_per_step ({cfg.target_groups_per_step}) "
+                f"* group_size ({cfg.group_size}) "
                 f"= {samples_per_step} samples must be divisible by "
                 f"train_global_batch_size ({cfg.train_global_batch_size})"
             )
-        if cfg.train_global_batch_size % cfg.generations_per_prompt != 0:
+        if cfg.train_global_batch_size % cfg.group_size != 0:
             raise ValueError(
                 f"train_global_batch_size ({cfg.train_global_batch_size}) must "
-                f"be divisible by generations_per_prompt "
-                f"({cfg.generations_per_prompt}) so a mini-batch contains "
+                f"be divisible by group_size "
+                f"({cfg.group_size}) so a mini-batch contains "
                 f"whole prompt groups"
             )
         self._sampler = StalenessSampler(cfg.max_weight_staleness_versions)
@@ -448,16 +449,16 @@ class SingleControllerActor:
         logprobs_required = refresh_policy_logprobs or refresh_reference_logprobs
 
         while self._train_steps < self._cfg.max_train_steps:
-            # __init__ coerces None → min_prompt_groups_per_batch (int);
+            # __init__ coerces None → min_groups_per_batch (int);
             # the assert narrows the Optional[int] type for pyrefly.
-            assert self._cfg.target_prompt_groups_per_step is not None
+            assert self._cfg.target_groups_per_step is not None
             assert self._cfg.train_global_batch_size is not None
-            target_groups: int = self._cfg.target_prompt_groups_per_step
+            target_groups: int = self._cfg.target_groups_per_step
             # Mini-batch aggregation: K groups per begin/finish cycle, where
-            # K * generations_per_prompt == train_global_batch_size. Each
+            # K * group_size == train_global_batch_size. Each
             # cycle is one opt.step. Mirrors sync's gb_idx loop in the worker.
             groups_per_minibatch = (
-                self._cfg.train_global_batch_size // self._cfg.generations_per_prompt
+                self._cfg.train_global_batch_size // self._cfg.group_size
             )
             num_minibatches = target_groups // groups_per_minibatch
             rollout_exhausted = False
@@ -479,9 +480,9 @@ class SingleControllerActor:
                         await self._claim_available_meta()
                         evicted_meta = await self._evict_stale_claimed()
                         if evicted_meta is not None:
-                            evicted_groups = count_prompt_groups(
+                            evicted_groups = count_groups(
                                 evicted_meta,
-                                generations_per_prompt=self._cfg.generations_per_prompt,
+                                group_size=self._cfg.group_size,
                             )
                             for _ in range(evicted_groups):
                                 self._buffer_capacity.release()
@@ -494,7 +495,7 @@ class SingleControllerActor:
                             group_indices = self._sampler.select_one_group(
                                 self._claimed_meta,
                                 trainer_version=self._trainer_version,
-                                generations_per_prompt=self._cfg.generations_per_prompt,
+                                group_size=self._cfg.group_size,
                             )
 
                         if group_indices is None:
@@ -775,9 +776,7 @@ class SingleControllerActor:
         ``claim_meta`` advances TQ's per-task cursor, so SC must keep a
         local cache of claimed-but-not-yet-trained samples for now.
         """
-        batch_size = (
-            self._cfg.max_claim_prompt_groups * self._cfg.generations_per_prompt
-        )
+        batch_size = self._cfg.max_claim_groups * self._cfg.group_size
         meta = await self._call_dp(
             "claim_meta",
             partition_id=self._cfg.partition_id,
@@ -820,7 +819,7 @@ class SingleControllerActor:
         indices = self._sampler.evictable_indices(
             self._claimed_meta,
             trainer_version=self._trainer_version,
-            generations_per_prompt=self._cfg.generations_per_prompt,
+            group_size=self._cfg.group_size,
         )
         if not indices:
             return None
@@ -828,9 +827,9 @@ class SingleControllerActor:
         log.info(
             "  evicting %d stale samples from %d prompt group(s)",
             evicted_meta.size,
-            count_prompt_groups(
+            count_groups(
                 evicted_meta,
-                generations_per_prompt=self._cfg.generations_per_prompt,
+                group_size=self._cfg.group_size,
             ),
         )
         await self._call_dp(
