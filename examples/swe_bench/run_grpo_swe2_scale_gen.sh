@@ -49,6 +49,7 @@
 #               BASE_LOG_DIR, LOGGER_LOG_DIR, STREAMING_TOOL_CALL,
 #               LOG_GYM_RESPONSES, TEMPERATURE, TOP_P,
 #               SNAPSHOT_POLL_INTERVAL_SECONDS,
+#               STREAMING_MIN_CHUNK_CHARS,
 #               SWE_BENCH_ARTIFACT_CACHE_OFFLINE
 # Credentials are NOT sourced here — export HF_HOME / HF_TOKEN / WANDB_API_KEY yourself.
 # ============================================================================
@@ -219,7 +220,13 @@ MOE_ROUTER_BIAS_UPDATE_RATE="1e-3"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 SNAPSHOT_POLL_INTERVAL_SECONDS="${SNAPSHOT_POLL_INTERVAL_SECONDS:-0.1}"
+STREAMING_MIN_CHUNK_CHARS="${STREAMING_MIN_CHUNK_CHARS:-}"
 SWE_BENCH_ARTIFACT_CACHE_OFFLINE="${SWE_BENCH_ARTIFACT_CACHE_OFFLINE:-0}"
+
+if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ] && ! [[ "${STREAMING_MIN_CHUNK_CHARS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: STREAMING_MIN_CHUNK_CHARS must be a positive integer when set." >&2
+  exit 1
+fi
 
 # =================== Checkpointing & validation ===================
 SAVE_PERIOD=5
@@ -313,6 +320,9 @@ echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, p
 echo "Model: ${MODEL_PATH}"
 echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
 echo "Streaming snapshot poll interval: ${SNAPSHOT_POLL_INTERVAL_SECONDS}s"
+if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ]; then
+  echo "Streaming min chunk chars: ${STREAMING_MIN_CHUNK_CHARS}"
+fi
 echo "SWE-bench artifact cache offline: ${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}"
 echo "Checkpoint: ${CHECKPOINT_DIR}"
 echo "=========================================="
@@ -471,6 +481,12 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   logger.wandb.name=${WANDB_NAME} \
   logger.wandb.project=${WANDB_PROJ} \
   ++logger.wandb.group=${WANDB_GROUP}"
+
+if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ]; then
+  export COMMAND="${COMMAND} \
+  policy.generation.vllm_cfg.streaming_tool_call.min_chunk_chars=${STREAMING_MIN_CHUNK_CHARS} \
+  env.nemo_gym.streaming_tool_call.min_chunk_chars=${STREAMING_MIN_CHUNK_CHARS}"
+fi
 
 if [ "${ASYNC_GRPO_ENABLED}" = "True" ]; then
   export COMMAND="${COMMAND} \

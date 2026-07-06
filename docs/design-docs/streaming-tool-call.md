@@ -729,7 +729,8 @@ is available at
 `results/swebench_verified/swebench_verified_no_timeout_observed_474.jsonl`.
 The verified-pair launcher accepts the backward-compatible arm form
 `name:streaming_enabled`, plus an optional per-arm poll interval,
-`name:streaming_enabled:poll_seconds`. The following submits a broader
+`name:streaming_enabled:poll_seconds`, and an optional per-arm text threshold,
+`name:streaming_enabled:poll_seconds:min_chunk_chars`. The following submits a broader
 streaming-on 100 ms / 50 ms admission comparison. Each arm uses 32 generation
 replicas across nine nodes; it is therefore a `batch`-partition workload rather
 than an interactive smoke test.
