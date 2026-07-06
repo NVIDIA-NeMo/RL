@@ -15,13 +15,11 @@ issues are:
 
 1. strict trajectory collection can silently stop short of the requested
    manifest size;
-2. `VLLM_BATCH_INVARIANT` is exported but is not recognized by the deployed
-   vLLM;
-3. the audit calls arbitrary arms `streaming_off` and `streaming_on`, even when
+2. the audit calls arbitrary arms `streaming_off` and `streaming_on`, even when
    both have streaming enabled;
-4. external `raw.githubusercontent.com` DNS failures are asymmetric between
+3. external `raw.githubusercontent.com` DNS failures are asymmetric between
    arms; and
-5. a normal request can exceed the model context by one token and become an
+4. a normal request can exceed the model context by one token and become an
    empty assistant result.
 
 The retry overlay is useful diagnosis, but must not be presented as a clean,
@@ -46,7 +44,6 @@ streaming sessions. `Unknown` is deliberately not treated as `No`.
 | ID | Streaming-off status | Evidence and interpretation |
 | --- | --- | --- |
 | STC-001 | **Yes — shared launcher** | The collection-size defaults are independent of `STREAMING_TOOL_CALL`. The historical partial incident was a both-streaming-on poll pair, but an off trajectory-collection launch uses the same code path. |
-| STC-002 | **Yes — shared environment export** | `VLLM_BATCH_INVARIANT` is appended to `COMMAND` before the streaming flag is interpreted. A vLLM worker is created in both arms, so an unsupported variable is not a streaming-only condition. |
 | STC-003 | **Conditional** | Labels are correct for a true off/on comparison, but misleading for off/off, on/on, or poll100/poll050 comparisons. The historical off-repeat comparison is therefore also affected. |
 | STC-004 | **Yes — confirmed; cache mitigation validated** | Off drivers `13293269`, `13304353`, and `13342775` all log `raw.githubusercontent.com` DNS failures while `streaming_tool_call.enabled=False`. The new cache and strict-offline path is shared by both arms. |
 | STC-005 | **Unknown — not confirmed in off** | The observed 131,073-token overflow came from a streaming-enabled full workload. It uses the normal final chat endpoint and may be reachable without streaming, but archived off logs do not establish that. |
@@ -123,38 +120,6 @@ actual collected count in the report metadata.
 **Acceptance test:** A dry run with `EXPECTED_COUNT=256` and batch size 128
 must exit nonzero. A valid 256 run must emit exactly 256 distinct instance IDs
 per arm before comparison begins.
-
-### STC-002 — `VLLM_BATCH_INVARIANT` is a non-functional launch setting
-
-**Severity:** P0<br>
-**Status:** Open
-
-The launcher exports `VLLM_BATCH_INVARIANT`, but the deployed vLLM reports it
-as unknown. Repository search finds only shell-script forwarding; there is no
-NeMo-RL Python consumer of this setting.
-
-Evidence:
-
-```text
-# 13395097 driver log, line 91
-WARNING ... Unknown vLLM environment variable detected: VLLM_BATCH_INVARIANT
-
-# 13395098 driver log, line 104
-WARNING ... Unknown vLLM environment variable detected: VLLM_BATCH_INVARIANT
-```
-
-The setting is also inconsistent at the launcher boundary: the strict-pair
-wrapper defaults it to `1`, while the scale launcher defaults it to `0`. Neither
-value proves invariant batching is active.
-
-**Required fix:** Remove the environment variable unless a supported vLLM or
-NeMo-RL configuration replaces it. Express the actual invariant-workload
-contract directly: fixed replicas, prompts per step, generations per prompt,
-and samples per replica. The launcher should fail on an unsupported requested
-flag rather than silently forwarding it.
-
-**Acceptance test:** The driver must log the resolved, supported batch-control
-configuration and no worker may emit an unknown-environment-variable warning.
 
 ### STC-003 — Audit arm names misrepresent the 100 ms / 50 ms experiment
 
@@ -386,7 +351,7 @@ controlled, labeled, or excluded from a claim.
 
 ## Recommended order of work
 
-1. Fix STC-001 through STC-004, then add their launcher/audit tests.
+1. Fix STC-001, STC-003, and STC-004, then add their launcher/audit tests.
 2. Fix STC-005 before relying on long-context accuracy results.
 3. Make STC-006 provenance explicit and stop using retry overlay as a final
    accuracy result.
@@ -401,7 +366,6 @@ controlled, labeled, or excluded from a claim.
 | --- | --- |
 | Partial 128/256 driver overrides | `results/streaming_tool_call_verified/20260702T230000Z-admission-poll256/slurm/13359969-logs/ray-driver.log:13` and `.../13359970-logs/ray-driver.log:13` |
 | Correct 256/256 replacement run | `results/streaming_tool_call_verified/20260703T181000Z-admission-poll256-batch256/slurm/13385088-logs/ray-driver.log:11698` and `.../13385093-logs/ray-driver.log:14861` |
-| Unknown batch-invariant setting | `results/streaming_tool_call_verified/20260703T111754Z/slurm/13395097-logs/ray-driver.log:91` and `.../13395098-logs/ray-driver.log:104` |
 | DNS setup failures | `results/streaming_tool_call_verified/20260703T111754Z/slurm/13395097-logs/ray-driver.log:1161` and `.../13395098-logs/ray-driver.log:753` |
 | Retry-overlay comparison | `results/streaming_tool_call_verified/20260703T181000Z-admission-poll256-batch256/poll100_vs_poll050_with_infra_retry_comparison.json` |
 | Teardown errors | `results/streaming_tool_call_verified/20260703T111754Z/slurm/13395097-logs/ray-driver.log:1497` and `.../13395098-logs/ray-driver.log:1189` |

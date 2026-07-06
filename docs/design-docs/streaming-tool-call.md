@@ -699,7 +699,7 @@ output, not the number of sessions once it does.
 
 On 2026-07-02, that tuning smoke completed with `min_chunk_chars=256` fixed,
 four vLLM replicas, one prompt expanded to eight rollouts, temperature zero,
-top-p one, and `VLLM_BATCH_INVARIANT=0`. Both arms used the same R2E instance,
+and top-p one. Both arms used the same R2E instance,
 `pandas-dev__pandas-002b2c37f37479532e5186fdb9c97f31630ba5d7`, but the agent
 trajectories diverged despite those fixed inputs. It is therefore a mechanism
 smoke, not an accuracy or end-to-end performance comparison.
@@ -740,7 +740,6 @@ VERIFIED_DATA_PATH=results/swebench_verified/swebench_verified_no_timeout_observ
 EXPECTED_COUNT=474 \
 NUM_VLLM_REPLICAS=32 \
 TRAJECTORY_COLLECTION_BATCH_SIZE=128 \
-VLLM_BATCH_INVARIANT=0 \
 PAIR_ARMS="poll100:1:0.1 poll050:1:0.05" \
 SBATCH_ACCOUNT=nemotron_sw_post \
 SBATCH_PARTITION=batch \
