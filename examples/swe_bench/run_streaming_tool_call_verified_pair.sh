@@ -28,7 +28,6 @@ WANDB_GROUP="${WANDB_GROUP:-streaming-tool-call-verified-temp0-${RUN_ID}}"
 NUM_VLLM_REPLICAS="${NUM_VLLM_REPLICAS:-32}"
 TRAJECTORY_COLLECTION_BATCH_SIZE="${TRAJECTORY_COLLECTION_BATCH_SIZE:-128}"
 EXPECTED_COUNT="${EXPECTED_COUNT:-500}"
-VLLM_BATCH_INVARIANT="${VLLM_BATCH_INVARIANT:-1}"
 PREWARM_SWEBENCH_ARTIFACTS="${PREWARM_SWEBENCH_ARTIFACTS:-1}"
 # Each PAIR_ARMS entry accepts name:streaming_enabled[:snapshot_poll_seconds].
 SNAPSHOT_POLL_INTERVAL_SECONDS="${SNAPSHOT_POLL_INTERVAL_SECONDS:-0.1}"
@@ -70,7 +69,6 @@ submit_arm() {
   VAL_DATA_PATH="${VERIFIED_DATA_PATH}" \
   TEMPERATURE=0.0 \
   TOP_P=1.0 \
-  VLLM_BATCH_INVARIANT="${VLLM_BATCH_INVARIANT}" \
   SWE_BENCH_ARTIFACT_CACHE_OFFLINE="${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}" \
   STREAMING_TOOL_CALL="${streaming_enabled}" \
   SNAPSHOT_POLL_INTERVAL_SECONDS="${snapshot_poll_interval_seconds}" \
@@ -103,9 +101,9 @@ for arm_spec in ${PAIR_ARMS}; do
 done
 
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "Strict Verified pair dry run complete (VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT})"
+  echo "Strict Verified pair dry run complete"
 else
-  echo "Strict Verified pair submitted (VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT})"
+  echo "Strict Verified pair submitted"
 fi
 echo "Pair directory: ${PAIR_DIR}"
 echo "Manifest: ${VERIFIED_DATA_PATH}"

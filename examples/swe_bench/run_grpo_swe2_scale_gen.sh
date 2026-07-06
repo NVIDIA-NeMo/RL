@@ -49,7 +49,7 @@
 #               BASE_LOG_DIR, LOGGER_LOG_DIR, STREAMING_TOOL_CALL,
 #               LOG_GYM_RESPONSES, TEMPERATURE, TOP_P,
 #               SNAPSHOT_POLL_INTERVAL_SECONDS,
-#               VLLM_BATCH_INVARIANT, SWE_BENCH_ARTIFACT_CACHE_OFFLINE
+#               SWE_BENCH_ARTIFACT_CACHE_OFFLINE
 # Credentials are NOT sourced here — export HF_HOME / HF_TOKEN / WANDB_API_KEY yourself.
 # ============================================================================
 
@@ -218,7 +218,6 @@ MOE_ROUTER_BIAS_UPDATE_RATE="1e-3"
 # ======================= Generation / vLLM =======================
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
-VLLM_BATCH_INVARIANT="${VLLM_BATCH_INVARIANT:-0}"
 SNAPSHOT_POLL_INTERVAL_SECONDS="${SNAPSHOT_POLL_INTERVAL_SECONDS:-0.1}"
 SWE_BENCH_ARTIFACT_CACHE_OFFLINE="${SWE_BENCH_ARTIFACT_CACHE_OFFLINE:-0}"
 
@@ -314,7 +313,6 @@ echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, p
 echo "Model: ${MODEL_PATH}"
 echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
 echo "Streaming snapshot poll interval: ${SNAPSHOT_POLL_INTERVAL_SECONDS}s"
-echo "vLLM batch invariant: ${VLLM_BATCH_INVARIANT}"
 echo "SWE-bench artifact cache offline: ${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}"
 echo "Checkpoint: ${CHECKPOINT_DIR}"
 echo "=========================================="
@@ -382,7 +380,6 @@ export SETUP_COMMAND
 # ================ Training command (bihu-style: uv run --frozen, no --extra mcore) ================
 export COMMAND="NRL_VLLM_USE_V1=1 \
   NRL_WG_USE_RAY_REF=1 \
-  VLLM_BATCH_INVARIANT=${VLLM_BATCH_INVARIANT} \
   WANDB_API_KEY=${WANDB_API_KEY} \
   HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN} \
   GITHUB_TOKEN=${GITHUB_TOKEN} \
