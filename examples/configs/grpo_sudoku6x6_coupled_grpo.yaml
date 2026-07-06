@@ -1,0 +1,23 @@
+# CoupledGRPO on Nemotron-Labs-Diffusion-3B, 6x6 Sudoku (2x3 boxes).
+# Parents: coupled_grpo algorithm base ([noisy|clean] coupled pair, coupled_grpo
+# logprob estimator) + grpo_sudoku6x6_base.yaml (shared task). Batch sizes set to 8 like
+# ESPO (coupled uses paired-row microbatching; a smoke should confirm 8 divides
+# the per-rank batch). Node count matches ESPO (its sibling).
+defaults:
+  - deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron.yaml
+  - grpo_sudoku6x6_base.yaml
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-coupled_grpo-sudoku6x6-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-coupled_grpo-sudoku6x6-sglang"
+  wandb:
+    name: "grpo-nd3b-coupled_grpo-sudoku6x6-blanks-fewshot"
+
+cluster:
+  num_nodes: 4
+
+policy:
+  train_micro_batch_size: 8    # like ESPO
+  logprob_batch_size: 8        # match train_micro_batch_size

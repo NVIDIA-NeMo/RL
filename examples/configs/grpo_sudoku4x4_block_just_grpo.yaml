@@ -17,3 +17,7 @@ logger:
 
 cluster:
   num_nodes: 8
+
+policy:
+  train_micro_batch_size: 8    # sudoku seq (1536) is short -> larger microbatch fits
+  logprob_batch_size: 8        # match train_micro_batch_size
