@@ -73,7 +73,7 @@ from nemo_rl.algorithms.utils import (
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
+from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS, DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
@@ -787,6 +787,13 @@ def grpo_train_sync(
                 seq_logprob_error_threshold = master_config.grpo.get(
                     "seq_logprob_error_threshold", None
                 )
+                # Effective field set for this step. Filtered once; both
+                # the driver-side read_from_dataplane and the workers'
+                # train_presharded fetch (via train_from_meta) consume it.
+                train_fields = tuple(
+                    f for f in DP_TRAIN_FIELDS
+                    if not (skip_prev_logprobs and f == "prev_logprobs")
+                )
 
                 if compute_prev or compute_ref:
                     print("▶ Preparing for logprob inference...", flush=True)
@@ -923,7 +930,7 @@ def grpo_train_sync(
                         meta,
                         loss_fn=loss_fn,
                         timer=timer,
-                        skip_prev_logprobs=skip_prev_logprobs,
+                        train_fields=train_fields,
                     )
 
                 if sync_kv_scales:

@@ -364,7 +364,7 @@ class TQPolicy(Policy):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
-        skip_prev_logprobs: bool = False,
+        train_fields: Optional[tuple[str, ...]] = None,
     ) -> dict[str, Any]:
         """1-hop counterpart to :meth:`train`.
 
@@ -393,12 +393,10 @@ class TQPolicy(Policy):
         # logprob deltas + advantages + sample_mask). Caller is responsible
         # for ensuring those columns have been written to TQ before this
         # call (workers + driver delta-writes).
-        # skip_prev_logprobs=True → loss uses curr_logprobs in place of
-        # prev_logprobs, so drop it from the fetch entirely (dp_client
-        # rejects unknown fields).
-        train_fields = DP_TRAIN_FIELDS
-        if skip_prev_logprobs:
-            train_fields = tuple(f for f in train_fields if f != "prev_logprobs")
+        # Caller may narrow the fetch schema (e.g. drop prev_logprobs
+        # when force_on_policy_ratio=True); default to DP_TRAIN_FIELDS.
+        if train_fields is None:
+            train_fields = DP_TRAIN_FIELDS
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
