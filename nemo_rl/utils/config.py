@@ -32,6 +32,10 @@ def merge_with_override(
 ) -> DictConfig:
     """Merge configs with support for _override_ marker to completely override sections."""
     for key in list(override_config.keys()):
+        # Keep mandatory values (``???``) unresolved while composing configs.
+        # A child config or a CLI override may provide them after inheritance.
+        if OmegaConf.is_missing(override_config, key):
+            continue
         if isinstance(override_config[key], DictConfig):
             if override_config[key].get("_override_", False):
                 # remove the _override_ marker
@@ -190,6 +194,8 @@ def parse_hydra_overrides(cfg: DictConfig, overrides: list[str]) -> DictConfig:
 
 def register_omegaconf_resolvers() -> None:
     """Register shared OmegaConf resolvers used in configs."""
+    if not OmegaConf.has_resolver("add"):
+        OmegaConf.register_new_resolver("add", lambda a, b: a + b)
     if not OmegaConf.has_resolver("mul"):
         OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
     if not OmegaConf.has_resolver("div"):
