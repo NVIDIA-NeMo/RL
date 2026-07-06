@@ -838,7 +838,9 @@ def grpo_train_sync(
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
                     prev_logprobs = (
-                        extras_bdd["prev_logprobs"] if compute_prev else None
+                        extras_bdd["prev_logprobs"]
+                        if compute_prev
+                        else torch.zeros_like(generation_logprobs)
                     )
                     reference_policy_logprobs = (
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
@@ -1214,9 +1216,7 @@ def grpo_train_sync(
                 log_data["sample_loss_mask"] = sample_mask.tolist()
                 log_data["advantages"] = advantages.tolist()
                 log_data["generation_logprobs"] = generation_logprobs.tolist()
-                log_data["prev_logprobs"] = (
-                    prev_logprobs.tolist() if prev_logprobs is not None else None
-                )
+                log_data["prev_logprobs"] = prev_logprobs.tolist()
                 # input_ids was stashed before the step-end clear_samples (the
                 # keys are no longer in TQ at this point); ``_log_input_ids``
                 # is None when nemo_gym-responses logging path skipped the
