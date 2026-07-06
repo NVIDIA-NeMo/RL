@@ -292,7 +292,7 @@ class MegatronPolicyWorkerImpl(
         )
         # Handle model import if needed. Subclasses (e.g. ModelOpt quant
         # worker) may set ``_model_import_post_wrap_hook`` and
-        # ``_transformer_layer_spec`` on ``self`` before calling
+        # layer-spec hooks on ``self`` before calling
         # super().__init__() to inject quantization hooks into HF->Megatron
         # import.
         handle_model_import(
@@ -302,6 +302,7 @@ class MegatronPolicyWorkerImpl(
             pt_checkpoint_exists,
             model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
             transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+            mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
         )
         log_gpu_memory_diagnostics(
             label="after_hf_import", worker_type="MegatronPolicyWorker"
@@ -639,6 +640,17 @@ class MegatronPolicyWorkerImpl(
                         self.optimizer.zero_grad()
                         self._copy_main_params_to_param_buffer()
 
+                    # Set moe_grad_scale_func for MoE aux-loss gradient scaling.
+                    # With calculate_per_token_loss=True, the router pre-multiplies
+                    # the aux loss by (num_local_tokens * tp_cp_group.size()), and
+                    # MoEAuxLossAutoScaler applies loss_scale to the gradient. Setting
+                    # loss_scale = 1/global_valid_toks (G = global valid token count)
+                    # normalizes the aux gradient consistently with the main per-token
+                    # SFT loss:
+                    #   (1/G) * N_local * tp_cp_size * aux_grad -> DDP SUM -> aux_grad / G
+                    self._set_moe_grad_scale_func(  # pragma: no cover
+                        self._compute_moe_grad_scale(global_valid_toks)
+                    )
                     # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
                     mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
@@ -667,8 +679,8 @@ class MegatronPolicyWorkerImpl(
                             straggler_timer=self.mcore_state.straggler_timer,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
-                            use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
-                                "use_linear_ce_fusion_loss", False
+                            use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
+                                "use_fused_linear_logprobs", False
                             ),
                             use_router_replay=use_router_replay,
                             router_replay_train=not eval_mode,
@@ -677,6 +689,9 @@ class MegatronPolicyWorkerImpl(
                 # Clear mtp_grad_scale_func after the forward-backward pass so
                 # it doesn't get serialized in the run_config.yaml when saving
                 self._set_mtp_grad_scale_func(None)
+
+                # Clear moe_grad_scale_func after the forward-backward pass
+                self._set_moe_grad_scale_func(None)  # pragma: no cover
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -803,6 +818,23 @@ class MegatronPolicyWorkerImpl(
         self._collect_mtp_metrics(metrics)
         return metrics
 
+    def _compute_moe_grad_scale(self, global_valid_toks):
+        """Build a moe_grad_scale_func that normalizes the aux-loss gradient.
+
+        Returns a callable yielding loss_scale = 1/global_valid_toks (clamped to
+        avoid division by zero) so the MoE aux gradient is normalized consistently
+        with the main per-token SFT loss. See the call site in train() for the
+        full derivation.
+        """
+        moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+        return lambda: moe_scale
+
+    def _set_moe_grad_scale_func(self, func):
+        """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""
+        config = self._get_model_config()
+        if config is not None:
+            config.moe_grad_scale_func = func
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self,
@@ -866,13 +898,13 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
-        use_linear_ce_fusion = self.cfg["megatron_cfg"].get(
-            "use_linear_ce_fusion_loss", False
+        use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
+            "use_fused_linear_logprobs", False
         )
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
             sampling_params=self.sampling_params,
-            use_linear_ce_fusion=use_linear_ce_fusion,
+            use_fused_linear_logprobs=use_fused_linear_logprobs,
         )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
@@ -893,7 +925,7 @@ class MegatronPolicyWorkerImpl(
                 defer_fp32_logits=self.defer_fp32_logits,
                 sampling_params=self.sampling_params,
                 straggler_timer=self.mcore_state.straggler_timer,
-                use_linear_ce_fusion_loss=use_linear_ce_fusion,
+                use_fused_linear_logprobs=use_fused_linear_logprobs,
                 use_router_replay=use_router_replay,
                 router_replay_train=False,
             )
@@ -1334,6 +1366,9 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
+    def _use_real_quant_refit(self) -> bool:
+        return False
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -1376,7 +1411,7 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.empty_cache()
 
     def finish_inference(self) -> None:
-        """Offload model params to CPU after inference."""
+        """Offload model params to CPU after inference. Only used in PPO."""
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )

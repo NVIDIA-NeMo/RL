@@ -20,10 +20,12 @@ This module provides different advantage estimation strategies:
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
+- OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
 - GAE: https://arxiv.org/abs/1506.02438 (High-Dimensional Continuous Control Using Generalized Advantage Estimation)
+- MOPD: https://arxiv.org/abs/2601.02780
 """
 
 import torch
@@ -103,7 +105,7 @@ class GDPOAdvantageEstimator:
         Args:
             prompt_ids: Tensor identifying which prompt each sample belongs to (for per-prompt baselines).
             rewards: Unused; for interface consistency.
-            repeated_batch: Batch containing reward1, reward2, ... keys.
+            repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             **kwargs: Additional arguments (unused).
 
@@ -113,8 +115,8 @@ class GDPOAdvantageEstimator:
         reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
         if len(reward_component_keys) < 2:
             raise ValueError(
-                f"GDPO requires multiple reward components (reward1, reward2, ...). "
-                f"This batch has {len(reward_component_keys)} component(s). "
+                f"GDPO requires multiple reward components (reward/name1, reward/name2, ...). "
+                f"This batch has {len(reward_component_keys)} component(s): {reward_component_keys}. "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
         valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
@@ -507,3 +509,82 @@ class GeneralizedAdvantageEstimator:
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = advantages + values
         return advantages, returns
+
+
+class OPDAdvantageEstimator:
+    """Multi-Teacher On-Policy Distillation (MOPD) advantage estimator (arXiv:2601.02780).
+
+    Computes token-level distillation advantages:
+        Â_MOPD,t = sg[log π_teacher - log π_student]
+
+    This is Equation 8 from the MOPD paper. The IS truncation (w_t, the
+    hard gate on the training-to-inference ratio) is handled separately by
+    ICE-POP mode in ClippedPGLoss — not here.
+
+    The loss function should be configured with:
+        disable_ppo_ratio: true               (REINFORCE, no PPO ratio)
+        use_importance_sampling_correction: true
+        truncated_importance_sampling_type: icepop
+        truncated_importance_sampling_ratio_min: <eps_low>
+        truncated_importance_sampling_ratio: <eps_high>
+
+    Required kwargs in compute_advantage:
+        teacher_logprobs: [B, S] teacher model log probabilities
+        prev_logprobs: [B, S] student training-engine log probabilities
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: dict):
+        self.last_metrics: dict[str, float] = {}
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        teacher_logprobs=None,
+        prev_logprobs=None,
+        **kwargs,
+    ):
+        """Compute OPD distillation advantages.
+
+        Args:
+            prompt_ids: [B] prompt IDs (unused, kept for interface compatibility)
+            rewards: [B] rewards (unused for pure distillation)
+            mask: [B, S] token mask
+            teacher_logprobs: [B, S] teacher model logprobs (required)
+            prev_logprobs: [B, S] student training-engine logprobs (required)
+
+        Returns:
+            [B, S] token-level distillation advantages (stop-gradient)
+        """
+        if teacher_logprobs is None:
+            raise ValueError("OPD requires teacher_logprobs")
+        if prev_logprobs is None:
+            raise ValueError("OPD requires prev_logprobs")
+
+        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
+        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
+
+        # Apply mask
+        advantages = distill_advantages * mask
+
+        # Metrics
+        self._compute_metrics(distill_advantages, advantages, mask)
+
+        return advantages
+
+    def _compute_metrics(self, distill_advantages, advantages, mask):
+        """Compute OPD logging metrics and store in self.last_metrics."""
+        valid_bool = mask.bool()
+        distill_valid = torch.masked_select(distill_advantages, valid_bool)
+        adv_valid = torch.masked_select(advantages, valid_bool)
+
+        distill_mean = distill_valid.mean().item() if distill_valid.numel() > 0 else 0.0
+        adv_mean = adv_valid.mean().item() if adv_valid.numel() > 0 else 0.0
+        adv_std = adv_valid.std().item() if adv_valid.numel() > 1 else 0.0
+
+        self.last_metrics = {
+            "on_policy_distillation/teacher_student_logprob_gap_mean": distill_mean,
+            "on_policy_distillation/adv_mean": adv_mean,
+            "on_policy_distillation/adv_std": adv_std,
+        }

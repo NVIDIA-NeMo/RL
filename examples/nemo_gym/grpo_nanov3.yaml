@@ -113,6 +113,7 @@ policy:
     moe_per_layer_logging: True
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     optimizer:
       optimizer: "adam"

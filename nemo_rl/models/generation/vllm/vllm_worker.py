@@ -304,6 +304,19 @@ class BaseVllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
+        # MTP speculative decoding with load_format="dummy" gets its policy
+        # weights via refit, but the MTP draft layer is not covered by refit, so
+        # those layers are loaded directly from the checkpoint after engine init
+        # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
+        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config")
+        mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_load_from_disk: bool = (
+            load_format == "dummy"
+            and spec_cfg is not None
+            and spec_cfg.get("method") in ("deepseek_mtp", "mtp")
+            and not mtp_weights_from_refit
+        )
+
         if (
             len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0
             and vllm_kwargs["distributed_executor_backend"] == "ray"
@@ -348,6 +361,7 @@ class BaseVllmGenerationWorker:
             for arch in (
                 "Gemma3ForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
             )
@@ -359,6 +373,7 @@ class BaseVllmGenerationWorker:
                 in (
                     "Gemma3ForConditionalGeneration",
                     "Gemma4ForConditionalGeneration",
+                    "Mistral3ForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
                 )
@@ -370,6 +385,39 @@ class BaseVllmGenerationWorker:
                     "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
+
+        # Mistral 3.5 (Mistral3ForConditionalGeneration) integration.
+        if "Mistral3ForConditionalGeneration" in getattr(
+            hf_config, "architectures", []
+        ):
+            # Mistral 3.5 ships FP8 on disk, but NeMo-RL refits bf16 weights via
+            # ZMQ (load_format='dummy'). Clear the auto-detected quantization_config
+            # so vLLM allocates bf16 buffers instead of building Fp8Config.
+            if hasattr(hf_config, "quantization_config"):
+                assert load_format == "dummy", (
+                    "Loading FP8-quantized Mistral3 in vLLM is only supported "
+                    "with load_format='dummy' (NeMo-RL refits bf16 weights via "
+                    "ZMQ). Got load_format=%r." % load_format
+                )
+                # NeMo-RL refits bf16 weights, so we intentionally clear any fp8
+                # quantization here -- including the quantization="fp8" that
+                # init_fp8 set above when precision == "fp8". Warn so a
+                # precision: fp8 Mistral3 config isn't silently downgraded to bf16.
+                if self.cfg["vllm_cfg"]["precision"] == "fp8":
+                    print(
+                        "Mistral3 refits bf16 weights via ZMQ; ignoring "
+                        "precision='fp8' and running vLLM generation in bf16."
+                    )
+                vllm_kwargs["quantization"] = None
+                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+
+            # Force the HF config parser. Auto-detect picks Mistral-native format
+            # and remaps architectures to Pixtral, whose weight loader is
+            # incompatible with NeMo-RL's HF-format ZMQ refit keys.
+            vllm_kwargs["config_format"] = "hf"
+
+            # Text-only runs additionally set generation.vllm_kwargs.language_model_only
+            # in the recipe YAML to skip vLLM's multimodal preflight.
 
         llm_kwargs = dict(
             model=self.model_name,
@@ -542,6 +590,10 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
+        if self._mtp_load_from_disk:
+            self.llm.collective_rpc(
+                "load_mtp_weights_from_disk", args=(self.model_name,)
+            )
 
     def init_collective(
         self,

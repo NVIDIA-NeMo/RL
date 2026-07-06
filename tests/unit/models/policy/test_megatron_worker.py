@@ -75,6 +75,85 @@ def test_megatron_prepare_for_training_restores_optimizer():
     assert restored_devices == ["cuda"]
 
 
+def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
+    """_set_moe_grad_scale_func should set/clear moe_grad_scale_func on the config."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model_config = SimpleNamespace()
+    worker.model = SimpleNamespace(config=model_config)
+
+    def scale():
+        return 0.5
+
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, scale)
+    assert model_config.moe_grad_scale_func is scale
+
+    # Clearing after the forward-backward pass restores None.
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, None)
+    assert model_config.moe_grad_scale_func is None
+
+
+def test_set_moe_grad_scale_func_handles_float16module_wrapper():
+    """_get_model_config should unwrap a Float16Module-style .module.config."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    inner_config = SimpleNamespace()
+    worker.model = SimpleNamespace(module=SimpleNamespace(config=inner_config))
+
+    def scale():
+        return 2.0
+
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, scale)
+    assert inner_config.moe_grad_scale_func is scale
+
+
+def test_set_moe_grad_scale_func_noop_when_no_config():
+    """A model without a resolvable config should be a no-op, not an error."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace()  # no .config and no .module
+
+    # Should not raise even though there is no config to set the func on.
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, lambda: 1.0)
+
+
+def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
+    """_compute_moe_grad_scale should yield loss_scale = 1/global_valid_toks."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+
+    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(4.0)
+    )
+    assert torch.allclose(scale_fn(), torch.tensor(0.25))
+
+
+def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
+    """clamp(min=1) must guard against division by zero when no valid tokens."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+
+    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(0.0)
+    )
+    assert torch.allclose(scale_fn(), torch.tensor(1.0))
+
+
 def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
     source_path = (
         Path(__file__).parents[4]
@@ -225,9 +304,10 @@ def create_megatron_test_config(
             "moe_token_dispatcher_type": "alltoall",
             "moe_shared_expert_overlap": False,
             "defer_fp32_logits": defer_fp32_logits,
-            "use_linear_ce_fusion_loss": False,
-            "linear_ce_fusion_chunk_size": 256,
+            "use_fused_linear_logprobs": False,
+            "fused_linear_logprobs_chunk_size": 256,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -2060,15 +2140,15 @@ def test_megatron_sft_linear_ce_fusion_agreement(tiny_qwen2_model_path):
         max_colocated_worker_groups=1,
     )
     config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
-    config_fuse["megatron_cfg"]["use_linear_ce_fusion_loss"] = True
-    config_fuse["megatron_cfg"]["linear_ce_fusion_chunk_size"] = 256
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
     policy_fuse = Policy(
         cluster=cluster_fuse,
         config=config_fuse,
         tokenizer=tokenizer,
         init_reference_model=False,
     )
-    sft_loss_fuse = NLLLossFn(use_linear_ce_fusion=True)
+    sft_loss_fuse = NLLLossFn(use_fused_linear_logprobs=True)
 
     try:
         policy_fuse.prepare_for_training()
@@ -2162,15 +2242,15 @@ def test_megatron_dpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
         max_colocated_worker_groups=1,
     )
     config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
-    config_fuse["megatron_cfg"]["use_linear_ce_fusion_loss"] = True
-    config_fuse["megatron_cfg"]["linear_ce_fusion_chunk_size"] = 256
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
     policy_fuse = Policy(
         cluster=cluster_fuse,
         config=config_fuse,
         tokenizer=tokenizer,
         init_reference_model=False,
     )
-    dpo_loss_fuse = DPOLossFn(dpo_cfg, use_linear_ce_fusion=True)
+    dpo_loss_fuse = DPOLossFn(dpo_cfg, use_fused_linear_logprobs=True)
 
     try:
         policy_fuse.prepare_for_training()
@@ -2185,6 +2265,110 @@ def test_megatron_dpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
     assert not torch.isnan(loss_fuse).any(), "Fusion DPO loss should not be NaN"
     assert not torch.isinf(loss_std).any(), "Standard DPO loss should not be Inf"
     assert not torch.isinf(loss_fuse).any(), "Fusion DPO loss should not be Inf"
+
+    # Verify losses are numerically close
+    torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.timeout(600)
+def test_megatron_grpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
+    """Test that linear CE fusion loss matches the standard path for GRPO (ClippedPGLossFn)."""
+    import time
+
+    num_gpus = 2
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 151936
+
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    token_mask = torch.triu(torch.ones(batch_size, seq_len), diagonal=1)
+    sample_mask = torch.ones(batch_size)
+    # Use small-magnitude logprobs so the importance ratio exp(curr - prev) stays
+    # well-conditioned and the agreement check is not dominated by exp blow-up.
+    advantages = torch.randn(batch_size, seq_len)
+    prev_logprobs = torch.randn(batch_size, seq_len) * 0.1
+    generation_logprobs = torch.randn(batch_size, seq_len) * 0.1
+    reference_policy_logprobs = torch.randn(batch_size, seq_len) * 0.1
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "advantages": advantages,
+            "prev_logprobs": prev_logprobs,
+            "generation_logprobs": generation_logprobs,
+            "reference_policy_logprobs": reference_policy_logprobs,
+        }
+    )
+
+    pg_cfg = ClippedPGLossConfig()
+
+    # --- Standard GRPO (no linear CE fusion) ---
+    cluster_std = RayVirtualCluster(
+        name="test-grpo-std",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_std = create_megatron_test_config(tiny_qwen2_model_path)
+    tokenizer = get_tokenizer(config_std["tokenizer"])
+    policy_std = Policy(
+        cluster=cluster_std,
+        config=config_std,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    pg_loss_std = ClippedPGLossFn(pg_cfg)
+
+    try:
+        policy_std.prepare_for_training()
+        results_std = policy_std.train(data, pg_loss_std)
+        loss_std = results_std["loss"]
+    finally:
+        policy_std.shutdown()
+        cluster_std.shutdown()
+
+    time.sleep(10)
+
+    # --- GRPO with linear CE fusion ---
+    cluster_fuse = RayVirtualCluster(
+        name="test-grpo-fuse",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
+    policy_fuse = Policy(
+        cluster=cluster_fuse,
+        config=config_fuse,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    pg_loss_fuse = ClippedPGLossFn(pg_cfg, use_fused_linear_logprobs=True)
+
+    try:
+        policy_fuse.prepare_for_training()
+        results_fuse = policy_fuse.train(data, pg_loss_fuse)
+        loss_fuse = results_fuse["loss"]
+    finally:
+        policy_fuse.shutdown()
+        cluster_fuse.shutdown()
+
+    # Verify both produce valid losses
+    assert not torch.isnan(loss_std).any(), "Standard GRPO loss should not be NaN"
+    assert not torch.isnan(loss_fuse).any(), "Fusion GRPO loss should not be NaN"
+    assert not torch.isinf(loss_std).any(), "Standard GRPO loss should not be Inf"
+    assert not torch.isinf(loss_fuse).any(), "Fusion GRPO loss should not be Inf"
 
     # Verify losses are numerically close
     torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)

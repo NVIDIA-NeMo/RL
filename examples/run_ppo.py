@@ -52,7 +52,7 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "ppo_math_1B_megatron.yaml"
+            os.path.dirname(__file__), "configs", "ppo_math_1B.yaml"
         )
 
     config = load_config(args.config)

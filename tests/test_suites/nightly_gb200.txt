@@ -72,3 +72,7 @@ tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n4g-fsdp2tp1.v1.sh
 
 # Short megatron
 tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n4g-megatron-tp1pp2cp2-pack.sh
+
+# Nano3 hybrid MoE/Mamba ModelOpt layer-spec smoke. Keeps
+# policy.disable_modelopt_layer_spec=false to cover modelopt_mamba_stack_spec.
+tests/test_suites/llm/distillation-nano3-30ba3b-4n4g-megatron-qa-nvfp4-modelopt-spec.sh

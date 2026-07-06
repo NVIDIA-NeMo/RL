@@ -417,6 +417,15 @@ def select_segment_nodes(
 
     domain_nodes: dict[str, list[tuple[str, int]]] = {}
     for nid, (domain, topo_rank) in topology.items():
+        # Skip nodes with no NVLink-domain info. They all collapse into a single
+        # NVLINK_DOMAIN_UNKNOWN pseudo-domain with TOPO_RANK_UNKNOWN (-1), so they
+        # would sort first and be selected — but the resulting placement-group
+        # constraint {NVLINK_DOMAIN_UNKNOWN: 0.001} names a Ray resource that
+        # ray.sub never registers, so the bundle can never schedule. Excluding
+        # them here means we only ever pin to real, registered NVLink domains
+        # (and these nodes fall through to remaining_node_ids).
+        if domain == NVLINK_DOMAIN_UNKNOWN:
+            continue
         domain_nodes.setdefault(domain, []).append((nid, topo_rank))
     for domain in domain_nodes:
         domain_nodes[domain].sort(key=lambda x: x[1])
@@ -865,20 +874,42 @@ class RayVirtualCluster:
         Returns:
             Tuple of (address, port)
         """
-        # Get placement groups if not already created
-        if not self._node_placement_groups:
-            self.get_placement_groups()
+        results = self.get_available_addresses_and_ports_batch([(pg_idx, bundle_idx)])
+        return results[0]
 
-        # Get the placement group
+    def get_available_addresses_and_ports_batch(
+        self,
+        pg_bundle_pairs: list[tuple[int, int]],
+        batch_size: int = 256,
+    ) -> list[tuple[str, int]]:
+        """Discovers available addresses and ports for multiple bundles in parallel.
+
+        Fires all remote tasks up front, then collects results in batches via ray.wait()
+        to avoid putting too many objects into the Ray object
+        store at once.
+        See https://docs.ray.io/en/latest/ray-core/patterns/ray-get-too-many-objects.html
+
+        Args:
+            pg_bundle_pairs: List of ``(pg_idx, bundle_idx)`` pairs.
+            batch_size: Maximum number of ready futures to fetch at once.
+
+        Returns:
+            List of ``(address, port)`` tuples in the same order as ``pg_bundle_pairs``.
+        """
         placement_groups = self.get_placement_groups()
-        if len(placement_groups) == 1:
-            pg = placement_groups[0]
-        else:
-            pg = placement_groups[pg_idx]
+        refs: list[ray.ObjectRef] = []
+        for pg_idx, bundle_idx in pg_bundle_pairs:
+            pg = (
+                placement_groups[0]
+                if len(placement_groups) == 1
+                else placement_groups[pg_idx]
+            )
+            if not pg.bundle_specs:
+                raise RuntimeError(
+                    "No valid placement groups found to get available address and port"
+                )
 
-        if pg.bundle_specs:
-            # Launch port finder on the given bundle of this placement group
-            addr, port = ray.get(
+            refs.append(
                 _get_node_ip_and_free_port.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg, placement_group_bundle_index=bundle_idx
@@ -887,11 +918,29 @@ class RayVirtualCluster:
                     num_cpus=0,
                 ).remote(self.port_range_low, self.port_range_high)
             )
-            return addr, port
 
-        raise RuntimeError(
-            "No valid placement groups found to get available address and port"
-        )
+        if len(refs) <= batch_size:
+            return ray.get(refs)
+
+        # ray.wait returns refs in completion order, so map each ref back to
+        # its input index to preserve worker-to-port ordering.
+        ref_to_idx = {ref: idx for idx, ref in enumerate(refs)}
+        results: list[Optional[tuple[str, int]]] = []
+        for _ in refs:
+            results.append(None)
+        remaining = list(refs)
+        while remaining:
+            ready, remaining = ray.wait(
+                remaining, num_returns=min(batch_size, len(remaining))
+            )
+            for ref, value in zip(ready, ray.get(ready)):
+                results[ref_to_idx[ref]] = value
+
+        ordered_results: list[tuple[str, int]] = []
+        for result in results:
+            assert result is not None
+            ordered_results.append(result)
+        return ordered_results
 
     def get_master_address_and_port(self) -> tuple[str, int]:
         """Gets the master address and port for the distributed training setup.

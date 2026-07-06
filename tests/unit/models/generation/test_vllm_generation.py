@@ -469,6 +469,33 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     assert configured["vllm_cfg"]["load_format"] == "dummy"
 
 
+@pytest.mark.parametrize("method", ["deepseek_mtp", "mtp"])
+def test_configure_generation_config_keeps_dummy_startup_weights_for_mtp(method):
+    """MTP keeps dummy startup weights even without draft refit.
+
+    The policy weights arrive via refit and only the MTP draft layer is loaded
+    from disk on the worker, so we must not force load_format="auto" (which would
+    read the full base-model checkpoint).
+    """
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_kwargs"] = {
+        "speculative_config": {
+            "method": method,
+            "num_speculative_tokens": 1,
+        }
+    }
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    configured = configure_generation_config(
+        vllm_config,
+        tokenizer,
+        is_eval=False,
+        has_refit_draft_weights=False,
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
 def get_basic_megatron_test_config(
     tp: int = 1,
     pp: int = 1,
@@ -525,6 +552,7 @@ def get_basic_megatron_test_config(
             "bias_activation_fusion": True,
             "moe_per_layer_logging": False,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -2843,6 +2871,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
+    vllm_config["vllm_cfg"]["max_model_len"] = 128
 
     megatron_config = get_basic_megatron_test_config(
         tp=1,

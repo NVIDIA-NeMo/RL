@@ -124,7 +124,7 @@ policy: &POLICY_BASE
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
         gradient_accumulation_fusion: false
-        
+        use_fused_weighted_squared_relu: false
         optimizer:
             optimizer: "adam"
             lr: 2.00001e-5

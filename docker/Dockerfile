@@ -66,6 +66,13 @@ apt install -y nsight-systems-cli
 # To fix CVE-2025-68973
 apt install -y --only-upgrade gnupg
 
+# Upgrade rsync to address security vulnerabilities
+apt-get install -y --only-upgrade rsync
+
+# Remove ffmpeg (from base image) to reduce attack surface
+apt-get remove -y --purge ffmpeg || true
+apt-get autoremove -y
+
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
@@ -275,16 +282,17 @@ EOF
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
 # into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
 # source COPY above so examples/nemo_gym/prefetch_venvs.py is present.
-# The gym pins vllm==0.17.0 (default PyPI wheel is cu12); pin NEMO_GYM_CUDA and override vllm to
-# vLLM's matching prebuilt cu-wheel so the gym venvs share RL's torch/nvidia stack.
+# Gym pins vllm==0.20.0; override it to vLLM's prebuilt cu-wheel (PyPI default is cu12) so Gym's
+# venvs share RL's torch/nvidia stack. 0.20.0's default GitHub wheel is the cu130 build (the
+# same wheel the policy pins in pyproject.toml); UV_TORCH_BACKEND keeps torch on the same CUDA.
 ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.17.0
+ARG NEMO_GYM_VLLM_VERSION=0.20.0
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
-    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s+%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
-        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_CUDA}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
+        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
     UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
