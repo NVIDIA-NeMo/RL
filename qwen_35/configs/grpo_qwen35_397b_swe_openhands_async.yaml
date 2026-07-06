@@ -366,7 +366,7 @@ env:
       responses_api_agents:
         swe_agents:
           # Must match the OpenHands commit baked into the image
-          # (docker/Dockerfile.gym_qwen35 AGENT_FRAMEWORK_COMMIT). The gym
+          # (docker/mlperf/Dockerfile.gym_qwen35 AGENT_FRAMEWORK_COMMIT). The gym
           # default (25bacbc6...) does not exist in the baked nv-OpenHands
           # checkout, and run_infer.sh aborts on any commit switch because the
           # runtime copies prompt templates into the checkout (dirty tree).

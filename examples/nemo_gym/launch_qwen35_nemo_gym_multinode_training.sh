@@ -244,7 +244,7 @@ fi
 # and re-wrapped the imports at build time), which crashes
 # run_local_evaluation on import and zeroes EVERY train/val reward. Mount
 # corrected copies whose import lines cannot re-match the baked repair
-# patterns. See docker/gym/mlperf-gym.patch (PY_R2E_RUNTIME heredoc).
+# patterns. See docker/mlperf/mlperf-gym.patch (PY_R2E_RUNTIME heredoc).
 R2E_FIXES_DIR="${R2E_FIXES_DIR:-/lustre/fsw/coreai_mlperf_training/users/mfutrega/data/r2e_fixes}"
 if [[ -d "${R2E_FIXES_DIR}" ]]; then
     R2E_UTILS_DIR="${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/swe_r2e_gym_setup/R2E-Gym/src/r2egym/agenthub/utils"
