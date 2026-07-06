@@ -42,6 +42,12 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Optional JSONL filepath for one trace row per /v1/chat/completions request.
+    mocker_request_server_trace_jsonl: NotRequired[str | None]
+    # Enables the background vLLM metrics sampler used for per-worker time series.
+    enable_vllm_metrics_logger: NotRequired[bool]
+    # Sampling interval in seconds for the vLLM metrics logger.
+    vllm_metrics_logger_interval: NotRequired[float]
     # Extra environment variables forwarded to every vLLM worker process. Useful
     # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
     # affecting other test cases.

@@ -18,6 +18,7 @@ import json
 import tempfile
 from copy import deepcopy
 from dataclasses import asdict
+from uuid import UUID
 
 import pytest
 import ray
@@ -40,6 +41,8 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
+    _append_mocker_request_trace_jsonl,
+    _build_mocker_request_trace_records,
     _calculate_single_metric,
     generate_responses_async,
     run_async_multi_turn_rollout,
@@ -102,6 +105,91 @@ class TestCalculateSingleMetric:
         result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+class TestMockerRequestTrace:
+    def test_build_records_uses_shared_request_id(self):
+        request_id = "f728c13d-e80e-49e4-916f-0cb1d2a316db"
+        results = [
+            {
+                "message_log": [
+                    {"role": "user", "token_ids": torch.tensor([10, 11])},
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([20]),
+                        "request_id": request_id,
+                    },
+                ]
+            }
+        ]
+
+        records = _build_mocker_request_trace_records(results, step_id="test-step")
+
+        assert records[0]["uuid"] == request_id
+        assert records[0]["request_id"] == request_id
+
+    def test_build_records_generates_one_fallback_id(self):
+        results = [
+            {
+                "message_log": [
+                    {"role": "user", "token_ids": torch.tensor([10, 11])},
+                    {"role": "assistant", "token_ids": torch.tensor([20])},
+                ]
+            }
+        ]
+
+        records = _build_mocker_request_trace_records(results, step_id="test-step")
+
+        assert records[0]["request_id"] == records[0]["uuid"]
+        assert str(UUID(records[0]["uuid"])) == records[0]["uuid"]
+
+    def test_build_records_reconstructs_prompt_prefixes(self):
+        results = [
+            {
+                "message_log": [
+                    {"role": "user", "token_ids": torch.tensor([10, 11])},
+                    {"role": "assistant", "token_ids": torch.tensor([20])},
+                    {"role": "user", "token_ids": torch.tensor([30, 31])},
+                    {"role": "assistant", "token_ids": torch.tensor([40, 41])},
+                ]
+            }
+        ]
+
+        records = _build_mocker_request_trace_records(results, step_id="test-step")
+
+        assert len(records) == 2
+        assert records[0]["tokens"] == [10, 11]
+        assert records[0]["max_output_tokens"] == 1
+        assert records[0]["input_length"] == 2
+        assert records[0]["output_length"] == 1
+        assert len(records[0]["prompt_token_hash"]) == 64
+        assert len(records[0]["generation_token_hash"]) == 64
+        assert records[0]["trace_join_key"] == (
+            f"{records[0]['prompt_token_hash']}:"
+            f"{records[0]['generation_token_hash']}"
+        )
+        assert records[1]["tokens"] == [10, 11, 20, 30, 31]
+        assert records[1]["max_output_tokens"] == 2
+        assert records[1]["input_length"] == 5
+        assert records[1]["output_length"] == 2
+
+    def test_append_records_writes_direct_request_jsonl(self, tmp_path):
+        trace_path = tmp_path / "requests.jsonl"
+        records = [
+            {
+                "tokens": [1, 2, 3],
+                "max_output_tokens": 4,
+                "uuid": None,
+                "dp_rank": 0,
+                "arrival_timestamp_ms": None,
+            }
+        ]
+
+        _append_mocker_request_trace_jsonl(str(trace_path), records)
+
+        lines = trace_path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0]) == records[0]
 
 
 class _DummyTokenizer:

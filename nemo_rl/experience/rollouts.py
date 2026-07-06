@@ -17,14 +17,19 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 import math
+import os
 import statistics
+import threading
 import warnings
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, cast
+from uuid import uuid4
 
 import ray
 import torch
@@ -57,6 +62,100 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+_mocker_request_trace_step_counter = 0
+_mocker_request_trace_write_lock = threading.Lock()
+
+
+def _token_ids_hash(token_ids: list[int]) -> str:
+    payload = json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _token_ids_to_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        return [int(token_id) for token_id in value.detach().cpu().tolist()]
+    return [int(token_id) for token_id in value]
+
+
+def _next_mocker_request_trace_step_id() -> str:
+    global _mocker_request_trace_step_counter
+    _mocker_request_trace_step_counter += 1
+    return f"nemo-gym-rollout-{os.getpid()}-{_mocker_request_trace_step_counter}"
+
+
+def _mocker_request_trace_jsonl_path(
+    generation_config: GenerationConfig,
+) -> str | None:
+    config_dict = cast(dict[str, Any], generation_config)
+    trace_path = config_dict.get("mocker_request_trace_jsonl")
+    if trace_path:
+        return str(trace_path)
+
+    vllm_cfg = config_dict.get("vllm_cfg")
+    if isinstance(vllm_cfg, dict):
+        trace_path = vllm_cfg.get("mocker_request_trace_jsonl")
+        if trace_path:
+            return str(trace_path)
+    return None
+
+
+def _build_mocker_request_trace_records(
+    results: list[dict],
+    step_id: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+
+    for sample_idx, result in enumerate(results):
+        prompt_tokens: list[int] = []
+        turn_idx = 0
+        for message in result["message_log"]:
+            token_ids = _token_ids_to_list(message.get("token_ids"))
+            if message.get("role") == "assistant":
+                prompt_token_hash = _token_ids_hash(prompt_tokens)
+                generation_token_hash = _token_ids_hash(token_ids)
+                request_id = message.get("request_id") or str(uuid4())
+                request_id = str(request_id)
+                record = {
+                    "tokens": list(prompt_tokens),
+                    "max_output_tokens": len(token_ids),
+                    "uuid": request_id,
+                    "request_id": request_id,
+                    "dp_rank": 0,
+                    "arrival_timestamp_ms": None,
+                    "step_id": step_id,
+                    "sample_idx": sample_idx,
+                    "turn_idx": turn_idx,
+                    "input_length": len(prompt_tokens),
+                    "output_length": len(token_ids),
+                    "prompt_token_hash": prompt_token_hash,
+                    "generation_token_hash": generation_token_hash,
+                    "trace_join_key": f"{prompt_token_hash}:{generation_token_hash}",
+                }
+                records.append(record)
+                turn_idx += 1
+
+            prompt_tokens.extend(token_ids)
+
+    return records
+
+
+def _append_mocker_request_trace_jsonl(path: str, records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+
+    trace_path = Path(path)
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    with _mocker_request_trace_write_lock:
+        fd = os.open(str(trace_path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            for record in records:
+                line = json.dumps(record, separators=(",", ":")) + "\n"
+                os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
 
 
 def _add_r3_fallback_metrics(
@@ -1821,6 +1920,19 @@ def run_async_nemo_gym_rollout(
                 "generation_logprobs",
             )
 
+    mocker_request_trace_count = 0
+    mocker_request_trace_path = _mocker_request_trace_jsonl_path(generation_config)
+    if mocker_request_trace_path:
+        mocker_request_trace_records = _build_mocker_request_trace_records(
+            results,
+            step_id=_next_mocker_request_trace_step_id(),
+        )
+        _append_mocker_request_trace_jsonl(
+            mocker_request_trace_path,
+            mocker_request_trace_records,
+        )
+        mocker_request_trace_count = len(mocker_request_trace_records)
+
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
     length_rewards_low = shaping.length_rewards_low
@@ -1901,6 +2013,10 @@ def run_async_nemo_gym_rollout(
             # )
             # / batch_size,
         }
+        if mocker_request_trace_path:
+            rollout_metrics["mocker_request_trace/num_requests"] = (
+                mocker_request_trace_count
+            )
 
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):

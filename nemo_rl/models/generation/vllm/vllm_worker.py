@@ -211,6 +211,18 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
+        self.trace_worker_seed = seed
+        self.trace_bundle_indices = (
+            list(bundle_indices) if bundle_indices is not None else None
+        )
+        if seed is not None:
+            self.trace_worker_id = str(seed)
+        elif bundle_indices is not None:
+            self.trace_worker_id = "bundle-" + "-".join(
+                str(idx) for idx in bundle_indices
+            )
+        else:
+            self.trace_worker_id = "non-owner"
         self._extra_env_vars = extra_env_vars
 
         # Store the Python executable being used by this worker

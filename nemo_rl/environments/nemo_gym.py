@@ -82,6 +82,28 @@ class NemoGymConfig(TypedDict):
     ]  # Require Gym output items to carry R3 routed_experts
 
 
+def _build_nemo_rl_assistant_message(
+    output_item_dict: dict[str, Any],
+    generation_token_ids: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    *,
+    is_invalid_tool_call: bool,
+    has_malformed_thinking: bool,
+) -> dict[str, Any]:
+    message = {
+        "role": "assistant",
+        "content": "",
+        "token_ids": generation_token_ids,
+        "generation_logprobs": generation_logprobs,
+        "is_invalid_tool_call": is_invalid_tool_call,
+        "has_malformed_thinking": has_malformed_thinking,
+    }
+    request_id = output_item_dict.get("request_id")
+    if request_id is not None:
+        message["request_id"] = str(request_id)
+    return message
+
+
 def _detect_invalid_tool_call_and_malformed_thinking(
     output_item_dict: dict[str, Any],
     invalid_tool_call_patterns: list[str] | None = None,
@@ -401,14 +423,13 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 )
             )
 
-            assistant_message = {
-                "role": "assistant",
-                "content": "",
-                "token_ids": torch.tensor(generation_token_ids),
-                "generation_logprobs": torch.tensor(generation_log_probs),
-                "is_invalid_tool_call": is_invalid_tool_call,
-                "has_malformed_thinking": has_malformed_thinking,
-            }
+            assistant_message = _build_nemo_rl_assistant_message(
+                output_item_dict,
+                torch.tensor(generation_token_ids),
+                torch.tensor(generation_log_probs),
+                is_invalid_tool_call=is_invalid_tool_call,
+                has_malformed_thinking=has_malformed_thinking,
+            )
             if routed_experts is not None:
                 assistant_message["routed_experts"] = routed_experts[
                     generation_start:generation_end

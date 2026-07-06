@@ -15,7 +15,10 @@
 import asyncio
 import copy
 import gc
+import hashlib
+import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -49,6 +52,248 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
+_TRACE_WRITE_LOCK = threading.Lock()
+
+
+def _json_hash(value: Any) -> str | None:
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    except Exception:
+        return None
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _token_ids_hash(token_ids: list[int] | None) -> str | None:
+    if token_ids is None:
+        return None
+    return _json_hash(token_ids)
+
+
+def _token_id_from_value(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        if value.startswith("token_id:"):
+            value = value.removeprefix("token_id:")
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _as_int_token_list(value: Any) -> list[int] | None:
+    if not isinstance(value, list):
+        return None
+    token_ids = []
+    for item in value:
+        token_id = _token_id_from_value(item)
+        if token_id is None:
+            return None
+        token_ids.append(token_id)
+    return token_ids
+
+
+def _find_first_token_list(value: Any, key: str) -> list[int] | None:
+    if isinstance(value, dict):
+        tokens = _as_int_token_list(value.get(key))
+        if tokens is not None:
+            return tokens
+        for child in value.values():
+            tokens = _find_first_token_list(child, key)
+            if tokens is not None:
+                return tokens
+    elif isinstance(value, list):
+        for child in value:
+            tokens = _find_first_token_list(child, key)
+            if tokens is not None:
+                return tokens
+    return None
+
+
+def _model_dump(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    try:
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+    except TypeError:
+        try:
+            return value.model_dump()
+        except Exception:
+            return None
+    except Exception:
+        return None
+    return None
+
+
+def _extract_sse_json_dict(chunk: Any) -> dict[str, Any] | None:
+    if isinstance(chunk, dict):
+        return chunk
+
+    if isinstance(chunk, bytes):
+        text = chunk.decode("utf-8", errors="ignore")
+    elif isinstance(chunk, str):
+        text = chunk
+    else:
+        return None
+
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped.startswith("data:"):
+            continue
+        payload = stripped.removeprefix("data:").strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    return None
+
+
+def _generation_token_ids_from_logprobs(
+    response_dump: dict[str, Any] | None,
+) -> list[int] | None:
+    choices = response_dump.get("choices") if response_dump else None
+    if not isinstance(choices, list):
+        return None
+
+    token_ids = []
+    saw_logprob_content = False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        logprobs = choice.get("logprobs")
+        if not isinstance(logprobs, dict):
+            continue
+        content = logprobs.get("content")
+        if not isinstance(content, list):
+            continue
+        saw_logprob_content = True
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            token_id = _token_id_from_value(item.get("token"))
+            if token_id is not None:
+                token_ids.append(token_id)
+
+    return token_ids if saw_logprob_content else None
+
+
+def _generation_token_ids_from_choices(
+    response_dump: dict[str, Any] | None,
+) -> list[int] | None:
+    choices = response_dump.get("choices") if response_dump else None
+    if not isinstance(choices, list):
+        return None
+
+    token_ids = []
+    saw_token_ids = False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        choice_token_ids = _as_int_token_list(choice.get("token_ids"))
+        if choice_token_ids is None:
+            continue
+        saw_token_ids = True
+        token_ids.extend(choice_token_ids)
+
+    return token_ids if saw_token_ids else None
+
+
+def _generation_token_ids_from_response_dump(
+    response_dump: dict[str, Any] | None,
+) -> list[int] | None:
+    token_ids = _generation_token_ids_from_choices(response_dump)
+    if token_ids is None:
+        token_ids = _find_first_token_list(response_dump, "generation_token_ids")
+    if token_ids is None:
+        token_ids = _generation_token_ids_from_logprobs(response_dump)
+    return token_ids
+
+
+def _usage_from_response(
+    response_dump: dict[str, Any] | None,
+) -> dict[str, int | None]:
+    usage = response_dump.get("usage") if response_dump else None
+    if not isinstance(usage, dict):
+        return {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+    return {
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _snapshot_vllm_trace_metrics() -> dict[str, float | int | None]:
+    metrics: dict[str, float | int | None] = {
+        "num_requests_running": None,
+        "num_requests_waiting": None,
+        "kv_cache_usage_perc": None,
+        "generation_tokens": None,
+    }
+    try:
+        from vllm.v1.metrics.reader import get_metrics_snapshot
+
+        name_map = {
+            "vllm:num_requests_running": "num_requests_running",
+            "vllm:num_requests_waiting": "num_requests_waiting",
+            "vllm:kv_cache_usage_perc": "kv_cache_usage_perc",
+            "vllm:generation_tokens": "generation_tokens",
+        }
+        for metric in get_metrics_snapshot():
+            name = getattr(metric, "name", None)
+            target = name_map.get(name)
+            if target is None:
+                continue
+            value = getattr(metric, "value", None)
+            if value is None:
+                values = getattr(metric, "values", None)
+                if isinstance(values, list) and values:
+                    value = values[-1]
+            if value is not None:
+                metrics[target] = value
+    except Exception:
+        metrics["snapshot_error"] = 1
+    return metrics
+
+
+def _append_trace_jsonl(path: str, record: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    line = json.dumps(record, separators=(",", ":"), default=str) + "\n"
+    encoded = line.encode("utf-8")
+    with _TRACE_WRITE_LOCK:
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
 
 
 def _replace_prefix_tokens(
@@ -437,6 +682,163 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
+    def _mocker_request_server_trace_jsonl_path(self) -> str | None:
+        vllm_cfg = self.cfg.get("vllm_cfg", {})
+        path = vllm_cfg.get("mocker_request_server_trace_jsonl")
+        if path:
+            return str(path)
+
+        path = self.cfg.get("mocker_request_server_trace_jsonl")
+        if path:
+            return str(path)
+
+        return None
+
+    def _build_request_trace_base_record(
+        self,
+        raw_request,
+        request: Any,
+        *,
+        arrival_unix_ms: float,
+        arrival_monotonic_ms: float,
+    ) -> dict[str, Any]:
+        request_dump = _model_dump(request)
+        client_host = getattr(getattr(raw_request, "client", None), "host", None)
+        client_port = getattr(getattr(raw_request, "client", None), "port", None)
+        trace_id = raw_request.headers.get("x-request-id") or str(uuid.uuid4())
+        arrival_metrics = _snapshot_vllm_trace_metrics()
+        max_completion_tokens = getattr(request, "max_completion_tokens", None)
+        deprecated_max_tokens = getattr(request, "max_tokens", None)
+        effective_max_tokens = (
+            max_completion_tokens
+            if max_completion_tokens is not None
+            else deprecated_max_tokens
+        )
+        return {
+            "trace_schema_version": 1,
+            "event": "vllm_chat_completion",
+            "trace_id": trace_id,
+            "request_id": trace_id,
+            "worker_id": getattr(self, "trace_worker_id", None),
+            "chosen_worker": getattr(self, "trace_worker_id", None),
+            "worker_seed": getattr(self, "trace_worker_seed", None),
+            "bundle_indices": getattr(self, "trace_bundle_indices", None),
+            "base_url": getattr(self, "base_url", None),
+            "node_ip": _get_node_ip_local(),
+            "client_host": client_host,
+            "client_port": client_port,
+            "http_path": str(getattr(raw_request, "url", "")),
+            "request_header_id": raw_request.headers.get("x-request-id"),
+            "request_hash": _json_hash(request_dump),
+            "model": getattr(request, "model", None),
+            "max_tokens": effective_max_tokens,
+            "max_completion_tokens": max_completion_tokens,
+            "temperature": getattr(request, "temperature", None),
+            "top_p": getattr(request, "top_p", None),
+            "stream": bool(getattr(request, "stream", False)),
+            "arrival_timestamp_ms": arrival_unix_ms,
+            "arrival_monotonic_ms": arrival_monotonic_ms,
+            "arrival_metrics": arrival_metrics,
+            "num_requests_running_at_arrival": arrival_metrics.get(
+                "num_requests_running"
+            ),
+            "num_requests_waiting_at_arrival": arrival_metrics.get(
+                "num_requests_waiting"
+            ),
+            "kv_cache_usage_perc_at_arrival": arrival_metrics.get(
+                "kv_cache_usage_perc"
+            ),
+        }
+
+    def _finish_request_trace_record(
+        self,
+        record: dict[str, Any],
+        *,
+        completion_unix_ms: float,
+        completion_monotonic_ms: float,
+        response: Any = None,
+        error: Any = None,
+        status_code: int | None = None,
+        streaming: bool = False,
+        prompt_token_ids: list[int] | None = None,
+        generation_token_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
+        response_dump = _model_dump(response)
+        if prompt_token_ids is None:
+            prompt_token_ids = _find_first_token_list(
+                response_dump, "prompt_token_ids"
+            )
+        if generation_token_ids is None:
+            generation_token_ids = _generation_token_ids_from_response_dump(
+                response_dump
+            )
+        usage = _usage_from_response(response_dump)
+        response_id = response_dump.get("id") if response_dump else None
+        completion_metrics = _snapshot_vllm_trace_metrics()
+        prompt_tokens = _coerce_int(usage["prompt_tokens"])
+        if prompt_tokens is None and prompt_token_ids is not None:
+            prompt_tokens = len(prompt_token_ids)
+        completion_tokens = _coerce_int(usage["completion_tokens"])
+        if completion_tokens is None and generation_token_ids is not None:
+            completion_tokens = len(generation_token_ids)
+        total_tokens = _coerce_int(usage["total_tokens"])
+        if (
+            total_tokens is None
+            and prompt_tokens is not None
+            and completion_tokens is not None
+        ):
+            total_tokens = prompt_tokens + completion_tokens
+        prompt_token_hash = _token_ids_hash(prompt_token_ids)
+        generation_token_hash = _token_ids_hash(generation_token_ids)
+        record.update(
+            {
+                "completion_timestamp_ms": completion_unix_ms,
+                "completion_monotonic_ms": completion_monotonic_ms,
+                "duration_ms": completion_monotonic_ms
+                - record["arrival_monotonic_ms"],
+                "completion_metrics": completion_metrics,
+                "num_requests_running_at_completion": completion_metrics.get(
+                    "num_requests_running"
+                ),
+                "num_requests_waiting_at_completion": completion_metrics.get(
+                    "num_requests_waiting"
+                ),
+                "kv_cache_usage_perc_at_completion": completion_metrics.get(
+                    "kv_cache_usage_perc"
+                ),
+                "status_code": status_code,
+                "streaming": streaming,
+                "response_id": response_id,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "output_tokens": completion_tokens,
+                "input_length": prompt_tokens,
+                "output_length": completion_tokens,
+                "total_tokens": total_tokens,
+                "extracted_prompt_tokens": (
+                    len(prompt_token_ids)
+                    if prompt_token_ids is not None
+                    else None
+                ),
+                "extracted_generation_tokens": (
+                    len(generation_token_ids)
+                    if generation_token_ids is not None
+                    else None
+                ),
+                "prompt_token_ids": prompt_token_ids,
+                "generation_token_ids": generation_token_ids,
+                "prompt_token_hash": prompt_token_hash,
+                "generation_token_hash": generation_token_hash,
+                "trace_join_key": (
+                    f"{prompt_token_hash}:{generation_token_hash}"
+                    if prompt_token_hash and generation_token_hash
+                    else None
+                ),
+                "error": str(error) if error is not None else None,
+            }
+        )
+        return record
+
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy
@@ -499,6 +901,26 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             lora_modules=None,
         )
         openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
+
+        trace_enabled = bool(self._mocker_request_server_trace_jsonl_path())
+        trace_prompt_token_ids_by_request: dict[int, list[int]] = {}
+
+        def _record_trace_prompt_token_ids(request, engine_prompts) -> None:
+            if not trace_enabled or not engine_prompts:
+                return
+            if not (
+                hasattr(request, "max_tokens")
+                or hasattr(request, "max_completion_tokens")
+            ):
+                return
+            engine_prompt = engine_prompts[0]
+            if not isinstance(engine_prompt, dict):
+                return
+            prompt_token_ids = _as_int_token_list(
+                engine_prompt.get("prompt_token_ids")
+            )
+            if prompt_token_ids is not None:
+                trace_prompt_token_ids_by_request[id(request)] = prompt_token_ids
 
         class NeMoRLOpenAIChatRequestMixin:
             def model_post_init(self, context):
@@ -598,6 +1020,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         )
                     raise
 
+                _record_trace_prompt_token_ids(request, res[1])
+
                 if (
                     not hasattr(request, "required_prefix_token_ids")
                     or request.required_prefix_token_ids is None
@@ -657,6 +1081,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+                _record_trace_prompt_token_ids(request, [engine_prompt])
 
                 # Clamp after prefix replacement since the prompt length may have changed.
                 if actual_request_max_tokens is not None:
@@ -775,11 +1200,55 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
 
+            trace_request_key = id(request)
+            trace_path = self._mocker_request_server_trace_jsonl_path()
+            trace_record = None
+            if trace_path:
+                trace_record = self._build_request_trace_base_record(
+                    raw_request,
+                    request,
+                    arrival_unix_ms=time.time() * 1000.0,
+                    arrival_monotonic_ms=time.monotonic() * 1000.0,
+                )
+
+            def pop_trace_prompt_token_ids() -> list[int] | None:
+                return trace_prompt_token_ids_by_request.pop(
+                    trace_request_key, None
+                )
+
             try:
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
+            except asyncio.CancelledError:
+                if trace_path and trace_record is not None:
+                    _append_trace_jsonl(
+                        trace_path,
+                        self._finish_request_trace_record(
+                            trace_record,
+                            completion_unix_ms=time.time() * 1000.0,
+                            completion_monotonic_ms=time.monotonic() * 1000.0,
+                            error="request cancelled",
+                            status_code=499,
+                            streaming=bool(getattr(request, "stream", False)),
+                            prompt_token_ids=pop_trace_prompt_token_ids(),
+                        ),
+                    )
+                raise
             except VLLMValidationError as e:
+                if trace_path and trace_record is not None:
+                    _append_trace_jsonl(
+                        trace_path,
+                        self._finish_request_trace_record(
+                            trace_record,
+                            completion_unix_ms=time.time() * 1000.0,
+                            completion_monotonic_ms=time.monotonic() * 1000.0,
+                            error=e,
+                            status_code=400,
+                            streaming=bool(getattr(request, "stream", False)),
+                            prompt_token_ids=pop_trace_prompt_token_ids(),
+                        ),
+                    )
                 # vLLM 0.20 raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
@@ -794,18 +1263,145 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     },
                     status_code=400,
                 )
+            except Exception as e:
+                if trace_path and trace_record is not None:
+                    _append_trace_jsonl(
+                        trace_path,
+                        self._finish_request_trace_record(
+                            trace_record,
+                            completion_unix_ms=time.time() * 1000.0,
+                            completion_monotonic_ms=time.monotonic() * 1000.0,
+                            error=e,
+                            status_code=500,
+                            streaming=bool(getattr(request, "stream", False)),
+                            prompt_token_ids=pop_trace_prompt_token_ids(),
+                        ),
+                    )
+                raise
 
             if isinstance(generator, ErrorResponse):
+                if trace_path and trace_record is not None:
+                    _append_trace_jsonl(
+                        trace_path,
+                        self._finish_request_trace_record(
+                            trace_record,
+                            completion_unix_ms=time.time() * 1000.0,
+                            completion_monotonic_ms=time.monotonic() * 1000.0,
+                            response=generator,
+                            error=getattr(
+                                getattr(generator, "error", None),
+                                "message",
+                                None,
+                            ),
+                            status_code=generator.error.code,
+                            streaming=False,
+                            prompt_token_ids=pop_trace_prompt_token_ids(),
+                        ),
+                    )
                 return JSONResponse(
                     content=generator.model_dump(), status_code=generator.error.code
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(
-                    content=model_dump_chat_response_with_routed_experts(generator)
+                response_payload = model_dump_chat_response_with_routed_experts(
+                    generator
+                )
+                if trace_path and trace_record is not None:
+                    _append_trace_jsonl(
+                        trace_path,
+                        self._finish_request_trace_record(
+                            trace_record,
+                            completion_unix_ms=time.time() * 1000.0,
+                            completion_monotonic_ms=time.monotonic() * 1000.0,
+                            response=response_payload,
+                            status_code=200,
+                            streaming=False,
+                            prompt_token_ids=pop_trace_prompt_token_ids(),
+                        ),
+                    )
+                return JSONResponse(content=response_payload)
+
+            if not trace_path or trace_record is None:
+                return StreamingResponse(
+                    content=generator, media_type="text/event-stream"
                 )
 
-            return StreamingResponse(content=generator, media_type="text/event-stream")
+            async def traced_stream():
+                last_payload: dict[str, Any] | None = None
+                stream_prompt_token_ids: list[int] | None = None
+                stream_generation_token_ids: list[int] = []
+                saw_stream_generation_token_ids = False
+                stream_error: Exception | None = None
+                try:
+                    if hasattr(generator, "__aiter__"):
+                        async for chunk in generator:
+                            payload = _extract_sse_json_dict(chunk)
+                            if payload is not None:
+                                last_payload = payload
+                                payload_prompt_token_ids = _find_first_token_list(
+                                    payload, "prompt_token_ids"
+                                )
+                                if payload_prompt_token_ids is not None:
+                                    stream_prompt_token_ids = payload_prompt_token_ids
+                                payload_generation_token_ids = (
+                                    _generation_token_ids_from_response_dump(payload)
+                                )
+                                if payload_generation_token_ids is not None:
+                                    saw_stream_generation_token_ids = True
+                                    stream_generation_token_ids.extend(
+                                        payload_generation_token_ids
+                                    )
+                            yield chunk
+                    else:
+                        for chunk in generator:
+                            payload = _extract_sse_json_dict(chunk)
+                            if payload is not None:
+                                last_payload = payload
+                                payload_prompt_token_ids = _find_first_token_list(
+                                    payload, "prompt_token_ids"
+                                )
+                                if payload_prompt_token_ids is not None:
+                                    stream_prompt_token_ids = payload_prompt_token_ids
+                                payload_generation_token_ids = (
+                                    _generation_token_ids_from_response_dump(payload)
+                                )
+                                if payload_generation_token_ids is not None:
+                                    saw_stream_generation_token_ids = True
+                                    stream_generation_token_ids.extend(
+                                        payload_generation_token_ids
+                                    )
+                            yield chunk
+                except Exception as e:
+                    stream_error = e
+                    raise
+                finally:
+                    prompt_token_ids = pop_trace_prompt_token_ids()
+                    if prompt_token_ids is None:
+                        prompt_token_ids = stream_prompt_token_ids
+                    _append_trace_jsonl(
+                        trace_path,
+                        self._finish_request_trace_record(
+                            trace_record,
+                            completion_unix_ms=time.time() * 1000.0,
+                            completion_monotonic_ms=time.monotonic() * 1000.0,
+                            response=last_payload,
+                            error=stream_error,
+                            status_code=(
+                                500 if stream_error is not None else 200
+                            ),
+                            streaming=True,
+                            prompt_token_ids=prompt_token_ids,
+                            generation_token_ids=(
+                                stream_generation_token_ids
+                                if saw_stream_generation_token_ids
+                                else None
+                            ),
+                        ),
+                    )
+
+            return StreamingResponse(
+                content=traced_stream(), media_type="text/event-stream"
+            )
 
         ########################################
         # /tokenize endpoint

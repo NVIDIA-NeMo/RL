@@ -204,6 +204,9 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    # Optional: append real NeMo-Gym rollout requests as Dynamo mocker DirectRequest JSONL.
+    # Feed this into dynamo.replay.estimate_request_bounds_from_jsonl.
+    mocker_request_trace_jsonl: /scratch/router_bound/nemo_gym_mocker_requests.jsonl
     mcore_generation_config:
       # Scoped to generation workers only; training keeps its own defaults
       # via the base yaml. The mcore_generation_config block is merged into
@@ -259,6 +262,10 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       expose_http_server: true
+      # Optional: append one row per /v1/chat/completions request served by each DP vLLM worker.
+      mocker_request_server_trace_jsonl: /scratch/router_bound/nemo_gym_vllm_server_requests.jsonl
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.2
       reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
       http_server_serving_chat_kwargs:
         enable_auto_tools: true

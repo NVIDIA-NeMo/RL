@@ -28,6 +28,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _build_nemo_rl_assistant_message,
     setup_nemo_gym_config,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -40,6 +41,20 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_build_assistant_message_preserves_request_id():
+    request_id = "f728c13d-e80e-49e4-916f-0cb1d2a316db"
+
+    message = _build_nemo_rl_assistant_message(
+        {"request_id": request_id},
+        torch.tensor([1, 2]),
+        torch.tensor([-0.1, -0.2]),
+        is_invalid_tool_call=False,
+        has_malformed_thinking=False,
+    )
+
+    assert message["request_id"] == request_id
 
 
 @pytest.mark.nemo_gym
@@ -279,6 +294,7 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
+            message.pop("request_id", None)
             message.setdefault("is_invalid_tool_call", False)
             message.setdefault("has_malformed_thinking", False)
 

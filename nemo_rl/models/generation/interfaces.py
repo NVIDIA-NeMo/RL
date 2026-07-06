@@ -130,6 +130,12 @@ class GenerationConfig(TypedDict):
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
     use_async_rollouts: NotRequired[bool]
+    # Optional JSONL filepath for Dynamo mocker DirectRequest traces.
+    # Each line can be loaded and passed to estimate_mocker_request_bounds.
+    mocker_request_trace_jsonl: NotRequired[str | None]
+    # Optional JSONL filepath for per-request vLLM HTTP server traces.
+    # Each line records the observed worker, timing, and worker-state snapshot.
+    mocker_request_server_trace_jsonl: NotRequired[str | None]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
