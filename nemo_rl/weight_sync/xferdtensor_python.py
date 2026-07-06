@@ -628,6 +628,7 @@ def _xferdtensor_python_impl_v1(
     dst_mesh,
     dst_placement,
     process_group,
+    stream=None,
 ) -> None:
     """Reshard ``src_tensor`` into ``dst_tensor`` with exact data movement.
 
@@ -648,7 +649,8 @@ def _xferdtensor_python_impl_v1(
 
     # Split is collective on the parent communicator, so complete/cache it
     # before enqueuing parent-communicator P2P work.
-    stream = torch.cuda.current_stream(device=device)
+    if stream is None:
+        stream = torch.cuda.current_stream(device=device)
     with torch.cuda.device(device), torch.cuda.stream(stream):
         _validate_local_inputs(
             rank, src_tensor, dst_tensor, src_regions, dst_regions, device, dtype
@@ -953,8 +955,15 @@ def xferdtensor_python_impl(
     dst_mesh,
     dst_placement,
     process_group,
+    stream=None,
 ) -> None:
-    """Reshard exactly, using striped receives for compatible replicas."""
+    """Reshard exactly, using striped receives for compatible replicas.
+
+    ``stream`` (optional ``torch.cuda.Stream``) pins every enqueued operation
+    onto the caller's stream so the reshard is ordered with the caller's
+    surrounding work (e.g. staging/copy-back of merged params); ``None`` uses
+    the current stream.
+    """
     rank = int(process_group.rank)
     global_shape, device, dtype = _tensor_metadata(src_tensor, dst_tensor)
     striped = _striped_geometry(
@@ -973,6 +982,7 @@ def xferdtensor_python_impl(
             dst_mesh,
             dst_placement,
             process_group,
+            stream,
         )
 
     (
@@ -982,7 +992,8 @@ def xferdtensor_python_impl(
         transfers,
         stripes_by_rank,
     ) = striped
-    stream = torch.cuda.current_stream(device=device)
+    if stream is None:
+        stream = torch.cuda.current_stream(device=device)
     with torch.cuda.device(device), torch.cuda.stream(stream):
         _validate_local_inputs(
             rank, src_tensor, dst_tensor, src_regions, dst_regions, device, dtype

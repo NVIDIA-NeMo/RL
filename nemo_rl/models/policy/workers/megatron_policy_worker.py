@@ -2316,33 +2316,11 @@ class MegatronPolicyWorkerImpl(
         # hf_to_local_param_map is built once in prepare_nccl_reshard_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.
-        # Overlapping broadcast and the nccl-reshard path refits.
-        import concurrent.futures
-
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        # The misc producer requires the worker's CUDA device setting.
-        # Otherwise it defaults to device 0
-        _misc_device = torch.cuda.current_device()
-
-        def _run_misc_broadcast():
-            torch.cuda.set_device(_misc_device)
-            self._broadcast_misc_params_packed(kv_scales=kv_scales)
-
-        # Serialize the bulk reshard and the misc broadcast (bulk -> misc) by
-        # default; both sides must agree (see vllm_backend.nccl_reshard_refit).
-        _parallel_misc = os.environ.get(
-            "NRL_NCCL_RESHARD_REFIT_PARALLEL_MISC", ""
-        ).lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        if _parallel_misc:
-            _misc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            _misc_future = _misc_pool.submit(_run_misc_broadcast)
-
+        # spec.pre (grouped-MoE expert stacking) and spec.post enqueue on this
+        # worker's current stream; xferdtensor should use the same stream.
+        nccl_reshard_stream = torch.cuda.current_stream()
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
             for param_info in self.nccl_reshard_refit_info["per_layer_params"][
                 layer_name
@@ -2378,6 +2356,7 @@ class MegatronPolicyWorkerImpl(
                     param_info["dst_mesh_info"],
                     param_info["dst_placements"],
                     group,
+                    nccl_reshard_stream,
                 )
                 if spec.post is not None:
                     spec.post(ctx)
@@ -2385,15 +2364,20 @@ class MegatronPolicyWorkerImpl(
                 # memory returns to the caching allocator
                 del ctx, src_tensor
 
-        # Bulk reshard done.  Default: run misc now (serial, no concurrent
-        # communicators).  Parallel opt-in: join the background misc broadcast.
-        if not _parallel_misc:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            _run_misc_broadcast()
-        else:
-            _misc_future.result()
-            _misc_pool.shutdown(wait=True)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        import time
+
+        misc_t0 = time.perf_counter()
+        self._broadcast_misc_params_packed(kv_scales=kv_scales)
+        torch.cuda.synchronize()
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[nccl_reshard_refit] misc broadcast (train side): "
+                f"{time.perf_counter() - misc_t0:.2f}s",
+                flush=True,
+            )
 
     def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
         """Broadcast misc params via the existing packed_broadcast machinery."""

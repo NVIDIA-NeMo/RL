@@ -723,7 +723,7 @@ class VllmInternalWorkerExtension:
 
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        def _recv_one_param(param_info, group):
+        def _recv_one_param(param_info, group, stream):
             # Coverage guard: every bulk param must have a spec; a missing entry
             # would silently discard its weights.
             spec = self.hf_to_local_param_map.get(param_info["name"])
@@ -731,6 +731,8 @@ class VllmInternalWorkerExtension:
                 f"nccl_reshard_refit: {param_info['name']!r} has no spec in "
                 "hf_to_local_param_map (would silently discard its weights)"
             )
+            # spec.pre/post run on the caller's current stream (this stage's
+            # stream); xferdtensor should use the same stream.
             ctx = (
                 spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
             )
@@ -743,6 +745,7 @@ class VllmInternalWorkerExtension:
                 param_info["dst_mesh_info"],
                 param_info["dst_placements"],
                 group,
+                stream,
             )
             if spec.post is not None:
                 spec.post(ctx)
@@ -759,56 +762,35 @@ class VllmInternalWorkerExtension:
             int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)
         )
 
-        # Overlapping broadcast and the nccl-reshard path refits.
-        import concurrent.futures
-
-        # The misc producer requires the worker's CUDA device setting.
-        # Otherwise it defaults to device 0
-        _misc_device = torch.cuda.current_device()
-
-        def _run_misc_recv():
-            torch.cuda.set_device(_misc_device)
-            self._receive_and_load_misc_params()
-
-        # Serialize the bulk reshard and the misc broadcast (bulk -> misc) by
-        # default: running the two NCCL communicators concurrently can deadlock —
-        _parallel_misc = os.environ.get(
-            "NRL_NCCL_RESHARD_REFIT_PARALLEL_MISC", ""
-        ).lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        if _parallel_misc:
-            _misc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            _misc_future = _misc_pool.submit(_run_misc_recv)
-
         streams = [torch.cuda.Stream() for _ in range(num_streams)]
         events = {}
         for idx, (stage, params) in enumerate(stage_params.items()):
             # synchronize the last run in the same stream
             if (idx - num_streams) in events:
                 events[idx - num_streams].synchronize()
-            with torch.cuda.stream(streams[idx % num_streams]):
+            stage_stream = streams[idx % num_streams]
+            with torch.cuda.stream(stage_stream):
                 group = self.pp_comm_groups[stage]
                 for p in params:
-                    _recv_one_param(p, group)
+                    _recv_one_param(p, group, stage_stream)
                 ev = torch.cuda.Event()
                 ev.record()
                 events[idx] = ev
 
-        # Bulk reshard done.  Default: run misc now (serial, no concurrent
-        # communicators).  Parallel opt-in: join the background misc broadcast.
-        if not _parallel_misc:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            _run_misc_recv()
-        else:
-            _misc_future.result()
-            _misc_pool.shutdown(wait=True)
-
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        import time
+
+        misc_t0 = time.perf_counter()
+        self._receive_and_load_misc_params()
+        torch.cuda.synchronize()
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[nccl_reshard_refit] misc recv+load (gen side): "
+                f"{time.perf_counter() - misc_t0:.2f}s",
+                flush=True,
+            )
         torch.cuda.empty_cache()
 
         # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast.

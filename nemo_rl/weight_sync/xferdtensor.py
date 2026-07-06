@@ -31,6 +31,7 @@ this module needs no import from there.
 
 import logging
 import os
+from contextlib import nullcontext
 
 import torch
 from torch.distributed._tensor import Shard
@@ -124,6 +125,7 @@ def xferdtensor(
     dst_mesh,
     dst_placement,
     process_group,
+    stream=None,
 ):
     """Public XferDTensor entry point used by all external callers.
 
@@ -139,6 +141,13 @@ def xferdtensor(
     the real op accepts a one-sided ``None`` and derives the absent side's local
     shape from the present side's local shape + mesh/placements.  PyTorch
     Shard/Replicate placements are passed through directly.
+
+    ``stream`` (optional ``torch.cuda.Stream``) pins the reshard's communication
+    onto the caller's stream so it is ordered with the caller's surrounding work
+    (e.g. the ``LocalParamSpec`` pre/post copies).  Without it the real op
+    communicates on its own side stream, which races against pre/post ops
+    enqueued on the caller's stream; ``None`` falls back to the current stream
+    (Python path) / the op's default stream (real op).
     """
     global _XFERDTENSOR_PATH_LOGGED
     use_golden = _use_golden_api()
@@ -174,22 +183,31 @@ def xferdtensor(
             dst_mesh,
             dst_placement,
             process_group,
+            stream,
         )
 
     if use_golden:
-        return xferdtensor_golden(
-            src_tensor,
-            src_mesh,
-            src_placement,
-            dst_tensor,
-            dst_mesh,
-            dst_placement,
-            process_group,
-        )
+        stream_ctx = torch.cuda.stream(stream) if stream is not None else nullcontext()
+        with stream_ctx:
+            return xferdtensor_golden(
+                src_tensor,
+                src_mesh,
+                src_placement,
+                dst_tensor,
+                dst_mesh,
+                dst_placement,
+                process_group,
+            )
 
     src_local = src_tensor._local_tensor if src_tensor is not None else None
     dst_local = dst_tensor._local_tensor if dst_tensor is not None else None
 
+    # Pin the op's communication to the caller's stream (nccl4py-convention raw
+    # stream handle); omitted entirely when no stream is given so older wheels
+    # without the kwarg keep working.
+    reshard_kwargs = {}
+    if stream is not None:
+        reshard_kwargs["stream"] = int(stream.cuda_stream)
     _reshard(  # pyrefly: ignore[not-callable]
         src_local,
         dst_local,
@@ -198,6 +216,7 @@ def xferdtensor(
         src_placements=src_placement,
         dst_mesh=dst_mesh.mesh.tolist(),
         dst_placements=dst_placement,
+        **reshard_kwargs,
     )
 
 

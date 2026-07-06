@@ -227,6 +227,7 @@ def test_public_api_and_exports_are_upstream_compatible():
         "dst_mesh",
         "dst_placement",
         "process_group",
+        "stream",
     ]
     assert impl.__all__ == [
         "clear_xferdtensor_python_caches",

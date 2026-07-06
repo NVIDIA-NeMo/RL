@@ -156,8 +156,8 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         # 2. Bulk-path comm group(s): one per PP stage, each spanning that
         #    stage's train ranks + all gen ranks (non-PP == a single stage over
         #    all train + gen ranks).  Separate NCCL communicator from
-        #    model_update_group so the bulk reshard can overlap the misc
-        #    broadcast (opt-in via NRL_NCCL_RESHARD_REFIT_PARALLEL_MISC).
+        #    model_update_group; the workers run the misc broadcast strictly
+        #    after the bulk reshard (concurrent communicators can deadlock).
         pp_size = train_parallelism["pp_size"]
         train_gpus_per_node = self._train_cluster.num_gpus_per_node
         train_ranks_per_stage = train_world_size // pp_size
