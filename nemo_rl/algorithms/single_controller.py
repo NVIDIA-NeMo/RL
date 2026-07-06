@@ -430,8 +430,7 @@ class SingleControllerActor:
           - End-of-step: ``finish_train_step`` →
             single ``clear_samples`` → ``_sync_weights``.
 
-        Concurrency contract
-        --------------------
+        **Concurrency contract:**
         ``self._trainer`` is a driver-side ``TQPolicy`` object (no
         ``PolicyTrainerActor`` wrapper). Trainer calls run via
         ``asyncio.to_thread`` and are awaited sequentially, so the worker's
