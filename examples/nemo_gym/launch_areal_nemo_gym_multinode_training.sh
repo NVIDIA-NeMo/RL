@@ -22,7 +22,7 @@
 # ----- PARAMETERS -----
 # WANDB_API_KEY, HF_TOKEN, EXP_NAME, NUM_ACTOR_NODES, NUM_SLURM_NODES (optional), REPO_LOCATION, CONTAINER_IMAGE_PATH, SLURM_ACCOUNT, SLURM_PARTITION
 
-REPO_LOCATION=/home/haitianj/repos/nemo-RL
+REPO_LOCATION=/lustre/fsw/portfolios/coreai/users/haitianj/repos/nemo-RL
 
 HF_HOME=/lustre/fsw/portfolios/coreai/users/haitianj/hf_cache
 EXP_NAME=${EXP_NAME:-grpo-nanov3-12B-8n8g-gym-areal}

@@ -19,7 +19,7 @@
 EXP_NAME=${EXP_NAME:-grpo-nanov3-12B-8n8g-async-gym}
 NUM_ACTOR_NODES=${NUM_ACTOR_NODES:-8}
 NUM_SLURM_NODES=${NUM_SLURM_NODES:-8}
-REPO_LOCATION=/home/haitianj/repos/nemo-RL
+REPO_LOCATION=/lustre/fsw/portfolios/coreai/users/haitianj/repos/nemo-RL
 CONTAINER_IMAGE_PATH=/lustre/fsw/portfolios/coreai/users/yukih/enroot-images/nvcr.io/nvidian/nemo-rl:29fc948-55351550.squashfs
 SLURM_ACCOUNT=coreai_dlalgo_nemorl
 SLURM_PARTITION=batch
