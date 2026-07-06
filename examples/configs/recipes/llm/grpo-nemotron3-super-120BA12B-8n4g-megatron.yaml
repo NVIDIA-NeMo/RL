@@ -32,6 +32,8 @@ policy:
     defer_fp32_logits: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+      NRL_REFIT_NUM_BUFFERS: "1"
   generation:
     colocated:
       enabled: false
