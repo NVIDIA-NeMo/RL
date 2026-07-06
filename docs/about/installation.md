@@ -12,6 +12,11 @@ docker pull nvcr.io/nvidia/nemo-rl:v0.6.0
 git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
 
+# Set HuggingFace variables in your shell before running (recommended):
+# export HF_TOKEN=hf_...                        # required for gated models (e.g. Llama)
+# export HF_HOME=~/.cache/huggingface           # model and tokenizer cache
+# export HF_DATASETS_CACHE=~/.cache/huggingface/datasets  # dataset cache
+
 # Launch the container
 docker run --rm -it \
   -u root \
@@ -21,7 +26,9 @@ docker run --rm -it \
   --ulimit memlock=-1 \
   -v $PWD:/opt/nemo-rl \
   -v ${HF_HOME:-$HOME/.cache/huggingface}:/hf_home \
+  -v ${HF_DATASETS_CACHE:-$HOME/.cache/huggingface/datasets}:/hf_datasets_cache \
   -e HF_HOME=/hf_home \
+  -e HF_DATASETS_CACHE=/hf_datasets_cache \
   -e HF_TOKEN \
   -e WANDB_API_KEY \
   -w /opt/nemo-rl \
@@ -35,16 +42,7 @@ Once inside the container, run any training command directly:
 uv run python examples/run_grpo.py
 ```
 
-> [!NOTE]
-> `HF_TOKEN` and `WANDB_API_KEY` are forwarded from your shell environment. Set them before launching the container if you need authenticated model downloads or W&B logging.
-
 For instructions on building your own image (e.g. from a custom branch), see the [Docker documentation](../docker.md).
-
----
-
-## Bare-Metal Installation
-
-If you prefer to run outside of a container, follow the steps below to set up your environment manually.
 
 ## Clone the Repository
 

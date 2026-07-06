@@ -166,6 +166,9 @@ For detailed information on backend selection, configuration, and examples, see 
 > ```sh
 > git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 > cd nemo-rl
+> # export HF_TOKEN=hf_...                        # required for gated models (e.g. Llama)
+> # export HF_HOME=~/.cache/huggingface           # model and tokenizer cache
+> # export HF_DATASETS_CACHE=~/.cache/huggingface/datasets  # dataset cache
 > docker run --rm -it \
 >   -u root \
 >   --runtime=nvidia \
@@ -174,7 +177,9 @@ For detailed information on backend selection, configuration, and examples, see 
 >   --ulimit memlock=-1 \
 >   -v $PWD:/opt/nemo-rl \
 >   -v ${HF_HOME:-$HOME/.cache/huggingface}:/hf_home \
+>   -v ${HF_DATASETS_CACHE:-$HOME/.cache/huggingface/datasets}:/hf_datasets_cache \
 >   -e HF_HOME=/hf_home \
+>   -e HF_DATASETS_CACHE=/hf_datasets_cache \
 >   -e HF_TOKEN \
 >   -e WANDB_API_KEY \
 >   -w /opt/nemo-rl \
