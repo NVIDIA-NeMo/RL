@@ -364,6 +364,7 @@ class TQPolicy(Policy):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        skip_prev_logprobs: bool = False,
     ) -> dict[str, Any]:
         """1-hop counterpart to :meth:`train`.
 
@@ -392,11 +393,11 @@ class TQPolicy(Policy):
         # logprob deltas + advantages + sample_mask). Caller is responsible
         # for ensuring those columns have been written to TQ before this
         # call (workers + driver delta-writes).
-        # force_on_policy_ratio=True → loss uses curr_logprobs in place
-        # of prev_logprobs, so drop it from the fetch entirely
-        # (dp_client rejects missing fields — see noop adapter).
+        # skip_prev_logprobs=True → loss uses curr_logprobs in place of
+        # prev_logprobs, so drop it from the fetch entirely (dp_client
+        # rejects unknown fields).
         train_fields = DP_TRAIN_FIELDS
-        if getattr(loss_fn, "force_on_policy_ratio", False):
+        if skip_prev_logprobs:
             train_fields = tuple(f for f in train_fields if f != "prev_logprobs")
         train_meta = replace(
             meta,
