@@ -2358,30 +2358,26 @@ def _placeholder_seq_logprob_error_metrics() -> dict[str, float]:
     }
 
 
-def _resolve_logprob_skip_flags(
-    master_config: MasterConfig,
-) -> tuple[bool, Any, Optional[float]]:
-    """Return (skip_prev, skip_ref, seq_logprob_error_threshold); warn on incompatible combos."""
-    # Skip prev_logprobs computation when force_on_policy_ratio=True
-    # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
-    seq_logprob_error_threshold = master_config.grpo.get(
-        "seq_logprob_error_threshold", None
-    )
-    skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
+def _resolve_logprob_skip_flags(master_config: MasterConfig) -> tuple[bool, Any]:
+    """Return (skip_prev_logprobs, skip_reference_logprobs); warn on incompatible combos.
+
+    Skip prev_logprobs when force_on_policy_ratio=True unless
+    seq_logprob_error_threshold is set (which requires prev_logprobs).
+    Skip reference_policy_logprobs when
+    ``grpo.skip_reference_policy_logprobs_calculation`` is set.
+    """
     # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
     if (
         master_config.loss_fn.force_on_policy_ratio
-        and seq_logprob_error_threshold is not None
+        and master_config.grpo.get("seq_logprob_error_threshold") is not None
     ):
         warnings.warn(
             "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
             "Computing prev_logprobs anyway for seq-level error masking."
         )
-    # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
     return (
-        skip_prev_logprobs,
+        opd_module._skip_prev_logprobs(master_config),
         master_config.grpo.get("skip_reference_policy_logprobs_calculation"),
-        seq_logprob_error_threshold,
     )
 
 
@@ -2978,11 +2974,12 @@ def grpo_train(
                     metrics_logging_data["content"] = flat_messages["content"]
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
-                (
-                    skip_prev_logprobs,
-                    skip_reference_logprobs,
-                    seq_logprob_error_threshold,
-                ) = _resolve_logprob_skip_flags(master_config)
+                skip_prev_logprobs, skip_reference_logprobs = (
+                    _resolve_logprob_skip_flags(master_config)
+                )
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
 
                 if not (skip_prev_logprobs and skip_reference_logprobs):
                     print("▶ Preparing for logprob inference...", flush=True)
@@ -4361,11 +4358,12 @@ def async_grpo_train(
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)
-                (
-                    skip_prev_logprobs,
-                    skip_reference_logprobs,
-                    seq_logprob_error_threshold,
-                ) = _resolve_logprob_skip_flags(master_config)
+                skip_prev_logprobs, skip_reference_logprobs = (
+                    _resolve_logprob_skip_flags(master_config)
+                )
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
 
                 if not (skip_prev_logprobs and skip_reference_logprobs):
                     print("▶ Preparing for logprob inference...", flush=True)

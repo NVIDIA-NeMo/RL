@@ -392,11 +392,10 @@ class TQPolicy(Policy):
         # logprob deltas + advantages + sample_mask). Caller is responsible
         # for ensuring those columns have been written to TQ before this
         # call (workers + driver delta-writes).
-        # When force_on_policy_ratio=True the loss uses curr_logprobs in
-        # place of prev_logprobs (see ClippedPGLoss), so we drop it from
-        # the fetch instead of forcing the driver to write placeholder
-        # zeros back to TQ.
-        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS
+        # force_on_policy_ratio=True → loss uses curr_logprobs in place
+        # of prev_logprobs, so drop it from the fetch entirely
+        # (dp_client rejects missing fields — see noop adapter).
+        train_fields = DP_TRAIN_FIELDS
         if getattr(loss_fn, "force_on_policy_ratio", False):
             train_fields = tuple(f for f in train_fields if f != "prev_logprobs")
         train_meta = replace(
