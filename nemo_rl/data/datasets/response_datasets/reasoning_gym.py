@@ -51,6 +51,8 @@ class ReasoningGymDataset(RawDataset):
         repeat: int = 1,
         system_prompt_file: str | None = None,
         prompt_style: str | None = None,
+        min_empty: int | None = None,
+        max_empty: int | None = None,
         **kwargs,
     ) -> None:
         self.task_name = task_name
@@ -66,7 +68,16 @@ class ReasoningGymDataset(RawDataset):
             )
             rg = generate_sudoku6x6(size=size, seed=seed)
         else:
-            rg = reasoning_gym.create_dataset(task_name, size=size, seed=seed)
+            cfg_kwargs = {}
+            # Optional difficulty control (e.g. sudoku min/max blank cells); also
+            # bounds 9x9 uniqueness-carve time at dataset build.
+            if min_empty is not None:
+                cfg_kwargs["min_empty"] = min_empty
+            if max_empty is not None:
+                cfg_kwargs["max_empty"] = max_empty
+            rg = reasoning_gym.create_dataset(
+                task_name, size=size, seed=seed, **cfg_kwargs
+            )
         # The rg_entry is stored as a JSON string column because HF Datasets do not
         # round-trip nested dicts cleanly (mirrors nemo_gym_data_processor).
         rows = []

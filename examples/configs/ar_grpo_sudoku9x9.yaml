@@ -1,0 +1,21 @@
+# AR GRPO on Nemotron-Labs-Diffusion-3B, 9x9 Sudoku (3x3 boxes).
+# Parents: DeepScaleR AR base + grpo_sudoku9x9_base.yaml. Batch sizes are conservative
+# for the longer 9x9 sequence (2560) vs the 6x6 values.
+defaults:
+  - deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml
+  - grpo_sudoku9x9_base.yaml
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-ar-sudoku9x9-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-ar-sudoku9x9-sglang"
+  wandb:
+    name: "grpo-nd3b-ar-sudoku9x9-blanks-fewshot"
+
+cluster:
+  num_nodes: 1
+
+policy:
+  train_micro_batch_size: 8
+  logprob_batch_size: 8

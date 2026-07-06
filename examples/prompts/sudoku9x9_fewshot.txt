@@ -1,0 +1,55 @@
+You are solving 9x9 Sudoku puzzles. Each row, each column, and each 3x3 box must contain the digits 1-9 exactly once.
+
+Reason step by step inside <think> </think> tags, then output ONLY the completed 9x9 grid inside <answer> </answer> tags, formatted as 9 rows of space-separated digits with rows separated by newlines.
+
+Example 1
+Puzzle:
+_ 5 4 6 1 7 8 9 2
+9 _ _ 5 2 _ 1 4 6
+_ 6 2 _ 9 4 7 5 3
+4 9 _ _ 6 5 2 _ 8
+_ 2 _ _ _ 8 6 _ 9
+_ 1 8 2 7 9 _ 3 5
+5 _ 9 7 8 2 3 6 1
+2 _ 1 9 4 6 5 8 7
+8 7 6 3 _ _ 9 2 4
+<think>
+Fill each blank with the digit missing from its row, its column, and its 3x3 box, starting with the most constrained cells and propagating. Row 1 already has 5,4,6,1,7,8,9,2, so its blank takes 3; column 1 then resolves down the grid, and the remaining cells follow by the same elimination until every row, column, and box holds 1-9 once.
+</think>
+<answer>
+3 5 4 6 1 7 8 9 2
+9 8 7 5 2 3 1 4 6
+1 6 2 8 9 4 7 5 3
+4 9 3 1 6 5 2 7 8
+7 2 5 4 3 8 6 1 9
+6 1 8 2 7 9 4 3 5
+5 4 9 7 8 2 3 6 1
+2 3 1 9 4 6 5 8 7
+8 7 6 3 5 1 9 2 4
+</answer>
+
+Example 2
+Puzzle:
+6 7 4 3 1 _ 8 _ 5
+_ 9 3 5 _ _ 4 7 1
+5 8 1 9 4 7 _ _ _
+8 3 2 1 5 6 9 4 _
+7 1 9 8 2 4 5 3 6
+4 _ _ _ 3 _ _ 1 _
+9 5 8 _ 7 _ 6 _ 3
+3 2 7 _ _ 5 1 8 4
+1 4 6 2 _ _ 7 5 9
+<think>
+Scan for cells whose row, column, and 3x3 box leave only one candidate and fill those first, then repeat. Row 1 is missing 2 and 9; column 6 already contains 9, so the row-1 blank there is 2 and the other is 9. Continue this elimination across all rows, columns, and 3x3 boxes until the grid is complete.
+</think>
+<answer>
+6 7 4 3 1 2 8 9 5
+2 9 3 5 6 8 4 7 1
+5 8 1 9 4 7 3 6 2
+8 3 2 1 5 6 9 4 7
+7 1 9 8 2 4 5 3 6
+4 6 5 7 3 9 2 1 8
+9 5 8 4 7 1 6 2 3
+3 2 7 6 9 5 1 8 4
+1 4 6 2 8 3 7 5 9
+</answer>

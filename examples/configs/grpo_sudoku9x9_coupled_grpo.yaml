@@ -1,0 +1,20 @@
+# CoupledGRPO on Nemotron-Labs-Diffusion-3B, 9x9 Sudoku (3x3 boxes).
+# Parents: coupled_grpo base ([noisy|clean] pair) + grpo_sudoku9x9_base.yaml.
+defaults:
+  - deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron.yaml
+  - grpo_sudoku9x9_base.yaml
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-coupled_grpo-sudoku9x9-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-coupled_grpo-sudoku9x9-sglang"
+  wandb:
+    name: "grpo-nd3b-coupled_grpo-sudoku9x9-blanks-fewshot"
+
+cluster:
+  num_nodes: 4
+
+policy:
+  train_micro_batch_size: 4
+  logprob_batch_size: 4

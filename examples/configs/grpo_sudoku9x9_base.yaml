@@ -1,0 +1,44 @@
+# Shared 9x9 Sudoku task settings (3x3 boxes, digits 1-9, blanks-only reward + few-shot),
+# inherited by the per-algorithm 9x9 configs. Uses reasoning_gym's native "sudoku" generator.
+# ~6.7e21 valid grids -> unmemorizable; the hardest variant. Blanks reduced to 20-35 (vs the
+# reasoning_gym 30-50 default) for learnability on a first run AND to bound the 9x9 uniqueness-
+# carve time at dataset build (stays well under the idle-GPU watchdog).
+grpo:
+  val_at_start: true
+  max_val_samples: 1024   # >= validation size(128) * repeat(4) = 512 avg@4 gens
+
+policy:
+  max_total_sequence_length: 2560   # ~1071 few-shot prompt + 1024 generation
+  generation:
+    max_new_tokens: 1024            # 9x9 answer ~161 tok; room for reasoning (div by 16 and 32)
+
+data:
+  _override_: true
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  max_input_seq_length: 1280        # 9x9 few-shot prompt ~1071 tok
+  train:
+    dataset_name: sudoku
+    size: 3000                      # small: keep 9x9 dataset-build under the idle-GPU watchdog
+    seed: 1
+  validation:
+    dataset_name: sudoku
+    size: 128
+    seed: 2
+    repeat: 4                       # avg@4 (128 distinct puzzles x 4 = 512 val gens; gen is 2x 6x6)
+  default:
+    prompt_file: null
+    system_prompt_file: examples/prompts/sudoku9x9_fewshot.txt
+    processor: "reasoning_gym_data_processor"
+    env_name: "reasoning_gym"
+    prompt_style: "sudoku_answer_tag"
+    enable_thinking: true
+    min_empty: 20                   # medium 9x9 difficulty (reasoning_gym default is 30-50)
+    max_empty: 35
+
+env:
+  reasoning_gym:
+    task: "sudoku"
+    reward_mode: "sudoku_blanks"
+    answer_format_penalty: 0.5
