@@ -55,7 +55,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
 from nemo_rl.algorithms.single_controller_utils.utils import (
-    aggregate_step_metrics,
+    aggregate_step_metrics_multi_minibatch,
     fields_for_put,
     reduce_advantage_pump_metrics,
     squeeze_trailing_unit_dim,
@@ -564,11 +564,10 @@ class SingleControllerArealActor:
                     partition_id=self._partition_id,
                 )
 
-                # Reduce the per-minibatch finish results through the EXISTING
-                # metrics path (no new helper). The last minibatch's metrics carry
-                # the step-level scalars (lr/wd after the final scheduler.step,
-                # global valid seqs/toks); aggregate_step_metrics flattens them.
-                step_metrics = aggregate_step_metrics(step_results[-1])
+                # Reduce every per-minibatch finish result into one RL-step view.
+                # LR/WD come from the final optimizer result; token counts and
+                # FLOPs span the whole list for correct throughput accounting.
+                step_metrics = aggregate_step_metrics_multi_minibatch(step_results)
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )

@@ -132,9 +132,29 @@ class _FailingTrainer(_RecordingTrainer):
         self._mb_count += 1
 
 
+class _MetricTrainer(_RecordingTrainer):
+    """Return a distinct metric payload for each finished minibatch."""
+
+    def __init__(self, events: list, results: list[dict]) -> None:
+        super().__init__(events)
+        self._results = list(results)
+
+    def finish_train_step(self, ep) -> dict:
+        self.events.append(("finish_train_step", ep))
+        return self._results.pop(0)
+
+
 class _NullLogger:
     def log_metrics(self, *args, **kwargs) -> None:
         pass
+
+
+class _RecordingLogger:
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict, dict]] = []
+
+    def log_metrics(self, metrics, **kwargs) -> None:
+        self.calls.append((dict(metrics), kwargs))
 
 
 class _ArealHelper:
@@ -473,8 +493,8 @@ def test_tail_drop_clear_samples_uses_full_unaligned_batch_ids():
 
 # NOTE (intentionally NOT tested here): a collected batch SMALLER than one
 # minibatch is trimmed to zero by ``_dp_align_batch``, leaving ``step_results``
-# empty; the publish path then evaluates ``aggregate_step_metrics(step_results[-1])``
-# (single_controller_areal.py:544), which raises IndexError on an empty list.
+# empty; the publish path then passes that empty list to
+# ``aggregate_step_metrics_multi_minibatch``, which raises ``ValueError``.
 # This is a latent edge in the controller, not a property to assert as "graceful";
 # in production ``train_global_batch_size`` divides ``rl_step_samples`` so the
 # common path is exact and this never trips. Flagged in the report, not encoded
@@ -578,6 +598,62 @@ def test_publish_happens_once_after_minibatch_loop():
     sync = _ep_index(events, "sync_weights")
     assert len(clear) == 1 and len(sync) == 1
     assert max(finishes) < clear[0] < sync[0]
+
+
+def test_publish_aggregates_metrics_from_every_minibatch():
+    """The publish path must pass all finish results to the shared reducer."""
+    events: list = []
+    trainer = _MetricTrainer(
+        events,
+        results=[
+            {
+                "loss": 2.0,
+                "grad_norm": 4.0,
+                "total_flops": 10.0,
+                "all_mb_metrics": {
+                    "lr": [1.0e-4],
+                    "wd": [0.01],
+                    "global_valid_toks": [100.0],
+                    "custom_sum": [1.0],
+                },
+            },
+            {
+                "loss": 6.0,
+                "grad_norm": 8.0,
+                "total_flops": 20.0,
+                "all_mb_metrics": {
+                    "lr": [2.0e-4],
+                    "wd": [0.02],
+                    "global_valid_toks": [200.0],
+                    "custom_sum": [2.0],
+                },
+            },
+        ],
+    )
+    helper = _ArealHelper(
+        minibatch_size=4,
+        max_num_steps=1,
+        batches=[_make_batch(8)],
+        trainer=trainer,
+        events=events,
+    )
+    logger = _RecordingLogger()
+    helper._logger = logger
+
+    _run(helper)
+
+    train_metrics = next(
+        metrics for metrics, kwargs in logger.calls if kwargs["prefix"] == "train"
+    )
+    assert train_metrics["loss"] == pytest.approx(4.0)
+    assert train_metrics["grad_norm"] == pytest.approx(6.0)
+    assert train_metrics["total_flops"] == pytest.approx(30.0)
+    assert train_metrics["global_valid_toks"] == pytest.approx(300.0)
+    # Summed mb keys rescale by 1/M in aggregate_step_metrics_multi_minibatch
+    # (each result's list already sums to its own minibatch's mean).
+    assert train_metrics["custom_sum"] == pytest.approx((1.0 + 2.0) / 2)
+    assert train_metrics["lr"] == pytest.approx(2.0e-4)
+    assert train_metrics["wd"] == pytest.approx(0.02)
 
 
 def test_clear_samples_uses_full_batch_sample_ids():
