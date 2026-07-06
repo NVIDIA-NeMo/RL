@@ -364,7 +364,7 @@ class TQPolicy(Policy):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
-        train_fields: Optional[tuple[str, ...]] = None,
+        train_fields: tuple[str, ...] = DP_TRAIN_FIELDS,
     ) -> dict[str, Any]:
         """1-hop counterpart to :meth:`train`.
 
@@ -394,9 +394,7 @@ class TQPolicy(Policy):
         # for ensuring those columns have been written to TQ before this
         # call (workers + driver delta-writes).
         # Caller may narrow the fetch schema (e.g. drop prev_logprobs
-        # when force_on_policy_ratio=True); default to DP_TRAIN_FIELDS.
-        if train_fields is None:
-            train_fields = DP_TRAIN_FIELDS
+        # when force_on_policy_ratio=True).
         train_meta = replace(
             meta,
             fields=fields_with_optional_routed_experts(
