@@ -160,7 +160,35 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Quick Start
 
-Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends. 
+> [!TIP]
+> **Recommended:** Use the pre-built NGC container to skip manual system dependency setup. The container ships with CUDA, cuDNN, vLLM, and SGLang already installed.
+>
+> ```sh
+> git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
+> cd nemo-rl
+> docker run --rm -it \
+>   -u root \
+>   --runtime=nvidia \
+>   --gpus all \
+>   --shm-size=64g \
+>   --ulimit memlock=-1 \
+>   -v $PWD:/opt/nemo-rl \
+>   -v ${HF_HOME:-$HOME/.cache/huggingface}:/hf_home \
+>   -e HF_HOME=/hf_home \
+>   -e HF_TOKEN \
+>   -e WANDB_API_KEY \
+>   -w /opt/nemo-rl \
+>   nvcr.io/nvidia/nemo-rl:v0.6.0 \
+>   bash
+> ```
+>
+> Then inside the container: `uv run python examples/run_grpo.py`
+>
+> See the [Installation guide](docs/about/installation.md#docker-quickstart) for details.
+
+### Bare-Metal Quick Start
+
+Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends.
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.

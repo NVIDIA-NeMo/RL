@@ -1,5 +1,51 @@
 # Installation and Prerequisites
 
+## Docker Quickstart
+
+The fastest way to get started is with the pre-built NGC container, which includes all system dependencies (CUDA, cuDNN, vLLM, SGLang) pre-installed and removes the need for manual system-level setup.
+
+```sh
+# Pull the latest stable release
+docker pull nvcr.io/nvidia/nemo-rl:v0.6.0
+
+# Clone the repo (needed to mount your source into the container)
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
+cd nemo-rl
+
+# Launch the container
+docker run --rm -it \
+  -u root \
+  --runtime=nvidia \
+  --gpus all \
+  --shm-size=64g \
+  --ulimit memlock=-1 \
+  -v $PWD:/opt/nemo-rl \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/hf_home \
+  -e HF_HOME=/hf_home \
+  -e HF_TOKEN \
+  -e WANDB_API_KEY \
+  -w /opt/nemo-rl \
+  nvcr.io/nvidia/nemo-rl:v0.6.0 \
+  bash
+```
+
+Once inside the container, run any training command directly:
+
+```sh
+uv run python examples/run_grpo.py
+```
+
+> [!NOTE]
+> `HF_TOKEN` and `WANDB_API_KEY` are forwarded from your shell environment. Set them before launching the container if you need authenticated model downloads or W&B logging.
+
+For instructions on building your own image (e.g. from a custom branch), see the [Docker documentation](../docker.md).
+
+---
+
+## Bare-Metal Installation
+
+If you prefer to run outside of a container, follow the steps below to set up your environment manually.
+
 ## Clone the Repository
 
 Clone **NeMo RL** with submodules:
