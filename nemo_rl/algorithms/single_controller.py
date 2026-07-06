@@ -73,6 +73,24 @@ TOKEN_MASK_FIELD = "token_mask"
 SAMPLE_MASK_FIELD = "sample_mask"
 
 
+class StubRefitConfig(BaseModel):
+    """No-op refit backend for dry runs and tests."""
+
+    impl: Literal["stub"] = "stub"
+
+
+class NcclRefitConfig(BaseModel):
+    """NCCL weight-broadcast refit backend.
+
+    NOTE: addr/port currently have no readers; they're reserved for the
+    NCCL transport that lands with weight_sync wiring in a follow-up PR.
+    """
+
+    impl: Literal["nccl"] = "nccl"
+    addr: str = "127.0.0.1"
+    port: Optional[int] = None
+
+
 class SingleControllerConfig(BaseModel, extra="allow"):
     """Configuration for SingleController.
 
@@ -129,14 +147,12 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     # Diagnostics
     diagnostics: bool = False
 
-    # Weight transport backend ("stub" for dry-run, "nccl" for production).
-    # NOTE: weight_nccl_addr / weight_nccl_port currently have no readers;
-    # they're reserved for the NCCL transport that lands with weight_sync
-    # wiring in a follow-up PR. Kept here so the config surface doesn't
-    # churn when that arrives.
-    weight_transport: str = "stub"
-    weight_nccl_addr: str = "127.0.0.1"
-    weight_nccl_port: Optional[int] = None
+    # Refit (weight transport) backend. Discriminated on ``impl`` so each
+    # backend carries only its own knobs and pydantic narrows the type at
+    # construction — not every algorithm/deployment uses NCCL.
+    refit_cfg: StubRefitConfig | NcclRefitConfig = Field(
+        default_factory=StubRefitConfig, discriminator="impl"
+    )
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -272,7 +288,7 @@ class SingleControllerActor:
             cfg.max_weight_staleness_versions,
             cfg.max_buffered_rollouts,
             cfg.max_inflight_prompts,
-            cfg.weight_transport,
+            cfg.refit_cfg.impl,
         )
 
     def _timed(self, label: str) -> Any:
