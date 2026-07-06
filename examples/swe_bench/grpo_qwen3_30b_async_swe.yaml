@@ -249,6 +249,7 @@ policy:
         session_ttl_seconds: 900
         stability_margin_tokens: 8
         min_chunk_chars: 256
+        snapshot_poll_interval_seconds: 0.1
         flush_interval_seconds: 0.25
         request_timeout_seconds: 60
       http_server_serving_chat_kwargs:
@@ -373,6 +374,8 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: false
   nemo_gym:
+    is_trajectory_collection: false
+    trajectory_collection_batch_size: null
     streaming_tool_call: *streaming_tool_call
     skip_venv_if_present: true
     port_range_low: 15001

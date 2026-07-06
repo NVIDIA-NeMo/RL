@@ -28,10 +28,12 @@ OpenHands checkout used by the SWE harness:
 - Tool completion closes the speculative request after exact final-prefix
   validation. The next model turn still uses the unchanged normal chat endpoint.
 
-The OpenHands integration is stored as
-`responses_api_agents/swe_agents/patches/streaming_tool_call.patch` in the Gym
-submodule. The setup path applies it to both new and cached compatible
-OpenHands checkouts.
+The OpenHands integration is stored as the base
+`responses_api_agents/swe_agents/patches/streaming_tool_call.patch`, followed
+by the incremental `streaming_tool_call_observability.patch` and
+`streaming_tool_call_admission_observability.patch` in the Gym submodule. The
+setup path applies the compatible missing suffix of that patch chain to a new
+or cached checkout without forcing a venv rebuild.
 
 The following items from the broader design are not implemented in v1:
 
@@ -310,6 +312,15 @@ cumulative command-output snapshots from its existing polling loop and still
 returns the identical final observation. A push transport can replace polling
 later without changing the prefill protocol.
 
+OpenHands currently produces snapshots every 50 ms. The consumer's
+`snapshot_poll_interval_seconds` is separately configurable: the production
+default remains 100 ms to preserve the original request rate, while 50 ms is
+the only faster setting worth evaluating with the current producer. Polling
+below 50 ms cannot discover new producer snapshots and only adds redundant
+HTTP reads. This cadence is deliberately independent of
+`flush_interval_seconds`, which controls later streaming appends rather than
+the first admission decision.
+
 The callback must receive observation-like content, not raw PTY bytes. This
 keeps cumulative tokenization candidates aligned with the formatting that will
 eventually reach `ConversationMemory`. Completion metadata remains final-only
@@ -415,6 +426,7 @@ policy:
         session_ttl_seconds: 900
         stability_margin_tokens: 8
         min_chunk_chars: 256
+        snapshot_poll_interval_seconds: 0.1
         flush_interval_seconds: 0.25
         request_timeout_seconds: 60
 
@@ -430,6 +442,12 @@ keys do not gain separate hidden defaults in Python.
 
 V1 exports these per-sample metrics through the SWE agent result and W&B:
 
+- eligible shell actions whose model-response context was recovered,
+- eligible actions skipped because no two stable append-only snapshots arrived,
+- a snapshot-admission funnel: polls, changed revisions, non-empty snapshots,
+  and snapshots at or above `min_chunk_chars`,
+- mutually exclusive no-session categories: no output, one snapshot, below the
+  character threshold, or tool completion before admission,
 - sessions started,
 - prefill requests and accepted prefill tokens,
 - completed chunks and discarded dummy tokens,
@@ -438,13 +456,25 @@ V1 exports these per-sample metrics through the SWE agent result and W&B:
 - aggregate client-side streaming request time.
 
 The vLLM metrics logger also separates streaming prefill and dummy-token work
-from ordinary generation token accounting.
+from ordinary generation token accounting. It exports the following cumulative
+per-replica timelines through `generation_metrics`:
+
+- `streaming_tool_call_prefill_tokens`,
+- `streaming_tool_call_dummy_tokens`,
+- `prefix_cache_queries`, and
+- `prefix_cache_hits`.
+
+The prefix-cache counters use token units. Compute interval values by
+differencing adjacent samples; interval APC hit rate is
+`delta(prefix_cache_hits) / delta(prefix_cache_queries)`. The counters include
+all vLLM requests on the replica, so they measure aggregate cache behavior and
+do not by themselves attribute a hit to one streaming session.
 
 The following planned observability is not implemented yet:
 
-- eligible and enabled tool calls,
-- fallback count and reason,
-- received shell snapshots and bytes,
+- enabled tool calls by action type,
+- fallback reason labels (the aggregate fallback count is implemented),
+- snapshot byte distributions,
 - cumulative-tokenizer CPU time,
 - stable and committed token distributions,
 - chunk size distribution,
@@ -467,6 +497,13 @@ The following planned observability is not implemented yet:
   invalidation behavior is covered.
 - Close cancels an in-flight manager append without waiting for engine output.
 - Engine failures reach the waiting append, and stability holdback is enforced.
+- The metrics sampler records vLLM prefix-cache query/hit counters and streaming
+  prefill/dummy-token totals, and the generation layer preserves every worker
+  metric for W&B logging.
+- The OpenHands integration distinguishes eligible shell actions from actions
+  skipped because they completed without two stable append-only snapshots.
+- Cached OpenHands checkouts apply the base integration and observability patches
+  independently, so adding metrics does not force a venv rebuild.
 - A worker lifecycle call from a second asyncio loop is marshalled to the
   manager's HTTP-server loop before active sessions are cancelled and awaited.
 - Refit preparation failure prevents training and inference weight-transfer
@@ -496,9 +533,14 @@ metrics remain zero and that streaming failures fail open.
 The full-workload run below additionally covers five async training steps and
 five in-flight refits with active streaming sessions.
 
+A controlled single-replica live-vLLM test now also measures the final
+authoritative request's `RequestOutput.num_cached_tokens`. It verifies cold and
+warm controls, then compares immediate and delayed final requests after the
+same streaming prefill. This distinguishes actual APC reuse from a prefix check
+or TTFT-only inference.
+
 ### Remaining tests
 
-- Report final APC cached-token reuse for a controlled prompt.
 - Compare final prompt IDs, generated IDs, and log probabilities against a
   deterministic baseline within existing tolerances.
 - Add true incremental-encoding tests for Unicode and BPE split boundaries if
@@ -508,6 +550,21 @@ five in-flight refits with active streaming sessions.
 - Run larger repeated accuracy and throughput comparisons.
 
 ### Reproducing the end-to-end smoke
+
+Run the controlled APC check on an allocated GPU node with the same vLLM and
+FlashAttention environment as the production recipe:
+
+```bash
+uv run examples/swe_bench/verify_streaming_tool_call_apc.py
+```
+
+The script defaults to Qwen3-0.6B, a 4,097-token final prompt, 512-token
+candidates, an eight-token stability margin, and one deterministic dummy token
+per engine acknowledgement. It exits nonzero unless the cold and warm controls
+behave correctly, the committed prefix is immediately reusable, and adding a
+100 ms cleanup delay does not change the cached-token count. It also enables
+the production `PrometheusStatLogger` and reports the prefix-cache query/hit
+counter delta for each case.
 
 Use `examples/swe_bench/run_grpo_swe2_scale_gen.sh` for paired baseline and
 enabled runs. Validate generation-only behavior before testing async training
@@ -558,6 +615,160 @@ queueing, KV-cache pressure, and cache evictions. A latency improvement that
 reduces aggregate rollout throughput is not sufficient.
 
 ### Current validation evidence
+
+On 2026-07-02, `examples/swe_bench/verify_streaming_tool_call_apc.py` ran on one
+interactive GPU node with vLLM 0.17.1, Qwen3-0.6B, prefix caching enabled,
+FlashAttention, eager execution, and no concurrent requests:
+
+| Case | Committed tokens | Request cached tokens | Counter queries | Counter hits | TTFT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Direct, cold cache | N/A | 0 | 4,097 | 0 | 85.73 ms |
+| Direct, identical warm request | N/A | 4,096 | 4,097 | 4,096 | 11.38 ms |
+| Streaming close, immediate final request | 3,576 | 3,568 | 4,601 | 3,568 | 16.92 ms |
+| Streaming close, final request after 100 ms | 3,576 | 3,568 | 4,601 | 3,568 | 10.46 ms |
+
+Both streaming cases completed seven chunks and drained seven dummy tokens.
+The final prompt passed the exact committed-prefix check, and vLLM reused 3,568
+tokens: the 3,576-token committed prefix rounded down to its 16-token cache
+block boundary. The immediate case does not call the manager's cleanup-yield
+helper. Its cached-token count matching the 100 ms delayed case shows no
+explicit cleanup-barrier dependency in this controlled run. TTFT is included as
+a sanity check only; this eager small-model experiment is validation of cache
+mechanics, not a production performance result. The Prometheus counter deltas
+match the request-level cache evidence: cold increments no hits, the identical
+warm request increments 4,096 hits, and both streaming cases increment 3,568
+hits. The streaming query total also includes the resumable prefill work, which
+is why it is 4,601 rather than the 4,097-token final prompt length.
+
+On 2026-07-02, two production-path diagnostic runs used two nodes, four vLLM
+replicas, eight rollouts of the same R2E-Gym prompt, temperature zero, top-p one,
+and one generation-only GRPO step with streaming enabled:
+
+| Run | Slurm / W&B | Rollout time | Eligible classification | Live streaming | Aggregate APC |
+| --- | --- | ---: | --- | --- | ---: |
+| Before action-level observability | `13352219` / [`8kxr3jyl`](https://wandb.ai/nvidia/swe-benchmark/runs/8kxr3jyl) | 815.8 s | Not recorded | 0 sessions; 0 requests; 0 prefill tokens | 49,073,760 / 49,481,442 (99.1761%) |
+| With action-level observability | `13353745` / [`xg22bezn`](https://wandb.ai/nvidia/swe-benchmark/runs/xg22bezn) | 976.5 s | 709 eligible = 688 no-stable-output + 19 sessions + 2 fallbacks | 38 requests; 1,031,203 prefill tokens; 19 completed chunks | 76,971,504 / 77,323,246 (99.5451%) |
+
+The second run proves the complete production path is active. OpenHands
+reported 19 admitted sessions, 19 completed chunks, 19 discarded dummy tokens,
+and 19 exact final-prefix matches. The vLLM worker timelines independently
+reported the same 1,031,203 prefill tokens and 19 dummy tokens: worker 0 handled
+56,434 prefill tokens and two dummy tokens, worker 2 handled 974,769 prefill
+tokens and 17 dummy tokens, and the other two workers handled no streaming
+prefill. The two fallback events remained fail-open and did not prevent all
+eight rollouts or the GRPO step from completing. The driver logged
+`Async GRPO training complete!`; the later missing-`server_thread` and aiohttp
+cross-loop messages occurred during process teardown.
+
+The classification also explains why a streaming-enabled workload can
+legitimately report zero streaming totals. Most eligible shell actions in the
+observed workload completed before two stable append-only snapshots reached
+the admission threshold: 688 of 709 actions in the instrumented run. The first
+run's zero session count therefore was not sufficient evidence of a broken
+context or vLLM path. Its aggregate APC hit rate was high, but aggregate APC
+includes ordinary model requests and cannot prove streaming reuse on its own.
+
+These two diagnostics are not a performance or accuracy comparison. Although
+they used the same prompt and sampling parameters, their trajectories differed:
+the first averaged 26,277 generated tokens and 117.4 turns per sample, while the
+second averaged 37,140 generated tokens and 157.2 turns. The 160.7-second
+rollout-time difference is therefore confounded by substantially more model
+work in the second run. Both runs had zero reward and zero resolved samples.
+The controlled live-vLLM result above, rather than the aggregate APC rate in
+this table, remains the direct evidence that a final request reuses streamed KV
+blocks.
+
+### Admission coverage and polling experiment
+
+Final tool-output length is a necessary but insufficient condition for
+admission: V1 also needs a second distinct append-only snapshot before the tool
+finishes. A July 2026 scan of persisted final outputs illustrates this
+distinction. Output is capped by OpenHands' final-observation truncation, so
+these are not raw terminal-byte distributions.
+
+| Artifact | Shell outputs | Median chars | Final outputs >=256 chars | Sessions / shell actions | Active trajectories |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SWE-Verified 474, streaming on | 53,659 | 326 | 61.07% | 3,431 / 59,839 (5.73%) | 331 / 474 (69.83%) |
+| R2E diagnostic, eight rollouts of one prompt | 704 | 267 | 51.14% | 19 / 709 (2.68%) | 2 / 8 (25.00%) |
+
+The R2E row is not a dataset-wide estimate: all eight rollouts use the same
+instance. Conditional on becoming active, it has 9.5 sessions per active
+trajectory, close to SWE-Verified's 10.4. The observed difference is therefore
+primarily the probability that a trajectory encounters progressive command
+output, not the number of sessions once it does.
+
+On 2026-07-02, that tuning smoke completed with `min_chunk_chars=256` fixed,
+four vLLM replicas, one prompt expanded to eight rollouts, temperature zero,
+top-p one, and `VLLM_BATCH_INVARIANT=0`. Both arms used the same R2E instance,
+`pandas-dev__pandas-002b2c37f37479532e5186fdb9c97f31630ba5d7`, but the agent
+trajectories diverged despite those fixed inputs. It is therefore a mechanism
+smoke, not an accuracy or end-to-end performance comparison.
+
+| Arm | Slurm / W&B | Slurm elapsed | Reward / resolved | Eligible actions | Sessions / eligible | Polls / eligible | Revisions / eligible | Non-empty snapshots / eligible | >=256 snapshots / eligible |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 ms (default) | `13357509` / [`475b8of1`](https://wandb.ai/nvidia/swe-benchmark/runs/475b8of1) | 1,276 s | 1 / 1 | 898 | 5 / 898 (0.557%) | 2.89 | 1.24 | 0.72 | 0.31 |
+| 50 ms | `13357510` / [`63x28shr`](https://wandb.ai/nvidia/swe-benchmark/runs/63x28shr) | 1,314 s | 0 / 0 | 585 | 2 / 585 (0.342%) | 5.18 | 1.30 | 0.84 | 0.38 |
+
+The faster consumer did observe more snapshots per eligible action: revisions
+increased by 5.1%, non-empty snapshots by 16.3%, and at-or-above-threshold
+snapshots by 22.3%. That is the expected mechanical effect of matching the
+50 ms producer cadence. It did **not** increase admission in this one-prompt
+smoke: the trajectory-dependent session rate was lower, and the two arms had
+different action counts and rewards. In both arms every admitted session had a
+completed chunk, a discarded dummy token, and an exact final-prefix match
+(5/5 at 100 ms; 2/2 at 50 ms).
+
+The default consequently remains 100 ms. The next decision-quality experiment
+should replay fixed command-output traces or use a broader fixed evaluation
+set, then compare sessions per eligible action, prefix-match rate, streaming
+overhead, and final model-call interval. Do not lower the interval below 50 ms
+until the producer cadence changes.
+
+The 474-instance SWE-Verified subset whose prior four rollouts did not time out
+is available at
+`results/swebench_verified/swebench_verified_no_timeout_observed_474.jsonl`.
+The verified-pair launcher accepts the backward-compatible arm form
+`name:streaming_enabled`, plus an optional per-arm poll interval,
+`name:streaming_enabled:poll_seconds`. The following submits a broader
+streaming-on 100 ms / 50 ms admission comparison. Each arm uses 32 generation
+replicas across nine nodes; it is therefore a `batch`-partition workload rather
+than an interactive smoke test.
+
+```bash
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-admission-poll474" \
+VERIFIED_DATA_PATH=results/swebench_verified/swebench_verified_no_timeout_observed_474.jsonl \
+EXPECTED_COUNT=474 \
+NUM_VLLM_REPLICAS=32 \
+TRAJECTORY_COLLECTION_BATCH_SIZE=128 \
+VLLM_BATCH_INVARIANT=0 \
+PAIR_ARMS="poll100:1:0.1 poll050:1:0.05" \
+SBATCH_ACCOUNT=nemotron_sw_post \
+SBATCH_PARTITION=batch \
+bash examples/swe_bench/run_streaming_tool_call_verified_pair.sh
+```
+
+Use `DRY_RUN=1` first to verify the manifest hash and the derived nine-node
+shape without submitting jobs. The launcher keeps `min_chunk_chars=256`; the
+only experimental difference between the two arms is the consumer poll interval.
+
+For a lower-cost fixed-sample validation, build a deterministic 256-instance
+subset from that same no-timeout manifest before submission. The selection is
+hash-ranked by `seed + instance_id`, so both arms receive exactly the same
+instances without relying on file ordering:
+
+```bash
+uv run examples/swe_bench/verified_trajectory_audit.py subset-manifest \
+  --manifest results/swebench_verified/swebench_verified_no_timeout_observed_474.jsonl \
+  --output results/swebench_verified/swebench_verified_no_timeout_observed_256.jsonl \
+  --expected-count 474 \
+  --subset-count 256 \
+  --selection-seed streaming-tool-call-admission-256-v1
+```
+
+Then replace `VERIFIED_DATA_PATH` with the generated 256-row manifest and set
+`EXPECTED_COUNT=256` in the polling-pair command above. The output metadata
+pins both the source and subset SHA-256 values, together with the selection
+seed and selected-ID digest.
 
 On 2026-06-30, the generation-only SWE entrypoint was run with four vLLM
 replicas, eight rollouts, temperature zero, and one GRPO step through the
@@ -693,9 +904,10 @@ The runs exposed two additional non-terminal issues:
 
 ### Phase 0: vLLM feasibility spike
 
-Status: partially complete. Unit and live SWE runs validate resumable input,
-dummy-token draining, cancellation, and lifecycle invalidation. A controlled
-test that reports exact APC cached-token reuse remains.
+Status: complete. Unit and live SWE runs validate resumable input, dummy-token
+draining, cancellation, and lifecycle invalidation. The controlled single-
+replica test additionally confirms exact final-request APC reuse at vLLM cache-
+block granularity, including immediate reuse after session close.
 
 ### Phase 1: OpenHands runtime stream
 
