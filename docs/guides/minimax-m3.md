@@ -13,12 +13,12 @@ validated scope, the reference GRPO recipes, and known limitations.
 
 | Model                | Training backend    | Training parallelism                              | Inference backend | Precision                                       | Status           |
 | -------------------- | ------------------- | ------------------------------------------------- | ----------------- | ----------------------------------------------- | ---------------- |
-| MiniMaxAI/MiniMax-M3 | AutoModel (DTensor) | Expert Parallel (EP) and Pipeline Parallel (PP)   | vLLM              | BF16 training weights with BF16 vLLM generation | Functional Ready |
+| MiniMaxAI/MiniMax-M3 | AutoModel (DTensor) | EP, PP and CP  | vLLM              | BF16 training weights with BF16 vLLM generation | Functional Ready |
 
 Validated scope:
 
 - **Training backend**: [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel).
-- **Training parallelism**: Expert Parallel (EP) and Pipeline Parallel (PP).
+- **Training parallelism**: Expert Parallel (EP), Pipeline Parallel (PP) and Context Parallel (CP).
 - **Inference backend**: [vLLM](https://github.com/vllm-project/vllm).
 - **Precision**: BF16 training weights and BF16 vLLM generation.
 
@@ -61,16 +61,17 @@ Two reference GRPO recipes are provided. Both run non-colocated vLLM generation
 (`generation.colocated.enabled: false`) on the DAPO Math datasets
 (`DAPOMath17K` for training, `DAPOMathAIME2024` for validation).
 
-**EP only — `exp/grpo-minimax-m3-32n8g-non-colocated.yaml`**
-
-- AutoModel (DTensor) training with `expert_parallel_size: 128`.
-- 2048-token maximum sequence length.
-
 **EP + PP — `exp/grpo-minimax-m3-32n8g-non-colocated-fused-adam-pp.yaml`**
 
 - AutoModel (DTensor) training with `expert_parallel_size: 32` and
   `pipeline_parallel_size: 4`.
 - Fused Adam optimizer and a 4096-token maximum sequence length.
+
+**EP + CP — `exp/grpo-m3-32n8g-non-colocated-fused-adam-cp8.yaml`**
+
+- AutoModel (DTensor) training with `expert_parallel_size: 128` and
+  `context_parallel_size: 8`.
+- Fused Adam optimizer and an 8192-token maximum sequence length.
 
 ### 3. Launch
 
@@ -80,40 +81,27 @@ above:
 ```bash
 export NRL_FORCE_REBUILD_VENVS=true
 
-# EP only
-uv run examples/run_grpo.py \
-  --config exp/grpo-minimax-m3-32n8g-non-colocated.yaml
-
 # EP + PP
 uv run examples/run_grpo.py \
   --config exp/grpo-minimax-m3-32n8g-non-colocated-fused-adam-pp.yaml
+
+# EP + CP
+uv run examples/run_grpo.py \
+  --config exp/grpo-m3-32n8g-non-colocated-fused-adam-cp8.yaml
 ```
 
 ### Reference Training Curves
 
-The following curves were produced with the reference recipes above.
+The following curve was produced with the reference recipes above, covering
+both the EP + PP and EP + CP configurations:
 
-EP only (`exp/grpo-minimax-m3-32n8g-non-colocated.yaml`):
-
-![MiniMax-M3 GRPO training curve (EP only)](../assets/minimax_m3_grpo_curve.png)
-
-EP + PP (`exp/grpo-minimax-m3-32n8g-non-colocated-fused-adam-pp.yaml`):
-
-![MiniMax-M3 GRPO training curve (EP + PP)](../assets/minimax_m3_grpo_curve_ep_pp.png)
+![MiniMax-M3 GRPO training curve (EP + PP and EP + CP)](../assets/minimax_m3_grpo_curve.png)
 
 ## Known Issues
 
-- **Sequence length**: The validated configurations cover EP=128 at a 2k
-  sequence length and EP=32 + PP=4 at a 4k sequence length. Longer sequences may
-  OOM and will likely require additional parallelism such as Context Parallel
-  (CP).
 - **Long-run validation**: Current validation covers short training runs only;
   long-run convergence has not been established.
-- **Additional parallelism**: CP and sequence packing are not yet part of the
-  validated MiniMax-M3 training scope.
 
 ## What's Next
 
 - Validate long-run MiniMax-M3 training.
-- Add and validate more training parallelism, especially CP, to support longer
-  contexts.
