@@ -14,9 +14,10 @@
 
 """SingleController: asyncio-based orchestrator for the RL training loop.
 
-SingleController is a CPU-only Ray actor that owns three concurrent asyncio
-pumps and coordinates all other actors via lightweight RPCs. Other actors
-expose methods and wait to be called.
+SingleController is a CPU-only Ray actor that owns two concurrent asyncio
+pumps and coordinates the other components: gen and DataPlane via
+lightweight actor RPCs, and the trainer as a driver-side ``TQPolicy``
+object invoked through ``asyncio.to_thread``.
 
 Key invariant: SC does not run model work. It sends control signals
 (``KVBatchMeta`` and actor handles) and reads metadata. When advantage
@@ -31,7 +32,8 @@ Data flow:
                  → _advantage_pump(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
-                 → trainer.train_from_meta(meta)
+                 → trainer.begin/train_microbatch/finish_train_step (split API,
+                     driver-side TQPolicy via asyncio.to_thread)
                      Trainer → dp_client.get_samples(...)   (via its own client)
                  → dp_client.clear_samples(...)             ← SC clears after train
   _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights()
@@ -309,33 +311,6 @@ class SingleControllerActor:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
         return await obj_ref
 
-    async def _reap_in_flight_nonblocking(
-        self, refs: list[ray.ObjectRef]
-    ) -> list[ray.ObjectRef]:
-        """Drain completed refs without blocking; return still-pending refs.
-
-        Uses ``asyncio.wait`` with ``timeout=0`` so Ray ObjectRefs are checked
-        through their awaitable interface (which is accurate in async actors).
-        ``ray.wait(timeout=0)`` does not always reflect cross-process ref
-        readiness from an async actor, so we avoid it here.
-        """
-        if not refs:
-            return []
-        ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
-        # Yield once so newly-scheduled Tasks can step their ObjectRef
-        # awaitables (asyncio.wait(timeout=0) by itself may return before
-        # the Tasks ever run). Then peek non-blockingly.
-        await asyncio.sleep(0)
-        await asyncio.wait(ref_to_task.values(), timeout=0.0)
-        pending: list[ray.ObjectRef] = []
-        for ref, task in ref_to_task.items():
-            if task.done():
-                task.result()  # surface exceptions; payload ignored
-            else:
-                task.cancel()
-                pending.append(ref)
-        return pending
-
     async def _call_dp(self, method_name: str, **kwargs) -> Any:
         """Call a DataPlaneClient method or a Ray actor exposing that method."""
         method = getattr(self._dp_client, method_name)
@@ -398,22 +373,21 @@ class SingleControllerActor:
         Per step:
           - Lazy ``begin_train_step`` on first ready group.
           - Per ready group: optional ``prepare_logprobs_from_meta`` →
-            ``_advantage_pump`` → ``train_microbatch_from_meta`` (queued).
-          - End-of-step: drain in-flight → ``finish_train_step`` →
+            ``_advantage_pump`` → ``train_microbatch_from_meta``.
+          - End-of-step: ``finish_train_step`` →
             single ``clear_samples`` → ``_sync_weights``.
 
         Concurrency contract
         --------------------
-        SC submits ``train_microbatch_from_meta`` calls without awaiting
-        each result so the sampling loop stays decoupled from GPU pace.
-        Serialization is provided by the trainer actor's mailbox, which
-        requires ``max_concurrency=1`` on ``self._trainer``. The worker's
+        ``self._trainer`` is a driver-side ``TQPolicy`` object (no
+        ``PolicyTrainerActor`` wrapper). Trainer calls run via
+        ``asyncio.to_thread`` and are awaited sequentially, so the worker's
         ``_train_step_state`` accumulators (``local_valid_seqs +=``,
-        ``mb_losses.append``, ``all_mb_metrics.append``) are not
-        concurrency-safe; an async actor or ``max_concurrency>1`` would
-        race them. ``in_flight`` retains ObjectRefs only so
-        ``_reap_in_flight_nonblocking`` can surface exceptions promptly
-        (fast-fail) without blocking the loop.
+        ``mb_losses.append``, ``all_mb_metrics.append``), which are not
+        concurrency-safe, see exactly one call at a time. ``to_thread``
+        keeps the fan-out + internal ``ray.get`` off the event loop so the
+        rollout pump makes progress during trainer calls; exceptions
+        surface at the corresponding ``await``.
         """
         refresh_policy_logprobs = self._cfg.advantage_policy_logprobs_field is not None
         refresh_reference_logprobs = (
@@ -439,7 +413,6 @@ class SingleControllerActor:
             for mb_idx in range(num_minibatches):
                 step_id = f"sc-step-{self._train_steps:06d}-mb-{mb_idx:02d}"
                 groups_dispatched = 0
-                in_flight: list[ray.ObjectRef] = []
                 step_open = False
                 step_min_weight_version: int | None = None
 
@@ -473,16 +446,9 @@ class SingleControllerActor:
                             )
 
                         if group_indices is None:
-                            in_flight = await self._reap_in_flight_nonblocking(
-                                in_flight
-                            )
-                            if (
-                                self._rollout_done
-                                and len(in_flight) == 0
-                                and (
-                                    self._claimed_meta is None
-                                    or self._claimed_meta.size == 0
-                                )
+                            if self._rollout_done and (
+                                self._claimed_meta is None
+                                or self._claimed_meta.size == 0
                             ):
                                 rollout_exhausted = True
                                 break
@@ -497,12 +463,11 @@ class SingleControllerActor:
                             # the TQ partition under the configured field names.
                             # Block here: advantage estimation downstream reads them.
                             with self._timed("prepare_logprobs"):
-                                await self._ray_get(
-                                    self._trainer.prepare_logprobs_from_meta.remote(
-                                        group_meta,
-                                        refresh_policy_logprobs=refresh_policy_logprobs,
-                                        refresh_reference_logprobs=refresh_reference_logprobs,
-                                    )
+                                await asyncio.to_thread(
+                                    self._trainer.prepare_logprobs_from_meta,
+                                    group_meta,
+                                    refresh_policy_logprobs=refresh_policy_logprobs,
+                                    refresh_reference_logprobs=refresh_reference_logprobs,
                                 )
 
                         # Advantage pump
@@ -512,17 +477,18 @@ class SingleControllerActor:
                         if not step_open:
                             # gbs/mbs default to worker-side cfg when None; SC
                             # owns only loss_fn (stable across the whole run).
-                            await self._ray_get(
-                                self._trainer.begin_train_step.remote(
-                                    step_id, self._loss_fn
-                                )
+                            await asyncio.to_thread(
+                                self._trainer.begin_train_step,
+                                step_id,
+                                self._loss_fn,
                             )
                             step_open = True
 
-                        future = self._trainer.train_microbatch_from_meta.remote(
-                            step_id, group_meta
+                        await asyncio.to_thread(
+                            self._trainer.train_microbatch_from_meta,
+                            step_id,
+                            group_meta,
                         )
-                        in_flight.append(future)
                         groups_dispatched += 1
                         self._buffer_capacity.release()
                         self._step_consumed_sample_ids.extend(group_meta.sample_ids)
@@ -533,11 +499,6 @@ class SingleControllerActor:
                                 if step_min_weight_version is None
                                 else min(step_min_weight_version, group_min_v)
                             )
-
-                        in_flight = await self._reap_in_flight_nonblocking(in_flight)
-
-                    for fut in in_flight:
-                        await self._ray_get(fut)
 
                     if not step_open:
                         # No groups consumed this mini-batch — either rollouts
@@ -556,8 +517,8 @@ class SingleControllerActor:
                     # via _sync_weights at end of the outer step. Capture
                     # train_results for the logger emit below.
                     with self._timed("policy_training"):
-                        train_results = await self._ray_get(
-                            self._trainer.finish_train_step.remote(step_id)
+                        train_results = await asyncio.to_thread(
+                            self._trainer.finish_train_step, step_id
                         )
                 except Exception:
                     # Worker may be left with a half-open step (train_microbatch
@@ -567,8 +528,8 @@ class SingleControllerActor:
                     # abort errors so the original exception still surfaces.
                     if step_open:
                         try:
-                            await self._ray_get(
-                                self._trainer.abort_train_step.remote(step_id)
+                            await asyncio.to_thread(
+                                self._trainer.abort_train_step, step_id
                             )
                         except Exception:
                             log.exception(

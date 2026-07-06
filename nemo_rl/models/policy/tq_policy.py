@@ -373,8 +373,8 @@ class TQPolicy(Policy):
         Workers write the per-token tensors back into the TQ partition;
         the Ray return is None. No-op if both flags are False.
 
-        ``PolicyTrainerActor`` wraps this as an actor-callable method so
-        SC can invoke it via ``self._trainer.prepare_logprobs_from_meta.remote``.
+        SingleController invokes this directly on the driver-side
+        ``TQPolicy`` via ``asyncio.to_thread``.
         """
         if refresh_policy_logprobs:
             self.get_logprobs_from_meta(
@@ -489,8 +489,8 @@ class TQPolicy(Policy):
 
     # ── split-API fanout (SC async path) ───────────────────────────────────
     #
-    # Counterpart to :meth:`train_from_meta`, exposed to ``PolicyTrainerActor``
-    # so :class:`SingleControllerActor` can stream microbatches without
+    # Counterpart to :meth:`train_from_meta`, consumed directly by
+    # :class:`SingleControllerActor` so it can stream microbatches without
     # forcing a full-step optimizer.step on every dispatch.
     #
     # Lifecycle (one step open at a time — workers raise on a second
