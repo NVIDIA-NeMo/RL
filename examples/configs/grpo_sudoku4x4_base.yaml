@@ -42,3 +42,6 @@ env:
   reasoning_gym:
     task: "mini_sudoku"
     reward_mode: "sudoku_blanks"
+    # Reward x0.5 unless <answer> is exactly one clean grid (no prose/extra
+    # blocks) -- discourages the model putting reasoning inside <answer>.
+    answer_format_penalty: 0.5

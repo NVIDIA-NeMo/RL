@@ -45,12 +45,47 @@ class ReasoningGymEnvironment(EnvironmentInterface[ReasoningGymMetadata]):
         # "sudoku_blanks": SPG-style reward = fraction of originally-blank cells
         # filled correctly (copying givens earns nothing). Overrides binary_reward.
         self.reward_mode = self.cfg.get("reward_mode", None)
+        # Multiplicative penalty in [0,1] applied to the sudoku_blanks reward when the
+        # model's <answer> is not exactly one clean NxN grid (extra prose/rows, or
+        # multiple <answer> blocks) -- discourages putting reasoning inside <answer>.
+        # 1.0 disables it (default), preserving prior behavior.
+        self.answer_format_penalty = self.cfg.get("answer_format_penalty", 1.0)
         self._score_fns: dict[str, Any] = {}
 
     def _get_score_fn(self, task: str) -> Any:
         if task not in self._score_fns:
             self._score_fns[task] = reasoning_gym.get_score_answer_fn(task)
         return self._score_fns[task]
+
+    @staticmethod
+    def _is_clean_grid(ans: str, n: int) -> bool:
+        """True iff `ans` is exactly n non-empty lines, each n single digits 1..n."""
+        lines = [ln for ln in ans.splitlines() if ln.strip()]
+        if len(lines) != n:
+            return False
+        for ln in lines:
+            toks = ln.split()
+            if len(toks) != n:
+                return False
+            for t in toks:
+                if not (len(t) == 1 and t.isdigit() and 1 <= int(t) <= n):
+                    return False
+        return True
+
+    def _answer_format_factor(
+        self, assistant_text: str, ans: str, rg_entry: dict
+    ) -> float:
+        """1.0 if the <answer> holds exactly one clean grid; else answer_format_penalty.
+        Penalizes reasoning/extra text inside <answer> and multiple <answer> blocks."""
+        if self.answer_format_penalty >= 1.0:
+            return 1.0
+        meta = rg_entry.get("metadata", {}) if isinstance(rg_entry, dict) else {}
+        solution = meta.get("solution")
+        if not solution:
+            return 1.0
+        n = len(solution)
+        clean = self._is_clean_grid(ans, n) and assistant_text.count("<answer>") <= 1
+        return 1.0 if clean else self.answer_format_penalty
 
     def _sudoku_blanks_score(self, ans: str, rg_entry: dict) -> float:
         """SPG-style reward: fraction of originally-blank cells filled correctly."""
@@ -132,6 +167,9 @@ class ReasoningGymEnvironment(EnvironmentInterface[ReasoningGymMetadata]):
             try:
                 if self.reward_mode == "sudoku_blanks":
                     reward = self._sudoku_blanks_score(ans, meta["rg_entry"])
+                    reward *= self._answer_format_factor(
+                        assistant_text, ans, meta["rg_entry"]
+                    )
                 elif self.reward_mode == "countdown_agrpo":
                     reward = self._countdown_agrpo_score(ans, meta["rg_entry"])
                 else:
