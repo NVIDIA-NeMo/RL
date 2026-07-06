@@ -65,6 +65,60 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
 
+_HF_CONFIG_PATCHED = False
+
+
+def _patch_hf_config_double_instantiation():
+    """Patch HF config classes whose __post_init__ fails with Megatron's recursive instantiation.
+
+    Megatron-LM's instantiate_utils recursively instantiates all nested configs
+    that have a _target_ key. Some HF config classes (e.g. Qwen3OmniMoeTalkerConfig)
+    then try to re-instantiate those nested configs in __post_init__ via ** unpacking,
+    which fails because the value is already an object, not a dict.
+
+    This adds isinstance guards so the __post_init__ is a no-op when the nested
+    config is already the correct type.
+    """
+    global _HF_CONFIG_PATCHED
+    if _HF_CONFIG_PATCHED:
+        return
+
+    import transformers
+
+    assert transformers.__version__ < "5.9.0", (
+        f"transformers {transformers.__version__} detected. "
+        "The Qwen3OmniMoeTalkerConfig monkey-patch was written for <5.9.0. "
+        "Check if the upstream __post_init__ double-instantiation bug is fixed "
+        "and remove this patch if so."
+    )
+
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeTalkerCodePredictorConfig,
+        Qwen3OmniMoeTalkerConfig,
+        Qwen3OmniMoeTalkerTextConfig,
+    )
+
+    def _safe_post_init(self, **kwargs):
+        if self.code_predictor_config is None:
+            self.code_predictor_config = Qwen3OmniMoeTalkerCodePredictorConfig()
+        elif not isinstance(
+            self.code_predictor_config, Qwen3OmniMoeTalkerCodePredictorConfig
+        ):
+            self.code_predictor_config = Qwen3OmniMoeTalkerCodePredictorConfig(
+                **self.code_predictor_config
+            )
+
+        if self.text_config is None:
+            self.text_config = Qwen3OmniMoeTalkerTextConfig()
+        elif not isinstance(self.text_config, Qwen3OmniMoeTalkerTextConfig):
+            self.text_config = Qwen3OmniMoeTalkerTextConfig(**self.text_config)
+
+        super(Qwen3OmniMoeTalkerConfig, self).__post_init__(**kwargs)
+
+    Qwen3OmniMoeTalkerConfig.__post_init__ = _safe_post_init
+    _HF_CONFIG_PATCHED = True
+
+
 try:
     from megatron.core.distributed import (
         TorchFullyShardedDataParallel as torch_FSDP,  # noqa: F401 unused-import
@@ -464,6 +518,8 @@ def setup_model_config(
                 "directory not mounted on this node. Please check."
             )
 
+        _patch_hf_config_double_instantiation()
+
         try:
             cfg_from_pretrained = ConfigContainer.from_yaml(
                 pretrained_run_config, mode=InstantiationMode.STRICT
@@ -581,8 +637,8 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         assert config["sequence_packing"]["enabled"], (
             "Sequence Packing must be enabled to use Context Parallelism with MCore."
         )
-        assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
-            "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
+        assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
+            "Context Parallelism is not supported with linear CE fusion loss, please set use_fused_linear_logprobs to false"
         )
 
 
@@ -951,6 +1007,21 @@ def _create_megatron_config(
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
 
+    # Fused linear logprobs run the decoder but read output_layer.weight directly
+    # instead of calling output_layer.forward(). Megatron's distributed-optimizer
+    # overlap_param_gather prefetch chain assumes every param-gather bucket
+    # (including the output layer) is consumed by a module forward; skipping it
+    # leaves a stale param_gather_handle and trips
+    #   assert self.param_gather_handle is None  (param_and_grad_buffer.py)
+    # on the next iteration, so the two are mutually exclusive.
+    if config["megatron_cfg"].get("use_fused_linear_logprobs", False):
+        assert not overlap_param_gather, (
+            "use_fused_linear_logprobs is incompatible with overlap_param_gather: "
+            "the fused forward bypasses output_layer.forward(), leaving a stale "
+            "param_gather_handle in the distributed-optimizer prefetch chain. "
+            "Set policy.megatron_cfg.distributed_data_parallel_config."
+            "overlap_param_gather=false."
+        )
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -1237,9 +1308,9 @@ def setup_model_and_optimizer(
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     setattr(megatron_cfg.model, "_pg_collection", pg_collection)
-    if policy_cfg["megatron_cfg"].get("use_linear_ce_fusion_loss", False):
+    if policy_cfg["megatron_cfg"].get("use_fused_linear_logprobs", False):
         patch_gpt_model_forward_for_linear_ce_fusion(
-            chunk_size=policy_cfg["megatron_cfg"]["linear_ce_fusion_chunk_size"]
+            chunk_size=policy_cfg["megatron_cfg"]["fused_linear_logprobs_chunk_size"]
         )
     model = get_model(
         megatron_cfg.model,
