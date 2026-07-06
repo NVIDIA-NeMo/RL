@@ -156,16 +156,13 @@ class SGLangGeneration(GenerationInterface):
         return ray.get([e.get_base_url.remote() for e in self.rollout_engines])
 
     def _start_engines(
-        self, port_cursors: dict[int, int] | None = None
+        self, port_cursors: dict[int, int] = {}
     ) -> tuple[list, dict[int, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
 
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
         of Ray ObjectRefs and *port_cursors* maps node index -> next free port.
         """
-        if port_cursors is None:
-            port_cursors = {}
-
         num_gpu_per_engine = min(self.num_gpus_per_engine, self.num_gpus_per_node)
         pg = self.pg
         reordered_bundle_indices = self.pg_reordered_bundle_indices
@@ -251,12 +248,12 @@ class SGLangGeneration(GenerationInterface):
         if len(local_all_engines) == 0:
             return [], port_cursors
 
-        gen_port_low = self.sglang_cfg.get(
-            "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
-        )
-        gen_port_high = self.sglang_cfg.get(
-            "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
-        )
+        gen_port_low = self.sglang_cfg.get("port_range_low")
+        if gen_port_low is None:
+            gen_port_low = DEFAULT_GENERATION_PORT_RANGE_LOW
+        gen_port_high = self.sglang_cfg.get("port_range_high")
+        if gen_port_high is None:
+            gen_port_high = DEFAULT_GENERATION_PORT_RANGE_HIGH
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             gpus_per_node=self.num_gpus_per_node,
             sglang_cfg=self.sglang_cfg,

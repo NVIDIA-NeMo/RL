@@ -206,10 +206,6 @@ def _patch_megatron_training_hook_mode() -> None:
 def _patch_sglang_custom_all_reduce_v2_tms_cudagraph() -> None:
     """Backport sglang#27948 for colocated TMS CUDA graph capture.
 
-    This patch refers to and mirrors the upstream fix in
-    https://github.com/sgl-project/sglang/pull/27948, which addresses the
-    issue tracked at https://github.com/radixark/miles/issues/1176.
-
     With ``SGLANG_MEMORY_SAVER_CUDA_GRAPH=true``, custom all-reduce v2 must
     not flag the kernel as capturing. TMS replaces the IPC addresses during
     capture, so the addresses registered while ``set_cuda_graph_capture`` is
@@ -221,9 +217,9 @@ def _patch_sglang_custom_all_reduce_v2_tms_cudagraph() -> None:
         (
             (
                 "from sglang.srt.environ import envs\n",
-                "from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (\n",
+                "from sglang.srt.utils import is_sm100_supported, log_info_on_rank0\n",
                 "from sglang.srt.environ import envs\n"
-                "from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (\n",
+                "from sglang.srt.utils import is_sm100_supported, log_info_on_rank0\n",
             ),
             (
                 "        self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()\n",

@@ -54,7 +54,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     rank_offset=0,
     port_range_low: int = DEFAULT_GENERATION_PORT_RANGE_LOW,
     port_range_high: int = DEFAULT_GENERATION_PORT_RANGE_HIGH,
-    node_port_cursor: dict[int, int] | None = None,
+    node_port_cursor: dict[int, int] = {},
 ):
     # get ports
     # there are 4 ports we need to allocate
@@ -72,12 +72,6 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     _gpus_per_engine = num_gpus_per_engine
     num_engines_per_node = max(1, num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
-
-    # Track per-node port cursors so that different server groups (called
-    # sequentially) never race for the same ports on a given node.  Seeded from
-    # the caller's cursor so successive _start_engines calls keep advancing.
-    if node_port_cursor is None:
-        node_port_cursor = {}
 
     visited_nodes = set()
     for rank, engine in local_all_engines:
@@ -99,8 +93,8 @@ def _allocate_rollout_engine_addr_and_ports_normal(
 
             def port(consecutive=1):
                 nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
+                port = ray.get(
+                    engine._get_current_free_port.remote(
                         port_range_low=port_range_low,
                         port_range_high=port_range_high,
                         consecutive=consecutive,

@@ -86,7 +86,6 @@ class PY_EXECUTABLES:
 #   15001-20000  NeMo Gym HTTP servers       (env.nemo_gym.port_range_low/high)
 #   20001+       vLLM TP/DP rendezvous       (VLLM_PORT env var, 100-port spacing)
 #   25000-28000  Master address / TCPStore    (cluster.master_port_range_low/high)
-#   28001-30000  SGLang router + Prometheus  (dedicated band, see below)
 DEFAULT_GENERATION_PORT_RANGE_LOW = 11001
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 15000
 DEFAULT_GYM_PORT_RANGE_LOW = 15001
@@ -98,14 +97,12 @@ DEFAULT_GYM_PORT_RANGE_HIGH = 20000
 # ensure the range does not overlap with MASTER (25000+) on very large nodes.
 DEFAULT_VLLM_PORT_RANGE_LOW = 20001
 DEFAULT_VLLM_PORTS_PER_ENGINE = 100
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 20001
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 22500
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH + 1
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 25000
 DEFAULT_MASTER_PORT_RANGE_LOW = 25000
 DEFAULT_MASTER_PORT_RANGE_HIGH = 28000
-# SGLang router HTTP + Prometheus ports.  Kept in a dedicated band so the
-# router actor never overlaps the per-node engine port cursor.
-DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 28001
-DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 29000
-DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 29000
-DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 30000
 
 # ---------------------------------------------------------------------------
 # Topology resource keys
@@ -197,9 +194,9 @@ def _get_free_consecutive_ports_local(
     consecutive: int = 1,
     start_port: Optional[int] = None,
 ) -> int:
-    """Find ``consecutive`` contiguous bindable ports in [port_range_low,
-    port_range_high), scanning upward from *start_port*, and return the base.
+    """Find ``consecutive`` contiguous bindable ports and return the base.
 
+    Scans upward from *start_port* within [port_range_low, port_range_high).
     *start_port* lets a caller thread a per-node cursor so successive blocks do
     not overlap. Raises ``RuntimeError`` if no such block exists in the range.
     """

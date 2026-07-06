@@ -164,13 +164,13 @@ class SGLangGenerationWorker:
         return response.json()
 
     @staticmethod
-    def _get_current_node_ip_and_free_port(
+    def _get_current_free_port(
         port_range_low=DEFAULT_GENERATION_PORT_RANGE_LOW,
         port_range_high=DEFAULT_GENERATION_PORT_RANGE_HIGH,
         consecutive=1,
         start_port=None,
     ):
-        return get_current_node_ip(), _get_free_consecutive_ports_local(
+        return _get_free_consecutive_ports_local(
             port_range_low=port_range_low,
             port_range_high=port_range_high,
             consecutive=consecutive,
