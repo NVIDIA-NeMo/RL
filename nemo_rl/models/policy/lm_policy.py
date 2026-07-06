@@ -891,6 +891,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
+    def start_gen_benchmark_keepalive(self, *args: Any, **kwargs: Any) -> None:
+        """Benchmark-only: keep training GPUs non-idle while real training is skipped."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "start_gen_benchmark_keepalive"
+        )
+        ray.get(futures)
+
     def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_for_lp_inference"
@@ -1044,6 +1051,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             kv_scales=kv_scales,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
+        return futures
+
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Publish weights to ModelExpress for NIXL RDMA refit (v2 path)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "stream_weights_via_mx",
+            version=int(version),
+            mx_config=mx_config,
+            kv_scales=kv_scales,
+        )
         return futures
 
     def offload_before_refit(self) -> None:

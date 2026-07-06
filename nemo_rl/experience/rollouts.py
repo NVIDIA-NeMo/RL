@@ -17,7 +17,6 @@
 
 import asyncio
 import copy
-import json
 import math
 import statistics
 import warnings
@@ -30,7 +29,7 @@ import ray
 import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
-from wandb import Histogram, Table
+from wandb import Histogram
 
 from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
@@ -334,7 +333,8 @@ async def generate_responses_async(
 
     # Check if this is a supported inference engine with async generation enabled.
     # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``; vLLM and
-    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag.
+    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag;
+    # Dynamo is intrinsically async (HTTP-only).
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -352,6 +352,8 @@ async def generate_responses_async(
                 "async_engine", False
             )
         )
+    elif backend == "dynamo":
+        use_async_generation = True
     else:
         use_async_generation = False
 
@@ -359,8 +361,8 @@ async def generate_responses_async(
         "Async generation is not enabled. For SGLang, set "
         "policy.generation.use_async_rollouts=True. For vLLM, set "
         "policy.generation.vllm_cfg.async_engine=True. For Megatron, set "
-        "policy.generation.mcore_generation_config.async_engine=True. The "
-        "generation backend must also implement generate_async."
+        "policy.generation.mcore_generation_config.async_engine=True. For Dynamo, "
+        "async is always on. The generation backend must also implement generate_async."
     )
 
     # Use async generation with per-sample streaming
@@ -1110,9 +1112,10 @@ async def run_sample_multi_turn_rollout(
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
-        # Pass-through per-worker per-turn accounting for aggregation at batch level
-        "per_worker_token_counts": per_worker_token_counts,
     }
+    if per_worker_token_counts:
+        # Pass-through per-worker per-turn accounting for aggregation at batch level.
+        sample_metrics["per_worker_token_counts"] = per_worker_token_counts
 
     return final_sample_state, sample_metrics
 
@@ -1283,11 +1286,11 @@ def run_async_multi_turn_rollout(
         }
 
         # Calculate per-worker token counts
-        if "per_worker_token_counts" in all_sample_metrics[0]:
-            per_worker_token_counts = {}
-            for m in all_sample_metrics:
-                for k, v in m["per_worker_token_counts"].items():
-                    per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
+        per_worker_token_counts = {}
+        for m in all_sample_metrics:
+            for k, v in m.get("per_worker_token_counts", {}).items():
+                per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
+        if per_worker_token_counts:
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
         # Collect ISL, OSL, and ISL+OSL metrics for all samples
@@ -1927,11 +1930,15 @@ def run_async_nemo_gym_rollout(
                         )
                     )
 
-            # Log the full result
-            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
-            per_agent_metrics[f"{agent_name}/full_result"] = Table(
-                data=to_log, columns=["Full result"]
-            )
+            # NOTE: previously logged the full per-rollout trajectory JSON as a
+            # wandb Table ({agent}/full_result). For SWE2 that is ~700MB/step
+            # (131k-token multi-turn trajectories x 64) — it 500-errors on upload
+            # and STARVES the metric-history commit (the dashboard shows "no data
+            # for the selected runs"; only the summary lands). should_log_nemo_gym_
+            # responses does NOT gate this async path (grpo.py only pops full_result
+            # in the non-async branch), so it logged unconditionally. Dropped to keep
+            # the history committing. Re-add gated on should_log_nemo_gym_responses
+            # AND sampled (a handful of rows) if you need trajectory inspection.
 
         rollout_metrics.update(per_agent_metrics)
 

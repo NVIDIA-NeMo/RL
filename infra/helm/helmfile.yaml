@@ -61,3 +61,17 @@ releases:
   version: 0.11.1
   wait: true
 
+#
+# Dynamo Platform: dynamo-operator (reconciles DynamoGraphDeployment CRs into
+# pods), bundled etcd + NATS for service discovery / event plane. Required when
+# any nrl-k8s recipe sets `infra.dynamo.<key>`.
+#
+- name: dynamo-platform
+  namespace: dynamo-platform
+  createNamespace: true
+  chart: oci://ghcr.io/ai-dynamo/dynamo-platform
+  version: 1.2.0
+  wait: true
+  values:
+  - values/dynamo-platform.yaml
+

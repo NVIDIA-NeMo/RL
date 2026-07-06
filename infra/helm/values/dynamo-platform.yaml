@@ -1,0 +1,24 @@
+# Dynamo Platform values for the nrl-k8s helmfile.
+#
+# This integrates with the kai-scheduler we already install (v0.14.0) and uses
+# the platform chart's bundled etcd + NATS so the operator has the service
+# discovery and event plane it expects out of the box.
+#
+# To enable Grove (multi-node DGDs), flip both `install` and `enabled` under
+# `global.grove`. Off here because Phase 2 only ships single-node DGDs.
+
+global:
+  etcd:
+    install: true
+  kai-scheduler:
+    install: false   # already installed by the kai-scheduler release in helmfile.yaml
+    enabled: true    # the operator should still inject schedulerName + queue labels into DGD pods
+  grove:
+    install: false
+    enabled: false
+
+dynamo-operator:
+  enabled: true
+  upgradeCRD: true   # apply CRDs via the pre-install/pre-upgrade hook Job
+  nats:
+    enabled: true

@@ -1,0 +1,58 @@
+# Phase 0.5 DGD patch for kavin/nemorl-mx-worker.
+#
+# Applies:
+#   1. New VllmDecodeWorker image (Phase 0.5 arm64 build with pinned-CPU
+#      staging support in nixl_transfer + patched dynamo extension).
+#   2. MX_MEGATRON_BUFFER_LOC=host env var to opt into the pinned-CPU
+#      buffer cache.
+#
+# Apply with:
+#   kubectl -n kavin patch dgd nemorl-mx-worker \
+#     --type merge \
+#     -p "$(cat phase_0_5_manifest_patch.yaml)"
+#
+# The DGD operator recreates PodCliques + pods with the new spec.
+# Since we're modifying only the VllmDecodeWorker service, the trainer
+# and other services aren't touched.
+spec:
+  services:
+    VllmDecodeWorker:
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidian/dynamo-dev/model-express-dev:phase-0.5-3623f45
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: HF_HOME
+              value: "/mnt/rl-workspace/kavink/hf-cache"
+            - name: NIXL_PLUGIN_DIR
+              value: "/opt/dynamo/venv/lib/python3.12/site-packages/nixl_cu12.libs/nixl"
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: VLLM_USE_V1
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.kavin.svc.cluster.local:8001"
+            - name: UCX_TLS
+              value: "rc,cuda_copy"
+            - name: NIXL_UCX_TLS
+              value: "rc,cuda_copy"
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            - name: UCX_CUDA_COPY_DMABUF
+              value: "yes"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_IB_GID_INDEX
+              value: "3"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            # PHASE 0.5 NEW: opt into pinned-CPU buffer cache
+            # (Istvan 2.5). Frees ~model-shard-sized HBM at the cost of
+            # an async H2D copy per refit cycle. Falls back to
+            # "device" (HBM) if unset — this line is what activates
+            # the new code path.
+            - name: MX_MEGATRON_BUFFER_LOC
+              value: "host"

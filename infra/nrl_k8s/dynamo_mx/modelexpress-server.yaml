@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# ModelExpress server (Rust + Redis) — single Deployment per namespace, reachable
+# from both the trainer Ray cluster and the DGD worker pods at:
+#
+#   modelexpress-server.<namespace>.svc.cluster.local:8001  (gRPC)
+#
+# The trainer sets ``cfg.cluster.weight_sync.mx_server_url`` to this address;
+# the DGD workers read ``MODEL_EXPRESS_URL`` env (set by the DGD manifest)
+# pointing at the same Service. Both the trainer's MxV2TrainingPublisher and
+# the workers' MxV2RefitReceiver register their NIXL metadata here so the
+# picker can match same-rank (publisher_rank == receiver_rank) pairs.
+#
+# Image: ``ai-dynamo/modelexpress`` server at branch ``kavink/nemo_rl_moe``
+# (head ``1d8049d5`` as of 2026-05-11). Build instructions in the modelexpress
+# repo README. Until we have a stable tag, pin the digest. The image is small
+# (Rust binary + Redis embedded), no GPU needed.
+#
+# Apply once per namespace:
+#   envsubst < infra/nrl_k8s/dynamo_mx/modelexpress-server.yaml | kubectl apply -f -
+#
+# Required env vars (envsubst substitutes them):
+#   K8S_NAMESPACE         target namespace (e.g. "default")
+#   MX_SERVER_IMAGE       image ref, e.g. "nvcr.io/nvidian/dynamo-dev/modelexpress-server:kavink-1d8049d5"
+#   MX_IMAGE_PULL_SECRET  e.g. "nvcr-imagepullsecret"
+#   MX_SERVICE_ACCOUNT    e.g. "default"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: modelexpress-server
+    app.kubernetes.io/component: mx-server
+spec:
+  replicas: 1                      # single-leader; clients re-discover on restart
+  strategy:
+    type: Recreate                 # NIXL agent registrations are ephemeral; no benefit to RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: modelexpress-server
+        app.kubernetes.io/component: mx-server
+    spec:
+      serviceAccountName: ${MX_SERVICE_ACCOUNT}
+      imagePullSecrets:
+        - name: ${MX_IMAGE_PULL_SECRET}
+      # CPU-only — explicit anti-affinity to GPU nodes so we don't waste a slot.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.present
+                    operator: NotIn
+                    values: ["true"]
+      containers:
+        # MX server needs MX_METADATA_BACKEND={redis,kubernetes}. We bundle
+        # Redis as a sibling container (loopback) so the same Deployment is
+        # self-contained — no extra Redis Deployment, no CRD install, no
+        # RBAC for the kubernetes backend.
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          args: ["--save", "", "--appendonly", "no"]  # in-memory only
+          ports:
+            - containerPort: 6379
+              name: redis
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 2
+            periodSeconds: 5
+        - name: server
+          image: ${MX_SERVER_IMAGE}
+          imagePullPolicy: IfNotPresent
+          # No `command`/`args`: the image's built-in ENTRYPOINT runs the
+          # MX server bound to 0.0.0.0:8001 by default. Override here only if
+          # you need a non-default port or backend selection.
+          env:
+            - name: MX_METADATA_BACKEND
+              value: "redis"
+            # Redis sibling container reachable on loopback.
+            - name: REDIS_URL
+              value: "redis://127.0.0.1:6379"
+          ports:
+            - containerPort: 8001
+              name: grpc
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          readinessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+  namespace: ${K8S_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: modelexpress-server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: modelexpress-server
+  ports:
+    - name: grpc
+      port: 8001
+      targetPort: 8001
+      protocol: TCP

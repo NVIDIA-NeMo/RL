@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.6
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Phase 0.5 overlay: existing Dynamo/vLLM base image + our local
+# ModelExpress branch + patched dynamo.vllm.mx_refit.extension for
+# MX_MEGATRON_BUFFER_LOC support.
+#
+# Difference from the parent Dockerfile:
+#   * Base is the currently-deployed image (not the RL-tokenize variant)
+#     so we inherit exactly what's running in the kavin namespace today.
+#   * modelexpress is installed from a local checkout (COPY) instead of
+#     git+https — lets us pick up unmerged branches without pushing.
+#   * The dynamo.vllm.mx_refit.extension.py is overwritten by our
+#     Phase 0.5 patched copy after the pip install completes.
+#
+# Build:
+#   docker buildx build --platform linux/arm64 \
+#     --build-arg BASE_IMAGE=jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest \
+#     --load \
+#     -t nvcr.io/nvidian/dynamo-dev/model-express-dev:phase-0.5-<sha> \
+#     -f infra/nrl_k8s/dynamo_mx/Dockerfile.phase_0_5 \
+#     <repo-root-with-modelexpress-copied-in>
+#
+# The build context must contain:
+#   ./modelexpress_client/python — the local MX client source
+#   ./dynamo_extension.py        — the patched extension.py
+
+ARG BASE_IMAGE=jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Install modelexpress from the local checkout. --force-reinstall
+# ensures the base image's older modelexpress version (whatever it
+# was pinned to) is replaced with our Phase 0.5 build. --no-deps
+# avoids re-resolving the client's optional deps; the base image
+# already has the ones we need (torch, nixl, etc.).
+COPY modelexpress_client/python /tmp/modelexpress_client_python
+RUN python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+      /tmp/modelexpress_client_python \
+ && python3 -c "\
+from modelexpress.nixl_transfer import NixlTransferManager, _resolve_local_mem_type; \
+assert hasattr(NixlTransferManager, 'rebind_tensors'), 'rebind_tensors missing'; \
+print('modelexpress Phase 0.5 install OK')" \
+ && rm -rf /tmp/modelexpress_client_python
+
+# Overlay the Phase 0.5 patched Dynamo extension.py on top of the
+# base image's copy. The base image ships extension.py from
+# jthomson04/dynamo-k8s-integration; we replace it with the version
+# that reads MX_MEGATRON_BUFFER_LOC and calls rebind_tensors on the
+# cache-hit path.
+COPY dynamo_extension.py \
+     /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm/mx_refit/extension.py
+RUN python3 -c "\
+from dynamo.vllm.mx_refit.extension import MxRefitWorkerExtension; \
+import inspect, re; \
+src = inspect.getsource(MxRefitWorkerExtension); \
+assert 'MX_MEGATRON_BUFFER_LOC' in src, 'Phase 0.5 extension patch missing'; \
+assert 'rebind_tensors' in src, 'rebind_tensors call missing from extension'; \
+print('dynamo.vllm.mx_refit.extension Phase 0.5 overlay OK')"
+
+# Preserve the base image's ENTRYPOINT / CMD (Dynamo entry point).

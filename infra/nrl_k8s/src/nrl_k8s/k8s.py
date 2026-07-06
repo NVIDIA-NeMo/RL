@@ -258,6 +258,34 @@ def get_rayjob(name: str, namespace: str) -> dict[str, Any] | None:
         raise
 
 
+def wait_for_rayjob_raycluster_name(
+    rayjob_name: str,
+    namespace: str,
+    *,
+    timeout_s: int = 120,
+    poll_s: int = 2,
+) -> str:
+    """Poll the RayJob's ``.status.rayClusterName`` until KubeRay populates it.
+
+    KubeRay creates the RayCluster (with an auto-suffixed name) shortly after
+    the RayJob is applied, then writes the cluster's name to the RayJob
+    status. Callers need that name to look up the cluster's UID for things
+    like ownerReferences. Typical settle time is a few seconds.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        obj = get_rayjob(rayjob_name, namespace)
+        if obj is not None:
+            cluster_name = (obj.get("status") or {}).get("rayClusterName")
+            if cluster_name:
+                return cluster_name
+        time.sleep(poll_s)
+    raise TimeoutError(
+        f"RayJob {rayjob_name} in {namespace} never populated "
+        f".status.rayClusterName after {timeout_s}s"
+    )
+
+
 def wait_for_rayjob_terminal(
     name: str,
     namespace: str,
@@ -295,6 +323,201 @@ def wait_for_rayjob_terminal(
         f"RayJob {name} in {namespace} did not reach a terminal state "
         f"(last seen jobDeploymentStatus={last[0]!r}, jobStatus={last[1]!r}) "
         f"after {timeout_s}s"
+    )
+
+
+def _rayjob_dashboard_base(rayjob: dict[str, Any], namespace: str) -> str | None:
+    """In-cluster URL for the rayjob's head dashboard, or None if not ready.
+
+    Returns ``http://<rc>-head-svc.<ns>.svc.cluster.local:8265``. Caller is
+    in-cluster (the dev pod, the training pod, or the operator) so we go
+    through ClusterDNS rather than the rayjob's external ``dashboardURL``.
+    """
+    rc_name = (rayjob.get("status") or {}).get("rayClusterName")
+    if not rc_name:
+        return None
+    return f"http://{rc_name}-head-svc.{namespace}.svc.cluster.local:8265"
+
+
+def _http_get_jobs(dashboard_base: str, timeout_s: float = 5.0) -> list[dict] | None:
+    """``GET <base>/api/jobs/`` returning the list, or None on transport error."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"{dashboard_base}/api/jobs/", method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _http_post_job(
+    dashboard_base: str,
+    *,
+    entrypoint: str,
+    submission_id: str,
+    timeout_s: float = 10.0,
+) -> tuple[int, str]:
+    """``POST <base>/api/jobs/`` returning ``(status_code, body)``.
+
+    Body schema matches Ray Job Submission API. ``submission_id`` is the
+    client-supplied identifier — we pass the kuberay-assigned ``jobId`` so
+    the operator's bookkeeping can find the submission afterwards.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    payload = json.dumps({
+        "entrypoint": entrypoint,
+        "submission_id": submission_id,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{dashboard_base}/api/jobs/",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError) as exc:
+        return -1, str(exc)
+
+
+def _raycluster_provisioned(raycluster: dict[str, Any]) -> bool:
+    """True iff the RayCluster's ``RayClusterProvisioned`` condition is True."""
+    for cond in (raycluster.get("status") or {}).get("conditions") or []:
+        if cond.get("type") == "RayClusterProvisioned":
+            return cond.get("status") == "True"
+    return False
+
+
+def ensure_rayjob_driver_submitted(
+    rayjob_name: str,
+    namespace: str,
+    *,
+    operator_grace_s: int = 90,
+    overall_timeout_s: int = 600,
+    poll_s: int = 5,
+    log: callable | None = None,
+) -> str:
+    """Guarantee the rayjob's driver is submitted; fall back to POSTing directly.
+
+    KubeRay's ``submissionMode: HTTPMode`` is supposed to POST the entrypoint
+    to ``/api/jobs/`` on the head dashboard once the RayCluster reaches
+    ``RayClusterProvisioned=True``. We've observed cases where the
+    rayjob-controller's watch on the RayCluster status misses the
+    provisioning transition (timing-correlated with the worker pod's CNI
+    sandbox retries during DRA NIC plumbing), leaving the rayjob stuck in
+    ``jobDeploymentStatus=Running`` with ``/api/jobs/`` empty forever.
+
+    This helper:
+      1. Waits for the RayCluster to exist and reach ``RayClusterProvisioned=True``.
+      2. Polls the dashboard's ``/api/jobs/`` for up to ``operator_grace_s``
+         to give the operator its chance to POST.
+      3. If the operator hasn't POSTed by then, POSTs the entrypoint
+         directly with ``submission_id == jobId`` (the kuberay convention)
+         so the operator's bookkeeping still works once it next reconciles.
+
+    Returns the submission_id the driver was registered under. Raises
+    ``TimeoutError`` if neither the cluster comes up nor a direct POST
+    succeeds within ``overall_timeout_s``.
+    """
+    log = log or (lambda msg: None)
+    deadline = time.monotonic() + overall_timeout_s
+
+    # 1. Wait for the RayCluster to be provisioned (operator-independent).
+    rj: dict[str, Any] | None = None
+    rc_name: str | None = None
+    while time.monotonic() < deadline:
+        rj = get_rayjob(rayjob_name, namespace)
+        if rj is None:
+            time.sleep(poll_s)
+            continue
+        rc_name = (rj.get("status") or {}).get("rayClusterName")
+        if rc_name:
+            break
+        time.sleep(poll_s)
+    if not rc_name:
+        raise TimeoutError(
+            f"RayJob {rayjob_name} never populated rayClusterName"
+        )
+
+    while time.monotonic() < deadline:
+        rc = get_raycluster(rc_name, namespace)
+        if rc is not None and _raycluster_provisioned(rc):
+            log(f"[ensure-driver] RayCluster {rc_name} is provisioned")
+            break
+        time.sleep(poll_s)
+    else:
+        raise TimeoutError(
+            f"RayCluster {rc_name} did not reach RayClusterProvisioned=True"
+        )
+
+    # 2. Grace window for the operator to do its own POST.
+    rj = get_rayjob(rayjob_name, namespace) or {}
+    job_id = (rj.get("status") or {}).get("jobId") or ""
+    if not job_id:
+        raise TimeoutError(
+            f"RayJob {rayjob_name} never populated jobId; cannot submit driver"
+        )
+    dashboard = _rayjob_dashboard_base(rj, namespace)
+    if dashboard is None:
+        raise TimeoutError(
+            f"RayJob {rayjob_name} has no dashboard URL (no rayClusterName)"
+        )
+    log(
+        f"[ensure-driver] waiting up to {operator_grace_s}s for operator to "
+        f"submit driver (rayjob={rayjob_name}, jobId={job_id})"
+    )
+    grace_until = min(deadline, time.monotonic() + operator_grace_s)
+    while time.monotonic() < grace_until:
+        jobs = _http_get_jobs(dashboard)
+        if jobs is not None:
+            for job in jobs:
+                if job.get("submission_id") == job_id:
+                    log(
+                        f"[ensure-driver] operator submitted driver "
+                        f"(submission_id={job_id})"
+                    )
+                    return job_id
+        time.sleep(poll_s)
+
+    # 3. Operator missed it — POST ourselves.
+    rj = get_rayjob(rayjob_name, namespace) or {}
+    entrypoint = (rj.get("spec") or {}).get("entrypoint")
+    if not entrypoint:
+        raise RuntimeError(
+            f"RayJob {rayjob_name} has no spec.entrypoint to POST"
+        )
+    log(
+        f"[ensure-driver] operator did not submit driver within "
+        f"{operator_grace_s}s; POSTing entrypoint to dashboard with "
+        f"submission_id={job_id} (workaround for kuberay HTTPMode stall bug)"
+    )
+    status, body = _http_post_job(
+        dashboard, entrypoint=entrypoint, submission_id=job_id
+    )
+    if status == 200 or status == 201:
+        log("[ensure-driver] direct POST succeeded")
+        return job_id
+    # The operator may have raced us between our check and our POST. A 400
+    # with "already exists" is success-equivalent.
+    if status == 400 and "exists" in body.lower():
+        log(
+            "[ensure-driver] direct POST returned 'already exists' — "
+            "operator submitted in the meantime"
+        )
+        return job_id
+    raise RuntimeError(
+        f"failed to POST driver entrypoint (status={status}): {body[:300]}"
     )
 
 
@@ -699,6 +922,7 @@ __all__ = [
     "delete_rayjob",
     "delete_resource_claim_template",
     "delete_service",
+    "ensure_rayjob_driver_submitted",
     "get_deployment",
     "get_head_pod",
     "get_pod_phase",
@@ -711,5 +935,6 @@ __all__ = [
     "wait_for_deployment_ready",
     "wait_for_raycluster_gone",
     "wait_for_raycluster_ready",
+    "wait_for_rayjob_raycluster_name",
     "wait_for_rayjob_terminal",
 ]

@@ -157,3 +157,76 @@ class TestLatestDaemonJob:
         sid, status = ins._latest_daemon_job("rc-gym", "ns-a", "gym-daemon")
         assert sid == "gym-daemon"
         assert status is None
+
+
+# =============================================================================
+# _status_for — RayJob auto-suffix fallback
+# =============================================================================
+
+
+def _fake_cluster_spec(name: str, daemon=None):
+    """Stand-in for `ClusterSpec` — only the attrs `_status_for` reads."""
+    return SimpleNamespace(name=name, daemon=daemon)
+
+
+def _fake_infra(namespace: str = "ns-a"):
+    return SimpleNamespace(namespace=namespace)
+
+
+class TestStatusForRayJobSuffix:
+    """In `--rayjob` mode KubeRay creates the RayCluster with a random
+    suffix and writes it to the RayJob's `.status.rayClusterName`. The
+    bare cluster.name is gone, so `_status_for` must follow the RayJob.
+    """
+
+    def test_falls_back_to_rayjob_when_bare_cluster_missing(
+        self, monkeypatch
+    ) -> None:
+        cluster = _fake_cluster_spec("rc-train")
+
+        # Bare cluster.name 404s; suffixed name resolves.
+        def _get_rc(name, _ns):
+            return (
+                {"status": {"state": "ready"}}
+                if name == "rc-train-abc12"
+                else None
+            )
+
+        monkeypatch.setattr(ins.k8s, "get_raycluster", _get_rc)
+        monkeypatch.setattr(
+            ins.k8s,
+            "get_rayjob",
+            lambda name, _ns: {"status": {"rayClusterName": "rc-train-abc12"}},
+        )
+
+        captured: dict = {}
+
+        def _list_pods(cluster_name, _ns):
+            captured["cluster_name"] = cluster_name
+            return ins.RayClusterPods(head_name="rc-train-abc12-head-x")
+
+        monkeypatch.setattr(ins, "list_cluster_pods", _list_pods)
+
+        result = ins._status_for("training", cluster, _fake_infra())
+
+        assert result.state == "ready"
+        assert result.head_pod == "rc-train-abc12-head-x"
+        assert captured["cluster_name"] == "rc-train-abc12"
+        # The displayed name stays the configured one — matches how users
+        # reference the cluster in their recipe.
+        assert result.name == "rc-train"
+
+    def test_reports_not_found_when_neither_cluster_nor_rayjob_exists(
+        self, monkeypatch
+    ) -> None:
+        cluster = _fake_cluster_spec("rc-train")
+        monkeypatch.setattr(ins.k8s, "get_raycluster", lambda *_a: None)
+        monkeypatch.setattr(ins.k8s, "get_rayjob", lambda *_a: None)
+        monkeypatch.setattr(
+            ins,
+            "list_cluster_pods",
+            lambda *_a: ins.RayClusterPods(),
+        )
+
+        result = ins._status_for("training", cluster, _fake_infra())
+        assert result.state == "(not found)"

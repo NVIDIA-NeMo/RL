@@ -1,0 +1,15 @@
+# Incremental fix14: fix13 + replica_uid unique-sid fan-out fix (commit e286b0b).
+# Only re-installs the updated modelexpress client; everything else (dynamo
+# extension, fused_moe patch, base stack) is inherited unchanged from fix13.
+FROM nvcr.io/nvidian/dynamo-dev/model-express-dev:phase-0.5-3623f45-fix13
+
+USER root
+
+COPY modelexpress_client_python /tmp/modelexpress_client_python
+RUN python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
+      --no-build-isolation /tmp/modelexpress_client_python \
+ && python3 -c "import inspect; from modelexpress.nemo_rl_v2 import MxV2RefitReceiver; \
+assert 'replica_uid' in inspect.getsource(MxV2RefitReceiver.publish_self_as_source), 'replica_uid fix missing'; \
+assert 'prefer_replicas' in inspect.getsource(MxV2RefitReceiver.discover_v2_sources), 'prefer_replicas missing'; \
+print('fix14 modelexpress replica_uid + prefer_replicas verified')" \
+ && rm -rf /tmp/modelexpress_client_python

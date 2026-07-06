@@ -1,0 +1,89 @@
+# Minimal standalone Prometheus for the GlobalPlanner SLA-scaling test.
+#
+# The SLA planner reads observed load + latency (num_req / ITL / TTFT / ISL /
+# OSL) from Prometheus by querying `dynamo_component_router_*` series labeled
+# `dynamo_namespace="default_<pool-dgd>"`. Those series are exported by the
+# pool LocalRouter pods on their DYN_SYSTEM_PORT (:9090) /metrics endpoint.
+# This Prometheus scrapes every dynamo DGD pod in `default` on :9090 (routers
+# answer; others just show as down — harmless).
+#
+# The pool Planner is pointed here via PROMETHEUS_ENDPOINT=
+#   http://prometheus.default.svc.cluster.local:9090
+#
+# Ad-hoc test infra (not wired into nrl-k8s). Apply/delete manually:
+#   kubectl apply  -f infra/nrl_k8s/dynamo_mx/prometheus.yaml
+#   kubectl delete -f infra/nrl_k8s/dynamo_mx/prometheus.yaml
+# No RBAC: my SA can't create Roles, and we don't need kubernetes_sd. The
+# dynamo operator creates a stable headless Service per DGD (`<dgd>-0`) whose
+# A records resolve to all that DGD's pod IPs (router/planner/worker). We point
+# Prometheus dns_sd at those names and scrape :9090 on each — pure DNS, zero
+# API access. Survives pod recreation (DNS re-resolves to new IPs).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: default
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 10s
+      evaluation_interval: 10s
+    scrape_configs:
+      - job_name: dynamo-gp-pools
+        dns_sd_configs:
+          - names:
+              - jothomson-dyn-gp-p0-0.default.svc.cluster.local
+              - jothomson-dyn-gp-p1-0.default.svc.cluster.local
+              - jothomson-dyn-gp-ctrl-0.default.svc.cluster.local
+            type: A
+            port: 9090
+            refresh_interval: 10s
+        metrics_path: /metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: default
+  labels: {app: prometheus}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: prometheus}
+  template:
+    metadata:
+      labels: {app: prometheus}
+    spec:
+      serviceAccountName: prometheus
+      nodeSelector:
+        nodeGroup: customer-cpu
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=2h
+          ports:
+            - {containerPort: 9090, name: web}
+          resources:
+            requests: {cpu: "1", memory: "2Gi"}
+            limits:   {cpu: "2", memory: "4Gi"}
+          volumeMounts:
+            - {name: config, mountPath: /etc/prometheus}
+            - {name: data,   mountPath: /prometheus}
+      volumes:
+        - name: config
+          configMap: {name: prometheus-config}
+        - name: data
+          emptyDir: {sizeLimit: 5Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: default
+spec:
+  selector: {app: prometheus}
+  ports:
+    - {port: 9090, targetPort: 9090, name: web}

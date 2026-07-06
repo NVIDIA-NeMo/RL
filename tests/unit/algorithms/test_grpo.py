@@ -1686,6 +1686,128 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
 
 
+def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = {
+        "prepare_for_generation_tags": [],
+        "invalidate_kv_cache": 0,
+        "stream_weights_via_http": [],
+        "offload_before_refit": 0,
+        "offload_after_refit": 0,
+    }
+
+    class DummySGLangGeneration:
+        def prepare_for_generation(self, tags=None):
+            calls["prepare_for_generation_tags"].append(tags)
+
+        def get_sglang_url_to_gpu_uuids(self):
+            return {"http://localhost:12345": ["gpu-uuid-0"]}
+
+        def invalidate_kv_cache(self):
+            calls["invalidate_kv_cache"] += 1
+            return True
+
+    class DummyPolicy:
+        def offload_before_refit(self):
+            calls["offload_before_refit"] += 1
+
+        def offload_after_refit(self):
+            calls["offload_after_refit"] += 1
+
+        def get_free_memory_bytes(self):
+            return 1024 * 1024 * 1024
+
+        def stream_weights_via_http(self, sglang_url_to_gpu_uuids):
+            calls["stream_weights_via_http"].append(sglang_url_to_gpu_uuids)
+            return ["ok"]
+
+    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
+    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummySGLangGeneration(),
+        colocated_inference=True,
+    )
+
+    assert calls["offload_before_refit"] == 1
+    assert calls["offload_after_refit"] == 1
+    assert calls["invalidate_kv_cache"] == 1
+    assert calls["stream_weights_via_http"] == [
+        {"http://localhost:12345": ["gpu-uuid-0"]}
+    ]
+    assert calls["prepare_for_generation_tags"] == [["weights"], ["kv_cache"]]
+
+
+def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    class DummySGLangGeneration:
+        pass
+
+    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
+
+    with pytest.raises(NotImplementedError):
+        grpo_mod.refit_policy_generation(
+            policy=object(),
+            policy_generation=DummySGLangGeneration(),
+            colocated_inference=False,
+        )
+
+
+def test_refit_policy_generation_mx_passes_kv_scales(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = {}
+
+    class DummyMxConfig:
+        enabled = True
+
+    class DummyPolicy:
+        def stream_weights_via_mx(self, *, version, mx_config, kv_scales=None):
+            calls["publish"] = {
+                "version": version,
+                "mx_config": mx_config,
+                "kv_scales": kv_scales,
+            }
+            return ["train"]
+
+    class DummyDynamoGeneration:
+        def update_weights_via_mx(self, *, version, mx_config):
+            calls["receive"] = {"version": version, "mx_config": mx_config}
+            return ["infer"]
+
+    def fake_ray_get(refs):
+        if refs == ["infer"]:
+            return [True]
+        return refs
+
+    mx_config = DummyMxConfig()
+    kv_scales = {
+        "model.layers.0.self_attn.k_scale": 1.25,
+        "model.layers.0.self_attn.v_scale": 1.5,
+    }
+    monkeypatch.setattr(grpo_mod.ray, "get", fake_ray_get)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummyDynamoGeneration(),
+        colocated_inference=False,
+        kv_scales=kv_scales,
+        weight_sync_method="mx",
+        mx_config=mx_config,
+        refit_version=7,
+    )
+
+    assert calls["publish"] == {
+        "version": 7,
+        "mx_config": mx_config,
+        "kv_scales": kv_scales,
+    }
+    assert calls["receive"] == {"version": 7, "mx_config": mx_config}
+
+
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):

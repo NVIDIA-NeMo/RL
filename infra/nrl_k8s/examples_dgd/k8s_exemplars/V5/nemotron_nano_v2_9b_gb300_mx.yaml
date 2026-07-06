@@ -1,0 +1,139 @@
+# DynamoGraphDeployment for nvidia/NVIDIA-Nemotron-Nano-9B-v2 on GB300, MX-enabled.
+#
+# Used by the V5 workplace-assistant k8s smoke. The Dynamo image includes the
+# Modelexpress client and Megatron MX refit receiver, so the worker starts
+# directly without copying source from the shared workspace.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: nemotron-nano-v2-9b-gb300-mx
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+          env:
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          gpu: "2"
+          memory: "128Gi"
+        limits:
+          gpu: "2"
+          memory: "220Gi"
+      extraPodSpec:
+        securityContext:
+          runAsUser: 0
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        tolerations:
+          - operator: Exists
+        resourceClaims:
+          - name: roce-channel
+            resourceClaimTemplateName: roce-mx-qwen3-4b
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - nvidia/NVIDIA-Nemotron-Nano-9B-v2
+            - --served-model-name
+            - nvidia/NVIDIA-Nemotron-Nano-9B-v2
+            - --load-format
+            - mx
+            - --model-express-url
+            - modelexpress-server.default.svc.cluster.local:8001
+            - --tensor-parallel-size
+            - "2"
+            - --dtype
+            - bfloat16
+            - --gpu-memory-utilization
+            - "0.8"
+            - --max-model-len
+            - "8192"
+            - --max-num-seqs
+            - "16"
+            - --max-num-batched-tokens
+            - "16384"
+            - --enforce-eager
+            - --mamba-ssm-cache-dtype
+            - float32
+            - --dyn-tool-call-parser
+            - nemotron_deci
+            - --dyn-reasoning-parser
+            - nemotron_nano
+          resources:
+            claims:
+              - name: roce-channel
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.default.svc.cluster.local:8001"
+            - name: UCX_TLS
+              value: "rc,cuda_copy"
+            - name: NIXL_UCX_TLS
+              value: "rc,cuda_copy"
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            - name: UCX_CUDA_COPY_DMABUF
+              value: "yes"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"

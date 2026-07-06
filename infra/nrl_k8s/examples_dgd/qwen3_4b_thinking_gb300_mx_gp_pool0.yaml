@@ -1,0 +1,184 @@
+# Pool 0 DGD for the hierarchical (GlobalPlanner + GlobalRouter) MX smoke.
+#
+# One agg pool behind the GlobalRouter in jothomson-dyn-gp-ctrl. Dynamo
+# namespace (operator-derived): default-jothomson-dyn-gp-p0. Three components:
+#
+#   LocalRouter       — dynamo.router serving `<pool-ns>.router.generate`, the
+#                       endpoint the GlobalRouter forwards to. It KV-aware-routes
+#                       across this pool's worker(s), pulling from the worker's
+#                       `<pool-ns>.backend.generate`.
+#   VllmDecodeWorker  — the SAME MX-enabled aggregated vLLM worker as the
+#                       standalone 4B MX worker shape:
+#                       ModelExpress v2 mid-training refit (self-polling via the
+#                       MX server), NIXL/RoCE, load-format mx-target. No
+#                       --is-prefill-worker → registers at backend.generate and
+#                       handles prefill+decode (agg). The trainer publishes
+#                       weights to the MX server; this worker (and pool 1's)
+#                       self-refit independently — no endpoint topology needed.
+#   Planner           — local SLA planner pinned at min=max=1 GPU (mode=agg).
+#                       Delegates scale execution to the GlobalPlanner
+#                       (environment=global-planner). The 1/1 band blocks all
+#                       scaling decisions, which is what we want for now.
+#
+# This is pool 0 — the GlobalRouter's 1x1 grid maps ALL requests here.
+#
+# RoCE: this worker binds a RoCE NIC for NIXL RDMA via the pre-provisioned
+# `roce-mx-qwen3-4b` ResourceClaimTemplate (nrl-k8s does NOT auto-create
+# DGD-side RoCE templates — only RayCluster ones). See the resourceClaims note
+# below.
+#
+# Names hardcoded for the `default` namespace + `jothomson` user — see the
+# header of qwen3_4b_thinking_gb300_mx_gp_ctrl.yaml before reusing.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: jothomson-dyn-gp-p0
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    LocalRouter:
+      componentType: default
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          # arm64 — dynamo image is arm64-only.
+          kubernetes.io/arch: arm64
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-be735142:latest
+          workingDir: /workspace
+          env:
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+          command:
+            - python3
+            - -m
+            - dynamo.router
+          args:
+            # Aggregated worker registers at backend.generate (no prefill split).
+            - --endpoint
+            - default-jothomson-dyn-gp-p0.backend.generate
+            - --router-block-size
+            - "16"
+            - --router-kv-overlap-score-credit
+            - "0"
+
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          gpu: "1"
+          memory: "64Gi"
+        limits:
+          gpu: "1"
+          memory: "128Gi"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        # RoCE DRA claim — required for NIXL RDMA. Unlike RayCluster claims,
+        # nrl-k8s does NOT auto-create ResourceClaimTemplates for DGD pods, so
+        # this references the pre-provisioned `roce-mx-qwen3-4b` template (the
+        # same generic RoCE NIC claim the single-pool MX smoke uses). Each pod
+        # referencing it gets its own ResourceClaim instance. If it's missing:
+        #   kubectl get resourceclaimtemplate roce-mx-qwen3-4b -n default
+        resourceClaims:
+          - name: roce-channel
+            resourceClaimTemplateName: roce-mx-qwen3-4b
+        mainContainer:
+          # Worker image with tokenize endpoint, MX v2 refit, bundled-UCX nixl
+          # and modelexpress baked in. No runtime source overlay is required.
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-be735142:latest
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-4B-Thinking-2507
+            - --load-format
+            - mx-target
+            - --tensor-parallel-size
+            - "1"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --max-model-len
+            - "16384"
+            - --enforce-eager
+            - --dyn-tool-call-parser
+            - hermes
+            - --dyn-reasoning-parser
+            - qwen3
+          resources:
+            claims:
+              - name: roce-channel
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: HF_HOME
+              value: /tmp/hf-cache
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.default.svc.cluster.local:8001"
+            - name: UCX_TLS
+              value: "rc,cuda_copy"
+            - name: NIXL_UCX_TLS
+              value: "rc,cuda_copy"
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            - name: UCX_CUDA_COPY_DMABUF
+              value: "yes"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+
+    Planner:
+      componentType: planner
+      replicas: 1
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-be735142:latest
+          workingDir: /workspace
+          env:
+            # SLA planner reads pool0's load (num_req / ITL / TTFT / ISL / OSL)
+            # from the standalone Prometheus (infra/nrl_k8s/dynamo_mx/prometheus.yaml),
+            # which scrapes dynamo_component_router_* off the pool LocalRouters.
+            - name: PROMETHEUS_ENDPOINT
+              value: "http://prometheus.default.svc.cluster.local:9090"
+          command:
+            - python3
+            - -m
+            - dynamo.planner
+          # SLA-SCALING TEST (mode=agg → single decode engine type).
+          # optimization_target=sla with impossibly strict ttft_ms=1 / itl_ms=1:
+          # no 4B model hits 1ms TTFT/ITL, so under ANY observed load the SLA
+          # regression demands more replicas and the planner scales toward
+          # max_gpu_budget. Starts at 1 worker (DGD replicas=1), max 4 (1 GPU
+          # each in agg). environment=global-planner → the unconstrained
+          # GlobalPlanner executes the replica patch. 30s tick = fast scaling.
+          args:
+            - --config
+            - '{"environment":"global-planner","global_planner_namespace":"default-jothomson-dyn-gp-ctrl","backend":"vllm","mode":"agg","optimization_target":"sla","enable_load_scaling":false,"enable_throughput_scaling":true,"throughput_metrics_source":"router","throughput_adjustment_interval_seconds":30,"ttft_ms":1,"itl_ms":1,"min_gpu_budget":1,"max_gpu_budget":4,"decode_engine_num_gpu":1,"model_name":"Qwen/Qwen3-4B-Thinking-2507","profile_results_dir":"/workspace/components/src/dynamo/planner/tests/data/profiling_results/H200_TP1P_TP1D"}'

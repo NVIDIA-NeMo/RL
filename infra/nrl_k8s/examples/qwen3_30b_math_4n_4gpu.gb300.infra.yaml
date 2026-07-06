@@ -136,6 +136,16 @@ launch:
     LOG=\${LOG_DIR}/${user:}-raycluster-qwen3-30b-math-gb300-training-\${TIMESTAMP}.log
     mkdir -p "\${LOG_DIR}"
 
+    # Tee through a fifo so python's exit code propagates instead of being
+    # swallowed by tee. Ray's entrypoint runs under /bin/dash, which has no
+    # `set -o pipefail` and no $PIPESTATUS — without this, a Python crash
+    # exits the pipeline 0 and KubeRay records the run as SUCCEEDED.
+    PIPE=\$(mktemp -u)
+    mkfifo "\${PIPE}"
+    tee "\${LOG}" < "\${PIPE}" &
+    TEE_PID=\$!
+
+    RC=0
     python -u examples/run_grpo.py \
       --config examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml \
       grpo.max_num_steps=5 \
@@ -146,7 +156,11 @@ launch:
       logger.monitor_gpus=true \
       logger.wandb.project=nemorl-single-k8s \
       logger.wandb.name=qwen3-30b-math-gb300 \
-      2>&1 | tee "\${LOG}"
+      > "\${PIPE}" 2>&1 || RC=\$?
+
+    wait "\${TEE_PID}" || true
+    rm -f "\${PIPE}"
+    exit "\${RC}"
 
 kuberay:
   training:
