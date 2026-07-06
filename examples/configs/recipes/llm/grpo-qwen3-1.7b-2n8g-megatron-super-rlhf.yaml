@@ -25,6 +25,8 @@ policy:
       reasoning_parser_plugin: null
       http_server_serving_chat_kwargs:
         reasoning_parser: deepseek_r1
+    vllm_kwargs:
+      mamba_cache_mode: "none"
 data:
   train:
     data_path: ${oc.env:HF_HOME}/superv3_data/rlhf/train-split.jsonl

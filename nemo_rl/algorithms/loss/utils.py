@@ -74,7 +74,10 @@ def prepare_loss_input(
     elif loss_fn.input_type == LossInputType.LOGPROB:
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
-        if hasattr(loss_fn, "use_linear_ce_fusion") and loss_fn.use_linear_ce_fusion:
+        if (
+            hasattr(loss_fn, "use_fused_linear_logprobs")
+            and loss_fn.use_fused_linear_logprobs
+        ):
             logprobs = logits
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
@@ -137,23 +140,30 @@ def prepare_loss_input(
             "H_all": H_all,
         }
     elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
-        # Rebuild the full-vocab teacher logits from the per-rank CUDA IPC
-        # handles and do the shared CP-resolution both loss paths need; the loss
-        # fn does the projection / chunk-average / KL reductions. The TP/CP groups
-        # are derived from the student logits' own device mesh.
-        teacher_full_logits, student_logits_contig, align, tp_group, cp_group = (
-            prepare_xtoken_cross_tokenizer_loss_input(
-                logits,
-                data,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
-            )
+        # Rebuild each teacher's full-vocab logits from its per-rank CUDA IPC
+        # handles and do the shared CP-resolution the loss needs; the loss fn
+        # does the per-teacher projection / chunk-average / KL reductions and
+        # aggregates them by ``kd_loss_mode``. ``projection_matrix_paths`` drives
+        # the teacher count and which teachers are same-tokenizer (``None``). The
+        # TP/CP groups are derived from the student logits' own device mesh.
+        (
+            student_logits_contig,
+            teacher_full_logits_by_idx,
+            aligns_by_idx,
+            tp_group,
+            cp_group,
+        ) = prepare_xtoken_cross_tokenizer_loss_input(
+            logits,
+            data,
+            projection_matrix_paths=loss_fn.projection_matrix_paths,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
         )
         loss_input = {
             "logits": logits,
-            "teacher_full_logits": teacher_full_logits,
             "student_logits_contig": student_logits_contig,
-            "align": align,
+            "teacher_full_logits_by_idx": teacher_full_logits_by_idx,
+            "aligns_by_idx": aligns_by_idx,
             "tp_group": tp_group,
             "cp_group": cp_group,
         }

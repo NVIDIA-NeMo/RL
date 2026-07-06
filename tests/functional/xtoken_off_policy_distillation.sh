@@ -42,21 +42,22 @@ uv run python -m tools.x_token.minimal_projection_via_multitoken \
     --output-filename xtoken_l1_smoke \
     --output-dir $PROJ_DIR
 
-# Step 2: run the xtoken off-policy distillation trainer for 3 steps. Only
-# overrides that DIFFER from examples/configs/xtoken_off_policy_distillation.yaml
-# are set here.
+# Step 2: run the xtoken off-policy distillation trainer for 3 steps. Uses the
+# exemplar (examples/configs/xtoken_off_policy_distillation.yaml), which defaults
+# to a single teacher; teacher knobs target teachers.0 (the one teacher). Only
+# overrides that DIFFER from the exemplar are set here.
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_xtoken_off_policy_distillation.py \
-    teacher.model_name=$TEACHER_MODEL \
-    teacher.tokenizer.name=$TEACHER_MODEL \
+    teachers.0.model_name=$TEACHER_MODEL \
+    teachers.0.tokenizer.name=$TEACHER_MODEL \
     cluster.gpus_per_node=2 \
     policy.train_global_batch_size=8 \
     policy.max_total_sequence_length=256 \
-    teacher.train_global_batch_size=8 \
-    teacher.max_total_sequence_length=256 \
+    teachers.0.train_global_batch_size=8 \
+    teachers.0.max_total_sequence_length=256 \
     distillation.num_prompts_per_step=8 \
     distillation.max_num_steps=3 \
-    loss_fn.projection_matrix_path=$PROJ_PATH \
+    teachers.0.projection_matrix_path=$PROJ_PATH \
     data.train.characters_per_sample=256 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \

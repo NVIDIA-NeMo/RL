@@ -2439,8 +2439,9 @@ def _write_ct_projection(tmp_path):
 
 
 def _ct_loss_cfg(projection_path, *, gold_loss):
+    # Per-teacher metadata as ``setup`` injects it: parallel lists, one entry
+    # per teacher (here a single teacher).
     return {
-        "projection_matrix_path": projection_path,
         "gold_loss": gold_loss,
         "xtoken_loss": False,
         "temperature": _CT_TEMPERATURE,
@@ -2451,8 +2452,15 @@ def _ct_loss_cfg(projection_path, *, gold_loss):
         "kl_loss_weight": 1.0,
         "ce_loss_scale": 1.0,
         "dynamic_loss_scaling": False,
+        "kd_loss_mode": "sum",
+        "alpha": 1.0,
+        "normalize_teacher_by_vocab": False,
         "student_vocab_size": _CT_V_STUDENT,
-        "teacher_vocab_size": _CT_V_TEACHER,
+        "projection_matrix_paths": [projection_path],
+        "teacher_vocab_sizes": [_CT_V_TEACHER],
+        "teacher_weights": [1.0],
+        "teacher_gold_loss": [None],
+        "teacher_xtoken_loss": [None],
     }
 
 
@@ -2527,7 +2535,12 @@ def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
 
     student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
     loss, kl_common, l1_uncommon, n_valid, _ = loss_fn._compute_gold(
-        student_logits, teacher_logits, align
+        student_logits,
+        teacher_logits,
+        align,
+        projection_matrix_path=loss_fn.projection_matrix_paths[0],
+        teacher_vocab_size=loss_fn.teacher_vocab_sizes[0],
+        xtoken_loss=loss_fn.xtoken_loss,
     )
 
     assert torch.isfinite(loss)
@@ -2583,10 +2596,33 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
 
     student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
     loss, _, _, n_valid, _ = loss_fn._compute_gold(
-        student_logits, teacher_logits, align
+        student_logits,
+        teacher_logits,
+        align,
+        projection_matrix_path=loss_fn.projection_matrix_paths[0],
+        teacher_vocab_size=loss_fn.teacher_vocab_sizes[0],
+        xtoken_loss=loss_fn.xtoken_loss,
     )
     assert n_valid.item() == 0
     assert torch.equal(loss.detach(), torch.zeros(()))
+
+
+def test_cross_tokenizer_mismatched_per_teacher_lists_raises(tmp_path):
+    """Unequal-length per-teacher lists fail loudly at construction."""
+    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    # Two weights but a single entry in every other per-teacher list.
+    cfg["teacher_weights"] = [1.0, 1.0]
+    with pytest.raises(ValueError, match="per-teacher lists must be equal length"):
+        CrossTokenizerDistillationLossFn(cfg)
+
+
+def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
+    """normalize_teacher_by_vocab is a no-op outside sum mode, so reject it there."""
+    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    cfg["kd_loss_mode"] = "averaged_logits"
+    cfg["normalize_teacher_by_vocab"] = True
+    with pytest.raises(ValueError, match="normalize_teacher_by_vocab"):
+        CrossTokenizerDistillationLossFn(cfg)
 
 
 def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
