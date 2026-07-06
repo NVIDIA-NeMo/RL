@@ -51,6 +51,7 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
+    _placeholder_seq_logprob_error_metrics,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
@@ -829,15 +830,13 @@ def grpo_train_sync(
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
                     if skip_prev_logprobs:
-                        # Train workers fetch prev_logprobs via
-                        # train_presharded (it's in DP_TRAIN_FIELDS), so the
-                        # column must exist in TQ even when the forward was
-                        # skipped.
+                        # Driver-local placeholder for the advantage-compute
+                        # call below; not written to TQ. Train workers drop
+                        # prev_logprobs from the fetch when
+                        # loss_fn.force_on_policy_ratio is True
+                        # (see TQPolicy.train_from_meta) and the loss then
+                        # uses curr_logprobs instead.
                         prev_logprobs = torch.zeros_like(generation_logprobs)
-                        policy.write_to_dataplane(
-                            meta,
-                            fields={"prev_logprobs": prev_logprobs},
-                        )
                     else:
                         prev_logprobs = extras_bdd["prev_logprobs"]
                     reference_policy_logprobs = (
@@ -849,9 +848,8 @@ def grpo_train_sync(
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     sample_mask = loss_multiplier
-                    # No valid measurements — leave the seq-level metrics
-                    # out of the emitted dict rather than pinning them to 0.
-                    seq_logprob_error_metrics: dict[str, Any] = {}
+                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
                 else:
                     sample_mask, seq_logprob_error_metrics = (
                         _compute_seq_logprob_error_metrics(
