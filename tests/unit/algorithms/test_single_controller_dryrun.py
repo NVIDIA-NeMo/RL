@@ -859,16 +859,25 @@ class StaggeredGenWorker:
     pushes a row with ``group_id="group-{idx}"``.
     """
 
-    def __init__(self, weight_version: int = 0) -> None:
+    def __init__(self, weight_version: int = 0, unique_ids: bool = False) -> None:
         self._weight_version = weight_version
         self._completion_timestamps: list[float] = []
+        # When True, suffix ids with a per-call counter so re-dispatching
+        # the same prompt (epoch loops) yields distinct groups instead of
+        # colliding on already-claimed DataPlane rows.
+        self._unique_ids = unique_ids
+        self._calls = 0
 
     async def generate_and_push(self, prompt: str, dp_client: Any) -> None:
         idx_str, latency_str = prompt.split(":")
         idx = int(idx_str)
         latency = float(latency_str)
+        self._calls += 1
+        call_idx = self._calls
         await asyncio.sleep(latency)
         group_id = f"group-{idx:04d}"
+        if self._unique_ids:
+            group_id = f"{group_id}-c{call_idx:04d}"
         sample_id = f"{group_id}_g0"
         await dp_client.put_samples.remote(
             sample_ids=[sample_id],
@@ -916,6 +925,7 @@ class TestStreamingTrainPump:
         max_inflight_prompts=8,
         max_weight_staleness_versions=1,
         batch_selection_strategy="staleness_window",
+        max_num_epochs=None,
     ):
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
@@ -927,6 +937,7 @@ class TestStreamingTrainPump:
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
             batch_selection_strategy=batch_selection_strategy,
+            max_num_epochs=max_num_epochs,
         )
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
@@ -1145,3 +1156,34 @@ class TestStreamingTrainPump:
         for _, ids, _ in mbs:
             dispatched_ids.update(ids)
         assert set(clear_calls[0]) == dispatched_ids
+
+    def test_epoch_bound_limits_dataset_passes(self, ray_init):
+        """max_num_epochs bounds dispatch to N passes over the prompt list."""
+        dp_client = FakeDataPlaneActor.remote()
+        gen = StaggeredGenWorker.remote(unique_ids=True)
+        trainer = DryRunTrainer(dp_client, train_latency_s=0.0)
+        prompts = ["0:0.01", "1:0.01"]
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            prompts=prompts,
+            max_train_steps=1,
+            # Budget far above the epoch bound: epochs must be the binding
+            # constraint (2 epochs x 2 prompts = 4 dispatches, not 100).
+            max_rollout_prompts=100,
+            target_prompt_groups_per_step=4,
+            min_prompt_groups_per_batch=1,
+            max_num_epochs=2,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=60)
+        assert result["epochs"] == 2
+        assert result["train_steps"] == 1
+        mbs = trainer.get_microbatch_calls()
+        dispatched_ids = set()
+        for _, ids, _ in mbs:
+            dispatched_ids.update(ids)
+        assert len(dispatched_ids) == len(prompts) * 2, (
+            f"expected 4 unique sample ids (2 epochs x 2 prompts), got "
+            f"{sorted(dispatched_ids)}"
+        )

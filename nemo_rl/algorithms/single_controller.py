@@ -98,6 +98,11 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     # Training
     max_train_steps: int = 10
     max_rollout_prompts: int = 32
+    # Bounded dataset passes, mirroring grpo.py's max_num_epochs loop. One
+    # epoch = one pass over the prompt list. None preserves the unbounded
+    # behavior: max_rollout_prompts alone caps dispatch (cycling through
+    # the prompt list) and no epoch accounting is performed.
+    max_num_epochs: Optional[int] = None
     # Worker-side optimizer mini-batch size, in samples. SC opens one
     # begin / microbatch×K / finish cycle (= one opt.step) per
     # ``train_global_batch_size`` worth of samples. Number of opt.steps per
@@ -256,6 +261,9 @@ class SingleControllerActor:
         self._trainer_version: int = 0
         self._train_steps: int = 0
         self._rollout_done: bool = False
+        # Completed prompt-list passes; only advances when
+        # cfg.max_num_epochs is set (see _rollout_pump).
+        self._current_epoch: int = 0
         self._claimed_meta: KVBatchMeta | None = None
         self._step_consumed_sample_ids: list[str] = []
 
@@ -293,6 +301,7 @@ class SingleControllerActor:
         return {
             "train_steps": self._train_steps,
             "trainer_version": self._trainer_version,
+            "epochs": self._current_epoch,
         }
 
     async def ping(self) -> dict[str, Any]:
@@ -303,6 +312,7 @@ class SingleControllerActor:
             "train_steps": self._train_steps,
             "inflight_rollouts": self._inflight_rollouts,
             "rollout_permitted": self._rollout_permitted.is_set(),
+            "epoch": self._current_epoch,
         }
 
     # ── internal helpers ───────────────────────────────────────────────────
@@ -335,6 +345,7 @@ class SingleControllerActor:
           4. Decrement _inflight_rollouts
         """
         n = self._cfg.max_rollout_prompts
+        max_epochs = self._cfg.max_num_epochs
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
 
         start = time.monotonic()
@@ -354,16 +365,41 @@ class SingleControllerActor:
                 finally:
                     self._inflight_rollouts -= 1
 
-        tasks = [
-            asyncio.ensure_future(_one_group(self._prompts[i % len(self._prompts)]))
-            for i in range(n)
-        ]
-        await asyncio.gather(*tasks)
+        dispatched = 0
+        if max_epochs is None:
+            # Unbounded-epoch path: max_rollout_prompts alone caps dispatch,
+            # all prompts in flight together (cycling through the list).
+            tasks = [
+                asyncio.ensure_future(_one_group(self._prompts[i % len(self._prompts)]))
+                for i in range(n)
+            ]
+            await asyncio.gather(*tasks)
+            dispatched = n
+        else:
+            # Epoch-bounded path: one gather per pass over the prompt list,
+            # mirroring grpo.py's per-epoch dataset iteration. Ends at
+            # whichever bound is hit first (epochs or total prompt budget).
+            while dispatched < n and self._current_epoch < max_epochs:
+                k = min(len(self._prompts), n - dispatched)
+                tasks = [
+                    asyncio.ensure_future(_one_group(self._prompts[i]))
+                    for i in range(k)
+                ]
+                await asyncio.gather(*tasks)
+                dispatched += k
+                self._current_epoch += 1
+                log.info(
+                    "rollout_pump: epoch %d/%d complete (%d/%d prompts)",
+                    self._current_epoch,
+                    max_epochs,
+                    dispatched,
+                    n,
+                )
 
         self._rollout_done = True
         log.info(
             "rollout_pump: finished %d prompts in %.2fs",
-            n,
+            dispatched,
             time.monotonic() - start,
         )
 
