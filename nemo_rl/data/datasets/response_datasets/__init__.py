@@ -39,9 +39,9 @@ from nemo_rl.data.datasets.response_datasets.intent import (
 )
 from nemo_rl.data.datasets.response_datasets.math import MathDataset
 from nemo_rl.data.datasets.response_datasets.mmau import MMAUDataset
-from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
 from nemo_rl.data.datasets.response_datasets.mmlu import MMLUDataset
 from nemo_rl.data.datasets.response_datasets.mmlu_pro import MMLUProDataset
+from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
     NemotronCascade2SFTMathDataset,
