@@ -65,6 +65,8 @@ class AudioMCQDataset(RawDataset):
     """
 
     task_name = "audiomcq"
+    default_processor = "vlm_hf_data_processor"
+    is_multimodal = True
 
     def __init__(
         self,

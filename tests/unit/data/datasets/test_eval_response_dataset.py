@@ -17,18 +17,28 @@ import random
 import pytest
 from datasets import Dataset
 
+from nemo_rl.data.datasets.response_datasets import aime as aime_module
 from nemo_rl.data.datasets.response_datasets import (
     is_multimodal_response_dataset,
     load_response_dataset,
 )
 from nemo_rl.data.datasets.response_datasets.aime import AIMEDataset
-from nemo_rl.data.datasets.response_datasets import aime as aime_module
+from nemo_rl.data.datasets.response_datasets.audiomcq import AudioMCQDataset
+from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
+from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
+from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.gpqa import GPQADataset
+from nemo_rl.data.datasets.response_datasets.intent import (
+    IntentBenchDataset,
+    IntentTrainDataset,
+)
 from nemo_rl.data.datasets.response_datasets.math import MathDataset
 from nemo_rl.data.datasets.response_datasets.mmau import MMAUDataset
 from nemo_rl.data.datasets.response_datasets.mmlu import MMLUDataset
 from nemo_rl.data.datasets.response_datasets.mmlu_pro import MMLUProDataset
+from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
+from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
@@ -40,8 +50,16 @@ from nemo_rl.data.processors import PROCESSOR_REGISTRY
         (MathDataset, "math", "math_data_processor"),
         (MMLUDataset, "mmlu", "multichoice_qa_processor"),
         (MMLUProDataset, "mmlu_pro", "multichoice_qa_processor"),
+        (AudioMCQDataset, "audiomcq", "vlm_hf_data_processor"),
+        (AVQADataset, "avqa", "vlm_hf_data_processor"),
+        (CLEVRCoGenTDataset, "clevr-cogent", "vlm_hf_data_processor"),
         (MMAUDataset, "mmau", "vlm_hf_data_processor"),
         (DailyOmniDataset, "daily-omni", "vlm_hf_data_processor"),
+        (Geometry3KDataset, "geometry3k", "vlm_hf_data_processor"),
+        (IntentTrainDataset, "intent-train", "vlm_hf_data_processor"),
+        (IntentBenchDataset, "intent-bench", "vlm_hf_data_processor"),
+        (MMPRTinyDataset, "mmpr-tiny", "vlm_hf_data_processor"),
+        (RefCOCODataset, "refcoco", "vlm_hf_data_processor"),
     ],
 )
 def test_eval_dataset_selects_default_processor_without_config_duplication(
@@ -66,7 +84,22 @@ def test_explicit_processor_still_overrides_dataset_default():
     assert dataset.processor is PROCESSOR_REGISTRY["math_hf_data_processor"]
 
 
-@pytest.mark.parametrize("name", ["mmau", "TwinkStart/MMAU", "daily-omni"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "audiomcq",
+        "avqa",
+        "clevr-cogent",
+        "daily-omni",
+        "geometry3k",
+        "intent-train",
+        "intent-bench",
+        "mmau",
+        "TwinkStart/MMAU",
+        "mmpr-tiny",
+        "refcoco",
+    ],
+)
 def test_multimodal_eval_dataset_capability(name):
     assert is_multimodal_response_dataset(name) is True
 
