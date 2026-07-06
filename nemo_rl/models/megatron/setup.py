@@ -211,11 +211,8 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Pin the communicator to the correct GPU explicitly.
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.distributed.init_process_group(
-        "nccl", device_id=torch.device(f"cuda:{local_rank}")
-    )
+    # Initialize process group
+    torch.distributed.init_process_group("nccl")
 
 
 def validate_and_set_config(
