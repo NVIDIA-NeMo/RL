@@ -36,6 +36,7 @@ PERF_FIELDS = (
     "total_completion_tokens",
     "num_turns",
     "num_tool_calls",
+    "streaming_tool_call_eligible_actions",
     "streaming_tool_call_sessions_started",
     "streaming_tool_call_prefill_requests",
     "streaming_tool_call_prefill_tokens",
@@ -123,6 +124,19 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def count_function_calls(response: Any) -> int | None:
+    """Return the number of function calls recorded in a Responses API result."""
+    if not isinstance(response, dict):
+        return None
+    output = response.get("output")
+    if not isinstance(output, list):
+        return None
+    return sum(
+        isinstance(item, dict) and item.get("type") == "function_call"
+        for item in output
+    )
+
+
 def read_result_jsonl(path: Path) -> list[dict[str, Any]]:
     """Stream a large trajectory JSONL while retaining only audit fields."""
     rows = []
@@ -139,6 +153,12 @@ def read_result_jsonl(path: Path) -> list[dict[str, Any]]:
 
             params = full_result.get("responses_create_params", {})
             metadata = params.get("metadata", {})
+            response = full_result.get("response")
+            num_tool_calls = full_result.get("num_tool_calls")
+            if not isinstance(num_tool_calls, (int, float)) or isinstance(
+                num_tool_calls, bool
+            ):
+                num_tool_calls = count_function_calls(response)
             result = {
                 "responses_create_params": {
                     "model": params.get("model"),
@@ -155,8 +175,8 @@ def read_result_jsonl(path: Path) -> list[dict[str, Any]]:
                 "infrastructure_error": any(
                     marker in line for marker in INFRASTRUCTURE_ERROR_MARKERS
                 ),
-                "response_error": full_result.get("response", {}).get("error")
-                is not None,
+                "response_error": isinstance(response, dict)
+                and response.get("error") is not None,
                 "trajectory_sha256": canonical_trajectory_sha256(full_result),
                 "model_patch_available": "model_patch" in full_result,
                 "model_patch_nonempty": isinstance(full_result.get("model_patch"), str)
@@ -171,7 +191,11 @@ def read_result_jsonl(path: Path) -> list[dict[str, Any]]:
                 if required_field in full_result:
                     result[required_field] = None
             for field in PERF_FIELDS:
-                result[field] = full_result.get(field)
+                result[field] = (
+                    num_tool_calls
+                    if field == "num_tool_calls"
+                    else full_result.get(field)
+                )
             rows.append(result)
     return rows
 
