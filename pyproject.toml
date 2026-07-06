@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel>=0.46.2"]
+requires = ["setuptools>=78.1.1", "wheel>=0.46.2"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -354,6 +354,9 @@ override-dependencies = [
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
+  # Upgrade av (PyAV) to pick up FFmpeg 8.1.x bundled in >=17.1.0, addressing CVE-2026-40962
+  # (qwen-vl-utils pins no floor on av; this forces the patched FFmpeg libs in av.libs/)
+  "av>=17.1.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   # vLLM 0.20.0 imports CUTLASS CUTE during Qwen3.5 MoE profiling.
