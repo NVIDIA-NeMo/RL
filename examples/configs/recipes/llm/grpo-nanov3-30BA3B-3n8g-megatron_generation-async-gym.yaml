@@ -1,5 +1,7 @@
 defaults: ../../../nemo_gym/grpo_nanov3.yaml
 grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
   async_grpo:
     enabled: true
     in_flight_weight_updates: true
@@ -11,6 +13,9 @@ policy:
     name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   train_global_batch_size: 16
   max_total_sequence_length: 2048
+  megatron_cfg:
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
   sequence_packing:
     enabled: false
   generation:
