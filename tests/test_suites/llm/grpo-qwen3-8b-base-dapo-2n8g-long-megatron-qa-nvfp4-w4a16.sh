@@ -3,29 +3,29 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=1
+NUM_NODES=2
+GPUS_PER_NODE=8
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=25
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_sft.py \
+uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
-    sft.max_num_steps=$MAX_STEPS \
+    grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=true \
+    checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
-    ~policy.tokenizer.chat_template \
     $@ \
     2>&1 | tee $RUN_LOG
 
@@ -34,10 +34,15 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    # Smoke checks: run completed and loss is finite/reasonable.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 0.49' \
-        'data["train/loss"]["10"] < 0.45'
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'max(data["train/gen_kl_error"]) < 0.003' \
+        'max(data["train/reward"]) > -0.9'
+
+    if ! grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"; then echo "ERROR: VllmQuantInternalWorkerExtension not found in real-quant run" >&2; exit 1; fi
+    if ! grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"; then echo "ERROR: 'Detected ModelOpt NVFP4 checkpoint' not found in real-quant run" >&2; exit 1; fi
+    if grep -q "FakeQuantWorker" "$RUN_LOG"; then echo "ERROR: FakeQuantWorker unexpectedly present in real-quant run" >&2; exit 1; fi
+    if grep -q "VLLM_QUANT_CFG" "$RUN_LOG"; then echo "ERROR: VLLM_QUANT_CFG unexpectedly present in real-quant run" >&2; exit 1; fi
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

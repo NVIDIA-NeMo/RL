@@ -216,7 +216,14 @@ class ClippedPGLossFn(LossFunction):
 
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: ClippedPGLossConfig):
+    def __init__(
+        self, cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool = False
+    ):
+        # When True, the model forward is patched to return precomputed next-token
+        # logprobs (via chunked linear CE fusion) instead of full logits. This is
+        # consumed by prepare_loss_input, which short-circuits the logits->logprobs
+        # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
@@ -730,8 +737,8 @@ class NLLLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, use_linear_ce_fusion: bool = False):
-        self.use_linear_ce_fusion = use_linear_ce_fusion
+    def __init__(self, use_fused_linear_logprobs: bool = False):
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
 
     def __call__(
         self,
@@ -951,14 +958,14 @@ class DPOLossFn(PreferenceLossFn):
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
+    def __init__(self, cfg: DPOLossConfig, use_fused_linear_logprobs: bool = False):
         self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
         self.preference_loss_weight = cfg.preference_loss_weight
         self.sft_loss_weight = cfg.sft_loss_weight
         self.preference_average_log_probs = cfg.preference_average_log_probs
         self.sft_average_log_probs = cfg.sft_average_log_probs
-        self.use_linear_ce_fusion = use_linear_ce_fusion
-        self.sft_loss = NLLLossFn(use_linear_ce_fusion=use_linear_ce_fusion)
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.sft_loss = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
 
     def _dpo_loss(
         self,

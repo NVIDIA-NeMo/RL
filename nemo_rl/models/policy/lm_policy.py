@@ -1056,6 +1056,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
         ray.get(futures)
 
+    def offload_to_cpu(self) -> None:
+        """Offload to CPU to free GPU memory; currently only used by PPO."""
+        self.offload_after_refit()
+
     def save_checkpoint(
         self,
         weights_path: str,
