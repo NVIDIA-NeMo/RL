@@ -837,13 +837,8 @@ def grpo_train_sync(
                     )
                     generation_logprobs = extras_bdd["generation_logprobs"]
                     token_mask = extras_bdd["token_mask"]
-                    # Unused placeholder for compute_advantage's
-                    # logprobs_policy arg — GRPO/Reinforce++ ignore it,
-                    # and OPD is forbidden here (asserted by opd module).
                     prev_logprobs = (
-                        extras_bdd["prev_logprobs"]
-                        if compute_prev
-                        else torch.zeros_like(generation_logprobs)
+                        extras_bdd["prev_logprobs"] if compute_prev else None
                     )
                     reference_policy_logprobs = (
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
