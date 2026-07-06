@@ -212,6 +212,11 @@ policy:
       # dump debug info" wrote nothing (job 2289258 step-2 deadlock).
       TORCH_NCCL_TRACE_BUFFER_SIZE: "2000"
       TORCH_NCCL_DUMP_ON_TIMEOUT: "1"
+      # Fail fast on the step-boundary deadlock (bug #16): 60 min of waiting
+      # provably never unsticks it (jobs 2289258/2291300) and burns half a 2h
+      # window before the watchdog dumps. 30 min still clears legitimate gaps
+      # (741G checkpoint resume-load ~10-15 min).
+      NRL_NCCL_TIMEOUT_MINUTES: "30"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0
