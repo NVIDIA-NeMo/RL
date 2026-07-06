@@ -51,7 +51,6 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
-    _placeholder_seq_logprob_error_metrics,
     _resolve_logprob_skip_flags,
     _should_log_nemo_gym_responses,
     _should_use_nemo_gym,
@@ -850,7 +849,9 @@ def grpo_train_sync(
                 # Seq-level logprob error metrics/masking require real prev_logprobs
                 if skip_prev_logprobs:
                     sample_mask = loss_multiplier
-                    seq_logprob_error_metrics = _placeholder_seq_logprob_error_metrics()
+                    # No valid measurements — leave the seq-level metrics
+                    # out of the emitted dict rather than pinning them to 0.
+                    seq_logprob_error_metrics: dict[str, Any] = {}
                 else:
                     sample_mask, seq_logprob_error_metrics = (
                         _compute_seq_logprob_error_metrics(
