@@ -266,8 +266,9 @@ class SingleControllerActor:
         )
 
     def _timed(self, label: str) -> Any:
-        """Context manager that wraps a code block with the SC Timer if a
-        logger is attached, else a no-op. Use as
+        """Time a code block with the SC Timer when a logger is attached.
+
+        No-op when no logger is configured. Use as
         ``with self._timed("phase"): ...``.
         """
         return self._timer.time(label) if self._timer is not None else nullcontext()
@@ -533,9 +534,7 @@ class SingleControllerActor:
                                 else min(step_min_weight_version, group_min_v)
                             )
 
-                        in_flight = await self._reap_in_flight_nonblocking(
-                            in_flight
-                        )
+                        in_flight = await self._reap_in_flight_nonblocking(in_flight)
 
                     for fut in in_flight:
                         await self._ray_get(fut)
