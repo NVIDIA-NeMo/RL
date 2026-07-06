@@ -1,7 +1,8 @@
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
-from threading import Thread
+from threading import Lock, Thread
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -60,6 +61,40 @@ def _make_manager(
         max_sessions=max_sessions,
         session_ttl_seconds=session_ttl_seconds,
         stability_margin_tokens=stability_margin_tokens,
+    )
+
+
+def test_worker_records_streaming_and_prefix_cache_metrics() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"enable_vllm_metrics_logger": True}}
+    worker._vllm_metrics_lock = Lock()
+    worker.streaming_tool_call_manager = SimpleNamespace(
+        total_dummy_tokens=3,
+        total_prefill_tokens=40,
+    )
+    worker._reset_vllm_logger_metrics()
+
+    worker._record_vllm_gauge_metric("vllm:num_requests_running", 2)
+    worker._record_vllm_gauge_metric("vllm:num_requests_waiting", 1)
+    worker._record_vllm_gauge_metric("vllm:kv_cache_usage_perc", 0.25)
+    worker._record_vllm_counter_metric("vllm:generation_tokens", 100)
+    worker._record_vllm_counter_metric("vllm:prefix_cache_queries", 80)
+    worker._record_vllm_counter_metric("vllm:prefix_cache_hits", 48)
+
+    assert worker.get_vllm_logger_metrics() == {
+        "inflight_batch_sizes": [2],
+        "num_pending_samples": [1],
+        "kv_cache_usage_perc": [0.25],
+        "generation_tokens": [97],
+        "streaming_tool_call_dummy_tokens": [3],
+        "streaming_tool_call_prefill_tokens": [40],
+        "prefix_cache_queries": [80],
+        "prefix_cache_hits": [48],
+    }
+
+    worker.clear_vllm_logger_metrics()
+    assert all(
+        not metric_values for metric_values in worker.get_vllm_logger_metrics().values()
     )
 
 

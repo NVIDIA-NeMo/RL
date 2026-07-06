@@ -1032,29 +1032,20 @@ class VllmGeneration(GenerationInterface):
 
         results = ray.get(futures)
         vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
-            "inflight_batch_sizes": {},  # dp_idx -> list[int]
-            "num_pending_samples": {},  # dp_idx -> list[int]
-            "kv_cache_usage_perc": {},  # dp_idx -> list[float]
-            "generation_tokens": {},  # dp_idx -> list[int]
+            "inflight_batch_sizes": {},
+            "num_pending_samples": {},
+            "kv_cache_usage_perc": {},
+            "generation_tokens": {},
         }
 
         for dp_idx, stats in zip(dp_indices, results):
             if not stats:
                 continue
-            inflight_batch_sizes = stats.get("inflight_batch_sizes")
-            if inflight_batch_sizes:
-                vllm_logger_metrics["inflight_batch_sizes"][dp_idx] = (
-                    inflight_batch_sizes
-                )
-            num_pending_samples = stats.get("num_pending_samples")
-            if num_pending_samples:
-                vllm_logger_metrics["num_pending_samples"][dp_idx] = num_pending_samples
-            kv_cache_usage_perc = stats.get("kv_cache_usage_perc")
-            if kv_cache_usage_perc:
-                vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
-            generation_tokens = stats.get("generation_tokens")
-            if generation_tokens:
-                vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+            for metric_name, metric_values in stats.items():
+                if metric_values:
+                    vllm_logger_metrics.setdefault(metric_name, {})[dp_idx] = (
+                        metric_values
+                    )
 
         return vllm_logger_metrics
 

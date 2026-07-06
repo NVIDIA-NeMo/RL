@@ -436,54 +436,23 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         stop_event = threading.Event()
         self._vllm_metrics_logger_stop_event = stop_event
 
-        self.inflight_batch_sizes: list[int] = []
-        self.num_pending_samples: list[int] = []
-        self.kv_cache_usage_perc: list[float] = []
-        self.generation_tokens: list[int] = []
-        self.streaming_tool_call_dummy_tokens: list[int] = []
-        self.streaming_tool_call_prefill_tokens: list[int] = []
+        self._reset_vllm_logger_metrics()
 
         def _logger_loop():
             # Delay a little to let engine settle
             time.sleep(min(2.0, interval_s))
             while True:
                 try:
-                    for m in get_metrics_snapshot():
+                    for metric in get_metrics_snapshot():
                         with self._vllm_metrics_lock:
-                            if isinstance(m, Gauge):
-                                # Log the vllm inflight batch sizes
-                                if m.name == "vllm:num_requests_running":
-                                    self.inflight_batch_sizes.append(int(m.value))
-                                # Log the vllm pending number of requests in the queue
-                                elif m.name == "vllm:num_requests_waiting":
-                                    self.num_pending_samples.append(int(m.value))
-                                # Log the vllm kv cache usage
-                                elif m.name == "vllm:kv_cache_usage_perc":
-                                    self.kv_cache_usage_perc.append(float(m.value))
-                            elif isinstance(m, Counter):
-                                if m.name == "vllm:generation_tokens":
-                                    manager = getattr(
-                                        self, "streaming_tool_call_manager", None
-                                    )
-                                    dummy_tokens = (
-                                        manager.total_dummy_tokens
-                                        if manager is not None
-                                        else 0
-                                    )
-                                    prefill_tokens = (
-                                        manager.total_prefill_tokens
-                                        if manager is not None
-                                        else 0
-                                    )
-                                    self.generation_tokens.append(
-                                        max(0, int(m.value) - dummy_tokens)
-                                    )
-                                    self.streaming_tool_call_dummy_tokens.append(
-                                        dummy_tokens
-                                    )
-                                    self.streaming_tool_call_prefill_tokens.append(
-                                        prefill_tokens
-                                    )
+                            if isinstance(metric, Gauge):
+                                self._record_vllm_gauge_metric(
+                                    metric.name, metric.value
+                                )
+                            elif isinstance(metric, Counter):
+                                self._record_vllm_counter_metric(
+                                    metric.name, metric.value
+                                )
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -502,6 +471,41 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             flush=True,
         )
 
+    def _reset_vllm_logger_metrics(self) -> None:
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
+        self.kv_cache_usage_perc: list[float] = []
+        self.generation_tokens: list[int] = []
+        self.streaming_tool_call_dummy_tokens: list[int] = []
+        self.streaming_tool_call_prefill_tokens: list[int] = []
+        self.prefix_cache_queries: list[int] = []
+        self.prefix_cache_hits: list[int] = []
+
+    def _record_vllm_gauge_metric(
+        self, metric_name: str, metric_value: int | float
+    ) -> None:
+        if metric_name == "vllm:num_requests_running":
+            self.inflight_batch_sizes.append(int(metric_value))
+        elif metric_name == "vllm:num_requests_waiting":
+            self.num_pending_samples.append(int(metric_value))
+        elif metric_name == "vllm:kv_cache_usage_perc":
+            self.kv_cache_usage_perc.append(float(metric_value))
+
+    def _record_vllm_counter_metric(
+        self, metric_name: str, metric_value: int | float
+    ) -> None:
+        if metric_name == "vllm:generation_tokens":
+            manager = self.streaming_tool_call_manager
+            dummy_tokens = manager.total_dummy_tokens if manager is not None else 0
+            prefill_tokens = manager.total_prefill_tokens if manager is not None else 0
+            self.generation_tokens.append(max(0, int(metric_value) - dummy_tokens))
+            self.streaming_tool_call_dummy_tokens.append(dummy_tokens)
+            self.streaming_tool_call_prefill_tokens.append(prefill_tokens)
+        elif metric_name == "vllm:prefix_cache_queries":
+            self.prefix_cache_queries.append(int(metric_value))
+        elif metric_name == "vllm:prefix_cache_hits":
+            self.prefix_cache_hits.append(int(metric_value))
+
     def get_vllm_logger_metrics(self) -> dict[str, Any]:
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return {}
@@ -518,6 +522,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "streaming_tool_call_prefill_tokens": copy.deepcopy(
                     self.streaming_tool_call_prefill_tokens
                 ),
+                "prefix_cache_queries": copy.deepcopy(self.prefix_cache_queries),
+                "prefix_cache_hits": copy.deepcopy(self.prefix_cache_hits),
             }
         return metric
 
@@ -526,12 +532,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             return
 
         with self._vllm_metrics_lock:
-            self.inflight_batch_sizes = []
-            self.num_pending_samples = []
-            self.kv_cache_usage_perc = []
-            self.generation_tokens = []
-            self.streaming_tool_call_dummy_tokens = []
-            self.streaming_tool_call_prefill_tokens = []
+            self._reset_vllm_logger_metrics()
 
     async def post_init_async(self):
         if self.llm is not None:

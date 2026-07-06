@@ -110,6 +110,10 @@ longer sources any env script. Before submitting, export these yourself:
 - `WANDB_API_KEY` — required for wandb logging (`logger.wandb_enabled=True`)
 - `GITHUB_TOKEN` — only if your data/repo access needs it
 
+`ray.sub` deliberately keeps shell xtrace disabled and does not dump the full
+environment because `COMMAND` carries these credentials. Do not re-enable
+either behavior in shared job logs.
+
 ### 2.5 Caches (created automatically, listed for reference)
 
 The launcher seeds vLLM/inductor/triton caches from a persistent dir under your
@@ -126,6 +130,23 @@ Node-local (/tmp, recreated each run):
   /tmp/nemo_rl_inductor_cache
   /tmp/nemo_rl_triton_cache
   /tmp/uv_cache
+```
+
+For a strict SWE-bench Verified pair, the pair launcher additionally runs
+`prewarm_swebench_artifacts.sh` by default. It allocates one
+`nemotron_sw_post` / `interactive` node, caches the repository dependency files
+that SWE-bench otherwise fetches from `raw.githubusercontent.com`, verifies the
+cache offline, then sets `SWE_BENCH_ARTIFACT_CACHE_OFFLINE=1` in both arms.
+This keeps DNS failures from becoming asymmetric post-rollout evaluation
+failures. The shared cache is
+`3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/swebench_artifact_cache`.
+
+Set `PREWARM_SWEBENCH_ARTIFACTS=0` only for a legacy online run. To prewarm a
+manifest manually, run:
+
+```bash
+bash examples/swe_bench/prewarm_swebench_artifacts.sh \
+  results/swebench_verified/swebench_verified_no_timeout_observed_474.jsonl
 ```
 
 ---
@@ -339,7 +360,24 @@ group. The **per-replica** `generation_metrics/*` timelines should stay **flat**
 | `generation_metrics/*num_pending_samples` | ≈ 0 (no queue backlog) |
 | `generation_metrics/*kv_cache_usage_perc` | flat (≈8–10%) |
 | `generation_metrics/*generation_tokens` | flat per replica per window |
+| `generation_metrics/*prefix_cache_queries` | cumulative queried prompt tokens; compare adjacent-sample deltas |
+| `generation_metrics/*prefix_cache_hits` | cumulative cached prompt tokens; interval hit rate = `Δhits / Δqueries` |
+| `generation_metrics/*streaming_tool_call_prefill_tokens` | cumulative accepted streaming-prefill tokens; zero when disabled |
+| `generation_metrics/*streaming_tool_call_dummy_tokens` | cumulative discarded acknowledgement tokens; zero when disabled |
+| `*streaming_tool_call_eligible_actions*` | shell actions whose model-response context reached the streaming integration |
+| `*streaming_tool_call_skipped_no_stable_output*` | eligible actions that completed before two stable append-only snapshots could admit a session |
+| `*streaming_tool_call_snapshot_polls*` | runtime reads of the current shell-output snapshot; compare with session coverage to detect polling overhead |
+| `*streaming_tool_call_snapshot_revisions*` | changed snapshot revisions observed by the runtime |
+| `*streaming_tool_call_nonempty_snapshots*` | non-empty changed snapshots observed before tool completion |
+| `*streaming_tool_call_snapshots_at_or_above_min_chunk_chars*` | observed snapshots satisfying the 256-character admission size gate |
+| `*streaming_tool_call_skipped_single_snapshot*` | eligible actions that produced only one non-empty snapshot before completion |
+| `*streaming_tool_call_skipped_below_min_chunk_chars*` | eligible actions with multiple snapshots but none reaching the character gate |
+| `*streaming_tool_call_skipped_completed_before_admission*` | eligible actions that reached the size gate but completed before admission |
 | worker-trace count | equals the replica count (`gen_gpus / vLLM_TP`) |
+
+The four token counters above are cumulative within each vLLM replica. Do not
+compare their raw endpoint values across runs with different durations. Compute
+per-window deltas first, then aggregate matching windows across replicas.
 
 > Note: SWE rollouts are **agent / tool-execution-bound** (each sample is a multi-turn
 > OpenHands rollout in an apptainer sandbox), so per-replica inflight/KV stay low and
