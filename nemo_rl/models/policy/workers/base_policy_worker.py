@@ -50,7 +50,7 @@ class AbstractPolicyWorker:
         torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=device)
 
-    def init_nccl_xfer_comm_group(
+    def init_nccl_reshard_comm_group(
         self,
         pp_ips: list[str],
         pp_ports: list[int],
@@ -59,7 +59,7 @@ class AbstractPolicyWorker:
         sub_world_size: int,
         my_rank_in_group: int,
     ) -> None:
-        """Bootstrap this train worker's nccl_xfer comm group.
+        """Bootstrap this train worker's nccl_reshard comm group.
 
         One comm group per PP stage; each train worker joins exactly its own
         stage's group (``pp_ips[my_pp_stage]`` / ``pp_ports[my_pp_stage]``).

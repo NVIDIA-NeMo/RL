@@ -50,11 +50,6 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.distributed.nccl_xfer_utils import (
-    HFToLocalParamMap,
-    LocalParamSpec,
-    RefitCtx,
-)
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
@@ -101,6 +96,11 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
+from nemo_rl.weight_sync.nccl_reshard_utils import (
+    HFToLocalParamMap,
+    LocalParamSpec,
+    RefitCtx,
+)
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -1841,7 +1841,7 @@ class MegatronPolicyWorkerImpl(
         so that the logic for adding KV scales stays consistent in one place.
 
         ``conversion_tasks`` (optional) overrides ``self.refit_conversion_tasks``
-        — used by the nccl_xfer_refit misc-refit path to pass a filtered subset so
+        — used by the nccl_reshard_refit misc-refit path to pass a filtered subset so
         Bridge only does TP/EP all-gather for those tasks instead of the full model.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
@@ -1908,10 +1908,10 @@ class MegatronPolicyWorkerImpl(
     def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
 
-        Used by the nccl_xfer_refit bulk path (``build_hf_to_local_param_map``).
+        Used by the nccl_reshard_refit bulk path (``build_hf_to_local_param_map``).
         Only the FFN projections (gate/up/down_proj) take the bulk
         path, so this yields ONLY those. Others. take the misc packed_broadcast path
-        and are skipped here (see ``is_nccl_xfer_param``).
+        and are skipped here (see ``is_nccl_reshard_param``).
 
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
         via ``export_hf_weights``), this yields TP-local shards directly from the
@@ -1922,7 +1922,7 @@ class MegatronPolicyWorkerImpl(
         """
         from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
 
-        from nemo_rl.distributed.nccl_xfer_utils import is_nccl_xfer_param
+        from nemo_rl.weight_sync.nccl_reshard_utils import is_nccl_reshard_param
 
         for task in self.refit_conversion_tasks:
             local_tensor = task.param_weight  # local megatron tensor
@@ -1943,7 +1943,7 @@ class MegatronPolicyWorkerImpl(
             # simple gate/up) takes hits this branch. QKV (a compound mapping) and
             # every non-FFN param fall through to misc, so they are skipped.
             hf_param = task.mapping.hf_param
-            if not isinstance(hf_param, dict) and is_nccl_xfer_param(str(hf_param)):
+            if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
                 yield str(hf_param), local_tensor
 
     @torch.no_grad()
@@ -1996,7 +1996,7 @@ class MegatronPolicyWorkerImpl(
           - ``virtual_pipeline_model_parallel_size`` (interleaved PP)
           - ``account_for_embedding_in_pipeline_split``
           - ``account_for_loss_in_pipeline_split``
-        These cases are checked in check_nccl_xfer_refit_support function.
+        These cases are checked in check_nccl_reshard_refit_support function.
         """
         # Read from the runtime model's config rather than the bridge's
         # default — the user's per-stage layout overrides
@@ -2005,19 +2005,19 @@ class MegatronPolicyWorkerImpl(
         config = self.model.config
 
         assert getattr(config, "pipeline_model_parallel_layout", None) is None, (
-            "nccl_xfer_refit does not support custom pipeline_model_parallel_layout yet"
+            "nccl_reshard_refit does not support custom pipeline_model_parallel_layout yet"
         )
         assert getattr(config, "virtual_pipeline_model_parallel_size", None) in (
             None,
             1,
         ), (
-            "nccl_xfer_refit does not support virtual_pipeline_model_parallel_size > 1 yet"
+            "nccl_reshard_refit does not support virtual_pipeline_model_parallel_size > 1 yet"
         )
         assert not getattr(config, "account_for_embedding_in_pipeline_split", False), (
-            "nccl_xfer_refit does not support account_for_embedding_in_pipeline_split yet"
+            "nccl_reshard_refit does not support account_for_embedding_in_pipeline_split yet"
         )
         assert not getattr(config, "account_for_loss_in_pipeline_split", False), (
-            "nccl_xfer_refit does not support account_for_loss_in_pipeline_split yet"
+            "nccl_reshard_refit does not support account_for_loss_in_pipeline_split yet"
         )
 
         num_layers = config.num_layers
@@ -2053,7 +2053,7 @@ class MegatronPolicyWorkerImpl(
                 count = middle_per_stage
             for _ in range(count):
                 # Emit both HF naming conventions so the lookup in
-                # build_nccl_xfer_refit_info hits regardless of model family:
+                # build_nccl_reshard_refit_info hits regardless of model family:
                 # Llama/Qwen use ``model.layers.N``; NemotronH uses
                 # ``backbone.layers.N``.  Keys are looked up (not iterated), so
                 # the unused convention's extra keys are harmless.
@@ -2075,23 +2075,23 @@ class MegatronPolicyWorkerImpl(
         return layer_to_pp_stage
 
     @torch.no_grad()
-    def prepare_nccl_xfer_refit_info(
+    def prepare_nccl_reshard_refit_info(
         self,
         train_parallelism,
         gen_parallelism,
         train_world_size,
         gen_world_size,
     ):
-        """Prepare per-layer parameter metadata for nccl_xfer-based refit.
+        """Prepare per-layer parameter metadata for nccl_reshard-based refit.
 
         The builder groups per-expert MoE params into backend-agnostic grouped
         HF entries (gate_proj/up_proj/down_proj); the gen backend maps those into
         its own fused layout (e.g., vLLM w13/w2) gen-side, so this train worker
         stays agnostic to any gen backend's MoE-fusion layout.
         """
-        from nemo_rl.distributed.nccl_xfer_utils import (
-            build_nccl_xfer_refit_info,
-            is_nccl_xfer_param,
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            build_nccl_reshard_refit_info,
+            is_nccl_reshard_param,
         )
 
         self.refit_param_info_mcore = self._calculate_refit_param_info()
@@ -2138,8 +2138,8 @@ class MegatronPolicyWorkerImpl(
                 }
                 _nbytes = tensor.numel() * tensor.element_size()
                 # Downsized whitelist: only FFN gate/up/down weights take the bulk
-                # nccl-xfer path; everything else -> misc (packed_broadcast).
-                if is_nccl_xfer_param(name):
+                # nccl-reshard path; everything else -> misc (packed_broadcast).
+                if is_nccl_reshard_param(name):
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
                 else:
@@ -2150,7 +2150,7 @@ class MegatronPolicyWorkerImpl(
         _tot = _xfer_bytes + _bcast_bytes
         print(
             f"[xferd-payload] ffn_only "
-            f"nccl_xfer={_xfer_bytes / _gib:.2f}GiB "
+            f"nccl_reshard={_xfer_bytes / _gib:.2f}GiB "
             f"bcast_misc={_bcast_bytes / _gib:.2f}GiB "
             f"total={_tot / _gib:.2f}GiB "
             f"xfer_frac={_xfer_bytes / max(_tot, 1):.1%}",
@@ -2164,7 +2164,7 @@ class MegatronPolicyWorkerImpl(
         )
 
         # The key metadata, which should shared with generation workers
-        self.nccl_xfer_refit_info = build_nccl_xfer_refit_info(
+        self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
             state_dict_metadata,
             train_parallelism,
             gen_parallelism,
@@ -2172,14 +2172,14 @@ class MegatronPolicyWorkerImpl(
             gen_world_size,
             layer_to_pp_stage=layer_to_pp_stage,
         )
-        # Build HFToLocalParamMap (see nccl_xfer_utils)
+        # Build HFToLocalParamMap (see nccl_reshard_utils)
         self.hf_to_local_param_map = self.build_hf_to_local_param_map(
-            self.nccl_xfer_refit_info
+            self.nccl_reshard_refit_info
         )
 
-        # Keep the misc_meta in the nccl_xfer_refit_info
+        # Keep the misc_meta in the nccl_reshard_refit_info
         # misc_meta[hf_name] -> [shape, dtype]
-        self.nccl_xfer_refit_info["misc_meta"] = misc_meta
+        self.nccl_reshard_refit_info["misc_meta"] = misc_meta
         # Filter conversion_tasks to the misc subset.
         _misc_names = set(misc_meta.keys())
 
@@ -2189,7 +2189,7 @@ class MegatronPolicyWorkerImpl(
             if task.global_param_name.endswith("_scale_inv"):
                 return True
             # Compound mappings (QKV/GatedMLP) export homogeneous sub-params
-            # (all nccl-xfer or all misc), so the first HF name is representative.
+            # (all nccl-reshard or all misc), so the first HF name is representative.
             hf = task.mapping.hf_param
             name = next(iter(hf.values())) if isinstance(hf, dict) else str(hf)
             return name in _misc_names
@@ -2200,7 +2200,7 @@ class MegatronPolicyWorkerImpl(
             if task is not None and _task_is_misc(task)
         ]
 
-        return self.nccl_xfer_refit_info
+        return self.nccl_reshard_refit_info
 
     def _build_expert_groups(self, param_map):
         """Group this rank's local expert params into stack-ready views.
@@ -2235,7 +2235,7 @@ class MegatronPolicyWorkerImpl(
         must precede expert 1 to match the EP ``Shard(0)`` layout the gen side
         expects.
         """
-        from nemo_rl.distributed.nccl_xfer_utils import _INDIVIDUAL_EXPERT_RE
+        from nemo_rl.weight_sync.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
 
         index_groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
         for name in param_map:
@@ -2301,7 +2301,7 @@ class MegatronPolicyWorkerImpl(
         return HFToLocalParamMap(specs=mapping)
 
     @torch.no_grad()
-    def nccl_xfer_refit(self, kv_scales=None):
+    def nccl_reshard_refit(self, kv_scales=None):
         """Transfer weights to generation workers via xferdtensor.
 
         Uses TP-local shards directly from Megatron parameters, bypassing
@@ -2309,17 +2309,17 @@ class MegatronPolicyWorkerImpl(
         reconstructs the full tensor from per-rank shards internally.
 
         ``kv_scales`` (FP8 KV cache): the per-layer k/v(/q) scales ride the misc
-        packed-broadcast as plain scale tensors (the is_nccl_xfer_param whitelist
+        packed-broadcast as plain scale tensors (the is_nccl_reshard_param whitelist
         excludes ``.k_scale``/``.v_scale``/``.q_scale`` -> misc); the gen side finalizes
         them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
         """
-        # hf_to_local_param_map is built once in prepare_nccl_xfer_refit_info;
+        # hf_to_local_param_map is built once in prepare_nccl_reshard_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.
-        # Overlapping broadcast and the nccl-xfer path refits.
+        # Overlapping broadcast and the nccl-reshard path refits.
         import concurrent.futures
 
-        from nemo_rl.distributed.xferdtensor import DTensorRef, xferdtensor
+        from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         # The misc producer requires the worker's CUDA device setting.
         # Otherwise it defaults to device 0
@@ -2330,9 +2330,9 @@ class MegatronPolicyWorkerImpl(
             self._broadcast_misc_params_packed(kv_scales=kv_scales)
 
         # Serialize the bulk reshard and the misc broadcast (bulk -> misc) by
-        # default; both sides must agree (see vllm_backend.nccl_xfer_refit).
+        # default; both sides must agree (see vllm_backend.nccl_reshard_refit).
         _parallel_misc = os.environ.get(
-            "NRL_NCCL_XFER_REFIT_PARALLEL_MISC", ""
+            "NRL_NCCL_RESHARD_REFIT_PARALLEL_MISC", ""
         ).lower() in (
             "1",
             "true",
@@ -2343,8 +2343,10 @@ class MegatronPolicyWorkerImpl(
             _misc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             _misc_future = _misc_pool.submit(_run_misc_broadcast)
 
-        for layer_name in self.nccl_xfer_refit_info["layer_names"]:
-            for param_info in self.nccl_xfer_refit_info["per_layer_params"][layer_name]:
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
+                layer_name
+            ]:
                 # Each train worker handles only its own PP stage's params
                 # (non-PP = every param is in pp_stage 0).
                 if param_info.get("pp_stage", 0) != self.my_pp_stage:
@@ -2395,7 +2397,7 @@ class MegatronPolicyWorkerImpl(
 
     def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
         """Broadcast misc params via the existing packed_broadcast machinery."""
-        misc_meta = self.nccl_xfer_refit_info.get("misc_meta", {})
+        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
         if not misc_meta:
             return
 

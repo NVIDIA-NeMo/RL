@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Refit metadata builders and lightweight wrapper types for nccl_xfer.
+"""Refit metadata builders and lightweight wrapper types for nccl_reshard.
 
 This module provides:
 - MeshInfo: lightweight DeviceMesh-compatible wrapper that doesn't require a
   shared torch.distributed process group (needed for cross-world transfers)
 - Placement rules: mapping param names to TP/EP sharding strategies
-- build_nccl_xfer_refit_info: compute per-layer param metadata for refit
+- build_nccl_reshard_refit_info: compute per-layer param metadata for refit
 - restore_refit_info_placements: undo msgspec dict-flattening of placements
   and meshes on the receiving side
 
 The transfer kernel (``xferdtensor``) and its ``DTensorRef`` src/dst wrapper
-live in ``nemo_rl/distributed/xferdtensor.py`` — import both from there.
+live in ``nemo_rl/weight_sync/xferdtensor.py`` — import both from there.
 """
 
 import re
@@ -123,15 +123,15 @@ class HFToLocalParamMap:
 
 @runtime_checkable
 class RefitBuilderInterface(Protocol):
-    """Structural contract for an nccl_xfer refit backend (train src / gen dst).
+    """Structural contract for an nccl_reshard refit backend (train src / gen dst).
 
     A backend builds its ``hf_name -> LocalParamSpec`` map once via
-    :meth:`build_hf_to_local_param_map`, then its ``nccl_xfer_refit`` loop drives
+    :meth:`build_hf_to_local_param_map`, then its ``nccl_reshard_refit`` loop drives
     each param's transfer through the spec's ``pre``/``post`` hooks.
     """
 
     def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
-        """Build the unified ``hf_name -> LocalParamSpec`` map for nccl_xfer refit."""
+        """Build the unified ``hf_name -> LocalParamSpec`` map for nccl_reshard refit."""
         ...
 
 
@@ -141,7 +141,7 @@ class RefitBuilderInterface(Protocol):
 
 # FFN column-parallel suffixes: TP shards along dim 0 (output / intermediate).
 # Only FFN gate/up reach the bulk path; everything else (attention, embeddings,
-# scales, ...) takes the misc path (see ``is_nccl_xfer_param``).
+# scales, ...) takes the misc path (see ``is_nccl_reshard_param``).
 COLUMN_PARALLEL_SUFFIXES = [
     "gate_proj.weight",
     "up_proj.weight",
@@ -187,10 +187,10 @@ FFN_PROJ_WEIGHT_SUFFIXES = (
 )
 
 
-def is_nccl_xfer_param(param_name: str) -> bool:
+def is_nccl_reshard_param(param_name: str) -> bool:
     """Return True iff the param takes the xferdtensor bulk reshard path.
 
-    Only the FFN projection weights take the nccl_xfer bulk path:
+    Only the FFN projection weights take the nccl_reshard bulk path:
     ``gate_proj`` / ``up_proj`` / ``down_proj`` ``.weight``, for both the dense
     MLP and the MoE experts. This will cover >95% of the refit payload. For the
     large models.
@@ -375,7 +375,7 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
 
 # Matches individual expert params: model.layers.X.mlp.experts.Y.proj.weight
 # Anchored with ``$`` so it doesn't prefix-match FP8 ``_scale_inv`` siblings
-# (scale_inv siblings take the misc refit path via ``is_nccl_xfer_param`` and
+# (scale_inv siblings take the misc refit path via ``is_nccl_reshard_param`` and
 # must not appear in the per-expert weight fusion groups).
 _INDIVIDUAL_EXPERT_RE = re.compile(
     r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
@@ -461,8 +461,8 @@ def _extract_layer_name(param_name: str) -> str:
     return param_name.split(".")[0]
 
 
-def check_nccl_xfer_refit_support(master_config: dict) -> None:
-    """Validate ``master_config`` against every precondition of nccl_xfer_refit.
+def check_nccl_reshard_refit_support(master_config: dict) -> None:
+    """Validate ``master_config`` against every precondition of nccl_reshard_refit.
 
     Collects all violations and raises a single ``ValueError`` listing them, so
     a user fixing their config can address everything in one pass rather than
@@ -494,10 +494,10 @@ def check_nccl_xfer_refit_support(master_config: dict) -> None:
     if generation.get("colocated", {}).get("enabled", False):
         violations.append(
             "policy.generation.colocated.enabled must be False "
-            "(nccl_xfer_refit is only for disaggregated train/gen)."
+            "(nccl_reshard_refit is only for disaggregated train/gen)."
         )
 
-    # Gen backend = vLLM — only backend with prepare_nccl_xfer_refit_info.
+    # Gen backend = vLLM — only backend with prepare_nccl_reshard_refit_info.
     backend = generation.get("backend")
     if backend != "vllm":
         violations.append(
@@ -569,7 +569,7 @@ def check_nccl_xfer_refit_support(master_config: dict) -> None:
         if gen_precision not in (None, "auto", "bf16", "bfloat16", "fp8"):
             violations.append(
                 f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
-                "supported by nccl_xfer_refit (use 'bf16'/'bfloat16', 'fp8', "
+                "supported by nccl_reshard_refit (use 'bf16'/'bfloat16', 'fp8', "
                 "'auto', or leave unset); the refit byte-copies weights, so the "
                 "gen dtype must match the train dtype."
             )
@@ -614,12 +614,12 @@ def check_nccl_xfer_refit_support(master_config: dict) -> None:
 
     if violations:
         raise ValueError(
-            "nccl_xfer_refit cannot be enabled with the current config:\n"
+            "nccl_reshard_refit cannot be enabled with the current config:\n"
             + "\n".join(f"  - {v}" for v in violations)
         )
 
 
-def build_nccl_xfer_refit_info(
+def build_nccl_reshard_refit_info(
     state_dict_metadata: dict[str, dict[str, Any]],
     train_parallelism: dict[str, int],
     gen_parallelism: dict[str, int],
@@ -627,7 +627,7 @@ def build_nccl_xfer_refit_info(
     gen_world_size: int,
     layer_to_pp_stage: Optional[dict[str, int]] = None,
 ) -> dict[str, Any]:
-    """Build per-layer parameter info for nccl_xfer-based refit.
+    """Build per-layer parameter info for nccl_reshard-based refit.
 
     Args:
         state_dict_metadata: ``{hf_param_name: {"shape": list, "dtype": str}}``
@@ -661,7 +661,7 @@ def build_nccl_xfer_refit_info(
             "layer_to_pp_stage must be provided when pp_size > 1"
         )
 
-    # Currently we don't support ETP>1 for the nccl_xfer_refit.
+    # Currently we don't support ETP>1 for the nccl_reshard_refit.
     # Non-expert params, ranks are partitioned (tp, dp);
     # Expert params, ranks are partitioned (ep, edp).
     def _build_train_src_meshes(num_gpus: int, rank_offset: int, stage_pp: int):

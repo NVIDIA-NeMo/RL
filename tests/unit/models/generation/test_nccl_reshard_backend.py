@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the vLLM-side nccl_xfer refit mapping (CPU, no GPU).
+"""Unit tests for the vLLM-side nccl_reshard refit mapping (CPU, no GPU).
 
 Covers the FFN-only bulk path in ``nemo_rl/models/generation/vllm/vllm_backend.py``
 (``_build_hf_to_gen_backend_mapping`` + ``build_hf_to_local_param_map``), driven by
@@ -30,12 +30,12 @@ import torch
 
 pytest.importorskip("vllm")  # module-top `import vllm` in vllm_backend
 
-from nemo_rl.distributed.nccl_xfer_utils import (  # noqa: E402
-    HFToLocalParamMap,
-    RefitBuilderInterface,
-)
 from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
     VllmInternalWorkerExtension,
+)
+from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
+    HFToLocalParamMap,
+    RefitBuilderInterface,
 )
 
 pytestmark = pytest.mark.vllm

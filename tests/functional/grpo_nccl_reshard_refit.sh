@@ -1,5 +1,5 @@
 #!/bin/bash
-# Functional smoke for the nccl_xfer disaggregated weight-refit path
+# Functional smoke for the nccl_reshard disaggregated weight-refit path
 # (Megatron train -> vLLM gen on disjoint GPUs), forced onto the broadcast-based
 # GOLDEN reshard (NRL_XFERDTENSOR_GOLDEN=1) so it does not require the real
 # nccl.xfer op in the container.
@@ -7,21 +7,21 @@
 # 1T1G disaggregated run on 2 GPUs (1 node): Megatron TP1 (train, 1 GPU) ->
 # vLLM TP1 (gen, 1 GPU), non-colocated.  This is sized for the 2-GPU functional
 # CI runner, so the reshard itself is trivial (fully replicated 1->1), but it
-# still EXERCISES the whole disaggregated nccl_xfer code path end to end:
-# prepare_nccl_xfer_refit_info / build_nccl_xfer_refit_info, the gen-side
+# still EXERCISES the whole disaggregated nccl_reshard code path end to end:
+# prepare_nccl_reshard_refit_info / build_nccl_reshard_refit_info, the gen-side
 # _build_hf_to_gen_backend_mapping (qkv / gate_up merge slices, lm_head tie),
-# nccl_xfer_refit + get_dst_dtensor, the misc packed_broadcast, and
+# nccl_reshard_refit + get_dst_dtensor, the misc packed_broadcast, and
 # xferdtensor_golden -- which is the coverage this smoke is here to add.
 #
 # REAL reshards (TP/EP/PP down- and up-shard, e.g. TP4xDP2 -> TP2xDP4) plus
 # MoE / PP / FP8 / large-model coverage live in the SLURM script/new_refit/
 # matrix (>=16 GPUs); the MoE expert grouping + w13/w2 mapping are covered by
-# the unit tests (tests/unit/distributed/test_nccl_xfer_utils.py and
-# tests/unit/models/generation/test_nccl_xfer_backend.py).
+# the unit tests (tests/unit/weight_sync/test_nccl_reshard_utils.py and
+# tests/unit/models/generation/test_nccl_reshard_backend.py).
 #
 # Requires the mcore + vllm extras and a 2-GPU allocation (the functional CI
 # runner), e.g.:
-#   uv run --extra mcore --extra vllm bash tests/functional/grpo_nccl_xfer_refit.sh
+#   uv run --extra mcore --extra vllm bash tests/functional/grpo_nccl_reshard_refit.sh
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
@@ -65,7 +65,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.generation.colocated.resources.gpus_per_node=1 \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     policy.generation.vllm_cfg.async_engine=true \
-    +policy.nccl_xfer_refit=true \
+    +policy.nccl_reshard_refit=true \
     cluster.num_nodes=1 \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \

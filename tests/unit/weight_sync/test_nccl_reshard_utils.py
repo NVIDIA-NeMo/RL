@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pure-CPU unit tests for the nccl_xfer refit metadata builders.
+"""Pure-CPU unit tests for the nccl_reshard refit metadata builders.
 
-Covers the metadata/placement logic in ``nemo_rl/distributed/nccl_xfer_utils.py``
-that runs on the train side to build the shared ``nccl_xfer_refit_info``:
+Covers the metadata/placement logic in ``nemo_rl/weight_sync/nccl_reshard_utils.py``
+that runs on the train side to build the shared ``nccl_reshard_refit_info``:
 mesh construction, placement rules, expert grouping, and the top-level
-``build_nccl_xfer_refit_info``.  All pure functions — no GPU, no
+``build_nccl_reshard_refit_info``.  All pure functions — no GPU, no
 torch.distributed, no model object — so this module runs on CPU with no extras.
 """
 
@@ -25,14 +25,14 @@ import pytest
 import torch
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from nemo_rl.distributed.nccl_xfer_utils import (
+from nemo_rl.weight_sync.nccl_reshard_utils import (
     HFToLocalParamMap,
     LocalParamSpec,
     MeshInfo,
     RefitBuilderInterface,
     RefitCtx,
     build_mesh_info,
-    build_nccl_xfer_refit_info,
+    build_nccl_reshard_refit_info,
     get_placements,
     get_tp_shard_dim,
     group_expert_params_in_metadata,
@@ -259,7 +259,7 @@ def test_group_expert_params_no_experts_is_identity():
 
 
 # --------------------------------------------------------------------------
-# build_nccl_xfer_refit_info
+# build_nccl_reshard_refit_info
 # --------------------------------------------------------------------------
 def _dense_metadata(hidden=32, inter=64):
     # FFN-only: the bulk path carries just gate/up/down (everything else -> misc).
@@ -288,7 +288,7 @@ def _find(info, name):
 
 
 def test_build_refit_info_top_level_and_param_fields():
-    info = build_nccl_xfer_refit_info(
+    info = build_nccl_reshard_refit_info(
         _dense_metadata(),
         train_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
         gen_parallelism={"tp_size": 4, "ep_size": 1, "pp_size": 1},
@@ -358,7 +358,7 @@ def test_build_refit_info_sets_pp_stage_when_pp_gt_1():
         "model.layers.0": 0,
         "model.layers.1": 1,
     }
-    info = build_nccl_xfer_refit_info(
+    info = build_nccl_reshard_refit_info(
         md,
         train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 2},
         gen_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},
@@ -373,7 +373,7 @@ def test_build_refit_info_sets_pp_stage_when_pp_gt_1():
 
 
 def test_build_refit_info_groups_experts_and_tags_them():
-    info = build_nccl_xfer_refit_info(
+    info = build_nccl_reshard_refit_info(
         _moe_metadata(num_experts=2),
         train_parallelism={"tp_size": 1, "ep_size": 2, "pp_size": 1},
         gen_parallelism={"tp_size": 2, "ep_size": 1, "pp_size": 1},

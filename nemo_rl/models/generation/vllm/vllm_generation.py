@@ -970,7 +970,7 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    def init_nccl_xfer_comm_group(
+    def init_nccl_reshard_comm_group(
         self,
         pp_ips: list[str],
         pp_ports: list[int],
@@ -978,7 +978,7 @@ class VllmGeneration(GenerationInterface):
         train_ranks_per_stage: int,
         sub_world_size: int,
     ) -> list[ray.ObjectRef]:
-        """Initialize the nccl_xfer bulk-path comm group(s) on all gen workers.
+        """Initialize the nccl_reshard bulk-path comm group(s) on all gen workers.
 
         One group per PP stage (non-PP = ``pp_size`` 1).
         """
@@ -986,9 +986,9 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Worker group is not initialized")
 
         method_name = (
-            "init_nccl_xfer_comm_group_async"
+            "init_nccl_reshard_comm_group_async"
             if self.cfg["vllm_cfg"]["async_engine"]
-            else "init_nccl_xfer_comm_group"
+            else "init_nccl_reshard_comm_group"
         )
 
         total_workers = len(self.worker_group.workers)
@@ -1010,12 +1010,12 @@ class VllmGeneration(GenerationInterface):
         # co-works with lm_policy; wait for all futures to complete outside
         return futures
 
-    def prepare_nccl_xfer_refit_info(self, refit_info: dict) -> None:
-        """Forward per-layer param metadata to vLLM workers for nccl_xfer refit."""
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Forward per-layer param metadata to vLLM workers for nccl_reshard refit."""
         method_name = (
-            "prepare_nccl_xfer_refit_info_async"
+            "prepare_nccl_reshard_refit_info_async"
             if self.cfg["vllm_cfg"]["async_engine"]
-            else "prepare_nccl_xfer_refit_info"
+            else "prepare_nccl_reshard_refit_info"
         )
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
@@ -1024,15 +1024,15 @@ class VllmGeneration(GenerationInterface):
         )
         ray.get(futures)
 
-    def nccl_xfer_refit(self) -> list[ray.ObjectRef]:
-        """Receive weights from training workers via nccl_xfer (xferdtensor)."""
+    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_reshard (xferdtensor)."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
         method_name = (
-            "nccl_xfer_refit_async"
+            "nccl_reshard_refit_async"
             if self.cfg["vllm_cfg"]["async_engine"]
-            else "nccl_xfer_refit"
+            else "nccl_reshard_refit"
         )
         futures = self.worker_group.run_all_workers_single_data(
             method_name,

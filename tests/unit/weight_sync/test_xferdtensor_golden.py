@@ -35,8 +35,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from nemo_rl.distributed.nccl_xfer_utils import MeshInfo
-from nemo_rl.distributed.xferdtensor import (
+from nemo_rl.weight_sync.nccl_reshard_utils import MeshInfo
+from nemo_rl.weight_sync.xferdtensor import (
     DTensorRef,
     _compute_shard_slices,
     xferdtensor_golden,

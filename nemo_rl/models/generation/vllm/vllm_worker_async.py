@@ -1470,7 +1470,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    async def init_nccl_xfer_comm_group_async(
+    async def init_nccl_reshard_comm_group_async(
         self,
         rank_prefix: int,
         pp_ips: list[str],
@@ -1479,9 +1479,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         train_ranks_per_stage: int,
         sub_world_size: int,
     ) -> None:
-        """Async version of init_nccl_xfer_comm_group."""
+        """Async version of init_nccl_reshard_comm_group."""
         await self.llm.collective_rpc(
-            "init_nccl_xfer_comm_group",
+            "init_nccl_reshard_comm_group",
             args=(
                 rank_prefix,
                 pp_ips,
@@ -1492,21 +1492,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             ),
         )
 
-    async def prepare_nccl_xfer_refit_info_async(self, refit_info: dict) -> None:
-        """Async version of prepare_nccl_xfer_refit_info."""
+    async def prepare_nccl_reshard_refit_info_async(self, refit_info: dict) -> None:
+        """Async version of prepare_nccl_reshard_refit_info."""
         await self.llm.collective_rpc(
-            "prepare_nccl_xfer_refit_info", args=(refit_info,)
+            "prepare_nccl_reshard_refit_info", args=(refit_info,)
         )
 
-    async def nccl_xfer_refit_async(self) -> bool:
-        """Async version of nccl_xfer_refit."""
+    async def nccl_reshard_refit_async(self) -> bool:
+        """Async version of nccl_reshard_refit."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
             )
 
             result_or_coro = await self.llm.collective_rpc(
-                "nccl_xfer_refit", args=tuple()
+                "nccl_reshard_refit", args=tuple()
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1517,11 +1517,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             worker_result = worker_results[0]
 
             if not worker_result:
-                print(f"Error: Worker failed nccl_xfer_refit. Result: {worker_result}")
+                print(
+                    f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
+                )
                 return False
             return True
         except Exception as e:
-            print(f"Exception during nccl_xfer_refit: {e}", flush=True)
+            print(f"Exception during nccl_reshard_refit: {e}", flush=True)
             import traceback
 
             traceback.print_exc()
