@@ -132,6 +132,7 @@ def test_compare_arms_rejects_sampling() -> None:
 def test_read_result_jsonl_projects_large_trajectory_fields(tmp_path) -> None:
     row = result_row("owner__repo-1", 0)
     row["response"]["output"] = ["Temporary failure in name resolution"]
+    row["num_tool_calls"] = 0
     path = tmp_path / "trajectories.jsonl"
     path.write_text(json.dumps(row) + "\n")
 
@@ -164,6 +165,7 @@ def test_read_result_jsonl_projects_large_trajectory_fields(tmp_path) -> None:
                     "total_completion_tokens",
                     "num_turns",
                     "num_tool_calls",
+                    "streaming_tool_call_eligible_actions",
                     "streaming_tool_call_sessions_started",
                     "streaming_tool_call_prefill_requests",
                     "streaming_tool_call_prefill_tokens",
@@ -172,6 +174,23 @@ def test_read_result_jsonl_projects_large_trajectory_fields(tmp_path) -> None:
             },
         }
     ]
+
+
+def test_read_result_jsonl_counts_function_calls_when_metric_is_missing(
+    tmp_path,
+) -> None:
+    row = result_row("owner__repo-1", 0)
+    row["response"]["output"] = [
+        {"type": "function_call", "call_id": "call-1"},
+        {"type": "function_call_output", "call_id": "call-1"},
+        {"type": "function_call", "call_id": "call-2"},
+    ]
+    path = tmp_path / "trajectories.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+
+    result = read_result_jsonl(path)
+
+    assert result[0]["num_tool_calls"] == 2
 
 
 def test_overlay_result_rows_replaces_retried_instance(tmp_path) -> None:
