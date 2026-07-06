@@ -46,7 +46,7 @@ if [[ "${SWEBENCH_PREWARM_IN_SRUN:-0}" != "1" ]]; then
     --gres="gpu:${PREWARM_GPUS}" \
     --time="${PREWARM_TIME}" \
     --immediate=60 \
-    env SWEBENCH_PREWARM_IN_SRUN=1 bash "$0" "${DATASET_PATH}"
+    /usr/bin/env SWEBENCH_PREWARM_IN_SRUN=1 /bin/bash "$0" "${DATASET_PATH}"
 fi
 
 if [[ ! -f "${DATASET_PATH}" ]]; then
