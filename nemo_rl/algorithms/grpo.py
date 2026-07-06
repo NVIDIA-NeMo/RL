@@ -3552,16 +3552,17 @@ def async_grpo_train(
         mlperf_logger: Optional MLPerf GRPO logger
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
+    # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, and TRT-LLM;
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron") and _should_use_async_rollouts(
+    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
         master_config
     ), (
-        "Async GRPO requires an async vLLM or Megatron generation engine. "
+        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
         "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
-        "policy.generation.mcore_generation_config.async_engine=true (Megatron)."
+        "policy.generation.mcore_generation_config.async_engine=true (Megatron), or "
+        "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM)."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
