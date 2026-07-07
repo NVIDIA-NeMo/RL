@@ -148,6 +148,15 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     advantage_policy_logprobs_field: str | None = None
     advantage_reference_logprobs_field: str | None = None
 
+    # Loss-driven logprob refresh. The loss can consume prev/reference
+    # logprob columns even when the advantage estimator does not — sync GRPO
+    # refreshes reference logprobs iff
+    # ``loss_fn.reference_policy_kl_penalty != 0``. The wiring layer sets
+    # these from the loss config; either trigger (loss flag or advantage
+    # field) enables the corresponding refresh.
+    refresh_prev_logprobs_for_loss: bool = False
+    refresh_reference_logprobs_for_loss: bool = False
+
     # Diagnostics
     diagnostics: bool = False
 
@@ -442,9 +451,13 @@ class SingleControllerActor:
         rollout pump makes progress during trainer calls; exceptions
         surface at the corresponding ``await``.
         """
-        refresh_policy_logprobs = self._cfg.advantage_policy_logprobs_field is not None
+        refresh_policy_logprobs = (
+            self._cfg.refresh_prev_logprobs_for_loss
+            or self._cfg.advantage_policy_logprobs_field is not None
+        )
         refresh_reference_logprobs = (
-            self._cfg.advantage_reference_logprobs_field is not None
+            self._cfg.refresh_reference_logprobs_for_loss
+            or self._cfg.advantage_reference_logprobs_field is not None
         )
         logprobs_required = refresh_policy_logprobs or refresh_reference_logprobs
 

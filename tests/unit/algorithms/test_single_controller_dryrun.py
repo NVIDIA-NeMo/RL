@@ -534,6 +534,8 @@ class TestSingleControllerDryRun:
         advantage_estimator=None,
         advantage_policy_logprobs_field=None,
         advantage_reference_logprobs_field=None,
+        refresh_prev_logprobs_for_loss=False,
+        refresh_reference_logprobs_for_loss=False,
         diagnostics=False,
     ):
         cfg = SingleControllerConfig(
@@ -547,6 +549,8 @@ class TestSingleControllerDryRun:
             advantage_enabled=advantage_enabled,
             advantage_policy_logprobs_field=advantage_policy_logprobs_field,
             advantage_reference_logprobs_field=advantage_reference_logprobs_field,
+            refresh_prev_logprobs_for_loss=refresh_prev_logprobs_for_loss,
+            refresh_reference_logprobs_for_loss=refresh_reference_logprobs_for_loss,
             diagnostics=diagnostics,
         )
         if weight_sync is None:
@@ -637,6 +641,59 @@ class TestSingleControllerDryRun:
             "prepare_logprobs_from_meta must not be called when both "
             f"advantage_*_logprobs_field are None; got {calls3}"
         )
+
+    def test_loss_driven_logprob_refresh_without_advantage_fields(self, ray_init):
+        """Loss flags alone must trigger prepare_logprobs_from_meta.
+
+        The loss can consume prev/reference logprob columns even when the
+        advantage estimator does not (sync GRPO refreshes reference
+        logprobs iff ``reference_policy_kl_penalty != 0``), so
+        ``refresh_*_for_loss`` gates the refresh independently of the
+        ``advantage_*_logprobs_field`` triggers.
+        """
+        # Case 1: both loss flags set, no advantage fields
+        dp_client = FakeDataPlaneActor.remote()
+        gen = DryRunGenWorker.remote(gen_latency_s=0.01)
+        trainer = DryRunTrainer(dp_client, train_latency_s=0.01)
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            max_train_steps=1,
+            max_rollout_prompts=2,
+            min_groups_per_batch=2,
+            group_size=1,
+            refresh_prev_logprobs_for_loss=True,
+            refresh_reference_logprobs_for_loss=True,
+        )
+        ray.get(ctrl.run.remote(), timeout=30)
+        calls = trainer.get_prepare_logprobs_calls()
+        assert len(calls) == 2, f"expected 2 logprob refresh calls, got {calls}"
+        for sample_ids, refresh_policy, refresh_ref in calls:
+            assert refresh_policy is True
+            assert refresh_ref is True
+            assert len(sample_ids) > 0
+
+        # Case 2: reference-only loss flag (KL penalty without IS correction)
+        dp_client2 = FakeDataPlaneActor.remote()
+        gen2 = DryRunGenWorker.remote(gen_latency_s=0.01)
+        trainer2 = DryRunTrainer(dp_client2, train_latency_s=0.01)
+        ctrl2 = self._make_controller(
+            dp_client2,
+            gen2,
+            trainer2,
+            max_train_steps=1,
+            max_rollout_prompts=2,
+            min_groups_per_batch=2,
+            group_size=1,
+            refresh_reference_logprobs_for_loss=True,
+        )
+        ray.get(ctrl2.run.remote(), timeout=30)
+        calls2 = trainer2.get_prepare_logprobs_calls()
+        assert len(calls2) == 2
+        for _, refresh_policy, refresh_ref in calls2:
+            assert refresh_policy is False
+            assert refresh_ref is True
 
     def test_advantage_pump_writes_advantages_before_train(self, ray_init):
         """SC computes advantages from DataPlane inputs and writes them back."""
