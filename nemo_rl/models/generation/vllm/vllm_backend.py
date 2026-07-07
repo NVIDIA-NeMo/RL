@@ -602,20 +602,31 @@ class VllmInternalWorkerExtension:
             if proj == "gate_proj"
         }
 
-        # Normalize HF checkpoint prefixes to the live vLLM module hierarchy.
-        # Qwen3.5 nests the text decoder differently in its HF checkpoint
-        # (``model.language_model.*``) and vLLM module
-        # (``language_model.model.*``). NemotronH uses ``backbone.*`` in HF and
-        # ``model.*`` in vLLM. DeepSeek V4 omits the leading ``model.`` in its
-        # checkpoint. For conventional models this is a no-op.
+        def _layer_suffix(name):
+            if name.startswith("layers."):
+                return name
+            _, marker, suffix = name.partition(".layers.")
+            return f"layers.{suffix}" if marker else None
+
+        # Resolve checkpoint prefixes against the live vLLM hierarchy by the
+        # model-independent suffix beginning at layers.N.
+        vllm_names_by_layer_suffix = {}
+        for name in vllm_params:
+            suffix = _layer_suffix(name)
+            if suffix is not None:
+                vllm_names_by_layer_suffix.setdefault(suffix, []).append(name)
+
         def _to_vllm_name(n):
-            if n.startswith("model.language_model."):
-                return "language_model.model." + n[len("model.language_model.") :]
-            if n.startswith("backbone."):
-                return "model." + n[len("backbone.") :]
-            if n.startswith("layers."):
-                return "model." + n
-            return n
+            suffix = _layer_suffix(n)
+            if suffix is None:
+                return n
+            candidates = vllm_names_by_layer_suffix.get(suffix, [])
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"Ambiguous vLLM parameters for layer suffix {suffix!r}: "
+                    f"{candidates!r}"
+                )
+            return candidates[0] if candidates else n
 
         for hf_name in hf_shapes:
             # 1) Grouped MoE expert params (gate_proj/up_proj/down_proj, each
