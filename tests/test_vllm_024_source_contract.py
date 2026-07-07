@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ASYNC_WORKER = ROOT / "nemo_rl/models/generation/vllm/vllm_worker_async.py"
+SMOKE_SCRIPT = ROOT / "scripts/vllm_024_compat_smoke.py"
 
 
 def load_tree() -> ast.Module:
@@ -38,6 +39,31 @@ def test_async_http_adapter_imports_vllm_024_tokenization_service() -> None:
         "vllm.entrypoints.serve.tokenize.serving",
         "OpenAIServingTokenization",
     ) not in imports
+
+
+def test_cluster_smoke_imports_vllm_024_chat_service() -> None:
+    tree = ast.parse(SMOKE_SCRIPT.read_text(encoding="utf-8"))
+    imports = {
+        (node.module, alias.name)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+
+    assert (
+        "vllm.entrypoints.openai.chat_completion.serving",
+        "OpenAIServingChat",
+    ) in imports
+    assert (
+        "vllm.entrypoints.openai.serving_chat",
+        "OpenAIServingChat",
+    ) not in imports
+
+
+def test_async_worker_filters_the_vllm_024_chat_logger() -> None:
+    source = ASYNC_WORKER.read_text(encoding="utf-8")
+    assert '"vllm.entrypoints.openai.chat_completion.serving"' in source
+    assert '"vllm.entrypoints.openai.serving_chat"' not in source
 
 
 def test_async_render_override_uses_vllm_024_parser_argument() -> None:

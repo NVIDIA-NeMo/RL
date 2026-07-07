@@ -885,7 +885,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         return False
                 return True
 
-        _getLogger("vllm.entrypoints.openai.serving_chat").addFilter(
+        _getLogger("vllm.entrypoints.openai.chat_completion.serving").addFilter(
             MaxContextLengthFilter()
         )
 
