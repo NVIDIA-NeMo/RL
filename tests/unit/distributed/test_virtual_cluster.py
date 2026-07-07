@@ -374,3 +374,28 @@ class TestVllmPortAssignment:
 
         _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(num_gpus=1)
         assert "VLLM_PORT" not in env_vars
+
+    @pytest.mark.parametrize("engine_group_index", [0, 1, 3, 7])
+    def test_global_engine_group_index_assigns_unique_port(self, engine_group_index):
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORT_RANGE_LOW,
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=(
+                3,
+                [3, 19, 35, 51, 2, 18, 34, 50],
+                engine_group_index,
+            ),
+        )
+
+        expected_port = (
+            DEFAULT_VLLM_PORT_RANGE_LOW
+            + engine_group_index * DEFAULT_VLLM_PORTS_PER_ENGINE
+        )
+        assert env_vars["VLLM_PORT"] == str(expected_port)

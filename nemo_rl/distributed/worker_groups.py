@@ -540,11 +540,15 @@ class RayWorkerGroup:
                 worker_env_vars.pop("RAY_RAYLET_PID", None)
                 worker_env_vars.pop("RAY_USAGE_STATS_ENABLED", None)
 
-                # Only the first worker in each group gets bundle_indices
+                # Only the first worker in each group gets bundle metadata.
                 # This ensures only one worker per group is the model owner
                 worker_bundle_indices = None
                 if local_rank == 0:
-                    worker_bundle_indices = (pg_idx, local_bundle_indices)
+                    worker_bundle_indices = (
+                        pg_idx,
+                        local_bundle_indices,
+                        group_idx,
+                    )
                     self.dp_leader_worker_indices.append(global_rank)
 
                 # Create a descriptive name based on group structure

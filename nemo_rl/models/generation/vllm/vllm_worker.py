@@ -120,18 +120,17 @@ class BaseVllmGenerationWorker:
             )
 
             # Give each vLLM engine a deterministic starting port for TP/DP
-            # rendezvous.  vLLM's _get_open_port() reads VLLM_PORT and
-            # auto-increments on collision, so the per-engine spacing
-            # provides headroom.  See the port layout in virtual_cluster.py.
-            if len(local_bundle_indices) == 1:
-                engine_index_on_node = local_bundle_indices[0]
+            # rendezvous. Topology-aware allocation can produce non-contiguous
+            # bundle lists, so use the global worker-group index when present.
+            if len(bundle_indices) > 2:
+                engine_index = bundle_indices[2]
+            elif len(local_bundle_indices) == 1:
+                engine_index = local_bundle_indices[0]
             else:
-                engine_index_on_node = local_bundle_indices[0] // len(
-                    local_bundle_indices
-                )
+                engine_index = local_bundle_indices[0] // len(local_bundle_indices)
             env_vars["VLLM_PORT"] = str(
                 DEFAULT_VLLM_PORT_RANGE_LOW
-                + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
+                + engine_index * DEFAULT_VLLM_PORTS_PER_ENGINE
             )
 
         # Check if this worker is part of a parallel group (TP or TP+PP).

@@ -37,6 +37,7 @@ class MyTestActor:
         self.bundle_indices_seen_in_init = kwargs.get(
             "bundle_indices_seen_in_init", "not_set"
         )
+        self.bundle_indices_in_init = kwargs.get("bundle_indices_in_init")
         self.env_vars = dict(os.environ)
         self.pid = os.getpid()
         self.stored_data = None
@@ -74,6 +75,9 @@ class MyTestActor:
             self.env_vars.get("CONFIGURED_WORKER_CALLED"),
         )
 
+    def get_bundle_indices_in_init(self):
+        return self.bundle_indices_in_init
+
     def get_actual_python_executable_path(self):
         return sys.executable
 
@@ -98,6 +102,7 @@ class MyTestActor:
         init_kwargs_update = {
             "configured_gpus": num_gpus,
             "bundle_indices_seen_in_init": bundle_indices is not None,
+            "bundle_indices_in_init": bundle_indices,
         }
         resources = {"num_gpus": num_gpus}
         env_vars_update = {"CONFIGURED_WORKER_CALLED": "1"}
@@ -441,6 +446,23 @@ def test_custom_environment_variables(register_test_actor, virtual_cluster):
         assert ws == "2"
         assert node_rank == "0"
         assert local_rank == str(i)
+
+    worker_group.shutdown(force=True)
+
+
+def test_engine_group_index_metadata(register_test_actor, virtual_cluster):
+    actor_fqn = register_test_actor
+    builder = RayWorkerBuilder(actor_fqn)
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster,
+        remote_worker_builder=builder,
+        bundle_indices_list=[(0, [0]), (0, [1])],
+    )
+
+    bundle_indices = ray.get(
+        [worker.get_bundle_indices_in_init.remote() for worker in worker_group.workers]
+    )
+    assert bundle_indices == [(0, [0], 0), (0, [1], 1)]
 
     worker_group.shutdown(force=True)
 
