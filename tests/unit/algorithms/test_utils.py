@@ -400,6 +400,31 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
     assert "Throughputs (per GPU)" in out
 
 
+def test_empty_per_worker_token_counts_skips_imbalance(capsys):
+    master_config = _base_master_config(colocated=True)
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 1.0,
+        "policy_training": 3.0,
+        "total_step_time": 8.0,
+        "generation": 2.0,
+        "prepare_for_generation/total": 0.5,
+    }
+
+    metrics = {
+        "total_num_tokens": 1600.0,
+        "per_worker_token_counts": {},
+    }
+
+    perf = print_performance_metrics({}, metrics, timing_metrics, master_config)
+
+    assert "average_token_imbalance" not in perf
+
+    out = capsys.readouterr().out
+    assert "No per-worker generation load data available." in out
+    assert "Throughputs (per GPU)" in out
+
+
 # ============================================================================
 # Tests for calculate_baseline_and_std_per_prompt function
 # ============================================================================

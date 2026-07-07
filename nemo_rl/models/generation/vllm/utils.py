@@ -15,8 +15,12 @@
 from collections import defaultdict
 from typing import Any, Optional
 
+import torch
+
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+
+R3_MISSING_ROUTE_SENTINEL = -1
 
 
 def format_prompt_for_vllm_generation(
@@ -66,7 +70,7 @@ def format_prompt_for_vllm_generation(
                 continue
             # init prompt dict
             prompt_dict = {"prompt": msg}
-            # collect multi_modal_data from images and audios
+            # collect multi_modal_data from images, audios, and videos
             multi_modal_data = {}
             images = data.get("vllm_images", None)
             if images is not None and len(images[i]) > 0:
@@ -77,6 +81,11 @@ def format_prompt_for_vllm_generation(
             if audios is not None and len(audios[i]) > 0:
                 multi_modal_data["audio"] = (
                     audios[i][0] if len(audios[i]) == 1 else audios[i]
+                )
+            videos = data.get("vllm_videos", None)
+            if videos is not None and len(videos[i]) > 0:
+                multi_modal_data["video"] = (
+                    videos[i][0] if len(videos[i]) == 1 else videos[i]
                 )
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
@@ -93,6 +102,188 @@ def format_prompt_for_vllm_generation(
             prompts.append(_get_regular_prompt(i))
 
     return prompts if return_all else prompts[0]
+
+
+def pad_and_align_routed_expert_indices(
+    request_output: Any,
+    completion_output: Any,
+    *,
+    valid_length: int,
+    padded_length: int,
+    device: torch.device,
+    require_complete_routed_experts: bool = False,
+    allow_missing_routed_experts_fallback: bool = True,
+    return_stats: bool = False,
+) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], dict[str, int]]:
+    """Return full-sequence-aligned routed experts as ``[S, L, topk]`` int32."""
+    routed = getattr(completion_output, "routed_experts", None)
+    prompt_routed = getattr(request_output, "prompt_routed_experts", None)
+
+    if prompt_routed is not None:
+        prompt_routed = torch.as_tensor(prompt_routed, dtype=torch.int32, device=device)
+    if routed is not None:
+        routed = torch.as_tensor(routed, dtype=torch.int32, device=device)
+
+    if prompt_routed is not None and routed is not None:
+        routed = torch.cat((prompt_routed, routed), dim=0)
+    elif prompt_routed is not None:
+        routed = prompt_routed
+
+    expected_routes = min(max(valid_length - 1, 0), padded_length)
+    stats = {
+        "actual_routes": 0,
+        "expected_routes": expected_routes,
+        "missing_routes": 0,
+        "surplus_routes": 0,
+    }
+
+    if routed is None:
+        return (None, stats) if return_stats else None
+    if routed.dim() != 3:
+        raise ValueError(
+            "vLLM routed_experts must have shape [tokens, num_moe_layers, topk], "
+            f"got {tuple(routed.shape)}"
+        )
+
+    stats["actual_routes"] = int(routed.shape[0])
+    stats["missing_routes"] = max(expected_routes - int(routed.shape[0]), 0)
+    stats["surplus_routes"] = max(int(routed.shape[0]) - (expected_routes + 1), 0)
+    if (
+        require_complete_routed_experts
+        and stats["missing_routes"] > 0
+        and not allow_missing_routed_experts_fallback
+    ):
+        # This has only been observed rarely with vLLM prefix caching plus
+        # chunked prefill: a small number of samples can omit routed-expert
+        # rows even though most requests are complete. Keep
+        # tools/model_diagnostics/6.vllm_routed_experts_completeness.py as a
+        # standalone reproducer for upstream vLLM bug reports.
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned incomplete routed_experts for router replay: "
+            f"routes={routed.shape[0]}, expected_at_least={expected_routes}, "
+            f"valid_length={valid_length}, padded_length={padded_length}, "
+            f"num_cached_tokens={num_cached_tokens}. This usually means the "
+            "generation backend did not return routed experts for every "
+            "non-final token in the prompt+response sequence."
+        )
+    max_allowed_routes = expected_routes + 1
+    if require_complete_routed_experts and routed.shape[0] > max_allowed_routes:
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned too many routed_experts routes for router replay: "
+            f"routes={routed.shape[0]}, expected={expected_routes}, "
+            f"max_allowed={max_allowed_routes}, valid_length={valid_length}, "
+            f"padded_length={padded_length}, num_cached_tokens={num_cached_tokens}. "
+            "Router replay allows at most one surplus final-token route."
+        )
+
+    default_route = torch.arange(
+        routed.shape[2],
+        dtype=torch.int32,
+        device=device,
+    )
+    full = (
+        default_route.view(1, 1, -1)
+        .expand(padded_length, routed.shape[1], routed.shape[2])
+        .clone()
+    )
+    full = full.to(dtype=torch.int32)
+    routes_to_copy = min(expected_routes, routed.shape[0])
+    if routes_to_copy > 0:
+        full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
+    if stats["missing_routes"] > 0:
+        full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
+    return (full, stats) if return_stats else full
+
+
+def attach_routed_experts_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+    *,
+    device: torch.device,
+    logger: Any = None,
+) -> Any:
+    """Attach aligned routed experts to OpenAI chat response choices."""
+    outputs_by_index = {
+        output.index: output for output in getattr(final_request_output, "outputs", [])
+    }
+    prompt_token_count = len(
+        getattr(final_request_output, "prompt_token_ids", []) or []
+    )
+
+    choices = list(getattr(response, "choices", []))
+    attached_choice_indices = set()
+    for choice in choices:
+        generation_details = outputs_by_index.get(choice.index)
+        if generation_details is None:
+            continue
+        attached_choice_indices.add(choice.index)
+
+        generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
+        routed_result = pad_and_align_routed_expert_indices(
+            final_request_output,
+            generation_details,
+            valid_length=prompt_token_count + generation_token_count,
+            padded_length=prompt_token_count + generation_token_count,
+            device=device,
+            require_complete_routed_experts=True,
+            return_stats=True,
+        )
+        if not isinstance(routed_result, tuple):
+            raise RuntimeError(
+                "Expected routed_experts alignment to return stats for the "
+                "OpenAI-compatible chat endpoint."
+            )
+        routed_experts, r3_stats = routed_result
+        if routed_experts is None:
+            raise RuntimeError(
+                "vLLM was asked to return routed experts for the "
+                "OpenAI-compatible chat endpoint but the generation "
+                "output did not include routed_experts."
+            )
+        if r3_stats["missing_routes"] > 0 and logger is not None:
+            logger.warning(
+                "R3 router replay fallback: vLLM returned incomplete "
+                "routed_experts for chat choice_idx=%d, "
+                "missing_token_routes=%d, actual_routes=%d, "
+                "expected_routes=%d. Megatron will use its own router "
+                "for those missing token routes.",
+                choice.index,
+                r3_stats["missing_routes"],
+                r3_stats["actual_routes"],
+                r3_stats["expected_routes"],
+            )
+        choice.message.routed_experts = routed_experts.to(dtype=torch.int32).tolist()
+
+    if len(attached_choice_indices) != len(choices):
+        missing_choice_indices = sorted(
+            choice.index
+            for choice in choices
+            if choice.index not in attached_choice_indices
+        )
+        raise RuntimeError(
+            "vLLM was asked to return routed experts for the "
+            "OpenAI-compatible chat endpoint but response choices could not be "
+            "matched to generation outputs: "
+            f"missing_choice_indices={missing_choice_indices}."
+        )
+
+    return response
+
+
+def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any]:
+    """Dump a vLLM OpenAI chat response while preserving dynamic R3 fields."""
+    response_dict = response.model_dump()
+    for choice, choice_dict in zip(
+        getattr(response, "choices", []), response_dict.get("choices", [])
+    ):
+        routed_experts = getattr(
+            getattr(choice, "message", None), "routed_experts", None
+        )
+        if routed_experts is not None:
+            choice_dict.setdefault("message", {})["routed_experts"] = routed_experts
+    return response_dict
 
 
 def aggregate_spec_decode_counters(

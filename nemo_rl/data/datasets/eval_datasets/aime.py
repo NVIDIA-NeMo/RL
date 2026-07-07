@@ -54,7 +54,8 @@ class AIMEDataset:
         self.processor = processors.math_data_processor
 
     def _rekey(self, data: dict[str, Any]):
+        # MathArena/aime_2026 stores `answer` as int64; cast to keep the schema uniform.
         return {
             "problem": data[self.input_key],
-            "expected_answer": data["answer"],
+            "expected_answer": str(data["answer"]),
         }

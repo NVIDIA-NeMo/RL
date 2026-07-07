@@ -13,7 +13,7 @@
 # limitations under the License.
 """Shared constants and type aliases for the data-plane meta contract."""
 
-from typing import Literal
+from typing import Literal, Sequence
 
 # Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
 Layout = Literal["padded", "jagged"]
@@ -60,3 +60,17 @@ LP_SEED_FIELDS = (
 # grid metadata, etc.) when present; it's harmlessly absent for
 # text-only models so the filter skips it on those.
 DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
+
+ROUTED_EXPERTS_FIELD = "routed_experts"
+
+
+def fields_with_optional_routed_experts(
+    fields: Sequence[str],
+    *,
+    enabled: bool,
+) -> list[str]:
+    """Return `fields` plus routed experts when router replay is enabled."""
+    out = list(fields)
+    if enabled and ROUTED_EXPERTS_FIELD not in out:
+        out.append(ROUTED_EXPERTS_FIELD)
+    return out

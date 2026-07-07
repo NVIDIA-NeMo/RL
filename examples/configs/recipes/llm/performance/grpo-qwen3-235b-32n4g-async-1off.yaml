@@ -19,3 +19,4 @@ logger:
 cluster:
   gpus_per_node: 4
   num_nodes: 32
+  segment_size: 16

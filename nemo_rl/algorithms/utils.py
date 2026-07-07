@@ -14,7 +14,6 @@
 
 import math
 import random
-import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -32,10 +31,11 @@ from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
 
 
-def get_gdpo_reward_component_keys(batch) -> list:
-    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
-    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
-    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
+def get_gdpo_reward_component_keys(batch) -> list[str]:
+    """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
+    return sorted(
+        k for k in batch.keys() if isinstance(k, str) and k.startswith("reward/")
+    )
 
 
 def calculate_kl(
@@ -44,6 +44,7 @@ def calculate_kl(
     kl_type: str = "k3",
     input_clamp_value: float | None = 20.0,
     output_clamp_value: float | None = 10.0,
+    importance_sampling_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two logprobs.
 
@@ -57,13 +58,26 @@ def calculate_kl(
                            If None, no clamping is applied.
         output_clamp_value: Optional clamping value for kl to prevent numerical instability.
                            If None, no clamping is applied.
+        importance_sampling_weights: Optional per-token importance weights. When
+                                     provided, weights are multiplied into the KL
+                                     before output clamping. If input clamping
+                                     applies to a token, the corresponding weight
+                                     is detached so the clamp suppresses both KL
+                                     and sampling-weight gradients.
 
     Returns:
         torch.Tensor: Per-token KL penalty values (b, s)
     """
     logr = logprobs_reference - logprobs
     if input_clamp_value is not None:
-        logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        logr_clamped = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        if importance_sampling_weights is not None:
+            importance_sampling_weights = torch.where(
+                logr == logr_clamped,
+                importance_sampling_weights,
+                importance_sampling_weights.detach(),
+            )
+        logr = logr_clamped
 
     if kl_type == "k1":
         kl = -logr
@@ -76,6 +90,9 @@ def calculate_kl(
 
     else:
         raise ValueError(f"Invalid KL type: {kl_type}")
+
+    if importance_sampling_weights is not None:
+        kl = importance_sampling_weights * kl
 
     if output_clamp_value is not None:
         kl = kl.clamp(min=-output_clamp_value, max=output_clamp_value)
@@ -237,6 +254,23 @@ def mask_out_neg_inf_logprobs(
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
     return logprobs
+
+
+def masked_var(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    mean: Optional[torch.Tensor | float] = None,
+    unbiased: bool = True,
+) -> torch.Tensor:
+    if mean is None:
+        mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values.pow(2), mask)
+
+    if unbiased:
+        normalization_factor = torch.sum(mask)
+        variance = variance * (normalization_factor / (normalization_factor - 1))
+    return variance
 
 
 def set_seed(seed: int) -> None:
@@ -490,16 +524,27 @@ def print_performance_metrics(
     # =====================================================
     # Generate Token Imbalance Visualization
     # =====================================================
-    def visualize_per_worker_load(per_worker_token_counts: dict[int, int]) -> float:
+    def visualize_per_worker_load(
+        per_worker_token_counts: dict[int, int],
+    ) -> Optional[float]:
         per_worker_token_counts_list = [
             v for k, v in sorted(per_worker_token_counts.items())
         ]
+        print("  • Visualizing Token Imbalance per Generation Worker:")
+        if not per_worker_token_counts_list:
+            print("    - No per-worker generation load data available.")
+            return None
+
+        max_token_count = max(per_worker_token_counts_list)
+        if max_token_count <= 0:
+            print("    - No generated tokens recorded per worker.")
+            return None
+
         per_worker_load_ratio = [
-            v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
+            v / max_token_count for v in per_worker_token_counts_list
         ]
         max_rows_to_print = 1000
         bar_length = 20
-        print("  • Visualizing Token Imbalance per Generation Worker:")
         for i in range(min(len(per_worker_token_counts_list), max_rows_to_print)):
             print(
                 f"    - Generated Tokens from Worker {i:3.0f}:"
@@ -532,7 +577,8 @@ def print_performance_metrics(
 
         if per_worker_token_counts is not None:
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
-            performance_metrics["average_token_imbalance"] = average_token_imbalance
+            if average_token_imbalance is not None:
+                performance_metrics["average_token_imbalance"] = average_token_imbalance
 
     if "mean_total_tokens_per_sample" in metrics:
         print(
@@ -663,24 +709,26 @@ def print_performance_metrics(
     # Throughputs
     # =====================================================
 
-    policy_and_reference_logprobs_time = timing_metrics["policy_and_reference_logprobs"]
-    policy_training_time = timing_metrics["policy_training"]
+    policy_and_reference_logprobs_time = timing_metrics.get(
+        "policy_and_reference_logprobs", 0
+    )
+    policy_training_time = timing_metrics.get("policy_training", 0)
     total_time = timing_metrics["total_step_time"]
     refit_time = (
         timing_metrics["weight_sync"]
         if "weight_sync" in timing_metrics
-        else timing_metrics["prepare_for_generation/total"]
+        else timing_metrics.get("prepare_for_generation/total", 0)
     )
-    if "generation" in timing_metrics:  # Sync GRPO
+    if "generation" in timing_metrics:  # Sync
         generation_time = timing_metrics["generation"]
-    else:  # Async GRPO
+    else:  # Async
         # If the training time is greater than the generation time, we include the idle time caused by training as part of the generation time.
         # if training time > generation time, generation time = training time
         # if training time < generation time, generation time = training time + exposed generation time
         generation_time = (
-            timing_metrics["exposed_generation"]
-            + timing_metrics["policy_and_reference_logprobs"]
-            + timing_metrics["policy_training"]
+            timing_metrics.get("exposed_generation", 0)
+            + policy_and_reference_logprobs_time
+            + policy_training_time
         )
 
     num_nodes = master_config.cluster["num_nodes"]
@@ -689,11 +737,10 @@ def print_performance_metrics(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
-    grpo_config = master_config.grpo
+    grpo_config = getattr(master_config, "grpo", {})
     if (
         "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
     ) and not colocated_inference:
-        # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
@@ -713,9 +760,15 @@ def print_performance_metrics(
             training_worker_idle_time_ratio
         )
 
-    number_of_samples_per_step = (
-        grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
+    # Detect which algorithm config key is being used
+    algo_config = (
+        getattr(master_config, "grpo", None)
+        or getattr(master_config, "ppo", None)
+        or {}
     )
+    number_of_samples_per_step = algo_config.get(
+        "num_prompts_per_step", 1
+    ) * algo_config.get("num_generations_per_prompt", 1)
 
     if colocated_inference:
         training_num_gpus = total_num_gpus
@@ -733,28 +786,39 @@ def print_performance_metrics(
         )
         training_num_gpus = total_num_gpus - generation_num_gpus
 
+    total_num_tokens = metrics.get("total_num_tokens", 0)
+
     e2e_samples_per_sec_per_gpu = (
         number_of_samples_per_step / total_time / total_num_gpus
+        if total_time > 0
+        else 0
     )
 
     e2e_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / total_time / total_num_gpus
+        total_num_tokens / total_time / total_num_gpus if total_time > 0 else 0
     )
     policy_training_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / policy_training_time / training_num_gpus
+        total_num_tokens / policy_training_time / training_num_gpus
+        if policy_training_time > 0
+        else 0
     )
     policy_and_reference_logprobs_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / policy_and_reference_logprobs_time
-        / training_num_gpus
+        total_num_tokens / policy_and_reference_logprobs_time / training_num_gpus
+        if policy_and_reference_logprobs_time > 0
+        else 0
+    )
+    training_worker_group_time = (
+        policy_training_time + policy_and_reference_logprobs_time
     )
     training_worker_group_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / (policy_training_time + policy_and_reference_logprobs_time)
-        / training_num_gpus
+        total_num_tokens / training_worker_group_time / training_num_gpus
+        if training_worker_group_time > 0
+        else 0
     )
     generation_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / generation_time / generation_num_gpus
+        total_num_tokens / generation_time / generation_num_gpus
+        if generation_time > 0
+        else 0
     )
 
     print("  • Throughputs (per GPU):")
