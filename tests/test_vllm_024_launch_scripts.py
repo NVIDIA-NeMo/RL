@@ -42,3 +42,24 @@ def test_performance_launcher_uses_short_compute_node_tmpdir() -> None:
     )
 
     assert "TMPDIR=/tmp" in output
+
+
+def test_performance_launcher_preserves_compute_visible_workdir() -> None:
+    output = _run_script(
+        REPO_ROOT
+        / "experiments"
+        / "vllm_024_upgrade"
+        / "submit_performance_step10.sh",
+        "dry-run",
+        "qwen32b",
+        REPO_DIR="/lustre/users/sna/RL",
+    )
+
+    assert "CONTAINER_WORKDIR=/lustre/users/sna/RL" in output
+
+
+def test_ray_launcher_accepts_an_explicit_container_workdir() -> None:
+    source = (REPO_ROOT / "ray.sub").read_text(encoding="utf-8")
+
+    assert 'CONTAINER_WORKDIR=${CONTAINER_WORKDIR:-$SLURM_SUBMIT_DIR}' in source
+    assert 'COMMON_SRUN_ARGS+=" --container-workdir=$CONTAINER_WORKDIR"' in source

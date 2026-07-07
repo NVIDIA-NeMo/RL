@@ -85,6 +85,7 @@ submit_one() {
   local environment=(
     "CONTAINER=${CONTAINER}"
     "MOUNTS=/lustre:/lustre"
+    "CONTAINER_WORKDIR=${REPO_DIR}"
     "COMMAND=${command}"
     "BASE_LOG_DIR=${run_dir}"
     "GPUS_PER_NODE=4"
