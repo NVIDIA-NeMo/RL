@@ -190,8 +190,10 @@ class BaseVllmGenerationWorker:
         # (which inherits sched_setaffinity + numa_set_membind via fork).
         # Individual TP workers get their own NUMA binding via collective_rpc
         # in post_init / post_init_async.
+        # ray.get_gpu_ids()[0] is this worker's physical GPU index, which keys
+        # the affinity file.
         if bundle_indices is not None and len(bundle_indices) == 1:
-            bind_to_gpu_numa()
+            bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
 
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars

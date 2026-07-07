@@ -293,9 +293,12 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
 
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
-        # Pin this value worker to its GPU's NUMA-local CPUs/memory before model
-        # load (mirrors the Megatron/DTensor policy workers and vLLM workers).
-        bind_to_gpu_numa()
+        # Pin to this worker's GPU-local CPUs/memory before model load, matching
+        # the policy workers. local_rank (== ray.get_gpu_ids()[0]) is the physical
+        # GPU index that keys the affinity file. Pass it explicitly:
+        # CUDA_VISIBLE_DEVICES lists all node devices here
+        # (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1).
+        bind_to_gpu_numa(local_rank)
 
         self.cfg = config
         self.rank = get_rank_safe()

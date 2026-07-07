@@ -278,7 +278,11 @@ class MegatronPolicyWorkerImpl(
 
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
-        bind_to_gpu_numa()
+        # local_rank (== ray.get_gpu_ids()[0]) is the physical GPU index that
+        # keys the affinity file. Pass it explicitly: CUDA_VISIBLE_DEVICES lists
+        # all node devices here (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
+        # set by configure_worker), so it can't identify this worker's GPU.
+        bind_to_gpu_numa(local_rank)
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)

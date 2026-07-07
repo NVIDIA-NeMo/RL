@@ -31,6 +31,7 @@ from nemo_rl.distributed.numa_utils import (
     _parse_cpulist,
     _set_numa_membind,
     bind_to_gpu_numa,
+    resolve_visible_gpu_id,
 )
 
 # ---------------------------------------------------------------------------
@@ -191,35 +192,67 @@ class TestParseCpulist:
         assert _parse_cpulist("42") == {42}
 
 
+class TestResolveVisibleGpuId:
+    """Resolve a process-local CUDA device index to its physical GPU id.
+
+    This is the logic the vLLM TP-worker bind path relies on. It is
+    hardware-independent (pure CUDA_VISIBLE_DEVICES string parsing), so it
+    exercises the multi-GPU / non-zero-based-instance cases that local 2-GPU
+    hosts cannot reproduce.
+    """
+
+    def test_noset_subset_maps_local_to_physical(self, monkeypatch):
+        # vLLM TP=2 EngineCore for an instance on GPUs [4,5]: CVD is the
+        # per-instance subset, so local index i maps to that subset's i-th GPU.
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5")
+        assert resolve_visible_gpu_id(0) == 4
+        assert resolve_visible_gpu_id(1) == 5
+
+    def test_full_node_list(self, monkeypatch):
+        # NOSET full-node list (e.g. Megatron): local index == physical index.
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+        assert resolve_visible_gpu_id(3) == 3
+
+    def test_isolated_single_device(self, monkeypatch):
+        # vLLM TP=1 / DTensor: CVD isolated to one GPU, local index is 0.
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5")
+        assert resolve_visible_gpu_id(0) == 5
+
+    def test_no_cvd_returns_none(self, monkeypatch):
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        assert resolve_visible_gpu_id(0) is None
+
+    def test_empty_cvd_returns_none(self, monkeypatch):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+        assert resolve_visible_gpu_id(0) is None
+
+    def test_out_of_range_returns_none(self, monkeypatch):
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5")
+        assert resolve_visible_gpu_id(2) is None
+
+    def test_non_integer_entries_return_none(self, monkeypatch):
+        # e.g. MIG UUIDs — cannot map to a physical index, so skip binding.
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abc,GPU-def")
+        assert resolve_visible_gpu_id(0) is None
+
+
 class TestBindToGpuNuma:
     """Test bind_to_gpu_numa logic with mock affinity files."""
 
     def test_disabled_via_env(self, monkeypatch):
         monkeypatch.setenv("NRL_DISABLE_NUMA_BINDING", "1")
-        assert bind_to_gpu_numa() is False
-
-    def test_no_cuda_visible_devices(self, monkeypatch):
-        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-        monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
-        assert bind_to_gpu_numa() is False
-
-    def test_empty_cuda_visible_devices(self, monkeypatch):
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-        monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
-        assert bind_to_gpu_numa() is False
+        assert bind_to_gpu_numa(0) is False
 
     def test_missing_affinity_file(self, monkeypatch):
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
 
         old_path = _patch_affinity_path("/nonexistent/path")
         try:
-            assert bind_to_gpu_numa() is False
+            assert bind_to_gpu_numa(0) is False
         finally:
             _patch_affinity_path(old_path)
 
     def test_gpu_not_in_file(self, monkeypatch):
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
         monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
 
@@ -229,14 +262,13 @@ class TestBindToGpuNuma:
 
             old_path = _patch_affinity_path(f.name)
             try:
-                assert bind_to_gpu_numa() is False
+                assert bind_to_gpu_numa(7) is False
             finally:
                 _patch_affinity_path(old_path)
                 os.unlink(f.name)
 
     def test_successful_cpu_binding(self, monkeypatch):
         """Verify sched_setaffinity is called with the correct CPU set."""
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
         monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
 
@@ -255,7 +287,7 @@ class TestBindToGpuNuma:
 
             old_path = _patch_affinity_path(f.name)
             try:
-                result = bind_to_gpu_numa()
+                result = bind_to_gpu_numa(2)
                 assert result is True
                 bound_cpus = os.sched_getaffinity(0)
                 assert bound_cpus == set(group1)
@@ -264,13 +296,19 @@ class TestBindToGpuNuma:
                 os.unlink(f.name)
                 _reset_all_bindings()
 
-    def test_multi_gpu_cvd_uses_first(self, monkeypatch):
-        """When CUDA_VISIBLE_DEVICES=2,3 we bind to GPU 2's cpulist."""
-        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    def test_explicit_gpu_id_ignores_cuda_visible_devices(self, monkeypatch):
+        """Binding follows the explicit gpu_id, not CUDA_VISIBLE_DEVICES.
+
+        Under ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` a worker sees the
+        full node device list in ``CUDA_VISIBLE_DEVICES``, which cannot identify
+        its own GPU. ``gpu_id=2`` must bind to GPU 2's CPUs even though CVD lists
+        all 8 devices.
+        """
+        # Full-node CVD as seen under NOSET mode.
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
         monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
 
-        # Host-portable cpulist (see test_successful_cpu_binding).
         group0, group1 = _split_available_cpus()
         if group1 is None:
             pytest.skip("need >= 2 available CPUs to exercise NUMA CPU binding")
@@ -283,10 +321,10 @@ class TestBindToGpuNuma:
 
             old_path = _patch_affinity_path(f.name)
             try:
-                result = bind_to_gpu_numa()
+                result = bind_to_gpu_numa(2)
                 assert result is True
-                bound_cpus = os.sched_getaffinity(0)
-                assert bound_cpus == set(group1)
+                # gpu_id=2 maps to the second CPU group in the affinity file.
+                assert os.sched_getaffinity(0) == set(group1)
             finally:
                 _patch_affinity_path(old_path)
                 os.unlink(f.name)
@@ -396,7 +434,7 @@ class TestNUMABindingBenchmark:
         old_path = _patch_affinity_path(affinity_file)
         gpu_str = cvd.split(",")[0]
         try:
-            result = bind_to_gpu_numa()
+            result = bind_to_gpu_numa(int(gpu_str))
             assert result is True, f"bind_to_gpu_numa() failed for GPU {gpu_str}"
         finally:
             _patch_affinity_path(old_path)
@@ -450,15 +488,13 @@ class TestNUMABindingBenchmark:
 
         libnuma = _load_libnuma()
         old_path = _patch_affinity_path(affinity_file)
-        old_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 
         results = []
         try:
             for gpu_idx, expected_cpulist in gpu_map.items():
                 _reset_all_bindings()
-                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_idx
 
-                result = bind_to_gpu_numa()
+                result = bind_to_gpu_numa(int(gpu_idx))
                 assert result is True, f"bind_to_gpu_numa() failed for GPU {gpu_idx}"
 
                 bound_cpus = os.sched_getaffinity(0)
@@ -472,10 +508,6 @@ class TestNUMABindingBenchmark:
                 results.append((gpu_idx, expected_cpulist, numa_node))
         finally:
             _patch_affinity_path(old_path)
-            if old_cvd:
-                os.environ["CUDA_VISIBLE_DEVICES"] = old_cvd
-            else:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             _reset_all_bindings()
             os.unlink(affinity_file)
 

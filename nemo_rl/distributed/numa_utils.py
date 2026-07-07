@@ -36,13 +36,21 @@ GPU_CPU_AFFINITY_PATH = os.environ.get(
 )
 
 
-def bind_to_gpu_numa() -> bool:
-    """Pin the current process to the NUMA-local CPUs and memory of its assigned GPU.
+def bind_to_gpu_numa(gpu_id: int) -> bool:
+    """Pin the current process to the NUMA-local CPUs and memory of the given GPU.
 
     Reads the GPU→cpulist mapping written by topology_probe.sh at node
     startup, then calls os.sched_setaffinity() for CPU pinning and
     numa_set_membind() for memory policy. Best-effort: failures are
     logged, never raised.
+
+    Args:
+        gpu_id: Node-global physical GPU index (``nvidia-smi`` numbering), which
+            is how the affinity file is keyed. Passed explicitly because
+            ``CUDA_VISIBLE_DEVICES`` lists all devices on the node under
+            ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` and so does not
+            identify a single worker's GPU. In a Ray actor this is
+            ``int(ray.get_gpu_ids()[0])``.
 
     Returns True if CPU binding succeeded, False if skipped or failed.
     Memory binding is attempted independently and logged separately.
@@ -50,11 +58,7 @@ def bind_to_gpu_numa() -> bool:
     if os.environ.get("NRL_DISABLE_NUMA_BINDING") == "1":
         return False
 
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if not cvd:
-        return False
-
-    gpu = cvd.split(",")[0]
+    gpu = str(gpu_id)
     try:
         with open(GPU_CPU_AFFINITY_PATH) as f:
             for line in f:
@@ -74,6 +78,34 @@ def bind_to_gpu_numa() -> bool:
     except Exception as exc:
         logger.debug("NUMA binding skipped: %s", exc)
     return False
+
+
+def resolve_visible_gpu_id(local_index: int) -> int | None:
+    """Map a process-local CUDA device index to its node-global physical GPU id.
+
+    ``CUDA_VISIBLE_DEVICES`` lists the physical GPU ids visible to this process
+    in device-index order, and ``local_index`` (e.g.
+    ``torch.cuda.current_device()``) indexes into that list. The affinity file is
+    keyed by the physical id, so return ``CUDA_VISIBLE_DEVICES[local_index]``.
+
+    ``CUDA_VISIBLE_DEVICES`` contents depend on the worker:
+      - vLLM TP>1 (``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1``): the
+        per-instance device subset, e.g. ``"4,5"``.
+      - vLLM TP=1: a single isolated device, so ``local_index`` is 0.
+
+    Returns the physical GPU id, or None if it cannot be resolved (unset CVD,
+    index out of range, or non-integer entries such as MIG UUIDs).
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not cvd:
+        return None
+    devices = cvd.split(",")
+    if local_index < 0 or local_index >= len(devices):
+        return None
+    try:
+        return int(devices[local_index])
+    except ValueError:
+        return None
 
 
 def _load_libnuma() -> ctypes.CDLL | None:
