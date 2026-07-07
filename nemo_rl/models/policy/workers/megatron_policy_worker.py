@@ -1270,7 +1270,93 @@ class MegatronPolicyWorkerImpl(
             )
         )
 
+    @staticmethod
+    def _cfg_get(cfg_obj: Any, key: str, default: Any = None) -> Any:
+        if cfg_obj is None:
+            return default
+        try:
+            return cfg_obj.get(key, default)
+        except Exception:
+            pass
+        try:
+            return getattr(cfg_obj, key)
+        except Exception:
+            return default
+
+    def _refit_architecture_overrides(self) -> list[str]:
+        hf_config_overrides = self._cfg_get(self.cfg, "hf_config_overrides", None)
+        if not hf_config_overrides:
+            policy_cfg = self._cfg_get(self.cfg, "policy", {}) or {}
+            hf_config_overrides = (
+                self._cfg_get(policy_cfg, "hf_config_overrides", {}) or {}
+            )
+
+        architectures = self._cfg_get(hf_config_overrides, "architectures", None)
+        if architectures is None:
+            return []
+        if isinstance(architectures, str):
+            return [architectures]
+        try:
+            return [str(architecture) for architecture in architectures]
+        except TypeError:
+            return [str(architectures)]
+
+    def _ensure_refit_bridge_architectures(self) -> None:
+        architectures = self._refit_architecture_overrides()
+        if not architectures:
+            return
+
+        child_attrs = (
+            "hf_pretrained",
+            "config",
+            "hf_config",
+            "text_config",
+            "language_config",
+        )
+        stack = [("bridge", self.megatron_bridge), ("model", self.model)]
+        visited: set[int] = set()
+        patched_paths: list[str] = []
+
+        while stack:
+            path_name, obj = stack.pop()
+            if obj is None:
+                continue
+
+            obj_id = id(obj)
+            if obj_id in visited:
+                continue
+            visited.add(obj_id)
+
+            is_config_like = (
+                hasattr(obj, "architectures")
+                or hasattr(obj, "model_type")
+                or hasattr(obj, "to_dict")
+            )
+            if is_config_like and not getattr(obj, "architectures", None):
+                try:
+                    setattr(obj, "architectures", list(architectures))
+                except Exception:
+                    pass
+                else:
+                    patched_paths.append(path_name)
+
+            for attr in child_attrs:
+                try:
+                    child = getattr(obj, attr, None)
+                except Exception:
+                    continue
+                if child is not None and child is not obj:
+                    stack.append((f"{path_name}.{attr}", child))
+
+        if self.rank == 0:
+            print(
+                "KIMI refit bridge architectures guard: "
+                f"override={architectures} patched={patched_paths}",
+                flush=True,
+            )
+
     def _prepare_refit_conversion_tasks(self) -> None:
+        self._ensure_refit_bridge_architectures()
         conversion_tasks = [
             task
             for task in self.megatron_bridge.get_conversion_tasks([self.model])

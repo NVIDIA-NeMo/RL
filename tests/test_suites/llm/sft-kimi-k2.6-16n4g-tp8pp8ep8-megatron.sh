@@ -8,12 +8,12 @@ export NRL_UV_NO_INSTALL_PACKAGES=${NRL_UV_NO_INSTALL_PACKAGES:-deep-ep,causal-c
 export NRL_SERIALIZE_UV_SYNC=${NRL_SERIALIZE_UV_SYNC:-true}
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=16
-GPUS_PER_NODE=4
-STEPS_PER_RUN=1
-MAX_STEPS=1
+NUM_NODES=${KIMI_SFT_NODES:-16}
+GPUS_PER_NODE=${KIMI_SFT_GPUS_PER_NODE:-4}
+MAX_STEPS=${KIMI_SFT_MAX_STEPS:-1}
+STEPS_PER_RUN=${KIMI_SFT_STEPS_PER_RUN:-$MAX_STEPS}
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=120
+NUM_MINUTES=${KIMI_SFT_NUM_MINUTES:-120}
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -42,7 +42,10 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     uv run tests/check_metrics.py $JSON_METRICS \
         'data["train/loss"]["1"] == data["train/loss"]["1"]' \
         'data["train/loss"]["1"] < 1.0e20' \
-        'data["train/loss"]["1"] > -1.0e20'
+        'data["train/loss"]["1"] > -1.0e20' \
+        "data[\"train/loss\"][\"$MAX_STEPS\"] == data[\"train/loss\"][\"$MAX_STEPS\"]" \
+        "data[\"train/loss\"][\"$MAX_STEPS\"] < 1.0e20" \
+        "data[\"train/loss\"][\"$MAX_STEPS\"] > -1.0e20"
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
