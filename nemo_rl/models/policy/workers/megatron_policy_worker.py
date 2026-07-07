@@ -2114,24 +2114,12 @@ class MegatronPolicyWorkerImpl(
         misc_meta = OrderedDict()
         _xfer_bytes = _bcast_bytes = 0  # full-tensor payload routed to each path
 
-        # Handle tied LM head.
-        from megatron.core.utils import unwrap_model
-
-        _model0 = self.model[0] if isinstance(self.model, list) else self.model
-        tie_lm_head = bool(
-            getattr(unwrap_model(_model0), "share_embeddings_and_output_weights", False)
-        )
-
         # Iterates all the params to construct the state_dict_metadata (xferdtensor path)
         # state_dict_metadata[hf_name] -> [shape, dtype]
         # At the same time, filter the params to the misc subset (packed_broadcast path).
         # misc_meta[hf_name] -> [shape, dtype]
         with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
-                if tie_lm_head and name == "lm_head.weight":
-                    # Tied to embed_tokens; no standalone tensor to source
-                    # (embed_tokens carries it; vLLM ties them on load).
-                    continue
                 meta = {
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),

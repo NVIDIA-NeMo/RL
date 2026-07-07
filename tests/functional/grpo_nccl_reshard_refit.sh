@@ -1,9 +1,9 @@
 #!/bin/bash
 # Functional smoke for the nccl_reshard disaggregated weight-refit path
 # (Megatron train -> vLLM gen on disjoint GPUs).  Runs the default transport
-# selection: the real nccl.m2n reshard when the wheel is installed, otherwise
-# the xferdtensor_python exact-transfer implementation -- the same path users
-# get, with no environment override.
+# with no override: when the real nccl.m2n op is absent (as in the CI
+# container) the dispatcher falls back to the xferdtensor_python exact-transfer
+# reshard -- the same path a user without that op gets.
 #
 # 1T1G disaggregated run on 2 GPUs (1 node): Megatron TP1 (train, 1 GPU) ->
 # vLLM TP1 (gen, 1 GPU), non-colocated.  This is sized for the 2-GPU functional
@@ -12,7 +12,7 @@
 # prepare_nccl_reshard_refit_info / build_nccl_reshard_refit_info, the gen-side
 # _build_hf_to_gen_backend_mapping (qkv / gate_up merge slices, lm_head tie),
 # nccl_reshard_refit + get_dst_dtensor, the misc packed_broadcast, and
-# xferdtensor_golden -- which is the coverage this smoke is here to add.
+# xferdtensor_python_impl -- which is the coverage this smoke is here to add.
 #
 # REAL reshards (TP/EP/PP down- and up-shard, e.g. TP4xDP2 -> TP2xDP4) plus
 # MoE / PP / FP8 / large-model coverage live in the SLURM script/new_refit/
@@ -38,8 +38,6 @@ JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
-# Force the golden (broadcast) reshard path so the test does not depend on the
-# real nccl.xfer XdtensorRedistribute op being present in the container.
 
 rm -rf $EXP_DIR $LOG_DIR
 mkdir -p $EXP_DIR $LOG_DIR
