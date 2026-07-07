@@ -74,7 +74,7 @@ uv run --no-project use_existing_torch.py
 # Install dependencies
 echo "Installing dependencies..."
 uv pip install --upgrade pip
-uv pip install numpy setuptools setuptools_scm
+uv pip install numpy setuptools setuptools_scm setuptools_rust
 uv pip install torch==2.10.0 --torch-backend=cu129
 
 # Install vLLM using precompiled wheel

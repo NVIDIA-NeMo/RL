@@ -453,6 +453,9 @@ mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
+# xgrammar (pulled in as a vllm dependency) doesn't declare its own build backend
+# (scikit_build_core) in build-system.requires, so uv's build isolation excludes it.
+xgrammar = ["scikit_build_core"]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
