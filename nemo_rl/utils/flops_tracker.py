@@ -24,7 +24,14 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_rl.utils.flops_formulas import FLOPSConfig, deepseekv3, llama, qwen2, qwen3
+from nemo_rl.utils.flops_formulas import (
+    FLOPSConfig,
+    deepseekv3,
+    glm_moe_dsa,
+    llama,
+    qwen2,
+    qwen3,
+)
 
 
 def get_default_hf_config(model_name: str) -> PretrainedConfig:
@@ -99,6 +106,37 @@ def convert_config_to_flops_config(
             mtp_num_layers=0,
             causal_self_attn=True,
         ), deepseekv3
+    elif config.__class__.model_type == "glm_moe_dsa":
+        moe_layer_freq = [0] * config.first_k_dense_replace + [1] * (
+            config.num_hidden_layers - config.first_k_dense_replace
+        )
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            attention_heads=config.num_attention_heads,
+            moe_router_topk=config.num_experts_per_tok,
+            query_groups=config.num_key_value_heads,
+            vocab_size=config.vocab_size,
+            q_lora_rank=config.q_lora_rank,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_head_dim=config.qk_nope_head_dim,
+            qk_pos_emb_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            moe_layer_freq=moe_layer_freq,
+            moe_shared_expert_intermediate_size=(
+                config.moe_intermediate_size * config.n_shared_experts
+            ),
+            moe_ffn_hidden_size=config.moe_intermediate_size,
+            # GLM-5 HF config may expose next-token-prediction heads, but the
+            # MCore Bridge path used by these runs disables MTP mappings.
+            mtp_num_layers=None,
+            causal_self_attn=True,
+            dsa_indexer_n_heads=config.index_n_heads,
+            dsa_indexer_head_dim=config.index_head_dim,
+            dsa_indexer_topk=config.index_topk,
+        ), glm_moe_dsa
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 
