@@ -240,9 +240,8 @@ class TestBegin:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("step-0", loss_fn=w._test_loss_fn, gbs=16, mbs=4)
+        w.begin_train_step(loss_fn=w._test_loss_fn, gbs=16, mbs=4)
         assert w._train_step_state is not None
-        assert w._train_step_state["step_id"] == "step-0"
         assert w._train_step_state["loss_type"] == LossType.TOKEN_LEVEL
         assert w._train_step_state["gbs"] == 16
         assert w._train_step_state["mbs"] == 4
@@ -252,7 +251,7 @@ class TestBegin:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("step-0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         w.model.zero_grad_buffer.assert_called_once()
         w.optimizer.zero_grad.assert_called_once()
         w.model.train.assert_called_once()
@@ -265,7 +264,7 @@ class TestBegin:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
-        w.begin_train_step("step-0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w.model.config.grad_sync_func is None
         assert w._train_step_state["saved_grad_sync_func"] == "ORIGINAL_GRAD_SYNC_FUNC"
 
@@ -273,15 +272,15 @@ class TestBegin:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("step-0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         with pytest.raises(RuntimeError, match="already open"):
-            w.begin_train_step("step-1", loss_fn=w._test_loss_fn)
+            w.begin_train_step(loss_fn=w._test_loss_fn)
 
     def test_uses_cfg_defaults_when_gbs_mbs_omitted(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("step-0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w._train_step_state["gbs"] == w.cfg["train_global_batch_size"]
         assert w._train_step_state["mbs"] == w.cfg["train_micro_batch_size"]
 
@@ -295,29 +294,21 @@ class TestAssertStepOpen:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         with pytest.raises(RuntimeError, match="no train step open"):
-            w._assert_step_open("step-0")
-
-    def test_raises_on_step_id_mismatch(self, mock_module_symbols):
-        from nemo_rl.algorithms.loss.interfaces import LossType
-
-        w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("step-correct", loss_fn=w._test_loss_fn)
-        with pytest.raises(RuntimeError, match="step_id mismatch"):
-            w._assert_step_open("step-WRONG")
+            w._assert_step_open()
 
     def test_train_microbatch_without_begin_raises(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         with pytest.raises(RuntimeError, match="no train step open"):
-            w.train_microbatch("step-0", _fake_batch())
+            w.train_microbatch(_fake_batch())
 
     def test_finish_without_begin_raises(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         with pytest.raises(RuntimeError, match="no train step open"):
-            w.finish_train_step("step-0")
+            w.finish_train_step()
 
 
 # ── train_microbatch ─────────────────────────────────────────────────────
@@ -331,8 +322,8 @@ class TestTrainMicrobatch:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
         # no_sync() must have been ENTERED (called as a context manager).
         # MagicMock with __enter__/__exit__ records the __enter__ call.
         ctx = w.model.no_sync.return_value
@@ -343,8 +334,8 @@ class TestTrainMicrobatch:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
         assert mock_module_symbols["mfb"].call_count == 1
 
     def test_passes_placeholder_n_one_to_loss(self, mock_module_symbols):
@@ -353,8 +344,8 @@ class TestTrainMicrobatch:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
         kwargs = mock_module_symbols["mfb"].call_args.kwargs
         # placeholder_n is a tensor(1.0)
         assert "global_valid_seqs" in kwargs
@@ -366,16 +357,16 @@ class TestTrainMicrobatch:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         # _fake_batch has sample_mask sum = 8, token_mask*sample_mask sum = 8*256 = 2048
-        w.train_microbatch("s0", _fake_batch())
+        w.train_microbatch(_fake_batch())
         assert float(w._train_step_state["local_valid_seqs"].item()) == pytest.approx(
             8.0
         )
         assert float(w._train_step_state["local_valid_toks"].item()) == pytest.approx(
             2048.0
         )
-        w.train_microbatch("s0", _fake_batch())
+        w.train_microbatch(_fake_batch())
         assert float(w._train_step_state["local_valid_seqs"].item()) == pytest.approx(
             16.0
         )
@@ -387,11 +378,11 @@ class TestTrainMicrobatch:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         # get_microbatch_iterator mock returns num_microbatches=2 per call
-        w.train_microbatch("s0", _fake_batch())
-        w.train_microbatch("s0", _fake_batch())
-        w.train_microbatch("s0", _fake_batch())
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
         assert w._train_step_state["total_num_microbatches"] == 6
 
     def test_does_not_call_optimizer_step(self, mock_module_symbols):
@@ -400,9 +391,9 @@ class TestTrainMicrobatch:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())
-        w.train_microbatch("s0", _fake_batch())
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
         w.optimizer.step.assert_not_called()
 
 
@@ -412,8 +403,8 @@ class TestTrainMicrobatch:
 class TestFinish:
     def _setup_open_step(self, mock_module_symbols, loss_type):
         w = _make_worker(loss_type)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
         return w
 
     def test_rescales_grads_with_inv_n(self, mock_module_symbols):
@@ -422,7 +413,7 @@ class TestFinish:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
-        w.finish_train_step("s0")
+        w.finish_train_step()
         # scale_gradients should have been called with some 1/N scalar < 1
         w.model.scale_gradients.assert_called_once()
         arg = w.model.scale_gradients.call_args.args[0]
@@ -453,7 +444,7 @@ class TestFinish:
         w.optimizer.step.side_effect = lambda: (
             order.append("opt_step") or (True, 0.5, 0)
         )
-        w.finish_train_step("s0")
+        w.finish_train_step()
         if overlap_grad_reduce:
             assert order == ["scale", "start_sync", "finish_sync", "opt_step"]
         else:
@@ -464,7 +455,7 @@ class TestFinish:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
-        w.finish_train_step("s0")
+        w.finish_train_step()
         # local_valid_toks accumulated = 2048; with mocked all_reduce as no-op,
         # global_valid_toks == 2048 → inv_n = 1/2048
         arg = w.model.scale_gradients.call_args.args[0]
@@ -474,7 +465,7 @@ class TestFinish:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.SEQUENCE_LEVEL)
-        w.finish_train_step("s0")
+        w.finish_train_step()
         # local_valid_seqs = 8 → inv_n = 1/8
         arg = w.model.scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 8.0, rel=1e-4)
@@ -483,14 +474,14 @@ class TestFinish:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
-        w.finish_train_step("s0")
+        w.finish_train_step()
         assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
 
     def test_clears_train_step_state(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
-        w.finish_train_step("s0")
+        w.finish_train_step()
         assert w._train_step_state is None
 
     def test_calls_scheduler_step_with_increment_gbs(self, mock_module_symbols):
@@ -498,14 +489,14 @@ class TestFinish:
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
         w._train_step_state["gbs"] = 64
-        w.finish_train_step("s0")
+        w.finish_train_step()
         w.scheduler.step.assert_called_once_with(increment=64)
 
     def test_returns_metrics_dict(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
-        metrics = w.finish_train_step("s0")
+        metrics = w.finish_train_step()
         for key in (
             "global_loss",
             "rank",
@@ -521,7 +512,7 @@ class TestFinish:
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
         w.model.config.num_moe_experts = None
-        metrics = w.finish_train_step("s0")
+        metrics = w.finish_train_step()
         assert "moe_metrics" not in metrics
 
     def test_moe_branch_uses_total_num_microbatches_for_scale(
@@ -535,11 +526,11 @@ class TestFinish:
         w.model.config.num_moe_experts = 4
         # Have get_moe_metrics return non-empty so the branch fires
         mock_module_symbols["moe"].return_value = {"aux_loss": 0.1}
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         # 3 train_microbatch calls × 2 pipeline mbs each = 6
         for _ in range(3):
-            w.train_microbatch("s0", _fake_batch())
-        w.finish_train_step("s0")
+            w.train_microbatch(_fake_batch())
+        w.finish_train_step()
         # get_moe_metrics receives loss_scale=1/6
         kwargs = mock_module_symbols["moe"].call_args.kwargs
         assert kwargs["loss_scale"] == pytest.approx(1.0 / 6.0, rel=1e-6)
@@ -564,9 +555,9 @@ class TestFinish:
                 "other_metric": 2048.0,
             }
         ]
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())  # 8 seqs / 2048 valid toks
-        w.finish_train_step("s0")
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())  # 8 seqs / 2048 valid toks
+        w.finish_train_step()
         m = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
         assert m["tok_metric"] == pytest.approx(1.0)  # 2048 / 2048
         assert m["seq_metric"] == pytest.approx(1.0)  # 8 / 8
@@ -589,9 +580,9 @@ class TestFinish:
         mock_module_symbols["mfb"].return_value = [
             {"loss": 0.5, "num_valid_samples": 8.0, "num_unmasked_tokens": 2048.0}
         ]
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())  # inv_n = 1/2048
-        w.finish_train_step("s0")
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())  # inv_n = 1/2048
+        w.finish_train_step()
         m = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
         assert m["num_valid_samples"] == pytest.approx(8.0)
         assert m["num_unmasked_tokens"] == pytest.approx(2048.0)
@@ -625,9 +616,9 @@ class TestFinish:
                 "sampling_importance_ratio": 2048.0,
             }
         ]
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())  # 8 seqs / 2048 valid toks
-        w.finish_train_step("s0")
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())  # 8 seqs / 2048 valid toks
+        w.finish_train_step()
         m = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
         assert m["loss"] == pytest.approx(1.0)  # ÷ toks (loss_type)
         assert m["is_oob_ratio"] == pytest.approx(1.0)  # ÷ seqs, NOT toks
@@ -642,18 +633,18 @@ class TestAbort:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.abort_train_step("s0")
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.abort_train_step()
         assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
 
     def test_zero_grad_buffer_and_zero_grad_called(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         w.model.zero_grad_buffer.reset_mock()
         w.optimizer.zero_grad.reset_mock()
-        w.abort_train_step("s0")
+        w.abort_train_step()
         w.model.zero_grad_buffer.assert_called_once()
         w.optimizer.zero_grad.assert_called_once()
 
@@ -661,17 +652,17 @@ class TestAbort:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())
-        w.abort_train_step("s0")
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.abort_train_step()
         w.optimizer.step.assert_not_called()
 
     def test_clears_train_step_state(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.abort_train_step("s0")
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.abort_train_step()
         assert w._train_step_state is None
 
     def test_idempotent_with_no_open_step(self, mock_module_symbols):
@@ -680,27 +671,19 @@ class TestAbort:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         # Should not raise
-        w.abort_train_step("s0")
+        w.abort_train_step()
         assert getattr(w, "_train_step_state", None) is None
-
-    def test_mismatched_step_id_raises(self, mock_module_symbols):
-        from nemo_rl.algorithms.loss.interfaces import LossType
-
-        w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        with pytest.raises(RuntimeError, match="does not match open step"):
-            w.abort_train_step("s-WRONG")
 
     def test_can_begin_new_step_after_abort(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
-        w.train_microbatch("s0", _fake_batch())
-        w.abort_train_step("s0")
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        w.train_microbatch(_fake_batch())
+        w.abort_train_step()
         # New step opens cleanly
-        w.begin_train_step("s1", loss_fn=w._test_loss_fn)
-        assert w._train_step_state["step_id"] == "s1"
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        assert w._train_step_state is not None
         assert float(w._train_step_state["local_valid_seqs"].item()) == 0.0
 
 
@@ -714,10 +697,10 @@ class TestGradSyncFuncLifecycle:
         w = _make_worker(LossType.TOKEN_LEVEL)
         sentinel = "MY_CUSTOM_GRAD_SYNC"
         w.model.config.grad_sync_func = sentinel
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w.model.config.grad_sync_func is None
-        w.train_microbatch("s0", _fake_batch())
-        w.finish_train_step("s0")
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
         assert w.model.config.grad_sync_func == sentinel
 
     def test_begin_abort_round_trip(self, mock_module_symbols):
@@ -726,9 +709,9 @@ class TestGradSyncFuncLifecycle:
         w = _make_worker(LossType.TOKEN_LEVEL)
         sentinel = "MY_CUSTOM_GRAD_SYNC"
         w.model.config.grad_sync_func = sentinel
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w.model.config.grad_sync_func is None
-        w.abort_train_step("s0")
+        w.abort_train_step()
         assert w.model.config.grad_sync_func == sentinel
 
     def test_handles_originally_none_grad_sync_func(self, mock_module_symbols):
@@ -738,8 +721,8 @@ class TestGradSyncFuncLifecycle:
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.model.config.grad_sync_func = None
-        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
         assert w.model.config.grad_sync_func is None
-        w.train_microbatch("s0", _fake_batch())
-        w.finish_train_step("s0")
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
         assert w.model.config.grad_sync_func is None

@@ -106,16 +106,14 @@ def _run_split(
     data plane: presharded begin/finish fan-out + replica-leader dedup +
     the shared ``_aggregate_train_results``; the microbatch dispatch uses
     the backend ``train_microbatch`` with driver-sharded tensors instead
-    of ``train_microbatch_from_meta`` (which requires a TQ partition)."""
+    of ``train_microbatches_from_meta`` (which requires a TQ partition)."""
     wg = policy.worker_group
     policy.prepare_for_training()
     results = []
-    for step in range(NUM_STEPS):
-        step_id = f"parity-{step}"
+    for _step in range(NUM_STEPS):
         wg.get_all_worker_results(
             wg.run_all_workers_single_data(
                 "begin_train_step_presharded",
-                step_id=step_id,
                 loss_fn=loss_fn,
                 gbs=gbs,
                 mbs=mbs,
@@ -137,13 +135,10 @@ def _run_split(
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={"step_id": step_id},
             )
         )
         finish_results = wg.get_all_worker_results(
-            wg.run_all_workers_single_data(
-                "finish_train_step_presharded", step_id=step_id
-            )
+            wg.run_all_workers_single_data("finish_train_step_presharded")
         )
         leaders = [r for r in finish_results if r.get("is_replica_leader", True)]
         results.append(_aggregate_train_results(leaders))

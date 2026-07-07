@@ -464,17 +464,17 @@ class TQPolicy(Policy):
     # so :class:`SingleControllerActor` can stream microbatches without
     # forcing a full-step optimizer.step on every dispatch.
     #
-    # Lifecycle:
-    #   begin_train_step                  — open step; broadcast loss_fn/gbs/mbs
-    #   train_microbatch_from_meta (N×)   — DP-sharded fwd/bwd, grads accumulate
-    #   finish_train_step                 — all_reduce + opt.step + sched.step
-    #   abort_train_step                  — drop accumulators, no opt.step
+    # Lifecycle (one step open at a time — workers raise on a second
+    # ``begin``, so no step identifier is threaded through the API):
+    #   begin_train_step                    — open step; broadcast loss_fn/gbs/mbs
+    #   train_microbatches_from_meta (N×)   — DP-sharded fwd/bwd, grads accumulate
+    #   finish_train_step                   — all_reduce + opt.step + sched.step
+    #   abort_train_step                    — drop accumulators, no opt.step
     #
     # ``train_from_meta`` is unchanged and remains the sync entrypoint.
 
     def begin_train_step(
         self,
-        step_id: str,
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
@@ -486,20 +486,23 @@ class TQPolicy(Policy):
             self.flops_tracker.reset()
         futures = self.worker_group.run_all_workers_single_data(
             "begin_train_step_presharded",
-            step_id=step_id,
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
         )
         self.worker_group.get_all_worker_results(futures)
 
-    def train_microbatch_from_meta(
+    def train_microbatches_from_meta(
         self,
-        step_id: str,
         meta: KVBatchMeta,
         timer: Optional[Timer] = None,
     ) -> dict[str, Any]:
-        """Dispatch one microbatch (DP-sharded) into an open train step.
+        """Dispatch one meta slice (DP-sharded) into an open train step.
+
+        Named plural because one call fans out to every DP rank and the
+        backend then iterates its own internal (pipeline/packed)
+        microbatches — with a 2x packing ratio a group of G generations is
+        G/2 backend microbatches inside this single call, not G/2 calls.
 
         Mirrors the sharding logic of :meth:`train_from_meta` but without
         a logical-batch sizing constraint: this routes ``meta`` to DP
@@ -545,14 +548,13 @@ class TQPolicy(Policy):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={"step_id": step_id},
             )
         results = self.worker_group.get_all_worker_results(futures)
         # Per-microbatch metrics: pass through DP-rank-0 by convention,
         # backend may aggregate later if needed. Surface as-is for now.
         return results[0] if results else {}
 
-    def finish_train_step(self, step_id: str) -> dict[str, Any]:
+    def finish_train_step(self) -> dict[str, Any]:
         """Close an open train step: all_reduce, rescale, optimizer.step.
 
         Aggregates per-rank step results into the same shape as
@@ -561,7 +563,6 @@ class TQPolicy(Policy):
         """
         futures = self.worker_group.run_all_workers_single_data(
             "finish_train_step_presharded",
-            step_id=step_id,
         )
         results = self.worker_group.get_all_worker_results(futures)
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
@@ -580,11 +581,10 @@ class TQPolicy(Policy):
 
         return aggregated_results
 
-    def abort_train_step(self, step_id: str) -> None:
+    def abort_train_step(self) -> None:
         """Drop partial step state on every worker. No optimizer.step."""
         futures = self.worker_group.run_all_workers_single_data(
             "abort_train_step_presharded",
-            step_id=step_id,
         )
         self.worker_group.get_all_worker_results(futures)
 

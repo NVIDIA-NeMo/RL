@@ -894,7 +894,6 @@ class MegatronPolicyWorkerImpl(
 
     def _split_step_state_init(
         self,
-        step_id: str,
         loss_fn: LossFunction,
         gbs: Optional[int],
         mbs: Optional[int],
@@ -910,7 +909,6 @@ class MegatronPolicyWorkerImpl(
             metric_normalizations = {}
 
         return {
-            "step_id": step_id,
             "loss_fn": loss_fn,
             "loss_type": getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL),
             "metric_normalizations": metric_normalizations,
@@ -926,15 +924,11 @@ class MegatronPolicyWorkerImpl(
             "saved_no_sync_func": None,
         }
 
-    def _assert_step_open(self, step_id: str) -> dict[str, Any]:
+    def _assert_step_open(self) -> dict[str, Any]:
         state = getattr(self, "_train_step_state", None)
         if state is None:
             raise RuntimeError(
-                f"no train step open; begin_train_step({step_id!r}) must be called first"
-            )
-        if state["step_id"] != step_id:
-            raise RuntimeError(
-                f"step_id mismatch: open step is {state['step_id']!r}, got {step_id!r}"
+                "no train step open; begin_train_step must be called first"
             )
         return state
 
@@ -956,7 +950,6 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/begin_train_step")
     def begin_train_step(
         self,
-        step_id: str,
         loss_fn: LossFunction,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
@@ -964,8 +957,8 @@ class MegatronPolicyWorkerImpl(
         existing = getattr(self, "_train_step_state", None)
         if existing is not None:
             raise RuntimeError(
-                f"train step {existing['step_id']!r} is already open; "
-                f"call finish_train_step or abort_train_step before begin"
+                "a train step is already open; "
+                "call finish_train_step or abort_train_step before begin"
             )
         # Match sync train() inference-state reset (line 332-340).
         if hasattr(self.model, "inference_params"):
@@ -980,9 +973,7 @@ class MegatronPolicyWorkerImpl(
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
 
-        state = self._split_step_state_init(
-            step_id=step_id, loss_fn=loss_fn, gbs=gbs, mbs=mbs
-        )
+        state = self._split_step_state_init(loss_fn=loss_fn, gbs=gbs, mbs=mbs)
 
         # Null both mcore hooks that would fire a mid-step DP reduce:
         #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
@@ -1016,7 +1007,6 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/train_microbatch")
     def train_microbatch(
         self,
-        step_id: str,
         data: BatchedDataDict[Any],
     ) -> dict[str, Any]:
         """One DP slice of data → one ``forward_backward_func`` invocation.
@@ -1026,7 +1016,7 @@ class MegatronPolicyWorkerImpl(
         dispatching a per-call DP reduce. The single true reduce is done
         explicitly in ``finish_train_step``.
         """
-        state = self._assert_step_open(step_id)
+        state = self._assert_step_open()
         try:
             return self._train_microbatch_body(state, data)
         except Exception:
@@ -1039,9 +1029,7 @@ class MegatronPolicyWorkerImpl(
                 self._restore_saved_grad_sync_func(state)
             except Exception:
                 log.exception(
-                    "failed to restore grad_sync_func after train_microbatch "
-                    "error (step=%s)",
-                    step_id,
+                    "failed to restore grad_sync_func after train_microbatch error"
                 )
             raise
 
@@ -1070,7 +1058,7 @@ class MegatronPolicyWorkerImpl(
         state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
         state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
 
-        # Build the per-call iterator. Each ``train_microbatch_from_meta``
+        # Build the per-call iterator. Each ``train_microbatches_from_meta``
         # call carries one DP slice; the iterator subdivides into pipeline
         # microbatches.
         (
@@ -1159,8 +1147,8 @@ class MegatronPolicyWorkerImpl(
         }
 
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
-    def finish_train_step(self, step_id: str) -> dict[str, Any]:
-        state = self._assert_step_open(step_id)
+    def finish_train_step(self) -> dict[str, Any]:
+        state = self._assert_step_open()
         try:
             return self._finish_train_step_body(state)
         except Exception:
@@ -1173,9 +1161,7 @@ class MegatronPolicyWorkerImpl(
                 self._restore_saved_grad_sync_func(state)
             except Exception:
                 log.exception(
-                    "failed to restore grad_sync_func after finish_train_step "
-                    "error (step=%s)",
-                    step_id,
+                    "failed to restore grad_sync_func after finish_train_step error"
                 )
             raise
 
@@ -1345,15 +1331,10 @@ class MegatronPolicyWorkerImpl(
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/abort_train_step")
-    def abort_train_step(self, step_id: str) -> None:
+    def abort_train_step(self) -> None:
         state = getattr(self, "_train_step_state", None)
         if state is None:
             return
-        if state["step_id"] != step_id:
-            raise RuntimeError(
-                f"abort_train_step({step_id!r}) does not match open step "
-                f"{state['step_id']!r}"
-            )
         # Restore grad_sync_func first so the model is back to a normal
         # state before zero_grad_buffer touches anything.
         self._restore_saved_grad_sync_func(state)
