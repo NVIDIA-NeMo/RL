@@ -77,7 +77,8 @@ class DataConfig(TypedDict):
 # ===============================================================================
 # Eval Dataset Configs
 # ===============================================================================
-# These configs correspond to the eval datasets in data/datasets/eval_datasets/
+# These configs are used by the evaluation entrypoint. Migrated datasets such
+# as AIME use the response registry; the rest still use eval_datasets/.
 # Note: TypedDict doesn't allow narrowing types in child classes, so each config
 # is defined independently with common fields repeated.
 
@@ -123,17 +124,10 @@ class MMLUProEvalDataConfig(TypedDict):
 
 
 class AIMEEvalDataConfig(TypedDict):
-    """Config for AIME datasets."""
+    """Config for AIME datasets loaded from the response registry."""
 
     max_input_seq_length: int
-    dataset_name: Literal[
-        "AIME2024",
-        "AIME2025",
-        "AIME2026",
-        "aime2024",
-        "aime2025",
-        "aime2026",
-    ]
+    dataset_name: Literal["AIME2024", "AIME2025", "AIME2026"]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
     processor: NotRequired[str]

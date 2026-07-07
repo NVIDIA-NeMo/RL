@@ -55,6 +55,9 @@ def setup_data(tokenizer, data_config, env_configs):
     print("Setting up data...")
 
     # load dataset
+    # TODO(#2840): consolidate onto load_response_dataset. Migration is in
+    # progress -- remaining eval-only datasets (mmlu, gpqa, math, mmau) will
+    # move into DATASET_REGISTRY, at which point this branch collapses.
     if data_config["dataset_name"] in DATASET_REGISTRY:
         base_dataset = load_response_dataset(data_config)
         rekeyed_ds = base_dataset.dataset

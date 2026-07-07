@@ -20,8 +20,10 @@ from datasets import Dataset
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import load_response_dataset
+from nemo_rl.data.datasets.response_datasets import aime as aime_module
 from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_dataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
+from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
 def create_sample_data(input_key, output_key, is_save_to_disk=False, file_ext=".json"):
@@ -61,6 +63,31 @@ def tokenizer():
     """Initialize tokenizer for the test model."""
     tokenizer = get_tokenizer({"name": "Qwen/Qwen3-0.6B"})
     return tokenizer
+
+
+def test_aime_defaults_to_one_copy_and_supports_explicit_repeat(monkeypatch):
+    source = Dataset.from_list(
+        [
+            {"problem": "problem 1", "answer": 1},
+            {"problem": "problem 2", "answer": 2},
+        ]
+    )
+    monkeypatch.setattr(aime_module, "load_dataset", lambda *args, **kwargs: source)
+
+    default_dataset = load_response_dataset(
+        {"dataset_name": "AIME2024", "processor": "math_hf_data_processor"}
+    )
+    repeated_dataset = load_response_dataset(
+        {
+            "dataset_name": "AIME2024",
+            "processor": "math_hf_data_processor",
+            "repeat": 3,
+        }
+    )
+
+    assert len(default_dataset.dataset) == 2
+    assert len(repeated_dataset.dataset) == 6
+    assert default_dataset.processor is PROCESSOR_REGISTRY["math_hf_data_processor"]
 
 
 @pytest.mark.parametrize(
@@ -221,13 +248,13 @@ def test_build_in_dataset(dataset_name, tokenizer):
         assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"
     elif dataset_name == "AIME2024":
         assert first_example["messages"][1]["content"] == "204"
-        assert len(dataset.dataset) == 480
+        assert len(dataset.dataset) == 30
     elif dataset_name == "AIME2025":
         assert first_example["messages"][1]["content"] == "70"
-        assert len(dataset.dataset) == 480
+        assert len(dataset.dataset) == 30
     elif dataset_name == "AIME2026":
         assert first_example["messages"][1]["content"] == "277"
-        assert len(dataset.dataset) == 480
+        assert len(dataset.dataset) == 30
 
     # check the combined message
     chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
