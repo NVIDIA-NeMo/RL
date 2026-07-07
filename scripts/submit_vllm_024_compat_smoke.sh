@@ -14,18 +14,6 @@ UV_CACHE_DIR="${UV_CACHE_DIR:-${REPO_DIR}/.cache/uv}"
 HF_HOME="${HF_HOME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/hf_home}"
 DRY_RUN="${DRY_RUN:-false}"
 
-read -r -d '' COMMAND <<EOF || true
-set -euo pipefail
-cd '${REPO_DIR}'
-export UV_CACHE_DIR='${UV_CACHE_DIR}'
-export UV_PROJECT_ENVIRONMENT='${VENV_DIR}'
-export HF_HOME='${HF_HOME}'
-export NRL_FORCE_REBUILD_VENVS=true
-uv venv --allow-existing '${VENV_DIR}'
-uv sync --locked --extra vllm --no-dev
-'${VENV_DIR}/bin/python' scripts/vllm_024_compat_smoke.py
-EOF
-
 SRUN_COMMAND=(
   srun
   --nodes=1
@@ -34,7 +22,12 @@ SRUN_COMMAND=(
   --container-image="${CONTAINER}"
   --container-mounts=/lustre:/lustre
   --container-workdir="${REPO_DIR}"
-  bash -lc "${COMMAND}"
+  env
+  "REPO_DIR=${REPO_DIR}"
+  "VENV_DIR=${VENV_DIR}"
+  "UV_CACHE_DIR=${UV_CACHE_DIR}"
+  "HF_HOME=${HF_HOME}"
+  bash "${REPO_DIR}/scripts/run_vllm_024_compat_smoke.sh"
 )
 printf -v WRAPPED_COMMAND '%q ' "${SRUN_COMMAND[@]}"
 WRAPPED_COMMAND="${WRAPPED_COMMAND% }"
