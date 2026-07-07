@@ -202,7 +202,13 @@ policy:
     # in _clear_fp8_caches claims ~5x on the IPC path) - measure and revisit.
     # NCCL_DEBUG=WARN surfaces the underlying CUDA error code if it recurs.
     env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      # Bug #16 test: expandable_segments (added for GB300 fragmentation) is
+      # documented incompatible with NCCL user-buffer registration; VMM pool
+      # growth during step 1 + stale buffer registrations wedging some peer
+      # pairs on step 2 matches the FR signature (one rank's alltoall
+      # transfers complete, 31 peers' wedge; NVLS=0 did not help, job
+      # 2295735). Revert to the default allocator for discrimination.
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
       NCCL_DEBUG: "WARN"
       # Jobs 2269608/2272089 OOM'd in TE's UNFUSED dot-product-attention
       # fallback (softmax.py forward_torch_softmax), which materializes the
