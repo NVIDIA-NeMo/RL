@@ -1,0 +1,42 @@
+# Block-aware ESPO with K = 2 coupled pairs (num_mc_samples = 4) on
+# Nemotron-Labs-Diffusion-3B, DeepScaleR train / AIME 2024 val.
+#
+# Inherits the bs16 single-pair ESPO config and only raises the Monte-Carlo count:
+# each extra MC sample is an antithetic coupled pair (its complement), so
+# num_mc_samples = 2 * num_pairs. With num_pairs = 2 there are 4 mask levels
+# {0,1} (pair 0) and {2,3} (pair 1); each pair's two complementary levels partition
+# the response tokens. The block-aware ELBO is averaged over all 4 levels (the
+# 1/num_mc_samples = 1/4 factor) -- a lower-variance ELBO / ratio estimator than the
+# single pair. See nemo_rl/algorithms/espo_logprobs.py and the ESPO worker.
+#
+# prev / reference logprobs now run 2K = 4 forwards each (vs 2), summing WITHIN each
+# pair to K per-pair [N, S] tensors (pair 0 = the standard prev_logprobs, pairs
+# 1..K-1 = prev_logprobs_pair{p}); the loss routes pair = level // 2's tensor onto
+# each level row and reduces per level. The 2K forwards are the dominant new cost at
+# this K. The per-training-forward row count is UNCHANGED at
+# num_samples_per_micro_batch * num_mc_samples (K_seq = 1 -> 4 rows here).
+#
+# MICROBATCH SIZING: train_micro_batch_size = num_samples_per_micro_batch (1) *
+# num_mc_samples (4) = 4. Decoupled from per_rank_sequences (the full global batch
+# trains via gradient accumulation over per_rank / K_seq microbatches). The worker
+# raises a clear error if train_micro_batch_size != K_seq * num_mc_samples.
+# logprob_batch_size is in sequence-units and must divide the per-rank logprob batch
+# (no-grad, independent of training K_seq); 2 is inherited from the bs16 base.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_espo_block_aware_coupled_megatron_bs16.yaml"
+
+policy:
+  logprob_estimation:
+    # K = 2 antithetic coupled pairs = 4 mask levels.
+    num_mc_samples: 4
+
+  # num_samples_per_micro_batch (K_seq = 1, inherited) * num_mc_samples (4) = 4 rows
+  # per training microbatch (the worker validates this).
+  train_micro_batch_size: 4
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-espo-block-aware-coupled-2pairs-deepscaler-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-espo-block-aware-coupled-2pairs-deepscaler-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-espo-block-aware-coupled-2pairs-deepscaler-megatron-sglang"

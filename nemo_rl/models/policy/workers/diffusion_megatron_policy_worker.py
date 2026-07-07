@@ -348,6 +348,16 @@ class DiffusionMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl, ABC):
             current_device_uuid=self.report_device_id(),
         )
 
+    def _coupled_pair_count_scale(self) -> int:
+        """Multiplier on the global valid seq/token counts used to normalize the loss.
+
+        Defaults to 1. Subclasses whose training schedule accumulates each response
+        token / sequence more than once per optimizer step (CoupledGRPO with K > 1
+        coupled pairs: level-major over 2K levels harvests each token K times) return
+        K so the loss stays a proper MC average instead of being K-fold over-scaled.
+        """
+        return 1
+
     @wrap_with_nvtx_name("diffusion_megatron_policy_worker/train")
     def train(
         self,
@@ -419,6 +429,14 @@ class DiffusionMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl, ABC):
                 )
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
+                # Scale the loss normalizer when the training schedule accumulates each
+                # token / sequence more than once per step (CoupledGRPO with K>1 coupled
+                # pairs). Only the counts passed to forward/backward are scaled; the
+                # reported metrics below keep the true (unscaled) counts. No-op at scale
+                # 1 (single pair / ESPO / DiffuGRPO) -> byte-for-byte.
+                _count_scale = self._coupled_pair_count_scale()
+                _fb_global_valid_seqs = global_valid_seqs * _count_scale
+                _fb_global_valid_toks = global_valid_toks * _count_scale
 
                 (
                     data_iterator,
@@ -457,8 +475,8 @@ class DiffusionMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl, ABC):
                         post_processing_fn=loss_post_processor,
                         forward_only=eval_mode,
                         defer_fp32_logits=self.defer_fp32_logits,
-                        global_valid_seqs=global_valid_seqs,
-                        global_valid_toks=global_valid_toks,
+                        global_valid_seqs=_fb_global_valid_seqs,
+                        global_valid_toks=_fb_global_valid_toks,
                         sampling_params=self.sampling_params,
                         straggler_timer=self.mcore_state.straggler_timer,
                         draft_model=None,

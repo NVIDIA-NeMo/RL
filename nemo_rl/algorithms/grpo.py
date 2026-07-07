@@ -1347,6 +1347,35 @@ def _maybe_set_coupled_sglang_kl_logprobs(
     )["logprobs"]
 
 
+def _maybe_capture_coupled_pair_logprobs(
+    *,
+    train_data: BatchedDataDict[Any],
+    logprobs: BatchedDataDict[Any],
+    master_config: MasterConfig,
+    source_prefix: str,
+    dest_prefix: str,
+) -> None:
+    """CoupledGRPO / ESPO with K > 1 coupled pairs: capture the per-pair prev / ref logprobs.
+
+    No-op unless the estimator is ``coupled_grpo`` or ``espo_block_aware`` with
+    ``num_mc_samples > 2`` (so the single-pair paths -- which emit no per-pair keys --
+    are untouched). ``logprobs`` is the worker return dict; it carries pairs 1..K-1
+    as ``{source_prefix}_pair{p}`` (``logprobs_pair{p}`` for prev, ``reference_logprobs
+    _pair{p}`` for reference). Copy them onto ``train_data`` as
+    ``{dest_prefix}_pair{p}`` so ``make_coupled_level_view`` rides them into the
+    training batch (pair 0 stays the standard ``prev_logprobs`` /
+    ``reference_policy_logprobs``).
+    """
+    estimation_cfg = master_config["policy"].get("logprob_estimation", {})
+    if estimation_cfg.get("type") not in ("coupled_grpo", "espo_block_aware"):
+        return
+    num_pairs = int(estimation_cfg.get("num_mc_samples", 2) or 2) // 2
+    for pair in range(1, num_pairs):
+        key = f"{source_prefix}_pair{pair}"
+        if key in logprobs:
+            train_data[f"{dest_prefix}_pair{pair}"] = logprobs[key]
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -1797,18 +1826,37 @@ def grpo_train(
                         logprob_data["coupled_grpo_seed"] = train_data[
                             "coupled_grpo_seed"
                         ]
-                    train_data["prev_logprobs"] = policy.get_logprobs(
+                    prev_logprobs_out = policy.get_logprobs(
                         logprob_data, timer=timer
-                    )["logprobs"]
+                    )
+                    train_data["prev_logprobs"] = prev_logprobs_out["logprobs"]
+                    # Coupled/ESPO K > 1: also carry pairs 1..K-1 prev logprobs (no-op else).
+                    _maybe_capture_coupled_pair_logprobs(
+                        train_data=train_data,
+                        logprobs=prev_logprobs_out,
+                        master_config=master_config,
+                        source_prefix="logprobs",
+                        dest_prefix="prev_logprobs",
+                    )
 
                     if not master_config["grpo"].get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
-                        train_data["reference_policy_logprobs"] = (
+                        reference_logprobs_out = (
                             policy.get_reference_policy_logprobs(
                                 logprob_data,
                                 timer=timer,
-                            )["reference_logprobs"]
+                            )
+                        )
+                        train_data["reference_policy_logprobs"] = (
+                            reference_logprobs_out["reference_logprobs"]
+                        )
+                        _maybe_capture_coupled_pair_logprobs(
+                            train_data=train_data,
+                            logprobs=reference_logprobs_out,
+                            master_config=master_config,
+                            source_prefix="reference_logprobs",
+                            dest_prefix="reference_policy_logprobs",
                         )
 
                     _maybe_set_coupled_sglang_kl_logprobs(
@@ -2909,16 +2957,34 @@ def async_grpo_train(
 
                 print("▶ Computing logprobs...")
                 with timer.time("policy_and_reference_logprobs"):
-                    fprop_logprobs = policy.get_logprobs(
+                    fprop_logprobs_out = policy.get_logprobs(
                         train_data,
                         timer=timer,
-                    )["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
+                    )
+                    reference_logprobs_out = policy.get_reference_policy_logprobs(
                         train_data,
                         timer=timer,
-                    )["reference_logprobs"]
-                    train_data["prev_logprobs"] = fprop_logprobs
-                    train_data["reference_policy_logprobs"] = reference_logprobs
+                    )
+                    train_data["prev_logprobs"] = fprop_logprobs_out["logprobs"]
+                    train_data["reference_policy_logprobs"] = reference_logprobs_out[
+                        "reference_logprobs"
+                    ]
+                    # Coupled/ESPO K > 1: also carry pairs 1..K-1 prev / reference
+                    # logprobs (no-op for the single-pair paths).
+                    _maybe_capture_coupled_pair_logprobs(
+                        train_data=train_data,
+                        logprobs=fprop_logprobs_out,
+                        master_config=master_config,
+                        source_prefix="logprobs",
+                        dest_prefix="prev_logprobs",
+                    )
+                    _maybe_capture_coupled_pair_logprobs(
+                        train_data=train_data,
+                        logprobs=reference_logprobs_out,
+                        master_config=master_config,
+                        source_prefix="reference_logprobs",
+                        dest_prefix="reference_policy_logprobs",
+                    )
 
                     _maybe_set_coupled_sglang_kl_logprobs(
                         policy=policy,

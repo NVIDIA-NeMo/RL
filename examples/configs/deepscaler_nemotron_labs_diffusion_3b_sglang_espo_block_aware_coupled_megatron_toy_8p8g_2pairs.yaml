@@ -1,0 +1,28 @@
+# Toy 8p8g smoke for ESPO with K = 2 coupled pairs (num_mc_samples = 4).
+# Inherits the 8p8g toy config and bumps the MC count to 2 pairs so the schedule
+# builds 4 sample-major level rows per sequence and prev/ref issue 2K = 4 forwards
+# each. K_seq = num_samples_per_micro_batch = 1 (inherited), so
+#   train_micro_batch_size == K_seq (1) * num_mc_samples (4) = 4.
+#
+# MEMORY (smoke-only): with num_mc_samples=4 the training microbatch is 4 rows
+# (2x the M=2 toy), which OOMs the single-node backward at the full 4096 seq length
+# (colocated with SGLang). This is a toy-scale capacity limit, NOT a correctness
+# issue -- all the K=2 logic (4-level mask gen, 2K prev/ref forwards + per-pair
+# summing, 4-level loss forward) runs before the backward. To fit mbs=4 on one node
+# we halve the sequence length and trim SGLang's static reservation. At real
+# (multi-node) scale these are unnecessary. Correctness is unaffected -- shorter
+# responses only lower reward, not the pipeline being exercised.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_espo_block_aware_coupled_megatron_toy_8p8g.yaml"
+
+policy:
+  logprob_estimation:
+    num_mc_samples: 4
+  # K_seq (num_samples_per_micro_batch=1, inherited) * num_mc_samples (4) = 4 rows.
+  train_micro_batch_size: 4
+  # Halve the sequence length so the 4-row training backward fits on one node.
+  max_total_sequence_length: 2048
+  generation:
+    max_new_tokens: 1698
+    sglang_cfg:
+      mem_fraction_static: 0.45
+      context_length: 2048

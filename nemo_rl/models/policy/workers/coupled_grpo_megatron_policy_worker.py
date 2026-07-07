@@ -19,11 +19,13 @@ import torch
 
 from nemo_rl.algorithms.block_just_grpo_logprobs import scatter_block_reveal_logprobs
 from nemo_rl.algorithms.coupled_grpo_logprobs import (
+    COUPLED_NUM_LEVELS,
     CoupledGRPORevealSchedule,
     build_coupled_base,
     get_coupled_grpo_logprob_estimation_cfg,
     make_coupled_level_view,
 )
+from nemo_rl.algorithms.diffu_grpo_logprobs import _scatter_original_response_values
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import LogprobOutputSpec
@@ -65,6 +67,31 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
     def _diffu_grpo_cfg(self):
         return self._coupled_cfg()
 
+    def _coupled_num_levels(self) -> int:
+        """Total mask levels per sequence (``num_mc_samples``, defaults to 2).
+
+        Each Monte-Carlo sample is an antithetic coupled pair, so this is
+        ``COUPLED_NUM_LEVELS * num_pairs`` and must be even and >= 2.
+        ``num_mc_samples == 2`` is the single-pair path (byte-for-byte CoupledGRPO);
+        4 -> 2 pairs, 6 -> 3 pairs, ..."""
+        num = int(self._coupled_cfg().get("num_mc_samples", COUPLED_NUM_LEVELS))
+        if num < COUPLED_NUM_LEVELS or num % COUPLED_NUM_LEVELS != 0:
+            raise ValueError(
+                "num_mc_samples must be even and >= 2 (each Monte-Carlo sample is an "
+                f"antithetic coupled pair, so COUPLED_NUM_LEVELS * num_pairs); got {num}."
+            )
+        return num
+
+    def _coupled_pair_count_scale(self) -> int:
+        # Level-major training accumulates each token/sequence once per pair across the
+        # 2K levels, so the loss normalizer scales by the pair count (1 at a single
+        # pair -> byte-for-byte with the original CoupledGRPO).
+        return self._coupled_num_pairs()
+
+    def _coupled_num_pairs(self) -> int:
+        """Independent coupled pairs (K = num_mc_samples // COUPLED_NUM_LEVELS)."""
+        return self._coupled_num_levels() // COUPLED_NUM_LEVELS
+
     # ---- training: lazy two-level schedule (one optimizer step) -------------
     def _build_training_megatron_batch(
         self,
@@ -72,16 +99,25 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         mbs: int,
     ) -> tuple[BatchedDataDict[Any], PolicyConfig, int, dict[str, Any]]:
         cfg = self._coupled_cfg()
+        num_pairs = self._coupled_num_pairs()
         block_size = self._diffusion_block_size()
         self._maybe_print_diffusion_block_size("coupled_grpo_train", block_size)
-        base, _num_samples, num_levels = build_coupled_base(
+        base, num_samples, num_levels = build_coupled_base(
             data,
             mask_token_id=cfg["mask_token_id"],
             pad_token_id=self.tokenizer.pad_token_id,
             noisy_block_size=block_size,
             pad_to_length=self._diffu_grpo_sequence_length_round(),
             include_loss=True,
+            num_pairs=num_pairs,
         )
+        # Scatter pairs 1..K-1 prev / reference logprobs into the noisy layout so
+        # ``make_coupled_level_view`` can route pair = level // 2's summed [N, S] onto
+        # its two level rows. Pair 0 is the standard prev_logprobs /
+        # reference_policy_logprobs base field (already scattered by include_loss).
+        # No-op at num_pairs == 1 (byte-for-byte CoupledGRPO).
+        if num_samples:
+            self._scatter_pair_logprobs(base, data, num_pairs)
         # One forward per level; samples within a level are microbatched the
         # standard way by train_micro_batch_size (passed in as ``mbs``). A single
         # forward_backward over the whole schedule accumulates gradients across
@@ -97,17 +133,18 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             {},
         )
 
-    # ---- logprobs: explicit for-loop over the two levels --------------------
+    # ---- logprobs: explicit for-loop over the 2K levels ---------------------
     def get_logprobs(
         self,
         *,
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
     ) -> BatchedDataDict[LogprobOutputSpec]:
-        # Sum both complementary levels: each masks its half of the response and
-        # runs one forward; the scattered logprobs land at that level's harvested
-        # positions (zero elsewhere), so the two levels reconstruct the [N, S]
-        # vector.
+        # Run all 2K levels and sum WITHIN each pair (a pair's two complementary
+        # levels partition the response tokens, so its per-pair sum holds each token's
+        # logprob once). Pair 0's sum is the standard ["logprobs"] [N, S]; pairs
+        # 1..K-1 ride as extra keys logprobs_pair{p}. At one pair (num_mc_samples=2)
+        # this is the single-tensor CoupledGRPO output.
         return self._coupled_logprobs(data=data, micro_batch_size=micro_batch_size)
 
     def get_logprobs_with_provided_mask(
@@ -135,6 +172,60 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             data=data, micro_batch_size=micro_batch_size, only_level0=True
         )
 
+    def get_reference_policy_logprobs(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[Any]:
+        # Mirror base_policy_worker.get_reference_policy_logprobs but also carry the
+        # per-pair extra keys (renamed logprobs_pair{p} -> reference_policy_logprobs
+        # _pair{p}) so pairs 1..K-1 reference logprobs reach the training batch. At
+        # one pair no extra keys exist -> {"reference_logprobs": ...} only.
+        with self.use_reference_model():
+            reference = self.get_logprobs(
+                data=data, micro_batch_size=micro_batch_size
+            )
+        out = BatchedDataDict[Any]()
+        out["reference_logprobs"] = reference["logprobs"].cpu()
+        for pair in range(1, self._coupled_num_pairs()):
+            key = f"logprobs_pair{pair}"
+            if key in reference:
+                out[f"reference_logprobs_pair{pair}"] = reference[key].cpu()
+        return out
+
+    def _scatter_pair_logprobs(
+        self,
+        base: BatchedDataDict[Any],
+        data: BatchedDataDict[Any],
+        num_pairs: int,
+    ) -> None:
+        """Scatter pairs 1..K-1 prev / reference logprobs into the noisy layout.
+
+        Pair p's per-token ``[N, S]`` prev / reference logprobs arrive as extra keys
+        ``prev_logprobs_pair{p}`` / ``reference_policy_logprobs_pair{p}`` (the summed
+        logprobs of pair p's two complementary levels; pair 0 uses the standard
+        ``prev_logprobs`` / ``reference_policy_logprobs``, already scattered by
+        ``build_fully_masked_completion_loss_batch``). Map them into the noisy layout
+        with the SAME scatter as those standard keys and attach as per-pair base
+        fields so ``make_coupled_level_view`` can route pair = level // 2's tensor per
+        row. No-op at num_pairs == 1 (the loop is empty).
+        """
+        total_length = base["input_ids"].shape[1]
+        completion_starts = base["diffu_grpo_completion_starts"]
+        response_lengths = base["diffu_grpo_response_lengths"]
+        for pair in range(1, num_pairs):
+            for prefix in ("prev_logprobs", "reference_policy_logprobs"):
+                key = f"{prefix}_pair{pair}"
+                if key not in data:
+                    continue
+                base[key] = _scatter_original_response_values(
+                    values=data[key],
+                    total_length=total_length,
+                    completion_starts=completion_starts,
+                    response_lengths=response_lengths,
+                )
+
     def _coupled_logprobs(
         self,
         *,
@@ -142,13 +233,19 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         micro_batch_size: Optional[int],
         only_level0: bool = False,
     ) -> BatchedDataDict[LogprobOutputSpec]:
-        """Build the coupled base and sum the scattered per-level ``[N, S]`` logprobs.
+        """Build the coupled base and return K per-pair summed ``[N, S]`` logprobs.
 
-        ``only_level0`` runs just level 0 (the provided-mask path); both choices are
-        rank-independent, so the pass count stays DP-uniform.
+        Pair 0's sum is ["logprobs"] (the single-tensor contract); pairs 1..K-1 are
+        ``logprobs_pair{p}``. ``only_level0`` (the provided-mask / generation-KL
+        verification path) pins ONE mask and runs a single level -- inherently
+        single-pair, so it collapses to num_pairs=1 and returns just ["logprobs"]. At
+        num_pairs == 1 the output is ``{"logprobs": <single [N, S]>}`` (byte-for-byte
+        CoupledGRPO). Both choices are rank-independent, so the pass count stays
+        DP-uniform.
         """
         self._validate_diffusion_algorithm_support()
         cfg = self._coupled_cfg()
+        num_pairs = 1 if only_level0 else self._coupled_num_pairs()
         block_size = self._diffusion_block_size()
         coupled_mbs = (
             micro_batch_size
@@ -162,11 +259,12 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             noisy_block_size=block_size,
             pad_to_length=self._diffu_grpo_sequence_length_round(),
             include_loss=False,
+            num_pairs=num_pairs,
         )
         if num_levels == 0:
             empty = torch.zeros_like(data["input_ids"], dtype=torch.float32)
             return BatchedDataDict[LogprobOutputSpec](logprobs=empty).to("cpu")
-        out = self._run_coupled_levels(
+        pair_logprobs = self._run_coupled_levels(
             data=data,
             base=base,
             num_samples=num_samples,
@@ -174,7 +272,11 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             coupled_mbs=coupled_mbs,
             levels=(0,) if only_level0 else range(num_levels),
         )
-        return BatchedDataDict[LogprobOutputSpec](logprobs=out).to("cpu")
+        out = BatchedDataDict[LogprobOutputSpec](logprobs=pair_logprobs[0])
+        if not only_level0:
+            for pair in range(1, num_pairs):
+                out[f"logprobs_pair{pair}"] = pair_logprobs[pair]
+        return out.to("cpu")
 
     def _run_coupled_levels(
         self,
@@ -185,32 +287,44 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         original_seq_len: int,
         coupled_mbs: Optional[int],
         levels,
-    ) -> torch.Tensor:
-        """Run one masked forward per level in ``levels`` and sum the scattered
-        per-level ``[N, S]`` logprobs.
+    ) -> list[torch.Tensor]:
+        """Run one masked forward per level and sum the scattered ``[N, S]`` logprobs
+        WITHIN each pair (levels ``2p`` / ``2p+1`` -> ``pair_out[p]``).
 
-        Each forward selects its level view through the ``self._cp_*`` instance
-        state that ``_build_logprob_megatron_batch`` reads back. The pass count is
-        ``len(levels)`` on every rank, so callers must pass a rank-independent
-        ``levels`` (e.g. ``range(2)`` or ``(0,)``) to stay DP-uniform.
+        Approach A: a pair's two complementary levels partition the response tokens,
+        so summing those two levels alone is lossless per pair (a GLOBAL sum over all
+        2K levels would over-count each token K times when K > 1). Returns the K
+        per-pair ``[N, S]`` tensors ordered by pair (at one pair, a single-element
+        list -- byte-for-byte CoupledGRPO). Each forward selects its level view
+        through the ``self._cp_*`` instance state ``_build_logprob_megatron_batch``
+        reads back; the pass count is ``len(levels)`` on every rank (rank-independent,
+        DP-uniform).
         """
         self._cp_base = base
         self._cp_coupled_mbs = coupled_mbs
         self._cp_num_samples = num_samples
         self._cp_original_seq_len = original_seq_len
-        accumulated: Optional[torch.Tensor] = None
+        # Derive the pair count from the levels actually run (not the config) so the
+        # single-level provided-mask / generation-KL path (levels=(0,)) collapses to
+        # one pair; the full path (range(2K)) yields K.
+        levels_list = [int(level) for level in levels]
+        num_pairs = max(l // COUPLED_NUM_LEVELS for l in levels_list) + 1
+        pair_out: list[Optional[torch.Tensor]] = [None] * num_pairs
         try:
-            for level in levels:
+            for level in levels_list:
                 self._cp_level = level
                 level_out = super().get_logprobs(
                     data=data, micro_batch_size=coupled_mbs
                 )["logprobs"]
-                accumulated = (
-                    level_out if accumulated is None else accumulated + level_out
+                pair = int(level) // COUPLED_NUM_LEVELS
+                pair_out[pair] = (
+                    level_out
+                    if pair_out[pair] is None
+                    else pair_out[pair] + level_out
                 )
         finally:
             self._cp_base = None
-        return accumulated
+        return pair_out
 
     def _build_logprob_megatron_batch(
         self,

@@ -1,0 +1,26 @@
+# Toy SINGLE-NODE smoke for CoupledGRPO with K = 2 coupled pairs (num_mc_samples = 4).
+# The coupled toy_8p8g inherits cluster.num_nodes: 8, so override to 1 node (TP=PP=1
+# puts the whole 3B model on one GPU -- cheaper smoke). CoupledGRPO is level-major
+# (one level per forward, samples microbatched by train_micro_batch_size, gradient
+# accumulates across all 4 levels), so num_mc_samples=4 only adds accumulation steps;
+# per-forward memory is unchanged. Seq length trimmed to fit the 1-node smoke.
+# With K=2 each response token is harvested twice across the 4 levels, so the loss
+# normalizer is scaled by num_pairs=2 (_coupled_pair_count_scale) to stay a proper MC
+# average -- the point of this smoke.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron_toy_8p8g.yaml"
+
+policy:
+  logprob_estimation:
+    num_mc_samples: 4
+  train_global_batch_size: 64
+  train_micro_batch_size: 2
+  logprob_batch_size: 2
+  max_total_sequence_length: 2048
+  generation:
+    max_new_tokens: 1698
+    sglang_cfg:
+      mem_fraction_static: 0.45
+      context_length: 2048
+
+cluster:
+  num_nodes: 1

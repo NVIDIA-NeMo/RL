@@ -64,12 +64,23 @@ __all__ = [
     "make_coupled_level_view",
     "CoupledGRPORevealSchedule",
     "COUPLED_NUM_LEVELS",
+    "COUPLED_PAIR_SEED_STRIDE",
 ]
 
 # CoupledGRPO always runs exactly two complementary forward passes. Keeping this a
 # constant (independent of per-rank response lengths) is what makes the estimator
-# data-parallel safe -- every rank issues the same number of collectives.
+# data-parallel safe -- every rank issues the same number of collectives. ESPO may
+# draw K > 1 independent coupled pairs (2*num_pairs levels), computed in the ESPO
+# worker; this DP-safety constant is NOT mutated for that.
 COUPLED_NUM_LEVELS = 2
+
+# Stride between the per-pair sub-seeds when ESPO draws K > 1 independent coupled
+# pairs: pair p is seeded from ``coupled_grpo_seed + p * COUPLED_PAIR_SEED_STRIDE``.
+# Distinct from the ``1_000_003`` per-step stride in ``maybe_set_coupled_grpo_seed``
+# (which spans ``[0, N)`` per step) so ``(K - 1) * stride`` cannot alias a neighbour
+# steps seed block for any realistic K. At num_pairs == 1 pair 0s seed is the
+# raw ``coupled_grpo_seed`` -- so the RNG stream is byte-for-byte identical to today.
+COUPLED_PAIR_SEED_STRIDE = 2_000_003
 
 
 def get_coupled_grpo_logprob_estimation_cfg(
@@ -119,15 +130,19 @@ def _build_level0_mask(
     base: BatchedDataDict[Any],
     seed: torch.Tensor | None,
     level0_override: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Draw the per-sample level-0 mask ``M`` and the valid-response mask.
+    num_pairs: int = 1,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Draw the ``num_pairs`` per-sample level-0 masks and the valid-response mask.
 
-    For sample ``i`` with seed ``s_i``: draw ``t ~ U(0, 1)`` then a per-position
-    ``u ~ U(0, 1)``; a valid response position is in ``M`` iff ``u < t``. The RNG
-    stream is drawn over the full sequence length (not just the response) so the
-    realization is a deterministic function of the seed alone, independent of the
-    per-sample response length. Returns ``(level0, valid)`` boolean tensors of
-    shape ``[N, total_len]``.
+    For pair ``p`` and sample ``i`` the RNG is seeded from the sub-seed
+    ``s_i + p * COUPLED_PAIR_SEED_STRIDE``: draw ``t ~ U(0, 1)`` then a per-position
+    ``u ~ U(0, 1)``; a valid response position is in that pair's ``M`` iff ``u < t``.
+    The RNG stream is drawn over the full sequence length (not just the response) so
+    the realization is a deterministic function of the sub-seed alone, independent of
+    the per-sample response length. At ``num_pairs == 1`` pair 0 uses the raw seed --
+    identical to the CoupledGRPO stream. Returns ``(level0_masks, valid)`` where
+    ``level0_masks`` is a list of ``num_pairs`` boolean tensors ``[N, total_len]`` and
+    ``valid`` is one boolean tensor ``[N, total_len]``.
     """
     device = base["input_ids"].device
     num_samples, total_len = base["input_ids"].shape
@@ -147,26 +162,35 @@ def _build_level0_mask(
     if level0_override is not None:
         # Caller pinned M directly (already mapped to the noisy layout); use
         # it verbatim, intersected with valid. No per-row RNG / seed consumed.
+        # The override path is single-pair only (verification / KL check).
         level0 = (level0_override.to(device) > 0.5) & valid
-        return level0, valid
+        return [level0], valid
     if seed is None:
         raise ValueError(
             "_build_level0_mask needs a seed when no level0_override is given"
         )
 
-    level0 = torch.zeros((num_samples, total_len), dtype=torch.bool, device=device)
     seed_cpu = seed.detach().to("cpu").to(torch.int64)
-    for i in range(num_samples):
-        gen = torch.Generator(device="cpu")
-        # manual_seed requires a non-negative value; mask off the sign bit.
-        gen.manual_seed(int(seed_cpu[i].item()) & 0x7FFFFFFFFFFFFFFF)
-        # Bound the per-sample masking ratio to [0.2, 0.8] (DiffuCoder coupled-GRPO
-        # default). Full-range t~U(0,1) lets a level mask ~0% or ~100% of the
-        # response, giving extreme/high-variance per-token conditioning.
-        t = 0.2 + 0.6 * float(torch.rand((), generator=gen).item())
-        u = torch.rand(total_len, generator=gen).to(device)
-        level0[i] = (u < t) & valid[i]
-    return level0, valid
+    level0_masks: list[torch.Tensor] = []
+    for pair in range(num_pairs):
+        level0 = torch.zeros(
+            (num_samples, total_len), dtype=torch.bool, device=device
+        )
+        for i in range(num_samples):
+            gen = torch.Generator(device="cpu")
+            # Pair p draws from a distinct sub-seed; at pair 0 this is the raw seed
+            # (byte-for-byte the CoupledGRPO stream). manual_seed requires a
+            # non-negative value; mask off the sign bit.
+            sub_seed = int(seed_cpu[i].item()) + pair * COUPLED_PAIR_SEED_STRIDE
+            gen.manual_seed(sub_seed & 0x7FFFFFFFFFFFFFFF)
+            # Bound the per-sample masking ratio to [0.2, 0.8] (DiffuCoder coupled-GRPO
+            # default). Full-range t~U(0,1) lets a level mask ~0% or ~100% of the
+            # response, giving extreme/high-variance per-token conditioning.
+            t = 0.2 + 0.6 * float(torch.rand((), generator=gen).item())
+            u = torch.rand(total_len, generator=gen).to(device)
+            level0[i] = (u < t) & valid[i]
+        level0_masks.append(level0)
+    return level0_masks, valid
 
 
 def build_coupled_base(
@@ -176,18 +200,22 @@ def build_coupled_base(
     noisy_block_size: int | None,
     pad_to_length: int | None = None,
     include_loss: bool = False,
+    num_pairs: int = 1,
 ) -> tuple[BatchedDataDict[Any], int, int]:
-    """Build the DiffuGRPO ``[noisy | clean]`` base + the coupled level-0 mask.
+    """Build the DiffuGRPO ``[noisy | clean]`` base + the coupled level-0 mask(s).
 
     Unlike block-reveal, the noisy side IS block-padded (``noisy_block_size`` is
     forwarded to the completion builder, mirroring DiffuGRPO) so the partial-mask
-    forward aligns to the model's block-diffusion attention windows. The level-0
-    mask ``M`` is computed once here from ``data["coupled_grpo_seed"]`` and stored
-    on the base; both level views derive from it. If
-    ``data["coupled_grpo_level0_mask_override"]`` (``[N, S]``, 1 = masked) is
-    present it pins ``M`` directly (verification path) and no seed is needed.
-    Returns ``(base, num_samples, num_levels)`` where ``num_levels`` is ``2``
-    (``0`` only for an empty batch).
+    forward aligns to the model's block-diffusion attention windows. The
+    ``num_pairs`` level-0 masks are computed once here from
+    ``data["coupled_grpo_seed"]`` (pair ``p`` from a distinct sub-seed) and stored on
+    the base as ``coupled_grpo_level0_mask_pair{p}``; ``coupled_grpo_level0_mask`` is
+    kept as an alias for pair 0. Level view ``level`` derives from pair
+    ``level // 2``. If ``data["coupled_grpo_level0_mask_override"]`` (``[N, S]``,
+    1 = masked) is present it pins pair 0's ``M`` directly (single-pair verification
+    path) and no seed is needed. Returns ``(base, num_samples, num_levels)`` where
+    ``num_levels`` is ``2 * num_pairs`` (``0`` only for an empty batch). At
+    ``num_pairs == 1`` this is byte-for-byte the CoupledGRPO base.
     """
     if include_loss:
         base = build_fully_masked_completion_loss_batch(
@@ -217,14 +245,20 @@ def build_coupled_base(
         # Verification/diagnostic path: the caller pins M (the level-0 mask)
         # instead of drawing it from the seed. The override is in the original
         # [N, S] layout (1 = masked); map it into the noisy layout the same way
-        # prev_logprobs / advantages are scattered.
+        # prev_logprobs / advantages are scattered. Single-pair only: the override
+        # pins exactly one mask, so multi-pair (num_pairs > 1) is unsupported here
+        # rather than silently downgraded to a single pair.
+        assert num_pairs == 1, (
+            "coupled_grpo_level0_mask_override (provided-mask path) supports only "
+            f"num_pairs == 1; got num_pairs={num_pairs}."
+        )
         override_noisy = _scatter_original_response_values(
             override.to(device=base["input_ids"].device, dtype=zeros.dtype),
             total_length=base["input_ids"].shape[1],
             completion_starts=base["diffu_grpo_completion_starts"],
             response_lengths=base["diffu_grpo_response_lengths"],
         )
-        level0, valid = _build_level0_mask(
+        level0_masks, valid = _build_level0_mask(
             base, seed=None, level0_override=override_noisy
         )
     else:
@@ -235,10 +269,16 @@ def build_coupled_base(
                 "logprob/train) unless a 'coupled_grpo_level0_mask_override' is "
                 "supplied."
             )
-        level0, valid = _build_level0_mask(base, data["coupled_grpo_seed"])
-    base["coupled_grpo_level0_mask"] = level0.to(dtype=zeros.dtype)
+        level0_masks, valid = _build_level0_mask(
+            base, data["coupled_grpo_seed"], num_pairs=num_pairs
+        )
+    for pair, level0 in enumerate(level0_masks):
+        base[f"coupled_grpo_level0_mask_pair{pair}"] = level0.to(dtype=zeros.dtype)
+    # Keep the un-suffixed name as an alias for pair 0 (CoupledGRPO / all existing
+    # single-pair consumers read this name).
+    base["coupled_grpo_level0_mask"] = base["coupled_grpo_level0_mask_pair0"]
     base["coupled_grpo_valid_mask"] = valid.to(dtype=zeros.dtype)
-    return base, num_samples, COUPLED_NUM_LEVELS
+    return base, num_samples, COUPLED_NUM_LEVELS * len(level0_masks)
 
 
 def make_coupled_level_view(
@@ -248,21 +288,25 @@ def make_coupled_level_view(
 ) -> BatchedDataDict[Any]:
     """Derive the level-``level`` view (N rows) from a coupled base.
 
-    Level 0 masks ``M`` and reveals ``valid \\ M`` as real context; level 1 masks
-    the exact complement ``valid \\ M`` and reveals ``M``. ``harvest_keys`` (score
-    and/or loss mask) are set to the level's harvested positions (the masked set),
-    so each valid response token is harvested in exactly one level. All other base
-    fields (asymmetric-AR metadata, target ids, scattered advantages, ...) are
-    passed through unchanged. Reuses block-reveal's ``block_reveal_*`` field names
-    so ``scatter_block_reveal_logprobs`` and the post-processors work untouched.
+    Level ``level`` belongs to pair ``level // 2``; its even level masks that pair's
+    ``M`` and reveals ``valid \\ M`` as real context, its odd level masks the exact
+    complement ``valid \\ M`` and reveals ``M``. ``harvest_keys`` (score and/or loss
+    mask) are set to the level's harvested positions (the masked set), so within a
+    pair each valid response token is harvested in exactly one of its two levels. All
+    other base fields (asymmetric-AR metadata, target ids, scattered advantages, ...)
+    are passed through unchanged. Reuses block-reveal's ``block_reveal_*`` field names
+    so ``scatter_block_reveal_logprobs`` and the post-processors work untouched. At a
+    single pair (levels 0/1) this is byte-for-byte the CoupledGRPO view.
     """
     device = base["input_ids"].device
     num_samples = base["input_ids"].shape[0]
     target_ids = base["diffu_grpo_target_ids"].to(device)
-    level0 = base["coupled_grpo_level0_mask"].to(device) > 0.5
+    pair = int(level) // COUPLED_NUM_LEVELS
+    is_complement = int(level) % COUPLED_NUM_LEVELS
+    level0 = base[f"coupled_grpo_level0_mask_pair{pair}"].to(device) > 0.5
     valid = base["coupled_grpo_valid_mask"].to(device) > 0.5
 
-    if int(level) == 0:
+    if is_complement == 0:
         mask_set = level0 & valid
     else:
         mask_set = valid & (~level0)
@@ -285,6 +329,17 @@ def make_coupled_level_view(
     view["coupled_grpo_level"] = torch.full(
         (num_samples,), int(level), device=device, dtype=torch.long
     )
+    # Route this level's pair (= level // 2) prev / reference logprobs. When the base
+    # carries per-pair fields (ESPO / CoupledGRPO with K > 1 coupled pairs), overwrite
+    # the standard field copied above with pair p's summed [N, S] logprobs so the loss
+    # reshape [K_seq, num_masks, S] has row 2p / 2p+1 carry pair p's tensor. Pair 0 /
+    # a missing key leaves the standard field untouched -- byte-for-byte at one pair
+    # (no ``_pair{p > 0}`` keys exist). ``generation_logprobs`` is never routed: it is
+    # the real per-token sampling logprob, correct at any harvest.
+    for prefix in ("prev_logprobs", "reference_policy_logprobs"):
+        pair_key = f"{prefix}_pair{pair}"
+        if pair_key in base:
+            view[prefix] = base[pair_key]
     return view
 
 
