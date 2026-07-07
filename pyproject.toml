@@ -164,7 +164,7 @@ mcore = [
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
   # sudo dpkg -i cuda-keyring_1.1-1_all.deb
   # sudo apt-get update
-  # sudo apt-get install cudnn-cuda-12
+  # sudo apt-get install cudnn-cuda-13
 
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
