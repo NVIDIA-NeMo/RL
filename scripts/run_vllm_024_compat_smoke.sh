@@ -17,6 +17,6 @@ if [[ -n "${ENGINE_SMOKE_MODEL:-}" ]]; then
   "${VENV_DIR}/bin/python" scripts/vllm_024_engine_smoke.py
 fi
 if [[ -n "${PYTEST_TARGET:-}" ]]; then
-  uv sync --locked --extra vllm
+  uv sync --locked --extra vllm --group test
   "${VENV_DIR}/bin/python" -m pytest -q "${PYTEST_TARGET}" -x
 fi
