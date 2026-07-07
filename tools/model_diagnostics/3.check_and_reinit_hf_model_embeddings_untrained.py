@@ -71,7 +71,6 @@ from typing import Optional
 
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Optional safetensors import – preferred for large sharded models
 # ---------------------------------------------------------------------------
