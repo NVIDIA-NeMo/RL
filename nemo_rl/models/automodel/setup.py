@@ -81,6 +81,90 @@ STRING_TO_DTYPE = {
 }
 
 
+def _resolve_effective_dispatcher(automodel_kwargs: dict) -> Optional[str]:
+    """Return the effective MoE token dispatcher implied by ``automodel_kwargs``.
+
+    Mirrors the resolution logic in ``nemo_automodel``'s ``BackendConfig``:
+    an explicit ``dispatcher`` wins; the deprecated ``enable_deepep`` flag maps
+    to ``"deepep"``/``"torch"``; otherwise the default is ``"deepep"`` when
+    the ``deep_ep`` package is importable, else ``"torch"``.
+
+    Returns ``None`` if a backend was supplied but its type cannot be
+    interpreted (e.g. a fully-constructed object without dispatcher attrs).
+    """
+    backend = (automodel_kwargs or {}).get("backend")
+
+    if backend is None:
+        backend_fields: dict = {}
+    elif isinstance(backend, dict):
+        backend_fields = backend
+    else:
+        # Object form (already-constructed BackendConfig). Read attrs directly.
+        dispatcher_attr = getattr(backend, "dispatcher", None)
+        enable_deepep_attr = getattr(backend, "enable_deepep", None)
+        if dispatcher_attr is not None:
+            return str(dispatcher_attr)
+        if enable_deepep_attr is True:
+            return "deepep"
+        if enable_deepep_attr is False:
+            return "torch"
+        backend_fields = {}
+
+    dispatcher = backend_fields.get("dispatcher")
+    if dispatcher is not None:
+        return str(dispatcher)
+
+    enable_deepep = backend_fields.get("enable_deepep")
+    if enable_deepep is True:
+        return "deepep"
+    if enable_deepep is False:
+        return "torch"
+
+    # Neither key set: mirror BackendConfig's default (deepep when importable).
+    try:
+        import deep_ep  # noqa: F401
+    except ImportError:
+        return "torch"
+    return "deepep"
+
+
+def _raise_if_deepep_with_activation_checkpointing(
+    config: PolicyConfig, rank: int = 0
+) -> None:
+    """Reject the unsupported ``activation_checkpointing`` + DeepEP dispatcher combo.
+
+    Wrapping the whole MoE block in a single reentrant checkpoint region
+    (see ``nemo_automodel/components/distributed/parallelizer.py``) means the
+    router + DeepEP dispatch re-run during backward. DeepEP's dispatch is
+    not guaranteed to produce the same per-expert token count on recompute,
+    which yields a shape mismatch inside TE's ``moe_unpermute_mask_map``
+    backward and crashes with a ``torch.utils.checkpoint.CheckpointError``.
+    Fail here with a clear message instead of blowing up in autograd.
+    """
+    dtensor_cfg = config.get("dtensor_cfg", {})
+    if not dtensor_cfg.get("activation_checkpointing"):
+        return
+    if dtensor_cfg.get("expert_parallel_size", 1) <= 1:
+        return
+
+    automodel_kwargs = dtensor_cfg.get("automodel_kwargs", {}) or {}
+    dispatcher = _resolve_effective_dispatcher(automodel_kwargs)
+    if dispatcher != "deepep":
+        return
+
+    raise ValueError(
+        "activation_checkpointing=True is not supported with the DeepEP MoE "
+        "token dispatcher: DeepEP's dispatch is nondeterministic across the "
+        "activation-checkpoint recompute, which causes a shape mismatch in "
+        "TransformerEngine's moe_unpermute backward (CheckpointError). "
+        "Workaround: set "
+        "policy.dtensor_cfg.automodel_kwargs.backend.dispatcher=torch "
+        "(or backend.enable_deepep=false), or disable activation "
+        "checkpointing. See "
+        "https://github.com/NVIDIA-NeMo/Automodel for the upstream fix."
+    )
+
+
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
@@ -392,6 +476,8 @@ def validate_and_prepare_config(
             "[WARNING]: sequence_parallel=True, but tp_size=1 which has no effect. "
             "Enable tp_size > 1 to use sequence parallelism."
         )
+
+    _raise_if_deepep_with_activation_checkpointing(config, rank)
 
     return RuntimeConfig(
         model_class=model_class,

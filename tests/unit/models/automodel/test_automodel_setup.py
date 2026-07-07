@@ -32,6 +32,8 @@ from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
+    _raise_if_deepep_with_activation_checkpointing,
+    _resolve_effective_dispatcher,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
@@ -2210,3 +2212,98 @@ def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
         "_disable_automodel_checkpoint_dtype_restore() workaround in setup.py is obsolete - "
         "remove it and this test."
     )
+
+
+class TestResolveEffectiveDispatcher:
+    """Tests for _resolve_effective_dispatcher backend resolution."""
+
+    def test_explicit_dispatcher_wins(self):
+        assert (
+            _resolve_effective_dispatcher(
+                {"backend": {"dispatcher": "torch", "enable_deepep": True}}
+            )
+            == "torch"
+        )
+
+    def test_enable_deepep_true_maps_to_deepep(self):
+        assert (
+            _resolve_effective_dispatcher({"backend": {"enable_deepep": True}})
+            == "deepep"
+        )
+
+    def test_enable_deepep_false_maps_to_torch(self):
+        assert (
+            _resolve_effective_dispatcher({"backend": {"enable_deepep": False}})
+            == "torch"
+        )
+
+    def test_object_form_dispatcher_attr(self):
+        backend = Mock(spec=["dispatcher", "enable_deepep"])
+        backend.dispatcher = "deepep"
+        backend.enable_deepep = None
+        assert _resolve_effective_dispatcher({"backend": backend}) == "deepep"
+
+    def test_defaulted_uses_deepep_when_importable(self):
+        # Backend with _target_ but no dispatcher / enable_deepep -> defaulted.
+        with patch.dict("sys.modules", {"deep_ep": Mock()}):
+            assert _resolve_effective_dispatcher({"backend": {}}) == "deepep"
+
+    def test_defaulted_falls_back_to_torch_without_deepep(self):
+        with patch.dict("sys.modules", {"deep_ep": None}):
+            assert _resolve_effective_dispatcher({"backend": {}}) == "torch"
+
+    def test_no_backend_defaults_via_deepep_import(self):
+        with patch.dict("sys.modules", {"deep_ep": Mock()}):
+            assert _resolve_effective_dispatcher({}) == "deepep"
+
+
+class TestRaiseIfDeepEPWithActivationCheckpointing:
+    """Guard for the unsupported AC + DeepEP dispatcher combo."""
+
+    def _cfg(self, *, ac: bool, ep: int, backend=None) -> dict:
+        dtensor: dict = {
+            "activation_checkpointing": ac,
+            "expert_parallel_size": ep,
+        }
+        if backend is not None:
+            dtensor["automodel_kwargs"] = {"backend": backend}
+        return {"dtensor_cfg": dtensor}
+
+    def test_raises_on_ac_plus_dispatcher_deepep(self):
+        cfg = self._cfg(ac=True, ep=8, backend={"dispatcher": "deepep"})
+        with pytest.raises(ValueError, match="DeepEP"):
+            _raise_if_deepep_with_activation_checkpointing(cfg)
+
+    def test_raises_on_ac_plus_enable_deepep_true(self):
+        cfg = self._cfg(ac=True, ep=8, backend={"enable_deepep": True})
+        with pytest.raises(ValueError, match="DeepEP"):
+            _raise_if_deepep_with_activation_checkpointing(cfg)
+
+    def test_raises_on_ac_plus_defaulted_when_deepep_importable(self):
+        # Recipe omits dispatcher / enable_deepep; BackendConfig defaults to deepep.
+        cfg = self._cfg(ac=True, ep=8, backend={})
+        with patch.dict("sys.modules", {"deep_ep": Mock()}):
+            with pytest.raises(ValueError, match="DeepEP"):
+                _raise_if_deepep_with_activation_checkpointing(cfg)
+
+    def test_passes_when_dispatcher_is_torch(self):
+        cfg = self._cfg(ac=True, ep=8, backend={"dispatcher": "torch"})
+        _raise_if_deepep_with_activation_checkpointing(cfg)  # no raise
+
+    def test_passes_when_enable_deepep_false(self):
+        cfg = self._cfg(ac=True, ep=8, backend={"enable_deepep": False})
+        _raise_if_deepep_with_activation_checkpointing(cfg)  # no raise
+
+    def test_passes_when_ac_disabled(self):
+        cfg = self._cfg(ac=False, ep=8, backend={"dispatcher": "deepep"})
+        _raise_if_deepep_with_activation_checkpointing(cfg)  # no raise
+
+    def test_passes_when_ep_size_one(self):
+        # No EP -> DeepEP isn't dispatching, guard is inapplicable.
+        cfg = self._cfg(ac=True, ep=1, backend={"dispatcher": "deepep"})
+        _raise_if_deepep_with_activation_checkpointing(cfg)  # no raise
+
+    def test_passes_when_defaulted_but_deepep_unavailable(self):
+        cfg = self._cfg(ac=True, ep=8, backend={})
+        with patch.dict("sys.modules", {"deep_ep": None}):
+            _raise_if_deepep_with_activation_checkpointing(cfg)  # no raise
