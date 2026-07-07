@@ -345,7 +345,10 @@ env:
           hf_home: null
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
           vllm_serve_kwargs:
+            attention_backend: TRITON_ATTN
             data_parallel_size: 4
             tensor_parallel_size: 8
             pipeline_parallel_size: 1
