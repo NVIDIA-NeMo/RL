@@ -2115,6 +2115,13 @@ def _create_advantage_estimator(master_config: MasterConfig):
     grpo_config = master_config.grpo
     loss_config = master_config.loss_fn
 
+    assert not (
+        loss_config.use_kl_in_reward and opd_module._skip_prev_logprobs(master_config)
+    ), (
+        "loss_fn.use_kl_in_reward requires real prev_logprobs but force_on_policy_ratio "
+        "with no grpo.seq_logprob_error_threshold zeros them (KL would be computed against a zero placeholder)."
+    )
+
     # Provide backward-compatible defaults when adv_estimator is not in config.
     # Fall back to top-level grpo.normalize_rewards / grpo.use_leave_one_out_baseline
     # which older configs still use.
