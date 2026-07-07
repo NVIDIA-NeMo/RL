@@ -50,6 +50,11 @@ class ReasoningGymEnvironment(EnvironmentInterface[ReasoningGymMetadata]):
         # multiple <answer> blocks) -- discourages putting reasoning inside <answer>.
         # 1.0 disables it (default), preserving prior behavior.
         self.answer_format_penalty = self.cfg.get("answer_format_penalty", 1.0)
+        # If True, zero the reward for any completion that emits non-whitespace
+        # content after the final </answer> (i.e. does not stop cleanly), or that
+        # never closes the answer tag. Counters length inflation / post-answer
+        # rambling (EOS suppression). Off by default (preserves prior behavior).
+        self.require_clean_stop = self.cfg.get("require_clean_stop", False)
         self._score_fns: dict[str, Any] = {}
 
     def _get_score_fn(self, task: str) -> Any:
@@ -71,6 +76,17 @@ class ReasoningGymEnvironment(EnvironmentInterface[ReasoningGymMetadata]):
                 if not (len(t) == 1 and t.isdigit() and 1 <= int(t) <= n):
                     return False
         return True
+
+    @staticmethod
+    def _ends_cleanly(assistant_text: str) -> bool:
+        """True iff nothing but whitespace / the EOS marker follows the final
+        </answer>. False if the model rambles past the answer or never closes the
+        answer tag -- used to reject length-inflated / non-terminating completions."""
+        idx = assistant_text.rfind("</answer>")
+        if idx == -1:
+            return False
+        tail = assistant_text[idx + len("</answer>") :].replace("<|im_end|>", "")
+        return tail.strip() == ""
 
     def _answer_format_factor(
         self, assistant_text: str, ans: str, rg_entry: dict
@@ -185,6 +201,11 @@ class ReasoningGymEnvironment(EnvironmentInterface[ReasoningGymMetadata]):
                     )
             except Exception:
                 # Malformed model output must not crash the batch.
+                reward = 0.0
+            # Hard format brake: a completion that does not stop cleanly after
+            # </answer> (post-answer rambling / no EOS) earns zero, regardless of
+            # how many blanks it got right.
+            if self.require_clean_stop and not self._ends_cleanly(assistant_text):
                 reward = 0.0
             rewards.append(reward)
 
