@@ -23,7 +23,10 @@ from nemo_rl.algorithms.coupled_grpo_logprobs import (
     make_coupled_level_view,
 )
 from nemo_rl.algorithms.espo_logprobs import get_espo_logprob_estimation_cfg
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.megatron.espo_train import ESPOLossPostProcessor
+from nemo_rl.models.megatron.train import LossPostProcessor
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import LogprobOutputSpec
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
@@ -87,6 +90,19 @@ class ESPOMegatronPolicyWorkerImpl(CoupledGRPOMegatronPolicyWorkerImpl):
                 f"num_samples_per_micro_batch must be >= 1, got {k}"
             )
         return k
+
+    def _make_loss_post_processor(
+        self,
+        loss_fn: LossFunction,
+        cfg: PolicyConfig,
+        num_microbatches: int,
+    ) -> LossPostProcessor:
+        return ESPOLossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=cfg,
+            num_microbatches=num_microbatches,
+            sampling_params=self.sampling_params,
+        )
 
     # ---- training: SAMPLE-MAJOR microbatches + gradient accumulation -------
     def _build_training_megatron_batch(

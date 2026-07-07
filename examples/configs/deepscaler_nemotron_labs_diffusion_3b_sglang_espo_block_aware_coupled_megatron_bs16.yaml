@@ -36,9 +36,8 @@
 # stay [N, S] with no scalar plumbing, identical reduction to curr. The per-row
 # mask seed is shared across prev/reference/training (set in grpo.py) so the ratio
 # is valid; it resamples every step. Two forwards on every rank -> DP-uniform. The
-# logprob (prev/ref) path microbatches by logprob_batch_size (set to 2 below; requires
-# an even per-rank logprob batch, which holds for the current prompt/generation/node
-# counts); it is no-grad and independent of K.
+# logprob (prev/ref) path microbatches by logprob_batch_size (set to 2 below; must
+# divide the per-rank seq count, 16 prod / 8 toy); it is no-grad and independent of K.
 #
 # Inherits the CoupledGRPO config for the shared diffusion-model / SGLang setup
 # and only swaps the policy worker, the logprob estimator, and the loss to the
@@ -92,8 +91,10 @@ policy:
   # there is no single-microbatch OOM constraint. Raise K to trade memory for fewer
   # accumulation steps (train_micro_batch_size = K * 2).
   train_micro_batch_size: 2
-  # logprob (prev/ref) microbatch size; 1 always divides the per-rank logprob batch
-  # (no-grad, independent of training K).
+  # logprob (prev/ref) microbatch size (sequence units; must divide the per-rank
+  # seq count: 16 prod / 8 toy). No-grad and independent of training K, so a
+  # moderate value is fine; raise further (e.g. 4/8, must divide per-rank) for fewer
+  # no-grad forwards.
   logprob_batch_size: 2
 
 loss_fn:
