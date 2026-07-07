@@ -249,12 +249,14 @@ policy:
       # nothing; suspect NVLS/multicast interplay under steady-state
       # alltoall+p2p+SP traffic. Disable NVLS to discriminate.
       NCCL_NVLS_ENABLE: "0"
-      # Bug #16 test #4: NVLS=0 did not help (job 2295735). Next transport
-      # lever: NCCL cuMem (VMM) buffer allocation, which interacts with the
-      # torch expandable-segments VMM pool above. Silent ranks in the FR
-      # dumps stop enqueueing on ALL comms with their streams drained -
-      # consistent with a wedged registration/mapping, not scheduling.
-      NCCL_CUMEM_ENABLE: "0"
+      # Bug #16 test #4: NCCL_CUMEM_ENABLE=0 was INFEASIBLE - bringup itself
+      # hung quietly for 2h during megatron worker init/checkpoint load (job
+      # 2296607; rendezvous-phase hang, outside any watchdog). Do not disable
+      # cuMem on this stack.
+      # Bug #16 test #5: pin the NCCL protocol. LL/LL128 protocol wedges
+      # under mixed alltoall+p2p+SP traffic are a classic; Simple is the
+      # conservative fallback (slower, functional).
+      NCCL_PROTO: "Simple"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0
