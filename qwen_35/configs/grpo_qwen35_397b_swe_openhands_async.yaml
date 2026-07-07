@@ -173,7 +173,16 @@ policy:
       override_opt_param_scheduler: true
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
-      overlap_grad_reduce: true
+      # Bug #16 mitigation (2nd attempt): async per-bucket reduce-scatters
+      # enqueued from backward hooks interleave with PP p2p / TP / EP ops in
+      # rank-dependent order once mid-schedule D2H syncs (GDN
+      # _resolve_cu_seqlens .cpu().item(), formerly the NaN grad check)
+      # jitter CPU timing -> cross-communicator deadlock on every process's
+      # SECOND step (the first step is serialized by per-process triton JIT
+      # of the GDN kernels, masking the race). py-spy at the job-2293084
+      # hang: 12/32 ranks past the whole schedule in empty_cache while
+      # others sat mid-forward - whole DP replicas diverged.
+      overlap_grad_reduce: false
       overlap_param_gather: false
       # Bug #16 fix: the per-bucket NaN grad check D2H-syncs inside the DDP
       # grad-ready hook and deadlocked every process's second train step at
