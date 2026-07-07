@@ -61,8 +61,8 @@ def _param(*shape):
     return torch.empty(*shape)
 
 
-def test_build_mapping_glm_style_ffn_only():
-    # GLM uses the conventional model.layers.*.mlp gate/up/down layout.
+def test_build_mapping_ffn_only():
+    # Downsized bulk path: only FFN gate/up/down reach the resolver.
     H, E, Pl = 32, 2, 64
     refit_info = {
         "gen_tp_size": 4,
@@ -157,117 +157,6 @@ def test_build_mapping_non_gated_expert_up_is_direct():
     mapping = _make_ext(vllm_params)._build_hf_to_gen_backend_mapping(refit_info)
     assert mapping["model.layers.0.mlp.experts.up_proj.weight"] == (w13, None)
     assert mapping["model.layers.0.mlp.experts.down_proj.weight"] == (w2, None)
-
-
-def test_build_mapping_qwen35_language_model_prefix():
-    """Qwen3.5 HF text weights map into vLLM's nested language model."""
-    H, E, P = 16, 2, 32
-    hf_prefix = "model.language_model.layers.0.mlp.experts"
-    vllm_prefix = "language_model.model.layers.0.mlp.experts"
-    refit_info = {
-        "gen_tp_size": 1,
-        "layer_names": ["model.language_model.layers.0"],
-        "per_layer_params": {
-            "model.language_model.layers.0": [
-                {
-                    "name": f"{hf_prefix}.gate_proj.weight",
-                    "global_shape": [E, P, H],
-                    "grouped_expert_proj": "gate_proj",
-                },
-                {
-                    "name": f"{hf_prefix}.up_proj.weight",
-                    "global_shape": [E, P, H],
-                    "grouped_expert_proj": "up_proj",
-                },
-                {
-                    "name": f"{hf_prefix}.down_proj.weight",
-                    "global_shape": [E, H, P],
-                    "grouped_expert_proj": "down_proj",
-                },
-            ]
-        },
-    }
-    w13 = _param(E, 2 * P, H)
-    w2 = _param(E, H, P)
-
-    mapping = _make_ext(
-        {
-            f"{vllm_prefix}.w13_weight": w13,
-            f"{vllm_prefix}.w2_weight": w2,
-        }
-    )._build_hf_to_gen_backend_mapping(refit_info)
-
-    assert mapping[f"{hf_prefix}.gate_proj.weight"] == (
-        w13,
-        (slice(None), slice(0, P), slice(None)),
-    )
-    assert mapping[f"{hf_prefix}.up_proj.weight"] == (
-        w13,
-        (slice(None), slice(P, 2 * P), slice(None)),
-    )
-    assert mapping[f"{hf_prefix}.down_proj.weight"] == (w2, None)
-
-
-def test_build_mapping_deepseek_v4_projection_aliases():
-    """DeepSeek w1/w3/w2 map to vLLM gate/up/down and w13/w2 storage."""
-    H, E, P = 16, 2, 32
-    experts = "layers.0.ffn.experts"
-    shared = "layers.0.ffn.shared_experts"
-    refit_info = {
-        "gen_tp_size": 1,
-        "layer_names": ["layers.0"],
-        "per_layer_params": {
-            "layers.0": [
-                {
-                    "name": f"{experts}.w1.weight",
-                    "global_shape": [E, P, H],
-                    "grouped_expert_proj": "gate_proj",
-                },
-                {
-                    "name": f"{experts}.w3.weight",
-                    "global_shape": [E, P, H],
-                    "grouped_expert_proj": "up_proj",
-                },
-                {
-                    "name": f"{experts}.w2.weight",
-                    "global_shape": [E, H, P],
-                    "grouped_expert_proj": "down_proj",
-                },
-                {"name": f"{shared}.w1.weight", "global_shape": [P, H]},
-                {"name": f"{shared}.w3.weight", "global_shape": [P, H]},
-                {"name": f"{shared}.w2.weight", "global_shape": [H, P]},
-            ]
-        },
-    }
-    expert_w13 = _param(E, 2 * P, H)
-    expert_w2 = _param(E, H, P)
-    shared_gate_up = _param(2 * P, H)
-    shared_down = _param(H, P)
-
-    mapping = _make_ext(
-        {
-            "model.layers.0.ffn.experts.w13_weight": expert_w13,
-            "model.layers.0.ffn.experts.w2_weight": expert_w2,
-            "model.layers.0.ffn.shared_experts.gate_up_proj.weight": shared_gate_up,
-            "model.layers.0.ffn.shared_experts.down_proj.weight": shared_down,
-        }
-    )._build_hf_to_gen_backend_mapping(refit_info)
-
-    assert mapping[f"{experts}.w1.weight"] == (
-        expert_w13,
-        (slice(None), slice(0, P), slice(None)),
-    )
-    assert mapping[f"{experts}.w3.weight"] == (
-        expert_w13,
-        (slice(None), slice(P, 2 * P), slice(None)),
-    )
-    assert mapping[f"{experts}.w2.weight"] == (expert_w2, None)
-    assert mapping[f"{shared}.w1.weight"] == (shared_gate_up, (slice(0, P),))
-    assert mapping[f"{shared}.w3.weight"] == (
-        shared_gate_up,
-        (slice(P, 2 * P),),
-    )
-    assert mapping[f"{shared}.w2.weight"] == (shared_down, None)
 
 
 def test_build_mapping_unmapped_param_raises():
