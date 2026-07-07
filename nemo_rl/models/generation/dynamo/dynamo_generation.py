@@ -335,7 +335,7 @@ def _discover_worker_instances(
 
 
 @ray.remote(num_cpus=0)
-def _post_dynamo_worker_route_remote(
+def _post_dynamo_worker_route_remote(  # pragma: no cover
     *,
     system_url: str,
     route: str,
@@ -357,7 +357,7 @@ def _post_dynamo_worker_route_remote(
 
 
 @ray.remote(num_cpus=0)
-def _update_dynamo_worker_weights_remote(
+def _update_dynamo_worker_weights_remote(  # pragma: no cover
     *,
     system_url: str,
     update_info: dict[str, Any],
