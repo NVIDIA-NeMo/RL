@@ -1437,6 +1437,75 @@ class TestValidateDtypeConfig:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigGlooProcessGroups:
+    """Tests for use_gloo_process_groups plumbing in _create_megatron_config."""
+
+    @staticmethod
+    def _config(**megatron_overrides):
+        megatron_cfg = {
+            "optimizer": {"use_distributed_optimizer": False},
+            "scheduler": {},
+            "distributed_data_parallel_config": {
+                "overlap_param_gather": False,
+                "grad_reduce_in_fp32": False,
+                "overlap_grad_reduce": False,
+                "data_parallel_sharding_strategy": "no_shard",
+            },
+            "train_iters": 10,
+        }
+        megatron_cfg.update(megatron_overrides)
+        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+
+    def _dist_config_passed_to_container(self, config):
+        """Return the dist config _create_megatron_config hands to ConfigContainer.
+
+        The container and sibling sub-config builders are patched so only the
+        DistributedInitConfig branch is exercised; DistributedInitConfig itself
+        stays real so the asserted attribute reflects actual behavior.
+        """
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_container,
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        return mock_container.call_args.kwargs["dist"]
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_explicit_value_is_forwarded(self, value):
+        """An explicit use_gloo_process_groups is applied to the dist config."""
+        dist_config = self._dist_config_passed_to_container(
+            self._config(use_gloo_process_groups=value)
+        )
+
+        assert dist_config.use_gloo_process_groups is value
+
+    def test_absent_key_defers_to_bridge_default(self):
+        """Omitting the key leaves the Megatron Bridge default untouched."""
+        from megatron.bridge.training.config import DistributedInitConfig
+
+        dist_config = self._dist_config_passed_to_container(self._config())
+
+        assert (
+            dist_config.use_gloo_process_groups
+            == DistributedInitConfig().use_gloo_process_groups
+        )
+
+
+@pytest.mark.mcore
 class TestValidateAndSetConfig:
     """Tests for validate_and_set_config function."""
 
