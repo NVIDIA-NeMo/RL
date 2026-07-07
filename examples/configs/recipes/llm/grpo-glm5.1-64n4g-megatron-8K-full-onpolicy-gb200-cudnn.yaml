@@ -1,0 +1,29 @@
+defaults: ./grpo-glm5.1-64n4g-megatron-8K-full-onpolicy-gb200.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-glm51-full-64n4g-cudnn-gen512-mbt4k-nomaxseq-vllmtp4ep64-mgtp1pp8cp32ep32-trainmb131k-recompute
+  save_period: 12
+
+policy:
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 9
+    num_layers_in_last_pipeline_stage: 9
+    context_parallel_size: 32
+    expert_model_parallel_size: 32
+    activation_checkpointing: true
+    recompute_granularity: full
+    moe_permute_fusion: false
+    dsa_kernel_backend: cudnn
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      expert_parallel_size: 64
+    vllm_kwargs:
+      max_num_batched_tokens: 4096
+
+logger:
+  log_dir: logs/grpo-glm51-full-64n4g-cudnn-gen512-mbt4k-nomaxseq-vllmtp4ep64-mgtp1pp8cp32ep32-trainmb131k-recompute
+  wandb:
+    name: grpo-glm51-full-64n4g-cudnn-gen512-mbt4k-nomaxseq-vllmtp4ep64-mgtp1pp8cp32ep32-trainmb131k-recompute
