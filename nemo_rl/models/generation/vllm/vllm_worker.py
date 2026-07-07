@@ -55,9 +55,7 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
-def _merge_fp8_kwargs(
-    vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]
-) -> None:
+def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
     """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
 
     ``init_fp8`` returns a nested ``hf_overrides`` (holding ``quantization_config``),
