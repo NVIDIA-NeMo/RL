@@ -60,6 +60,18 @@ def test_cluster_smoke_imports_vllm_024_chat_service() -> None:
     ) not in imports
 
 
+def test_cluster_smoke_exercises_the_ray_executor_patch() -> None:
+    tree = ast.parse(SMOKE_SCRIPT.read_text(encoding="utf-8"))
+    calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+    assert "_patch_vllm_init_workers_ray" in calls
+    assert "patch_vllm_ray_env_vars" not in calls
+
+
 def test_async_worker_filters_the_vllm_024_chat_logger() -> None:
     source = ASYNC_WORKER.read_text(encoding="utf-8")
     assert '"vllm.entrypoints.openai.chat_completion.serving"' in source

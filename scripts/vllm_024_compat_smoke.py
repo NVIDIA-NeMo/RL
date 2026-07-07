@@ -51,7 +51,10 @@ def main() -> None:
         "NRL_VLLM_DISABLE_REJECTION_SAMPLER_PATCH",
     }
     existing_ray_env = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
-    patches.patch_vllm_ray_env_vars()
+    patches._patch_vllm_init_workers_ray(
+        sys.executable,
+        sorted(required_ray_env),
+    )
     copied_ray_env = {
         name
         for name in os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"].split(",")
