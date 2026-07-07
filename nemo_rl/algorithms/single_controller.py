@@ -55,6 +55,7 @@ from tensordict import TensorDict
 from nemo_rl.algorithms.staleness_sampler import (
     StalenessSampler,
     count_groups,
+    incomplete_group_indices,
     min_weight_version,
 )
 from nemo_rl.data_plane import KVBatchMeta
@@ -498,12 +499,18 @@ class SingleControllerActor:
                             )
 
                         if group_indices is None:
-                            if self._rollout_done and (
-                                self._claimed_meta is None
-                                or self._claimed_meta.size == 0
-                            ):
-                                rollout_exhausted = True
-                                break
+                            if self._rollout_done:
+                                # No group is selectable and no more samples
+                                # will arrive: flush groups that can never
+                                # complete so the emptiness check fires
+                                # instead of spinning forever.
+                                await self._flush_incomplete_groups()
+                                if (
+                                    self._claimed_meta is None
+                                    or self._claimed_meta.size == 0
+                                ):
+                                    rollout_exhausted = True
+                                    break
                             await asyncio.sleep(0.005)
                             continue
 
@@ -838,6 +845,46 @@ class SingleControllerActor:
         )
         self._claimed_meta = self._claimed_meta.drop(indices)
         return evicted_meta
+
+    async def _flush_incomplete_groups(self) -> None:
+        """Drop groups that can never become selectable after rollout shutdown.
+
+        With ``_rollout_done`` set, a group that is uncommitted or short of
+        ``expected_num_samples`` will never receive more rows, yet the sampler
+        neither selects nor evicts it — without this flush the train pump
+        spins forever and ``run()`` hangs. Drain rows still unclaimed at
+        DataPlane first: a group can straddle a ``claim_meta`` batch boundary,
+        so incomplete-in-``_claimed_meta`` does not yet prove
+        incomplete-in-partition.
+        """
+        while True:
+            before = self._claimed_meta.size if self._claimed_meta is not None else 0
+            await self._claim_available_meta()
+            after = self._claimed_meta.size if self._claimed_meta is not None else 0
+            if after == before:
+                break
+        if self._claimed_meta is None or self._claimed_meta.size == 0:
+            return
+        indices = incomplete_group_indices(
+            self._claimed_meta,
+            group_size=self._cfg.group_size,
+        )
+        if not indices:
+            return
+        dropped = self._claimed_meta.subset(indices)
+        log.warning(
+            "rollout done: dropping %d sample(s) from incomplete prompt "
+            "group(s) that can no longer complete",
+            dropped.size,
+        )
+        await self._call_dp(
+            "clear_samples",
+            sample_ids=dropped.sample_ids,
+            partition_id=dropped.partition_id,
+        )
+        self._claimed_meta = self._claimed_meta.drop(indices)
+        # No _buffer_capacity release: the rollout pump has exited, so no
+        # dispatcher will acquire again this run.
 
 
 def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:

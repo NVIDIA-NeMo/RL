@@ -1187,3 +1187,50 @@ class TestStreamingTrainPump:
             f"expected 4 unique sample ids (2 epochs x 2 prompts), got "
             f"{sorted(dispatched_ids)}"
         )
+
+    def test_incomplete_group_does_not_hang_train_pump(self, ray_init):
+        """A permanently-incomplete group must not deadlock the train pump.
+
+        Seed DataPlane with 3 of ``expected_num_samples=4`` rows for one
+        group and dispatch no rollouts: the group is never selectable and
+        never evictable, so without the post-``_rollout_done`` flush the
+        exhaustion check never fires and ``run()`` hangs.
+        """
+        dp = FakeDataPlaneActor.remote()
+        ray.get(
+            dp.put_samples.remote(
+                sample_ids=["g0_s0", "g0_s1", "g0_s2"],
+                partition_id="rollout_data",
+                fields=TensorDict(
+                    {"input_ids": torch.ones((3, 3), dtype=torch.long)},
+                    batch_size=[3],
+                ),
+                tags=[
+                    {
+                        "group_id": "g0",
+                        "weight_version": 0,
+                        "committed": True,
+                        "expected_num_samples": 4,
+                    }
+                ]
+                * 3,
+            )
+        )
+        ctrl = self._make_controller(
+            dp,
+            StaggeredGenWorker.remote(weight_version=0),
+            DryRunTrainer(dp, train_latency_s=0.0),
+            prompts=[],
+            max_train_steps=1,
+            max_rollout_prompts=0,
+            target_groups_per_step=1,
+            min_groups_per_batch=1,
+            group_size=4,
+            batch_selection_strategy="strict_on_policy",
+            max_weight_staleness_versions=0,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=15)
+        assert result["train_steps"] == 0
+        # The stuck rows must be cleared from the partition, not leaked.
+        clear_calls = ray.get(dp.get_clear_calls.remote())
+        assert set(clear_calls[-1]) == {"g0_s0", "g0_s1", "g0_s2"}

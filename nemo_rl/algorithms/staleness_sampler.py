@@ -119,6 +119,27 @@ def count_groups(
     return sum(1 for group in _iter_groups(meta, group_size) if group.is_complete)
 
 
+def incomplete_group_indices(
+    meta: KVBatchMeta,
+    *,
+    group_size: int,
+) -> list[int]:
+    """Flat indices of groups that are uncommitted or short of expected samples.
+
+    Such groups are invisible to both selection (``select_*`` skip them) and
+    eviction (``evictable_indices`` skips them), so once no more samples can
+    arrive they are permanently stuck. Callers drop them after rollout
+    shutdown so exhaustion checks can fire.
+    """
+    return _flatten_group_indices(
+        [
+            group
+            for group in _iter_groups(meta, group_size)
+            if not group.committed or not group.is_complete
+        ]
+    )
+
+
 def min_weight_version(meta: KVBatchMeta) -> int | None:
     """Smallest ``weight_version`` across per-sample tags, or None if absent."""
     versions = [
