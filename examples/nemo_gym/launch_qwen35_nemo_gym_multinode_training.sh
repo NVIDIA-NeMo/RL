@@ -142,6 +142,17 @@ if (( $# )); then
     printf -v EXTRA_OVERRIDES ' %q' "$@"
 fi
 
+# Topology-aware placement is a PAIR: sbatch --segment=N (contiguous NVLink
+# segments in the allocation; added to SBATCH_EXTRA_ARGS below) AND
+# cluster.segment_size=N (NeMo-RL orders worker bundles by NVL domain and
+# enforces complete N-node segments; see
+# nemo_rl/distributed/virtual_cluster.py get_reordered_bundle). Setting only
+# the sbatch half leaves rank placement unaligned. Wire both from one env.
+SEGMENT_VALUE="${SLURM_SEGMENT:-${SBATCH_SEGMENT:-}}"
+if [[ -n "${SEGMENT_VALUE}" ]]; then
+    EXTRA_OVERRIDES+=" ++cluster.segment_size=${SEGMENT_VALUE}"
+fi
+
 # ray.sub is submitted from the host checkout, but training runs from the
 # baked checkout inside the container.
 cd "${REPO_LOCATION}"
