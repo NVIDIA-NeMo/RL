@@ -386,19 +386,23 @@ class SingleControllerActor:
 
             with self._timer.time("total_step_time"):
                 while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
-                    await asyncio.sleep(0)
-
-                    # evict stale groups
-                    evicted = await self._sampler.evict(
-                        current_train_weight=self._trainer_version,
-                    )
-                    if evicted:
-                        print(f"  evicted {evicted} stale prompt group(s)", flush=True)
-                        for _ in range(evicted):
-                            self._buffer_capacity.release()
-
-                    # Get train data
+                    # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
+                        await asyncio.sleep(0)
+
+                        # Evict stale groups
+                        evicted = await self._sampler.evict(
+                            current_train_weight=self._trainer_version,
+                        )
+                        if evicted:
+                            print(
+                                f"  evicted {evicted} stale prompt group(s)",
+                                flush=True,
+                            )
+                            for _ in range(evicted):
+                                self._buffer_capacity.release()
+
+                        # Select a batch
                         max_prompt_groups = (
                             grpo_cfg["num_prompts_per_step"] - groups_dispatched
                         )
@@ -412,12 +416,14 @@ class SingleControllerActor:
                             max_prompt_groups=max_prompt_groups,
                         )
 
-                    if train_meta is None:
-                        await asyncio.sleep(0.05)
-                        continue
+                        # If no batch is selectable, sleep and retry
+                        if train_meta is None:
+                            await asyncio.sleep(0.05)
+                            continue
 
-                    for _ in range(num_groups):
-                        self._buffer_capacity.release()
+                        # Release buffer capacity
+                        for _ in range(num_groups):
+                            self._buffer_capacity.release()
 
                     # Compute prev_logprobs / ref_logprobs
                     with self._timer.time("logprob_inference_prep"):
@@ -433,6 +439,7 @@ class SingleControllerActor:
                                 train_meta,
                             )
 
+                    # Compute advantages
                     with self._timer.time("advantage_calculation"):
                         train_meta = await self._advantage_pump(train_meta)
 
