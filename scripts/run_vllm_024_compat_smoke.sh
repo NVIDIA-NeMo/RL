@@ -16,3 +16,7 @@ uv sync --locked --extra vllm --no-dev
 if [[ -n "${ENGINE_SMOKE_MODEL:-}" ]]; then
   "${VENV_DIR}/bin/python" scripts/vllm_024_engine_smoke.py
 fi
+if [[ -n "${PYTEST_TARGET:-}" ]]; then
+  uv sync --locked --extra vllm
+  "${VENV_DIR}/bin/python" -m pytest -q "${PYTEST_TARGET}" -x
+fi

@@ -13,6 +13,7 @@ VENV_DIR="${VENV_DIR:-${REPO_DIR}/venvs/vllm024-smoke}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-${REPO_DIR}/.cache/uv}"
 HF_HOME="${HF_HOME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/hf_home}"
 ENGINE_SMOKE_MODEL="${ENGINE_SMOKE_MODEL:-}"
+PYTEST_TARGET="${PYTEST_TARGET:-}"
 DRY_RUN="${DRY_RUN:-false}"
 
 SRUN_COMMAND=(
@@ -29,6 +30,7 @@ SRUN_COMMAND=(
   "UV_CACHE_DIR=${UV_CACHE_DIR}"
   "HF_HOME=${HF_HOME}"
   "ENGINE_SMOKE_MODEL=${ENGINE_SMOKE_MODEL}"
+  "PYTEST_TARGET=${PYTEST_TARGET}"
   bash "${REPO_DIR}/scripts/run_vllm_024_compat_smoke.sh"
 )
 printf -v WRAPPED_COMMAND '%q ' "${SRUN_COMMAND[@]}"
