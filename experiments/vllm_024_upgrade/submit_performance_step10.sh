@@ -65,11 +65,15 @@ submit_one() {
   local segment="${num_nodes}"
   local run_dir="${EXPERIMENT_ROOT}/${label}"
   local wandb_name="${RUN_TAG}-${label}-cg-on"
+  local triton_cache_dir="/tmp/nemorl-vllm024-triton-${RUN_TAG}-${label}"
+  local inductor_cache_dir="/tmp/nemorl-vllm024-inductor-${RUN_TAG}-${label}"
   local command
 
   printf -v command '%q ' \
     env \
     "PYTHONPATH=${REPO_DIR}" \
+    "TRITON_CACHE_DIR=${triton_cache_dir}" \
+    "TORCHINDUCTOR_CACHE_DIR=${inductor_cache_dir}" \
     /opt/nemo_rl_venv/bin/python \
     examples/run_grpo.py \
     --config "${config}" \
@@ -98,6 +102,8 @@ submit_one() {
     "PYTHONDONTWRITEBYTECODE=1"
     "RAY_LOG_SYNC_FREQUENCY=60"
     "TMPDIR=${TMPDIR}"
+    "TRITON_CACHE_DIR=${triton_cache_dir}"
+    "TORCHINDUCTOR_CACHE_DIR=${inductor_cache_dir}"
   )
   local sbatch_args=(
     --account="${ACCOUNT}"

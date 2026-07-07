@@ -72,6 +72,24 @@ def test_performance_launcher_imports_nemo_rl_from_the_checkout() -> None:
     assert "PYTHONPATH=/lustre/users/sna/RL" in output
 
 
+def test_performance_launcher_uses_node_local_compiler_caches() -> None:
+    output = _run_script(
+        REPO_ROOT
+        / "experiments"
+        / "vllm_024_upgrade"
+        / "submit_performance_step10.sh",
+        "dry-run",
+        "qwen32b",
+        RUN_TAG="cache-test",
+    )
+
+    assert "TRITON_CACHE_DIR=/tmp/nemorl-vllm024-triton-cache-test-qwen32b" in output
+    assert (
+        "TORCHINDUCTOR_CACHE_DIR=/tmp/nemorl-vllm024-inductor-cache-test-qwen32b"
+        in output
+    )
+
+
 def test_ray_launcher_accepts_an_explicit_container_workdir() -> None:
     source = (REPO_ROOT / "ray.sub").read_text(encoding="utf-8")
 
