@@ -33,33 +33,6 @@ SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).
 autotune_cache_kwargs = {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 
 
-def _nrl_blackwell_conservative_prune(configs, named_args, **kwargs):
-    """Bug #16 (NeMo-RL Qwen3.5 GB200/GB300): Blackwell can select unstable
-    Triton pipelining configs during fla autotuning (upstream fla #999/#913/
-    #618 family; PR #1000 fixed only prepare_wy_repr_bwd_kernel and did not
-    stop the every-second-train-step deadlock). Generalize the restriction to
-    EVERY fla autotuned kernel: within each block-size variant, keep only the
-    conservative pipelining point (num_warps<=2, num_stages<=4 when
-    available, else the group's most conservative config). No-op off
-    Blackwell. IS_NVIDIA_BLACKWELL is referenced lazily (defined below)."""
-    if not globals().get('IS_NVIDIA_BLACKWELL', False):
-        return configs
-    from collections import defaultdict
-    groups = defaultdict(list)
-    for c in configs:
-        groups[tuple(sorted(c.kwargs.items()))].append(c)
-    kept = []
-    for g in groups.values():
-        cons = [c for c in g if c.num_warps <= 2 and c.num_stages <= 4]
-        pool = cons or g
-        kept.append(min(pool, key=lambda c: (c.num_warps, abs(c.num_stages - 4))))
-    return kept
-
-
-autotune_cache_kwargs["prune_configs_by"] = {
-    "early_config_prune": _nrl_blackwell_conservative_prune,
-}
-
 
 @lru_cache(maxsize=1)
 def check_environments():
@@ -583,3 +556,43 @@ def _register_aliases():
 _register_aliases()
 
 del _register_aliases
+
+
+# --- NeMo-RL bug #16 patch (dynamo-safe variant) -------------------------
+# Restrict every triton Autotuner created after this import to conservative
+# pipelining configs on Blackwell (num_warps<=2, num_stages<=4 per block-size
+# variant; else the group's most conservative). Upstream context: fla
+# #999/#913/#618, PR #1000. The earlier prune_configs_by approach breaks
+# torch.compile (dynamo's triton_kernel_wrap asserts on early_config_prune,
+# torch 2.11); filtering the config lists at decoration time is equivalent
+# for our purpose and invisible to dynamo. Scope note: affects all Autotuners
+# constructed in this process after fla.utils import - acceptable for
+# diagnosis (conservative configs are correct-if-slower everywhere).
+if IS_NVIDIA_BLACKWELL:
+    import triton.runtime.autotuner as _nrl_autotuner_mod
+
+    _nrl_orig_autotuner_init = _nrl_autotuner_mod.Autotuner.__init__
+
+    def _nrl_filter_configs(configs):
+        try:
+            from collections import defaultdict
+            groups = defaultdict(list)
+            for c in configs:
+                groups[tuple(sorted(c.kwargs.items()))].append(c)
+            kept = []
+            for g in groups.values():
+                cons = [c for c in g if c.num_warps <= 2 and c.num_stages <= 4]
+                pool = cons or g
+                kept.append(min(pool, key=lambda c: (c.num_warps, abs(c.num_stages - 4))))
+            return kept
+        except Exception:
+            return configs
+
+    def _nrl_conservative_autotuner_init(self, *args, **kwargs):
+        if 'configs' in kwargs and kwargs['configs']:
+            kwargs['configs'] = _nrl_filter_configs(kwargs['configs'])
+        elif len(args) >= 3 and args[2]:
+            args = (*args[:2], _nrl_filter_configs(args[2]), *args[3:])
+        _nrl_orig_autotuner_init(self, *args, **kwargs)
+
+    _nrl_autotuner_mod.Autotuner.__init__ = _nrl_conservative_autotuner_init
