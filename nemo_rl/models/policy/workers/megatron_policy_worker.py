@@ -135,6 +135,8 @@ def _model_self_packs_for_cp(model: Any) -> bool:
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
     return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+
+
 # Per-metric normalization tags for the split-API ``finish_train_step``
 # rescale. The sync path runs the loss with the true global_valid_*; the
 # split path runs each microbatch with global_valid_*=1 (raw sums) and
@@ -902,6 +904,7 @@ class MegatronPolicyWorkerImpl(
         return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
         return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
         return return_data
+
     # ── split-API train-step state machine (SingleController async path) ──
     #
     # SC drives one ``begin / train_microbatch×N / finish`` cycle per
