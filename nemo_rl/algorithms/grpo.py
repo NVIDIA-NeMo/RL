@@ -3843,6 +3843,10 @@ def async_grpo_train(
                         for k, v in t["rollout_metrics"].items():
                             per_group_metrics.setdefault(k, []).append(v)
                     rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
+                    if not _should_log_nemo_gym_responses_to_wandb(master_config):
+                        for key in list(rollout_metrics):
+                            if "full_result" in key:
+                                rollout_metrics.pop(key)
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
@@ -4336,9 +4340,10 @@ def async_grpo_train(
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
+            if _should_log_nemo_gym_responses_to_file(master_config):
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
             del train_data
             del flat_messages_content
 
