@@ -236,6 +236,13 @@ policy:
       # window before the watchdog dumps. 30 min still clears legitimate gaps
       # (741G checkpoint resume-load ~10-15 min).
       NRL_NCCL_TIMEOUT_MINUTES: "30"
+      # Bug #16 transport-layer test: flight recorder (job 2294872) shows one
+      # rank per EP group COMPLETING an alltoall (sent+received all) while
+      # its 31 peers never finish the same op — peers' mutual transfers
+      # wedged. Code-level fixes (NaN check, grad-reduce overlap) changed
+      # nothing; suspect NVLS/multicast interplay under steady-state
+      # alltoall+p2p+SP traffic. Disable NVLS to discriminate.
+      NCCL_NVLS_ENABLE: "0"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0
