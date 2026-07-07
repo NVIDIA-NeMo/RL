@@ -20,7 +20,6 @@ mkdir -p $EXP_DIR $LOG_DIR
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_ppo.py \
-    --config $PROJECT_ROOT/examples/configs/ppo_math_1B.yaml \
     policy.model_name=Qwen/Qwen2.5-0.5B \
     value.model_name=Qwen/Qwen2.5-0.5B \
     ppo.num_prompts_per_step=2 \

@@ -274,20 +274,28 @@ def test_multi_reward_env_step_basic(math_multi_reward_env, multi_reward_test_da
         "Metadata should be unchanged"
     )
 
-    # Check rewards: shape (batch_size=3, number_of_rewards=3)
-    assert result.rewards.shape == (3, 3), "Rewards should be a tensor of shape (3, 3)"
+    # Check rewards: dict with 3 named components, each Tensor of shape (3,)
+    assert isinstance(result.rewards, dict), "Rewards should be a dict"
+    expected_keys = {"reward/correctness", "reward/integer", "reward/format"}
+    assert set(result.rewards.keys()) == expected_keys, (
+        f"Reward keys should be {expected_keys}, got {set(result.rewards.keys())}"
+    )
+    for name, tensor in result.rewards.items():
+        assert tensor.shape == (3,), f"{name} should be a tensor of shape (3,)"
 
     # Check rewards for each data point
-    # First reward: correctness reward 1.0, int reward 1.0, format reward 1.0
-    assert (result.rewards[0] == 1.0).all(), "First reward should be 1.0"
-    # Second reward: correctness reward 0.0, int reward 0.0, format reward 1.0
-    assert result.rewards[1][0] == 0.0
-    assert result.rewards[1][1] == 0.0
-    assert result.rewards[1][2] == 1.0
-    # Third reward: correctness reward 1.0, int reward 1.0, format reward 0.0
-    assert result.rewards[2][0] == 1.0
-    assert result.rewards[2][1] == 1.0
-    assert result.rewards[2][2] == 0.0
+    # Sample 0: correct answer "4", integer, valid format -> all 1.0
+    assert result.rewards["reward/correctness"][0] == 1.0
+    assert result.rewards["reward/integer"][0] == 1.0
+    assert result.rewards["reward/format"][0] == 1.0
+    # Sample 1: wrong answer, not integer, valid format -> only format 1.0
+    assert result.rewards["reward/correctness"][1] == 0.0
+    assert result.rewards["reward/integer"][1] == 0.0
+    assert result.rewards["reward/format"][1] == 1.0
+    # Sample 2: correct answer "4", integer, bad format -> correctness+integer 1.0
+    assert result.rewards["reward/correctness"][2] == 1.0
+    assert result.rewards["reward/integer"][2] == 1.0
+    assert result.rewards["reward/format"][2] == 0.0
 
     # Check terminated flags
     assert result.terminateds.shape == (3,), (

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 import torch
@@ -38,6 +39,43 @@ def to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
         if key in aliases:
             return aliases[key]
     raise ValueError(f"Unknown dtype: {dtype}")
+
+
+@contextmanager
+def _prefer_nvrx_for_dist_ckpt_save():
+    """Prefer NVRx async strategy for torch_dist save in HF->Megatron import.
+
+    Megatron-LM's torch_dist sync save currently routes through the MCore async
+    finalize path, which can fail when write results contain non-picklable
+    objects (e.g., code objects) during gather_object.
+    """
+    try:
+        from megatron.core.dist_checkpointing.strategies.torch import (
+            TorchDistSaveShardedStrategy,
+        )
+    except ImportError:
+        # If dist-checkpoint strategy cannot be imported, leave behavior unchanged.
+        yield
+        return
+
+    original_save = TorchDistSaveShardedStrategy.save
+
+    def _save_with_nvrx_fallback(self, sharded_state_dict, checkpoint_dir):
+        try:
+            async_request = self.async_save(
+                sharded_state_dict, checkpoint_dir, async_strategy="nvrx"
+            )
+            async_request.execute_sync()
+            del async_request
+        except (ImportError, ModuleNotFoundError):
+            # Keep backward compatibility on environments without nvrx.
+            original_save(self, sharded_state_dict, checkpoint_dir)
+
+    TorchDistSaveShardedStrategy.save = _save_with_nvrx_fallback
+    try:
+        yield
+    finally:
+        TorchDistSaveShardedStrategy.save = original_save
 
 
 def import_model_from_hf_name(
@@ -147,7 +185,8 @@ def import_model_from_hf_name(
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
     config.pipeline_dtype = orig_pipeline_dtype
 
-    bridge.save_megatron_model(megatron_model, output_path)
+    with _prefer_nvrx_for_dist_ckpt_save():
+        bridge.save_megatron_model(megatron_model, output_path)
 
     # resetting mcore state
     import megatron.core.rerun_state_machine

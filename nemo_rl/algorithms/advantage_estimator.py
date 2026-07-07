@@ -105,7 +105,7 @@ class GDPOAdvantageEstimator:
         Args:
             prompt_ids: Tensor identifying which prompt each sample belongs to (for per-prompt baselines).
             rewards: Unused; for interface consistency.
-            repeated_batch: Batch containing reward1, reward2, ... keys.
+            repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             **kwargs: Additional arguments (unused).
 
@@ -115,8 +115,8 @@ class GDPOAdvantageEstimator:
         reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
         if len(reward_component_keys) < 2:
             raise ValueError(
-                f"GDPO requires multiple reward components (reward1, reward2, ...). "
-                f"This batch has {len(reward_component_keys)} component(s). "
+                f"GDPO requires multiple reward components (reward/name1, reward/name2, ...). "
+                f"This batch has {len(reward_component_keys)} component(s): {reward_component_keys}. "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
         valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
