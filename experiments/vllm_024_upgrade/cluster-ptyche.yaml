@@ -1,0 +1,12 @@
+---
+cluster: ptyche
+ssh_host: login-ptyche
+user: sna
+remote_cwd: /lustre/fsw/coreai_dlalgo_llm/users/sna/RL-vllm024-upgrade-20260707
+partition: batch
+account: coreai_dlalgo_llm
+container_image: /lustre/fsw/coreai_dlalgo_llm/users/sna/containers/nemo_rl_nightly_20260705.sqsh
+mounts:
+  - /lustre:/lustre
+gpus_per_node: 4
+subproject: nemorl-vllm024-perfcfg
