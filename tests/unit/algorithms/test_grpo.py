@@ -3634,16 +3634,14 @@ class TestAggregateRolloutMetrics:
 
 
 def _cfg(*, force=False, threshold=None, skip_ref=None, kl_reward=False):
-    from types import SimpleNamespace
-
-    return SimpleNamespace(
+    return MasterConfig.model_construct(
+        loss_fn=ClippedPGLossConfig(
+            force_on_policy_ratio=force, use_kl_in_reward=kl_reward
+        ),
         grpo={
             "seq_logprob_error_threshold": threshold,
             "skip_reference_policy_logprobs_calculation": skip_ref,
         },
-        loss_fn=SimpleNamespace(
-            force_on_policy_ratio=force, use_kl_in_reward=kl_reward
-        ),
     )
 
 
