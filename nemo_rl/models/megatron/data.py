@@ -270,9 +270,29 @@ def process_microbatch(
             position_ids = None
             attention_mask = None
         else:
-            input_ids_cp_sharded = input_ids
+            # Unpacked path. Under context parallelism, zigzag-shard the sequence
+            # so each CP rank holds S/cp tokens. Attention modules that handle CP
+            # via in-attention gather/scatter (e.g. the diffusion leftmost-reveal
+            # bidirectional path) reconstruct the full sequence internally, and
+            # the logits are re-gathered across CP in the post-processor.
+            cp_size = get_context_parallel_world_size()
+            if cp_size > 1:
+                assert input_ids.shape[1] % (2 * cp_size) == 0, (
+                    f"Unpacked context parallelism requires the sequence length "
+                    f"({input_ids.shape[1]}) to be divisible by 2*cp_size "
+                    f"({2 * cp_size}). Set policy.make_sequence_length_divisible_by "
+                    f"to a multiple of {2 * cp_size}."
+                )
+                input_ids_cp_sharded = _get_tokens_on_this_cp_rank(
+                    input_ids,
+                    get_context_parallel_rank(),
+                    cp_size,
+                    seq_dim=1,
+                )
+            else:
+                input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                data=input_ids,
+                data=input_ids_cp_sharded,
                 eod_token=0,  # used for loss_mask, which we don't use
                 pad_token=0,  # used for loss_mask, which we don't use
                 reset_position_ids=False,

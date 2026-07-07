@@ -208,6 +208,10 @@ class MegatronConfig(TypedDict):
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
+    # Allow context_parallel_size>1 without sequence packing. Only valid for
+    # workers whose attention handles CP internally (gather/scatter), e.g. the
+    # diffusion leftmost-reveal worker. Requires seq length divisible by 2*cp.
+    allow_unpacked_context_parallel: NotRequired[bool]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool

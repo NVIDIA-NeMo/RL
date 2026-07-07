@@ -400,8 +400,14 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
     if model_cfg.context_parallel_size > 1:
-        assert config["sequence_packing"]["enabled"], (
-            "Sequence Packing must be enabled to use Context Parallelism with MCore"
+        allow_unpacked_cp = config["megatron_cfg"].get(
+            "allow_unpacked_context_parallel", False
+        )
+        assert config["sequence_packing"]["enabled"] or allow_unpacked_cp, (
+            "Sequence Packing must be enabled to use Context Parallelism with MCore "
+            "(or set megatron_cfg.allow_unpacked_context_parallel=true for models that "
+            "handle CP via in-attention gather/scatter, e.g. the diffusion "
+            "leftmost-reveal worker)."
         )
         assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"

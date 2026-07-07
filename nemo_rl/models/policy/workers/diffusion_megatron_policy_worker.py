@@ -51,10 +51,20 @@ class DiffusionMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl, ABC):
         return cfg
 
     def _validate_diffusion_support(self, algorithm_name: str) -> None:
-        if self.cfg["megatron_cfg"]["context_parallel_size"] != 1:
+        # Context parallelism is supported unpacked: the diffusion leftmost-reveal
+        # attention gathers/scatters the sequence inside attention, the unpacked
+        # input is zigzag-sharded in data.process_microbatch, and the CP-sharded
+        # logits are re-gathered in the diffusion post-processors. Requires the
+        # sequence length divisible by 2*cp and packing disabled, opted in via
+        # megatron_cfg.allow_unpacked_context_parallel.
+        if self.cfg["megatron_cfg"]["context_parallel_size"] != 1 and not self.cfg[
+            "megatron_cfg"
+        ].get("allow_unpacked_context_parallel", False):
             raise NotImplementedError(
                 f"{algorithm_name} Megatron logprobs currently require "
-                "context_parallel_size=1"
+                "context_parallel_size=1 (or set "
+                "megatron_cfg.allow_unpacked_context_parallel=true for the "
+                "diffusion leftmost-reveal worker, which handles CP in-attention)"
             )
         if "draft" in self.cfg and self.cfg["draft"]["enabled"]:
             raise NotImplementedError(
