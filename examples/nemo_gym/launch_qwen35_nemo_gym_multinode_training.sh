@@ -271,6 +271,15 @@ if [[ -d "${R2E_FIXES_DIR}" ]]; then
     if [[ -f "${R2E_FIXES_DIR}/te_dpa_utils.py" ]]; then
         MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/te_dpa_utils.py:/root/.cache/uv/archive-v0/oVtZpwakETGWXnnj/transformer_engine/pytorch/attention/dot_product_attention/utils.py"
     fi
+    # fla GDN kernel fix (bug #16): backport of upstream fla PR #1000 onto
+    # the pinned fla-core 0.4.2 - Blackwell selects unstable Triton autotune
+    # configs for prepare_wy_repr_bwd_kernel (fla #999/#913: silent GDN
+    # backward hang on B200-class GPUs; matches the every-second-train-step
+    # deadlock signature, jobs 2289258..2295735). Target path verified via
+    # fla.__file__ inside this image (job 2300937).
+    if [[ -f "${R2E_FIXES_DIR}/fla_wy_fast.py" ]]; then
+        MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/fla_wy_fast.py:/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.13/site-packages/fla/ops/gated_delta_rule/wy_fast.py"
+    fi
 fi
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
