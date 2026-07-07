@@ -55,6 +55,25 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
+def _merge_fp8_kwargs(
+    vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]
+) -> None:
+    """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
+
+    ``init_fp8`` returns a nested ``hf_overrides`` (holding ``quantization_config``),
+    so a blanket ``vllm_kwargs.update(fp8_kwargs)`` would wholesale-replace any
+    user-supplied ``hf_overrides``. We pop ``hf_overrides`` before the shallow
+    update and merge it separately so that fp8's ``quantization_config`` is the
+    base while user overrides (e.g. ``max_position_embeddings``) survive and take
+    precedence. This regression was reintroduced once already; see #1413/#2904.
+    """
+    fp8_kwargs = dict(fp8_kwargs)
+    fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
+    vllm_kwargs.update(fp8_kwargs)
+    existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
+    vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -339,14 +358,9 @@ class BaseVllmGenerationWorker:
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
             )
 
-            # Pop hf_overrides before update() so we can merge instead of
-            # replacing: fp8 sets quantization_config as its base, but
-            # user-supplied overrides (e.g. max_position_embeddings) must
-            # survive and take precedence.
-            fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
-            vllm_kwargs.update(fp8_kwargs)
-            existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
-            vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
+            # Merge (rather than replace) so fp8's quantization_config coexists
+            # with user-supplied hf_overrides, which take precedence.
+            _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
