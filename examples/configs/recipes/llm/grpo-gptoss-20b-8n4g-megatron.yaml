@@ -14,3 +14,6 @@ policy:
       attention_backend: TRITON_ATTN
 cluster:
   gpus_per_node: 4
+  # EP=8, 4 GPU/node => each EP group spans 2 nodes. segment_size=2 aligns each
+  # EP group to a single NVL72 rack so the MoE EP all_to_all never crosses racks
+  segment_size: 2

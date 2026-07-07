@@ -55,6 +55,11 @@ from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
+from nemo_rl.models.megatron.router_replay import (
+    clear_router_replay,
+    set_router_replay_backward,
+    set_router_replay_forward,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 # Union type for any post-processing function (defined after classes below)
@@ -73,8 +78,9 @@ def model_forward(
     attention_mask: torch.Tensor,
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
+    mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
-    use_linear_ce_fusion_loss: bool = False,
+    use_fused_linear_logprobs: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -86,8 +92,10 @@ def model_forward(
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
+        mtp_loss_mask: MTP loss mask to exclude prompt tokens from MTP loss (optional)
         straggler_timer: Straggler detector for profiling the forward pass
-        use_linear_ce_fusion_loss: Whether to use linear CE fusion loss
+        use_fused_linear_logprobs: Whether to compute logprobs with the fused
+            chunked linear cross-entropy kernel (directly from hidden states)
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -102,9 +110,14 @@ def model_forward(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
+
+    # Pass MTP loss mask to exclude prompt tokens from MTP loss
+    if mtp_loss_mask is not None:
+        additional_kwargs["loss_mask"] = mtp_loss_mask
+
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
-    if use_linear_ce_fusion_loss:
+    if use_fused_linear_logprobs:
         additional_kwargs["labels"] = input_ids_cp_sharded
         # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
         # GPTModel.forward signatures do not accept it.
@@ -150,7 +163,9 @@ def forward_with_post_processing_fn(
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
-    use_linear_ce_fusion_loss: bool = False,
+    use_fused_linear_logprobs: bool = False,
+    use_router_replay: bool = False,
+    router_replay_train: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -186,21 +201,45 @@ def forward_with_post_processing_fn(
     position_ids = processed_mb.position_ids
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
+    mtp_loss_mask = processed_mb.mtp_loss_mask
+    routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+
+    if use_router_replay:
+        if routed_experts_cp_sharded is None:
+            raise RuntimeError(
+                "Router replay is enabled but routed_experts is missing from the microbatch."
+            )
+        set_router_replay_forward(model, routed_experts_cp_sharded)
 
     # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
     capture_context, capture = get_capture_context(model, enable_hidden_capture)
-    with capture_context:
-        output_tensor = model_forward(
-            model=model,
-            data_dict=data_dict,
-            input_ids_cp_sharded=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
-            defer_fp32_logits=defer_fp32_logits,
-            straggler_timer=straggler_timer,
-            use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
-        )
+    try:
+        with capture_context:
+            output_tensor = model_forward(
+                model=model,
+                data_dict=data_dict,
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+                defer_fp32_logits=defer_fp32_logits,
+                mtp_loss_mask=mtp_loss_mask,
+                straggler_timer=straggler_timer,
+                use_fused_linear_logprobs=use_fused_linear_logprobs,
+            )
+    except Exception:
+        # The forward above armed the router-replay action (set_router_replay_forward);
+        # if it raised, clear that armed state so stale replay action/indices do not
+        # leak into the next microbatch, then re-raise the original error unchanged.
+        if use_router_replay:
+            clear_router_replay(model)
+        raise
+
+    if use_router_replay:
+        if router_replay_train:
+            set_router_replay_backward(model)
+        else:
+            clear_router_replay(model)
 
     if capture is not None:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
@@ -271,7 +310,9 @@ def megatron_forward_backward(
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
-    use_linear_ce_fusion_loss: bool = False,
+    use_fused_linear_logprobs: bool = False,
+    use_router_replay: bool = False,
+    router_replay_train: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -308,19 +349,27 @@ def megatron_forward_backward(
         straggler_timer=straggler_timer,
         draft_model=draft_model,
         enable_hidden_capture=enable_hidden_capture,
-        use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
+        use_fused_linear_logprobs=use_fused_linear_logprobs,
+        use_router_replay=use_router_replay,
+        router_replay_train=router_replay_train,
     )
     forward_backward_func = get_forward_backward_func()
-    return forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=seq_length,
-        micro_batch_size=mbs,
-        decoder_seq_length=seq_length,
-        forward_only=forward_only,
-    )
+    if use_router_replay:
+        clear_router_replay(model)
+    try:
+        return forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=mbs,
+            decoder_seq_length=seq_length,
+            forward_only=forward_only,
+        )
+    finally:
+        if use_router_replay:
+            clear_router_replay(model)
 
 
 class LossPostProcessor:
@@ -332,12 +381,30 @@ class LossPostProcessor:
         cp_normalize: bool = True,
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
+        prepare_fn: Optional[Callable[..., Any]] = None,
     ):
+        """Build a per-microbatch loss post-processor for the Megatron train loop.
+
+        Args:
+            loss_fn: Loss function to wrap.
+            cfg: Policy(-like) config; supplies sequence_packing / logprob_chunk_size.
+            num_microbatches: Microbatch count, used to counteract Megatron's
+                per-microbatch loss averaging.
+            cp_normalize: Whether to divide the loss by the context-parallel size.
+            sampling_params: Optional temperature / top-k/p for logprob losses.
+            draft_model: Optional EAGLE draft model for distillation.
+            prepare_fn: Optional override for the default ``prepare_loss_input``.
+                Must accept ``(logits, data, loss_fn, vocab_parallel_rank,
+                vocab_parallel_group, context_parallel_group)`` and return
+                ``(loss_input, data)``; value models pass one that right-shifts
+                and CP-all-gathers the scalar value-head output.
+        """
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.num_microbatches = num_microbatches
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
+        self.prepare_fn = prepare_fn
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -365,19 +432,36 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
-        # wrap prepare_loss_input with sampling_params and optional d2t mapping
-        prepare_loss_input_wrapped = partial(
-            prepare_loss_input, sampling_params=self.sampling_params, d2t=self.d2t
-        )
+        # A custom prepare_fn (e.g. value models) overrides the default logit prep.
+        logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
+        if self.prepare_fn is not None:
+            prepare_loss_input_wrapped = self.prepare_fn
+        else:
+            prepare_loss_input_wrapped = partial(
+                prepare_loss_input,
+                sampling_params=self.sampling_params,
+                d2t=self.d2t,
+                chunk_size=logprob_chunk_size,
+            )
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
             if fuse_loss:
+                # The fused path prepares loss via prepare_packed_loss_input and
+                # cannot honor a custom prepare_fn (e.g. the value model's); guard
+                # rather than silently bypass it.
+                assert self.prepare_fn is None, (
+                    "sequence_packing.fuse_loss=true does not support a custom "
+                    "prepare_fn (e.g. the value model's value-specific prep). "
+                    "Disable fuse_loss for the value model."
+                )
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = partial(
-                    prepare_packed_loss_input, sampling_params=self.sampling_params
+                    prepare_packed_loss_input,
+                    sampling_params=self.sampling_params,
+                    chunk_size=logprob_chunk_size,
                 )
             else:
                 wrapper_cls = SequencePackingLossWrapper
@@ -449,11 +533,11 @@ class LogprobsPostProcessor:
         self,
         cfg: PolicyConfig,
         sampling_params: Optional[TrainingSamplingParams] = None,
-        use_linear_ce_fusion: bool = False,
+        use_fused_linear_logprobs: bool = False,
     ):
         self.cfg = cfg
         self.sampling_params = sampling_params
-        self.use_linear_ce_fusion = use_linear_ce_fusion
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
 
     def __call__(
         self,
@@ -478,7 +562,7 @@ class LogprobsPostProcessor:
         original_seq_length = unpacked_input_ids.shape[1]
 
         def processor_fn_inner(output_tensor):
-            if self.use_linear_ce_fusion:
+            if self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
             elif self.cfg["sequence_packing"]["enabled"]:

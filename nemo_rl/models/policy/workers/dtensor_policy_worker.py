@@ -575,6 +575,7 @@ class DTensorPolicyWorkerImpl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         if gbs is None:
@@ -590,7 +591,14 @@ class DTensorPolicyWorkerImpl(
         )
         num_global_batches = int(total_dataset_size.item()) // gbs
 
-        # dim 1 is always assumed to be the sequence dim, sanity check this here
+        # ``check_dim_skip_keys`` is accepted for parity with the v2 worker but
+        # this worker does not run cross-tokenizer distillation (the
+        # cross-tokenizer setup asserts the v2 worker), so it must be None.
+        assert check_dim_skip_keys is None, (
+            "check_dim_skip_keys is only supported by the v2 DTensor worker; "
+            "cross-tokenizer distillation requires dtensor_cfg._v2=True."
+        )
+        # dim 1 is always assumed to be the sequence dim, sanity check this here.
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
         for k, v in data.items():
@@ -1923,13 +1931,10 @@ class DTensorPolicyWorkerImpl(
             self.model = self.move_buffer_to_device(self.model, "cuda")
 
         self.model.train()
-        # Move optimizer state to CUDA if it exists
-        # colocated generation will always offload optimizer to cuda before refit
-        if (
-            self.optimizer is not None
-            and not self.cpu_offload
-            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
-        ):
+        # Training expects optimizer state on CUDA. Restore unconditionally rather
+        # than tracking which path offloaded it; move_optimizer_to_device is a no-op
+        # when the state is already resident.
+        if self.optimizer is not None and not self.cpu_offload:
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()

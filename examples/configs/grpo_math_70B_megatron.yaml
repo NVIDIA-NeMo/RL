@@ -25,7 +25,6 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    converter_type: "LlamaForCausalLM"
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 4
     context_parallel_size: 1
@@ -65,3 +64,4 @@ policy:
 cluster:
   gpus_per_node: 8
   num_nodes: 8
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
