@@ -3,28 +3,27 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=64
-GPUS_PER_NODE=8
-STEPS_PER_RUN=20
-MAX_STEPS=20
+NUM_NODES=1
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=240
+NUM_MINUTES=20
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo.py \
+uv run examples/run_dpo.py \
     --config $CONFIG_PATH \
-    grpo.max_num_steps=$MAX_STEPS \
+    dpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=True \
+    checkpointing.enabled=true \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG
@@ -34,9 +33,11 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # Smoke checks: run completed and loss is finite/reasonable.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'mean(data["train/gen_kl_error"]) < 0.01' \
-        'max(data["train/reward"]) > 0.1'
+        'data["train/loss"]["1"] < 0.7' \
+        'data["train/loss"]["10"] < 0.7' \
+        'data["train/accuracy"]["10"] >= 0.5'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
