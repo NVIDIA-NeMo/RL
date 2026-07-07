@@ -60,6 +60,8 @@ policy:
     activation_checkpointing: false
     tensor_parallel_size: 1
   megatron_cfg:
+    checkpoint:
+      async_save: true
     empty_unused_memory_level: 2
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2

@@ -1230,21 +1230,76 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.fully_parallel_load is True
         assert checkpoint_config.load_rng is False
 
-    def test_missing_ckpt_cfg_raises(self, tmp_path):
-        """ckpt_cfg is required: defaults live in the exemplar YAML, not here.
+    def test_missing_ckpt_cfg_defaults_to_sync_save(self, tmp_path):
+        """An absent checkpoint block defaults to sync save (backward compatible).
 
-        Omitting it (or omitting a required key) fails loudly rather than
-        silently falling back to a hidden call-site default.
+        Configs that predate the ``megatron_cfg.checkpoint`` block or don't inherit
+        an exemplar must keep working with the pre-existing behavior (async_save off)
+        instead of crashing with a KeyError.
         """
         from nemo_rl.models.megatron.setup import _create_checkpoint_config
 
-        with pytest.raises(KeyError):
-            _create_checkpoint_config(
-                str(tmp_path / "pretrained"),
-                str(tmp_path / "weights"),
-                str(tmp_path / "optimizer"),
-                ckpt_cfg=None,
-            )
+        weights_path = str(tmp_path / "weights")
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            weights_path,
+            str(tmp_path / "optimizer"),
+            ckpt_cfg=None,
+        )
+
+        assert checkpoint_config.async_save is False
+        # No fallback substitution for save when sync.
+        assert checkpoint_config.save == weights_path
+
+    def test_partial_ckpt_cfg_defaults_missing_async_save(self, tmp_path):
+        """A checkpoint block missing async_save still defaults to sync save."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg={"ckpt_assume_constant_structure": True},
+        )
+
+        assert checkpoint_config.async_save is False
+        assert checkpoint_config.ckpt_assume_constant_structure is True
+
+    def test_absent_ckpt_assume_constant_structure_uses_bridge_default(self, tmp_path):
+        """ckpt_assume_constant_structure is omitted unless set in YAML."""
+        from megatron.bridge.training.config import (
+            CheckpointConfig as BridgeCheckpointConfig,
+        )
+
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        pretrained_path = str(tmp_path / "pretrained")
+        weights_path = str(tmp_path / "weights")
+        optimizer_path = str(tmp_path / "optimizer")
+
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path,
+            weights_path,
+            optimizer_path,
+            ckpt_cfg={"async_save": False},
+        )
+        bridge_default = BridgeCheckpointConfig(
+            save_interval=100,
+            save=weights_path,
+            load=weights_path,
+            load_optim=True,
+            pretrained_checkpoint=pretrained_path,
+            async_save=False,
+            fully_parallel_save=True,
+            fully_parallel_load=True,
+            load_rng=False,
+            load_main_params_from_ckpt=False,
+        )
+
+        assert (
+            checkpoint_config.ckpt_assume_constant_structure
+            == bridge_default.ckpt_assume_constant_structure
+        )
 
     def test_async_save_config_wired_through(self, tmp_path):
         """async_save / ckpt_assume_constant_structure / parallel-IO fields propagate."""

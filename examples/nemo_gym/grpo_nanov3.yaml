@@ -84,6 +84,8 @@ policy:
 
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
     empty_unused_memory_level: 1
     activation_checkpointing: true
     bias_activation_fusion: False
