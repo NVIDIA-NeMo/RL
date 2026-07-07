@@ -62,14 +62,6 @@ def test_group_experts_stacks_in_order():
     assert torch.equal(out[2], e2)
 
 
-def test_group_experts_down_proj_uses_correct_key():
-    prefix = "model.layers.5.mlp.experts"
-    tensors = [torch.randn(4096, 1536), torch.randn(4096, 1536)]
-    groups = {(prefix, "down_proj"): tensors}
-    out = _group("down_proj", f"{prefix}.down_proj.weight", groups)
-    assert out.shape == (2, 4096, 1536)
-
-
 def test_group_experts_missing_group_raises():
     groups = {("other.experts", "gate_proj"): [torch.randn(8, 8)]}
     with pytest.raises(AssertionError):

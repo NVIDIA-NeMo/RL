@@ -529,6 +529,8 @@ def _stage_rank_operations(
     for source, representative, overlap in transfers:
         if source == representative:
             if rank == source:
+                # A rank in a local-copy transfer holds both tensors.
+                assert src_local is not None and dst_local is not None
                 source_view = src_local[_local_slices(overlap, src_region)]
                 destination_view = dst_local[_local_slices(overlap, dst_region)]
                 if source_view.is_cuda:
@@ -538,6 +540,8 @@ def _stage_rank_operations(
             continue
 
         if rank == source:
+            # A sending rank always holds the source tensor.
+            assert src_local is not None
             source_view = src_local[_local_slices(overlap, src_region)]
             if source_view.is_cuda:
                 # A noncontiguous source is packed asynchronously on this
@@ -549,6 +553,8 @@ def _stage_rank_operations(
             )
             sends.append((representative, send_buffer))
         elif rank == representative:
+            # A receiving rank always holds the destination tensor.
+            assert dst_local is not None
             destination_view = dst_local[_local_slices(overlap, dst_region)]
             if destination_view.is_cuda:
                 destination_view.record_stream(stream)
@@ -888,6 +894,8 @@ def _stage_striped_operations(
     for source, receiver, overlap in transfers:
         if source == receiver:
             if rank == source:
+                # A rank in a local-copy transfer holds the source tensor.
+                assert src_local is not None
                 source_view = src_local[_local_slices(overlap, src_region)]
                 destination_view = destination_buffer[
                     _local_slices(overlap, dst_region)
@@ -899,6 +907,8 @@ def _stage_striped_operations(
             continue
 
         if rank == source:
+            # A sending rank always holds the source tensor.
+            assert src_local is not None
             source_view = src_local[_local_slices(overlap, src_region)]
             if source_view.is_cuda:
                 source_view.record_stream(stream)

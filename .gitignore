@@ -47,7 +47,3 @@ code_snapshots*/
 
 # Claude Code review memory (local only)
 .claude/review-memory/
-
-# pytest run artifacts (contain the run's git SHA -> trips detect-secrets)
-tests/unit/unit_results.json
-tests/unit/unit_results/
