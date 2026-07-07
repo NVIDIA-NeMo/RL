@@ -791,7 +791,8 @@ def grpo_train_sync(
                 # the driver-side read_from_dataplane and the workers'
                 # train_presharded fetch (via train_from_meta) consume it.
                 train_fields = tuple(
-                    f for f in DP_TRAIN_FIELDS
+                    f
+                    for f in DP_TRAIN_FIELDS
                     if not (skip_prev_logprobs and f == "prev_logprobs")
                 )
 
