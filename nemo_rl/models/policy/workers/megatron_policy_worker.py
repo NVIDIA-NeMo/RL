@@ -1485,10 +1485,14 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
-    def _build_layer_to_pp_stage(self, pp_size: int) -> dict[str, int]:
+    def _build_layer_to_pp_stage(
+        self, pp_size: int, layer_prefix: str
+    ) -> dict[str, int]:
         """Build mapping from layer group name to PP stage index.
 
-        Returns a dictionary that maps the layer group name to the PP stage index.
+        ``layer_prefix`` is the detected module path before ``layers.N`` in the
+        exported HF parameter names. An empty prefix represents bare
+        ``layers.N`` names.
 
         Mirrors Megatron-LM's ``get_num_layers_to_build``
         (``transformer_block.py``) for the standard (non-VP, non-custom-layout)
@@ -1548,6 +1552,7 @@ class MegatronPolicyWorkerImpl(
             middle_per_stage = 0
 
         layer_to_pp_stage: dict[str, int] = {}
+        layer_stem = f"{layer_prefix}.layers" if layer_prefix else "layers"
         layer_idx = 0
         for stage in range(pp_size):
             if stage == 0 and n_first is not None:
@@ -1557,16 +1562,7 @@ class MegatronPolicyWorkerImpl(
             else:
                 count = middle_per_stage
             for _ in range(count):
-                # Emit the supported HF naming conventions so the lookup in
-                # build_nccl_reshard_refit_info hits regardless of model family:
-                # Llama/Qwen/GLM use ``model.layers.N``; Qwen3.5 nests its
-                # decoder under ``model.language_model.layers.N``; DeepSeek V4
-                # uses ``layers.N``; NemotronH uses ``backbone.layers.N``. Keys
-                # are looked up (not iterated), so unused aliases are harmless.
-                layer_to_pp_stage[f"model.layers.{layer_idx}"] = stage
-                layer_to_pp_stage[f"model.language_model.layers.{layer_idx}"] = stage
-                layer_to_pp_stage[f"layers.{layer_idx}"] = stage
-                layer_to_pp_stage[f"backbone.layers.{layer_idx}"] = stage
+                layer_to_pp_stage[f"{layer_stem}.{layer_idx}"] = stage
                 layer_idx += 1
 
         assert layer_idx == num_layers, (
@@ -1598,6 +1594,7 @@ class MegatronPolicyWorkerImpl(
         checkpoint aliases and the gen backend's MoE-fusion layout.
         """
         from nemo_rl.weight_sync.nccl_reshard_utils import (
+            _extract_layer_prefix,
             build_nccl_reshard_refit_info,
             is_nccl_reshard_param,
         )
@@ -1655,9 +1652,21 @@ class MegatronPolicyWorkerImpl(
 
         pp_size = train_parallelism.get("pp_size", 1)
         # Construct a dict[layer_name:str] -> pp_stage:int
-        layer_to_pp_stage = (
-            self._build_layer_to_pp_stage(pp_size) if pp_size > 1 else None
-        )
+        layer_to_pp_stage = None
+        if pp_size > 1:
+            layer_prefixes = set()
+            for name in state_dict_metadata:
+                layer_prefix = _extract_layer_prefix(name)
+                if layer_prefix is not None:
+                    layer_prefixes.add(layer_prefix)
+            if len(layer_prefixes) != 1:
+                raise ValueError(
+                    "Expected exactly one layer prefix in bulk parameters, got "
+                    f"{sorted(layer_prefixes)!r}"
+                )
+            layer_to_pp_stage = self._build_layer_to_pp_stage(
+                pp_size, layer_prefixes.pop()
+            )
 
         # The key metadata, which should shared with generation workers
         self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(

@@ -459,15 +459,18 @@ def group_expert_params_in_metadata(
 # Layer grouping and refit-info construction
 # =========================================================================
 
-# Match the per-layer prefix and the top-level module group for the conventional
-# ``model.layers.N`` layout, DeepSeek's bare ``layers.N``, NemotronH's
-# ``backbone.layers.N``, and multimodal models such as Qwen3.5 whose text
-# decoder is nested under ``model.language_model.layers.N``. Keeping these
-# naming-agnostic lets _extract_layer_name produce a stable per-layer key that
-# matches the keys
-# _build_layer_to_pp_stage emits, so PP-stage filtering works across families.
-_LAYER_RE = re.compile(r"((?:(?:model|backbone)\.)?(?:language_model\.)?layers\.\d+)\.")
+# Capture any module prefix before ``layers.N`` so layer grouping does not need
+# to enumerate model-specific hierarchies.
+_LAYER_RE = re.compile(r"^(?:(?P<prefix>.+)\.)?layers\.(?P<index>\d+)\.")
 _MODEL_PREFIX_RE = re.compile(r"((?:model|backbone)\.\w+)\.")
+
+
+def _extract_layer_prefix(param_name: str) -> Optional[str]:
+    """Return the module prefix before ``layers.N``, or None if absent."""
+    match = _LAYER_RE.match(param_name)
+    if match is None:
+        return None
+    return match.group("prefix") or ""
 
 
 def _extract_layer_name(param_name: str) -> str:
@@ -480,9 +483,11 @@ def _extract_layer_name(param_name: str) -> str:
         ``layers.2.ffn.shared_experts.w2.weight`` -> ``layers.2``
         ``backbone.layers.3.mlp.down_proj.weight`` -> ``backbone.layers.3``
     """
-    m = _LAYER_RE.match(param_name)
-    if m:
-        return m.group(1)
+    match = _LAYER_RE.match(param_name)
+    if match:
+        prefix = match.group("prefix")
+        layer_name = f"layers.{match.group('index')}"
+        return f"{prefix}.{layer_name}" if prefix else layer_name
     m = _MODEL_PREFIX_RE.match(param_name)
     if m:
         return m.group(1)
