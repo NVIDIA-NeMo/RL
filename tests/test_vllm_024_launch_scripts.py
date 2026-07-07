@@ -58,6 +58,20 @@ def test_performance_launcher_preserves_compute_visible_workdir() -> None:
     assert "CONTAINER_WORKDIR=/lustre/users/sna/RL" in output
 
 
+def test_performance_launcher_imports_nemo_rl_from_the_checkout() -> None:
+    output = _run_script(
+        REPO_ROOT
+        / "experiments"
+        / "vllm_024_upgrade"
+        / "submit_performance_step10.sh",
+        "dry-run",
+        "qwen32b",
+        REPO_DIR="/lustre/users/sna/RL",
+    )
+
+    assert "PYTHONPATH=/lustre/users/sna/RL" in output
+
+
 def test_ray_launcher_accepts_an_explicit_container_workdir() -> None:
     source = (REPO_ROOT / "ray.sub").read_text(encoding="utf-8")
 

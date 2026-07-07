@@ -68,6 +68,8 @@ submit_one() {
   local command
 
   printf -v command '%q ' \
+    env \
+    "PYTHONPATH=${REPO_DIR}" \
     /opt/nemo_rl_venv/bin/python \
     examples/run_grpo.py \
     --config "${config}" \
@@ -92,6 +94,7 @@ submit_one() {
     "HF_HOME=${HF_HOME}"
     "NEMO_RL_VENV_DIR=${run_dir}/venvs"
     "NRL_FORCE_REBUILD_VENVS=true"
+    "PYTHONPATH=${REPO_DIR}"
     "PYTHONDONTWRITEBYTECODE=1"
     "RAY_LOG_SYNC_FREQUENCY=60"
     "TMPDIR=${TMPDIR}"
