@@ -16,6 +16,7 @@ USE_GRES="${USE_GRES:-false}"
 RUN_TAG="${RUN_TAG:-vllm024-perfcfg-step10-20260707}"
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-${REPO_DIR}/experiments/vllm_024_upgrade/runs/${RUN_TAG}}"
 WALLTIME="${WALLTIME:-04:00:00}"
+TMPDIR="${TMPDIR_OVERRIDE:-/tmp}"
 
 if [[ "${MODE}" != "dry-run" && ! -f "${CONTAINER}" ]]; then
   echo "ERROR: container not found: ${CONTAINER}" >&2
@@ -92,6 +93,7 @@ submit_one() {
     "NRL_FORCE_REBUILD_VENVS=true"
     "PYTHONDONTWRITEBYTECODE=1"
     "RAY_LOG_SYNC_FREQUENCY=60"
+    "TMPDIR=${TMPDIR}"
   )
   local sbatch_args=(
     --account="${ACCOUNT}"
