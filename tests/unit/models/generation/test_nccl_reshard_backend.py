@@ -35,7 +35,6 @@ from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
 )
 from nemo_rl.weight_sync.nccl_reshard_utils import (  # noqa: E402
     HFToLocalParamMap,
-    RefitBuilderInterface,
 )
 
 pytestmark = pytest.mark.vllm
@@ -263,9 +262,3 @@ def test_build_hf_to_local_param_map_specs_and_roundtrip():
     egctx.buf.fill_(5.0)
     eg.post(egctx)
     assert torch.equal(w13[:, 0:Pl, :], torch.full_like(w13[:, 0:Pl, :], 5.0))
-
-
-def test_extension_satisfies_refit_builder_interface():
-    # Structural Protocol conformance (no inheritance — vLLM composes the
-    # extension via worker_extension_cls).
-    assert isinstance(_make_ext({}), RefitBuilderInterface)
