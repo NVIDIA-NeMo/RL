@@ -30,6 +30,8 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     HFToLocalParamMap,
     LocalParamSpec,
     RefitCtx,
+    _extract_layer_prefix,
+    parse_ffn_projection,
 )
 
 try:
@@ -431,9 +433,9 @@ class VllmInternalWorkerExtension:
                     aligned_size = calculate_aligned_size(size_in_bytes)
                     offset += aligned_size
 
-                assert offset == used_bytes, (
-                    "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
-                )
+                assert (
+                    offset == used_bytes
+                ), "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
 
                 # Load weights into the model
                 self._load_weights(weights)
@@ -553,8 +555,8 @@ class VllmInternalWorkerExtension:
     def _build_hf_to_gen_backend_mapping(self, refit_info):
         """Map each FFN HF param name to its gen-backend param and slice.
 
-        Only ``gate_proj`` / ``up_proj`` / ``down_proj`` ``.weight``
-        (dense MLP and MoE experts) reach here.
+        Only semantic FFN gate/up/down weights (including DeepSeek's w1/w3/w2
+        serialization) reach here.
         Returns ``hf_name -> (vllm_param, merged_param_slice or None)``; the
         slice (``None`` for a 1:1 direct map) is the local region of a fused
         vLLM param this HF piece occupies, applied by the LocalParamSpec
@@ -571,31 +573,61 @@ class VllmInternalWorkerExtension:
         mapping = {}
 
         # Collect FFN param names + global shapes from refit_info, plus the
-        # grouped-expert tag (gate_proj/up_proj/down_proj) for MoE params.
+        # canonical grouped-expert tag for MoE params. Keep a semantic
+        # prefix/role lookup so DeepSeek w1/w3/w2 can share the same mapping
+        # logic as conventional gate_proj/up_proj/down_proj names.
         hf_shapes = {}  # hf_name -> global_shape
         hf_grouped = {}  # hf_name -> "gate_proj"|"up_proj"|"down_proj" (MoE only)
+        hf_projections = {}
+        hf_by_prefix_role = {}
         for layer_name in refit_info["layer_names"]:
             # p is a dict of param info
             for p in refit_info["per_layer_params"][layer_name]:
-                hf_shapes[p["name"]] = tuple(p["global_shape"])
+                name = p["name"]
+                projection = parse_ffn_projection(name)
+                if projection is None:
+                    raise ValueError(
+                        f"_build_hf_to_gen_backend_mapping: non-FFN parameter "
+                        f"{name!r} reached the bulk path"
+                    )
+                hf_shapes[name] = tuple(p["global_shape"])
+                hf_projections[name] = projection
+                hf_by_prefix_role[(projection.prefix, projection.role)] = name
                 if p.get("grouped_expert_proj"):
-                    hf_grouped[p["name"]] = p["grouped_expert_proj"]
+                    hf_grouped[name] = p["grouped_expert_proj"]
 
         # Check if this model uses gated MLP layer (e.g., SwiGLU, Gated ReLU^2)
         has_gate = {
-            name.rsplit(".gate_proj.weight", 1)[0]
+            hf_projections[name].prefix
             for name, proj in hf_grouped.items()
             if proj == "gate_proj"
         }
 
-        # NemotronH (nemotron_h): HF FFN params use the ``backbone.*`` prefix
-        # while vLLM uses ``model.*`` (e.g. ``backbone.layers.N.mixer.experts.
-        # w13_weight`` -> ``model.layers.N.mixer.experts.w13_weight``). For
-        # non-NemotronH models the name is unchanged, so this is a no-op.
+        def _layer_suffix(name):
+            layer_prefix = _extract_layer_prefix(name)
+            if layer_prefix is None:
+                return None
+            return name[len(layer_prefix) + 1 :] if layer_prefix else name
+
+        # Resolve checkpoint prefixes against the live vLLM hierarchy by the
+        # model-independent suffix beginning at layers.N.
+        vllm_names_by_layer_suffix = {}
+        for name in vllm_params:
+            suffix = _layer_suffix(name)
+            if suffix is not None:
+                vllm_names_by_layer_suffix.setdefault(suffix, []).append(name)
+
         def _to_vllm_name(n):
-            if n.startswith("backbone."):
-                return "model." + n[len("backbone.") :]
-            return n
+            suffix = _layer_suffix(n)
+            if suffix is None:
+                return n
+            candidates = vllm_names_by_layer_suffix.get(suffix, [])
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"Ambiguous vLLM parameters for layer suffix {suffix!r}: "
+                    f"{candidates!r}"
+                )
+            return candidates[0] if candidates else n
 
         for hf_name in hf_shapes:
             # 1) Grouped MoE expert params (gate_proj/up_proj/down_proj, each
@@ -608,7 +640,7 @@ class VllmInternalWorkerExtension:
             grouped_proj = hf_grouped.get(hf_name)
             if grouped_proj is not None:
                 # e.g.) expert_prefix = model.layers.3.mlp.experts
-                expert_prefix = hf_name.rsplit(f".{grouped_proj}.weight", 1)[0]
+                expert_prefix = hf_projections[hf_name].prefix
                 vllm_suffix = (
                     "w2_weight" if grouped_proj == "down_proj" else "w13_weight"
                 )
@@ -664,9 +696,13 @@ class VllmInternalWorkerExtension:
                     mapping[hf_name] = (vllm_param, (slice(None), sl, slice(None)))
                 continue
 
+            projection = hf_projections[hf_name]
+
             # 2) Direct 1:1 (dense down_proj; also non-gated dense up_proj, which
-            #    vLLM keeps unmerged).
-            vllm_direct = _to_vllm_name(hf_name)
+            #    vLLM keeps unmerged). Resolve through the semantic role so
+            #    DeepSeek w2 targets vLLM's down_proj.
+            canonical_name = f"{projection.prefix}.{projection.role}.weight"
+            vllm_direct = _to_vllm_name(canonical_name)
             if vllm_direct in vllm_params:
                 mapping[hf_name] = (vllm_params[vllm_direct], None)
                 continue
@@ -674,15 +710,21 @@ class VllmInternalWorkerExtension:
             # 3) Gated dense MLP: gate/up fuse into gate_up_proj along dim 0,
             #    [gate; up] -> gate=[0:I_local], up=[I_local:2*I_local], where
             #    I_local = intermediate // gen TP (even split, gate==up size).
-            if hf_name.endswith(("gate_proj.weight", "up_proj.weight")):
-                is_gate = hf_name.endswith("gate_proj.weight")
-                suffix = "gate_proj.weight" if is_gate else "up_proj.weight"
-                prefix = hf_name[: -len(suffix)]
-                vllm_name = _to_vllm_name(prefix + "gate_up_proj.weight")
+            if projection.role in ("gate_proj", "up_proj"):
+                is_gate = projection.role == "gate_proj"
+                prefix = projection.prefix
+                vllm_name = _to_vllm_name(f"{prefix}.gate_up_proj.weight")
                 if vllm_name in vllm_params:
                     tp = refit_info.get("gen_tp_size", 1)
-                    gate_local = hf_shapes[prefix + "gate_proj.weight"][0] // tp
-                    up_local = hf_shapes[prefix + "up_proj.weight"][0] // tp
+                    gate_name = hf_by_prefix_role.get((prefix, "gate_proj"))
+                    up_name = hf_by_prefix_role.get((prefix, "up_proj"))
+                    if gate_name is None or up_name is None:
+                        raise ValueError(
+                            f"_build_hf_to_gen_backend_mapping: fused vLLM param "
+                            f"{vllm_name!r} requires both gate and up weights"
+                        )
+                    gate_local = hf_shapes[gate_name][0] // tp
+                    up_local = hf_shapes[up_name][0] // tp
                     sl = (
                         slice(0, gate_local)
                         if is_gate
