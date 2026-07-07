@@ -341,6 +341,19 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
+    gen_benchmark_skip_training = _gen_benchmark_skip_training()
+
+    if gen_benchmark_skip_training and not (
+        "async_grpo" in grpo_config
+        and grpo_config["async_grpo"]["enabled"]
+        and generation_config["backend"] == "vllm"
+        and not generation_config["colocated"]["enabled"]
+        and not checkpointing_config["enabled"]
+    ):
+        raise ValueError(
+            "NRL_GEN_BENCHMARK_SKIP_TRAINING requires async, non-colocated vLLM "
+            "with checkpointing.enabled=false"
+        )
 
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -653,6 +666,17 @@ def setup(
             flush=True,
         )
 
+    if gen_benchmark_skip_training and (
+        rm_env_enabled
+        or enable_opd_teachers
+        or enable_nemo_gym
+        or segment_size is not None
+    ):
+        raise ValueError(
+            "Generation-only benchmark mode does not support reward-model nodes, "
+            "non-colocated teachers, NeMo Gym, or cluster.segment_size"
+        )
+
     if colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
@@ -701,7 +725,18 @@ def setup(
         inference_nodes = inference_resources["num_nodes"]
 
         # validate and configure resources
-        if policy_nodes == 1:
+        if gen_benchmark_skip_training:
+            if (
+                inference_nodes is None
+                or inference_nodes <= 0
+                or total_nodes != inference_nodes
+                or inference_gpus_per_node != cluster_config["gpus_per_node"]
+            ):
+                raise ValueError(
+                    "Generation-only benchmark mode requires equal positive cluster and "
+                    "inference node counts, using all cluster GPUs per node"
+                )
+        elif policy_nodes == 1:
             # When policy_nodes == 1, train and inference are on the same node
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
@@ -752,6 +787,8 @@ def setup(
             f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
             f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
         )
+        if gen_benchmark_skip_training:
+            train_nodes = 0
 
         # Build topology-aware domain constraints for placement groups.
         # Each selected node's bundles are pinned to a specific NVLink domain so
@@ -1185,13 +1222,18 @@ def setup(
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
             worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
         else:
-            policy_generation, policy = initialize_generation_with_policy(
-                init_generation_fn=init_vllm,
-                generation_name="vLLM",
-                init_time_key="vllm_init_time_s",
-                colocated_inference=colocated_inference,
-                worker_init_timing_metrics=worker_init_timing_metrics,
-            )
+            if gen_benchmark_skip_training:
+                policy_generation, generation_time = init_vllm()
+                policy = cast(ColocatablePolicyInterface, policy_generation)
+                worker_init_timing_metrics["vllm_init_time_s"] = generation_time
+            else:
+                policy_generation, policy = initialize_generation_with_policy(
+                    init_generation_fn=init_vllm,
+                    generation_name="vLLM",
+                    init_time_key="vllm_init_time_s",
+                    colocated_inference=colocated_inference,
+                    worker_init_timing_metrics=worker_init_timing_metrics,
+                )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -1225,10 +1267,11 @@ def setup(
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
     # print the node IP and GPU ID of the policy workers for debugging
-    policy.print_node_ip_and_gpu_id()
+    if not gen_benchmark_skip_training:
+        policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and not gen_benchmark_skip_training:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -1267,9 +1310,10 @@ def setup(
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    if not gen_benchmark_skip_training:
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -3448,10 +3492,9 @@ def _gen_benchmark_skip_training() -> bool:
 
     Controlled by the ``NRL_GEN_BENCHMARK_SKIP_TRAINING`` environment variable
     (truthy values: 1/true/yes/on). In this mode the optimizer is not built and
-    policy.train() is replaced with zero-valued metrics, while generation,
-    refit/weight-sync, and the trajectory-collector cadence are preserved so
-    generation throughput can be benchmarked with training pinned to a minimal
-    (e.g. single-GPU) policy cluster. Async GRPO only.
+    No training policy is created. Generation, reward processing, and the
+    trajectory-collector drain/resume cadence are preserved, while the actual
+    refit is a no-op. Async, non-colocated vLLM only.
     """
     return os.environ.get("NRL_GEN_BENCHMARK_SKIP_TRAINING", "").lower() in (
         "1",
@@ -3461,18 +3504,25 @@ def _gen_benchmark_skip_training() -> bool:
     )
 
 
-def _make_benchmark_dummy_train_results() -> dict[str, Any]:
+def _make_benchmark_dummy_train_results(
+    train_data: BatchedDataDict[Any],
+) -> dict[str, Any]:
     """Zero-valued stand-in for policy.train() output in gen-benchmark mode.
 
     Matches the keys the async metrics path consumes: ``loss`` and ``grad_norm``
     are CPU tensors (the consumer calls ``.numpy()`` on them) and
-    ``all_mb_metrics`` is an empty dict. ``moe_metrics`` / ``mtp_metrics`` are
-    optional (guarded by ``in`` checks) and intentionally omitted.
+    ``all_mb_metrics`` contains the token/sequence counts consumed by the
+    standard logging path. ``moe_metrics`` / ``mtp_metrics`` are optional
+    (guarded by ``in`` checks) and intentionally omitted.
     """
     return {
         "loss": torch.zeros(1),
         "grad_norm": torch.zeros(1),
-        "all_mb_metrics": {},
+        "all_mb_metrics": {
+            "global_valid_seqs": [train_data["sample_mask"].sum().item()],
+            "global_valid_toks": [train_data["token_mask"].sum().item()],
+            "gen_kl_error": [0.0],
+        },
     }
 
 
@@ -3514,6 +3564,7 @@ def async_grpo_train(
     # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
+    gen_benchmark_skip_training = _gen_benchmark_skip_training()
     backend = generation_config.get("backend", "") if generation_config else ""
     assert backend in ("vllm", "megatron") and _should_use_async_rollouts(
         master_config
@@ -3525,6 +3576,10 @@ def async_grpo_train(
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
+    if gen_benchmark_skip_training:
+        assert policy is policy_generation, (
+            "Generation-only benchmark mode uses the generation engine as its policy placeholder"
+        )
     if router_replay_enabled(master_config.policy) and (
         master_config.data_plane or {}
     ).get("enabled", False):
@@ -3550,11 +3605,11 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
-    NEED_REFIT = not (
+    NEED_REFIT = not gen_benchmark_skip_training and not (
         isinstance(policy_generation, MegatronGeneration)
         and master_config.policy["generation"]["colocated"]["enabled"]
     )
-    POLICY_GENERATION_STALE = True
+    POLICY_GENERATION_STALE = not gen_benchmark_skip_training
     assert policy_generation is not None
 
     # Training state
@@ -3696,12 +3751,6 @@ def async_grpo_train(
 
     print("📦 Started continuous background trajectory collection")
 
-    if _gen_benchmark_skip_training():
-        # Training is skipped, so the policy GPUs would look idle between refits.
-        # Start a tiny NCCL-free keep-alive matmul to avoid idle-GPU reapers.
-        print("🫀 Starting gen-benchmark keep-alive on policy workers")
-        policy.start_gen_benchmark_keepalive()
-
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
@@ -3811,7 +3860,8 @@ def async_grpo_train(
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config.grpo['max_num_steps']} {'=' * 25}"
             )
-            maybe_gpu_profile_step(policy, step + 1)
+            if not gen_benchmark_skip_training:
+                maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
@@ -3903,11 +3953,12 @@ def async_grpo_train(
                     continue
 
                 # Optional sanity: ensure DP divisibility to avoid sharding issues
-                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
-                if expected_batch_size % dp_size != 0:
-                    raise AssertionError(
-                        f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
-                    )
+                if not gen_benchmark_skip_training:
+                    dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
+                    if expected_batch_size % dp_size != 0:
+                        raise AssertionError(
+                            f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
+                        )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
@@ -3983,7 +4034,10 @@ def async_grpo_train(
                     "seq_logprob_error_threshold", None
                 )
                 force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
+                skip_prev_logprobs = (
+                    gen_benchmark_skip_training
+                    or opd_module._skip_prev_logprobs(master_config)
+                )
 
                 # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
                 if force_on_policy_ratio and seq_logprob_error_threshold is not None:
@@ -4116,14 +4170,11 @@ def async_grpo_train(
                         train_data["advantages"], master_config.grpo
                     )
 
-                if _gen_benchmark_skip_training():
-                    # Benchmark mode: skip optimizer/forward/backward entirely and
-                    # return zero-valued metrics. Still mark generation stale so the
-                    # refit below runs every step, preserving the real weight-sync
-                    # cadence we want to measure.
+                if gen_benchmark_skip_training:
+                    # Generation-only benchmark mode has no policy worker. Keep the
+                    # downstream metrics shape while skipping all training work.
                     print("▶ Skipping training (gen_benchmark_skip_training)...")
-                    POLICY_GENERATION_STALE = True
-                    train_results = _make_benchmark_dummy_train_results()
+                    train_results = _make_benchmark_dummy_train_results(train_data)
                 else:
                     print("▶ Preparing for training...")
                     with timer.time("training_prep"):
@@ -4138,9 +4189,9 @@ def async_grpo_train(
                             timer=timer,
                         )
 
-                print("🔄 Synchronizing policy weights to trajectory collector…")
+                print("🔄 Coordinating trajectory collector step boundary…")
                 generation_logger_metrics = None
-                if NEED_REFIT:
+                if NEED_REFIT or gen_benchmark_skip_training:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
@@ -4153,14 +4204,18 @@ def async_grpo_train(
                             policy_generation.get_logger_metrics()
                         )
 
-                    # Only the actual refit/weight transfer should be counted as weight_sync
-                    print("🔄 Performing policy generation refit...")
+                    # Keep a weight-sync timing boundary in generation-only mode,
+                    # even though no weights are transferred.
                     with timer.time("weight_sync"):
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
-                        )
+                        if gen_benchmark_skip_training:
+                            print("🔄 Generation-only benchmark: no-op weight sync")
+                        else:
+                            print("🔄 Performing policy generation refit...")
+                            refit_policy_generation(
+                                policy,
+                                policy_generation,
+                                colocated_inference,
+                            )
                         POLICY_GENERATION_STALE = False
 
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
