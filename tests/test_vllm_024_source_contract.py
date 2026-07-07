@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 from pathlib import Path
+from unittest.mock import MagicMock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -170,3 +171,25 @@ def test_ray_patch_uses_vllm_024_extra_env_contract(
         "NCCL_NVLS_ENABLE",
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV",
     }
+
+
+def test_hermes_patch_accepts_vllm_024_parser_without_tokenizer_calls(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    patches = load_patches_module()
+    parser = tmp_path / "hermes_tool_parser.py"
+    parser.write_text(
+        "class Hermes2ProToolParser(ToolParser):\n"
+        "    def __init__(self, tokenizer, tools=None):\n"
+        "        super().__init__(tokenizer, tools)\n"
+        "        self._sent_content_idx = 0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _path: str(parser))
+    logger = MagicMock()
+
+    patches._patch_vllm_hermes_tool_parser_thread_safety(logger)
+
+    logger.warning.assert_not_called()
+    logger.info.assert_called_once()

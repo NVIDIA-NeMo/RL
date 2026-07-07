@@ -274,6 +274,16 @@ def _patch_vllm_hermes_tool_parser_thread_safety(logger) -> None:
             return
 
         if old_init_snippet not in content:
+            if (
+                "self.model_tokenizer.encode(" not in content
+                and "self.model_tokenizer.decode(" not in content
+            ):
+                logger.info(
+                    "Hermes tool parser thread-safety patch is not required: "
+                    "the parser no longer calls tokenizer encode/decode during "
+                    "initialization."
+                )
+                return
             logger.warning(
                 "Could not apply hermes tool parser thread-safety patch: "
                 "expected code snippet not found in %s. "
