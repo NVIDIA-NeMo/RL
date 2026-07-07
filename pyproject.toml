@@ -310,7 +310,6 @@ explicit = true
 [tool.uv]
 managed = true
 environments = [
-  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'",
   "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 preview = true # Enable preview features like extra-build-dependencies
