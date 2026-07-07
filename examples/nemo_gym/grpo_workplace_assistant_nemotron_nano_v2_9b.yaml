@@ -287,7 +287,10 @@ data:
 
 env:
   should_use_nemo_gym: true
-  should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
+  # Log full NeMo-Gym results as W&B tables.
+  should_log_nemo_gym_responses_to_wandb: true
+  # Log per-step training rollout data as JSONL under logger.log_dir.
+  should_log_nemo_gym_responses_to_file: true
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     # Port range for Gym HTTP servers, kept below the OS ephemeral range
     # (32768-60999) and non-overlapping with NeMo RL (11001-15000) or

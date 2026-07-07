@@ -1840,13 +1840,12 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     return should_use_nemo_gym
 
 
-def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
-    env_config = master_config.env
-    should_log_nemo_gym_responses = bool(
-        env_config.get("should_log_nemo_gym_responses")
-    )
+def _should_log_nemo_gym_responses_to_wandb(master_config: MasterConfig) -> bool:
+    return bool(master_config.env.get("should_log_nemo_gym_responses_to_wandb"))
 
-    return should_log_nemo_gym_responses
+
+def _should_log_nemo_gym_responses_to_file(master_config: MasterConfig) -> bool:
+    return bool(master_config.env.get("should_log_nemo_gym_responses_to_file"))
 
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
@@ -2477,7 +2476,7 @@ def grpo_train(
                         del nemo_gym_rollout_result
 
                         # NeMo Gym responses can be very large and expensive to log. Here we have logic to opt-in to logging.
-                        if not _should_log_nemo_gym_responses(master_config):
+                        if not _should_log_nemo_gym_responses_to_wandb(master_config):
                             for key in list(rollout_metrics):
                                 if "full_result" in key:
                                     rollout_metrics.pop(key)
@@ -3082,7 +3081,7 @@ def grpo_train(
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
-            if not _should_log_nemo_gym_responses(master_config):
+            if _should_log_nemo_gym_responses_to_file(master_config):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]

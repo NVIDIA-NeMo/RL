@@ -154,7 +154,8 @@ data:
 
 env:
   should_use_nemo_gym: true
-  should_log_nemo_gym_responses: false
+  should_log_nemo_gym_responses_to_wandb: false
+  should_log_nemo_gym_responses_to_file: true
   nemo_gym:
     rollout_max_attempts_to_avoid_lp_nan: 1
     config_paths:

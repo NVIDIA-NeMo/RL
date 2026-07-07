@@ -26,7 +26,7 @@ from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import (
-    _should_log_nemo_gym_responses,
+    _should_log_nemo_gym_responses_to_wandb,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
     aggregate_rollout_metrics,
@@ -778,7 +778,7 @@ def distillation_train(
 
                         # NeMo Gym responses can be very large and expensive to log.
                         # Here we have logic to opt-in to logging.
-                        if not _should_log_nemo_gym_responses(master_config):
+                        if not _should_log_nemo_gym_responses_to_wandb(master_config):
                             for key in list(rollout_metrics):
                                 if "full_result" in key:
                                     rollout_metrics.pop(key)
@@ -1172,7 +1172,7 @@ def validate(
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
-                if not _should_log_nemo_gym_responses(master_config):
+                if not _should_log_nemo_gym_responses_to_wandb(master_config):
                     for key in list(gen_metrics):
                         if "full_result" in key:
                             gen_metrics.pop(key)

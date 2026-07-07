@@ -31,7 +31,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     RewardScalingConfig,
-    _should_log_nemo_gym_responses,
+    _should_log_nemo_gym_responses_to_wandb,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
     extract_initial_prompt_messages,
@@ -1074,7 +1074,7 @@ def ppo_train(
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
 
-                        if not _should_log_nemo_gym_responses(master_config):
+                        if not _should_log_nemo_gym_responses_to_wandb(master_config):
                             for key in list(rollout_metrics):
                                 if "full_result" in key:
                                     rollout_metrics.pop(key)

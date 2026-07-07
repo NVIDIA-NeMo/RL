@@ -92,7 +92,8 @@ data:
 
 env:
   should_use_nemo_gym: true
-  should_log_nemo_gym_responses: false
+  should_log_nemo_gym_responses_to_wandb: false
+  should_log_nemo_gym_responses_to_file: true
   nemo_gym:
     port_range_low: 15001
     port_range_high: 20000

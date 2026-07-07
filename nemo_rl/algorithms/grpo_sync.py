@@ -51,7 +51,8 @@ from nemo_rl.algorithms.grpo import (
     _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
-    _should_log_nemo_gym_responses,
+    _should_log_nemo_gym_responses_to_file,
+    _should_log_nemo_gym_responses_to_wandb,
     _should_use_nemo_gym,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
@@ -656,7 +657,7 @@ def grpo_train_sync(
                         )
                     )
 
-                    if not _should_log_nemo_gym_responses(master_config):
+                    if not _should_log_nemo_gym_responses_to_wandb(master_config):
                         for key in list(rollout_metrics):
                             if "full_result" in key:
                                 rollout_metrics.pop(key)
@@ -938,7 +939,7 @@ def grpo_train_sync(
                 # the NonTensorStack wire field via materialize.
                 _log_input_ids: Optional[torch.Tensor] = None
                 _log_content: Optional[np.ndarray] = None
-                if not _should_log_nemo_gym_responses(master_config):
+                if _should_log_nemo_gym_responses_to_file(master_config):
                     _log_select = ["input_ids"]
                     if "content" in (meta.fields or []):
                         _log_select.append("content")
@@ -1167,7 +1168,7 @@ def grpo_train_sync(
             # ``token_ids`` we fetch the small ``input_ids`` column from
             # TQ at log time — same data-driven slice pattern as masking
             # / KV calibration.
-            if not _should_log_nemo_gym_responses(master_config):
+            if _should_log_nemo_gym_responses_to_file(master_config):
                 log_data: dict = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
@@ -1187,7 +1188,7 @@ def grpo_train_sync(
                 # input_ids was stashed before the step-end clear_samples (the
                 # keys are no longer in TQ at this point); ``_log_input_ids``
                 # is None when nemo_gym-responses logging path skipped the
-                # outer ``if not _should_log_nemo_gym_responses`` branch.
+                # outer ``if _should_log_nemo_gym_responses_to_file`` branch.
                 if _log_input_ids is not None:
                     log_data["token_ids"] = _log_input_ids.tolist()
                 # ``content`` (raw assistant text) is fetched from TQ as

@@ -444,7 +444,7 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     master_config.distillation["max_val_samples"] = 1
     master_config.distillation["val_batch_size"] = 1
     master_config.env["should_use_nemo_gym"] = True
-    master_config.env["should_log_nemo_gym_responses"] = False
+    master_config.env["should_log_nemo_gym_responses_to_wandb"] = False
     master_config.policy["generation"]["backend"] = "vllm"
     master_config.policy["generation"]["vllm_cfg"] = {
         "async_engine": True,
