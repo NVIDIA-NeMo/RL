@@ -26,6 +26,7 @@ split-path result aggregation.
 
 import numpy as np
 import pytest
+import ray
 import torch
 
 # megatron.bridge is only available with the mcore extras; stop collection
@@ -111,7 +112,10 @@ def _run_split(
     policy.prepare_for_training()
     results = []
     for _step in range(NUM_STEPS):
-        wg.get_all_worker_results(
+        # Single-data fan-outs return plain ObjectRefs — consume with
+        # ray.get (get_all_worker_results is for MultiWorkerFuture bundles
+        # from sharded dispatch).
+        ray.get(
             wg.run_all_workers_single_data(
                 "begin_train_step_presharded",
                 loss_fn=loss_fn,
@@ -137,7 +141,7 @@ def _run_split(
                 ],
             )
         )
-        finish_results = wg.get_all_worker_results(
+        finish_results = ray.get(
             wg.run_all_workers_single_data("finish_train_step_presharded")
         )
         leaders = [r for r in finish_results if r.get("is_replica_leader", True)]

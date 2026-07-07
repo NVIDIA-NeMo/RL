@@ -484,13 +484,16 @@ class TQPolicy(Policy):
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
+        # run_all_workers_single_data returns plain ObjectRefs (one per
+        # GPU), not a MultiWorkerFuture — consume with ray.get, matching
+        # every other single-data fan-out in lm_policy.
         futures = self.worker_group.run_all_workers_single_data(
             "begin_train_step_presharded",
             loss_fn=loss_fn,
             gbs=batch_size,
             mbs=micro_batch_size,
         )
-        self.worker_group.get_all_worker_results(futures)
+        ray.get(futures)
 
     def train_microbatches_from_meta(
         self,
@@ -564,7 +567,7 @@ class TQPolicy(Policy):
         futures = self.worker_group.run_all_workers_single_data(
             "finish_train_step_presharded",
         )
-        results = self.worker_group.get_all_worker_results(futures)
+        results = ray.get(futures)
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
         # returns one result per GPU (TP×CP×PP×DP), but TP/CP/non-last-PP
         # twins hold identical copies of their DP shard's metric list.
@@ -586,7 +589,7 @@ class TQPolicy(Policy):
         futures = self.worker_group.run_all_workers_single_data(
             "abort_train_step_presharded",
         )
-        self.worker_group.get_all_worker_results(futures)
+        ray.get(futures)
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
