@@ -62,6 +62,24 @@ def test_group_experts_stacks_in_order():
     assert torch.equal(out[2], e2)
 
 
+def test_group_experts_deepseek_alias_uses_semantic_role():
+    prefix = "layers.0.ffn.experts"
+    e0 = torch.randn(128, 16)
+    e1 = torch.randn(128, 16)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    param_map = {
+        f"{prefix}.0.w1.weight": e0,
+        f"{prefix}.1.w1.weight": e1,
+    }
+
+    groups = worker._build_expert_groups(param_map)
+    assert (prefix, "gate_proj") in groups
+
+    out = _group("gate_proj", f"{prefix}.w1.weight", groups)
+    assert torch.equal(out[0], e0)
+    assert torch.equal(out[1], e1)
+
+
 def test_group_experts_missing_group_raises():
     groups = {("other.experts", "gate_proj"): [torch.randn(8, 8)]}
     with pytest.raises(AssertionError):

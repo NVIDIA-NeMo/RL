@@ -1413,9 +1413,10 @@ class MegatronPolicyWorkerImpl(
         """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
 
         Used by the nccl_reshard_refit bulk path (``build_hf_to_local_param_map``).
-        Only the FFN projections (gate/up/down_proj) take the bulk
-        path, so this yields ONLY those. Others. take the misc packed_broadcast path
-        and are skipped here (see ``is_nccl_reshard_param``).
+        Only semantic FFN projections (gate/up/down, including DeepSeek's
+        w1/w3/w2 aliases) take the bulk path. Other parameters take the misc
+        packed_broadcast path and are skipped here (see
+        ``is_nccl_reshard_param``).
 
         Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
         via ``export_hf_weights``), this yields TP-local shards directly from the
@@ -1556,12 +1557,15 @@ class MegatronPolicyWorkerImpl(
             else:
                 count = middle_per_stage
             for _ in range(count):
-                # Emit both HF naming conventions so the lookup in
+                # Emit the supported HF naming conventions so the lookup in
                 # build_nccl_reshard_refit_info hits regardless of model family:
-                # Llama/Qwen use ``model.layers.N``; NemotronH uses
-                # ``backbone.layers.N``.  Keys are looked up (not iterated), so
-                # the unused convention's extra keys are harmless.
+                # Llama/Qwen/GLM use ``model.layers.N``; Qwen3.5 nests its
+                # decoder under ``model.language_model.layers.N``; DeepSeek V4
+                # uses ``layers.N``; NemotronH uses ``backbone.layers.N``. Keys
+                # are looked up (not iterated), so unused aliases are harmless.
                 layer_to_pp_stage[f"model.layers.{layer_idx}"] = stage
+                layer_to_pp_stage[f"model.language_model.layers.{layer_idx}"] = stage
+                layer_to_pp_stage[f"layers.{layer_idx}"] = stage
                 layer_to_pp_stage[f"backbone.layers.{layer_idx}"] = stage
                 layer_idx += 1
 
@@ -1588,10 +1592,10 @@ class MegatronPolicyWorkerImpl(
     ):
         """Prepare per-layer parameter metadata for nccl_reshard-based refit.
 
-        The builder groups per-expert MoE params into backend-agnostic grouped
-        HF entries (gate_proj/up_proj/down_proj); the gen backend maps those into
-        its own fused layout (e.g., vLLM w13/w2) gen-side, so this train worker
-        stays agnostic to any gen backend's MoE-fusion layout.
+        The builder groups per-expert MoE params into source-named entries tagged
+        with semantic gate/up/down roles; the gen backend maps those into its own
+        fused layout (e.g., vLLM w13/w2), so this train worker stays agnostic to
+        checkpoint aliases and the gen backend's MoE-fusion layout.
         """
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             build_nccl_reshard_refit_info,
@@ -1610,7 +1614,7 @@ class MegatronPolicyWorkerImpl(
         train_tp = train_parallelism.get("tp_size", 1)
         gen_tp = gen_parallelism.get("tp_size", 1)
 
-        # Only the FFN gate/up/down weights take the bulk
+        # Only semantic FFN gate/up/down weights take the bulk
         # xferdtensor path (>97% of payload for the large models this targets);
         # everything else (attention, embeddings, norms, router, MLA, scales)
         # goes to the misc packed_broadcast + vLLM load_weights path.
@@ -1629,8 +1633,8 @@ class MegatronPolicyWorkerImpl(
                     "dtype": str(tensor.dtype),
                 }
                 _nbytes = tensor.numel() * tensor.element_size()
-                # Downsized whitelist: only FFN gate/up/down weights take the bulk
-                # nccl-reshard path; everything else -> misc (packed_broadcast).
+                # Only recognized semantic FFN projections take the bulk path;
+                # everything else -> misc (packed_broadcast).
                 if is_nccl_reshard_param(name):
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
@@ -1710,9 +1714,11 @@ class MegatronPolicyWorkerImpl(
           * group 1 = prefix       -> ``"model.layers.3.mlp.experts"``
           * group 2 = expert index -> ``17``
           * group 3 = proj type    -> ``"gate_proj"``
-        so the name keys into ``("model.layers.3.mlp.experts", "gate_proj")``.
+        The captured projection is normalized to its semantic role, so both
+        ``gate_proj`` and DeepSeek's ``w1`` key into
+        ``("...experts", "gate_proj")``.
 
-        Returns ``{(prefix, proj): [tensor_0, tensor_1, ...]}`` — the per-expert
+        Returns ``{(prefix, role): [tensor_0, tensor_1, ...]}`` — the per-expert
         ``param_map`` views sorted by expert index.  Example — a layer with 2
         local experts (gated MoE) yields three keys:
           ``(".../experts", "gate_proj"): [view(expert 0), view(expert 1)]``
@@ -1727,16 +1733,21 @@ class MegatronPolicyWorkerImpl(
         must precede expert 1 to match the EP ``Shard(0)`` layout the gen side
         expects.
         """
-        from nemo_rl.weight_sync.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            _INDIVIDUAL_EXPERT_RE,
+            parse_ffn_projection,
+        )
 
         index_groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
         for name in param_map:
             # find all the expert params
             m = _INDIVIDUAL_EXPERT_RE.match(name)
             if m:
-                # key = (group1 prefix, group3 proj_type); value (group2 idx, name)
-                # example: ("model.layers.3.mlp.experts", "gate_proj") -> (0, name)
-                index_groups.setdefault((m.group(1), m.group(3)), []).append(
+                projection = parse_ffn_projection(name)
+                assert projection is not None
+                # Key by semantic role so DeepSeek w1/w3/w2 names match the
+                # canonical grouped_expert_proj tags in refit metadata.
+                index_groups.setdefault((m.group(1), projection.role), []).append(
                     (int(m.group(2)), name)
                 )
         # Sort by expert index, then resolve each name to its param_map view once.
@@ -1751,7 +1762,13 @@ class MegatronPolicyWorkerImpl(
         Using the pre-calculated ``expert_groups`` (from ``_build_expert_groups``)
         it is just calling torch.stack of all the local expert params.
         """
-        prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
+        from nemo_rl.weight_sync.nccl_reshard_utils import parse_ffn_projection
+
+        projection = parse_ffn_projection(grouped_name)
+        assert (
+            projection is not None
+        ), f"unrecognized grouped FFN param {grouped_name!r}"
+        prefix = projection.prefix
         expert_tensors = expert_groups.get((prefix, proj))
         assert expert_tensors, (
             f"no local experts for {grouped_name!r} (proj={proj!r}); "

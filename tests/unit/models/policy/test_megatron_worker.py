@@ -45,6 +45,26 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def test_build_layer_to_pp_stage_includes_model_family_aliases():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(config=SimpleNamespace(num_layers=4))
+
+    mapping = MegatronPolicyWorkerImpl._build_layer_to_pp_stage(worker, pp_size=2)
+
+    assert mapping["model.language_model.layers.0"] == 0
+    assert mapping["model.language_model.layers.1"] == 0
+    assert mapping["model.language_model.layers.2"] == 1
+    assert mapping["model.language_model.layers.3"] == 1
+    assert mapping["layers.0"] == 0
+    assert mapping["layers.3"] == 1
+    assert mapping["model.layers.0"] == 0
+    assert mapping["model.layers.3"] == 1
+
+
 class _FakeTrainableModel:
     def __init__(self):
         self.train_called = False

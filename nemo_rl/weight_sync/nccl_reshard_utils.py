@@ -139,37 +139,72 @@ class RefitBuilderInterface(Protocol):
 # Placement rules (from xferdtensor/src/placement_rules.py)
 # =========================================================================
 
-# FFN column-parallel suffixes: TP shards along dim 0 (output / intermediate).
-# Only FFN gate/up reach the bulk path; everything else (attention, embeddings,
-# scales, ...) takes the misc path (see ``is_nccl_reshard_param``).
-COLUMN_PARALLEL_SUFFIXES = [
-    "gate_proj.weight",
-    "up_proj.weight",
-]
 
-# FFN row-parallel suffix: TP shards along dim 1 (input dimension).
-ROW_PARALLEL_SUFFIXES = [
-    "down_proj.weight",  # dense MLP + grouped MoE expert (gen-side -> w2_weight)
-]
+@dataclass(frozen=True)
+class FFNProjection:
+    """Semantic FFN projection parsed from a serialized parameter name.
+
+    ``source_proj`` preserves the checkpoint spelling while ``role`` normalizes
+    it to the conventional HF name consumed by the placement and backend
+    mapping logic. DeepSeek V4 serializes gate/up/down as w1/w3/w2.
+    """
+
+    prefix: str
+    source_proj: str
+    role: str
+
+
+_FFN_PROJ_ALIASES = {
+    "gate_proj": "gate_proj",
+    "up_proj": "up_proj",
+    "down_proj": "down_proj",
+    "w1": "gate_proj",
+    "w3": "up_proj",
+    "w2": "down_proj",
+}
+_FFN_PROJ_RE = re.compile(
+    r"^(?P<prefix>.+)\." r"(?P<proj>gate_proj|up_proj|down_proj|w1|w2|w3)\.weight$"
+)
+
+
+def parse_ffn_projection(param_name: str) -> Optional[FFNProjection]:
+    """Return the semantic FFN projection represented by ``param_name``.
+
+    Restrict aliases to known FFN containers so an unrelated attention-side
+    ``gate_proj`` does not enter the bulk path. Supported containers cover the
+    standard/GLM/Qwen ``mlp`` layout, DeepSeek's ``ffn`` layout, and
+    NemotronH's ``mixer`` layout.
+    """
+    match = _FFN_PROJ_RE.match(param_name)
+    if match is None:
+        return None
+
+    prefix = match.group("prefix")
+    if not {"mlp", "ffn", "mixer"}.intersection(prefix.split(".")):
+        return None
+
+    source_proj = match.group("proj")
+    return FFNProjection(
+        prefix=prefix,
+        source_proj=source_proj,
+        role=_FFN_PROJ_ALIASES[source_proj],
+    )
 
 
 def get_tp_shard_dim(param_name: str) -> Optional[int]:
     """Return the TP shard dim for an FFN weight, or None if not TP-sharded.
 
-    Only FFN gate/up/down reach the bulk path: gate/up are column-parallel
-    (dim 0), down is row-parallel (dim 1).  MoE experts shard on EP not TP, so
+    FFN gate/up (including DeepSeek w1/w3 aliases) are column-parallel (dim 0),
+    while down/w2 is row-parallel (dim 1). MoE experts shard on EP not TP, so
     they return None here — ``get_placements`` routes experts through
     ``_get_expert_tp_shard_dim`` instead.
     """
     if ".experts." in param_name:
         return None
-    for suffix in COLUMN_PARALLEL_SUFFIXES:
-        if param_name.endswith(suffix):
-            return 0
-    for suffix in ROW_PARALLEL_SUFFIXES:
-        if param_name.endswith(suffix):
-            return 1
-    return None
+    proj = parse_ffn_projection(param_name)
+    if proj is None:
+        return None
+    return 1 if proj.role == "down_proj" else 0
 
 
 def is_expert_param(param_name: str) -> bool:
@@ -177,39 +212,26 @@ def is_expert_param(param_name: str) -> bool:
     return ".experts." in param_name
 
 
-# FFN projection weights (dense MLP + MoE experts) — the ONLY params on the
-# bulk xferdtensor path. For the large (MoE) models this feature targets these
-# are >97% of the refit payload.
-FFN_PROJ_WEIGHT_SUFFIXES = (
-    "gate_proj.weight",
-    "up_proj.weight",
-    "down_proj.weight",
-)
-
-
 def is_nccl_reshard_param(param_name: str) -> bool:
     """Return True iff the param takes the xferdtensor bulk reshard path.
 
-    Only the FFN projection weights take the nccl_reshard bulk path:
-    ``gate_proj`` / ``up_proj`` / ``down_proj`` ``.weight``, for both the dense
-    MLP and the MoE experts. This will cover >95% of the refit payload. For the
-    large models.
+    Only recognized FFN projection weights take the nccl_reshard bulk path:
+    conventional ``gate_proj`` / ``up_proj`` / ``down_proj`` and DeepSeek's
+    equivalent ``w1`` / ``w3`` / ``w2`` serialization, for dense/shared MLPs
+    and routed experts.
 
     Everything else falls back to the misc packed_broadcast + vLLM
     ``load_weights`` path, which can cover diversity of parameters.
     """
-    return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES)
+    return parse_ffn_projection(param_name) is not None
 
 
 def _get_expert_tp_shard_dim(param_name: str) -> Optional[int]:
     """Like get_tp_shard_dim but does NOT skip .experts. params."""
-    for suffix in COLUMN_PARALLEL_SUFFIXES:
-        if param_name.endswith(suffix):
-            return 0
-    for suffix in ROW_PARALLEL_SUFFIXES:
-        if param_name.endswith(suffix):
-            return 1
-    return None
+    proj = parse_ffn_projection(param_name)
+    if proj is None:
+        return None
+    return 1 if proj.role == "down_proj" else 0
 
 
 # =========================================================================
@@ -318,9 +340,9 @@ def build_mesh_info(
         to the corresponding mesh-tensor axis index.
     """
     dp_size = num_gpus // (tp_size * ep_size * pp_size)
-    assert dp_size * tp_size * ep_size * pp_size == num_gpus, (
-        f"Cannot divide {num_gpus} GPUs into TP={tp_size} EP={ep_size} PP={pp_size} DP={dp_size}"
-    )
+    assert (
+        dp_size * tp_size * ep_size * pp_size == num_gpus
+    ), f"Cannot divide {num_gpus} GPUs into TP={tp_size} EP={ep_size} PP={pp_size} DP={dp_size}"
 
     dim_sizes = {"tp": tp_size, "ep": ep_size, "dp": dp_size, "pp": pp_size}
     active_dims = [
@@ -373,12 +395,13 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
 # MoE expert param fusion
 # =========================================================================
 
-# Matches individual expert params: model.layers.X.mlp.experts.Y.proj.weight
+# Matches individual expert params in conventional gate/up/down or DeepSeek
+# w1/w3/w2 serialization.
 # Anchored with ``$`` so it doesn't prefix-match FP8 ``_scale_inv`` siblings
 # (scale_inv siblings take the misc refit path via ``is_nccl_reshard_param`` and
 # must not appear in the per-expert weight fusion groups).
 _INDIVIDUAL_EXPERT_RE = re.compile(
-    r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+    r"(.+\.experts)\.(\d+)\." r"(gate_proj|up_proj|down_proj|w1|w2|w3)\.weight$"
 )
 
 
@@ -391,12 +414,13 @@ def group_expert_params_in_metadata(
     grouped-expert entries.
 
     For each MoE projection, stack every expert's HF param into ONE entry along
-    a new leading expert dim, keeping the *HF* projection name:
+    a new leading expert dim, keeping the source projection name:
       - gate_proj : [E, intermediate, hidden]
       - up_proj   : [E, intermediate, hidden]
       - down_proj : [E, hidden, intermediate]
+      - w1 / w3 / w2 use the same respective layouts for DeepSeek V4
     Each grouped entry is tagged ``grouped_expert_proj`` ("gate_proj" /
-    "up_proj" / "down_proj").
+    "up_proj" / "down_proj") by semantic role, independent of source spelling.
 
     The input ``state_dict_metadata`` has a global view of the parameters.
     Non-expert params are passed through unchanged.
@@ -409,8 +433,8 @@ def group_expert_params_in_metadata(
         m = _INDIVIDUAL_EXPERT_RE.match(name)
         if m:
             prefix = m.group(1)  # e.g., "model.layers.0.mlp.experts"
-            proj = m.group(3)  # "gate_proj", "up_proj", "down_proj"
-            expert_groups.setdefault((prefix, proj), []).append((name, meta))
+            source_proj = m.group(3)
+            expert_groups.setdefault((prefix, source_proj), []).append((name, meta))
         else:
             grouped_metadata[name] = meta
 
@@ -419,13 +443,13 @@ def group_expert_params_in_metadata(
 
     # Stack each (prefix, proj) group into one [E, *per_expert_shape] grouped
     # HF entry.
-    for (prefix, proj), entries in expert_groups.items():
+    for (prefix, source_proj), entries in expert_groups.items():
         num_experts_global = len(entries)
         per_expert_shape = list(entries[0][1]["shape"])
-        grouped_metadata[f"{prefix}.{proj}.weight"] = {
+        grouped_metadata[f"{prefix}.{source_proj}.weight"] = {
             "shape": [num_experts_global, *per_expert_shape],
             "dtype": entries[0][1]["dtype"],
-            "grouped_expert_proj": proj,
+            "grouped_expert_proj": _FFN_PROJ_ALIASES[source_proj],
         }
 
     return grouped_metadata
@@ -435,13 +459,14 @@ def group_expert_params_in_metadata(
 # Layer grouping and refit-info construction
 # =========================================================================
 
-# Match the per-layer prefix and the top-level module group for both the
-# Llama/Qwen HF convention (``model.layers.N`` / ``model.embed_tokens`` /
-# ``model.norm``) and the NemotronH convention (``backbone.layers.N`` /
-# ``backbone.embeddings`` / ``backbone.norm_f``).  Keeping these naming-agnostic
-# lets _extract_layer_name produce a stable per-layer key that matches the keys
-# _build_layer_to_pp_stage emits, so PP-stage filtering works for both families.
-_LAYER_RE = re.compile(r"((?:model|backbone)\.layers\.\d+)\.")
+# Match the per-layer prefix and the top-level module group for the conventional
+# ``model.layers.N`` layout, DeepSeek's bare ``layers.N``, NemotronH's
+# ``backbone.layers.N``, and multimodal models such as Qwen3.5 whose text
+# decoder is nested under ``model.language_model.layers.N``. Keeping these
+# naming-agnostic lets _extract_layer_name produce a stable per-layer key that
+# matches the keys
+# _build_layer_to_pp_stage emits, so PP-stage filtering works across families.
+_LAYER_RE = re.compile(r"((?:(?:model|backbone)\.)?(?:language_model\.)?layers\.\d+)\.")
 _MODEL_PREFIX_RE = re.compile(r"((?:model|backbone)\.\w+)\.")
 
 
@@ -450,6 +475,9 @@ def _extract_layer_name(param_name: str) -> str:
 
     Examples:
         ``model.layers.0.mlp.gate_proj.weight`` -> ``model.layers.0``
+        ``model.language_model.layers.1.mlp.up_proj.weight`` ->
+        ``model.language_model.layers.1``
+        ``layers.2.ffn.shared_experts.w2.weight`` -> ``layers.2``
         ``backbone.layers.3.mlp.down_proj.weight`` -> ``backbone.layers.3``
     """
     m = _LAYER_RE.match(param_name)
@@ -473,11 +501,10 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     additional constraint cannot be checked from config and is enforced at
     runtime by the MoE fusion regex:
 
-      - MoE experts must use the ``...experts.N.{up_proj,down_proj}.weight``
-        naming, optionally with a ``gate_proj`` sibling.  Both gated SwiGLU
-        (gate_proj + up_proj) and non-gated ReLU^2 (up_proj only) are fused;
-        an expert naming the fusion regex doesn't recognize falls through and
-        vLLM's ``w13_weight`` / ``w2_weight`` consumers will then reject it.
+      - MoE experts must use conventional ``gate_proj/up_proj/down_proj`` or
+        DeepSeek ``w1/w3/w2`` projection names. Both gated SwiGLU and non-gated
+        ReLU^2 are grouped; an unrecognized expert naming scheme falls through
+        and vLLM's ``w13_weight`` / ``w2_weight`` consumers reject it.
 
     Raises:
         ValueError: if any precondition is violated.
@@ -646,10 +673,9 @@ def build_nccl_reshard_refit_info(
     # (caller separates misc into a parallel dict for the
     # packed_broadcast-based misc refit path).
 
-    # Group per-expert MoE params into backend-agnostic grouped HF entries
-    # (gate_proj/up_proj/down_proj, each [E, ...]).  Grouping is universal; the
-    # gen backend maps these into its own fused layout (e.g., vLLM w13/w2) gen-side.
-    # No-op for dense (non-MoE) models (early return when there are no expert params)
+    # Group per-expert MoE params into source-named entries tagged with their
+    # semantic gate/up/down role. The gen backend maps these into its own fused
+    # layout (e.g., vLLM w13/w2). No-op for dense models.
     state_dict_metadata = group_expert_params_in_metadata(state_dict_metadata)
 
     pp_size = train_parallelism.get("pp_size", 1)
@@ -657,9 +683,9 @@ def build_nccl_reshard_refit_info(
     ep_size = train_parallelism.get("ep_size", 1)
     use_per_stage = pp_size > 1
     if use_per_stage:
-        assert layer_to_pp_stage is not None, (
-            "layer_to_pp_stage must be provided when pp_size > 1"
-        )
+        assert (
+            layer_to_pp_stage is not None
+        ), "layer_to_pp_stage must be provided when pp_size > 1"
 
     # Currently we don't support ETP>1 for the nccl_reshard_refit.
     # Non-expert params, ranks are partitioned (tp, dp);

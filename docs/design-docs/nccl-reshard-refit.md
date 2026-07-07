@@ -36,7 +36,7 @@ single `ValueError` listing every violation. The current requirements are:
   accounting) are not supported yet.
 * **Precision** must match end to end: BF16 train ↔ BF16 gen, or FP8 train
   (`fp8_param=true` + blockwise recipe) ↔ FP8 gen (`vllm_cfg.precision=fp8`).
-  BF16 train ↔ FP8 gen is not supported yet.
+  BF16 train ↔ FP8 gen and MXFP4 expert destinations are not supported yet.
 * vLLM expert parallelism is supported with the NeMo RL convention
   `expert_parallel_size == tensor_parallel_size`.
 
@@ -54,10 +54,12 @@ that the MoE FFN layers account for 97%-98% of the model weights. To balance
 performance and software sustainability, we chose a dual-path strategy for the
 nccl-reshard-refit implementation:
 
-* **Bulk path** — the FFN projection weights (`gate_proj` / `up_proj` / `down_proj`
-  `.weight`, dense MLP and MoE experts alike; see `is_nccl_reshard_param()`). These are
-  resharded shard-to-shard with `xferdtensor` over dedicated NCCL communicators. For
-  large models this covers the vast majority of the refit bytes.
+* **Bulk path** — semantic FFN gate/up/down projection weights (the conventional
+  `gate_proj` / `up_proj` / `down_proj` names used by Qwen and GLM, plus DeepSeek's
+  equivalent `w1` / `w3` / `w2` serialization; dense/shared MLPs and routed experts
+  alike; see `parse_ffn_projection()`). These are resharded shard-to-shard with
+  `xferdtensor` over dedicated NCCL communicators. For large models this covers the
+  vast majority of the refit bytes.
 * **Misc path** — everything else (embeddings, attention projections, layernorms, the
   MoE router, `lm_head`, FP8 `_scale_inv` siblings, FP8 KV-cache scales, …). These ride
   a packed broadcast (conventional `packed_tensor.py` implementation) over the shared

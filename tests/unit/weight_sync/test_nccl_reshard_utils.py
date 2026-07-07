@@ -27,13 +27,70 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     MeshInfo,
+    _extract_layer_name,
     build_mesh_info,
     build_nccl_reshard_refit_info,
     get_placements,
     get_tp_shard_dim,
     group_expert_params_in_metadata,
+    is_nccl_reshard_param,
     is_expert_param,
+    parse_ffn_projection,
 )
+
+
+@pytest.mark.parametrize(
+    "param_name,expected",
+    [
+        ("model.layers.0.mlp.gate_proj.weight", "model.layers.0"),
+        (
+            "model.language_model.layers.12.mlp.experts.3.up_proj.weight",
+            "model.language_model.layers.12",
+        ),
+        ("layers.2.ffn.shared_experts.w2.weight", "layers.2"),
+        ("backbone.layers.3.mixer.down_proj.weight", "backbone.layers.3"),
+    ],
+)
+def test_extract_layer_name_supports_model_families(param_name, expected):
+    assert _extract_layer_name(param_name) == expected
+
+
+@pytest.mark.parametrize(
+    "param_name,role,tp_dim",
+    [
+        # Qwen3.5 and GLM use conventional projection names.
+        (
+            "model.language_model.layers.0.mlp.experts.3.gate_proj.weight",
+            "gate_proj",
+            None,
+        ),
+        ("model.layers.0.mlp.up_proj.weight", "up_proj", 0),
+        ("model.layers.0.mlp.down_proj.weight", "down_proj", 1),
+        # DeepSeek V4 uses w1=gate, w3=up, w2=down.
+        ("layers.0.ffn.shared_experts.w1.weight", "gate_proj", 0),
+        ("layers.0.ffn.shared_experts.w3.weight", "up_proj", 0),
+        ("layers.0.ffn.shared_experts.w2.weight", "down_proj", 1),
+    ],
+)
+def test_parse_ffn_projection_aliases(param_name, role, tp_dim):
+    projection = parse_ffn_projection(param_name)
+    assert projection is not None
+    assert projection.role == role
+    assert is_nccl_reshard_param(param_name)
+    assert get_tp_shard_dim(param_name) == tp_dim
+
+
+@pytest.mark.parametrize(
+    "param_name",
+    [
+        "layers.0.attn.compressor.gate_proj.weight",
+        "model.visual.blocks.0.mlp.linear_fc1.weight",
+        "layers.0.ffn.experts.0.w1.scale",
+    ],
+)
+def test_non_ffn_or_non_weight_params_stay_on_misc_path(param_name):
+    assert parse_ffn_projection(param_name) is None
+    assert not is_nccl_reshard_param(param_name)
 
 
 # --------------------------------------------------------------------------
@@ -252,6 +309,30 @@ def test_group_expert_params_no_experts_is_identity():
         }
     }
     assert group_expert_params_in_metadata(md) == md
+
+
+def test_group_deepseek_experts_preserves_source_names_and_tags_roles():
+    md = {}
+    for expert in range(2):
+        prefix = f"layers.0.ffn.experts.{expert}"
+        for proj, shape in (
+            ("w1", [64, 32]),
+            ("w3", [64, 32]),
+            ("w2", [32, 64]),
+        ):
+            md[f"{prefix}.{proj}.weight"] = {
+                "shape": shape,
+                "dtype": "torch.bfloat16",
+            }
+
+    grouped = group_expert_params_in_metadata(md)
+    prefix = "layers.0.ffn.experts"
+
+    assert grouped[f"{prefix}.w1.weight"]["grouped_expert_proj"] == "gate_proj"
+    assert grouped[f"{prefix}.w3.weight"]["grouped_expert_proj"] == "up_proj"
+    assert grouped[f"{prefix}.w2.weight"]["grouped_expert_proj"] == "down_proj"
+    assert grouped[f"{prefix}.w1.weight"]["shape"] == [2, 64, 32]
+    assert grouped[f"{prefix}.w2.weight"]["shape"] == [2, 32, 64]
 
 
 # --------------------------------------------------------------------------
