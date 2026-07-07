@@ -1,0 +1,130 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Generalized DynamoGraphDeployment (DGD) for the rollout/generation tier of the
+# NeMo-RL x Megatron x ModelExpress refit path. Cluster-agnostic template:
+# replace every <PLACEHOLDER> for your environment. Apply after the MX server
+# (modelexpress-server.yaml) is up in the same namespace.
+#
+#   envsubst < rollout-dgd.template.yaml | kubectl -n <NAMESPACE> apply -f -
+#
+# Placeholders:
+#   <WORKER_IMAGE>        Dynamo+vLLM worker image with the ModelExpress client
+#                         installed (the client auto-registers its vLLM
+#                         integrations via its vllm.general_plugins entry point).
+#   <MODEL_ID>            HF model id, e.g. meta-llama/Llama-3.1-8B-Instruct
+#   <NAMESPACE>           target namespace (MX server must be reachable here)
+#   <IMAGE_PULL_SECRET>   registry pull secret name
+#   <HF_CACHE_PATH>       path to a shared HF cache (PVC mount)
+#   <WORKSPACE_PVC>       PVC name for the shared workspace / HF cache
+#   <GPU_PRODUCT>         node selector GPU product label, e.g. NVIDIA-GB200
+#   <ROCE_CLAIM_TEMPLATE> RoCE/RDMA resourceClaimTemplate name for the worker
+#
+# RDMA note: the worker pod needs its RDMA NICs attached (via your cluster's
+# mechanism — a DRA resourceClaim as below, or multi-network annotations +
+# per-NIC resource requests) plus the IPC_LOCK capability.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: nemorl-mx-rollout
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests: {cpu: "2", memory: "4Gi"}
+        limits: {cpu: "4", memory: "8Gi"}
+      extraPodSpec:
+        nodeSelector:
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        mainContainer:
+          image: <WORKER_IMAGE>
+          command: [python3, -m, dynamo.frontend]
+          args: ["--router-reset-states"]
+
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1                       # scale up for a fan-out / elastic test
+      resources:
+        requests: {gpu: "1", memory: "96Gi"}
+        limits: {gpu: "1", memory: "192Gi"}
+      extraPodSpec:
+        securityContext:
+          runAsUser: 0
+          capabilities:
+            add: [IPC_LOCK]             # required for NIXL/UCX memory pinning
+        nodeSelector:
+          nvidia.com/gpu.product: <GPU_PRODUCT>
+        tolerations:
+          - operator: Exists
+        resourceClaims:
+          - name: roce-channel
+            resourceClaimTemplateName: <ROCE_CLAIM_TEMPLATE>
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: <WORKSPACE_PVC>
+        mainContainer:
+          image: <WORKER_IMAGE>
+          volumeMounts:
+            - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+          command: [python3, -m, dynamo.vllm]
+          args:
+            - --model
+            - <MODEL_ID>
+            - --served-model-name
+            - <MODEL_ID>
+            - --tensor-parallel-size
+            - "1"
+            - --dtype
+            - bfloat16
+            - --gpu-memory-utilization
+            - "0.8"
+            - --max-model-len
+            - "4096"
+            - --enforce-eager
+            # --- MoE models ONLY: keep the standard 3-D expert layout so refit
+            #     can write raw HF expert weights back in ---
+            # - --moe-backend
+            # - triton
+            #
+            # === Weight-transfer enablement — pick ONE ===
+            #
+            # (A) Going-forward: native vLLM "mx" weight-transfer backend.
+            #     The MX client registers it via its vllm.general_plugins entry
+            #     point, so this is a launch flag (no Dynamo code change). Use
+            #     this once the worker image carries the MX client with the
+            #     backend and the Dynamo build forwards the flag.
+            # - --weight-transfer-config
+            # - '{"backend":"mx"}'
+            #
+            # (B) Current integration (validated): MX model loader + refit
+            #     receiver, enabled by --load-format mx + DYN_MX_REFIT_ENABLED.
+            - --load-format
+            - mx
+            - --model-express-url
+            - modelexpress-server.<NAMESPACE>.svc.cluster.local:8001
+          resources:
+            claims:
+              - name: roce-channel
+          env:
+            - {name: DYN_MX_REFIT_ENABLED, value: "1"}      # path (B)
+            - {name: MODEL_EXPRESS_URL, value: "modelexpress-server.<NAMESPACE>.svc.cluster.local:8001"}
+            - {name: DYN_SYSTEM_PORT, value: "9090"}
+            - {name: DYN_HEALTH_CHECK_ENABLED, value: "false"}
+            - {name: HF_HOME, value: "<HF_CACHE_PATH>"}
+            # --- transport toggles (see the run guide §6) ---
+            - {name: UCX_TLS, value: "rc,cuda_copy,sm,self,tcp"}
+            - {name: UCX_IB_GPU_DIRECT_RDMA, value: "yes"}
+            - {name: MX_RDMA_NIC_PIN, value: "auto"}        # or "stripe" for per-transfer multi-rail
+            # --- optional perf/memory levers ---
+            # - {name: MX_MEGATRON_BUFFER_LOC, value: "host"}         # pinned-CPU receive staging
+            # - {name: MX_MEGATRON_ARENA, value: "1"}                 # one-region reg for large MoE
+            # - {name: UCX_CUDA_COPY_REG_WHOLE_ALLOC, value: "off"}   # required with arena
+            # - {name: MX_LOAD_MODE, value: "direct"}                 # MDL fast loader
+      imagePullSecrets:
+        - name: <IMAGE_PULL_SECRET>
