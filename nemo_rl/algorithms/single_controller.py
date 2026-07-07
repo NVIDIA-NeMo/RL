@@ -168,6 +168,60 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     )
 
 
+def warn_if_staleness_window_below_minibatches(
+    cfg: SingleControllerConfig,
+) -> None:
+    """Warn when the staleness window is too small to cover one outer step.
+
+    ``_train_pump`` runs ``num_minibatches`` begin/finish cycles per outer
+    step, bumping ``_trainer_version`` after each ``finish_train_step``
+    (one opt.step) but refreshing generation weights (``_sync_weights``)
+    only once, at the end of the outer step. A group produced at the version
+    the step started on therefore ages by up to ``num_minibatches - 1``
+    versions before the next sync. When the effective staleness window is
+    smaller than that, such groups become unselectable mid-step — the
+    sampler skips them and ``_evict_stale_claimed`` may drop them as stale —
+    so the pump can spin or thrash instead of consuming them.
+
+    Warns rather than raises: a run may intentionally accept the resulting
+    eviction churn. Self-contained (does not assume ``cfg`` has been coerced
+    by ``__init__``) so it is unit-testable without constructing the actor.
+
+    Args:
+        cfg: SingleController config. ``strict_on_policy`` pins the effective
+            window to 0 regardless of ``max_weight_staleness_versions``.
+    """
+    effective_window = (
+        0
+        if cfg.batch_selection_strategy == "strict_on_policy"
+        else cfg.max_weight_staleness_versions
+    )
+    target_groups = cfg.target_groups_per_step or cfg.min_groups_per_batch
+    samples_per_step = target_groups * cfg.group_size
+    train_global_batch_size = cfg.train_global_batch_size or samples_per_step
+    groups_per_minibatch = train_global_batch_size // cfg.group_size
+    if groups_per_minibatch <= 0:
+        return
+    num_minibatches = target_groups // groups_per_minibatch
+    if num_minibatches > 1 and effective_window < num_minibatches - 1:
+        log.warning(
+            "max_weight_staleness_versions (effective window %d) is smaller "
+            "than num_minibatches - 1 (%d): each outer step runs %d optimizer "
+            "steps but syncs generation weights only once, at the end, so "
+            "groups produced at the version the step began on age by up to %d "
+            "versions before the next sync and become unselectable "
+            "(skipped, then evicted as stale) mid-step — the train pump may "
+            "spin or thrash. Remedy: raise max_weight_staleness_versions to "
+            "at least %d, or lower target_groups_per_step * group_size / "
+            "train_global_batch_size to reduce num_minibatches.",
+            effective_window,
+            num_minibatches - 1,
+            num_minibatches,
+            num_minibatches - 1,
+            num_minibatches - 1,
+        )
+
+
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
@@ -269,6 +323,10 @@ class SingleControllerActor:
                 f"({cfg.group_size}) so a mini-batch contains "
                 f"whole prompt groups"
             )
+        # num_minibatches > 1 runs multiple opt.steps (each bumps
+        # trainer_version) between weight syncs; warn if the staleness window
+        # cannot keep same-step groups selectable across those bumps.
+        warn_if_staleness_window_below_minibatches(cfg)
         self._sampler = StalenessSampler(cfg.max_weight_staleness_versions)
 
         # ── asyncio state ──────────────────────────────────────────────────

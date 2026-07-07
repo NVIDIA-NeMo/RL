@@ -33,6 +33,7 @@ on real hardware:
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from typing import Any
@@ -45,6 +46,7 @@ from tensordict import TensorDict
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
+    warn_if_staleness_window_below_minibatches,
 )
 from nemo_rl.algorithms.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
@@ -983,6 +985,7 @@ class TestStreamingTrainPump:
         max_weight_staleness_versions=1,
         batch_selection_strategy="staleness_window",
         max_num_epochs=None,
+        train_global_batch_size=None,
     ):
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
@@ -995,6 +998,7 @@ class TestStreamingTrainPump:
             max_weight_staleness_versions=max_weight_staleness_versions,
             batch_selection_strategy=batch_selection_strategy,
             max_num_epochs=max_num_epochs,
+            train_global_batch_size=train_global_batch_size,
         )
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
@@ -1291,3 +1295,96 @@ class TestStreamingTrainPump:
         # The stuck rows must be cleared from the partition, not leaked.
         clear_calls = ray.get(dp.get_clear_calls.remote())
         assert set(clear_calls[-1]) == {"g0_s0", "g0_s1", "g0_s2"}
+
+    def test_multi_minibatch_step_consumes_all_groups(self, ray_init):
+        """num_minibatches > 1 runs multiple opt.steps per outer step.
+
+        ``target_groups_per_step=4`` with ``train_global_batch_size=2`` and
+        ``group_size=1`` gives 2 groups per mini-batch → 2 opt.steps per
+        outer step. With a staleness window of 1, groups produced at the
+        step's starting version survive the mid-step ``trainer_version`` bump
+        (lag 1 <= window 1) and remain selectable for the second mini-batch,
+        so the step completes and every dispatched sample is consumed.
+        """
+        dp_client = FakeDataPlaneActor.remote()
+        gen = StaggeredGenWorker.remote(weight_version=0)
+        trainer = DryRunTrainer(dp_client, train_latency_s=0.0)
+        prompts = [f"{i}:0.01" for i in range(4)]
+
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            prompts=prompts,
+            max_train_steps=1,
+            max_rollout_prompts=4,
+            target_groups_per_step=4,
+            train_global_batch_size=2,  # 2 groups/mb → 2 mini-batches
+            min_groups_per_batch=1,
+            group_size=1,
+            batch_selection_strategy="staleness_window",
+            max_weight_staleness_versions=1,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=60)
+        assert result["train_steps"] == 1
+        # 2 opt.steps → 2 finish calls → trainer_version advanced twice.
+        assert result["trainer_version"] == 2
+        assert trainer.get_finish_calls() == [
+            "sc-step-000000-mb-00",
+            "sc-step-000000-mb-01",
+        ]
+        mbs = trainer.get_microbatch_calls()
+        assert len(mbs) == 4
+        dispatched_ids = set()
+        for _, ids, _ in mbs:
+            dispatched_ids.update(ids)
+        # Every dispatched sample must be cleared (one clear per opt.step).
+        clear_calls = ray.get(dp_client.get_clear_calls.remote())
+        cleared_ids = set()
+        for call in clear_calls:
+            cleared_ids.update(call)
+        assert cleared_ids == dispatched_ids
+        assert len(dispatched_ids) == 4
+
+    def test_warns_when_staleness_window_below_minibatches(self, caplog):
+        """__init__'s validation warns when the window can't cover mini-batches.
+
+        The check is factored into a module-level helper so it is unit-
+        testable without constructing the Ray actor (which would run
+        ``__init__`` remotely and make caplog useless).
+        """
+        # num_minibatches = 4 // (2 // 1) = 2; strict_on_policy pins the
+        # effective window to 0 < num_minibatches - 1 (=1) → warn.
+        cfg = SingleControllerConfig(
+            target_groups_per_step=4,
+            group_size=1,
+            train_global_batch_size=2,
+            min_groups_per_batch=1,
+            batch_selection_strategy="strict_on_policy",
+            max_weight_staleness_versions=0,
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="nemo_rl.algorithms.single_controller"
+        ):
+            warn_if_staleness_window_below_minibatches(cfg)
+        assert any("num_minibatches" in record.message for record in caplog.records), (
+            f"expected a staleness-window warning, got {caplog.records}"
+        )
+
+        # A window of 1 covers the single mid-step version bump → no warning.
+        caplog.clear()
+        cfg_ok = SingleControllerConfig(
+            target_groups_per_step=4,
+            group_size=1,
+            train_global_batch_size=2,
+            min_groups_per_batch=1,
+            batch_selection_strategy="staleness_window",
+            max_weight_staleness_versions=1,
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="nemo_rl.algorithms.single_controller"
+        ):
+            warn_if_staleness_window_below_minibatches(cfg_ok)
+        assert not any(
+            "num_minibatches" in record.message for record in caplog.records
+        ), f"unexpected staleness-window warning, got {caplog.records}"
