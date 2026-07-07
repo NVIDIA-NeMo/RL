@@ -19,4 +19,7 @@ experiments/vllm_024_upgrade/submit_performance_step10.sh submit all
 ```
 
 The launcher reads the W&B key from `WANDB_API_KEY` or from the file named by
-`WANDB_API_KEY_FILE`. It never stores the key in the repository or job logs.
+`WANDB_API_KEY_FILE`. It can also read the private `.netrc` created by the
+cluster-setup skill when `WANDB_NETRC_HOME` is set. It never stores the key in
+the repository or job logs. Set `USE_GRES=true` on OCI-HSG and AWS-DFW; keep it
+false on Pre-Tyche.

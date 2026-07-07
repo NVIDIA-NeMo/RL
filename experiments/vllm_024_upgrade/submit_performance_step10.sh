@@ -11,6 +11,8 @@ CONTAINER="${CONTAINER:-/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/nemo_
 HF_HOME="${HF_HOME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/hf_home}"
 WANDB_PROJECT="${WANDB_PROJECT:-nemorl-vllm024-perfcfg-ptyche}"
 WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/lustre/fsw/coreai_dlalgo_llm/users/sna/.secrets/wandb_api_key}"
+WANDB_NETRC_HOME="${WANDB_NETRC_HOME:-}"
+USE_GRES="${USE_GRES:-false}"
 RUN_TAG="${RUN_TAG:-vllm024-perfcfg-step10-20260707}"
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-${REPO_DIR}/experiments/vllm_024_upgrade/runs/${RUN_TAG}}"
 WALLTIME="${WALLTIME:-04:00:00}"
@@ -21,11 +23,14 @@ if [[ "${MODE}" != "dry-run" && ! -f "${CONTAINER}" ]]; then
 fi
 
 if [[ "${MODE}" == "submit" && -z "${WANDB_API_KEY:-}" ]]; then
-  if [[ ! -r "${WANDB_API_KEY_FILE}" ]]; then
+  if [[ -r "${WANDB_API_KEY_FILE}" ]]; then
+    WANDB_API_KEY="$(<"${WANDB_API_KEY_FILE}")"
+  elif [[ -n "${WANDB_NETRC_HOME}" && -r "${WANDB_NETRC_HOME}/.netrc" ]]; then
+    WANDB_API_KEY="$(awk '$1 == "password" {print $2; exit}' "${WANDB_NETRC_HOME}/.netrc")"
+  else
     echo "ERROR: set WANDB_API_KEY or create ${WANDB_API_KEY_FILE}" >&2
     exit 2
   fi
-  WANDB_API_KEY="$(<"${WANDB_API_KEY_FILE}")"
   export WANDB_API_KEY
 fi
 
@@ -100,6 +105,9 @@ submit_one() {
     --output="${run_dir}/slurm-%j.out"
     --comment=metrics
   )
+  if [[ "${USE_GRES}" == "true" ]]; then
+    sbatch_args+=(--gres=gpu:4)
+  fi
 
   case "${MODE}" in
     dry-run)

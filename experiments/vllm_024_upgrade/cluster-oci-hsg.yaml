@@ -1,0 +1,12 @@
+---
+cluster: oci-hsg-cs-001
+ssh_host: oci-hsg-cs-001-vscode-02
+user: sna
+remote_cwd: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/RL-vllm024-upgrade-20260707
+partition: batch
+account: nemotron_n3_post
+container_image: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly.sqsh
+mounts:
+  - /lustre:/lustre
+gpus_per_node: 4
+subproject: nemorl-vllm024-perfcfg

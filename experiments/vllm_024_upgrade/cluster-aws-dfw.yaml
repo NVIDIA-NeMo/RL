@@ -1,0 +1,12 @@
+---
+cluster: aws-dfw-cs-001
+ssh_host: aws-dfw-cs-001-login-01.nvidia.com
+user: sna
+remote_cwd: /lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sna/RL-vllm024-upgrade-20260707
+partition: batch_long
+account: nemotron_sw_post
+container_image: /lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sna/containers/nemo_rl_nightly.sqsh
+mounts:
+  - /lustre:/lustre
+gpus_per_node: 4
+subproject: nemorl-vllm024-perfcfg
