@@ -30,6 +30,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     HFToLocalParamMap,
     LocalParamSpec,
     RefitCtx,
+    _extract_layer_prefix,
     parse_ffn_projection,
 )
 
@@ -603,10 +604,10 @@ class VllmInternalWorkerExtension:
         }
 
         def _layer_suffix(name):
-            if name.startswith("layers."):
-                return name
-            _, marker, suffix = name.partition(".layers.")
-            return f"layers.{suffix}" if marker else None
+            layer_prefix = _extract_layer_prefix(name)
+            if layer_prefix is None:
+                return None
+            return name[len(layer_prefix) + 1 :] if layer_prefix else name
 
         # Resolve checkpoint prefixes against the live vLLM hierarchy by the
         # model-independent suffix beginning at layers.N.
