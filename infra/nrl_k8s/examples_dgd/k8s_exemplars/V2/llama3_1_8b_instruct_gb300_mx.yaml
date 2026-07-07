@@ -1,90 +1,101 @@
-# DynamoGraphDeployment for meta-llama/Llama-3.1-8B-Instruct on GB300.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Used by the V2 Megatron + Dynamo + ModelExpress smoke. The Dynamo image
-# includes the Modelexpress client and Megatron MX refit receiver, so the
-# worker starts directly without copying source from the shared workspace.
+# DynamoGraphDeployment (rollout tier) for meta-llama/Llama-3.1-8B-Instruct with
+# Megatron + Dynamo + ModelExpress refit. This is the V2 exemplar, generalized:
+# replace every <PLACEHOLDER> for your environment. Apply after the MX server
+# (../../../dynamo_mx/modelexpress-server.yaml) is up in the same namespace.
+#
+# YOU MUST PROVIDE (these are environment-specific — create them from your own
+# accounts/keys; they are intentionally NOT baked into this file):
+#
+#   <WORKER_IMAGE>        A Dynamo + vLLM worker image with the ModelExpress
+#                         client installed (auto-registers its vLLM integrations
+#                         via the vllm.general_plugins entry point). Build it
+#                         from ../../../dynamo_mx/Dockerfile on top of a Dynamo
+#                         base image, and push to a registry you control.
+#   <SECRETS_NAME>        A Kubernetes Secret holding your credentials, consumed
+#                         via envFromSecret. At minimum a Hugging Face token
+#                         (HF_TOKEN) so the worker can pull the gated Llama-3.1
+#                         weights. Create it yourself, e.g.:
+#                           kubectl -n <NAMESPACE> create secret generic <SECRETS_NAME> \
+#                             --from-literal=HF_TOKEN=<your-hf-token>
+#   <IMAGE_PULL_SECRET>   A registry pull secret for <WORKER_IMAGE>, e.g.:
+#                           kubectl -n <NAMESPACE> create secret docker-registry <IMAGE_PULL_SECRET> \
+#                             --docker-server=<registry> --docker-username=<user> --docker-password=<your-api-key>
+#   <NAMESPACE>           Target namespace (MX server must be reachable here).
+#   <WORKSPACE_PVC>       A PVC for the shared workspace / HF cache.
+#   <HF_CACHE_PATH>       Path (inside the PVC mount) for the HF cache.
+#   <GPU_PRODUCT>         GPU node-selector product label, e.g. NVIDIA-GB200.
+#   <CPU_NODE_GROUP>      Node group/label for the CPU-only Frontend pod.
+#   <ROCE_CLAIM_TEMPLATE> A RoCE/RDMA resourceClaimTemplate for the worker's NICs
+#                         (or replace the resourceClaims block with your cluster's
+#                         RDMA mechanism — e.g. multi-network annotations).
 
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
 metadata:
-  name: llama3-1-8b-instruct-gb300-mx
-  annotations:
-    nvidia.com/kai-scheduler-queue: backfill
+  name: llama3-1-8b-instruct-mx
 spec:
   services:
     Frontend:
       componentType: frontend
       replicas: 1
       resources:
-        requests:
-          cpu: "2"
-          memory: "4Gi"
-        limits:
-          cpu: "4"
-          memory: "8Gi"
+        requests: {cpu: "2", memory: "4Gi"}
+        limits: {cpu: "4", memory: "8Gi"}
       extraPodSpec:
         nodeSelector:
-          nodeGroup: customer-cpu
+          nodeGroup: <CPU_NODE_GROUP>
           kubernetes.io/arch: arm64
         tolerations:
           - operator: Exists
+        imagePullSecrets:
+          - name: <IMAGE_PULL_SECRET>
         volumes:
           - name: rl-workspace
             persistentVolumeClaim:
-              claimName: rl-workspace
+              claimName: <WORKSPACE_PVC>
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          image: <WORKER_IMAGE>
           workingDir: /workspace
           volumeMounts:
-            - mountPath: /mnt/rl-workspace
-              name: rl-workspace
-          command:
-            - python3
-            - -m
-            - dynamo.frontend
-          args:
-            - --router-reset-states
+            - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+          command: [python3, -m, dynamo.frontend]
+          args: ["--router-reset-states"]
           env:
-            - name: HF_HOME
-              value: /mnt/rl-workspace/jothomson/hf-cache
+            - {name: HF_HOME, value: <HF_CACHE_PATH>}
     VllmDecodeWorker:
       componentType: worker
-      replicas: 1
-      envFromSecret: jothomson-secrets
+      replicas: 1                       # raise for fan-out / elastic testing
+      envFromSecret: <SECRETS_NAME>     # your HF_TOKEN (and any other creds)
       resources:
-        requests:
-          gpu: "1"
-          memory: "96Gi"
-        limits:
-          gpu: "1"
-          memory: "192Gi"
+        requests: {gpu: "1", memory: "96Gi"}
+        limits: {gpu: "1", memory: "192Gi"}
       extraPodSpec:
         securityContext:
           runAsUser: 0
+          capabilities:
+            add: [IPC_LOCK]             # required for NIXL/UCX memory pinning
         nodeSelector:
-          nvidia.com/gpu.product: NVIDIA-GB300
+          nvidia.com/gpu.product: <GPU_PRODUCT>
         tolerations:
           - operator: Exists
+        imagePullSecrets:
+          - name: <IMAGE_PULL_SECRET>
         resourceClaims:
           - name: roce-channel
-            # nrl-k8s only creates RayCluster-side DRA templates. DGD workers
-            # use this pre-provisioned RoCE template, shared by existing MX
-            # single-worker DGD exemplars.
-            resourceClaimTemplateName: roce-mx-qwen3-4b
+            resourceClaimTemplateName: <ROCE_CLAIM_TEMPLATE>
         volumes:
           - name: rl-workspace
             persistentVolumeClaim:
-              claimName: rl-workspace
+              claimName: <WORKSPACE_PVC>
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          image: <WORKER_IMAGE>
           workingDir: /workspace
           volumeMounts:
-            - mountPath: /mnt/rl-workspace
-              name: rl-workspace
-          command:
-            - python3
-            - -m
-            - dynamo.vllm
+            - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+          command: [python3, -m, dynamo.vllm]
           args:
             - --model
             - meta-llama/Llama-3.1-8B-Instruct
@@ -93,7 +104,7 @@ spec:
             - --load-format
             - mx
             - --model-express-url
-            - modelexpress-server.default.svc.cluster.local:8001
+            - modelexpress-server.<NAMESPACE>.svc.cluster.local:8001
             - --tensor-parallel-size
             - "1"
             - --dtype
@@ -111,25 +122,14 @@ spec:
             claims:
               - name: roce-channel
           env:
-            - name: DYN_HEALTH_CHECK_ENABLED
-              value: "false"
-            - name: DYN_SYSTEM_PORT
-              value: "9090"
-            - name: HF_HOME
-              value: /mnt/rl-workspace/jothomson/hf-cache
-            - name: DYN_MX_REFIT_ENABLED
-              value: "1"
-            - name: MODEL_EXPRESS_URL
-              value: "modelexpress-server.default.svc.cluster.local:8001"
-            - name: UCX_TLS
-              value: "rc,cuda_copy"
-            - name: NIXL_UCX_TLS
-              value: "rc,cuda_copy"
-            - name: UCX_IB_GPU_DIRECT_RDMA
-              value: "yes"
-            - name: UCX_CUDA_COPY_DMABUF
-              value: "yes"
-            - name: UCX_LOG_LEVEL
-              value: "info"
-            - name: MX_RDMA_NIC_PIN
-              value: "auto"
+            - {name: DYN_HEALTH_CHECK_ENABLED, value: "false"}
+            - {name: DYN_SYSTEM_PORT, value: "9090"}
+            - {name: HF_HOME, value: <HF_CACHE_PATH>}
+            - {name: DYN_MX_REFIT_ENABLED, value: "1"}
+            - {name: MODEL_EXPRESS_URL, value: "modelexpress-server.<NAMESPACE>.svc.cluster.local:8001"}
+            - {name: UCX_TLS, value: "rc,cuda_copy,sm,self,tcp"}
+            - {name: NIXL_UCX_TLS, value: "rc,cuda_copy,sm,self,tcp"}
+            - {name: UCX_IB_GPU_DIRECT_RDMA, value: "yes"}
+            - {name: UCX_CUDA_COPY_DMABUF, value: "yes"}
+            - {name: UCX_LOG_LEVEL, value: "info"}
+            - {name: MX_RDMA_NIC_PIN, value: "auto"}   # or "stripe" for per-transfer multi-rail
