@@ -717,6 +717,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     final_res,
                     device=torch.device("cpu"),
                     logger=LOGGER,
+                    routed_experts_dtype=worker_self.routed_experts_dtype,
                 )
 
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
@@ -1212,6 +1213,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
                 require_complete_routed_experts=return_routed_experts,
                 return_stats=True,
+                routed_experts_dtype=self.routed_experts_dtype,
             )
             if return_routed_experts and routed_experts is None:
                 raise RuntimeError(

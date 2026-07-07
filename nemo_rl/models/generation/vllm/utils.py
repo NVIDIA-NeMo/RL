@@ -18,9 +18,41 @@ from typing import Any, Optional
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_FALLBACK_DTYPE,
+    GenerationDatumSpec,
+)
 
 R3_MISSING_ROUTE_SENTINEL = -1
+
+# The expert-id range vs carry dtype is model-constant, so it is verified on the
+# first non-empty routed-experts tensor per process and skipped afterwards.
+G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+
+def _as_routed_experts_tensor(
+    value: Any, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Convert backend routed-expert ids to the resolved carry dtype.
+
+    Guards against expert ids overflowing ``dtype`` before the narrowing cast,
+    which would otherwise wrap silently (e.g. if the expert count was
+    mis-detected when resolving the dtype).
+    """
+    global G_ROUTED_EXPERTS_RANGE_CHECKED
+    tensor = torch.as_tensor(value, device=device)
+    if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
+        max_id = int(tensor.max())
+        limit = torch.iinfo(dtype).max
+        if max_id > limit:
+            raise ValueError(
+                f"routed expert id {max_id} exceeds the resolved carry dtype "
+                f"{dtype} (max {limit}); the model's expert count was likely "
+                "mis-detected (see resolve_routed_experts_dtype in "
+                "nemo_rl.models.generation.interfaces)."
+            )
+        G_ROUTED_EXPERTS_RANGE_CHECKED = True
+    return tensor.to(dtype=dtype)
 
 
 def format_prompt_for_vllm_generation(
@@ -114,15 +146,20 @@ def pad_and_align_routed_expert_indices(
     require_complete_routed_experts: bool = False,
     allow_missing_routed_experts_fallback: bool = True,
     return_stats: bool = False,
+    routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
 ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], dict[str, int]]:
-    """Return full-sequence-aligned routed experts as ``[S, L, topk]`` int32."""
+    """Return full-sequence-aligned routed experts as ``[S, L, topk]`` in ``routed_experts_dtype``."""
     routed = getattr(completion_output, "routed_experts", None)
     prompt_routed = getattr(request_output, "prompt_routed_experts", None)
 
     if prompt_routed is not None:
-        prompt_routed = torch.as_tensor(prompt_routed, dtype=torch.int32, device=device)
+        prompt_routed = _as_routed_experts_tensor(
+            prompt_routed, device=device, dtype=routed_experts_dtype
+        )
     if routed is not None:
-        routed = torch.as_tensor(routed, dtype=torch.int32, device=device)
+        routed = _as_routed_experts_tensor(
+            routed, device=device, dtype=routed_experts_dtype
+        )
 
     if prompt_routed is not None and routed is not None:
         routed = torch.cat((prompt_routed, routed), dim=0)
@@ -180,7 +217,7 @@ def pad_and_align_routed_expert_indices(
 
     default_route = torch.arange(
         routed.shape[2],
-        dtype=torch.int32,
+        dtype=routed_experts_dtype,
         device=device,
     )
     full = (
@@ -188,7 +225,6 @@ def pad_and_align_routed_expert_indices(
         .expand(padded_length, routed.shape[1], routed.shape[2])
         .clone()
     )
-    full = full.to(dtype=torch.int32)
     routes_to_copy = min(expected_routes, routed.shape[0])
     if routes_to_copy > 0:
         full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
@@ -203,6 +239,7 @@ def attach_routed_experts_to_chat_response_choices(
     *,
     device: torch.device,
     logger: Any = None,
+    routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
 ) -> Any:
     """Attach aligned routed experts to OpenAI chat response choices."""
     outputs_by_index = {
@@ -229,6 +266,7 @@ def attach_routed_experts_to_chat_response_choices(
             device=device,
             require_complete_routed_experts=True,
             return_stats=True,
+            routed_experts_dtype=routed_experts_dtype,
         )
         if not isinstance(routed_result, tuple):
             raise RuntimeError(
@@ -254,7 +292,9 @@ def attach_routed_experts_to_chat_response_choices(
                 r3_stats["actual_routes"],
                 r3_stats["expected_routes"],
             )
-        choice.message.routed_experts = routed_experts.to(dtype=torch.int32).tolist()
+        choice.message.routed_experts = routed_experts.to(
+            dtype=routed_experts_dtype
+        ).tolist()
 
     if len(attached_choice_indices) != len(choices):
         missing_choice_indices = sorted(
