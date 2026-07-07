@@ -72,6 +72,12 @@ def test_cluster_smoke_exercises_the_ray_executor_patch() -> None:
     assert "patch_vllm_ray_env_vars" not in calls
 
 
+def test_cluster_smoke_does_not_treat_ray_actor_classes_as_plain_classes() -> None:
+    source = SMOKE_SCRIPT.read_text(encoding="utf-8")
+    assert "VllmAsyncGenerationWorker.__name__" not in source
+    assert "VllmGenerationWorker.__name__" not in source
+
+
 def test_async_worker_filters_the_vllm_024_chat_logger() -> None:
     source = ASYNC_WORKER.read_text(encoding="utf-8")
     assert '"vllm.entrypoints.openai.chat_completion.serving"' in source

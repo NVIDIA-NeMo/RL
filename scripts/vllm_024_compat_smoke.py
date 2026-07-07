@@ -76,8 +76,8 @@ def main() -> None:
             "OpenAIServingChat": OpenAIServingChat.__name__,
             "OpenAIServingRender": OpenAIServingRender.__name__,
             "ServingTokenization": ServingTokenization.__name__,
-            "VllmAsyncGenerationWorker": VllmAsyncGenerationWorker.__name__,
-            "VllmGenerationWorker": VllmGenerationWorker.__name__,
+            "VllmAsyncGenerationWorker": type(VllmAsyncGenerationWorker).__name__,
+            "VllmGenerationWorker": type(VllmGenerationWorker).__name__,
         },
         "ray_extra_env_count": len(copied_ray_env),
     }
