@@ -29,7 +29,7 @@ Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
                      GenWorker → dp_client.put_samples(...)
   _train_pump    → dp_client.claim_meta(...) → StalenessSampler
-                 → _advantage_pump(meta) → dp_client.get_samples(...)
+                 → _advantage_stage(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
                  → trainer.begin/train_microbatch/finish_train_step (split API,
@@ -359,7 +359,7 @@ class SingleControllerActor:
             return await result
         return result
 
-    # ── the four pumps (three main pumps + advantage pump) ─────────────────
+    # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
         """Dispatch prompts as concurrent coroutines, one per prompt group.
@@ -436,7 +436,7 @@ class SingleControllerActor:
         Per step:
           - Lazy ``begin_train_step`` on first ready group.
           - Per ready group: optional ``prepare_logprobs_from_meta`` →
-            ``_advantage_pump`` → ``train_microbatch_from_meta``.
+            ``_advantage_stage`` → ``train_microbatch_from_meta``.
           - End-of-step: ``finish_train_step`` →
             single ``clear_samples`` → ``_sync_weights``.
 
@@ -542,9 +542,10 @@ class SingleControllerActor:
                                     refresh_reference_logprobs=refresh_reference_logprobs,
                                 )
 
-                        # Advantage pump
-                        with self._timed("advantage_pump"):
-                            group_meta = await self._advantage_pump(group_meta)
+                        # Advantage stage — inline in the train pump, not a
+                        # standalone pump task.
+                        with self._timed("advantage_stage"):
+                            group_meta = await self._advantage_stage(group_meta)
 
                         if not step_open:
                             # gbs/mbs default to worker-side cfg when None; SC
@@ -719,7 +720,7 @@ class SingleControllerActor:
         log.info("  _sync_weights: sync done in %.3fs", elapsed)
         self._rollout_permitted.set()
 
-    async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
+    async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -904,7 +905,7 @@ def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
     value = data[field_name]
     if not isinstance(value, torch.Tensor):
         raise TypeError(
-            f"advantage_pump expected tensor field {field_name!r}; got {type(value)}"
+            f"advantage stage expected tensor field {field_name!r}; got {type(value)}"
         )
     if value.is_nested:
         return torch.nested.to_padded_tensor(value, padding=0)

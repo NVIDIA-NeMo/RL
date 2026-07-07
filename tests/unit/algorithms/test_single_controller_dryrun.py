@@ -19,7 +19,7 @@ latencies — no GPU, no real model weights required.
 
 Coverage is intentionally limited to invariants that are hard to exercise
 on real hardware:
-  - Ordering contracts: logprob refresh before advantage pump, advantages
+  - Ordering contracts: logprob refresh before advantage stage, advantages
     written to the DataPlane before train dispatch.
   - Concurrency: rollout_pump dispatches while train_pump is busy.
   - Backpressure: buffer capacity blocks rollout_pump when full;
@@ -567,7 +567,7 @@ class TestSingleControllerDryRun:
             advantage_estimator,
         )
 
-    def test_prepare_logprobs_called_before_advantage_pump(self, ray_init):
+    def test_prepare_logprobs_called_before_advantage_stage(self, ray_init):
         """SC fires prepare_logprobs_from_meta with config-driven flags.
 
         When ``advantage_policy_logprobs_field`` / ``advantage_reference_logprobs_field``
@@ -695,7 +695,7 @@ class TestSingleControllerDryRun:
             assert refresh_policy is False
             assert refresh_ref is True
 
-    def test_advantage_pump_writes_advantages_before_train(self, ray_init):
+    def test_advantage_stage_writes_advantages_before_train(self, ray_init):
         """SC computes advantages from DataPlane inputs and writes them back."""
         dp_client = FakeDataPlaneActor.remote()
         gen = DryRunGenWorker.remote(gen_latency_s=0.01)
