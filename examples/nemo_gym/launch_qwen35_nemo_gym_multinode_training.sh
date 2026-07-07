@@ -245,7 +245,7 @@ fi
 # run_local_evaluation on import and zeroes EVERY train/val reward. Mount
 # corrected copies whose import lines cannot re-match the baked repair
 # patterns. See docker/mlperf/mlperf-gym.patch (PY_R2E_RUNTIME heredoc).
-R2E_FIXES_DIR="${R2E_FIXES_DIR:-/lustre/fsw/coreai_mlperf_training/users/mfutrega/data/r2e_fixes}"
+R2E_FIXES_DIR="${R2E_FIXES_DIR:-${REPO_LOCATION}/docker/mlperf/runtime_fixes}"
 if [[ -d "${R2E_FIXES_DIR}" ]]; then
     R2E_UTILS_DIR="${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/swe_r2e_gym_setup/R2E-Gym/src/r2egym/agenthub/utils"
     MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/log.py:${R2E_UTILS_DIR}/log.py"
@@ -264,6 +264,10 @@ if [[ -d "${R2E_FIXES_DIR}" ]]; then
     # attention ([B,H,S,S] materialization -> the training-step OOMs).
     # Verified empirically (preflight3b, job 2274314): with (10,3) allowed,
     # flash-attn 2.8.1 runs hdim-256 fwd+bwd on sm103 in thd and sbhd.
+    # NOTE: the uv-cache hash in the target path is specific to this
+    # container image; with a different image, locate TE via
+    #   find /root/.cache/uv -path '*dot_product_attention/utils.py'
+    # inside the container and override the mount accordingly.
     if [[ -f "${R2E_FIXES_DIR}/te_dpa_utils.py" ]]; then
         MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/te_dpa_utils.py:/root/.cache/uv/archive-v0/oVtZpwakETGWXnnj/transformer_engine/pytorch/attention/dot_product_attention/utils.py"
     fi
