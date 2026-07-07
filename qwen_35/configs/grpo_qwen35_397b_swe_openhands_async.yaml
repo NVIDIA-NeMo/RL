@@ -202,13 +202,13 @@ policy:
     # in _clear_fp8_caches claims ~5x on the IPC path) - measure and revisit.
     # NCCL_DEBUG=WARN surfaces the underlying CUDA error code if it recurs.
     env_vars:
-      # Bug #16 test: expandable_segments (added for GB300 fragmentation) is
-      # documented incompatible with NCCL user-buffer registration; VMM pool
-      # growth during step 1 + stale buffer registrations wedging some peer
-      # pairs on step 2 matches the FR signature (one rank's alltoall
-      # transfers complete, 31 peers' wedge; NVLS=0 did not help, job
-      # 2295735). Revert to the default allocator for discrimination.
-      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      # expandable_segments is LOAD-BEARING for bringup: without it NCCL's
+      # own cudaMalloc for reverse-direction p2p channels fails at first
+      # send/recv (Cuda failure 2 'out of memory' in _end_coalescing; jobs
+      # 2269456, 2296417, 2296489 - the max_split_size_mb:512 variant died
+      # identically twice). Keep it; test the NCCL-buffer interaction via
+      # NCCL_CUMEM_ENABLE below instead.
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
       NCCL_DEBUG: "WARN"
       # Jobs 2269608/2272089 OOM'd in TE's UNFUSED dot-product-attention
       # fallback (softmax.py forward_torch_softmax), which materializes the
@@ -249,6 +249,12 @@ policy:
       # nothing; suspect NVLS/multicast interplay under steady-state
       # alltoall+p2p+SP traffic. Disable NVLS to discriminate.
       NCCL_NVLS_ENABLE: "0"
+      # Bug #16 test #4: NVLS=0 did not help (job 2295735). Next transport
+      # lever: NCCL cuMem (VMM) buffer allocation, which interacts with the
+      # torch expandable-segments VMM pool above. Silent ranks in the FR
+      # dumps stop enqueueing on ALL comms with their streams drained -
+      # consistent with a wedged registration/mapping, not scheduling.
+      NCCL_CUMEM_ENABLE: "0"
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0
