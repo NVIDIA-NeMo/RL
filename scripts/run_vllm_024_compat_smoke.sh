@@ -13,3 +13,6 @@ export UV_PROJECT_ENVIRONMENT="${VENV_DIR}"
 uv venv --allow-existing "${VENV_DIR}"
 uv sync --locked --extra vllm --no-dev
 "${VENV_DIR}/bin/python" scripts/vllm_024_compat_smoke.py
+if [[ -n "${ENGINE_SMOKE_MODEL:-}" ]]; then
+  "${VENV_DIR}/bin/python" scripts/vllm_024_engine_smoke.py
+fi

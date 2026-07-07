@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ASYNC_WORKER = ROOT / "nemo_rl/models/generation/vllm/vllm_worker_async.py"
 SMOKE_SCRIPT = ROOT / "scripts/vllm_024_compat_smoke.py"
+ENGINE_SMOKE_SCRIPT = ROOT / "scripts/vllm_024_engine_smoke.py"
 
 
 def load_tree() -> ast.Module:
@@ -76,6 +77,21 @@ def test_cluster_smoke_does_not_treat_ray_actor_classes_as_plain_classes() -> No
     source = SMOKE_SCRIPT.read_text(encoding="utf-8")
     assert "VllmAsyncGenerationWorker.__name__" not in source
     assert "VllmGenerationWorker.__name__" not in source
+
+
+def test_engine_smoke_keeps_cuda_graphs_enabled() -> None:
+    tree = ast.parse(ENGINE_SMOKE_SCRIPT.read_text(encoding="utf-8"))
+    llm_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "LLM"
+    )
+    keyword_values = {keyword.arg: keyword.value for keyword in llm_call.keywords}
+
+    assert isinstance(keyword_values["enforce_eager"], ast.Constant)
+    assert keyword_values["enforce_eager"].value is False
 
 
 def test_async_worker_filters_the_vllm_024_chat_logger() -> None:
