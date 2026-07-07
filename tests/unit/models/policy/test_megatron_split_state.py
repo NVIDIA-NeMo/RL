@@ -544,6 +544,95 @@ class TestFinish:
         kwargs = mock_module_symbols["moe"].call_args.kwargs
         assert kwargs["loss_scale"] == pytest.approx(1.0 / 6.0, rel=1e-6)
 
+    def test_loss_advertised_normalizers_applied(self, mock_module_symbols):
+        """finish scales each metric by the denominator the loss advertised:
+        TOKENS → 1/global_valid_toks, SEQUENCES → 1/global_valid_seqs,
+        NONE → unscaled, unadvertised → gradient normalization (inv_n)."""
+        from nemo_rl.algorithms.loss.interfaces import LossType, MetricNormalizer
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._test_loss_fn.metric_normalizations = {
+            "tok_metric": MetricNormalizer.TOKENS,
+            "seq_metric": MetricNormalizer.SEQUENCES,
+            "raw_metric": MetricNormalizer.NONE,
+        }
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "tok_metric": 2048.0,
+                "seq_metric": 8.0,
+                "raw_metric": 8.0,
+                "other_metric": 2048.0,
+            }
+        ]
+        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.train_microbatch("s0", _fake_batch())  # 8 seqs / 2048 valid toks
+        w.finish_train_step("s0")
+        m = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
+        assert m["tok_metric"] == pytest.approx(1.0)  # 2048 / 2048
+        assert m["seq_metric"] == pytest.approx(1.0)  # 8 / 8
+        assert m["raw_metric"] == pytest.approx(8.0)  # unscaled
+        # unadvertised → inv_n of the loss_type (TOKEN_LEVEL → 1/2048)
+        assert m["other_metric"] == pytest.approx(1.0)
+
+    def test_raw_count_metrics_not_rescaled_by_inv_n(self, mock_module_symbols):
+        """Raw-count metrics (num_valid_samples, num_unmasked_tokens) are
+        absolute counts the loss advertises as NONE; finish must leave them
+        unscaled so the downstream sum recovers the true global count
+        (PR #2683 review, F-COUNT)."""
+        from nemo_rl.algorithms.loss.interfaces import LossType, MetricNormalizer
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._test_loss_fn.metric_normalizations = {
+            "num_valid_samples": MetricNormalizer.NONE,
+            "num_unmasked_tokens": MetricNormalizer.NONE,
+        }
+        mock_module_symbols["mfb"].return_value = [
+            {"loss": 0.5, "num_valid_samples": 8.0, "num_unmasked_tokens": 2048.0}
+        ]
+        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.train_microbatch("s0", _fake_batch())  # inv_n = 1/2048
+        w.finish_train_step("s0")
+        m = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
+        assert m["num_valid_samples"] == pytest.approx(8.0)
+        assert m["num_unmasked_tokens"] == pytest.approx(2048.0)
+
+    def test_flag_keyed_normalizers_from_real_loss(self, mock_module_symbols):
+        """seq-mask-tis + token-level loss: is_oob_ratio was reduced by
+        global_valid_seqs even though the gradient normalizer is tokens.
+        The advertised mapping from a real ClippedPGLossFn must key it on
+        the TIS type, not loss_type (PR #2683 review, F-SEQ)."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+        from nemo_rl.algorithms.loss.loss_functions import (
+            ClippedPGLossConfig,
+            ClippedPGLossFn,
+        )
+
+        real_loss = ClippedPGLossFn(
+            ClippedPGLossConfig(
+                token_level_loss=True,
+                use_importance_sampling_correction=True,
+                truncated_importance_sampling_type="seq-mask-tis",
+                truncated_importance_sampling_ratio=2.0,
+                truncated_importance_sampling_ratio_min=0.5,
+            )
+        )
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w._test_loss_fn.metric_normalizations = real_loss.metric_normalizations
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 2048.0,
+                "is_oob_ratio": 8.0,
+                "sampling_importance_ratio": 2048.0,
+            }
+        ]
+        w.begin_train_step("s0", loss_fn=w._test_loss_fn)
+        w.train_microbatch("s0", _fake_batch())  # 8 seqs / 2048 valid toks
+        w.finish_train_step("s0")
+        m = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"][0]
+        assert m["loss"] == pytest.approx(1.0)  # ÷ toks (loss_type)
+        assert m["is_oob_ratio"] == pytest.approx(1.0)  # ÷ seqs, NOT toks
+        assert m["sampling_importance_ratio"] == pytest.approx(1.0)  # ÷ toks
+
 
 # ── abort_train_step ─────────────────────────────────────────────────────
 

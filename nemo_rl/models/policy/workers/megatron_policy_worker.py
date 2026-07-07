@@ -137,50 +137,6 @@ def _model_self_packs_for_cp(model: Any) -> bool:
     return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
 
 
-# Per-metric normalization tags for the split-API ``finish_train_step``
-# rescale. The sync path runs the loss with the true global_valid_*; the
-# split path runs each microbatch with global_valid_*=1 (raw sums) and
-# applies the 1/N rescale once at finish, but different metrics need
-# different N. See ClippedPGLossFn (nemo_rl/algorithms/loss/loss_functions.py)
-# and PR #2683 review on lines 789/845 for the catalog.
-#
-# - "toks": divide partial sum by global_valid_toks
-# - "seqs": divide partial sum by global_valid_seqs
-# - "loss_type": pick toks or seqs based on loss_type (matches gradient
-#                normalization). Used for ``loss`` and ``kl_penalty``.
-# - "none":  raw count metric; sum across microbatches downstream is the
-#            correct value. Do NOT scale.
-# - "skip":  handled separately (min/max guard, or stamped after the loop).
-#
-# Metrics not listed default to "loss_type" — preserves prior behavior
-# for any unknown metric and matches the canonical case (loss-derived).
-_METRIC_NORMALIZATION_KIND: dict[str, str] = {
-    # ClippedPGLossFn metrics always normalized by token count regardless
-    # of loss_type (see L281-588 in loss_functions.py):
-    "token_mult_prob_error": "toks",
-    "gen_kl_error": "toks",
-    "policy_kl_error": "toks",
-    "js_divergence_error": "toks",
-    "approx_entropy": "toks",
-    "probs_ratio": "toks",
-    "probs_ratio_clamped": "toks",
-    # Loss-type-aware metrics (use the same N as the gradient normalization):
-    "loss": "loss_type",
-    "kl_penalty": "loss_type",
-    # Flag-dependent (sequence_level_importance_ratios / sequence_level_loss_mask
-    # toggles inside the loss). For now use loss_type as the best default;
-    # the seq-mask-tis + token-level combo mismatches here. TODO: thread
-    # the flags through so finish can pick correctly.
-    "sampling_importance_ratio": "loss_type",
-    "is_oob_ratio": "loss_type",
-    # Raw counts — must NOT be scaled. The sync path passes these through
-    # via `/num_global_batches`=1 → identity, and grpo.py's downstream
-    # reducer sums across microbatches to get the global count.
-    "num_valid_samples": "none",
-    "num_unmasked_tokens": "none",
-}
-
-
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
@@ -945,10 +901,19 @@ class MegatronPolicyWorkerImpl(
     ) -> dict[str, Any]:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
+        # Losses advertise per-metric denominators (see MetricNormalizer in
+        # the loss interfaces); guard the type so non-advertising losses and
+        # auto-attributed test doubles fall back to gradient normalization
+        # for every metric.
+        metric_normalizations = getattr(loss_fn, "metric_normalizations", None)
+        if not isinstance(metric_normalizations, dict):
+            metric_normalizations = {}
+
         return {
             "step_id": step_id,
             "loss_fn": loss_fn,
             "loss_type": getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL),
+            "metric_normalizations": metric_normalizations,
             "gbs": gbs or self.cfg["train_global_batch_size"],
             "mbs": mbs or self.cfg["train_micro_batch_size"],
             "local_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
@@ -1283,9 +1248,10 @@ class MegatronPolicyWorkerImpl(
 
         # Per-mb metrics were computed with global_valid_*=1 (raw sums);
         # rescale to match what the sync path produces. Different metrics
-        # use different denominators — see _METRIC_NORMALIZATION_KIND at
-        # module top. masked_mean is linear in 1/N so per-metric scalar
-        # multiplies recover the right normalized values.
+        # use different denominators — the loss advertises them per metric
+        # (see MetricNormalizer in the loss interfaces). masked_mean is
+        # linear in 1/N so per-metric scalar multiplies recover the right
+        # normalized values.
         n_toks_safe = (
             global_valid_toks
             if global_valid_toks.item() > 0
@@ -1299,16 +1265,24 @@ class MegatronPolicyWorkerImpl(
         inv_toks = float((1.0 / n_toks_safe).item())
         inv_seqs = float((1.0 / n_seqs_safe).item())
 
+        from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
+
+        metric_normalizations: dict[str, Any] = state["metric_normalizations"]
+
         def _scale_metric(name: str, value: Any) -> Any:
-            """Apply per-metric N according to _METRIC_NORMALIZATION_KIND."""
-            kind = _METRIC_NORMALIZATION_KIND.get(name, "loss_type")
-            if kind == "none":
+            """Apply the loss-advertised per-metric denominator.
+
+            Metrics the loss did not advertise fall back to the gradient
+            normalization (the ``loss_type`` denominator).
+            """
+            kind = metric_normalizations.get(name)
+            if kind is MetricNormalizer.NONE:
                 return value
-            if kind == "toks":
+            if kind is MetricNormalizer.TOKENS:
                 scale = inv_toks
-            elif kind == "seqs":
+            elif kind is MetricNormalizer.SEQUENCES:
                 scale = inv_seqs
-            else:  # "loss_type" → same as gradient normalization
+            else:  # not advertised → same as gradient normalization
                 scale = inv_n
             return (
                 value.detach() * scale
