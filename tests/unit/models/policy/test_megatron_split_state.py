@@ -108,7 +108,7 @@ def _make_worker(loss_type):
         "megatron_cfg": {
             "empty_unused_memory_level": 0,
             "moe_per_layer_logging": False,
-            "use_linear_ce_fusion_loss": False,
+            "use_fused_linear_logprobs": False,
             # overlap_grad_reduce=False matches the production default and
             # the sync-GRPO path. finish_train_step relies on this to gate
             # the explicit start_grad_sync call.
@@ -124,6 +124,7 @@ def _make_worker(loss_type):
     w.defer_fp32_logits = False
     w.dtype = torch.float32
     w._is_reward_model = False
+    w._router_replay_enabled = False
 
     # Stash a loss_fn with the requested loss_type for tests that need one.
     w._test_loss_fn = MagicMock(loss_type=loss_type)

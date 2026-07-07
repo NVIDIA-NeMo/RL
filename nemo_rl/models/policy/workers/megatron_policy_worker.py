@@ -1089,10 +1089,19 @@ class MegatronPolicyWorkerImpl(
         placeholder_n = torch.tensor(1.0, device="cuda")
 
         draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        use_router_replay = _should_use_router_replay(
+            enabled=self._router_replay_enabled,
+            data=data,
+            stage="train",
+            require=True,
+        )
 
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
-        with self.model.no_sync():
+        with (
+            maybe_r3_trace_stage("train", enabled=use_router_replay),
+            self.model.no_sync(),
+        ):
             rerun_state_machine = get_rerun_state_machine()
             while rerun_state_machine.should_run_forward_backward(data_iterator):
                 losses_reduced = megatron_forward_backward(
@@ -1110,9 +1119,11 @@ class MegatronPolicyWorkerImpl(
                     straggler_timer=self.mcore_state.straggler_timer,
                     draft_model=self.draft_model,
                     enable_hidden_capture=draft_enabled,
-                    use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
-                        "use_linear_ce_fusion_loss", False
+                    use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
+                        "use_fused_linear_logprobs", False
                     ),
+                    use_router_replay=use_router_replay,
+                    router_replay_train=True,
                 )
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
