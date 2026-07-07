@@ -280,6 +280,15 @@ if [[ -d "${R2E_FIXES_DIR}" ]]; then
     if [[ -f "${R2E_FIXES_DIR}/fla_wy_fast.py" ]]; then
         MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/fla_wy_fast.py:/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.13/site-packages/fla/ops/gated_delta_rule/wy_fast.py"
     fi
+    # Bug #16 escalation: the single-kernel PR #1000 backport above was
+    # verified ACTIVE in job 2300969 and the step-9 deadlock still occurred
+    # (same signature). Pin EVERY fla autotuned kernel to conservative
+    # pipelining on Blackwell via a global early_config_prune hook in
+    # fla/utils.py (autotune_cache_kwargs feeds all fla @triton.autotune
+    # sites; verified no prune_configs_by collisions in fla-core 0.4.2).
+    if [[ -f "${R2E_FIXES_DIR}/fla_utils.py" ]]; then
+        MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/fla_utils.py:/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.13/site-packages/fla/utils.py"
+    fi
 fi
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
