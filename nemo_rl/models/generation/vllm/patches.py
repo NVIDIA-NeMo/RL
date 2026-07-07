@@ -94,6 +94,14 @@ def _patch_vllm_init_workers_ray(
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV",
         *(extra_env_vars or []),
     ]
+    existing_extra_env_vars = {
+        name.strip()
+        for name in os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "").split(",")
+        if name.strip()
+    }
+    os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(
+        sorted(existing_extra_env_vars | set(additional_env_vars))
+    )
     additional_env_str = ", ".join(f'"{env_var}"' for env_var in additional_env_vars)
 
     new_lines = [

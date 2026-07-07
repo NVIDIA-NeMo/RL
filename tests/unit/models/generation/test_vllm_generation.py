@@ -230,11 +230,25 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class OpenAIServingTokenization:
+    class ServingTokenization:
         instances = []
 
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
+        def __init__(
+            self,
+            models,
+            openai_serving_render,
+            *,
+            request_logger,
+            chat_template,
+            chat_template_content_format,
+        ):
+            self.kwargs = {
+                "models": models,
+                "openai_serving_render": openai_serving_render,
+                "request_logger": request_logger,
+                "chat_template": chat_template,
+                "chat_template_content_format": chat_template_content_format,
+            }
             self.instances.append(self)
 
     class VLLMValidationError(Exception):
@@ -279,7 +293,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
-        OpenAIServingTokenization=OpenAIServingTokenization,
+        ServingTokenization=ServingTokenization,
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
