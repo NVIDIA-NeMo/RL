@@ -253,10 +253,15 @@ policy:
       # hung quietly for 2h during megatron worker init/checkpoint load (job
       # 2296607; rendezvous-phase hang, outside any watchdog). Do not disable
       # cuMem on this stack.
-      # Bug #16 test #5: pin the NCCL protocol. LL/LL128 protocol wedges
-      # under mixed alltoall+p2p+SP traffic are a classic; Simple is the
-      # conservative fallback (slower, functional).
-      NCCL_PROTO: "Simple"
+      # Bug #16 test #5: NCCL_PROTO=Simple was ALSO infeasible via this
+      # env block (job 2300140): these env_vars reach only the megatron
+      # workers, but the refit collective group spans megatron AND vLLM
+      # ranks - asymmetric NCCL env inside one communicator wedges its
+      # init (127/128 ranks blocked in init_nccl_communicator; same
+      # failure explains the NCCL_CUMEM_ENABLE=0 bringup hang). Comm-wide
+      # NCCL knobs must be applied symmetrically (launcher/ray.sub level)
+      # or not at all. NVLS=0 above is safe: it does not affect that
+      # init path (verified: job 2295735 trained through it).
     checkpoint:
       async_strategy: mcore
     mtp_loss_scaling_factor: 0.0
