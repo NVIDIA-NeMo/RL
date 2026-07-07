@@ -43,6 +43,7 @@ members = [
 ]
 constraints = [
     { name = "aiohttp", specifier = ">=3.13.3" },
+    { name = "av", specifier = ">=17.1.0" },
     { name = "brotli", specifier = ">=1.2.0" },
     { name = "cbor2", specifier = ">=5.9.0" },
     { name = "cryptography", specifier = ">=46.0.6" },
@@ -61,7 +62,6 @@ constraints = [
     { name = "wheel", specifier = ">=0.46.2" },
 ]
 overrides = [
-    { name = "av", specifier = ">=17.1.0" },
     { name = "deep-ep", marker = "platform_machine == 'aarch64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" },
     { name = "deep-ep", marker = "platform_machine == 'x86_64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=29d31c095796f3c8ece47ee9cdcc167051bbeed9" },
     { name = "langchain", specifier = ">=0.3.28" },
@@ -5478,7 +5478,7 @@ dependencies = [
     { name = "aiohttp", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "anthropic", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "apache-tvm-ffi", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-    { name = "av", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "av", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
     { name = "blobfile", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "build", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "compressed-tensors", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
