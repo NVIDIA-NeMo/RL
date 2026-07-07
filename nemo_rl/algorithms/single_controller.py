@@ -202,7 +202,6 @@ class SingleControllerActor:
 
         self._trainer_version: int = 0
         self._train_steps: int = 0
-        self._step_consumed_sample_ids: list[str] = []
         self._step_log_dict: dict[str, list] = {
             "rewards": [],
             "masked_advantages": [],
@@ -382,6 +381,7 @@ class SingleControllerActor:
         while self._train_steps < grpo_cfg["max_num_steps"]:
             step_id = f"sc-step-{self._train_steps:06d}"
             groups_dispatched = 0
+            min_sample_version = None
             step_open = False
 
             with self._timer.time("total_step_time"):
@@ -453,12 +453,31 @@ class SingleControllerActor:
                             train_meta,
                         )
 
-                    groups_dispatched += num_groups
-                    self._step_consumed_sample_ids.extend(train_meta.sample_ids)
                     if train_meta.sequence_lengths:
                         self._step_log_dict["sequence_lengths"].extend(
                             int(s) for s in train_meta.sequence_lengths
                         )
+
+                    # Refresh min_sample_version
+                    curr_min_sample_version = min(
+                        t["weight_version"]
+                        for t in train_meta.tags  # type: ignore
+                    )
+                    if min_sample_version is not None:
+                        min_sample_version = min(
+                            min_sample_version, curr_min_sample_version
+                        )
+                    else:
+                        min_sample_version = curr_min_sample_version
+
+                    # Remove consumed sample_ids from the buffer
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=list(train_meta.sample_ids),
+                        partition_id=self._partition_id,
+                    )
+
+                    groups_dispatched += num_groups
 
                 if not step_open:
                     print(
@@ -471,13 +490,6 @@ class SingleControllerActor:
                     result = await asyncio.to_thread(
                         self._trainer.finish_train_step, step_id
                     )
-                consumed_ids = list(self._step_consumed_sample_ids)
-                self._step_consumed_sample_ids = []
-                await self._call_dp(
-                    "clear_samples",
-                    sample_ids=list(consumed_ids),
-                    partition_id=self._partition_id,
-                )
 
                 step_metrics = aggregate_step_metrics(result)
                 step_metrics.update(
@@ -528,13 +540,11 @@ class SingleControllerActor:
 
             # min sample version refers to the version each consumed sample was
             # generated with; lag = current trainer version - oldest sample version.
-            min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
-            lag = self._trainer_version - min_sample_version
+            lag = self._trainer_version - min_sample_version  # type: ignore
             print(
                 f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
                 f"trainer_v={self._trainer_version}  "
-                f"lag={lag}  "
-                f"batch_size={len(consumed_ids)}",
+                f"lag={lag}  ",
                 flush=True,
             )
 
