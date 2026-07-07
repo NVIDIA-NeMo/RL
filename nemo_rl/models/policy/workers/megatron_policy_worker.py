@@ -1008,17 +1008,19 @@ class MegatronPolicyWorkerImpl(
     def train_microbatch(
         self,
         data: BatchedDataDict[Any],
-    ) -> dict[str, Any]:
+    ) -> None:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
         Wrapped in ``self.model.no_sync()`` so the mcore DDP hooks
         accumulate ``param.main_grad`` locally on each rank without
         dispatching a per-call DP reduce. The single true reduce is done
-        explicitly in ``finish_train_step``.
+        explicitly in ``finish_train_step``. Returns nothing: gradients
+        land in ``param.main_grad`` and per-microbatch metrics accumulate
+        in the open-step state until ``finish_train_step`` surfaces them.
         """
         state = self._assert_step_open()
         try:
-            return self._train_microbatch_body(state, data)
+            self._train_microbatch_body(state, data)
         except Exception:
             # The body left ``grad_sync_func`` nulled when begin_train_step
             # opened the step. If we propagate without restoring, future
@@ -1037,7 +1039,7 @@ class MegatronPolicyWorkerImpl(
         self,
         state: dict[str, Any],
         data: BatchedDataDict[Any],
-    ) -> dict[str, Any]:
+    ) -> None:
         loss_fn = state["loss_fn"]
 
         # Accumulate local mask sums for the finish-time all_reduce.
@@ -1150,12 +1152,6 @@ class MegatronPolicyWorkerImpl(
             # the global_loss aggregation at finish.
             if "loss" in m:
                 state["mb_losses"].append(m["loss"])
-
-        return {
-            "local_valid_seqs_mb": float(call_local_seqs.item()),
-            "local_valid_toks_mb": float(call_local_toks.item()),
-            "num_pipeline_microbatches": int(num_microbatches),
-        }
 
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:

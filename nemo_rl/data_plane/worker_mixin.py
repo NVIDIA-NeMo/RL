@@ -552,17 +552,17 @@ class TQWorkerMixin:
     def train_microbatch_presharded(
         self,
         meta: "KVBatchMeta",
-    ) -> dict[str, Any]:
+    ) -> None:
         """Per-rank microbatch entrypoint. Fetch → packing prep → forward+backward.
 
         Gradients accumulate into ``.grad`` across calls; no
-        ``optimizer.step`` here. Returns per-microbatch metrics (loss,
-        local_valid_*); the backend folds them into the step accumulator
-        and the caller may surface them for diagnostics.
+        ``optimizer.step`` here. Returns nothing — per-microbatch metrics
+        accumulate in the backend's open-step state and surface once via
+        ``finish_train_step_presharded``.
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
-        return self.train_microbatch(  # type: ignore[attr-defined]
+        self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )
 

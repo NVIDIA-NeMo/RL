@@ -499,7 +499,7 @@ class TQPolicy(Policy):
         self,
         meta: KVBatchMeta,
         timer: Optional[Timer] = None,
-    ) -> dict[str, Any]:
+    ) -> None:
         """Dispatch one meta slice (DP-sharded) into an open train step.
 
         Named plural because one call fans out to every DP rank and the
@@ -510,7 +510,9 @@ class TQPolicy(Policy):
         Mirrors the sharding logic of :meth:`train_from_meta` but without
         a logical-batch sizing constraint: this routes ``meta`` to DP
         ranks and runs forward+backward; gradients accumulate in
-        ``.grad``. The optimizer step happens at :meth:`finish_train_step`.
+        ``.grad``. Returns nothing — per-microbatch metrics accumulate in
+        the workers' open-step state and surface once via
+        :meth:`finish_train_step`.
         """
         self._stamp_pad_seqlen(meta)
         spa, dba = self._packing_args("train_mb_tokens")
@@ -552,10 +554,9 @@ class TQPolicy(Policy):
                     "pipeline_parallel",
                 ],
             )
-        results = self.worker_group.get_all_worker_results(futures)
-        # Per-microbatch metrics: pass through DP-rank-0 by convention,
-        # backend may aggregate later if needed. Surface as-is for now.
-        return results[0] if results else {}
+        # Wait for completion only — workers return None (metrics
+        # accumulate in their open-step state until finish_train_step).
+        self.worker_group.get_all_worker_results(futures)
 
     def finish_train_step(self) -> dict[str, Any]:
         """Close an open train step: all_reduce, rescale, optimizer.step.
