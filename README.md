@@ -104,10 +104,10 @@ For detailed information on backend selection, configuration, and examples, see 
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
 - 🔜 **Resiliency** - Fault tolerance and auto-scaling support
-- 🔜 **On-Policy Distillation** - Multi-teacher and cross tokenizer distillation support
+- 🔜 **On-Policy Cross-Tokenizer Distillation** - cross-tokenizer support for the on-policy (MOPD) recipe (today MOPD is same-tokenizer; cross-tokenizer xToken is off-policy)
 - 🔜 **New Models** - Qwen3-Next, Minimax 
 
-- ✅ **X-Token Off-Policy Distillation** - Off-policy distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
+- ✅ **X-Token Off-Policy Distillation** - Distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
 - ✅ **Muon Optimizer** - Emerging Optimizer support for SFT/RL
 - ✅ **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
 - ✅ **SGLang Inference** - SGLang rollout support for optimized inference.
@@ -142,7 +142,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
     |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
-    |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Distillation Single Node](#x-token-off-policy-distillation-single-node)|[X-Token Distillation Multi-node](#x-token-off-policy-distillation-multi-node)|
+    |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Off-Policy Distillation Single Node](#x-token-off-policy-distillation-single-node)|[X-Token Off-Policy Distillation Multi-node](#x-token-off-policy-distillation-multi-node)|
     |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
@@ -201,7 +201,7 @@ uv venv</code></pre>
 > [!TIP]
 > **Smoke test:** to validate your install end-to-end more quickly, run the smoke recipe — it switches to GSM8K and caps the run at 10 steps:
 > ```sh
-> uv run examples/run_grpo.py --config examples/configs/grpo-smoke.yaml
+> uv run examples/run_grpo.py --config examples/configs/grpo_smoke.yaml
 > ```
 
 ## Prerequisites
@@ -382,6 +382,15 @@ Reference example for training to play a Sliding Puzzle Game:
 uv run python examples/run_grpo_sliding_puzzle.py
 ```
 
+## Distillation
+
+NeMo RL supports two distillation recipes:
+
+| Recipe | Multi-teacher | Asynchronous | Policy | Loss | Tokenizer | Backend |
+|---|---|---|---|---|---|---|
+| MOPD | Yes | Yes | On-policy | Top-1 sampled (RL-style) | Same | Megatron |
+| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor V2 |
+
 ## On-policy Distillation
 
 We provide an example on-policy distillation experiment using the [DeepScaler dataset](https://huggingface.co/agentica-org/DeepScaleR-1.5B-Preview).
@@ -429,7 +438,7 @@ sbatch \
 
 We support off-policy distillation between a student and a teacher that **do not share a tokenizer** (cross-tokenizer, or "x-token", distillation) — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The reference recipe trains on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
 
-You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md), including how the (student, teacher) projection matrix is built and how the loss modes work.
+You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
 
 Before launching a run, build the projection matrix for your (student, teacher) tokenizer pair:
 
@@ -446,20 +455,20 @@ Before launching a run, build the projection matrix for your (student, teacher) 
 
 ### X-Token Off-Policy Distillation Single Node
 
-To run x-token off-policy distillation on a single node using `meta-llama/Llama-3.2-1B` as the student and `Qwen/Qwen3-4B` as the teacher:
+To run x-token distillation on a single node using `meta-llama/Llama-3.2-1B` as the student and `Qwen/Qwen3-4B` as the teacher:
 
 ```sh
 uv run python examples/run_xtoken_off_policy_distillation.py \
-  loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
+  teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
 ```
 
-By default, this uses the configuration in `examples/configs/xtoken_off_policy_distillation.yaml`. The projection matrix path is the only required override. You can customize other parameters with command-line overrides. For example:
+By default, this uses the configuration in `examples/configs/xtoken_off_policy_distillation.yaml`. The projection matrix path (per teacher) is the only required override. You can customize other parameters with command-line overrides. For example:
 
 ```sh
 uv run python examples/run_xtoken_off_policy_distillation.py \
-  loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
+  teachers.0.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
   policy.model_name="meta-llama/Llama-3.2-1B" \
-  teacher.model_name="Qwen/Qwen3-4B" \
+  teachers.0.model_name="Qwen/Qwen3-4B" \
   cluster.gpus_per_node=8
 ```
 
@@ -469,7 +478,7 @@ uv run python examples/run_xtoken_off_policy_distillation.py \
 # Run from the root of NeMo RL repo
 NUM_ACTOR_NODES=2
 
-COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml loss_fn.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
+COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml teachers.0.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \

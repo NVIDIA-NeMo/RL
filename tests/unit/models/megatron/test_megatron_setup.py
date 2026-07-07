@@ -903,6 +903,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": True,
                 "bias_activation_fusion": True,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -924,6 +925,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -946,6 +948,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -966,6 +969,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
                 "fp8_cfg": {
                     "enabled": True,
                     "fp8": "e4m3",
@@ -994,6 +998,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -1018,6 +1023,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -1039,6 +1045,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -1062,6 +1069,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -1255,8 +1263,12 @@ class TestValidateTrainingConfig:
         assert model_cfg.calculate_per_token_loss is True
         assert model_cfg.perform_initialization is True
 
-    def test_moe_aux_loss_not_supported(self):
-        """Test that MoE aux loss is not supported."""
+    def test_moe_aux_loss_now_supported(self):
+        """Test that MoE aux loss with a non-zero coefficient is now allowed.
+
+        Aux-loss gradient normalization is handled via moe_grad_scale_func in
+        megatron_policy_worker.py, so the previous blocking assertion was removed.
+        """
         from nemo_rl.models.megatron.setup import _validate_training_config
 
         model_cfg = MagicMock()
@@ -1268,10 +1280,11 @@ class TestValidateTrainingConfig:
             },
         }
 
-        with pytest.raises(AssertionError) as exc_info:
-            _validate_training_config(config, model_cfg)
+        # Should not raise now that aux loss is supported.
+        _validate_training_config(config, model_cfg)
 
-        assert "MoE aux loss is currently not supported" in str(exc_info.value)
+        assert model_cfg.calculate_per_token_loss is True
+        assert model_cfg.perform_initialization is True
 
     def test_moe_aux_loss_with_zero_coeff_is_ok(self):
         """Test that MoE aux loss with zero coefficient is allowed."""
@@ -1424,6 +1437,75 @@ class TestValidateDtypeConfig:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigGlooProcessGroups:
+    """Tests for use_gloo_process_groups plumbing in _create_megatron_config."""
+
+    @staticmethod
+    def _config(**megatron_overrides):
+        megatron_cfg = {
+            "optimizer": {"use_distributed_optimizer": False},
+            "scheduler": {},
+            "distributed_data_parallel_config": {
+                "overlap_param_gather": False,
+                "grad_reduce_in_fp32": False,
+                "overlap_grad_reduce": False,
+                "data_parallel_sharding_strategy": "no_shard",
+            },
+            "train_iters": 10,
+        }
+        megatron_cfg.update(megatron_overrides)
+        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+
+    def _dist_config_passed_to_container(self, config):
+        """Return the dist config _create_megatron_config hands to ConfigContainer.
+
+        The container and sibling sub-config builders are patched so only the
+        DistributedInitConfig branch is exercised; DistributedInitConfig itself
+        stays real so the asserted attribute reflects actual behavior.
+        """
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_container,
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        return mock_container.call_args.kwargs["dist"]
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_explicit_value_is_forwarded(self, value):
+        """An explicit use_gloo_process_groups is applied to the dist config."""
+        dist_config = self._dist_config_passed_to_container(
+            self._config(use_gloo_process_groups=value)
+        )
+
+        assert dist_config.use_gloo_process_groups is value
+
+    def test_absent_key_defers_to_bridge_default(self):
+        """Omitting the key leaves the Megatron Bridge default untouched."""
+        from megatron.bridge.training.config import DistributedInitConfig
+
+        dist_config = self._dist_config_passed_to_container(self._config())
+
+        assert (
+            dist_config.use_gloo_process_groups
+            == DistributedInitConfig().use_gloo_process_groups
+        )
+
+
+@pytest.mark.mcore
 class TestValidateAndSetConfig:
     """Tests for validate_and_set_config function."""
 
@@ -1547,6 +1629,103 @@ class TestModelAndOptimizerStateNamedTuple:
 
         assert state.checkpointing_context == {"test": "context"}
         assert callable(state.param_sync_func)
+
+
+@pytest.mark.mcore
+class TestMakePolicyLikeConfig:
+    """Tests for make_policy_like_config."""
+
+    @staticmethod
+    def _minimal_value_config():
+        """Build the minimum ValueConfig shape used by make_policy_like_config."""
+        return {
+            "model_name": "test-model",
+            "tokenizer": {"name": "test-model"},
+            "train_global_batch_size": 8,
+            "train_micro_batch_size": 2,
+            "precision": "bfloat16",
+            "megatron_cfg": {
+                "enabled": True,
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+            },
+            "dynamic_batching": {"enabled": False},
+            "make_sequence_length_divisible_by": 1,
+            "max_total_sequence_length": 128,
+        }
+
+    def test_adds_policy_fields_and_megatron_defaults(self):
+        """Value configs are adapted into the policy shape with setup defaults."""
+        from nemo_rl.models.megatron.setup import make_policy_like_config
+
+        value_config = self._minimal_value_config()
+
+        policy_config = make_policy_like_config(value_config)
+
+        assert policy_config["model_name"] == value_config["model_name"]
+        assert policy_config["tokenizer"] == value_config["tokenizer"]
+        assert (
+            policy_config["logprob_batch_size"]
+            == value_config["train_micro_batch_size"]
+        )
+        assert policy_config["sequence_packing"] == {"enabled": False}
+        assert policy_config["max_grad_norm"] == 1.0
+        assert policy_config["hf_config_overrides"] == {}
+        assert policy_config["offload_optimizer_for_logprob"] is False
+        assert policy_config["generation"] is None
+
+        megatron_cfg = policy_config["megatron_cfg"]
+        assert megatron_cfg is not value_config["megatron_cfg"]
+        assert megatron_cfg["empty_unused_memory_level"] == 1
+        assert megatron_cfg["freeze_moe_router"] is False
+        assert megatron_cfg["moe_token_dispatcher_type"] == "allgather"
+        assert megatron_cfg["apply_rope_fusion"] is True
+        assert megatron_cfg["bias_activation_fusion"] is True
+        assert megatron_cfg["gradient_accumulation_fusion"] is False
+        assert megatron_cfg["use_fused_weighted_squared_relu"] is False
+        assert megatron_cfg["defer_fp32_logits"] is False
+        assert megatron_cfg["force_overwrite_initial_ckpt"] is False
+
+        assert "use_fused_weighted_squared_relu" not in value_config["megatron_cfg"]
+
+    def test_preserves_explicit_value_config_overrides(self):
+        """Explicit ValueConfig settings should win over adapter defaults."""
+        from nemo_rl.models.megatron.setup import make_policy_like_config
+
+        value_config = self._minimal_value_config()
+        value_config.update(
+            {
+                "logprob_batch_size": 4,
+                "sequence_packing": {"enabled": True, "train_mb_tokens": 256},
+                "max_grad_norm": None,
+                "hf_config_overrides": {"rope_scaling": {"rope_type": "yarn"}},
+            }
+        )
+        value_config["megatron_cfg"].update(
+            {
+                "freeze_moe_router": True,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": True,
+                "use_fused_weighted_squared_relu": True,
+            }
+        )
+
+        policy_config = make_policy_like_config(value_config)
+
+        assert policy_config["logprob_batch_size"] == 4
+        assert policy_config["sequence_packing"] == {
+            "enabled": True,
+            "train_mb_tokens": 256,
+        }
+        assert policy_config["max_grad_norm"] is None
+        assert policy_config["hf_config_overrides"] == {
+            "rope_scaling": {"rope_type": "yarn"}
+        }
+        assert policy_config["megatron_cfg"]["freeze_moe_router"] is True
+        assert policy_config["megatron_cfg"]["bias_activation_fusion"] is False
+        assert policy_config["megatron_cfg"]["gradient_accumulation_fusion"] is True
+        assert policy_config["megatron_cfg"]["use_fused_weighted_squared_relu"] is True
 
 
 @pytest.mark.mcore

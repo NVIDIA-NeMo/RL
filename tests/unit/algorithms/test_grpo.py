@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,9 +28,11 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
+    RewardPenaltyConfig,
     _apply_configured_message_level_advantage_penalties,
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
+    _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
     aggregate_rollout_metrics,
@@ -469,8 +472,57 @@ def test_resolve_message_level_advantage_penalties_requires_nemo_gym(
     master_config.grpo["invalid_tool_call_advantage"] = -5.0
 
     with patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False):
-        with pytest.raises(AssertionError, match="NeMo-Gym path"):
+        with pytest.raises(ValueError, match="NeMo-Gym path"):
             _resolve_message_level_advantage_penalties(master_config)
+
+
+def test_raise_if_reward_penalties_enabled_without_nemo_gym_noops_when_all_flags_false(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.reward_penalties = RewardPenaltyConfig()
+
+    _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=False
+    )
+
+
+@pytest.mark.parametrize(
+    "penalty_flag",
+    [
+        "penalize_duplicated_reasoning",
+        "penalize_empty_final_answer",
+        "penalize_unwanted_tokens",
+        "penalize_malformed_think_tag",
+    ],
+)
+def test_raise_if_reward_penalties_enabled_without_nemo_gym_raises(
+    mock_grpo_components,
+    penalty_flag,
+):
+    master_config = mock_grpo_components["master_config"]
+    penalty_kwargs: dict[str, Any] = {penalty_flag: True}
+    if penalty_flag == "penalize_unwanted_tokens":
+        penalty_kwargs["token_ids"] = {"unwanted": [2]}
+    master_config.reward_penalties = RewardPenaltyConfig(**penalty_kwargs)
+
+    with pytest.raises(ValueError, match="reward_penalties require the NeMo-Gym path"):
+        _raise_if_reward_penalties_enabled_without_nemo_gym(
+            master_config, enable_nemo_gym=False
+        )
+
+
+def test_raise_if_reward_penalties_enabled_without_nemo_gym_allows_nemo_gym(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.reward_penalties = RewardPenaltyConfig(
+        penalize_empty_final_answer=True
+    )
+
+    _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=True
+    )
 
 
 def test_raise_if_message_level_advantage_penalties_enabled_noops_when_unset(
@@ -1634,45 +1686,6 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
 
 
-def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    calls = []
-    kv_scales = {"layer_0": 1.0}
-
-    class DummyPolicy:
-        def offload_before_refit(self):
-            calls.append("offload_before_refit")
-
-        def broadcast_weights_for_collective(self, kv_scales=None):
-            calls.append(("broadcast_weights_for_collective", kv_scales))
-            return ["train-ok"]
-
-        def prepare_for_training(self):
-            calls.append("prepare_for_training")
-
-    class DummyGeneration:
-        def update_weights_from_collective(self):
-            calls.append("update_weights_from_collective")
-            return ["inference-ok"]
-
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    grpo_mod.refit_policy_generation(
-        policy=DummyPolicy(),
-        policy_generation=DummyGeneration(),
-        colocated_inference=False,
-        kv_scales=kv_scales,
-    )
-
-    assert calls == [
-        "offload_before_refit",
-        ("broadcast_weights_for_collective", kv_scales),
-        "update_weights_from_collective",
-        "prepare_for_training",
-    ]
-
-
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):
@@ -2547,9 +2560,9 @@ def test_gdpo_advantage_estimator_multiple_rewards():
     prompt_ids = torch.tensor([[0], [0]])
     mask = torch.ones(2, 3)
     repeated_batch = {
-        "reward1": torch.tensor([1.0, 1.0]),
-        "reward2": torch.tensor([1.0, -1.0]),
-        "reward3": torch.tensor([1.0, 0.0]),
+        "reward/correctness": torch.tensor([1.0, 1.0]),
+        "reward/integer": torch.tensor([1.0, -1.0]),
+        "reward/format": torch.tensor([1.0, 0.0]),
     }
 
     result = estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
@@ -2569,7 +2582,7 @@ def test_gdpo_advantage_estimator_single_reward():
 
     prompt_ids = torch.tensor([[0], [0]])
     mask = torch.ones(2, 3)
-    repeated_batch = {"reward1": torch.tensor([1.0, 3.0])}
+    repeated_batch = {"reward/correctness": torch.tensor([1.0, 3.0])}
 
     with pytest.raises(ValueError):
         estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)

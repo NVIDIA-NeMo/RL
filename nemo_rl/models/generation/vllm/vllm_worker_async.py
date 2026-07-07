@@ -41,7 +41,9 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.utils import (
+    attach_routed_experts_to_chat_response_choices,
     format_prompt_for_vllm_generation,
+    model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
@@ -189,6 +191,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
+        # Defaults for HTTP server state; overwritten by _create_engine()
+        # when the worker is a model owner and the model is actually loaded.
+        self.server_thread = None
+        self.base_url = None
+        self.http_server = None
+
         super().__init__(
             config,
             bundle_indices,
@@ -209,6 +217,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         self.llm = None
         self.vllm_device_ids = None
+
+    def _return_routed_experts_enabled(self) -> bool:
+        engine_args = getattr(self, "llm_async_engine_args", None)
+        if bool(getattr(engine_args, "enable_return_routed_experts", False)):
+            return True
+        return bool(
+            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
 
     def _reserve_port(self) -> None:
         """Bind and listen on a TCP socket to reserve a free port from the OS.
@@ -280,7 +296,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             # Must run after AsyncLLM.from_engine_args and before
             # _setup_vllm_server spawns the uvicorn thread.
@@ -408,6 +423,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+        if self._mtp_load_from_disk:
+            await self.llm.collective_rpc(
+                "load_mtp_weights_from_disk", args=(self.model_name,)
+            )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -662,7 +681,45 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
         # belongs on the render subclass.
-        class NeMoRLOpenAIServingChat(OpenAIServingChat):
+        worker_self = self
+
+        class NeMoRLOpenAIServingChatMixin:
+            async def chat_completion_full_generator(
+                self,
+                request,
+                result_generator,
+                *args,
+                **kwargs,
+            ):
+                final_res = None
+
+                async def capture_result_generator():
+                    nonlocal final_res
+                    async for res in result_generator:
+                        final_res = res
+                        yield res
+
+                response = await super().chat_completion_full_generator(
+                    request,
+                    capture_result_generator(),
+                    *args,
+                    **kwargs,
+                )
+                if (
+                    not worker_self._return_routed_experts_enabled()
+                    or not isinstance(response, ChatCompletionResponse)
+                    or final_res is None
+                ):
+                    return response
+
+                return attach_routed_experts_to_chat_response_choices(
+                    response,
+                    final_res,
+                    device=torch.device("cpu"),
+                    logger=LOGGER,
+                )
+
+        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
             pass
 
         class NeMoRLOpenAIServingRender(NeMoRLOpenAIServingMixin, OpenAIServingRender):
@@ -744,7 +801,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(content=generator.model_dump())
+                return JSONResponse(
+                    content=model_dump_chat_response_with_routed_experts(generator)
+                )
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
 
@@ -1062,11 +1121,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             generation_details = final_request_output.outputs[0]
             generated_token_ids = list(generation_details.token_ids)
             num_generated_tokens = len(generated_token_ids)
-            return_routed_experts = bool(
-                self.cfg.get("vllm_kwargs", {}).get(
-                    "enable_return_routed_experts", False
-                )
-            )
+            return_routed_experts = self._return_routed_experts_enabled()
 
             original_input_ids_single_row = input_ids_batch[sample_idx]
             final_output_tensor_len = current_input_actual_length + num_generated_tokens

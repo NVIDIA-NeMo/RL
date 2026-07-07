@@ -113,7 +113,7 @@ policy:
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 8
+    context_parallel_size: 16
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: true
@@ -131,6 +131,7 @@ policy:
     defer_fp32_logits: True
     moe_per_layer_logging: True
     gradient_accumulation_fusion: False
+    use_fused_weighted_squared_relu: false
 
     mtp_loss_scaling_factor: 0.3
     mtp_use_repeated_layer: true
@@ -223,7 +224,7 @@ policy:
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.75
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
       use_deep_gemm: False
@@ -245,7 +246,9 @@ policy:
           enable_thinking: true
 
     vllm_kwargs:
+      max_num_batched_tokens: 8480
       mamba_ssm_cache_dtype: "float32"
+      mamba_cache_mode: align
       compilation_config:
         cudagraph_mode: PIECEWISE
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]

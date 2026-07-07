@@ -306,6 +306,9 @@ class MegatronConfig(TypedDict):
     moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Create gloo process groups during Megatron distributed init.
+    # Omitted: use the Megatron Bridge default.
+    use_gloo_process_groups: NotRequired[bool]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
@@ -323,15 +326,18 @@ class MegatronConfig(TypedDict):
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
     gradient_accumulation_fusion: NotRequired[bool]
-    # When True, uses chunked linear cross-entropy fusion loss to compute loss
-    # directly from hidden states, avoiding materialization of the full
-    # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak
-    # GPU memory, extending the maximum trainable sequence length (e.g. from <65K
-    # to >100K tokens). Only applicable to SFT with NLLLoss.
-    use_linear_ce_fusion_loss: NotRequired[bool]
-    # Number of tokens per chunk when computing the fused linear CE loss.
+    # Enable fused weighted squared ReLU when the architecture supports it.
+    use_fused_weighted_squared_relu: NotRequired[bool]
+    # When True, computes per-token logprobs with a chunked linear cross-entropy
+    # fusion kernel directly from hidden states, avoiding materialization of the
+    # full [batch, seq_len, vocab_size] logit tensor. This significantly reduces
+    # peak GPU memory, extending the maximum trainable sequence length (e.g. from
+    # <65K to >100K tokens). Supported for SFT, DPO, and GRPO. Not compatible with
+    # context parallelism, sequence packing, or top-k/top-p training-time filtering.
+    use_fused_linear_logprobs: NotRequired[bool]
+    # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
-    linear_ce_fusion_chunk_size: NotRequired[int]
+    fused_linear_logprobs_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
