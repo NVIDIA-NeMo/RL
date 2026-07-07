@@ -128,9 +128,9 @@ class BaseVllmGenerationWorker:
                 engine_index = local_bundle_indices[0]
             else:
                 engine_index = local_bundle_indices[0] // len(local_bundle_indices)
+            port_base = int(os.environ.get("VLLM_PORT", DEFAULT_VLLM_PORT_RANGE_LOW))
             env_vars["VLLM_PORT"] = str(
-                DEFAULT_VLLM_PORT_RANGE_LOW
-                + engine_index * DEFAULT_VLLM_PORTS_PER_ENGINE
+                port_base + engine_index * DEFAULT_VLLM_PORTS_PER_ENGINE
             )
 
         # Check if this worker is part of a parallel group (TP or TP+PP).

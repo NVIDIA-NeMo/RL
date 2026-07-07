@@ -399,3 +399,26 @@ class TestVllmPortAssignment:
             + engine_group_index * DEFAULT_VLLM_PORTS_PER_ENGINE
         )
         assert env_vars["VLLM_PORT"] == str(expected_port)
+
+    def test_job_port_base_override(self, monkeypatch):
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        port_base = 22001
+        engine_group_index = 3
+        monkeypatch.setenv("VLLM_PORT", str(port_base))
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=(
+                3,
+                [3, 19, 35, 51, 2, 18, 34, 50],
+                engine_group_index,
+            ),
+        )
+
+        expected_port = port_base + engine_group_index * DEFAULT_VLLM_PORTS_PER_ENGINE
+        assert env_vars["VLLM_PORT"] == str(expected_port)
