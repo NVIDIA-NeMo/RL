@@ -14,6 +14,7 @@ UV_CACHE_DIR="${UV_CACHE_DIR:-${REPO_DIR}/.cache/uv}"
 HF_HOME="${HF_HOME:-/lustre/fsw/coreai_dlalgo_llm/users/sna/hf_home}"
 ENGINE_SMOKE_MODEL="${ENGINE_SMOKE_MODEL:-}"
 PYTEST_TARGET="${PYTEST_TARGET:-}"
+USE_GRES="${USE_GRES:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 
 SRUN_COMMAND=(
@@ -49,6 +50,9 @@ SBATCH_ARGS=(
   --output="${LOG_DIR}/slurm-%j.out"
   --comment=metrics
 )
+if [[ "${USE_GRES}" == "true" ]]; then
+  SBATCH_ARGS+=(--gres=gpu:4)
+fi
 
 if [[ "${DRY_RUN}" == "true" ]]; then
   printf '[DRY-RUN] sbatch'
