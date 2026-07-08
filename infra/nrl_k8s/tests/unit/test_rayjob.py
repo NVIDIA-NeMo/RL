@@ -94,8 +94,15 @@ class TestSpec:
         spec = got["spec"]
         assert spec["entrypoint"] == "python run.py"
         assert spec["submissionMode"] == DEFAULT_SUBMISSION_MODE
+        assert spec["suspend"] is False
         assert spec["shutdownAfterJobFinishes"] is True
         assert spec["ttlSecondsAfterFinished"] == 3600
+
+    def test_suspend_override(self) -> None:
+        got = build_rayjob_manifest(
+            _make_cluster(), _make_infra(), entrypoint="x", suspend=True
+        )
+        assert got["spec"]["suspend"] is True
 
     def test_shutdown_override(self) -> None:
         got = build_rayjob_manifest(

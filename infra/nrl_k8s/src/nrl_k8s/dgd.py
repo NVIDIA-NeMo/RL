@@ -18,7 +18,7 @@ This module owns the DGD data-flow that doesn't fit cleanly in ``manifest.py``
 
 * ``load_dgd_manifest`` resolves a path reference to a standalone DGD YAML.
 * ``build_dgd_manifest`` deep-merges overrides, applies cross-cutting
-  ``infra`` patches (image, imagePullSecrets, serviceAccount, labels), and
+  ``infra`` patches (image, imagePullSecrets, labels), and
   returns a dict ready for ``apply_dgd``.
 * ``resolve_dgd_name`` returns the post-override ``metadata.name`` so the
   orchestrator can stamp it into the recipe.
@@ -37,10 +37,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from kubernetes import client
 from kubernetes.client.exceptions import ApiException
 from omegaconf import OmegaConf
-from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from ._logging import redact
 from ._retry import with_retries
@@ -142,23 +140,6 @@ def _patch_dgd_image_pull_secrets(spec: dict[str, Any], secrets: list[str]) -> N
         eps.setdefault("imagePullSecrets", body)
 
 
-def _patch_dgd_service_account(spec: dict[str, Any], service_account: str) -> None:
-    """Default each service's pod ``serviceAccountName`` to ``service_account``.
-
-    The dynamo operator creates a per-DGD ``<dgd-name>-k8s-service-discovery``
-    SA with RBAC for ``endpointslices`` and ``dynamoworkermetadatas`` and
-    wires worker pods to it during reconciliation. Setting
-    ``serviceAccountName`` in the DGD manifest overrides that wiring, so
-    the worker pod 403s on its discovery reflectors and the DGD deadlocks
-    at state=pending. Only honour this patch if the user explicitly set a
-    ``serviceAccountName`` somewhere in the DGD spec — otherwise leave the
-    operator alone.
-    """
-    for eps in _walk_service_pod_specs(spec):
-        if "serviceAccountName" in eps:
-            eps["serviceAccountName"] = service_account
-
-
 def build_owner_reference(
     *,
     api_version: str,
@@ -169,10 +150,9 @@ def build_owner_reference(
 ) -> dict[str, Any]:
     """Build a ``metadata.ownerReferences`` entry pointing at ``kind/name``.
 
-    The DGD already has a controller (the dynamo operator), so we set
-    ``controller: false`` — we are a non-controlling owner solely to drive
-    K8s garbage collection. ``blockOwnerDeletion=False`` keeps the parent's
-    deletion fast (the kubelet GC sweeps the DGD asynchronously).
+    The reference is non-controlling and exists solely to drive Kubernetes
+    garbage collection. ``blockOwnerDeletion=False`` keeps the parent's
+    deletion fast (the Kubernetes garbage collector sweeps the DGD asynchronously).
     """
     return {
         "apiVersion": api_version,
@@ -200,9 +180,9 @@ def build_dgd_manifest(
       4. Set ``metadata.namespace = infra.namespace``.
       5. Merge ``dgd.labels`` / ``dgd.annotations`` and the ``managed-by`` label.
       6. Attach ``ownerReferences`` if provided so K8s GC cascades when the
-         owning resource (typically the training RayCluster) is deleted.
-      7. Patch cross-cutting fields (image / imagePullSecrets / serviceAccount)
-         across every service's ``extraPodSpec``.
+         owning resource (typically a RayJob or RayCluster) is deleted.
+      7. Patch cross-cutting image and imagePullSecrets fields across every
+         service's ``extraPodSpec``.
     """
     raw = load_dgd_manifest(dgd.manifest, base_dir)
 
@@ -244,8 +224,6 @@ def build_dgd_manifest(
     spec = raw["spec"]
     _patch_dgd_images(spec, infra.image)
     _patch_dgd_image_pull_secrets(spec, list(infra.imagePullSecrets))
-    if infra.serviceAccount is not None:
-        _patch_dgd_service_account(spec, infra.serviceAccount)
 
     return raw
 
@@ -274,7 +252,7 @@ def resolve_dgd_name(dgd: DynamoGraphSpec, base_dir: Path) -> str:
 
 
 def apply_dgd(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
-    """Create-or-replace a DynamoGraphDeployment. Returns the server-side object."""
+    """Create a DGD, returning an empty dict if it already exists."""
     name = manifest["metadata"]["name"]
     api = custom_objects_api()
     try:
@@ -289,54 +267,9 @@ def apply_dgd(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
         )
     except ApiException as exc:
         if exc.status == 409:
-            return with_retries(
-                lambda: api.patch_namespaced_custom_object(
-                    group=DGD_GROUP,
-                    version=DGD_VERSION,
-                    namespace=namespace,
-                    plural=DGD_PLURAL,
-                    name=name,
-                    body=manifest,
-                )
-            )
+            return {}
         exc.nrl_k8s_manifest = redact(manifest)  # type: ignore[attr-defined]
         raise
-
-
-def patch_dgd_owner_ref(
-    name: str,
-    namespace: str,
-    owner_ref: dict[str, Any],
-) -> None:
-    """Back-fill ``metadata.ownerReferences`` on an existing DGD.
-
-    Used by the ``--rayjob`` flow: we apply the DGD *before* the RayJob (so
-    the gym frontend is reachable by the time KubeRay fires the driver
-    entrypoint), but the RayCluster doesn't exist yet at that point so we
-    can't ownerRef the DGD at apply time. Once the RayCluster has been
-    created and we have its UID, we PATCH the ownerRef in.
-
-    K8s GC re-evaluates owner refs every reconcile, so adding the ref late
-    still gives the cascade-delete-when-RayCluster-disappears behavior we
-    want — the DGD just isn't anchored to its eventual owner during the
-    brief window between apply and back-fill.
-
-    Uses a strategic-merge ``application/merge-patch+json`` body so we
-    cleanly replace the (empty) ownerReferences list without disturbing the
-    rest of metadata.
-    """
-    api = custom_objects_api()
-    body = {"metadata": {"ownerReferences": [owner_ref]}}
-    with_retries(
-        lambda: api.patch_namespaced_custom_object(
-            group=DGD_GROUP,
-            version=DGD_VERSION,
-            namespace=namespace,
-            plural=DGD_PLURAL,
-            name=name,
-            body=body,
-        )
-    )
 
 
 def get_dgd(name: str, namespace: str) -> dict[str, Any] | None:
@@ -375,105 +308,6 @@ def delete_dgd(name: str, namespace: str, *, ignore_missing: bool = True) -> Non
         raise
 
 
-def _all_dgd_pods_ready(name: str, namespace: str) -> bool:
-    """True if every pod owned by the DGD has all containers Ready.
-
-    The DGD operator marks ``.status.state == successful`` once it has
-    reconciled the desired-vs-observed pod count, but that fires BEFORE
-    the pods' containers have passed their readiness probes. Without
-    this gate, ``wait_for_dgd_ready`` can return while pods are still
-    in ``ContainerCreating`` / image-pull / readiness-probe-failing,
-    and the caller hits "connection refused" on the first request.
-    """
-    core = client.CoreV1Api()
-    try:
-        pods = with_retries(
-            lambda: core.list_namespaced_pod(
-                namespace=namespace,
-                label_selector=f"nvidia.com/dynamo-graph-deployment-name={name}",
-            )
-        ).items
-    except ApiException:
-        return False
-    if not pods:
-        return False
-    for pod in pods:
-        statuses = (pod.status.container_statuses or []) if pod.status else []
-        if not statuses:
-            return False
-        if not all(cs.ready for cs in statuses):
-            return False
-    return True
-
-
-def _dgd_has_frontend(obj: dict[str, Any] | None) -> bool:
-    """True if the DGD declares at least one ``componentType: frontend`` service.
-
-    Hierarchical global-router deployments split the public ``Frontend`` into
-    its own control DGD; the pool DGDs behind it run only ``LocalRouter`` +
-    worker + ``Planner`` and never bind an OpenAI :8000 listener. For those,
-    there is no ``<name>-frontend`` Service to probe, so ``wait_for_dgd_ready``
-    must skip the HTTP gate and rely on operator state + pod readiness alone.
-    """
-    services = ((obj or {}).get("spec") or {}).get("services") or {}
-    return any(
-        isinstance(svc, dict) and svc.get("componentType") == "frontend"
-        for svc in services.values()
-    )
-
-
-def _frontend_http_ready(name: str, namespace: str) -> bool:
-    """True if the DGD frontend's :8000 listener answers a real request.
-
-    The pod can be Ready (its kubelet probe is just a TCP connect)
-    well before the python ``dynamo.frontend`` process has bound to
-    the OpenAI port. We confirm with an HTTP request.
-
-    Transport selection:
-    * In-cluster (dev pod, training pod, operator): hit the ClusterIP
-      Service directly via Kubernetes DNS — fast and reliable.
-    * Out-of-cluster: fall back to the API server's service proxy,
-      which works without a port-forward but has been observed
-      returning ``ServiceUnavailable: EOF`` against this frontend
-      even when the listener is healthy — hence the in-cluster
-      preferred path.
-    """
-    import os
-    import urllib.error
-    import urllib.request
-
-    svc_name = f"{name}-frontend"
-
-    if "KUBERNETES_SERVICE_HOST" in os.environ:
-        # In-cluster: direct ClusterIP via Kubernetes DNS.
-        url = f"http://{svc_name}.{namespace}.svc.cluster.local:8000/v1/models"
-        try:
-            with urllib.request.urlopen(url, timeout=3.0):  # noqa: S310
-                return True
-        except urllib.error.HTTPError as exc:
-            # The OpenAI endpoint may not implement model listing, but a 5xx
-            # means the frontend is not yet ready to serve generation traffic.
-            return exc.code == 404
-        except (urllib.error.URLError, OSError):
-            return False
-
-    # Out-of-cluster: API server service proxy.
-    core = client.CoreV1Api()
-    try:
-        core.connect_get_namespaced_service_proxy_with_path(
-            name=f"{svc_name}:8000",
-            namespace=namespace,
-            path="v1/models",
-        )
-        return True
-    except ApiException as e:
-        if e.status == 404:
-            return True
-        return False
-    except (Urllib3HTTPError, OSError):
-        return False
-
-
 def wait_for_dgd_ready(
     name: str,
     namespace: str,
@@ -481,41 +315,46 @@ def wait_for_dgd_ready(
     timeout_s: int = 600,
     poll_s: int = 5,
 ) -> None:
-    """Block until the DGD is operator-successful and actually serving.
+    """Block until the operator reports a current-generation Ready DGD.
 
-    Three-gate check: operator state must be ``successful``, every pod
-    owned by the DGD must have all containers Ready, and the frontend
-    service must answer an HTTP request via the API server proxy. The
-    middle and last gates close the race where the operator reports
-    success before pods are actually accepting traffic.
-
-    Raises ``RuntimeError`` immediately on ``failed`` so the caller
-    doesn't keep waiting on a dead DGD.
+    The dynamo operator derives its Ready condition from the availability of
+    the managed service Deployments. Checking the CR status avoids duplicating
+    that controller logic with pod scans or API-server HTTP proxy probes.
     """
     deadline = time.monotonic() + timeout_s
     state: str | None = None
+    generation: int | None = None
+    observed_generation: int | None = None
     while time.monotonic() < deadline:
         obj = get_dgd(name, namespace)
-        state = (obj or {}).get("status", {}).get("state")
+        metadata = (obj or {}).get("metadata") or {}
+        status = (obj or {}).get("status") or {}
+        state = status.get("state")
+        generation = metadata.get("generation")
+        observed_generation = status.get("observedGeneration")
+        conditions = status.get("conditions") or []
         if state == _DGD_STATE_TERMINAL_BAD:
-            conds = (obj or {}).get("status", {}).get("conditions", [])
             raise RuntimeError(
                 f"DynamoGraphDeployment {name} in {namespace} reached state=failed; "
-                f"conditions={conds!r}"
+                f"conditions={conditions!r}"
             )
+        ready = any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in conditions
+        )
         if (
             state == _DGD_STATE_TERMINAL_GOOD
-            and _all_dgd_pods_ready(name, namespace)
-            # Frontend-less DGDs (e.g. the pool DGDs behind a GlobalRouter) have
-            # no :8000 listener to probe — gate on operator state + pods only.
-            and (not _dgd_has_frontend(obj) or _frontend_http_ready(name, namespace))
+            and generation is not None
+            and observed_generation == generation
+            and ready
         ):
             return
         time.sleep(poll_s)
     raise TimeoutError(
-        f"DynamoGraphDeployment {name} in {namespace} never reached state="
-        f"{_DGD_STATE_TERMINAL_GOOD!r} with all pods Ready + frontend HTTP-ready "
-        f"(last seen: {state!r}) after {timeout_s}s"
+        f"DynamoGraphDeployment {name} in {namespace} never reached a "
+        f"current-generation Ready condition (last state={state!r}, "
+        f"generation={generation!r}, observedGeneration={observed_generation!r}) "
+        f"after {timeout_s}s"
     )
 
 

@@ -1,2 +1,8 @@
 batchScheduler:
   name: kai-scheduler
+
+# nrl-k8s relies on ordered RayJob reconciliation and status transitions;
+# keep the alpha asynchronous dashboard-query path explicitly disabled.
+featureGates:
+  - name: AsyncJobInfoQuery
+    enabled: false

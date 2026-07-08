@@ -220,14 +220,12 @@ def test_namespace_from_pod_serviceaccount_file(in_k8s, stub_namespace):
     assert "test-ns.svc.cluster.local" in g.dp_openai_server_base_urls[0]
 
 
-def test_namespace_fallback_warns(in_k8s, monkeypatch, tmp_path):
-    # No namespace in config and no projected file — class warns and falls back to "default".
+def test_missing_namespace_fails(in_k8s, monkeypatch, tmp_path):
     missing = tmp_path / "missing"
     monkeypatch.setattr(k8s_utils, "POD_NAMESPACE_FILE", str(missing), raising=True)
 
-    with pytest.warns(UserWarning, match="namespace"):
-        g = DynamoGeneration(cluster=None, config=_base_config())
-    assert "default.svc.cluster.local" in g.dp_openai_server_base_urls[0]
+    with pytest.raises(RuntimeError, match="dynamo_cfg.namespace"):
+        DynamoGeneration(cluster=None, config=_base_config())
 
 
 def test_lifecycle_noops(in_k8s, stub_namespace):

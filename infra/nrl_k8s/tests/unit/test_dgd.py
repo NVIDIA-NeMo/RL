@@ -17,14 +17,12 @@
 from __future__ import annotations
 
 import textwrap
-import urllib.error
 from unittest.mock import MagicMock
 
 import pytest
 from kubernetes.client.exceptions import ApiException
 from nrl_k8s import dgd, k8s
 from nrl_k8s.schema import DynamoGraphSpec, InfraConfig
-from urllib3.exceptions import ProtocolError
 
 # =============================================================================
 # Shared fixtures (mirror test_k8s.py)
@@ -249,7 +247,7 @@ class TestBuildDgdManifest:
         for svc in m["spec"]["services"].values():
             assert svc["extraPodSpec"]["imagePullSecrets"] == [{"name": "pull-secret"}]
 
-    def test_service_account_when_set(self, tmp_path):
+    def test_manifest_service_account_is_preserved(self, tmp_path):
         body = _DGD_YAML.replace(
             "extraPodSpec:\n",
             "extraPodSpec:\n        serviceAccountName: manifest-service-account\n",
@@ -260,7 +258,9 @@ class TestBuildDgdManifest:
             DynamoGraphSpec(manifest="dgd.yaml"), infra, tmp_path
         )
         for svc in m["spec"]["services"].values():
-            assert svc["extraPodSpec"]["serviceAccountName"] == "my-sa"
+            assert (
+                svc["extraPodSpec"]["serviceAccountName"] == "manifest-service-account"
+            )
 
     def test_managed_by_label(self, tmp_path):
         self._write(tmp_path)
@@ -383,12 +383,13 @@ class TestApplyDgd:
         assert kwargs["version"] == "v1alpha1"
         assert kwargs["plural"] == "dynamographdeployments"
 
-    def test_409_falls_back_to_patch(self, mock_custom_api):
+    def test_409_reuses_without_patching(self, mock_custom_api):
         mock_custom_api.create_namespaced_custom_object.side_effect = _api_exc(409)
-        mock_custom_api.patch_namespaced_custom_object.return_value = {"y": 2}
+
         out = dgd.apply_dgd(self._manifest(), "ns")
-        assert out == {"y": 2}
-        mock_custom_api.patch_namespaced_custom_object.assert_called_once()
+
+        assert out == {}
+        mock_custom_api.patch_namespaced_custom_object.assert_not_called()
 
     def test_other_error_propagates(self, mock_custom_api):
         mock_custom_api.create_namespaced_custom_object.side_effect = _api_exc(500)
@@ -418,112 +419,31 @@ class TestDeleteDgd:
             dgd.delete_dgd("foo", "ns")
 
 
-class TestPatchDgdOwnerRef:
-    OWNER = {
-        "apiVersion": "ray.io/v1",
-        "kind": "RayCluster",
-        "name": "rc",
-        "uid": "abc-123",
-        "controller": True,
-        "blockOwnerDeletion": True,
-    }
-
-    def test_happy_path(self, mock_custom_api):
-        mock_custom_api.patch_namespaced_custom_object.return_value = {"ok": True}
-        dgd.patch_dgd_owner_ref("foo", "ns", self.OWNER)
-        kwargs = mock_custom_api.patch_namespaced_custom_object.call_args.kwargs
-        assert kwargs["group"] == "nvidia.com"
-        assert kwargs["version"] == "v1alpha1"
-        assert kwargs["plural"] == "dynamographdeployments"
-        assert kwargs["namespace"] == "ns"
-        assert kwargs["name"] == "foo"
-        assert kwargs["body"] == {"metadata": {"ownerReferences": [self.OWNER]}}
-
-    def test_error_propagates(self, mock_custom_api):
-        mock_custom_api.patch_namespaced_custom_object.side_effect = _api_exc(500)
-        with pytest.raises(ApiException):
-            dgd.patch_dgd_owner_ref("foo", "ns", self.OWNER)
-
-
-class TestFrontendHttpReady:
-    @pytest.mark.parametrize(
-        ("status", "expected"),
-        [(None, True), (404, True), (500, False), (503, False)],
-    )
-    def test_in_cluster_http_response(self, monkeypatch, status, expected):
-        monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
-
-        class Response:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        def fake_urlopen(url, timeout):
-            assert url == "http://foo-frontend.ns.svc.cluster.local:8000/v1/models"
-            assert timeout == 3.0
-            if status is not None:
-                raise urllib.error.HTTPError(url, status, "error", None, None)
-            return Response()
-
-        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-
-        assert dgd._frontend_http_ready("foo", "ns") is expected
-
-    def test_in_cluster_transport_error_is_not_ready(self, monkeypatch):
-        monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.0.0.1")
-
-        def fake_urlopen(*_args, **_kwargs):
-            raise urllib.error.URLError("connection reset")
-
-        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-
-        assert dgd._frontend_http_ready("foo", "ns") is False
-
-    @pytest.mark.parametrize(("status", "expected"), [(404, True), (500, False)])
-    def test_out_of_cluster_api_response(self, monkeypatch, status, expected):
-        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
-        core = MagicMock()
-        core.connect_get_namespaced_service_proxy_with_path.side_effect = _api_exc(
-            status
-        )
-        monkeypatch.setattr(dgd.client, "CoreV1Api", lambda: core)
-
-        assert dgd._frontend_http_ready("foo", "ns") is expected
-
-    def test_out_of_cluster_transport_error_is_not_ready(self, monkeypatch):
-        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
-        core = MagicMock()
-        core.connect_get_namespaced_service_proxy_with_path.side_effect = ProtocolError(
-            "connection reset"
-        )
-        monkeypatch.setattr(dgd.client, "CoreV1Api", lambda: core)
-
-        assert dgd._frontend_http_ready("foo", "ns") is False
-
-    def test_out_of_cluster_unexpected_error_propagates(self, monkeypatch):
-        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
-        core = MagicMock()
-        core.connect_get_namespaced_service_proxy_with_path.side_effect = RuntimeError(
-            "programming error"
-        )
-        monkeypatch.setattr(dgd.client, "CoreV1Api", lambda: core)
-
-        with pytest.raises(RuntimeError, match="programming error"):
-            dgd._frontend_http_ready("foo", "ns")
-
-
 class TestWaitForDgdReady:
-    def test_returns_when_successful(self, mock_custom_api, monkeypatch):
+    def test_returns_only_for_current_generation_ready_condition(
+        self, mock_custom_api, monkeypatch
+    ):
         monkeypatch.setattr(dgd.time, "sleep", lambda _s: None)
-        monkeypatch.setattr(dgd, "_all_dgd_pods_ready", lambda *_args: True)
-        monkeypatch.setattr(dgd, "_frontend_http_ready", lambda *_args: True)
         mock_custom_api.get_namespaced_custom_object.side_effect = [
-            {"status": {"state": "pending"}},
-            {"status": {"state": "successful"}},
+            {
+                "metadata": {"generation": 2},
+                "status": {
+                    "state": "successful",
+                    "observedGeneration": 1,
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
+            },
+            {
+                "metadata": {"generation": 2},
+                "status": {
+                    "state": "successful",
+                    "observedGeneration": 2,
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                },
+            },
         ]
         dgd.wait_for_dgd_ready("foo", "ns", timeout_s=10, poll_s=0)
+        assert mock_custom_api.get_namespaced_custom_object.call_count == 2
 
     def test_raises_on_failed(self, mock_custom_api, monkeypatch):
         monkeypatch.setattr(dgd.time, "sleep", lambda _s: None)
@@ -543,5 +463,5 @@ class TestWaitForDgdReady:
             "status": {"state": "pending"}
         }
         # Use a tiny timeout so the wall clock crosses it after one iteration.
-        with pytest.raises(TimeoutError, match="never reached state="):
+        with pytest.raises(TimeoutError, match="current-generation Ready"):
             dgd.wait_for_dgd_ready("foo", "ns", timeout_s=0, poll_s=0)

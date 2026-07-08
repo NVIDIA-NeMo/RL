@@ -47,6 +47,7 @@ def build_rayjob_manifest(
     shutdown_after_finishes: bool = True,
     ttl_seconds_after_finished: int = DEFAULT_TTL_SECONDS,
     submission_mode: str = DEFAULT_SUBMISSION_MODE,
+    suspend: bool = False,
     extra_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Wrap a RayCluster inline body in a RayJob envelope.
@@ -72,6 +73,9 @@ def build_rayjob_manifest(
             ``K8sJobMode`` creates a separate K8s Job, which breaks KAI
             gang scheduling — leave this at the default unless you know
             you need the other shape.
+        suspend: Create the RayJob without provisioning its RayCluster. This
+            gives prerequisite resources a live garbage-collection owner
+            before the job is resumed.
         extra_labels: merged on top of infra + cluster labels on the RayJob.
             Used by callers to tag runs (e.g. ``disagg.nemo-rl/run-id``).
     """
@@ -107,6 +111,7 @@ def build_rayjob_manifest(
         "spec": {
             "entrypoint": entrypoint,
             "submissionMode": submission_mode,
+            "suspend": suspend,
             "shutdownAfterJobFinishes": shutdown_after_finishes,
             "ttlSecondsAfterFinished": ttl_seconds_after_finished,
             "rayClusterSpec": ray_cluster_spec,

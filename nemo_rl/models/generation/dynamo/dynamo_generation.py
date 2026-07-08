@@ -23,7 +23,6 @@ It does not create or manage the DGD.
 import asyncio
 import logging
 import time
-import warnings
 from typing import Any, AsyncGenerator, Optional
 
 import ray
@@ -400,6 +399,18 @@ def _update_dynamo_worker_weights_remote(  # pragma: no cover
     return True
 
 
+def _resolve_dgd_namespace(dynamo_cfg: DynamoCfg) -> str:
+    """Resolve the DGD namespace without guessing a potentially wrong value."""
+    namespace = dynamo_cfg.namespace or read_pod_namespace()
+    if namespace:
+        return namespace
+    raise RuntimeError(
+        "Could not determine the DynamoGraphDeployment namespace. Set "
+        "policy.generation.dynamo_cfg.namespace explicitly or enable the "
+        "Kubernetes service-account namespace projection."
+    )
+
+
 def _derive_frontend_url_from_dgd(dynamo_cfg: DynamoCfg) -> str:
     """Build the cluster-internal URL of the DGD's frontend Service.
 
@@ -408,18 +419,7 @@ def _derive_frontend_url_from_dgd(dynamo_cfg: DynamoCfg) -> str:
     """
     dgd_name = dynamo_cfg.dgd_name
     assert dgd_name is not None
-    namespace = dynamo_cfg.namespace or read_pod_namespace()
-    if not namespace:
-        # Falling back to "default" is almost certainly wrong, but failing
-        # outright would be over-eager — the cluster might be configured
-        # without serviceaccount projection.
-        warnings.warn(
-            "Could not determine pod namespace; falling back to 'default'. "
-            "Set policy.generation.dynamo_cfg.namespace explicitly to silence this.",
-            UserWarning,
-            stacklevel=3,
-        )
-        namespace = "default"
+    namespace = _resolve_dgd_namespace(dynamo_cfg)
 
     return (
         f"http://{dgd_name}-frontend.{namespace}.svc.cluster.local:"
@@ -538,7 +538,7 @@ class DynamoGeneration(GenerationInterface):
         """Build worker-discovery arguments for NCCL refit."""
         dgd_name = dynamo_cfg.dgd_name
         assert dgd_name is not None
-        namespace = dynamo_cfg.namespace or read_pod_namespace() or "default"
+        namespace = _resolve_dgd_namespace(dynamo_cfg)
         return {
             "frontend_host": f"{dgd_name}-frontend.{namespace}.svc.cluster.local",
             "frontend_port": dynamo_cfg.frontend_port,

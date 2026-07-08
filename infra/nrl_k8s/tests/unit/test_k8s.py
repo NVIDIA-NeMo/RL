@@ -126,6 +126,31 @@ class TestApplyRaycluster:
 
 
 # =============================================================================
+# apply_rayjob
+# =============================================================================
+
+
+class TestApplyRayjob:
+    _manifest = {"metadata": {"name": "job-a"}, "spec": {"suspend": True}}
+
+    def test_creates_rayjob(self, mock_custom_api) -> None:
+        mock_custom_api.create_namespaced_custom_object.return_value = {"ok": True}
+
+        assert k8s.apply_rayjob(self._manifest, "ns-a") == {"ok": True}
+
+        mock_custom_api.create_namespaced_custom_object.assert_called_once()
+        mock_custom_api.patch_namespaced_custom_object.assert_not_called()
+
+    def test_conflict_is_not_patched(self, mock_custom_api) -> None:
+        mock_custom_api.create_namespaced_custom_object.side_effect = _api_exc(409)
+
+        with pytest.raises(ApiException):
+            k8s.apply_rayjob(self._manifest, "ns-a")
+
+        mock_custom_api.patch_namespaced_custom_object.assert_not_called()
+
+
+# =============================================================================
 # delete_raycluster
 # =============================================================================
 
@@ -201,6 +226,143 @@ class TestWaitForRayJobRayClusterName:
             k8s.wait_for_rayjob_raycluster_name(
                 "rj-train", "ns-a", timeout_s=10, poll_s=0
             )
+
+
+# =============================================================================
+# suspended RayJob lifecycle
+# =============================================================================
+
+
+class TestSetRayJobSuspended:
+    def test_patches_only_suspend_field(self, mock_custom_api) -> None:
+        mock_custom_api.patch_namespaced_custom_object.return_value = {"ok": True}
+
+        result = k8s.set_rayjob_suspended("job", "ns", suspended=False)
+
+        assert result == {"ok": True}
+        kwargs = mock_custom_api.patch_namespaced_custom_object.call_args.kwargs
+        assert kwargs == {
+            "group": "ray.io",
+            "version": "v1",
+            "namespace": "ns",
+            "plural": "rayjobs",
+            "name": "job",
+            "body": {"spec": {"suspend": False}},
+        }
+
+
+class TestWaitForRayJobSuspended:
+    def test_returns_suspended_object(self, mock_custom_api, monkeypatch) -> None:
+        suspended = {
+            "metadata": {"uid": "rayjob-uid"},
+            "status": {"jobDeploymentStatus": "Suspended"},
+        }
+        mock_custom_api.get_namespaced_custom_object.side_effect = [
+            {"status": {"jobDeploymentStatus": "Suspending"}},
+            suspended,
+        ]
+        monkeypatch.setattr(k8s.time, "sleep", lambda _s: None)
+
+        assert (
+            k8s.wait_for_rayjob_suspended("job", "ns", timeout_s=10, poll_s=0)
+            == suspended
+        )
+
+    def test_rejects_terminal_state(self, mock_custom_api, monkeypatch) -> None:
+        mock_custom_api.get_namespaced_custom_object.return_value = {
+            "status": {"jobDeploymentStatus": "Failed"}
+        }
+        monkeypatch.setattr(k8s.time, "sleep", lambda _s: None)
+
+        with pytest.raises(RuntimeError, match="before it was suspended"):
+            k8s.wait_for_rayjob_suspended("job", "ns", timeout_s=10, poll_s=0)
+
+
+# =============================================================================
+# custom-object owner transitions
+# =============================================================================
+
+
+class TestReplaceCustomObjectOwnerReference:
+    NEW_OWNER = {
+        "apiVersion": "ray.io/v1",
+        "kind": "RayCluster",
+        "name": "cluster",
+        "uid": "cluster-uid",
+        "controller": False,
+        "blockOwnerDeletion": False,
+    }
+
+    def test_replaces_expected_owner_and_preserves_others(
+        self, mock_custom_api
+    ) -> None:
+        unrelated = {"apiVersion": "v1", "kind": "Other", "uid": "other-uid"}
+        old_owner = {
+            "apiVersion": "ray.io/v1",
+            "kind": "RayJob",
+            "name": "job",
+            "uid": "rayjob-uid",
+        }
+        mock_custom_api.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "resourceVersion": "17",
+                "ownerReferences": [unrelated, old_owner],
+            }
+        }
+
+        k8s.replace_custom_object_owner_reference(
+            group="nvidia.com",
+            version="v1alpha1",
+            plural="dynamographdeployments",
+            name="dgd",
+            namespace="ns",
+            expected_owner_uid="rayjob-uid",
+            owner_ref=self.NEW_OWNER,
+        )
+
+        kwargs = mock_custom_api.patch_namespaced_custom_object.call_args.kwargs
+        assert kwargs["body"] == {
+            "metadata": {
+                "ownerReferences": [unrelated, self.NEW_OWNER],
+                "resourceVersion": "17",
+            }
+        }
+
+    def test_refuses_to_adopt_resource_without_expected_owner(
+        self, mock_custom_api
+    ) -> None:
+        mock_custom_api.get_namespaced_custom_object.return_value = {
+            "metadata": {"ownerReferences": []}
+        }
+
+        with pytest.raises(RuntimeError, match="refusing to adopt"):
+            k8s.replace_custom_object_owner_reference(
+                group="nvidia.com",
+                version="v1alpha1",
+                plural="dynamographdeployments",
+                name="dgd",
+                namespace="ns",
+                expected_owner_uid="rayjob-uid",
+                owner_ref=self.NEW_OWNER,
+            )
+        mock_custom_api.patch_namespaced_custom_object.assert_not_called()
+
+    def test_noop_when_new_owner_is_already_present(self, mock_custom_api) -> None:
+        mock_custom_api.get_namespaced_custom_object.return_value = {
+            "metadata": {"ownerReferences": [self.NEW_OWNER]}
+        }
+
+        k8s.replace_custom_object_owner_reference(
+            group="nvidia.com",
+            version="v1alpha1",
+            plural="dynamographdeployments",
+            name="dgd",
+            namespace="ns",
+            expected_owner_uid="rayjob-uid",
+            owner_ref=self.NEW_OWNER,
+        )
+
+        mock_custom_api.patch_namespaced_custom_object.assert_not_called()
 
 
 # =============================================================================

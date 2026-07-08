@@ -130,6 +130,60 @@ class TestBringUpCluster:
 
 
 # =============================================================================
+# DRA prerequisites
+# =============================================================================
+
+
+class TestEnsureDraResources:
+    def test_reports_created_resources_and_attaches_owner(
+        self, monkeypatch, log
+    ) -> None:
+        log_fn, _ = log
+        loaded = _loaded()
+        owner = {
+            "apiVersion": "ray.io/v1",
+            "kind": "RayJob",
+            "name": "job",
+            "uid": "job-uid",
+            "controller": False,
+            "blockOwnerDeletion": False,
+        }
+        monkeypatch.setattr(
+            orchestrate,
+            "dra_resources_for_cluster",
+            MagicMock(
+                return_value=[
+                    ("compute-domain", "domain"),
+                    ("roce", "roce-template"),
+                ]
+            ),
+        )
+        apply_domain = MagicMock(return_value={"metadata": {"name": "domain"}})
+        apply_roce = MagicMock(return_value={})
+        monkeypatch.setattr(orchestrate.k8s, "apply_compute_domain", apply_domain)
+        monkeypatch.setattr(
+            orchestrate.k8s, "apply_resource_claim_template", apply_roce
+        )
+
+        results = orchestrate.ensure_dra_resources(
+            "training", loaded, log=log_fn, owner_ref=owner
+        )
+
+        assert results == [
+            orchestrate.EnsureDraResourceResult(
+                kind="compute-domain", name="domain", created=True
+            ),
+            orchestrate.EnsureDraResourceResult(
+                kind="roce", name="roce-template", created=False
+            ),
+        ]
+        domain_manifest = apply_domain.call_args.args[0]
+        roce_manifest = apply_roce.call_args.args[0]
+        assert domain_manifest["metadata"]["ownerReferences"] == [owner]
+        assert roce_manifest["metadata"]["ownerReferences"] == [owner]
+
+
+# =============================================================================
 # submit_daemon — status-driven branching
 # =============================================================================
 
@@ -740,38 +794,34 @@ class TestEnsureDgd:
         wait.assert_called_once()
         assert any("already exists and matches" in ln for ln in lines)
 
-    def test_reused_dgd_reconciles_requested_owner_ref(
-        self, tmp_path, monkeypatch, log
-    ) -> None:
-        log_fn, lines = log
+    def test_reused_dgd_is_never_adopted(self, tmp_path, monkeypatch, log) -> None:
+        log_fn, _ = log
         loaded = _loaded_with_dgd(tmp_path)
         owner_ref = {
             "apiVersion": "ray.io/v1",
-            "kind": "RayCluster",
-            "name": "rc-train",
+            "kind": "RayJob",
+            "name": "new-job",
             "uid": "new-uid",
             "controller": False,
             "blockOwnerDeletion": False,
         }
         rendered = orchestrate.dgd_mod.build_dgd_manifest(
-            loaded.infra.dynamo["serving"],
-            loaded.infra,
-            tmp_path,
-            owner_ref=owner_ref,
+            loaded.infra.dynamo["serving"], loaded.infra, tmp_path
         )
+        existing_owner = {**owner_ref, "name": "existing-job", "uid": "old-uid"}
         live = {
             "metadata": {
                 "name": "from-disk",
                 "labels": {"nrl-k8s/owner": orchestrate.get_username()},
-                "ownerReferences": [{**owner_ref, "uid": "old-uid"}],
+                "ownerReferences": [existing_owner],
             },
             "spec": rendered["spec"],
         }
         monkeypatch.setattr(
             orchestrate.dgd_mod, "get_dgd", MagicMock(return_value=live)
         )
-        patch_owner = MagicMock()
-        monkeypatch.setattr(orchestrate.dgd_mod, "patch_dgd_owner_ref", patch_owner)
+        apply = MagicMock()
+        monkeypatch.setattr(orchestrate.dgd_mod, "apply_dgd", apply)
         monkeypatch.setattr(orchestrate.dgd_mod, "wait_for_dgd_ready", MagicMock())
 
         result = orchestrate.ensure_dgd(
@@ -779,46 +829,8 @@ class TestEnsureDgd:
         )
 
         assert result.created is False
-        patch_owner.assert_called_once_with("from-disk", "ns-a", owner_ref)
-        assert any("reconciling ownerReference" in line for line in lines)
-
-    def test_reused_dgd_does_not_repatch_matching_owner_ref(
-        self, tmp_path, monkeypatch, log
-    ) -> None:
-        log_fn, _ = log
-        loaded = _loaded_with_dgd(tmp_path)
-        owner_ref = {
-            "apiVersion": "ray.io/v1",
-            "kind": "RayCluster",
-            "name": "rc-train",
-            "uid": "current-uid",
-            "controller": False,
-            "blockOwnerDeletion": False,
-        }
-        rendered = orchestrate.dgd_mod.build_dgd_manifest(
-            loaded.infra.dynamo["serving"],
-            loaded.infra,
-            tmp_path,
-            owner_ref=owner_ref,
-        )
-        live = {
-            "metadata": {
-                "name": "from-disk",
-                "labels": {"nrl-k8s/owner": orchestrate.get_username()},
-                "ownerReferences": [owner_ref],
-            },
-            "spec": rendered["spec"],
-        }
-        monkeypatch.setattr(
-            orchestrate.dgd_mod, "get_dgd", MagicMock(return_value=live)
-        )
-        patch_owner = MagicMock()
-        monkeypatch.setattr(orchestrate.dgd_mod, "patch_dgd_owner_ref", patch_owner)
-        monkeypatch.setattr(orchestrate.dgd_mod, "wait_for_dgd_ready", MagicMock())
-
-        orchestrate.ensure_dgd("serving", loaded, log=log_fn, owner_ref=owner_ref)
-
-        patch_owner.assert_not_called()
+        assert live["metadata"]["ownerReferences"] == [existing_owner]
+        apply.assert_not_called()
 
     def test_recreate_replaces_drifted(self, tmp_path, monkeypatch, log) -> None:
         log_fn, _ = log
@@ -868,53 +880,6 @@ class TestDeleteDgd:
         orchestrate.delete_dgd("serving", loaded, log=log_fn)
 
         delete.assert_called_once_with("my-dgd", "ns-a")
-
-
-class TestInjectDynamoIntoRecipe:
-    def test_single_dgd_injects_backend_and_name(self, tmp_path, log) -> None:
-        log_fn, _ = log
-        loaded = _loaded_with_dgd(tmp_path)
-        orchestrate._inject_dynamo_into_recipe(loaded, log=log_fn)
-        assert loaded.recipe.policy.generation.backend == "dynamo"
-        assert loaded.recipe.policy.generation.dynamo_cfg.dgd_name == "from-disk"
-
-    def test_explicit_name_lands_in_recipe(self, tmp_path, log) -> None:
-        log_fn, _ = log
-        loaded = _loaded_with_dgd(tmp_path, name="override-name")
-        orchestrate._inject_dynamo_into_recipe(loaded, log=log_fn)
-        assert loaded.recipe.policy.generation.dynamo_cfg.dgd_name == "override-name"
-
-    def test_no_dgd_is_noop(self, tmp_path, log) -> None:
-        log_fn, _ = log
-        loaded = _loaded()  # no dynamo section
-        from omegaconf import OmegaConf
-
-        before = OmegaConf.to_yaml(loaded.recipe)
-        orchestrate._inject_dynamo_into_recipe(loaded, log=log_fn)
-        assert OmegaConf.to_yaml(loaded.recipe) == before
-
-    def test_multiple_dgds_no_injection(self, tmp_path, log) -> None:
-        from omegaconf import OmegaConf
-
-        log_fn, _ = log
-        manifest_path = tmp_path / "dgd.yaml"
-        manifest_path.write_text(_DGD_MANIFEST)
-        payload = _infra_payload()
-        payload["dynamo"] = {
-            "a": {"manifest": "dgd.yaml", "name": "name-a"},
-            "b": {"manifest": "dgd.yaml", "name": "name-b"},
-        }
-        infra = InfraConfig.model_validate(payload)
-        loaded = LoadedConfig(
-            recipe=OmegaConf.create({"policy": {"generation": {}}}),
-            infra=infra,
-            source_path=tmp_path / "recipe.yaml",
-            infra_source_path=tmp_path / "infra.yaml",
-        )
-
-        before = OmegaConf.to_yaml(loaded.recipe)
-        orchestrate._inject_dynamo_into_recipe(loaded, log=log_fn)
-        assert OmegaConf.to_yaml(loaded.recipe) == before
 
 
 class TestRunInvokesDgds:

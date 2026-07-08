@@ -20,7 +20,6 @@ passed to :func:`nrl_k8s.config.load_recipe_with_infra` as an override.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sys
 from dataclasses import dataclass
@@ -784,7 +783,7 @@ def _run_rayjob(
     dry_run: bool,
     cli_wait: bool | None,
 ) -> None:
-    """``nrl-k8s run --rayjob`` path. KubeRay owns the RayCluster lifecycle."""
+    """``nrl-k8s run --rayjob`` path. KubeRay owns the run lifecycle."""
     from . import dgd as dgd_mod
     from . import k8s, orchestrate
     from . import submit as submit_mod
@@ -799,16 +798,14 @@ def _run_rayjob(
         name=name,
         shutdown_after_finishes=shutdown_after,
         ttl_seconds_after_finished=ttl_seconds,
+        suspend=True,
     )
     job_name = manifest["metadata"]["name"]
     namespace = loaded.infra.namespace
 
     if dry_run:
         click.echo(yaml.safe_dump(manifest, sort_keys=False).rstrip())
-        # Render any declared DGDs too so the user sees the full ephemeral
-        # bring-up plan. Owner refs aren't filled in (no UID yet on a dry-run);
-        # the live path stamps them at apply time.
-        for dgd_key, dgd_spec in loaded.infra.dynamo.items():
+        for dgd_spec in loaded.infra.dynamo.values():
             click.echo("---")
             dgd_manifest = dgd_mod.build_dgd_manifest(
                 dgd_spec, loaded.infra, loaded.infra_source_path.parent
@@ -822,96 +819,120 @@ def _run_rayjob(
     _check_stale_rayjobs(loaded, namespace)
     _check_head_svc_collision(job_name, namespace, creating="rayjob")
 
-    orchestrate.ensure_dra_resources("training", loaded, log=click.echo)
-
-    # DGDs go up BEFORE the RayJob: KubeRay starts submitting the driver
-    # entrypoint as soon as the RayCluster head is Ready, but the gym's
-    # first request races whatever inference resources we asked for. By
-    # ensuring DGDs are already serving before the RayJob is applied,
-    # the entrypoint can hit the frontend immediately. We back-fill the
-    # ownerReference pointing at the RayCluster once it exists (see below)
-    # so K8s GC still cascades when the RayCluster is shut down.
-    created_dgd_names: list[str] = []
-    for dgd_key in loaded.infra.dynamo:
-        try:
-            result = orchestrate.ensure_dgd(
-                dgd_key, loaded, log=click.echo, owner_ref=None
+    click.echo(f"[run --rayjob] applying suspended RayJob {job_name} in {namespace}")
+    rayjob_created = False
+    try:
+        k8s.apply_rayjob(manifest, namespace)
+        rayjob_created = True
+        suspended_obj = k8s.wait_for_rayjob_suspended(job_name, namespace)
+        rayjob_uid = (suspended_obj.get("metadata") or {}).get("uid")
+        if not rayjob_uid:
+            raise RuntimeError(
+                f"suspended RayJob {job_name} has no metadata.uid; "
+                "cannot safely own prerequisites"
             )
-        except Exception as exc:  # noqa: BLE001
-            # Roll back DGDs created by this invocation. Reused DGDs belong to
-            # an existing lifecycle and must remain untouched.
-            for stranded in created_dgd_names:
-                click.echo(
-                    f"[dynamo] rolling back DGD {stranded} after apply failure",
-                    err=True,
-                )
-                with contextlib.suppress(Exception):
-                    dgd_mod.delete_dgd(stranded, namespace)
-            _explain_and_exit(exc, context=f"dynamo.{dgd_key} apply failed")
-        else:
+
+        rayjob_owner = dgd_mod.build_owner_reference(
+            api_version="ray.io/v1",
+            kind="RayJob",
+            name=job_name,
+            uid=rayjob_uid,
+        )
+        dra_results = orchestrate.ensure_dra_resources(
+            "training", loaded, log=click.echo, owner_ref=rayjob_owner
+        )
+        created_dra = [result for result in dra_results if result.created]
+
+        created_dgd_names: list[str] = []
+        for dgd_key in loaded.infra.dynamo:
+            result = orchestrate.ensure_dgd(
+                dgd_key, loaded, log=click.echo, owner_ref=rayjob_owner
+            )
             if result.created:
                 created_dgd_names.append(result.name)
 
-    click.echo(f"[run --rayjob] applying RayJob {job_name} in {namespace}")
-    try:
-        k8s.apply_rayjob(manifest, namespace)
+        click.echo(f"[run --rayjob] resuming RayJob {job_name}")
+        k8s.set_rayjob_suspended(job_name, namespace, suspended=False)
     except Exception as exc:  # noqa: BLE001
-        # RayJob never made it — clean up the DGDs we just stood up so
-        # the next attempt isn't blocked by a stale name collision.
-        for stranded in created_dgd_names:
-            click.echo(
-                f"[dynamo] rolling back DGD {stranded} after RayJob apply failure",
-                err=True,
-            )
-            with contextlib.suppress(Exception):
-                dgd_mod.delete_dgd(stranded, namespace)
-        _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
+        if rayjob_created:
+            try:
+                k8s.delete_rayjob(job_name, namespace)
+            except ApiException as cleanup_exc:
+                click.echo(
+                    f"[run --rayjob] warning: failed to delete RayJob {job_name} "
+                    f"after setup failure (status={cleanup_exc.status})",
+                    err=True,
+                )
+        _explain_and_exit(exc, context=f"rayjob {job_name} setup failed")
 
-    # Back-fill the ownerReference only on DGDs created for this RayJob.
-    # Reused DGDs may be persistent or shared and must not be adopted by an
-    # ephemeral RayCluster.
-    if created_dgd_names:
+    owned_resources: list[tuple[str, str, str, str]] = [
+        (dgd_mod.DGD_GROUP, dgd_mod.DGD_VERSION, dgd_mod.DGD_PLURAL, dgd_name)
+        for dgd_name in created_dgd_names
+    ]
+    for result in created_dra:
+        if result.kind == "compute-domain":
+            owned_resources.append(
+                (
+                    k8s.COMPUTE_DOMAIN_GROUP,
+                    k8s.COMPUTE_DOMAIN_VERSION,
+                    k8s.COMPUTE_DOMAIN_PLURAL,
+                    result.name,
+                )
+            )
+        else:
+            owned_resources.append(
+                (k8s.RCT_GROUP, k8s.RCT_VERSION, k8s.RCT_PLURAL, result.name)
+            )
+
+    if owned_resources:
         click.echo(
             f"[run --rayjob] waiting for RayJob {job_name} to spawn its RayCluster ..."
         )
         try:
             rc_name = k8s.wait_for_rayjob_raycluster_name(job_name, namespace)
-        except TimeoutError as exc:
-            _explain_and_exit(exc, context=f"rayjob {job_name} RayCluster lookup")
-        rc_obj = k8s.get_raycluster(rc_name, namespace)
-        rc_uid = (rc_obj or {}).get("metadata", {}).get("uid")
-        if not rc_uid:
-            _cli_error(
-                f"RayCluster {rc_name} has no metadata.uid yet; cannot anchor "
-                f"DGD ownerReferences. Try again in a few seconds."
+            rc_obj = k8s.get_raycluster(rc_name, namespace)
+            rc_uid = (rc_obj or {}).get("metadata", {}).get("uid")
+            if not rc_uid:
+                raise RuntimeError(f"RayCluster {rc_name} has no metadata.uid")
+        except (ApiException, RuntimeError, TimeoutError) as exc:
+            click.echo(
+                f"[run --rayjob] warning: could not resolve the RayCluster owner "
+                f"({exc}); prerequisites remain owned by RayJob {job_name} and "
+                "will be removed by its TTL",
+                err=True,
             )
-        owner = dgd_mod.build_owner_reference(
-            api_version="ray.io/v1",
-            kind="RayCluster",
-            name=rc_name,
-            uid=rc_uid,
-        )
-        for dgd_name in created_dgd_names:
-            try:
-                dgd_mod.patch_dgd_owner_ref(dgd_name, namespace, owner)
-            except ApiException as exc:
-                # Non-fatal: the DGD is serving and the RayJob is running.
-                # Worst case the user has to `kubectl delete dgd <name>`
-                # after the run if cascade-delete didn't fire. Surface
-                # loudly so it's not silently lost.
-                click.echo(
-                    f"[dynamo] warning: failed to back-fill ownerRef on DGD "
-                    f"{dgd_name} (status={exc.status}); cascade-delete on "
-                    f"RayCluster shutdown will not fire — clean up manually.",
-                    err=True,
-                )
+        else:
+            raycluster_owner = dgd_mod.build_owner_reference(
+                api_version="ray.io/v1",
+                kind="RayCluster",
+                name=rc_name,
+                uid=rc_uid,
+            )
+            for group, version, plural, resource_name in owned_resources:
+                try:
+                    k8s.replace_custom_object_owner_reference(
+                        group=group,
+                        version=version,
+                        plural=plural,
+                        name=resource_name,
+                        namespace=namespace,
+                        expected_owner_uid=rayjob_uid,
+                        owner_ref=raycluster_owner,
+                    )
+                except (ApiException, RuntimeError) as exc:
+                    click.echo(
+                        f"[run --rayjob] warning: could not reparent "
+                        f"{plural}/{resource_name} to RayCluster {rc_name} "
+                        f"({exc}); it remains owned by RayJob {job_name} and "
+                        "will be removed by its TTL",
+                        err=True,
+                    )
 
     job_id_cmd = f"$(kubectl get rayjob {job_name} -n {namespace} -o jsonpath='{{.status.jobId}}')"
     click.echo(
         f"follow:  kubectl get rayjob {job_name} -n {namespace} -w\n"
         f"logs:    nrl-k8s job logs {job_id_cmd} {recipe} --infra <infra> --role training -f",
     )
-    # Default is wait unless user passed --no-wait.
     if cli_wait is False:
         return
 
@@ -934,7 +955,6 @@ def _run_rayjob(
     click.echo(f"[run --rayjob] {job_name} finished: deployment={dep} job={job_status}")
     if message:
         click.echo(f"[run --rayjob] message: {message}")
-    orchestrate.delete_dra_resources("training", loaded, log=click.echo)
     sys.exit(0 if dep == "Complete" else 1)
 
 
@@ -1852,11 +1872,9 @@ def _check_stale_rayjobs(loaded: LoadedConfig, namespace: str) -> None:
     Reports every stale RayJob at once so the user can clean up in one pass
     rather than hitting them one at a time in a loop.
 
-    Stale DRA resources (ComputeDomain, RoCE ResourceClaimTemplate) are not
-    checked — they are 1:1 with the RayJob by design (named after the
-    cluster + role), so deleting the RayJob and resubmitting will recreate
-    them idempotently. TODO: add DRA garbage collection to a future
-    ``nrl-k8s clean`` command.
+    DRA resources are not checked separately. Ephemeral resources created by
+    this command have an owner reference and cascade with the RayJob or
+    RayCluster; pre-existing resources are reused without being adopted.
     """
     from . import k8s
     from .orchestrate import ALL_ROLES, _get_cluster

@@ -230,15 +230,23 @@ def dra_resources_for_cluster(
     return found
 
 
-def build_compute_domain_manifest(name: str, namespace: str) -> dict[str, Any]:
+def build_compute_domain_manifest(
+    name: str,
+    namespace: str,
+    *,
+    owner_ref: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "name": name,
+        "namespace": namespace,
+        "labels": {**_MANAGED_BY_LABEL},
+    }
+    if owner_ref is not None:
+        metadata["ownerReferences"] = [owner_ref]
     return {
         "apiVersion": "resource.nvidia.com/v1beta1",
         "kind": "ComputeDomain",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": {**_MANAGED_BY_LABEL},
-        },
+        "metadata": metadata,
         "spec": {
             "channel": {"resourceClaimTemplate": {"name": name}},
             "numNodes": 0,
@@ -246,16 +254,24 @@ def build_compute_domain_manifest(name: str, namespace: str) -> dict[str, Any]:
     }
 
 
-def build_roce_template_manifest(name: str, namespace: str) -> dict[str, Any]:
+def build_roce_template_manifest(
+    name: str,
+    namespace: str,
+    *,
+    owner_ref: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     # TODO: expose roce count via infra config — hardcoded to 8 for now
+    metadata: dict[str, Any] = {
+        "name": name,
+        "namespace": namespace,
+        "labels": {**_MANAGED_BY_LABEL},
+    }
+    if owner_ref is not None:
+        metadata["ownerReferences"] = [owner_ref]
     return {
         "apiVersion": "resource.k8s.io/v1",
         "kind": "ResourceClaimTemplate",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": {**_MANAGED_BY_LABEL},
-        },
+        "metadata": metadata,
         "spec": {
             "spec": {
                 "devices": {

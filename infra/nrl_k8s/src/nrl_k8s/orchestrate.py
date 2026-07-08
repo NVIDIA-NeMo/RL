@@ -85,6 +85,15 @@ class EnsureDgdResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class EnsureDraResourceResult:
+    """Outcome of ensuring one DRA prerequisite."""
+
+    kind: Literal["compute-domain", "roce"]
+    name: str
+    created: bool
+
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -216,24 +225,32 @@ def ensure_dra_resources(
     loaded: LoadedConfig,
     *,
     log: callable,
-) -> None:
-    """Create ComputeDomain / RoCE ResourceClaimTemplate if the spec needs them."""
+    owner_ref: dict[str, Any] | None = None,
+) -> list[EnsureDraResourceResult]:
+    """Create the ComputeDomain / RoCE resources required by a cluster."""
     cluster = _get_cluster(loaded.infra, role)
     if cluster is None:
-        return
+        return []
     namespace = loaded.infra.namespace
     resources = dra_resources_for_cluster(cluster.name, role, cluster.spec)
+    results: list[EnsureDraResourceResult] = []
     for kind, name in resources:
         if kind == "compute-domain":
             log(f"[{role}] ensuring ComputeDomain {name}")
-            k8s.apply_compute_domain(
-                build_compute_domain_manifest(name, namespace), namespace
+            applied = k8s.apply_compute_domain(
+                build_compute_domain_manifest(name, namespace, owner_ref=owner_ref),
+                namespace,
             )
         elif kind == "roce":
             log(f"[{role}] ensuring RoCE ResourceClaimTemplate {name}")
-            k8s.apply_resource_claim_template(
-                build_roce_template_manifest(name, namespace), namespace
+            applied = k8s.apply_resource_claim_template(
+                build_roce_template_manifest(name, namespace, owner_ref=owner_ref),
+                namespace,
             )
+        results.append(
+            EnsureDraResourceResult(kind=kind, name=name, created=bool(applied))
+        )
+    return results
 
 
 def delete_dra_resources(
@@ -366,8 +383,12 @@ def ensure_dgd(
         log(
             f"[dynamo:{dgd_key}] applying DynamoGraphDeployment {name} in namespace {namespace}"
         )
-        dgd_mod.apply_dgd(manifest, namespace)
-        created = True
+        created = bool(dgd_mod.apply_dgd(manifest, namespace))
+        if not created:
+            log(
+                f"[dynamo:{dgd_key}] DGD {name} appeared concurrently; "
+                "reusing without changing its owner"
+            )
     elif _spec_drifted(live.get("spec") or {}, manifest["spec"]):
         if recreate:
             log(
@@ -376,8 +397,7 @@ def ensure_dgd(
             )
             dgd_mod.delete_dgd(name, namespace)
             dgd_mod.wait_for_dgd_gone(name, namespace)
-            dgd_mod.apply_dgd(manifest, namespace)
-            created = True
+            created = bool(dgd_mod.apply_dgd(manifest, namespace))
         else:
             log(
                 f"[dynamo:{dgd_key}] warning: live DGD {name} drifted from rendered "
@@ -385,13 +405,6 @@ def ensure_dgd(
             )
     else:
         log(f"[dynamo:{dgd_key}] DGD {name} already exists and matches — reusing")
-
-    if live is not None and not created and owner_ref is not None:
-        desired_owner_refs = manifest.get("metadata", {}).get("ownerReferences", [])
-        live_owner_refs = live.get("metadata", {}).get("ownerReferences", [])
-        if live_owner_refs != desired_owner_refs:
-            log(f"[dynamo:{dgd_key}] reconciling ownerReference on DGD {name}")
-            dgd_mod.patch_dgd_owner_ref(name, namespace, owner_ref)
 
     if wait_ready:
         log(f"[dynamo:{dgd_key}] waiting for DGD {name} to reach state=successful ...")
@@ -553,7 +566,6 @@ def submit_training(
     wd: Path | None = None
     if upload:
         log("[training] staging working_dir ...")
-        _inject_dynamo_into_recipe(loaded, log=log)
         recipe_yaml = OmegaConf.to_yaml(loaded.recipe)
         wd = workdir.stage_workdir(
             repo_root,
@@ -867,31 +879,6 @@ def _require_dgd(infra: InfraConfig, key: str) -> DynamoGraphSpec:
     return spec
 
 
-def _inject_dynamo_into_recipe(loaded: LoadedConfig, *, log: callable) -> None:
-    """Stamp the DGD's name into the recipe before staging the working_dir.
-
-    Only applies when exactly one DGD is declared — the unambiguous case.
-    With multiple DGDs the user is expected to wire ``dgd_name`` themselves
-    (the orchestrator can't know which to point training at).
-    """
-    if len(loaded.infra.dynamo) != 1:
-        return
-    ((dgd_key, spec),) = loaded.infra.dynamo.items()
-    base_dir = loaded.infra_source_path.parent
-    resolved_name = dgd_mod.resolve_dgd_name(spec, base_dir)
-    OmegaConf.update(loaded.recipe, "policy.generation.backend", "dynamo", merge=False)
-    OmegaConf.update(
-        loaded.recipe,
-        "policy.generation.dynamo_cfg.dgd_name",
-        resolved_name,
-        force_add=True,
-    )
-    log(
-        f"[training] injecting policy.generation.backend=dynamo and "
-        f"dynamo_cfg.dgd_name={resolved_name} from infra.dynamo.{dgd_key}"
-    )
-
-
 def _upload_paths(infra: InfraConfig) -> list[str]:
     """Resolve the list of repo-relative paths to stage for Ray uploads."""
     if infra.launch.rayUploadPaths is not None:
@@ -944,6 +931,7 @@ def _wait_for_http(url: str, timeout_s: int, log: callable, role: str) -> None:
 __all__ = [
     "ALL_ROLES",
     "EnsureDgdResult",
+    "EnsureDraResourceResult",
     "RunResult",
     "bring_up_cluster",
     "default_run_id",
@@ -952,6 +940,7 @@ __all__ = [
     "ensure_cluster",
     "ensure_deployment",
     "ensure_dgd",
+    "ensure_dra_resources",
     "run",
     "submit_daemon",
     "submit_training",

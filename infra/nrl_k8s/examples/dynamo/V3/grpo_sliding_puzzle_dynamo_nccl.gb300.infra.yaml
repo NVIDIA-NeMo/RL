@@ -23,6 +23,8 @@ _shared:
   workerEnv: &shared_worker_env
     - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: NCCL_DEBUG,                    value: WARN}
+    # The refit collective spans independently scheduled Ray and DGD pods;
+    # force RoCE instead of MNNVL/IMEX.
     - {name: NCCL_MNNVL_ENABLE,             value: "0"}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
     - {name: TORCH_CUDA_ARCH_LIST,           value: "10.3"}

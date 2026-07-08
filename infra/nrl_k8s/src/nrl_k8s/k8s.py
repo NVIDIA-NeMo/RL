@@ -193,8 +193,7 @@ def wait_for_raycluster_gone(
 
 
 def apply_rayjob(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
-    """Create-or-replace a RayJob. Returns the server-side object."""
-    name = manifest["metadata"]["name"]
+    """Create a RayJob. Returns the server-side object."""
     api = custom_objects_api()
     try:
         return with_retries(
@@ -207,19 +206,28 @@ def apply_rayjob(manifest: dict[str, Any], namespace: str) -> dict[str, Any]:
             )
         )
     except ApiException as exc:
-        if exc.status == 409:
-            return with_retries(
-                lambda: api.patch_namespaced_custom_object(
-                    group=RAY_GROUP,
-                    version=RAY_VERSION,
-                    namespace=namespace,
-                    plural=RAYJOB_PLURAL,
-                    name=name,
-                    body=manifest,
-                )
-            )
         exc.nrl_k8s_manifest = redact(manifest)  # type: ignore[attr-defined]
         raise
+
+
+def set_rayjob_suspended(
+    name: str,
+    namespace: str,
+    *,
+    suspended: bool,
+) -> dict[str, Any]:
+    """Set ``spec.suspend`` without patching the rest of the RayJob."""
+    api = custom_objects_api()
+    return with_retries(
+        lambda: api.patch_namespaced_custom_object(
+            group=RAY_GROUP,
+            version=RAY_VERSION,
+            namespace=namespace,
+            plural=RAYJOB_PLURAL,
+            name=name,
+            body={"spec": {"suspend": suspended}},
+        )
+    )
 
 
 def delete_rayjob(name: str, namespace: str, *, ignore_missing: bool = True) -> None:
@@ -256,6 +264,35 @@ def get_rayjob(name: str, namespace: str) -> dict[str, Any] | None:
         if exc.status == 404:
             return None
         raise
+
+
+def wait_for_rayjob_suspended(
+    name: str,
+    namespace: str,
+    *,
+    timeout_s: int = 120,
+    poll_s: int = 2,
+) -> dict[str, Any]:
+    """Wait until KubeRay has observed a newly suspended RayJob."""
+    deadline = time.monotonic() + timeout_s
+    last_status: str | None = None
+    while time.monotonic() < deadline:
+        obj = get_rayjob(name, namespace)
+        if obj is not None:
+            last_status = (obj.get("status") or {}).get("jobDeploymentStatus")
+            if last_status == "Suspended":
+                return obj
+            if last_status in (*_RAYJOB_TERMINAL_DEPLOYMENT, "ValidationFailed"):
+                raise RuntimeError(
+                    f"RayJob {name} in {namespace} reached "
+                    f"jobDeploymentStatus={last_status!r} before it was suspended"
+                )
+        time.sleep(poll_s)
+    raise TimeoutError(
+        f"RayJob {name} in {namespace} never reached "
+        f"jobDeploymentStatus=Suspended (last seen: {last_status!r}) "
+        f"after {timeout_s}s"
+    )
 
 
 def wait_for_rayjob_raycluster_name(
@@ -339,6 +376,72 @@ def delete_configmap(name: str, namespace: str, *, ignore_missing: bool = True) 
         if exc.status == 404 and ignore_missing:
             return False
         raise
+
+
+# =============================================================================
+# Generic custom-object ownership
+# =============================================================================
+
+
+def replace_custom_object_owner_reference(
+    *,
+    group: str,
+    version: str,
+    plural: str,
+    name: str,
+    namespace: str,
+    expected_owner_uid: str,
+    owner_ref: dict[str, Any],
+) -> None:
+    """Replace one expected owner reference while preserving all others.
+
+    The UID check prevents an ephemeral run from adopting a reused resource.
+    Including ``resourceVersion`` makes the metadata update fail safely if
+    another actor changes the object between the GET and PATCH.
+    """
+    api = custom_objects_api()
+    obj = with_retries(
+        lambda: api.get_namespaced_custom_object(
+            group=group,
+            version=version,
+            namespace=namespace,
+            plural=plural,
+            name=name,
+        )
+    )
+    metadata = obj.get("metadata") or {}
+    owner_refs = metadata.get("ownerReferences") or []
+    if any(ref.get("uid") == owner_ref["uid"] for ref in owner_refs):
+        return
+
+    replaced = False
+    updated_refs: list[dict[str, Any]] = []
+    for ref in owner_refs:
+        if ref.get("uid") == expected_owner_uid:
+            updated_refs.append(owner_ref)
+            replaced = True
+        else:
+            updated_refs.append(ref)
+    if not replaced:
+        raise RuntimeError(
+            f"refusing to adopt {plural}/{name}: expected owner UID "
+            f"{expected_owner_uid!r} was not present"
+        )
+
+    patch_metadata: dict[str, Any] = {"ownerReferences": updated_refs}
+    resource_version = metadata.get("resourceVersion")
+    if resource_version:
+        patch_metadata["resourceVersion"] = resource_version
+    with_retries(
+        lambda: api.patch_namespaced_custom_object(
+            group=group,
+            version=version,
+            namespace=namespace,
+            plural=plural,
+            name=name,
+            body={"metadata": patch_metadata},
+        )
+    )
 
 
 # =============================================================================
@@ -735,10 +838,13 @@ __all__ = [
     "get_service",
     "list_rayclusters",
     "load_kubeconfig",
+    "replace_custom_object_owner_reference",
     "secret_exists",
+    "set_rayjob_suspended",
     "wait_for_deployment_ready",
     "wait_for_raycluster_gone",
     "wait_for_raycluster_ready",
     "wait_for_rayjob_raycluster_name",
+    "wait_for_rayjob_suspended",
     "wait_for_rayjob_terminal",
 ]

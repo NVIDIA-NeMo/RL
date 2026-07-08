@@ -59,9 +59,10 @@ args:
 - `frontend_url` is an explicit rollout URL for deployments outside the
   in-cluster naming convention. It supports generation, but not NCCL refit.
 
-`namespace`, `frontend_port`, and `dyn_system_port` optionally override
-the detected Kubernetes namespace, frontend port 8000, and worker admin port
-9090.
+`frontend_port` and `dyn_system_port` optionally override the frontend
+port 8000 and worker admin port 9090. `namespace` overrides the namespace
+projected into a Kubernetes pod. If neither source is available, startup fails
+instead of silently targeting the `default` namespace.
 
 ## Fixed worker fleet
 
@@ -97,6 +98,11 @@ with `engine_rpc: init_weight_transfer_engine` and:
 
 All initialization futures are awaited together, just like the normal
 non-colocated vLLM backend.
+
+The GB300 examples set `NCCL_MNNVL_ENABLE=0` on both the Ray and DGD workers.
+The refit collective crosses independently scheduled workloads, so it uses the
+DRA-provisioned RoCE interfaces rather than MNNVL/IMEX. This is a networking
+requirement, not a readiness workaround.
 
 ## Weight update
 
@@ -169,5 +175,14 @@ nrl-k8s run "$RECIPE" --infra "$INFRA" --rayjob --dry-run
 nrl-k8s run "$RECIPE" --infra "$INFRA" --rayjob --no-wait
 ```
 
-The RayJob owns an ephemeral RayCluster. The DGD is applied before the RayJob
-and receives an owner reference so teardown follows the ephemeral run.
+`nrl-k8s` first creates the RayJob with `spec.suspend: true` and waits for
+KubeRay to report `jobDeploymentStatus: Suspended`. It then creates the DGD and
+DRA prerequisites with the RayJob as their garbage-collection owner and waits
+for each DGD's current-generation `Ready=True` condition. Finally it clears
+`spec.suspend`, allowing KubeRay to create the RayCluster and submit the
+entrypoint through its normal reconciliation path.
+
+After KubeRay records the generated RayCluster name, resources created for this
+run are reparented from the RayJob to that RayCluster. Reused resources are
+never adopted. If reparenting races or fails, the RayJob owner remains as a
+safe TTL-based cleanup fallback, including for `--no-wait` runs.
