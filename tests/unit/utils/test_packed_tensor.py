@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from nemo_rl.utils.packed_tensor import (
+    _normalize_packing_tensors_for_broadcast,
     packed_broadcast_consumer,
     packed_broadcast_producer,
 )
@@ -66,6 +67,139 @@ def create_mock_model_params():
 def create_mock_state_dict_info(params):
     """Create state dict info (name -> (shape, dtype)) from params."""
     return {name: (tensor.shape, tensor.dtype) for name, tensor in params}
+
+
+def test_normalize_packing_tensors_empty_list():
+    """Test that an empty packing list is unchanged."""
+    assert _normalize_packing_tensors_for_broadcast([]) == []
+
+
+def test_normalize_packing_tensors_cpu_only_without_cuda():
+    """Test that CPU tensors stay on CPU when CUDA is not available."""
+    tensors = [
+        torch.arange(4, dtype=torch.uint8),
+        torch.arange(4, 8, dtype=torch.uint8),
+    ]
+
+    with patch("torch.cuda.is_available", return_value=False):
+        normalized = _normalize_packing_tensors_for_broadcast(tensors)
+
+    assert normalized is tensors
+    assert [tensor.device.type for tensor in normalized] == ["cpu", "cpu"]
+    assert torch.equal(torch.cat(normalized), torch.arange(8, dtype=torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_normalize_packing_tensors_cpu_only_with_cuda():
+    """Test that CPU tensors move to the current CUDA device when CUDA is available."""
+    tensors = [
+        torch.arange(4, dtype=torch.uint8),
+        torch.arange(4, 8, dtype=torch.uint8),
+    ]
+    expected_device = torch.device("cuda", torch.cuda.current_device())
+
+    normalized = _normalize_packing_tensors_for_broadcast(tensors)
+
+    assert [tensor.device for tensor in normalized] == [
+        expected_device,
+        expected_device,
+    ]
+    assert torch.equal(
+        torch.cat(normalized).cpu(), torch.arange(8, dtype=torch.uint8)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_normalize_packing_tensors_mixed_devices_use_current_cuda_device():
+    """Test that mixed CPU/CUDA pieces normalize to the current CUDA device."""
+    cuda_tensor = torch.arange(4, 8, dtype=torch.uint8, device="cuda")
+    tensors = [torch.arange(4, dtype=torch.uint8), cuda_tensor]
+    expected_device = torch.device("cuda", torch.cuda.current_device())
+
+    normalized = _normalize_packing_tensors_for_broadcast(tensors)
+
+    assert [tensor.device for tensor in normalized] == [
+        expected_device,
+        expected_device,
+    ]
+    assert torch.equal(
+        torch.cat(normalized).cpu(), torch.arange(8, dtype=torch.uint8)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_producer_handles_mixed_device_iterator():
+    """Test producer with mixed CPU/CUDA tensors from the iterator.
+
+    Regression test: `torch.cat` requires one device and NCCL broadcast requires
+    CUDA, so mixed-device pieces must be normalized before packing. These small
+    tensors intentionally stay under the packed-size threshold and exercise the
+    final StopIteration flush path.
+    """
+    params = [
+        ("cpu_weight", torch.randn(10, 20, dtype=torch.float32)),
+        ("cuda_weight", torch.randn(10, 20, dtype=torch.float32, device="cuda")),
+    ]
+    mock_group = MockCommunicationGroup()
+
+    packed_broadcast_producer(
+        iterator=iter(params),
+        group=mock_group,
+        src=0,
+        post_iter_func=lambda x: x[1],
+    )
+
+    assert mock_group.broadcast_count >= 1
+    for broadcasted in mock_group.broadcasted_tensors:
+        assert broadcasted.device.type == "cuda"
+
+    total_broadcasted_bytes = sum(
+        tensor.numel() for tensor in mock_group.broadcasted_tensors
+    )
+    expected_bytes = sum(
+        tensor.numel() * tensor.element_size() for _, tensor in params
+    )
+    assert total_broadcasted_bytes == expected_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_producer_normal_flush_with_mixed_devices():
+    """Test normal flush with mixed CPU/CUDA tensors.
+
+    Patching the target size forces the producer to flush before StopIteration,
+    so this covers the non-final packing path with mixed-device inputs.
+    """
+    params = [
+        (f"cpu_w{i}", torch.randn(10, 10, dtype=torch.float32))
+        for i in range(10)
+    ] + [
+        (f"cuda_w{i}", torch.randn(10, 10, dtype=torch.float32, device="cuda"))
+        for i in range(10)
+    ]
+    mock_group = MockCommunicationGroup()
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
+        return_value=1000,
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=mock_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
+
+    assert mock_group.broadcast_count > 1
+    for broadcasted in mock_group.broadcasted_tensors:
+        assert broadcasted.device.type == "cuda"
+
+    total_broadcasted_bytes = sum(
+        tensor.numel() for tensor in mock_group.broadcasted_tensors
+    )
+    expected_bytes = sum(
+        tensor.numel() * tensor.element_size() for _, tensor in params
+    )
+    assert total_broadcasted_bytes == expected_bytes
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
