@@ -39,6 +39,17 @@ def _globalize(hf_name: str, ep_rank: int) -> str:
     def sub(m):
         return f"{m.group(1)}{ep_rank * EXPERTS_PER_RANK + int(m.group(2))}{m.group(3)}"
     return _EXP_RE.sub(sub, hf_name)
+
+
+def _tp_shard_axis(hf: str):
+    """TP shard axis for an HF param by name: column-parallel (0), row-parallel
+    (1), or None for replicated (norms, router gate)."""
+    if any(k in hf for k in ("gate_proj", "up_proj", "q_proj", "k_proj", "v_proj",
+                             "embed_tokens", "lm_head")):
+        return 0
+    if any(k in hf for k in ("o_proj", "down_proj")):
+        return 1
+    return None
 GT_PATH = os.environ.get("GT_PATH", "/mnt/rl-workspace/kavink/phase-e-shape-2-qwen3-moe-groundtruth.pt")
 SHARD_AXIS_BY_ROLE = {"column": 0, "qkv_column": 0, "gated_mlp_column": 0,
                       "vocab_parallel": 0, "row": 1, "expert_column": 0,
@@ -131,7 +142,7 @@ def main() -> int:
     # accumulate. Non-expert tensors are replicated across sources -> dedupe by name.
     layout = TargetTpLayout(tp_size=TARGET_TP, tp_rank=TARGET_TP_RANK)
     gt = None
-    if TARGET_TP == 1 and os.path.exists(GT_PATH):
+    if os.path.exists(GT_PATH):
         gt = torch.load(GT_PATH, weights_only=False, mmap=True).get("hf_weights")
 
     print(f"[rcv] planning + translating per EP source (EP{EP_SIZE} -> TP{TARGET_TP}) ...", flush=True)
@@ -179,13 +190,19 @@ def main() -> int:
             if got is None:
                 n_missing += 1; continue
             e = exp.to(got.dtype) if got.dtype != exp.dtype else exp
+            if TARGET_TP > 1:
+                ax = _tp_shard_axis(hf_name)
+                if ax is not None and e.shape[ax] % TARGET_TP == 0:
+                    per = e.shape[ax] // TARGET_TP
+                    e = e.narrow(ax, TARGET_TP_RANK * per, per).contiguous()
             if got.shape == e.shape and torch.equal(got, e):
                 n_ok += 1
             else:
                 n_drift += 1
-        print(f"[rcv] byte-identity: {n_ok} ok / {n_drift} drift / {n_missing} missing / {len(gt)} GT", flush=True)
-        print("RESULT:", "PASS - EP->TP1 refit byte-identical" if n_ok == len(gt)
-              else f"PARTIAL - {n_ok}/{len(gt)}", flush=True)
+        print(f"[rcv] byte-identity (TP{TARGET_TP} rank{TARGET_TP_RANK}): "
+              f"{n_ok} ok / {n_drift} drift / {n_missing} missing / {len(gt)} GT", flush=True)
+        print("RESULT:", f"PASS - EP{EP_SIZE}->TP{TARGET_TP} refit byte-identical"
+              if n_ok == len(gt) else f"PARTIAL - {n_ok}/{len(gt)}", flush=True)
     else:
         print(f"RESULT: EP{EP_SIZE}->TP{TARGET_TP} produced {len(hf_results)} HF tensors", flush=True)
     return 0
