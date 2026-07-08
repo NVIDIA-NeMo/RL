@@ -26,6 +26,19 @@ import torch
 from safetensors.torch import save_file
 
 
+def _make_collective_update_extension(backend):
+    ext = backend.VllmInternalWorkerExtension.__new__(
+        backend.VllmInternalWorkerExtension
+    )
+    state_info = object()
+    ext.state_dict_info = {"model.weight": state_info}
+    ext.model_update_group = object()
+    ext.model_runner = SimpleNamespace(model=object())
+    ext.model_config = object()
+    ext.device = object()
+    return ext, state_info
+
+
 def _write_sharded_checkpoint(model_dir, shards):
     """Write safetensors shards plus a model.safetensors.index.json.
 
@@ -72,6 +85,52 @@ def _patch_vllm_postload(monkeypatch):
         process_weights,
     )
     return process_weights
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_processes_weights_after_loading(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    process_calls = []
+
+    def process_weights_after_loading(model, model_config, device):
+        call_order.append("process")
+        process_calls.append((model, model_config, device))
+
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.process_weights_after_loading",
+        process_weights_after_loading,
+    )
+    ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+
+    def load_weights(weights):
+        call_order.append("load")
+        assert weights == [("model.weight", "weight-value")]
+
+    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+        call_order.append("broadcast")
+        assert list(iterator) == [("model.weight", expected_state_info)]
+        assert group is ext.model_update_group
+        assert src == 0
+        post_unpack_func([("model.weight", "weight-value")])
+
+    ext._load_weights = load_weights
+    ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
+    monkeypatch.setattr(
+        vllm_backend.torch.cuda,
+        "empty_cache",
+        lambda: call_order.append("empty_cache"),
+    )
+
+    assert ext.update_weights_from_collective() is True
+
+    assert process_calls == [(ext.model_runner.model, ext.model_config, ext.device)]
+    assert call_order == ["broadcast", "load", "process", "kv", "gc", "empty_cache"]
 
 
 @pytest.mark.vllm

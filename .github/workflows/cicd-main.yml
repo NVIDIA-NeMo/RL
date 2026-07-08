@@ -792,6 +792,8 @@ jobs:
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Other_2
             runner: ${{ vars.GB200_RUNNER }}
+          - script: L1_Functional_Tests_GB200_MXFP8
+            runner: ${{ vars.GB200_RUNNER }}
     needs: [pre-flight, build-container-gb200, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
     if: >-
