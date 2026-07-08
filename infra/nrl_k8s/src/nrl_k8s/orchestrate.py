@@ -37,6 +37,7 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -60,6 +61,7 @@ from .submitters import SubmissionHandle, build_submitter, save_handle
 
 Role = Literal["generation", "gym", "training"]
 ALL_ROLES: tuple[Role, ...] = ("generation", "gym", "training")
+_LogFn = Callable[[str], None]
 
 
 @dataclass
@@ -107,7 +109,7 @@ def bring_up_cluster(
     role: Role,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     wait_ready: bool = True,
     ready_timeout_s: int = 900,
 ) -> str:
@@ -133,7 +135,7 @@ def ensure_cluster(
     role: Role,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     recreate: bool = False,
     wait_ready: bool = True,
     ready_timeout_s: int = 900,
@@ -224,7 +226,7 @@ def ensure_dra_resources(
     role: Role,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     owner_ref: dict[str, Any] | None = None,
 ) -> list[EnsureDraResourceResult]:
     """Create the ComputeDomain / RoCE resources required by a cluster."""
@@ -257,7 +259,7 @@ def delete_dra_resources(
     role: Role,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
 ) -> None:
     """Delete DRA resources for a role."""
     cluster = _get_cluster(loaded.infra, role)
@@ -278,7 +280,7 @@ def ensure_deployment(
     dep_key: str,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
 ) -> str:
     """Apply a Kubernetes Deployment + auto-created ClusterIP Service."""
     dep = _require_deployment(loaded.infra, dep_key)
@@ -324,7 +326,7 @@ def delete_deployment(
     dep_key: str,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
 ) -> None:
     """Delete a managed Deployment and its auto-created Service."""
     dep = _require_deployment(loaded.infra, dep_key)
@@ -340,7 +342,7 @@ def ensure_dgd(
     dgd_key: str,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     recreate: bool = False,
     wait_ready: bool = True,
     owner_ref: dict[str, Any] | None = None,
@@ -418,7 +420,7 @@ def delete_dgd(
     dgd_key: str,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
 ) -> None:
     """Delete a managed DynamoGraphDeployment.
 
@@ -438,7 +440,7 @@ def submit_daemon(
     loaded: LoadedConfig,
     cluster_name: str,
     *,
-    log: callable,
+    log: _LogFn,
     repo_root: Path,
     replace: bool = False,
 ) -> str | None:
@@ -514,7 +516,7 @@ def submit_daemon(
 def submit_training(
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     repo_root: Path,
     replace: bool = False,
     run_id: str | None = None,
@@ -697,7 +699,7 @@ def _rewrite_entrypoint_recipe(
     repo_root: Path,
     *,
     upload: bool,
-    log: callable,
+    log: _LogFn,
 ) -> str:
     """Rewrite ``--config <path>.yaml`` flags in the train entrypoint.
 
@@ -744,7 +746,7 @@ def _rewrite_entrypoint_recipe(
 def run(
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     repo_root: Path,
     replace: bool = False,
     run_id: str | None = None,
@@ -772,9 +774,11 @@ def run(
     # DGD ownerReferences against — that's how DGDs get garbage-collected when
     # the training cluster is torn down. The other roles (generation/gym) come
     # up afterwards in the same loop and are no-ops on the second pass.
+    cluster_names: dict[Role, str] = {}
     training_cluster_owner: dict[str, Any] | None = None
     if _get_cluster(loaded.infra, "training") is not None and loaded.infra.dynamo:
         training_name = ensure_cluster("training", loaded, log=log, recreate=recreate)
+        cluster_names["training"] = training_name
         training_obj = k8s.get_raycluster(training_name, loaded.infra.namespace)
         training_uid = (training_obj or {}).get("metadata", {}).get("uid")
         if training_uid:
@@ -798,7 +802,10 @@ def run(
         if _get_cluster(loaded.infra, role) is None:
             log(f"[{role}] not defined in recipe — skipping")
             continue
-        name = ensure_cluster(role, loaded, log=log, recreate=recreate)
+        name = cluster_names.get(role)
+        if name is None:
+            name = ensure_cluster(role, loaded, log=log, recreate=recreate)
+            cluster_names[role] = name
         if skip_daemons and role != "training":
             log(f"[{role}] --skip-daemons: not submitting daemon")
             continue
@@ -827,7 +834,7 @@ def _infer_disagg_job_id(infra: InfraConfig) -> str | None:
     return m.group(1) if m else None
 
 
-def _reset_endpoint_registry(loaded: LoadedConfig, *, log: callable) -> None:
+def _reset_endpoint_registry(loaded: LoadedConfig, *, log: _LogFn) -> None:
     """Delete the endpoint-registry ConfigMap for a fresh rendezvous.
 
     Ensures gym + training discover fresh URLs instead of caching
@@ -893,7 +900,7 @@ def _wait_job_stopped(
     client: JobSubmissionClient,
     submission_id: str,
     *,
-    log: callable,
+    log: _LogFn,
     role: Role,
     timeout_s: int = 60,
 ) -> None:
@@ -913,7 +920,7 @@ def _wait_job_stopped(
     )
 
 
-def _wait_for_http(url: str, timeout_s: int, log: callable, role: str) -> None:
+def _wait_for_http(url: str, timeout_s: int, log: _LogFn, role: str) -> None:
     log(f"[{role}] waiting for health-check {url} (timeout {timeout_s}s)")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:

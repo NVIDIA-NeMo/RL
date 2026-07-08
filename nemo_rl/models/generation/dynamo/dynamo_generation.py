@@ -859,6 +859,8 @@ class DynamoGeneration(GenerationInterface):
         padded_input_length = input_ids.size(1)
 
         per_sample_results = []
+        # TODO: parallelize this compatibility path if synchronous validation
+        # batches become large; async rollouts use generate_async instead.
         max_generated_length = 0
         for sample_idx in range(input_ids.shape[0]):
             input_length = int(input_lengths[sample_idx].item())

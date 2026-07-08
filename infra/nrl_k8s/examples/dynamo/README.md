@@ -8,10 +8,10 @@ example with Dynamo on Kubernetes:
 
 - `<name>.yaml`: the NeMo-RL recipe.
 - `<name>.<platform>.infra.yaml`: the Ray and Kubernetes topology. Its
-  `dynamoGraphDeployment.manifest` field references the DGD file in the same
-  directory.
-- `<name>.dgd.yaml`: the DynamoGraphDeployment (DGD), including the frontend
-  and vLLM worker configuration.
+  `dynamo.<key>.manifest` field references the DGD file in the same directory.
+- `<model>.<platform>.dgd.yaml`: the model-specific DynamoGraphDeployment
+  (DGD), including the frontend and vLLM worker configuration. The DGD
+  filename does not need to match the recipe filename.
 
 The current examples are:
 

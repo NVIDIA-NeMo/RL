@@ -206,6 +206,44 @@ class TestBuildDgdManifest:
         # Other service untouched:
         assert services["Frontend"]["replicas"] == 1
 
+    def test_dra_claim_uses_training_cluster_template(self, tmp_path):
+        body = _DGD_YAML.replace(
+            '      extraPodSpec:\n        mainContainer:\n          command: ["python3", "-m", "dynamo.vllm"]',
+            "      extraPodSpec:\n"
+            "        resourceClaims:\n"
+            "          - name: roce-channel\n"
+            "            resourceClaimTemplateName: authored-name\n"
+            "        mainContainer:\n"
+            '          command: ["python3", "-m", "dynamo.vllm"]',
+        )
+        self._write(tmp_path, body)
+        infra = _infra(
+            kuberay={
+                "training": {
+                    "name": "rc-train",
+                    "spec": {
+                        "workerGroupSpecs": [
+                            {
+                                "template": {
+                                    "spec": {
+                                        "resourceClaims": [{"name": "roce-channel"}]
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                }
+            }
+        )
+
+        manifest = dgd.build_dgd_manifest(
+            DynamoGraphSpec(manifest="dgd.yaml"), infra, tmp_path
+        )
+
+        worker = manifest["spec"]["services"]["VllmDecodeWorker"]
+        [claim] = worker["extraPodSpec"]["resourceClaims"]
+        assert claim["resourceClaimTemplateName"] == "roce-rc-train-training"
+
     def test_interpolations_resolved_without_overrides(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DGD_TEST_IMAGE", "registry/test:tag")
         body = _DGD_YAML.replace(
@@ -465,3 +503,23 @@ class TestWaitForDgdReady:
         # Use a tiny timeout so the wall clock crosses it after one iteration.
         with pytest.raises(TimeoutError, match="current-generation Ready"):
             dgd.wait_for_dgd_ready("foo", "ns", timeout_s=0, poll_s=0)
+
+
+class TestWaitForDgdGone:
+    def test_returns_after_dgd_disappears(self, monkeypatch):
+        get_dgd = MagicMock(side_effect=[{"metadata": {}}, None])
+        monkeypatch.setattr(dgd, "get_dgd", get_dgd)
+        monkeypatch.setattr(dgd.time, "sleep", lambda _s: None)
+
+        dgd.wait_for_dgd_gone("foo", "ns", timeout_s=10, poll_s=0)
+
+        assert get_dgd.call_count == 2
+
+    def test_raises_on_timeout(self, monkeypatch):
+        monotonic = MagicMock(side_effect=[0, 0, 2])
+        monkeypatch.setattr(dgd.time, "monotonic", monotonic)
+        monkeypatch.setattr(dgd.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(dgd, "get_dgd", MagicMock(return_value={"metadata": {}}))
+
+        with pytest.raises(TimeoutError, match="not deleted"):
+            dgd.wait_for_dgd_gone("foo", "ns", timeout_s=1, poll_s=0)

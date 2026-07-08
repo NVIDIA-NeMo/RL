@@ -186,7 +186,6 @@ dynamo:
           extraPodSpec:
             resourceClaims:
               - name: roce-channel
-                resourceClaimTemplateName: roce-${user:}-rc-llama31-8b-meg-dyn-nccl-v2-training
             mainContainer:
               resources:
                 claims:

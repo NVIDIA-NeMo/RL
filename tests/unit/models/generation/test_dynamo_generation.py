@@ -72,6 +72,15 @@ def _generation_data(
     return data
 
 
+def _empty_generation_data() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.empty((0, 0), dtype=torch.long),
+            "input_lengths": torch.empty(0, dtype=torch.long),
+        }
+    )
+
+
 @pytest.fixture
 def in_k8s(monkeypatch):
     """Pretend the test process is running inside a pod."""
@@ -626,6 +635,45 @@ def test_pickle_roundtrip_restores_process_local_refit_state(
 # ---------------------------------------------------------------------------
 # Direct generation — OpenAI completions payload + vLLM-parity tensors.
 # ---------------------------------------------------------------------------
+
+
+def test_generate_empty_batch_returns_empty_tensors():
+    g = DynamoGeneration(
+        cluster=None,
+        config=_base_config(frontend_url="http://dynamo.example.com:8000/v1"),
+    )
+
+    out = g.generate(_empty_generation_data())
+
+    assert out["output_ids"].shape == (0, 0)
+    assert out["logprobs"].shape == (0, 0)
+    assert out["generation_lengths"].shape == (0,)
+    assert out["unpadded_sequence_lengths"].shape == (0,)
+    assert out["truncated"].shape == (0,)
+
+
+def test_generate_async_empty_batch_yields_nothing():
+    g = DynamoGeneration(
+        cluster=None,
+        config=_base_config(frontend_url="http://dynamo.example.com:8000/v1"),
+    )
+
+    async def collect():
+        return [item async for item in g.generate_async(_empty_generation_data())]
+
+    assert asyncio.run(collect()) == []
+
+
+def test_generate_rejects_vllm_content():
+    g = DynamoGeneration(
+        cluster=None,
+        config=_base_config(frontend_url="http://dynamo.example.com:8000/v1"),
+    )
+    data = _generation_data([[1, 2]], [2])
+    data["vllm_content"] = [{}]
+
+    with pytest.raises(NotImplementedError, match="vllm_content"):
+        g.generate(data)
 
 
 def test_generate_requires_request_timeout_s(monkeypatch):

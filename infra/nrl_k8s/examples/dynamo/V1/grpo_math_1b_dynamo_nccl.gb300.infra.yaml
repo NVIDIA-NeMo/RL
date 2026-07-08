@@ -40,6 +40,8 @@ _shared:
       cpu: "8"
       memory: "64Gi"
       nvidia.com/gpu: "1"
+    claims:
+      - {name: roce-channel}
   gpuHeadPorts: &gpu_head_ports
     - {containerPort: 6379,  name: gcs-server}
     - {containerPort: 8265,  name: dashboard}
@@ -150,6 +152,8 @@ kuberay:
               nodeSelector: *worker_node_selector
               tolerations:
                 - operator: Exists
+              resourceClaims:
+                - name: roce-channel
               containers:
                 - name: ray-worker
                   env: *shared_worker_env
@@ -166,3 +170,13 @@ dynamo:
     manifest: qwen2_5_1_5b_gb300_nccl.dgd.yaml
     name: ${user:}-dyn-math-q25-nccl
     readyTimeoutS: 1200
+    overrides:
+      services:
+        VllmDecodeWorker:
+          extraPodSpec:
+            resourceClaims:
+              - name: roce-channel
+            mainContainer:
+              resources:
+                claims:
+                  - name: roce-channel

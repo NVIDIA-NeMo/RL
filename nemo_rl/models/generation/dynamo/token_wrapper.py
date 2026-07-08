@@ -128,10 +128,27 @@ def _validate_engine_data(response_body: dict[str, Any]) -> None:
         engine_data.get("prompt_token_ids"),
         "nvext.engine_data.prompt_token_ids",
     )
-    _coerce_token_id_list(
+    completion_token_ids = _coerce_token_id_list(
         engine_data.get("completion_token_ids"),
         "nvext.engine_data.completion_token_ids",
     )
+    completion_logprobs = engine_data.get("completion_logprobs")
+    if not isinstance(completion_logprobs, list):
+        raise ValueError(
+            "Dynamo response nvext.engine_data.completion_logprobs is missing or not a list."
+        )
+    if len(completion_logprobs) != len(completion_token_ids):
+        raise ValueError(
+            "Dynamo response nvext.engine_data.completion_logprobs "
+            "does not match completion_token_ids length."
+        )
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in completion_logprobs
+    ):
+        raise ValueError(
+            "Dynamo response nvext.engine_data.completion_logprobs must contain numeric values."
+        )
 
 
 def prepare_dynamo_chat_completion_request(

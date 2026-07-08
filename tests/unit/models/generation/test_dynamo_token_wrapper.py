@@ -177,6 +177,7 @@ def test_validate_engine_data_requires_prompt_and_completion_tokens() -> None:
                 "engine_data": {
                     "prompt_token_ids": [1, 2],
                     "completion_token_ids": [3],
+                    "completion_logprobs": [-0.1],
                 }
             }
         }
@@ -195,6 +196,27 @@ def test_validate_engine_data_requires_prompt_and_completion_tokens() -> None:
                     "engine_data": {
                         "prompt_token_ids": ["invalid"],
                         "completion_token_ids": [],
+                    }
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "completion_logprobs",
+    [None, "invalid", [], [-0.1, -0.2], [None]],
+)
+def test_validate_engine_data_requires_aligned_completion_logprobs(
+    completion_logprobs,
+) -> None:
+    with pytest.raises(ValueError, match="completion_logprobs"):
+        _validate_engine_data(
+            {
+                "nvext": {
+                    "engine_data": {
+                        "prompt_token_ids": [1, 2],
+                        "completion_token_ids": [3],
+                        "completion_logprobs": completion_logprobs,
                     }
                 }
             }
@@ -357,6 +379,7 @@ def test_token_wrapper_routes_and_lifecycle(monkeypatch) -> None:
                 "engine_data": {
                     "prompt_token_ids": [10],
                     "completion_token_ids": [11],
+                    "completion_logprobs": [-0.1],
                 }
             }
         }

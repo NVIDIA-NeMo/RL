@@ -24,6 +24,12 @@ from nccl.core import SUM
 from nccl.core.communicator import Communicator
 from nccl.core.utils import UniqueId, get_unique_id
 
+# Mirrors vLLM 0.20.0's StatelessProcessGroup.broadcast_obj key format and
+# PyNcclCommunicator ncclUniqueId pickle type. Revalidate both when bumping vLLM:
+# vllm/distributed/utils.py
+# vllm/distributed/device_communicators/pynccl.py
+# vllm/distributed/device_communicators/pynccl_wrapper.py
+# https://github.com/vllm-project/vllm/tree/v0.20.0
 _NEMO_UNIQUE_ID_KEY = "nccl_unique_id"
 _VLLM_UNIQUE_ID_KEY = "broadcast_from/0/0"
 _VLLM_NCCL_MODULE = "vllm.distributed.device_communicators.pynccl_wrapper"

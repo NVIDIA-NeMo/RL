@@ -78,6 +78,37 @@ class TestCheck:
         assert "ns-a" in result.output
         assert "img:1" in result.output
 
+    def test_summary_uses_manifest_dgd_name_for_ready_timeout(self, tmp_path) -> None:
+        (tmp_path / "dgd.yaml").write_text(
+            "apiVersion: nvidia.com/v1alpha1\n"
+            "kind: DynamoGraphDeployment\n"
+            "metadata:\n"
+            "  name: manifest-dgd\n"
+            "spec:\n"
+            "  services: {}\n"
+        )
+        recipe = _write_recipe(
+            tmp_path,
+            {
+                "infra": {
+                    "namespace": "ns-a",
+                    "image": "img:1",
+                    "dynamo": {
+                        "serving": {
+                            "manifest": "dgd.yaml",
+                            "readyTimeoutS": 321,
+                        }
+                    },
+                }
+            },
+        )
+
+        result = CliRunner().invoke(cli.main, ["check", str(recipe)])
+
+        assert result.exit_code == 0, result.output
+        assert "serving: manifest-dgd" in result.output
+        assert "readyTimeoutS=321" in result.output
+
     def test_summary_lists_each_declared_cluster(self, tmp_path) -> None:
         spec = {
             "headGroupSpec": {

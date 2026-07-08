@@ -177,7 +177,6 @@ dynamo:
           extraPodSpec:
             resourceClaims:
               - name: roce-channel
-                resourceClaimTemplateName: roce-${user:}-rc-sliding-q25-dynamo-nccl-training
             mainContainer:
               resources:
                 claims:

@@ -883,7 +883,7 @@ class TestDeleteDgd:
 
 
 class TestRunInvokesDgds:
-    def test_run_calls_ensure_dgd_per_declared_dgd(
+    def test_run_ensures_training_once_for_dgd_with_recreate(
         self, tmp_path, monkeypatch, log
     ) -> None:
         log_fn, _ = log
@@ -891,9 +891,8 @@ class TestRunInvokesDgds:
 
         ensure_dgd = MagicMock(return_value="from-disk")
         monkeypatch.setattr(orchestrate, "ensure_dgd", ensure_dgd)
-        monkeypatch.setattr(
-            orchestrate, "ensure_cluster", MagicMock(return_value="rc-train")
-        )
+        ensure_cluster = MagicMock(return_value="rc-train")
+        monkeypatch.setattr(orchestrate, "ensure_cluster", ensure_cluster)
         monkeypatch.setattr(
             orchestrate.k8s,
             "get_raycluster",
@@ -902,10 +901,13 @@ class TestRunInvokesDgds:
         monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
         monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
 
-        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"))
+        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"), recreate=True)
 
         ensure_dgd.assert_called_once()
         assert ensure_dgd.call_args.args[0] == "serving"
+        ensure_cluster.assert_called_once_with(
+            "training", loaded, log=log_fn, recreate=True
+        )
 
     def test_run_passes_owner_ref_pointing_at_training_cluster(
         self, tmp_path, monkeypatch, log

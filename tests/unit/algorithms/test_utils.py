@@ -242,6 +242,31 @@ def _base_master_config(colocated: bool):
     )
 
 
+def test_dynamo_throughput_uses_external_generation_gpu_count(capsys):
+    master_config = _base_master_config(colocated=False)
+    master_config.policy["generation"]["backend"] = "dynamo"
+    timing_metrics = {
+        "policy_and_reference_logprobs": 1.0,
+        "policy_training": 3.0,
+        "total_step_time": 8.0,
+        "generation": 2.0,
+        "weight_sync": 0.5,
+    }
+
+    perf = print_performance_metrics(
+        {}, {"total_num_tokens": 1600.0}, timing_metrics, master_config
+    )
+
+    assert perf["generation_tokens_per_sec_per_gpu"] == 0
+    assert perf["generation_tokens_per_sec"] == 0
+    assert math.isclose(
+        perf["policy_training_tokens_per_sec_per_gpu"],
+        1600.0 / 3.0 / 16.0,
+        rel_tol=1e-6,
+    )
+    assert "Generation Worker Group (Tokens/sec/gpu): 0.00" in capsys.readouterr().out
+
+
 def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     master_config = _base_master_config(colocated=True)
 

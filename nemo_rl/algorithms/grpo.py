@@ -1933,9 +1933,11 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
             "expose_http_server"
         )
     elif generation_config["backend"] == "dynamo":
-        # DynamoGeneration always exposes either the DGD frontend or its local
-        # token-preserving wrapper as an OpenAI-compatible URL.
-        should_expose_http_server = True
+        # Only the token-preserving wrapper injects exact token metadata for Gym;
+        # the raw DGD frontend is not sufficient.
+        should_expose_http_server = (generation_config.get("vllm_cfg") or {}).get(
+            "expose_http_server"
+        )
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (

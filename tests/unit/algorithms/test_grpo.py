@@ -35,6 +35,7 @@ from nemo_rl.algorithms.grpo import (
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _should_use_nemo_gym,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -905,6 +906,26 @@ def test_should_use_async_rollouts_selects_backend_specific_config(
     master_config.policy = {"generation": generation_config}
 
     assert _should_use_async_rollouts(master_config) is expected
+
+
+@pytest.mark.parametrize("vllm_cfg", [None, {}, {"expose_http_server": False}])
+def test_should_use_nemo_gym_requires_dynamo_token_wrapper(vllm_cfg) -> None:
+    master_config = MagicMock()
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy = {"generation": {"backend": "dynamo", "vllm_cfg": vllm_cfg}}
+
+    with pytest.raises(AssertionError, match="expose_http_server"):
+        _should_use_nemo_gym(master_config)
+
+
+def test_should_use_nemo_gym_accepts_dynamo_token_wrapper() -> None:
+    master_config = MagicMock()
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy = {
+        "generation": {"backend": "dynamo", "vllm_cfg": {"expose_http_server": True}}
+    }
+
+    assert _should_use_nemo_gym(master_config) is True
 
 
 def test_refit_policy_generation_dynamo_matches_vllm_packed_protocol(monkeypatch):

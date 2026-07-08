@@ -187,7 +187,6 @@ dynamo:
           extraPodSpec:
             resourceClaims:
               - name: roce-channel
-                resourceClaimTemplateName: roce-${user:}-rc-nemotron-nano-v2-9b-dyn-nccl-training
             mainContainer:
               resources:
                 claims:

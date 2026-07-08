@@ -43,10 +43,16 @@ from omegaconf import OmegaConf
 from ._logging import redact
 from ._retry import with_retries
 from .k8s import custom_objects_api
+from .manifest import dra_claim_template_names_for_cluster
 from .schema import DynamoGraphSpec, InfraConfig
 
 # CRD identifiers for DynamoGraphDeployment.
 DGD_GROUP = "nvidia.com"
+# TODO: migrate to v1beta1 once the deployed Dynamo operator serves it. The
+# pinned operator still stores and serves v1alpha1, although upstream marks
+# this version deprecated:
+# deploy/operator/api/v1alpha1/dynamographdeployment_types.go.
+
 DGD_VERSION = "v1alpha1"
 DGD_PLURAL = "dynamographdeployments"
 DGD_KIND = "DynamoGraphDeployment"
@@ -140,6 +146,17 @@ def _patch_dgd_image_pull_secrets(spec: dict[str, Any], secrets: list[str]) -> N
         eps.setdefault("imagePullSecrets", body)
 
 
+def _patch_dgd_dra_template_names(
+    spec: dict[str, Any], claim_template_names: dict[str, str]
+) -> None:
+    """Point DGD pod claims at DRA templates owned by the training cluster."""
+    for pod_spec in _walk_service_pod_specs(spec):
+        for claim in pod_spec.get("resourceClaims") or []:
+            template_name = claim_template_names.get(claim.get("name", ""))
+            if template_name:
+                claim["resourceClaimTemplateName"] = template_name
+
+
 def build_owner_reference(
     *,
     api_version: str,
@@ -181,7 +198,8 @@ def build_dgd_manifest(
       5. Merge ``dgd.labels`` / ``dgd.annotations`` and the ``managed-by`` label.
       6. Attach ``ownerReferences`` if provided so K8s GC cascades when the
          owning resource (typically a RayJob or RayCluster) is deleted.
-      7. Patch cross-cutting image and imagePullSecrets fields across every
+      7. Rewrite DRA claim templates to match the training RayCluster.
+      8. Patch cross-cutting image and imagePullSecrets fields across every
          service's ``extraPodSpec``.
     """
     raw = load_dgd_manifest(dgd.manifest, base_dir)
@@ -222,6 +240,12 @@ def build_dgd_manifest(
         metadata["ownerReferences"] = [owner_ref]
 
     spec = raw["spec"]
+    training = infra.kuberay.training
+    if training is not None:
+        claim_template_names = dra_claim_template_names_for_cluster(
+            training.name, "training", training.spec
+        )
+        _patch_dgd_dra_template_names(spec, claim_template_names)
     _patch_dgd_images(spec, infra.image)
     _patch_dgd_image_pull_secrets(spec, list(infra.imagePullSecrets))
 

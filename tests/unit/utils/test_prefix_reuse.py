@@ -14,6 +14,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from nemo_rl.utils.prefix_reuse import (
     derive_required_prefix_token_ids,
     messages_to_last_assistant,
@@ -63,3 +65,51 @@ def test_messages_to_last_assistant_includes_latest_assistant_turn() -> None:
     ]
 
     assert messages_to_last_assistant(messages) == messages[:4]
+
+
+def test_derive_required_prefix_token_ids_returns_none_without_metadata() -> None:
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    assert derive_required_prefix_token_ids(messages) is None
+
+
+def test_messages_to_last_assistant_without_assistant_returns_all() -> None:
+    messages = [{"role": "system"}, {"role": "user", "content": "hi"}]
+    assert messages_to_last_assistant(messages) == messages
+
+
+def test_replace_prefix_tokens_empty_model_prefix_returns_template() -> None:
+    assert replace_prefix_tokens(
+        _Tokenizer(),
+        model_prefix_token_ids=[],
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2, 3],
+    ) == [9, 2, 3]
+
+
+def test_replace_prefix_tokens_missing_eos_raises() -> None:
+    with pytest.raises(AssertionError, match="No EOS"):
+        replace_prefix_tokens(
+            _Tokenizer(),
+            model_prefix_token_ids=[7, 2],
+            template_prefix_token_ids=[9, 9, 9],
+            template_token_ids=[9, 9, 9, 10],
+        )
+
+
+def test_replace_prefix_tokens_non_monotonic_raises() -> None:
+    with pytest.raises(AssertionError, match="non-monotonically"):
+        replace_prefix_tokens(
+            _Tokenizer(),
+            model_prefix_token_ids=[7, 2],
+            template_prefix_token_ids=[9, 2],
+            template_token_ids=[9, 2],
+        )
+
+
+def test_derive_required_prefix_token_ids_rejects_non_iterable() -> None:
+    messages = [SimpleNamespace(prompt_token_ids=5, generation_token_ids=[1])]
+    with pytest.raises(ValueError, match="prompt_token_ids"):
+        derive_required_prefix_token_ids(messages)

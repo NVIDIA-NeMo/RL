@@ -495,14 +495,16 @@ def _print_check_summary(
 
     dgds = by_kind.get("DynamoGraphDeployment", [])
     if dgds:
+        from . import dgd as dgd_mod
+
         # Match each rendered DGD back to its infra.dynamo entry by name so we
         # can show the per-spec readyTimeoutS. The keys in infra.dynamo are
         # arbitrary labels chosen by the recipe author (`serving`, etc.); fall
         # back to the manifest name when no match is found.
         dgd_specs_by_name: dict[str, tuple[str, Any]] = {}
         for k, spec in loaded.infra.dynamo.items():
-            if spec.name:
-                dgd_specs_by_name[spec.name] = (k, spec)
+            name = dgd_mod.resolve_dgd_name(spec, loaded.infra_source_path.parent)
+            dgd_specs_by_name[name] = (k, spec)
         click.echo("")
         click.echo("DYNAMO")
         click.echo("------")
