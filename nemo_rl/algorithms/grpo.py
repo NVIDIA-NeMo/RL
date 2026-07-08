@@ -1208,12 +1208,24 @@ def setup(
         )
 
         # Capture rollout TP size on the policy once; refit calls no longer need it.
-        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
+        try:
+            policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
+        except NotImplementedError:
+            print("[sglang] policy worker lacks set_rollout_num_gpus_per_engine; refit infers engine TP at update time")
 
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
         )
+
+        if enable_nemo_gym:
+            # Engines are up (initialize_generation_with_policy blocks on init),
+            # so their HTTP base URLs are resolvable now.
+            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
+                policy_generation.get_rollout_engine_urls(),
+                generation_config["model_name"],
+            )
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
 
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
@@ -1222,7 +1234,12 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    # SGLang refits via per-engine zmq/ipc (update_weights_via_ipc_zmq); its
+    # init_collective is a stub, so joining the NCCL group would deadlock the
+    # train side on /nccl_unique_id. Skip the collective entirely.
+    if not colocated_inference and backend == "sglang":
+        print("[sglang] skipping train<->inference NCCL collective (zmq/ipc refit path)")
+    elif not colocated_inference:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -1831,6 +1848,10 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         should_expose_http_server = generation_config["mcore_generation_config"].get(
             "expose_http_server"
         )
+    elif generation_config["backend"] == "sglang":
+        # SGLang rollout engines are native HTTP servers (see
+        # SGLangGeneration.get_rollout_engine_urls); nothing extra to expose.
+        should_expose_http_server = True
     else:
         should_expose_http_server = False
     assert should_expose_http_server, (
@@ -1979,6 +2000,16 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    if os.environ.get("NRL_SGLANG_SKIP_REFIT") == "1":
+        # Megatron->SGLang weight streaming is not implemented yet. Engines
+        # boot with the real checkpoint weights, so generation-only runs
+        # (the policy is never updated) can skip refit explicitly.
+        print(
+            "[sglang] NRL_SGLANG_SKIP_REFIT=1: skipping refit "
+            "(engines keep boot weights)"
+        )
+        return
+
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.suspend_for_refit()
@@ -3472,16 +3503,18 @@ def async_grpo_train(
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
-    # SGLang async rollouts do not support the async GRPO replay path.
+    # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, and
+    # SGLang. The SGLang path currently requires NRL_SGLANG_SKIP_REFIT=1
+    # (generation-only) until Megatron->SGLang weight streaming lands.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron") and _should_use_async_rollouts(
+    assert backend in ("vllm", "megatron", "sglang") and _should_use_async_rollouts(
         master_config
     ), (
-        "Async GRPO requires an async vLLM or Megatron generation engine. "
-        "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
-        "policy.generation.mcore_generation_config.async_engine=true (Megatron)."
+        "Async GRPO requires an async vLLM, Megatron, or SGLang generation "
+        "engine. Set policy.generation.vllm_cfg.async_engine=true (vLLM), "
+        "policy.generation.mcore_generation_config.async_engine=true "
+        "(Megatron), or use backend=sglang."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
