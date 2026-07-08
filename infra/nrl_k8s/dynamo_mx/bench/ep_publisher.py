@@ -120,6 +120,9 @@ print(f"[pub r{RANK}] ep_rank={ep_rank} added {added} tensors; roles={dict(roles
 sid = pub.publish(version=1)
 pub.mark_ready()
 print(f"[pub r{RANK}] published ep_rank={ep_rank} sid={sid} READY", flush=True)
-dist.barrier()
+# No post-publish barrier: each rank publishes independently and the receiver
+# discovers all EP ranks from the MX server, so a collective here only risks
+# tearing ranks down (NCCL comm can be perturbed by NIXL CUDA registration under
+# rank-packing). Ranks must stay alive holding their NIXL agents for the pull.
 time.sleep(int(os.environ.get("HOLD_S", "2400")))
 pub.shutdown()
