@@ -39,6 +39,30 @@ sudo apt install cudnn  # Will install cuDNN meta packages which points to the l
 # sudo apt install cudnn9-cuda-12-8  # Will install cuDNN version 9.x.x compiled for cuda 12.8
 ```
 
+### cmake and ninja-build (For SGLang / vLLM Builds)
+
+Building SGLang (and some vLLM components) from source requires `cmake` and `ninja-build`. These are pre-installed in the NeMo RL container, but must be installed manually on bare metal:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y cmake ninja-build
+```
+
+> [!NOTE]
+> The NeMo RL container installs cmake 3.31.1 directly from the [Kitware GitHub releases](https://github.com/Kitware/CMake/releases) to ensure a recent version. If your system's `apt` cmake is too old (check with `cmake --version`), you can install the same version manually:
+>
+> ```sh
+> CMAKE_VERSION=3.31.1
+> ARCH=$(uname -m)
+> CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}"
+> curl -fsSL -o "${CMAKE_INSTALLER}.tar.gz" \
+>     "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz"
+> tar -xzf "${CMAKE_INSTALLER}.tar.gz"
+> sudo cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/
+> sudo cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/
+> rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
+> ```
+
 ### libibverbs (For vLLM Dependencies)
 
 If you encounter problems when installing vllm's dependency `deepspeed` on bare-metal (outside of a container), you may need to install `libibverbs-dev`:
