@@ -1841,6 +1841,16 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
+    """Whether NeMo Gym is responsible for full response logging (wandb/metrics paths).
+
+    When **True**, we **skip** the expensive per-step ``train_data_step*.jsonl`` dump and
+    **keep** ``full_result``-style keys in rollout metrics (large payloads).
+
+    When **False** (default if unset), we **strip** ``full_result`` from rollout metrics and
+    **write** the ``train_data_step*.jsonl`` file (can be very large for Gym).
+
+    Set via ``env.should_log_nemo_gym_responses`` in the master config.
+    """
     env_config = master_config.env
     should_log_nemo_gym_responses = bool(
         env_config.get("should_log_nemo_gym_responses")
@@ -4320,26 +4330,33 @@ def async_grpo_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
-            # Log training data (match sync GRPO logging payload for parity)
-            log_data = {}
-            if "agent_ref" in repeated_batch:
-                log_data["agent_ref"] = repeated_batch["agent_ref"]
-            log_data["content"] = flat_messages_content
-            log_data["rewards"] = rewards.tolist()
-            if master_config.grpo["use_dynamic_sampling"]:
-                # In dynamic sampling, `rewards` corresponds to filtered rewards
-                log_data["filtered_rewards"] = rewards.tolist()
-                log_data["rewards"] = repeated_batch["total_reward"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
-            log_data["token_ids"] = train_data["input_ids"].tolist()
-            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-            log_data["advantages"] = train_data["advantages"].tolist()
-            log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
-            log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
+            # Log training data (match sync GRPO logging payload for parity).
+            # NeMo Gym responses can be very large and expensive to log; when
+            # env.should_log_nemo_gym_responses is true, skip this jsonl (see
+            # _should_log_nemo_gym_responses).
+            if not _should_log_nemo_gym_responses(master_config):
+                log_data = {}
+                if "agent_ref" in repeated_batch:
+                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = flat_messages_content
+                log_data["rewards"] = rewards.tolist()
+                if master_config.grpo["use_dynamic_sampling"]:
+                    # In dynamic sampling, `rewards` corresponds to filtered rewards
+                    log_data["filtered_rewards"] = rewards.tolist()
+                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
+                log_data["input_lengths"] = input_lengths.tolist()
+                log_data["token_ids"] = train_data["input_ids"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["advantages"] = train_data["advantages"].tolist()
+                log_data["generation_logprobs"] = train_data[
+                    "generation_logprobs"
+                ].tolist()
+                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
+                del log_data
             del train_data
             del flat_messages_content
 

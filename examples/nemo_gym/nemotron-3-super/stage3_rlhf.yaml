@@ -279,6 +279,8 @@ data:
 
 env:
   should_use_nemo_gym: true
+  # true: skip expensive train_data_step*.jsonl (recommended for large Gym runs); false: enable full jsonl.
+  should_log_nemo_gym_responses: true
   nemo_gym:
     uv_venv_dir: "${oc.env:PERSISTENT_CACHE}/gym_venvs"  # overridden by super_launch.sh to $GYM_VENV_DIR
     skip_venv_if_present: true
