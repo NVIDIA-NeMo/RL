@@ -242,6 +242,39 @@ def test_get_best_checkpoint_path(checkpoint_manager, checkpoint_dir):
         assert metadata["loss"] == min(losses)
 
 
+def test_get_best_checkpoint_path_bias_recent_if_equal(
+    checkpoint_manager, checkpoint_dir, monkeypatch
+):
+    # Checkpoints that tie for the best (lowest) metric value at different steps.
+    # The most recent tied checkpoint should be returned, matching the tie-breaking
+    # used by remove_old_checkpoints (which keeps the more recent one on ties).
+    steps = [1, 5, 10]
+    losses = [0.2, 0.5, 0.2]  # steps 1 and 10 tie for the best (lowest) loss
+
+    for step, loss in zip(steps, losses):
+        training_info = {"loss": loss}
+        tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+        checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    # Force the checkpoint history into the adversarial (older-first) order so the
+    # test fails deterministically without the recency tie-break, regardless of the
+    # underlying filesystem's glob ordering.
+    import nemo_rl.utils.checkpoint as checkpoint_mod
+
+    orig_glob = checkpoint_mod.glob.glob
+    monkeypatch.setattr(
+        checkpoint_mod.glob,
+        "glob",
+        lambda pattern: sorted(
+            orig_glob(pattern), key=lambda p: int(Path(p).name.split("_")[1])
+        ),
+    )
+
+    best_path = checkpoint_manager.get_best_checkpoint_path()
+    # Among the tied-best checkpoints (steps 1 and 10), the most recent (step 10) wins.
+    assert Path(best_path).name == "step_10"
+
+
 def test_get_latest_checkpoint_path(checkpoint_manager, checkpoint_dir):
     # Create multiple checkpoints
     steps = [1, 2, 3]

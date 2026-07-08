@@ -342,9 +342,16 @@ class CheckpointManager:
             )
             return self.get_latest_checkpoint_path()
 
-        valid_checkpoints.sort(
-            key=lambda x: x[2][self.metric_name], reverse=self.higher_is_better
-        )
+        # Sort by metric value first, then by step number so that when multiple
+        # checkpoints share the best metric value the most recent one (highest step)
+        # is returned. This matches the tie-breaking used by remove_old_checkpoints,
+        # which keeps the more recent checkpoint on equal metrics.
+        if self.higher_is_better:
+            valid_checkpoints.sort(
+                key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
+            )
+        else:
+            valid_checkpoints.sort(key=lambda x: (x[2][self.metric_name], -x[0]))
         return str(valid_checkpoints[0][1])
 
     def get_latest_checkpoint_path(self) -> Optional[str]:
