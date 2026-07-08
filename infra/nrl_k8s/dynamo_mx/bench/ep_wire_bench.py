@@ -10,15 +10,16 @@ buffers as ONE arena region and issue one batched read, so we measure the wire.
 Pairs with ep_publisher.py (EP=N Megatron publisher, N EP sources). For each source
 we fetch its NIXL metadata + descriptors from the MX server, allocate matching device
 buffers in a VMM arena, register the arena once, and time a single receive_from_source.
-Reports per-source Gbps, the SEQUENTIAL total (sum of per-source device transfers), and
-a CONCURRENT run (N threads, one NIXL agent + arena each) to show aggregate rail sharing.
+Reports per-source Gbps and the total device-transfer time (sum of per-source reads).
+Sources are pulled one at a time (isolated agent+arena torn down before the next):
+NIXL local-descriptor resolution does not tolerate multiple live VMM arenas at once.
 
 Run on the vLLM WORKER image (full CUDA+IB NIXL) with the striped RDMA env
 (MX_RDMA_NIC_PIN=stripe, UCX GPUDirect, UCX_CUDA_COPY_REG_WHOLE_ALLOC=off). Env:
 MODEL_EXPRESS_URL, EP_SIZE (default 4).
 """
 from __future__ import annotations
-import os, socket, threading, time
+import os, socket, time
 import torch
 
 from modelexpress import MxV2RefitReceiver
@@ -45,10 +46,14 @@ def _descriptors_for(client, ref):
     return w.nixl_metadata, desc
 
 
-def _setup_one(ep, desc):
-    """Build + arena-register matching device buffers for one EP source.
-    use_arena is a non-reentrant global, so all setup runs in the main thread
-    (sequentially); only the RDMA read is done concurrently later."""
+def _pull_one(ep, meta, desc, out):
+    """Arena-register matching buffers for one EP source and time one batched read.
+
+    Setup + read are kept together per source (isolated agent+arena, torn down
+    before the next): NIXL local-descriptor resolution does not tolerate multiple
+    live VMM arenas registered at once, and use_arena is a non-reentrant global —
+    so sources are pulled one at a time. The per-source device rate is the wire
+    measurement; the total is the sum of per-source device-transfer times."""
     mgr = NixlTransferManager(agent_name=f"ep{ep}-wire-{socket.gethostname()}",
                               device_id=0, listen_port=0)
     mgr.initialize()
@@ -62,14 +67,11 @@ def _setup_one(ep, desc):
     torch.cuda.synchronize()
     mgr.register_arena(arena, bufs)
     torch.cuda.synchronize()
-    return mgr, arena, bufs
-
-
-def _xfer_one(ep, mgr, meta, desc, out):
-    """Time one batched device->device RDMA read against pre-registered buffers."""
     nb, nt, dur = mgr.receive_from_source(meta, desc, timeout_seconds=600)
     torch.cuda.synchronize()
     out[ep] = (nb, nt, dur)
+    del bufs, arena, mgr
+    torch.cuda.empty_cache()
 
 
 def main() -> int:
@@ -105,51 +107,26 @@ def main() -> int:
 
     install_pluggable_allocator()
 
-    # Set up all sources' NIXL agents + arena-registered buffers up front
-    # (sequential; use_arena is a non-reentrant global). One agent + arena/source.
-    print(f"\n[wire] setting up {EP_SIZE} agents + arena registrations ...", flush=True)
-    handles = {}  # ep -> (mgr, arena, bufs)
-    for ep, meta, desc in sources:
-        handles[ep] = _setup_one(ep, desc)
-
-    # ---- SEQUENTIAL: one batched device->device read at a time ----
-    print(f"\n[wire] SEQUENTIAL device->device reads (arena + stripe) ...", flush=True)
+    # ---- device->device pulls, one source at a time (arena + 4-rail stripe) ----
+    print(f"\n[wire] device->device pulls (arena + stripe), one source at a time ...", flush=True)
     seq = {}
     t0 = time.perf_counter()
     for ep, meta, desc in sources:
-        _xfer_one(ep, handles[ep][0], meta, desc, seq)
+        _pull_one(ep, meta, desc, seq)
         nb, nt, dur = seq[ep]
         print(f"  ep{ep}: {nb/1e9:.2f} GB in {dur:.3f}s -> {nb*8/dur/1e9:.1f} Gbps", flush=True)
     seq_wall = time.perf_counter() - t0
     seq_bytes = sum(v[0] for v in seq.values())
     seq_dev = sum(v[2] for v in seq.values())
-    print(f"[wire] SEQUENTIAL: {seq_bytes/1e9:.2f} GB; device transfer sum {seq_dev:.3f}s "
-          f"= {seq_bytes*8/seq_dev/1e9:.1f} Gbps; wall {seq_wall:.3f}s", flush=True)
-
-    # ---- CONCURRENT: N threads issue their reads simultaneously (rail sharing) ----
-    print(f"\n[wire] CONCURRENT device->device reads ({EP_SIZE} threads) ...", flush=True)
-    conc = {}
-    ths = [threading.Thread(target=_xfer_one, args=(ep, handles[ep][0], meta, desc, conc))
-           for ep, meta, desc in sources]
-    t0 = time.perf_counter()
-    for t in ths:
-        t.start()
-    for t in ths:
-        t.join()
-    conc_wall = time.perf_counter() - t0
-    conc_bytes = sum(v[0] for v in conc.values())
-    for ep in sorted(conc):
-        nb, nt, dur = conc[ep]
-        print(f"  ep{ep}: {nb/1e9:.2f} GB in {dur:.3f}s -> {nb*8/dur/1e9:.1f} Gbps", flush=True)
-    print(f"[wire] CONCURRENT: {conc_bytes/1e9:.2f} GB in {conc_wall:.3f}s wall "
-          f"= {conc_bytes*8/conc_wall/1e9:.1f} Gbps aggregate", flush=True)
 
     print("\n==== EP4 WIRE SUMMARY ====", flush=True)
     print(f"total model bytes across {EP_SIZE} EP sources: {seq_bytes/1e9:.2f} GB", flush=True)
-    print(f"sequential device-transfer time : {seq_dev:.3f}s "
-          f"({seq_bytes*8/seq_dev/1e9:.1f} Gbps)", flush=True)
-    print(f"concurrent wall time            : {conc_wall:.3f}s "
-          f"({conc_bytes*8/conc_wall/1e9:.1f} Gbps aggregate)", flush=True)
+    print(f"per-source device rate (median) : "
+          f"~{sorted(v[0]*8/v[2]/1e9 for v in seq.values())[len(seq)//2]:.0f} Gbps "
+          f"(4-rail stripe, GPU->GPU)", flush=True)
+    print(f"device-transfer time (sum)      : {seq_dev:.3f}s "
+          f"({seq_bytes*8/seq_dev/1e9:.1f} Gbps effective)", flush=True)
+    print(f"wall incl. arena setup/register : {seq_wall:.3f}s", flush=True)
     return 0
 
 
