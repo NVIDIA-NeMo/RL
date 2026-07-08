@@ -26,7 +26,13 @@ WORLD = int(os.environ.get("WORLD_SIZE", "1"))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
 EP = WORLD  # expert-parallel over the whole world (TP=PP=1)
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-torch.cuda.set_device(LOCAL_RANK)
+# Device packing: when nproc_per_node > visible GPUs (e.g. EP8 rank-packed onto a
+# 3-GPU node because the cluster has no 4-free node), map ranks round-robin onto the
+# visible devices. NCCL among the ranks stays on-node (NVLink). One GPU can host
+# several EP ranks; each still owns a distinct expert shard + its own NIXL agent.
+_NVIS = torch.cuda.device_count()
+DEV_ID = LOCAL_RANK % _NVIS
+torch.cuda.set_device(DEV_ID)
 
 dist.init_process_group(backend="nccl", world_size=WORLD, rank=RANK)
 from megatron.core import parallel_state
@@ -36,7 +42,7 @@ parallel_state.initialize_model_parallel(
 )
 ep_rank = parallel_state.get_expert_model_parallel_rank()
 print(f"[pub r{RANK}] EP={EP} ep_rank={ep_rank} host={socket.gethostname()} "
-      f"gpu={LOCAL_RANK}", flush=True)
+      f"gpu={DEV_ID} (local_rank={LOCAL_RANK})", flush=True)
 
 from megatron.bridge import AutoBridge
 t0 = time.perf_counter()
@@ -59,7 +65,7 @@ from modelexpress import MxV2TrainingPublisher, TrainerWorldLayout
 
 pub = MxV2TrainingPublisher(
     agent_name=f"{socket.gethostname()}-ep{EP}-pub-r{ep_rank}",
-    device_id=LOCAL_RANK,
+    device_id=DEV_ID,
     mx_server_url=os.environ.get("MODEL_EXPRESS_URL",
                                  "modelexpress-server.kavin.svc.cluster.local:8001"),
     worker_rank=ep_rank,
@@ -103,7 +109,7 @@ for name, local, spec, extras in collect_megatron_publish_set(
     target_dtype=torch.bfloat16,
 ):
     pub.add_tensor(name=name,
-        tensor=local.to(f"cuda:{LOCAL_RANK}").contiguous() if not local.is_cuda else local.contiguous(),
+        tensor=local.to(f"cuda:{DEV_ID}").contiguous() if not local.is_cuda else local.contiguous(),
         is_expert=spec.is_expert, expert_axis=spec.expert_axis,
         owned_expert_ids=spec.owned_expert_ids,
         megatron_role=spec.role, megatron_extras=spec.descriptor_extras)
