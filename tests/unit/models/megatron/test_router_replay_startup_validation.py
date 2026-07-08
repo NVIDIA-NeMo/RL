@@ -25,7 +25,9 @@ import pytest
 from omegaconf import OmegaConf
 
 from nemo_rl.models.megatron.router_replay import validate_router_replay_startup
-from nemo_rl.utils.config import load_config
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+register_omegaconf_resolvers()
 
 REPO_ROOT = Path(__file__).parents[4]
 QWEN30B_MEGATRON_YAML = REPO_ROOT / "examples/configs/grpo_math_qwen30ba3b_megatron.yaml"
