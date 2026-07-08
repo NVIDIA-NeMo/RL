@@ -245,6 +245,7 @@ policy:
       enable_thinking: true
       streaming_tool_call: &streaming_tool_call
         enabled: false
+        tokenizer_only: false
         max_sessions: 256
         session_ttl_seconds: 900
         stability_margin_tokens: 8

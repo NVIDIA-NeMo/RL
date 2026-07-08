@@ -25,12 +25,13 @@ VERIFIED_DATA_PATH="${VERIFIED_DATA_PATH:-${REPO_ROOT}/results/swebench_verified
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 PAIR_DIR="${PAIR_DIR:-${REPO_ROOT}/results/streaming_tool_call_verified/${RUN_ID}}"
 WANDB_GROUP="${WANDB_GROUP:-streaming-tool-call-verified-temp0-${RUN_ID}}"
+SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
 NUM_VLLM_REPLICAS="${NUM_VLLM_REPLICAS:-32}"
 TRAJECTORY_COLLECTION_BATCH_SIZE="${TRAJECTORY_COLLECTION_BATCH_SIZE:-128}"
 EXPECTED_COUNT="${EXPECTED_COUNT:-500}"
 PREWARM_SWEBENCH_ARTIFACTS="${PREWARM_SWEBENCH_ARTIFACTS:-1}"
 # Each PAIR_ARMS entry accepts
-# name:streaming_enabled[:snapshot_poll_seconds[:min_chunk_chars]].
+# name:streaming_enabled[:snapshot_poll_seconds[:min_chunk_chars[:tokenizer_only]]].
 SNAPSHOT_POLL_INTERVAL_SECONDS="${SNAPSHOT_POLL_INTERVAL_SECONDS:-0.1}"
 PAIR_ARMS="${PAIR_ARMS:-streaming_off:0 streaming_on:1}"
 
@@ -61,6 +62,7 @@ submit_arm() {
   local streaming_enabled="$2"
   local snapshot_poll_interval_seconds="$3"
   local min_chunk_chars="$4"
+  local tokenizer_only="$5"
   local experiment_name="streamtool-verified-temp0-r${NUM_VLLM_REPLICAS}-${RUN_ID}-${arm}"
 
   REPO_ROOT="${REPO_ROOT}" \
@@ -72,10 +74,12 @@ submit_arm() {
   TEMPERATURE=0.0 \
   TOP_P=1.0 \
   STREAMING_MIN_CHUNK_CHARS="${min_chunk_chars}" \
+  STREAMING_INCREMENTAL_TOKENIZER_ONLY="${tokenizer_only}" \
   SWE_BENCH_ARTIFACT_CACHE_OFFLINE="${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}" \
   STREAMING_TOOL_CALL="${streaming_enabled}" \
   SNAPSHOT_POLL_INTERVAL_SECONDS="${snapshot_poll_interval_seconds}" \
   LOG_GYM_RESPONSES=true \
+  SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY}" \
   SBATCH_TIME="${SBATCH_TIME:-4:0:0}" \
   WANDB_GROUP="${WANDB_GROUP}" \
   EXP_SUFFIX="${experiment_name}" \
@@ -94,14 +98,16 @@ for arm_spec in ${PAIR_ARMS}; do
   streaming_enabled=""
   snapshot_poll_interval_seconds=""
   min_chunk_chars=""
+  tokenizer_only=""
   extra=""
-  IFS=':' read -r arm streaming_enabled snapshot_poll_interval_seconds min_chunk_chars extra <<< "${arm_spec}"
+  IFS=':' read -r arm streaming_enabled snapshot_poll_interval_seconds min_chunk_chars tokenizer_only extra <<< "${arm_spec}"
   snapshot_poll_interval_seconds="${snapshot_poll_interval_seconds:-${SNAPSHOT_POLL_INTERVAL_SECONDS}}"
-  if [ -z "${arm}" ] || [ -n "${extra}" ] || { [ "${streaming_enabled}" != "0" ] && [ "${streaming_enabled}" != "1" ]; } || { [ -n "${min_chunk_chars}" ] && ! [[ "${min_chunk_chars}" =~ ^[1-9][0-9]*$ ]]; }; then
-    echo "ERROR: invalid PAIR_ARMS entry '${arm_spec}'; expected name:0[:poll_seconds[:min_chunk_chars]] or name:1[:poll_seconds[:min_chunk_chars]]" >&2
+  tokenizer_only="${tokenizer_only:-0}"
+  if [ -z "${arm}" ] || [ -n "${extra}" ] || { [ "${streaming_enabled}" != "0" ] && [ "${streaming_enabled}" != "1" ]; } || { [ -n "${min_chunk_chars}" ] && ! [[ "${min_chunk_chars}" =~ ^[1-9][0-9]*$ ]]; } || { [ "${tokenizer_only}" != "0" ] && [ "${tokenizer_only}" != "1" ]; } || { [ "${tokenizer_only}" = "1" ] && [ "${streaming_enabled}" != "1" ]; }; then
+    echo "ERROR: invalid PAIR_ARMS entry '${arm_spec}'; expected name:0[:poll_seconds[:min_chunk_chars[:tokenizer_only]]] or name:1[:poll_seconds[:min_chunk_chars[:tokenizer_only]]]" >&2
     exit 1
   fi
-  submit_arm "${arm}" "${streaming_enabled}" "${snapshot_poll_interval_seconds}" "${min_chunk_chars}"
+  submit_arm "${arm}" "${streaming_enabled}" "${snapshot_poll_interval_seconds}" "${min_chunk_chars}" "${tokenizer_only}"
 done
 
 if [ "${DRY_RUN:-0}" = "1" ]; then

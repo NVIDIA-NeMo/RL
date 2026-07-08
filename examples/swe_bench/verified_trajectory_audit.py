@@ -29,8 +29,43 @@ from typing import Any, Iterable
 SWE_BENCH_VERIFIED = "princeton-nlp/SWE-bench_Verified"
 PERF_FIELDS = (
     "total_model_call_time",
+    "total_model_call_count",
     "openhands_run_time",
     "total_command_exec_time",
+    "total_controller_action_count",
+    "total_controller_action_time",
+    "total_controller_cmd_action_count",
+    "total_controller_cmd_action_time",
+    "create_runtime_time",
+    "connect_to_runtime_time",
+    "initialize_runtime_time",
+    "run_controller_time",
+    "complete_runtime_time",
+    "runtime_close_time",
+    "post_controller_processing_time",
+    "process_instance_time",
+    "openhands_model_api_call_count",
+    "openhands_model_api_call_seconds",
+    "openhands_controller_observation_count",
+    "openhands_controller_observation_seconds",
+    "openhands_action_request_count",
+    "openhands_action_request_seconds",
+    "openhands_action_server_seconds",
+    "openhands_runtime_setup_action_count",
+    "openhands_runtime_setup_action_request_seconds",
+    "openhands_runtime_setup_action_server_seconds",
+    "openhands_runtime_initialize_action_count",
+    "openhands_runtime_initialize_action_request_seconds",
+    "openhands_runtime_initialize_action_server_seconds",
+    "openhands_controller_action_count",
+    "openhands_controller_action_request_seconds",
+    "openhands_controller_action_server_seconds",
+    "openhands_controller_cmd_action_count",
+    "openhands_controller_cmd_action_request_seconds",
+    "openhands_controller_cmd_action_server_seconds",
+    "openhands_runtime_completion_action_count",
+    "openhands_runtime_completion_action_request_seconds",
+    "openhands_runtime_completion_action_server_seconds",
     "final_eval_time",
     "total_prompt_tokens",
     "total_completion_tokens",
@@ -40,6 +75,22 @@ PERF_FIELDS = (
     "streaming_tool_call_sessions_started",
     "streaming_tool_call_prefill_requests",
     "streaming_tool_call_prefill_tokens",
+    "streaming_tool_call_valid_prefill_actions",
+    "streaming_tool_call_tokenizer_only_actions",
+    "streaming_tool_call_valid_tokenizer_actions",
+    "streaming_tool_call_prompt_reuse_candidates",
+    "streaming_tool_call_prompt_reuse_requests",
+    "streaming_tool_call_prompt_reuse_matches",
+    "streaming_tool_call_prompt_reuse_exact_matches",
+    "streaming_tool_call_prompt_reuse_token_equivalent_matches",
+    "streaming_tool_call_prompt_reuse_mismatches",
+    "streaming_tool_call_prompt_reuse_missing",
+    "streaming_tool_call_incremental_tokenizer_requests",
+    "streaming_tool_call_incremental_tokenizer_tokens",
+    "streaming_tool_call_incremental_tokenizer_seconds",
+    "streaming_tool_call_command_request_seconds",
+    "streaming_tool_call_post_command_tail_seconds",
+    "streaming_tool_call_snapshot_request_seconds",
     "streaming_tool_call_overhead_seconds",
 )
 INFRASTRUCTURE_ERROR_MARKERS = (
@@ -137,6 +188,17 @@ def count_function_calls(response: Any) -> int | None:
     )
 
 
+def is_infrastructure_error(full_result: dict[str, Any]) -> bool:
+    """Detect harness failures without scanning normal agent tool output."""
+    if full_result.get("infrastructure_error") is True:
+        return True
+    response = full_result.get("response")
+    if not isinstance(response, dict) or response.get("error") is None:
+        return False
+    error_text = json.dumps(response["error"], ensure_ascii=False)
+    return any(marker in error_text for marker in INFRASTRUCTURE_ERROR_MARKERS)
+
+
 def read_result_jsonl(path: Path) -> list[dict[str, Any]]:
     """Stream a large trajectory JSONL while retaining only audit fields."""
     rows = []
@@ -172,9 +234,7 @@ def read_result_jsonl(path: Path) -> list[dict[str, Any]]:
                 },
                 "reward": full_result.get("reward"),
                 "resolved": full_result.get("resolved"),
-                "infrastructure_error": any(
-                    marker in line for marker in INFRASTRUCTURE_ERROR_MARKERS
-                ),
+                "infrastructure_error": is_infrastructure_error(full_result),
                 "response_error": isinstance(response, dict)
                 and response.get("error") is not None,
                 "trajectory_sha256": canonical_trajectory_sha256(full_result),
@@ -475,6 +535,44 @@ def build_subset_manifest(
         "selection": {
             "method": "sha256_ranked_instance_id",
             "seed": selection_seed,
+            "selected_instance_ids_sha256": canonical_json_sha256(selected_ids),
+        },
+    }
+    atomic_write_json(output.with_suffix(".metadata.json"), metadata)
+    return metadata
+
+
+def build_prefix_manifest(
+    manifest_path: Path,
+    output: Path,
+    expected_count: int,
+    prefix_count: int,
+) -> dict[str, Any]:
+    """Build a manifest from the first rows in source order."""
+    if prefix_count <= 0:
+        raise AuditError("prefix count must be positive")
+
+    manifest_rows = read_jsonl(manifest_path)
+    manifest = validate_manifest(manifest_rows, expected_count)
+    if prefix_count > len(manifest_rows):
+        raise AuditError(
+            f"prefix count {prefix_count} exceeds manifest size {len(manifest_rows)}"
+        )
+
+    selected_rows = manifest_rows[:prefix_count]
+    selected_ids = [get_instance_id(row) for row in selected_rows]
+    atomic_write_jsonl(output, selected_rows)
+    metadata = {
+        "dataset": SWE_BENCH_VERIFIED,
+        "rows": len(selected_rows),
+        "sha256": file_sha256(output),
+        "manifest": str(output.resolve()),
+        "source_manifest": str(manifest_path.resolve()),
+        "source_manifest_rows": len(manifest),
+        "source_manifest_sha256": file_sha256(manifest_path),
+        "selection": {
+            "method": "source_order_prefix",
+            "prefix_count": prefix_count,
             "selected_instance_ids_sha256": canonical_json_sha256(selected_ids),
         },
     }
@@ -800,6 +898,14 @@ def parse_args() -> argparse.Namespace:
         "--selection-seed", default="streaming-tool-call-subset-v1"
     )
 
+    prefix_manifest = subparsers.add_parser(
+        "prefix-manifest", help="build a manifest from the first rows in source order"
+    )
+    prefix_manifest.add_argument("--manifest", type=Path, required=True)
+    prefix_manifest.add_argument("--output", type=Path, required=True)
+    prefix_manifest.add_argument("--expected-count", type=int, default=500)
+    prefix_manifest.add_argument("--prefix-count", type=int, required=True)
+
     compare = subparsers.add_parser("compare", help="strictly compare two result files")
     compare.add_argument("--manifest", type=Path, required=True)
     compare.add_argument("--streaming-off", type=Path, required=True)
@@ -854,6 +960,13 @@ def main() -> int:
                 args.expected_count,
                 args.subset_count,
                 args.selection_seed,
+            )
+        elif args.command == "prefix-manifest":
+            summary = build_prefix_manifest(
+                args.manifest,
+                args.output,
+                args.expected_count,
+                args.prefix_count,
             )
         else:
             report, outcomes = compare_arms(

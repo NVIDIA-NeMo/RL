@@ -584,7 +584,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+        from vllm.renderers import merge_kwargs
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
+        from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
@@ -656,6 +658,88 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
 
+            async def _preprocess_chat_with_prompt_token_ids(
+                self,
+                request,
+                messages,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
+                tool_dicts,
+                tool_parser,
+                reasoning_parser,
+                *,
+                skip_mm_cache: bool,
+            ):
+                """Render chat metadata while reusing authoritative prompt tokens."""
+                renderer = self.renderer
+                mm_config = self.model_config.multimodal_config
+                merged_template_kwargs = merge_kwargs(
+                    default_template_kwargs,
+                    dict(
+                        tools=tool_dicts,
+                        tokenize=is_mistral_tokenizer(renderer.tokenizer),
+                    ),
+                )
+                tok_params = request.build_tok_params(self.model_config)
+                chat_params = request.build_chat_params(
+                    default_template, default_template_content_format
+                ).with_defaults(
+                    merged_template_kwargs,
+                    default_media_io_kwargs=(
+                        mm_config.media_io_kwargs if mm_config else None
+                    ),
+                    default_mm_processor_kwargs=getattr(
+                        request, "mm_processor_kwargs", None
+                    ),
+                )
+
+                conversation, prompt = await renderer.render_messages_async(
+                    messages, chat_params
+                )
+                prompt["prompt_token_ids"] = list(
+                    request.required_full_prompt_token_ids
+                )
+                tokenized_prompt = await renderer.tokenize_prompt_async(
+                    prompt, tok_params
+                )
+                renderer._apply_prompt_extras(
+                    [tokenized_prompt],
+                    {
+                        key: value
+                        for key in ("mm_processor_kwargs", "cache_salt")
+                        if (value := getattr(request, key, None)) is not None
+                    },
+                )
+                engine_prompt = await renderer.process_for_engine_async(
+                    tokenized_prompt,
+                    time.time(),
+                    skip_mm_cache=skip_mm_cache,
+                )
+
+                if reasoning_parser is not None:
+                    tokenizer = renderer.get_tokenizer()
+                    request = reasoning_parser(
+                        tokenizer,
+                        model_config=self.model_config,
+                        chat_template_kwargs=chat_params.chat_template_kwargs,
+                    ).adjust_request(request=request)
+
+                if tool_parser is not None:
+                    tool_choice = getattr(request, "tool_choice", "none")
+                    tokenizer = renderer.get_tokenizer()
+                    is_mistral_grammar_eligible = (
+                        is_mistral_tool_parser(tool_parser)
+                        and is_mistral_tokenizer(tokenizer)
+                        and tokenizer.supports_grammar
+                    )
+                    if tool_choice != "none" or is_mistral_grammar_eligible:
+                        tool_parser(tokenizer, request.tools).adjust_request(
+                            request=request
+                        )
+
+                return conversation, [engine_prompt]
+
             # vLLM 0.20 moved chat preprocessing from
             # OpenAIServing._preprocess_chat to OpenAIServingRender.preprocess_chat,
             # so this override now applies via the render subclass.
@@ -691,6 +775,31 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     # So we don't need to set the request's max output tokens to 1 here.
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
+
+                if (
+                    isinstance(request, NeMoRLChatCompletionRequest)
+                    and request.required_full_prompt_token_ids is not None
+                ):
+                    res = await self._preprocess_chat_with_prompt_token_ids(
+                        request=request,
+                        messages=messages,
+                        default_template=default_template,
+                        default_template_content_format=(
+                            default_template_content_format
+                        ),
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        tool_parser=tool_parser,
+                        reasoning_parser=reasoning_parser,
+                        skip_mm_cache=skip_mm_cache,
+                    )
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            request.required_full_prompt_token_ids,
+                        )
+                    return res
 
                 try:
                     res = await super().preprocess_chat(
@@ -792,6 +901,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
+            required_full_prompt_token_ids: Optional[List[int]] = None
 
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override

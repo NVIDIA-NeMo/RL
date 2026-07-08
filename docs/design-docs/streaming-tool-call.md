@@ -27,6 +27,13 @@ OpenHands checkout used by the SWE harness:
   updates or cache resets. Sleep keeps admission paused until wake-up.
 - Tool completion closes the speculative request after exact final-prefix
   validation. The next model turn still uses the unchanged normal chat endpoint.
+- In tokenizer-only mode, tool completion stores the authoritative final
+  `/tokenize` result as a bounded one-shot candidate. The next matching model
+  turn consumes those token IDs for generation and prompt logging, without a
+  speculative prefill or a second tokenizer encode.
+- The tokenizer request retains only the newest assistant token-logging triplet
+  so NeMo-RL's authoritative historical-prefix replacement still runs. A
+  separate canonical comparison copy removes all token-logging fields.
 
 The OpenHands integration is stored as the base
 `responses_api_agents/swe_agents/patches/streaming_tool_call.patch`, followed
@@ -298,9 +305,225 @@ the strict append-only check falls back rather than trying to maintain a mutable
 head/tail frontier.
 
 True incremental tokenizer state that encodes only a new suffix, including BPE
-boundary repair, is future work. V1 performs incremental prefill, not
-incremental encoding. The normal final model call remains authoritative and
-unchanged.
+boundary repair, is not implemented. V1 performs incremental prefill, not
+incremental encoding. The `tokenizer_only` experiment still fully retokenizes
+each admitted cumulative prompt, but it now reuses the authoritative final
+tokenization in the next model call. This tests whether moving and deduplicating
+tokenizer work helps without issuing speculative generation/prefill requests;
+it is not yet the suffix-only encoder designed below.
+
+## Implemented Tokenizer-Only Prompt Reuse
+
+At tool completion, `LocalRuntime` reconstructs the unchanged authoritative
+`CmdOutputObservation`, sends one final tokenizer-only request, and receives a
+one-shot `reuse_id`. The Gym vLLM model proxy stores the exact preprocessed
+prompt fields, token IDs, sticky backend-client identity, and expiry time. The
+final request carries the YAML-configured `max_sessions` and
+`session_ttl_seconds`; candidates are lazily expired, bounded by that shared
+limit, and consumed at most once.
+
+The next OpenHands model call attaches only the opaque `reuse_id`. The proxy
+re-runs its ordinary request preprocessing and builds two views:
+
+```text
+model + messages + tools + chat_template_kwargs
+```
+
+The tokenize view keeps only the most recent assistant message containing all
+three of `prompt_token_ids`, `generation_token_ids`, and
+`generation_log_probs`; it removes older copies. This is required because the
+NeMo-RL vLLM `/tokenize` endpoint uses the newest prompt and generation IDs to
+replace a chat-template reconstruction with the exact historical model-token
+prefix. The comparison view removes all three fields from every message. It is
+small, and it makes candidate/request equality insensitive to OpenHands'
+intentional cleanup of old logging metadata.
+
+The fast path requires the comparison dictionary and selected sticky vLLM
+client to match the stored candidate. If the dictionary differs, the proxy
+tokenizes the actual request once and accepts the candidate only when the two
+complete token-ID sequences are equal; this is the `token_equivalent` safety
+path. A true token mismatch, missing/expired ID, changed tool observation, or
+different replica silently follows the original full tokenization path.
+Provider-only null/default assistant fields are removed when the streaming
+context is created so the candidate uses the same message shape that OpenHands
+will serialize on its next request.
+
+On a match, the proxy forwards `required_full_prompt_token_ids` to the NeMo-RL
+vLLM HTTP server. The server still renders the conversation for response
+formatting, reasoning, tool parsing, multimodal metadata, context-length
+validation, and max-output-token clamping, but supplies the stored tokens to
+the renderer instead of calling tokenizer encode. Gym also uses the same IDs
+for logged `prompt_token_ids`, eliminating its previous second `/tokenize`
+request. Thus one authoritative final tokenization replaces the generation
+path's tokenizer encode plus Gym's duplicate logging tokenization.
+
+This handoff cannot change trajectory tokens when either gate is obeyed: the
+token IDs came from the same backend `/tokenize` endpoint, and the fast gate
+requires canonical prompt equality while the fallback gate requires complete
+token equality. It does not trust an approximate string prefix or a
+client-provided token list. The direct vLLM field is internal to the trusted
+Gym-to-worker request and is never exposed as an arbitrary OpenHands token
+override. The unchanged NeMo-RL monotonic-token assertion remains the final
+end-to-end guard.
+
+```mermaid
+sequenceDiagram
+    participant O as OpenHands runtime
+    participant G as Gym vLLM proxy
+    participant V as NeMo-RL vLLM HTTP server
+
+    O->>G: final tokenizer-only request(authoritative observation)
+    G->>V: /tokenize(exact final chat)
+    V-->>G: prompt_token_ids
+    G-->>O: opaque one-shot reuse_id
+    O->>G: next chat completion + reuse_id
+    G->>G: canonical prompt + sticky-client comparison
+    alt canonical exact match
+        G->>V: chat completion + required_full_prompt_token_ids
+        V->>V: render conversation; skip tokenizer encode
+        V-->>G: completion
+        G->>G: log reused prompt IDs; skip duplicate /tokenize
+    else canonical mismatch
+        G->>V: /tokenize(actual next request)
+        alt complete token equality
+            G->>V: chat completion + required_full_prompt_token_ids
+        else true token mismatch
+            G->>V: unchanged baseline chat completion
+        end
+    else missing candidate
+        G->>V: unchanged baseline chat completion
+    end
+```
+
+## Proposed Exact Incremental Tokenizer
+
+Status: detailed design; not implemented by the current `tokenizer_only` path.
+
+The tokenizer cannot prevent a recent token suffix from changing when more
+characters arrive. Byte-level BPE merges, Unicode normalization, the
+pre-tokenizer, and the chat-template closing suffix can all revise recent token
+boundaries. Correctness therefore depends on preventing any *possibly mutable*
+token from entering the committed vLLM KV prefix.
+
+### Placement and interface
+
+The incremental tokenizer state belongs in the NeMo Gym model proxy selected by
+the existing sticky client cookie. That layer owns the authoritative chat
+template, tokenizer, and `_replace_prefix_tokens()` preprocessing; OpenHands
+should continue to send cumulative text snapshots without making tokenizer
+decisions.
+
+The proxy exposes one stateful tokenizer session per tool action:
+
+```text
+initialize(chat_without_final_tool_output, tokenizer_fingerprint)
+append(sequence_no, cumulative_tool_output) -> stable_token_suffix
+finalize(authoritative_final_chat) -> exact_prefix_match
+abort(reason)
+```
+
+The session records:
+
+- tokenizer, chat-template, special-token, and model-weight fingerprints;
+- the last accepted cumulative UTF-8 tool text and sequence number;
+- immutable prompt-prefix token IDs from prior conversation turns;
+- `committed_token_ids`, which may never be revised;
+- a mutable text/token tail with tokenizer offset or pre-tokenizer state;
+- the previous verified candidate token IDs and stable frontier;
+- checkpoint, rollback, mismatch, and encoded-byte counters.
+
+The chat renderer must expose the prompt as an immutable prefix, the growing
+tool-output field, and an unstable closing suffix. The closing suffix is never
+committed while the tool is running because appending tool text moves its token
+boundary.
+
+### Append and commit algorithm
+
+For each distinct cumulative snapshot:
+
+1. Require `new_text.startswith(previous_text)`. A terminal rewrite immediately
+   aborts speculative work and uses the baseline final request.
+2. Coalesce snapshots while an append is in flight; process only the newest
+   revision after the configured character/time bucket is reached.
+3. Feed only the newly appended UTF-8 bytes to a tokenizer-specific streaming
+   adapter. The adapter retains the last open pre-tokenizer segment and a
+   mutable token tail; it finalizes only lexical segments whose right boundary
+   is proven closed.
+4. Roll back and re-encode the mutable tail whenever new bytes change its token
+   segmentation. A fixed character lookback alone is not considered safe: a
+   tokenizer adapter must expose an exact stable boundary, otherwise this path
+   falls back to cumulative retokenization.
+5. Form the new verified candidate from the immutable prompt prefix, committed
+   tokens, repaired tail, and new tokens. Require it to start with every
+   `committed_token_id`.
+6. Compute the longest common token prefix with the previous verified candidate
+   and intersect it with the adapter's stable boundary. Subtract
+   `stability_margin_tokens`; only the remaining new suffix is commit-eligible.
+7. Periodically run the unchanged full tokenizer as a checkpoint. A mismatch
+   inside the mutable tail rolls back and repairs that tail. A mismatch touching
+   committed tokens aborts the streaming session because already-prefilled KV
+   cannot be edited safely.
+8. Submit only newly committed token IDs to the resumable prefill request. Empty
+   stable suffixes update tokenizer state without issuing vLLM work.
+
+```mermaid
+flowchart TD
+    A["New cumulative tool snapshot"] --> B{"Text extends previous snapshot?"}
+    B -- No --> X["Abort speculative session<br/>use normal final request"]
+    B -- Yes --> C["Append new bytes to tokenizer adapter<br/>rollback and re-encode mutable tail"]
+    C --> D{"Candidate still starts with<br/>all committed token IDs?"}
+    D -- No --> X
+    D -- Yes --> E["Stable frontier = adapter boundary<br/>intersect token LCP; subtract holdback"]
+    E --> F["Commit only newly proven stable tokens"]
+    F --> G{"Checkpoint or tool completion?"}
+    G -- No --> A
+    G -- Yes --> H["Full authoritative tokenization"]
+    H --> I{"Committed IDs are an exact prefix?"}
+    I -- No --> X
+    I -- Yes --> J["Mark tokenizer/prefill action valid<br/>normal final generation may reuse KV"]
+```
+
+### Finalization and correctness invariant
+
+Tool completion always constructs the unchanged authoritative final
+`CmdOutputObservation` and fully tokenizes the normal final chat request. Let
+`C` be the committed speculative tokens and `F` the authoritative final prompt
+tokens. Reuse is allowed only when:
+
+```python
+F[: len(C)] == C
+```
+
+Tentative-tail changes are expected and repaired. A change before `len(C)` is a
+hard invariant violation: abort the speculative request, increment the mismatch
+and fallback counters, and run the normal final request without relying on its
+KV state. This preserves trajectory tokens and accuracy even if the incremental
+adapter is wrong; only speculative performance is lost.
+
+### Supported tokenizers and fallback
+
+The first implementation should be an explicit adapter for the production Qwen
+byte-level BPE tokenizer and pre-tokenizer. A generic Hugging Face tokenizer is
+eligible only if it exposes enough state or offsets to prove a stable boundary.
+Unsupported normalization, template mutation, offset ambiguity, tokenizer
+fingerprint change, sequence gap, or context-length exhaustion falls back to
+the existing cumulative-retokenization path. No heuristic fixed-size byte or
+token window is allowed to commit KV without an exact checkpoint.
+
+### Complexity and acceptance tests
+
+Current cumulative retokenization processes roughly
+`sum(len(prompt_at_revision))` input, which becomes quadratic as a command grows.
+The target path processes the final prompt once plus mutable-tail repairs and
+occasional full checkpoints. It must retain snapshot coalescing so a 50 ms poll
+does not imply one tokenizer or HTTP request.
+
+Required tests include Unicode split points, byte fallback, whitespace and
+regex pre-tokenizer boundaries, adversarial BPE merges, terminal rewrites,
+30,000-character observation truncation, chat-template finalization, randomized
+chunk boundaries, checkpoint mismatch, and exact equality with one-shot final
+tokenization. The feature remains fail-open until every committed prefix passes
+the final invariant.
 
 ## Runtime Output Streaming
 
@@ -422,6 +645,7 @@ policy:
     vllm_cfg:
       streaming_tool_call: &streaming_tool_call
         enabled: false
+        tokenizer_only: false
         max_sessions: 256
         session_ttl_seconds: 900
         stability_margin_tokens: 8
@@ -442,6 +666,7 @@ keys do not gain separate hidden defaults in Python.
 
 V1 exports these per-sample metrics through the SWE agent result and W&B:
 
+- total model function/tool calls (`num_tool_calls`),
 - eligible shell actions whose model-response context was recovered,
 - eligible actions skipped because no two stable append-only snapshots arrived,
 - a snapshot-admission funnel: polls, changed revisions, non-empty snapshots,
@@ -450,10 +675,24 @@ V1 exports these per-sample metrics through the SWE agent result and W&B:
   character threshold, or tool completion before admission,
 - sessions started,
 - prefill requests and accepted prefill tokens,
+- valid prefill actions with at least one completed chunk and an exact final
+  committed-prefix match,
+- valid tokenizer-only actions whose admitted full-retokenization requests all
+  completed without fallback,
+- final tokenizer candidates, next-call reuse requests, canonical exact
+  matches, token-equivalent matches, true prompt/token mismatches, and
+  missing/expired one-shot candidates,
 - completed chunks and discarded dummy tokens,
 - final committed-prefix matches,
 - fail-open fallbacks, and
 - aggregate client-side streaming request time.
+
+The raw trajectory stores the action-level tool, prefill, tokenizer, and prompt
+reuse counts. NeMo-RL additionally emits their per-batch sums as
+`swe_agent/<metric>/total` under the rollout logger's `train/` prefix. The
+strict audit report computes each metric's whole-run `sum` directly from the
+raw trajectories, so multi-batch runs do not depend on W&B summary reduction
+semantics.
 
 The vLLM metrics logger also separates streaming prefill and dummy-token work
 from ordinary generation token accounting. It exports the following cumulative
@@ -476,6 +715,8 @@ The following planned observability is not implemented yet:
 - fallback reason labels (the aggregate fallback count is implemented),
 - snapshot byte distributions,
 - cumulative-tokenizer CPU time,
+- incremental-tokenizer mutable-tail rollback and re-encoded token counts,
+- full-tokenizer checkpoint and checkpoint-mismatch counts,
 - stable and committed token distributions,
 - chunk size distribution,
 - prefill request queue and execution time,
@@ -522,6 +763,13 @@ The following planned observability is not implemented yet:
   NeMo Gym's event-loop-bound global client.
 - The Gym proxy uses the selected sticky client and normal chat tokenization.
 - The disabled path creates no streaming sessions or additional requests.
+- Tokenizer-only candidate reuse is one-shot, bounded, and sticky-client
+  checked; canonical exact matches skip the next tokenizer call.
+- Canonical comparison drops all assistant logging arrays, while the actual
+  tokenizer body retains only the newest complete logging triplet so
+  authoritative-prefix replacement remains active.
+- A canonical mismatch reuses IDs only after complete token equivalence; a true
+  mismatch and a missing candidate both fail open.
 
 ### End-to-end evidence
 
@@ -539,10 +787,95 @@ warm controls, then compares immediate and delayed final requests after the
 same streaming prefill. This distinguishes actual APC reuse from a prefix check
 or TTFT-only inference.
 
+### Current rollout-only SWE evaluation path
+
+The strict rollout-only harness is a trajectory-collection path, not a short
+GRPO training run. The paired wrapper
+`examples/swe_bench/run_streaming_tool_call_verified_pair.sh` validates the
+fixed Verified manifest, optionally prewarms the SWE-bench artifact cache, and
+submits one independent arm for streaming-off and one for streaming-on. It
+passes `TRAJECTORY_COLLECTION=1` to
+`examples/swe_bench/run_grpo_swe2_scale_gen.sh`; the launcher consequently sets
+`SKIP_TRAINING=1`, disables checkpoint saving, and invokes the NeMo-Gym entry
+point with `env.nemo_gym.is_trajectory_collection=true`.
+
+```mermaid
+flowchart LR
+    subgraph Submit["1. Pair submission"]
+        direction TB
+        S1["Verified manifest<br/>+ streaming off/on arm specs"]
+        S2["Verify manifest<br/>optionally prewarm SWE artifacts"]
+        S3["For each arm: set collection,<br/>streaming, and sampling flags"]
+        S4["Submit one independent<br/>sbatch ray.sub job"]
+        S1 --> S2 --> S3 --> S4
+    end
+
+    subgraph Job["2. One rollout-only Ray job per arm"]
+        direction TB
+        J1["run_grpo_nemo_gym.py<br/>Set up policy, vLLM, Ray, and NeMo Gym"]
+        J2["Use val_dataloader only<br/>Set batch size; refit generation once"]
+        J3["run_async_nemo_gym_rollout()<br/>Start timing/rollout/total"]
+        J4["NemoGym.run_rollouts()<br/>OpenHands model/tool loop"]
+        J5["Return results + rollout_metrics<br/>Deduplicate; append full_result batch"]
+        J6{"More validation batches?"}
+        J7["finish_generation()<br/>Assert count; resolved = reward == 1"]
+        J1 --> J2 --> J3 --> J4 --> J5 --> J6
+        J6 -- Yes --> J3
+        J6 -- No --> J7
+    end
+
+    subgraph Output["3. Per-arm outputs and paired audit"]
+        direction TB
+        O1["Collection complete"]
+        O2["Raw full_result JSONL<br/>PAIR_DIR/arm/exp_001/trajectory_collection.jsonl"]
+        O3["W&B per batch<br/>train/timing/rollout/*<br/>generation_metrics/*<br/>trajectory_collection accuracy and counts"]
+        O4["Separate verified_trajectory_audit.py compare<br/>after both arms finish"]
+        O1 --> O2
+        O1 --> O3
+        O2 -. "off + on files" .-> O4
+    end
+
+    Submit --> Job --> Output
+```
+
+Rollout-only uses the async NeMo Gym path. The launcher sets the OpenHands
+semaphore to `max(GBS * max_trajectory_age_steps, BASE_CONCURRENCY)`, while the
+validation dataloader limits each invocation to
+`trajectory_collection_batch_size`. Effective concurrent agents for one batch
+are therefore bounded by the smaller of the batch size and that semaphore;
+they are distributed across the configured sticky vLLM replicas. The current
+16-sample diagnostic uses batch size 16, `BASE_CONCURRENCY=16`, and four vLLM
+replicas, so at most 16 OpenHands agents run concurrently (about four active
+sessions per replica under even routing).
+
+The collector calls `refit_policy_generation()` once so that the generation
+workers use the configured policy weights, but it does not enter `grpo_train`:
+there are no advantage calculations, loss/backward calls, optimizer updates,
+weight-version changes, or checkpoints. Although the pair launcher passes the
+same manifest as train and validation data for recipe compatibility, rollout
+collection iterates only `val_dataloader`.
+
+Each completed validation batch is durable because its `full_result` entries
+are appended immediately. The collector verifies unique `instance_id` values,
+requires the expected count, computes `resolved` as `reward == 1`, and logs the
+final aggregate accuracy. For each batch, the collector keeps `full_result` in
+the raw JSONL while logging the remaining rollout metrics under the same
+`train/*` namespace used by GRPO. It therefore records
+`train/timing/rollout/total` as batch E2E together with the other rollout
+metrics. When the vLLM metrics logger and W&B are enabled, it also clears and
+collects one isolated `generation_metrics/*` timeline per batch. The historical
+256-prompt rollout-only runs predate this logging path and still have no
+recoverable W&B batch-E2E series; the new metrics are available only in future
+runs.
+
 ### Remaining tests
 
-- Compare final prompt IDs, generated IDs, and log probabilities against a
-  deterministic baseline within existing tolerances.
+- The production vLLM 0.17.1 Qwen3-0.6B HTTP integration now verifies that a
+  full prompt reused through `required_full_prompt_token_ids` generates the
+  same deterministic first token as the normal HTTP path, prefix-replacement
+  path, and internal `generate_async` path.
+- Compare complete generated IDs and log probabilities against a deterministic
+  baseline within existing tolerances.
 - Add true incremental-encoding tests for Unicode and BPE split boundaries if
   incremental tokenizer state is implemented.
 - Exercise cache reset, sleep/wake, and shutdown under active sessions in a live
@@ -615,6 +948,35 @@ queueing, KV-cache pressure, and cache evictions. A latency improvement that
 reduces aggregate rollout throughput is not sufficient.
 
 ### Current validation evidence
+
+On 2026-07-09, the repaired tokenizer-only exact-reuse path completed a
+four-trajectory smoke and a 16-trajectory SWE-Verified rollout on two
+interactive nodes with four vLLM replicas. Both used temperature zero, top-p
+one, 50 ms snapshot polling, a 256-character threshold, no speculative
+prefill, and the unchanged strict monotonic-token assertion.
+
+| Run | Result | Candidate / request / match | Exact / token-equivalent / mismatch / missing |
+| --- | --- | ---: | ---: |
+| Slurm `13590505` / [`og2vh7yq`](https://wandb.ai/nvidia/swe-benchmark/runs/og2vh7yq) | 4/4 trajectories, 15:07 collection | 3 / 3 / 3 | 3 / 0 / 0 / 0 |
+| Slurm `13591216` / [`7khlbb9s`](https://wandb.ai/nvidia/swe-benchmark/runs/7khlbb9s) | 16/16 trajectories, 16:44 collection | 25 / 25 / 25 | 25 / 0 / 0 / 0 |
+
+The final run's canonical batch timer was
+`train/timing/rollout/total=1007.5938` seconds. Its frozen streaming-off
+baseline, Slurm `13580674` / [`8o58r22x`](https://wandb.ai/nvidia/swe-benchmark/runs/8o58r22x),
+recorded 1523.9629 seconds on the identical 16-row manifest. Strict accuracy
+was 1/16 on versus 2/16 off. The on arm made 1650 model calls and 1563 tool
+calls versus 1483 and 1446 off, and no trajectory hashes matched. The timing
+delta therefore describes the two saved asynchronous workloads, not a causal
+per-action tokenizer speedup or an accuracy-parity result. The standalone
+evaluation report contains the complete paired metrics and experiment history.
+
+An earlier canonical attempt removed token-logging fields from both comparison
+and tokenizer requests. That made raw prompts compare equal but disabled
+vLLM's authoritative-prefix replacement; Slurm `13588713` failed the existing
+non-contiguous-message assertion at token 48,277. The repaired split-view
+implementation keeps the newest logging triplet only for `/tokenize`. The 20
+subsequent smoke/final trajectories passed without weakening that assertion,
+and all 28 admitted reuse requests avoided the token-equivalent fallback.
 
 On 2026-07-02, `examples/swe_bench/verify_streaming_tool_call_apc.py` ran on one
 interactive GPU node with vLLM 0.17.1, Qwen3-0.6B, prefix caching enabled,

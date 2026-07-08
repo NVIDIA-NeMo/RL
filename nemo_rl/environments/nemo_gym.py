@@ -154,6 +154,51 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     return is_invalid_tool_call, has_malformed_thinking
 
 
+REQUEST_TIMING_FIELDS = (
+    "request_to_headers_seconds",
+    "server_ready_to_headers_seconds",
+    "response_body_read_seconds",
+    "response_json_decode_seconds",
+    "request_total_seconds",
+    "response_body_bytes",
+)
+
+
+def _summarize_request_timings(
+    request_timings: list[dict[str, float]], timer_prefix: str
+) -> dict[str, float]:
+    metrics = {}
+    metric_prefix = f"{timer_prefix}/transport"
+    for field in REQUEST_TIMING_FIELDS:
+        values = [timing[field] for timing in request_timings if field in timing]
+        if not values:
+            continue
+        metrics.update(
+            {
+                f"{metric_prefix}/{field}/count": float(len(values)),
+                f"{metric_prefix}/{field}/sum": sum(values),
+                f"{metric_prefix}/{field}/mean": sum(values) / len(values),
+                f"{metric_prefix}/{field}/max": max(values),
+            }
+        )
+
+    if request_timings:
+        request_start = min(
+            timing["request_started_time_unix_s"] for timing in request_timings
+        )
+        request_end = max(
+            timing["json_decoded_time_unix_s"] for timing in request_timings
+        )
+        metrics.update(
+            {
+                f"{metric_prefix}/request_start_time_unix_s": request_start,
+                f"{metric_prefix}/request_end_time_unix_s": request_end,
+                f"{metric_prefix}/request_span_seconds": request_end - request_start,
+            }
+        )
+    return metrics
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
@@ -277,14 +322,17 @@ Depending on your data shape, you may want to change these values."""
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
             nemo_gym_result_iterator = self.rch.run_examples(
-                examples=nemo_gym_examples, head_server_config=self.head_server_config
+                examples=nemo_gym_examples,
+                head_server_config=self.head_server_config,
+                include_request_timing=True,
             )
 
             nemo_rl_rowidxs = []
             nemo_rl_results = []
+            request_timings = []
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
+                    nemo_gym_row, nemo_gym_result, request_timing = await task
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -293,6 +341,7 @@ Depending on your data shape, you may want to change these values."""
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
                 nemo_rl_results.append(nemo_rl_result)
+                request_timings.append(request_timing)
 
             # determine if generation_logprobs contain NaN; if not, break;
             logprob_contains_nan = False
@@ -322,6 +371,7 @@ Depending on your data shape, you may want to change these values."""
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")
         total_time = timing_metrics.pop("_run_rollouts_total")
+        timing_metrics.update(_summarize_request_timings(request_timings, timer_prefix))
         timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
             100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
         )

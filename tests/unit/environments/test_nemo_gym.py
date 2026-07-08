@@ -29,6 +29,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _summarize_request_timings,
     setup_nemo_gym_config,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -50,6 +51,39 @@ def test_nemo_gym_stub_module():
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
     )
+
+
+def test_summarize_request_timings() -> None:
+    metrics = _summarize_request_timings(
+        [
+            {
+                "request_started_time_unix_s": 10.0,
+                "headers_received_time_unix_s": 12.0,
+                "json_decoded_time_unix_s": 14.0,
+                "request_to_headers_seconds": 2.0,
+                "response_body_read_seconds": 1.5,
+                "response_json_decode_seconds": 0.5,
+                "request_total_seconds": 4.0,
+                "response_body_bytes": 100.0,
+            },
+            {
+                "request_started_time_unix_s": 11.0,
+                "headers_received_time_unix_s": 13.0,
+                "json_decoded_time_unix_s": 16.0,
+                "request_to_headers_seconds": 2.0,
+                "response_body_read_seconds": 2.0,
+                "response_json_decode_seconds": 1.0,
+                "request_total_seconds": 5.0,
+                "response_body_bytes": 300.0,
+            },
+        ],
+        "timing/rollout",
+    )
+
+    assert metrics["timing/rollout/transport/request_span_seconds"] == 6.0
+    assert metrics["timing/rollout/transport/response_body_bytes/sum"] == 400.0
+    assert metrics["timing/rollout/transport/response_body_bytes/mean"] == 200.0
+    assert metrics["timing/rollout/transport/request_total_seconds/max"] == 5.0
 
 
 @pytest.fixture(scope="function")
