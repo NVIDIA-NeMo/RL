@@ -332,10 +332,15 @@ policy:
       # combo-kernel benchmarking off), the peers' logits allgather trips the
       # NCCL watchdog, and the whole engine dies (jobs 2269608/2272089/
       # 2273194; vLLM re-arms TORCH_NCCL_ASYNC_ERROR_HANDLING so the launcher
-      # env cannot relax it). Eager mode removes runtime compilation
-      # entirely. Perf follow-up: re-enable compiled engines once the vLLM
-      # process-group timeout can be raised past worst-case compile times.
-      enforce_eager: true
+      # env cannot relax it). Eager mode removed runtime compilation
+      # entirely during bringup. RE-ENABLED compiled engines 2026-07-08:
+      # eager decode latency starved the SWE agents (68% of train rollouts
+      # hit the 600s agent timeout with a median 517s spent in model calls
+      # -> zero patches -> all-zero advantages, no learning signal). The
+      # original compile-stall deaths are now mitigated by
+      # RAY_CGRAPH_get_timeout=1800, combo-kernel benchmarking off, and the
+      # gym 120s retry cap (an engine death back-fills instead of wedging).
+      enforce_eager: false
       use_deep_gemm: false
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
