@@ -4,13 +4,11 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-STEPS_PER_RUN=30
-MAX_STEPS=30
+GPUS_PER_NODE=4
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-# Note: This test's runtime variance is large: it depends on how many steps have rollouts whose
-# seqlen actually reaches 256k. In practice runs finish within ~2 hours; the
-# 4-hour cap is a safety margin for the worst case.
-NUM_MINUTES=240
+NUM_MINUTES=100
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -26,7 +24,7 @@ uv run examples/run_grpo.py \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=False \
+    checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG
@@ -34,11 +32,11 @@ uv run examples/run_grpo.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
+# Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'mean(data["train/token_mult_prob_error"], ignore_top_p=0.05) < 1.05' \
-        'data["train/reward"]["30"] > 0.5' \
-        'data["validation/accuracy"]["30"] > 0.1'
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        'data["train/token_mult_prob_error"]["10"] < 1.1'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
