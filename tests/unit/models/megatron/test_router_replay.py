@@ -626,8 +626,7 @@ def test_unified_wrapper_install_is_idempotent_inside_r3_trace_verifier(
         with r3_trace_stage("unit-forward"):
             router_replay._install_get_replay_topk_wrapper()
             assert (
-                RouterReplay.get_replay_topk
-                is router_replay._wrapped_get_replay_topk
+                RouterReplay.get_replay_topk is router_replay._wrapped_get_replay_topk
             )
     finally:
         RouterReplay.clear_global_router_replay_instances()
@@ -1112,3 +1111,38 @@ def test_get_replay_topk_wrapper_is_idempotent_and_survives_r3_trace_stage(
     finally:
         _reset_router_replay_wrapper_for_tests()
         RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_replay_fallback_stats_accumulate_and_reset(monkeypatch):
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+    from nemo_rl.models.megatron import router_replay
+
+    monkeypatch.setattr(router_replay, "G_REPLAY_FALLBACK_ROWS", 0)
+    monkeypatch.setattr(router_replay, "G_REPLAY_TOTAL_ROWS", 0)
+    router_replay._install_get_replay_topk_wrapper()
+
+    scores = torch.rand(4, 8)
+    target = torch.tensor([[0, 1], [-1, -1], [2, 3], [-1, -1]])
+    replay_instance = SimpleNamespace(
+        router_replay_action=RouterReplayAction.REPLAY_FORWARD,
+        target_topk_idx=target,
+        replay_backward_list=[target],
+    )
+
+    def default_compute_topk(scores, topk, num_groups=None, group_topk=None):
+        values, indices = torch.topk(scores, k=topk, dim=-1)
+        return values, indices
+
+    probs, indices = router_replay._wrapped_get_replay_topk(
+        replay_instance, scores, 2, None, None, default_compute_topk
+    )
+
+    assert indices.shape == (4, 2)
+    assert not indices.eq(-1).any()
+    assert router_replay.consume_replay_fallback_stats() == (2, 4)
+    # drained -> second read is zeroed
+    assert router_replay.consume_replay_fallback_stats() == (0, 0)

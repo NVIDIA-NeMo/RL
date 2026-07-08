@@ -251,6 +251,30 @@ def _validate_replay_tensor(
         )
 
 
+# Per-process fallback accounting for the training-side replay forward. Drained
+# once per train step by the Megatron worker into
+# r3/train_fallback_token_route_fraction (the train-side mirror of the
+# generation-side fallback metrics, which a transport-side trace desync would
+# never show).
+G_REPLAY_FALLBACK_ROWS = 0
+G_REPLAY_TOTAL_ROWS = 0
+
+
+def _note_replay_fallback(fallback_rows: int, total_rows: int) -> None:
+    global G_REPLAY_FALLBACK_ROWS, G_REPLAY_TOTAL_ROWS
+    G_REPLAY_FALLBACK_ROWS += fallback_rows
+    G_REPLAY_TOTAL_ROWS += total_rows
+
+
+def consume_replay_fallback_stats() -> tuple[int, int]:
+    """Return and reset (fallback_rows, total_rows) accumulated since last call."""
+    global G_REPLAY_FALLBACK_ROWS, G_REPLAY_TOTAL_ROWS
+    stats = (G_REPLAY_FALLBACK_ROWS, G_REPLAY_TOTAL_ROWS)
+    G_REPLAY_FALLBACK_ROWS = 0
+    G_REPLAY_TOTAL_ROWS = 0
+    return stats
+
+
 def _compute_get_replay_topk(
     replay_instance: Any,
     scores: torch.Tensor,
@@ -270,8 +294,12 @@ def _compute_get_replay_topk(
         RouterReplayAction.REPLAY_BACKWARD,
     }:
         return _original_get_replay_topk(
-            replay_instance, scores, topk,
-            num_groups, group_topk, default_compute_topk,
+            replay_instance,
+            scores,
+            topk,
+            num_groups,
+            group_topk,
+            default_compute_topk,
         )
 
     if action == RouterReplayAction.REPLAY_FORWARD:
@@ -282,16 +310,27 @@ def _compute_get_replay_topk(
 
     if target_topk_idx is None:
         return _original_get_replay_topk(
-            replay_instance, scores, topk,
-            num_groups, group_topk, default_compute_topk,
+            replay_instance,
+            scores,
+            topk,
+            num_groups,
+            group_topk,
+            default_compute_topk,
         )
 
     target_topk_idx = target_topk_idx.to(scores.device)
     fallback_mask = target_topk_idx.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
-    if not bool(fallback_mask.any().item()):
+    fallback_rows = int(fallback_mask.sum().item())
+    if action == RouterReplayAction.REPLAY_FORWARD:
+        _note_replay_fallback(fallback_rows, int(target_topk_idx.shape[0]))
+    if fallback_rows == 0:
         return _original_get_replay_topk(
-            replay_instance, scores, topk,
-            num_groups, group_topk, default_compute_topk,
+            replay_instance,
+            scores,
+            topk,
+            num_groups,
+            group_topk,
+            default_compute_topk,
         )
 
     if default_compute_topk is None:
@@ -300,7 +339,10 @@ def _compute_get_replay_topk(
         )
 
     _, default_indices = default_compute_topk(
-        scores, topk, num_groups=num_groups, group_topk=group_topk,
+        scores,
+        topk,
+        num_groups=num_groups,
+        group_topk=group_topk,
     )
     effective_topk_idx = target_topk_idx.clone()
     effective_topk_idx[fallback_mask] = default_indices[fallback_mask]
@@ -332,8 +374,12 @@ def _wrapped_get_replay_topk(
     """
     trace_ctx = replay_topk_snapshot(replay_instance)
     probs, top_indices = _compute_get_replay_topk(
-        replay_instance, scores, topk,
-        num_groups, group_topk, default_compute_topk,
+        replay_instance,
+        scores,
+        topk,
+        num_groups,
+        group_topk,
+        default_compute_topk,
     )
     replay_topk_record(replay_instance, scores, topk, trace_ctx, top_indices)
     return probs, top_indices

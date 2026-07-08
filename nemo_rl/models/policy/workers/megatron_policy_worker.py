@@ -67,7 +67,10 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
-from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.megatron.router_replay import (
+    consume_replay_fallback_stats,
+    router_replay_enabled,
+)
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
@@ -838,6 +841,12 @@ class MegatronPolicyWorkerImpl(
             losses=losses,
             data_parallel_group=parallel_state.get_data_parallel_group(),
         )
+
+        if self._router_replay_enabled:
+            fallback_rows, total_rows = consume_replay_fallback_stats()
+            mb_metrics["r3/train_fallback_token_route_fraction"] = [
+                fallback_rows / total_rows if total_rows else 0.0
+            ]
 
         metrics = {
             "global_loss": global_loss.cpu(),
