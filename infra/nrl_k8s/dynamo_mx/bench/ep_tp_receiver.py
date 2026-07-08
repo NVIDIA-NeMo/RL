@@ -183,6 +183,10 @@ def main() -> int:
     dt = time.perf_counter() - t0
     print(f"[rcv] refit (per-source) produced {len(hf_results)} HF tensors in {dt:.2f}s", flush=True)
 
+    # run_refit_cycle yields FULL HF weights ("ready for vllm.model.load_weights()");
+    # vLLM's weight_loader slices to each rollout TP rank at load time (placement
+    # parity proven by ep_live_test.py). So the receiver output is full + byte-identical
+    # regardless of the rollout's TARGET_TP; TP sharding is downstream at load.
     if gt is not None:
         n_ok = n_drift = n_missing = 0
         for hf_name, exp in gt.items():
@@ -190,18 +194,13 @@ def main() -> int:
             if got is None:
                 n_missing += 1; continue
             e = exp.to(got.dtype) if got.dtype != exp.dtype else exp
-            if TARGET_TP > 1:
-                ax = _tp_shard_axis(hf_name)
-                if ax is not None and e.shape[ax] % TARGET_TP == 0:
-                    per = e.shape[ax] // TARGET_TP
-                    e = e.narrow(ax, TARGET_TP_RANK * per, per).contiguous()
             if got.shape == e.shape and torch.equal(got, e):
                 n_ok += 1
             else:
                 n_drift += 1
-        print(f"[rcv] byte-identity (TP{TARGET_TP} rank{TARGET_TP_RANK}): "
-              f"{n_ok} ok / {n_drift} drift / {n_missing} missing / {len(gt)} GT", flush=True)
-        print("RESULT:", f"PASS - EP{EP_SIZE}->TP{TARGET_TP} refit byte-identical"
+        print(f"[rcv] byte-identity (full HF weights; TARGET_TP={TARGET_TP} slices at "
+              f"vLLM load): {n_ok} ok / {n_drift} drift / {n_missing} missing / {len(gt)} GT", flush=True)
+        print("RESULT:", f"PASS - EP{EP_SIZE}->TP{TARGET_TP} refit byte-identical (full HF weights)"
               if n_ok == len(gt) else f"PARTIAL - {n_ok}/{len(gt)}", flush=True)
     else:
         print(f"RESULT: EP{EP_SIZE}->TP{TARGET_TP} produced {len(hf_results)} HF tensors", flush=True)
