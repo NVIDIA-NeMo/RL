@@ -348,6 +348,9 @@ policy:
       in_flight_weight_updates: true
       recompute_kv_cache_after_weight_updates: false
       expose_http_server: true
+      default_chat_template_kwargs:
+        enable_thinking: true
+        truncate_history_thinking: false
 
     colocated:
       enabled: false
