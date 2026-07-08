@@ -1920,9 +1920,19 @@ class MegatronPolicyWorkerImpl(
         only this rank's local experts; PP non-local params have
         ``param_weight is None``.
         """
-        from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
+        from megatron.bridge.models.conversion.param_mapping import (
+            FusedExpertMapping,
+            FusedGatedExpertMapping,
+            GatedMLPMapping,
+        )
 
         from nemo_rl.weight_sync.nccl_reshard_utils import is_nccl_reshard_param
+
+        def _expert_idx(megatron_name: str) -> str:
+            # Grouped-GEMM experts are numbered by the megatron param name
+            m = re.search(r"\d+$", megatron_name)
+            assert m, f"expected trailing expert index in {megatron_name!r}"
+            return m.group()
 
         for task in self.refit_conversion_tasks:
             local_tensor = task.param_weight  # local megatron tensor
@@ -1939,8 +1949,28 @@ class MegatronPolicyWorkerImpl(
                 yield task.mapping.hf_param["up"], up
                 continue
 
+            if isinstance(task.mapping, FusedGatedExpertMapping):
+                # Grouped-GEMM MoE (e.g. Qwen3.5-VL): linear_fc1 fuses gate+up per
+                # expert [gate; up] (dim 0) — same layout as the dense branch
+                # above, but the hf_param is a single, index-less string.  Un-fuse
+                # into gate/up AND re-attach the per-expert index.
+                idx = _expert_idx(task.global_param_name)
+                prefix = str(task.mapping.hf_param)[: -len(".gate_up_proj")]
+                gate, up = torch.chunk(local_tensor, 2, dim=0)
+                yield f"{prefix}.{idx}.gate_proj.weight", gate
+                yield f"{prefix}.{idx}.up_proj.weight", up
+                continue
+
+            if isinstance(task.mapping, FusedExpertMapping):
+                # Grouped-GEMM down (linear_fc2): re-attach the per-expert index +
+                # ``.weight`` so it matches standard per-expert down_proj.
+                idx = _expert_idx(task.global_param_name)
+                prefix = str(task.mapping.hf_param)[: -len(".down_proj")]
+                yield f"{prefix}.{idx}.down_proj.weight", local_tensor
+                continue
+
             # Simple 1:1 mappings: only the FFN down_proj (and any non-gated
-            # simple gate/up) takes hits this branch. QKV (a compound mapping) and
+            # simple gate/up) hits this branch. QKV (a compound mapping) and
             # every non-FFN param fall through to misc, so they are skipped.
             hf_param = task.mapping.hf_param
             if not isinstance(hf_param, dict) and is_nccl_reshard_param(str(hf_param)):
@@ -1980,10 +2010,14 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
-    def _build_layer_to_pp_stage(self, pp_size: int) -> dict[str, int]:
+    def _build_layer_to_pp_stage(
+        self, pp_size: int, layer_prefix: str
+    ) -> dict[str, int]:
         """Build mapping from layer group name to PP stage index.
 
-        Returns a dictionary that maps the layer group name to the PP stage index.
+        Returns a dictionary that maps the layer group name to the PP stage
+        index.  ``layer_prefix`` is the module path before ``layers.N`` in the
+        exported HF names (e.g. ``model``, ``model.language_model``, ``backbone``)
 
         Mirrors Megatron-LM's ``get_num_layers_to_build``
         (``transformer_block.py``) for the standard (non-VP, non-custom-layout)
@@ -2052,26 +2086,13 @@ class MegatronPolicyWorkerImpl(
             else:
                 count = middle_per_stage
             for _ in range(count):
-                # Emit both HF naming conventions so the lookup in
-                # build_nccl_reshard_refit_info hits regardless of model family:
-                # Llama/Qwen use ``model.layers.N``; NemotronH uses
-                # ``backbone.layers.N``.  Keys are looked up (not iterated), so
-                # the unused convention's extra keys are harmless.
-                layer_to_pp_stage[f"model.layers.{layer_idx}"] = stage
-                layer_to_pp_stage[f"backbone.layers.{layer_idx}"] = stage
+                layer_to_pp_stage[f"{layer_prefix}.layers.{layer_idx}"] = stage
                 layer_idx += 1
 
         assert layer_idx == num_layers, (
             f"Layer assignment incomplete: assigned {layer_idx} of {num_layers}"
         )
-
-        # Embedding on the first stage, final norm + lm_head on the last.
-        # model.* = Llama/Qwen; backbone.* = NemotronH (embeddings / norm_f).
-        layer_to_pp_stage["model.embed_tokens"] = 0
-        layer_to_pp_stage["backbone.embeddings"] = 0
-        layer_to_pp_stage["model.norm"] = pp_size - 1
-        layer_to_pp_stage["backbone.norm_f"] = pp_size - 1
-        layer_to_pp_stage["lm_head"] = pp_size - 1
+        # Embeddings and the final lm_head are taking misc path, we can ignore them here.
         return layer_to_pp_stage
 
     @torch.no_grad()
@@ -2118,6 +2139,9 @@ class MegatronPolicyWorkerImpl(
         # state_dict_metadata[hf_name] -> [shape, dtype]
         # At the same time, filter the params to the misc subset (packed_broadcast path).
         # misc_meta[hf_name] -> [shape, dtype]
+        from nemo_rl.weight_sync.nccl_reshard_utils import _extract_layer_prefix
+
+        layer_prefix = None
         with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
                 meta = {
@@ -2130,6 +2154,12 @@ class MegatronPolicyWorkerImpl(
                 if is_nccl_reshard_param(name):
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
+                    if layer_prefix:
+                        assert layer_prefix == _extract_layer_prefix(name), (
+                            f"layer_prefix mismatch: {layer_prefix} != {_extract_layer_prefix(name)}"
+                        )
+                    else:  # first param layer_prefix=None
+                        layer_prefix = _extract_layer_prefix(name)
                 else:
                     misc_meta[name] = meta
                     _bcast_bytes += _nbytes
@@ -2146,10 +2176,11 @@ class MegatronPolicyWorkerImpl(
         )
 
         pp_size = train_parallelism.get("pp_size", 1)
-        # Construct a dict[layer_name:str] -> pp_stage:int
-        layer_to_pp_stage = (
-            self._build_layer_to_pp_stage(pp_size) if pp_size > 1 else None
-        )
+        # Construct a dict[layer_name:str] -> pp_stage:int.
+        layer_to_pp_stage = None
+        assert layer_prefix is not None, "layer_prefix is not set"
+        if pp_size > 1:
+            layer_to_pp_stage = self._build_layer_to_pp_stage(pp_size, layer_prefix)
 
         # The key metadata, which should shared with generation workers
         self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
@@ -2280,12 +2311,10 @@ class MegatronPolicyWorkerImpl(
         for layer_name in refit_info["layer_names"]:
             for p in refit_info["per_layer_params"][layer_name]:
                 name = p["name"]
-                proj = p.get("grouped_expert_proj")
-                mapping[name] = (
-                    _expert_spec(proj, name)
-                    if proj
-                    else LocalParamSpec(base=param_map.get(name))
-                )
+                if p.get("grouped_expert_proj"):
+                    mapping[name] = _expert_spec(p["grouped_expert_proj"], name)
+                else:
+                    mapping[name] = LocalParamSpec(base=param_map.get(name))
         return HFToLocalParamMap(specs=mapping)
 
     @torch.no_grad()

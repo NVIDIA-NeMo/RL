@@ -30,6 +30,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     HFToLocalParamMap,
     LocalParamSpec,
     RefitCtx,
+    _extract_layer_prefix,
 )
 
 try:
@@ -597,14 +598,22 @@ class VllmInternalWorkerExtension:
             if proj == "gate_proj"
         }
 
-        # NemotronH (nemotron_h): HF FFN params use the ``backbone.*`` prefix
-        # while vLLM uses ``model.*`` (e.g. ``backbone.layers.N.mixer.experts.
-        # w13_weight`` -> ``model.layers.N.mixer.experts.w13_weight``). For
-        # non-NemotronH models the name is unchanged, so this is a no-op.
-        def _to_vllm_name(n):
-            if n.startswith("backbone."):
-                return "model." + n[len("backbone.") :]
-            return n
+        # Resolve an HF FFN name to its vLLM param name.  The two differ only in
+        # the module prefix before ``layers.N`` (e.g. NemotronH's HF ``backbone.``
+        # vs vLLM ``model.``); the layer-relative suffix is identical.  Index the
+        # real vLLM names by that suffix so any prefix rename resolves generically
+        # instead of hardcoding per-model swaps.  Matching-prefix models (most)
+        # hit the exact-name fast path and never touch the index.
+        def _layer_relative(name: str) -> str:
+            prefix = _extract_layer_prefix(name)
+            return name[len(prefix) + 1 :] if prefix else name
+
+        vllm_by_relative = {_layer_relative(n): n for n in vllm_params}
+
+        def _to_vllm_name(n: str) -> str:
+            if n in vllm_params:
+                return n
+            return vllm_by_relative.get(_layer_relative(n), n)
 
         for hf_name in hf_shapes:
             # 1) Grouped MoE expert params (gate_proj/up_proj/down_proj, each

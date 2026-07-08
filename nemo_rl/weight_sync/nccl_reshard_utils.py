@@ -140,35 +140,24 @@ class RefitBuilderInterface(Protocol):
 # =========================================================================
 
 # FFN column-parallel suffixes: TP shards along dim 0 (output / intermediate).
-# Only FFN gate/up reach the bulk path; everything else (attention, embeddings,
-# scales, ...) takes the misc path (see ``is_nccl_reshard_param``).
-COLUMN_PARALLEL_SUFFIXES = [
-    "gate_proj.weight",
-    "up_proj.weight",
-]
-
+COLUMN_PARALLEL_SUFFIXES = ("gate_proj.weight", "up_proj.weight")
 # FFN row-parallel suffix: TP shards along dim 1 (input dimension).
-ROW_PARALLEL_SUFFIXES = [
-    "down_proj.weight",  # dense MLP + grouped MoE expert (gen-side -> w2_weight)
-]
+ROW_PARALLEL_SUFFIXES = ("down_proj.weight",)
 
 
 def get_tp_shard_dim(param_name: str) -> Optional[int]:
     """Return the TP shard dim for an FFN weight, or None if not TP-sharded.
 
-    Only FFN gate/up/down reach the bulk path: gate/up are column-parallel
-    (dim 0), down is row-parallel (dim 1).  MoE experts shard on EP not TP, so
-    they return None here — ``get_placements`` routes experts through
-    ``_get_expert_tp_shard_dim`` instead.
+    gate/up are column-parallel (dim 0), down is row-parallel (dim 1).  MoE
+    experts shard on EP not TP, so they return None here — ``get_placements``
+    routes experts through ``_get_expert_tp_shard_dim`` instead.
     """
     if ".experts." in param_name:
         return None
-    for suffix in COLUMN_PARALLEL_SUFFIXES:
-        if param_name.endswith(suffix):
-            return 0
-    for suffix in ROW_PARALLEL_SUFFIXES:
-        if param_name.endswith(suffix):
-            return 1
+    if param_name.endswith(COLUMN_PARALLEL_SUFFIXES):
+        return 0
+    if param_name.endswith(ROW_PARALLEL_SUFFIXES):
+        return 1
     return None
 
 
@@ -177,38 +166,45 @@ def is_expert_param(param_name: str) -> bool:
     return ".experts." in param_name
 
 
-# FFN projection weights (dense MLP + MoE experts) — the ONLY params on the
-# bulk xferdtensor path. For the large (MoE) models this feature targets these
-# are >97% of the refit payload.
+# FFN projection weights (dense MLP + per-expert MoE) — bulk xferdtensor path.
 FFN_PROJ_WEIGHT_SUFFIXES = (
     "gate_proj.weight",
     "up_proj.weight",
     "down_proj.weight",
+)
+# Grouped-GEMM MoE experts (e.g. Qwen3.5-VL) exported as pre-stacked 3D tensors
+# with gate+up fused: ``experts.gate_up_proj`` [E, 2*inter, hidden] and
+# ``experts.down_proj`` [E, hidden, inter] — no per-expert index, no ``.weight``.
+FFN_GROUPED_EXPERT_SUFFIXES = (
+    "experts.gate_up_proj",
+    "experts.down_proj",
 )
 
 
 def is_nccl_reshard_param(param_name: str) -> bool:
     """Return True iff the param takes the xferdtensor bulk reshard path.
 
-    Only the FFN projection weights take the nccl_reshard bulk path:
-    ``gate_proj`` / ``up_proj`` / ``down_proj`` ``.weight``, for both the dense
-    MLP and the MoE experts. This will cover >95% of the refit payload. For the
-    large models.
-
+    FFN projection weights take the bulk path: the split ``gate_proj`` /
+    ``up_proj`` / ``down_proj`` (dense MLP + per-expert MoE) and the grouped
+    gate-up-fused MoE experts (``experts.gate_up_proj`` / ``experts.down_proj``).
     Everything else falls back to the misc packed_broadcast + vLLM
-    ``load_weights`` path, which can cover diversity of parameters.
+    ``load_weights`` path.
+
+    Shared-expert FFN weights (``*.shared_expert.*``) are routed to misc path.
     """
-    return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES)
+    if "shared_expert" in param_name:
+        return False
+    return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES) or param_name.endswith(
+        FFN_GROUPED_EXPERT_SUFFIXES
+    )
 
 
 def _get_expert_tp_shard_dim(param_name: str) -> Optional[int]:
     """Like get_tp_shard_dim but does NOT skip .experts. params."""
-    for suffix in COLUMN_PARALLEL_SUFFIXES:
-        if param_name.endswith(suffix):
-            return 0
-    for suffix in ROW_PARALLEL_SUFFIXES:
-        if param_name.endswith(suffix):
-            return 1
+    if param_name.endswith(COLUMN_PARALLEL_SUFFIXES):
+        return 0
+    if param_name.endswith(ROW_PARALLEL_SUFFIXES):
+        return 1
     return None
 
 
@@ -404,6 +400,7 @@ def group_expert_params_in_metadata(
     # Group individual expert params by (prefix, proj_type)
     expert_groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
     grouped_metadata: dict[str, dict[str, Any]] = OrderedDict()
+    pre_grouped_experts = False  # whether any already-fused expert was tagged
 
     for name, meta in state_dict_metadata.items():
         m = _INDIVIDUAL_EXPERT_RE.match(name)
@@ -411,10 +408,37 @@ def group_expert_params_in_metadata(
             prefix = m.group(1)  # e.g., "model.layers.0.mlp.experts"
             proj = m.group(3)  # "gate_proj", "up_proj", "down_proj"
             expert_groups.setdefault((prefix, proj), []).append((name, meta))
+        elif name.endswith("experts.gate_up_proj"):
+            # Grouped-GEMM export (e.g. Qwen3.5-VL): experts arrive already
+            # stacked as ``[E, 2*inter, hidden]`` with gate+up fused.  The train
+            # side (``_iter_local_hf_param_shards``) un-fuses each expert into
+            # canonical ``gate_proj`` / ``up_proj`` halves, so here we only
+            # split the *shape* into the two ``[E, inter, hidden]`` grouped
+            # entries — no un-fuse metadata needed; they then look exactly like
+            # ordinary grouped gate/up.
+            prefix = name[: -len(".gate_up_proj")]  # ".../experts"
+            e_global, inter, hidden = meta["shape"]
+            for role in ("gate_proj", "up_proj"):
+                grouped_metadata[f"{prefix}.{role}.weight"] = {
+                    "shape": [e_global, inter // 2, hidden],
+                    "dtype": meta["dtype"],
+                    "grouped_expert_proj": role,
+                }
+            pre_grouped_experts = True
+        elif name.endswith("experts.down_proj"):
+            # Already-grouped down ``[E, hidden, inter]``: canonicalize the name
+            # (add ``.weight``) and tag it — indistinguishable from an ordinary
+            # grouped down_proj from here on.
+            grouped_metadata[f"{name}.weight"] = {
+                **meta,
+                "grouped_expert_proj": "down_proj",
+            }
+            pre_grouped_experts = True
         else:
             grouped_metadata[name] = meta
 
-    if not expert_groups:
+    # Dense model without any experts.
+    if not expert_groups and not pre_grouped_experts:
         return state_dict_metadata
 
     # Stack each (prefix, proj) group into one [E, *per_expert_shape] grouped
@@ -441,20 +465,45 @@ def group_expert_params_in_metadata(
 # ``backbone.embeddings`` / ``backbone.norm_f``).  Keeping these naming-agnostic
 # lets _extract_layer_name produce a stable per-layer key that matches the keys
 # _build_layer_to_pp_stage emits, so PP-stage filtering works for both families.
-_LAYER_RE = re.compile(r"((?:model|backbone)\.layers\.\d+)\.")
-_MODEL_PREFIX_RE = re.compile(r"((?:model|backbone)\.\w+)\.")
+# Capture any module prefix before ``layers.N`` so per-layer grouping works for
+# any HF layout without enumerating model families: ``model.layers.N``
+# (Llama/Qwen), ``model.language_model.layers.N`` (Qwen-VL), ``backbone.layers.N``
+# (NemotronH), or a bare ``layers.N`` (DeepSeek).
+_LAYER_RE = re.compile(r"^(?:(?P<prefix>.+)\.)?layers\.(?P<index>\d+)(?:\.|$)")
+_MODEL_PREFIX_RE = re.compile(r"^((?:model|backbone)\.\w+)\.")
+
+
+def _extract_layer_prefix(param_name: str) -> Optional[str]:
+    """Return the module prefix before ``layers.N``.
+
+    ``model`` / ``model.language_model`` / ``backbone`` for the usual layouts,
+    ``""`` for a bare ``layers.N``, or None if the name has no ``layers.N``.
+    """
+    m = _LAYER_RE.match(param_name)
+    if m is None:
+        return None
+    return m.group("prefix") or ""
 
 
 def _extract_layer_name(param_name: str) -> str:
-    """Extract the layer group name from a parameter name.
+    """Extract the per-layer group name from a parameter name.
 
     Examples:
         ``model.layers.0.mlp.gate_proj.weight`` -> ``model.layers.0``
-        ``backbone.layers.3.mlp.down_proj.weight`` -> ``backbone.layers.3``
+        ``model.language_model.layers.1.mlp.up_proj.weight``
+            -> ``model.language_model.layers.1``
+        ``backbone.layers.3.mixer.experts.0.down_proj.weight``
+            -> ``backbone.layers.3``
+        ``layers.2.ffn.shared_experts.w2.weight`` -> ``layers.2``
     """
     m = _LAYER_RE.match(param_name)
     if m:
-        return m.group(1)
+        prefix = m.group("prefix")
+        return (
+            f"{prefix}.layers.{m.group('index')}"
+            if prefix
+            else f"layers.{m.group('index')}"
+        )
     m = _MODEL_PREFIX_RE.match(param_name)
     if m:
         return m.group(1)

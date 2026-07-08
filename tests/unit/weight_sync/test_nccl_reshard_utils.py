@@ -27,12 +27,14 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     MeshInfo,
+    _extract_layer_name,
     build_mesh_info,
     build_nccl_reshard_refit_info,
     get_placements,
     get_tp_shard_dim,
     group_expert_params_in_metadata,
     is_expert_param,
+    is_nccl_reshard_param,
 )
 
 
@@ -136,6 +138,44 @@ def test_is_expert_param(name, expected):
 )
 def test_get_tp_shard_dim(name, expected):
     assert get_tp_shard_dim(name) == expected
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        # conventional gate/up/down (dense + per-expert) -> bulk
+        ("model.layers.0.mlp.gate_proj.weight", True),
+        ("model.layers.0.mlp.up_proj.weight", True),
+        ("model.layers.0.mlp.down_proj.weight", True),
+        ("model.layers.0.mlp.experts.3.gate_proj.weight", True),
+        ("model.language_model.layers.7.mlp.experts.3.up_proj.weight", True),
+        # shared experts are FFN-named but fuse differently -> misc
+        ("model.layers.0.mlp.shared_expert.gate_proj.weight", False),
+        ("model.language_model.layers.1.mlp.shared_expert.down_proj.weight", False),
+        # non-FFN params -> misc
+        ("model.layers.0.self_attn.q_proj.weight", False),
+        ("model.embed_tokens.weight", False),
+        ("model.layers.0.mlp.gate.weight", False),  # MoE router
+    ],
+)
+def test_is_nccl_reshard_param(name, expected):
+    assert is_nccl_reshard_param(name) is expected
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("model.layers.0.mlp.gate_proj.weight", "model.layers.0"),
+        (
+            "model.language_model.layers.7.mlp.experts.3.up_proj.weight",
+            "model.language_model.layers.7",
+        ),
+        ("backbone.layers.3.mlp.down_proj.weight", "backbone.layers.3"),
+        ("layers.2.mlp.down_proj.weight", "layers.2"),
+    ],
+)
+def test_extract_layer_name_handles_prefixes(name, expected):
+    assert _extract_layer_name(name) == expected
 
 
 # --------------------------------------------------------------------------
