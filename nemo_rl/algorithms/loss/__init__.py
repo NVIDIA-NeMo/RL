@@ -13,6 +13,9 @@
 # limitations under the License.
 
 from nemo_rl.algorithms.loss.loss_functions import (
+    ASFTLossConfig,
+    ASFTLossDataDict,
+    ASFTLossFn,
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
     ClippedPGLossFn,
@@ -41,6 +44,9 @@ from nemo_rl.algorithms.loss.wrapper import (
 )
 
 __all__ = [
+    "ASFTLossConfig",
+    "ASFTLossDataDict",
+    "ASFTLossFn",
     "ClippedPGLossConfig",
     "ClippedPGLossDataDict",
     "ClippedPGLossFn",
