@@ -1,0 +1,10 @@
+# CoupledGRPO 6x6 experiment: noisy_tail_mode=none.
+#  - noisy_tail_mode "none": drop the final-block block-padding (noisy region = exact
+#    response length, no mask tail).
+# Everything else (block_size 16, strict reward, batch/cluster) inherited from the 6x6
+# CoupledGRPO config. Requires the noisy_tail_mode knob (logprob_estimation) implemented.
+defaults: "grpo_sudoku6x6_coupled_grpo.yaml"
+
+policy:
+  logprob_estimation:
+    noisy_tail_mode: "none"

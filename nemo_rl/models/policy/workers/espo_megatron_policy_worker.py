@@ -138,6 +138,8 @@ class ESPOMegatronPolicyWorkerImpl(CoupledGRPOMegatronPolicyWorkerImpl):
             pad_to_length=self._diffu_grpo_sequence_length_round(),
             include_loss=True,
             num_pairs=num_pairs,
+            noisy_tail_mode=self._noisy_tail_mode(),
+            eos_token_id=self.tokenizer.eos_token_id,
         )
         # K must divide the per-rank sequence count so num_microbatches =
         # num_samples / K is an integer (DP-uniform microbatch count).

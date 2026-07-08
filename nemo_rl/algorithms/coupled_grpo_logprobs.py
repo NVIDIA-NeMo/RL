@@ -201,6 +201,8 @@ def build_coupled_base(
     pad_to_length: int | None = None,
     include_loss: bool = False,
     num_pairs: int = 1,
+    noisy_tail_mode: str = "mask",
+    eos_token_id: int | None = None,
 ) -> tuple[BatchedDataDict[Any], int, int]:
     """Build the DiffuGRPO ``[noisy | clean]`` base + the coupled level-0 mask(s).
 
@@ -224,6 +226,8 @@ def build_coupled_base(
             pad_token_id=pad_token_id,
             pad_to_length=pad_to_length,
             block_size=noisy_block_size,
+            noisy_tail_mode=noisy_tail_mode,
+            eos_token_id=eos_token_id,
         )
     else:
         base = build_fully_masked_completion_batch(
@@ -232,6 +236,8 @@ def build_coupled_base(
             pad_token_id=pad_token_id,
             pad_to_length=pad_to_length,
             block_size=noisy_block_size,
+            noisy_tail_mode=noisy_tail_mode,
+            eos_token_id=eos_token_id,
         )
     num_samples = base["input_ids"].shape[0]
     zeros = base["diffu_grpo_score_mask"].new_zeros(base["input_ids"].shape)

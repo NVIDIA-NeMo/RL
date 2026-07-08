@@ -33,6 +33,11 @@ policy:
     # Mask levels per sequence = COUPLED_NUM_LEVELS(2) * num_pairs; must be even, >= 2.
     # 2 = single antithetic pair (default). Set to 2*K for K coupled MC pairs.
     num_mc_samples: 2
+    # How the final block-padding tail of the noisy side is built:
+    #   mask = current full-block mask tail (matches generation);
+    #   eos  = full-block with EOS tail (matches SFT padding);
+    #   none = no block-padding, partial final block (no tail).
+    noisy_tail_mode: "mask"
     mask_token_id: 100
     exclude_mask_token_from_logits: true
     # Base offset folded into the per-row mask seed (grpo.py adds step & row).

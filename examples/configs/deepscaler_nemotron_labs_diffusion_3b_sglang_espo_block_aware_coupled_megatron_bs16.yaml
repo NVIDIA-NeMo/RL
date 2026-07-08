@@ -68,6 +68,11 @@ policy:
     # coupled-only keys, e.g. verify_gen_kl_with_sglang_mask) instead of merging.
     _override_: true
     type: "espo_block_aware"
+    # How the final block-padding tail of the noisy side is built:
+    #   mask = current full-block mask tail (matches generation);
+    #   eos  = full-block with EOS tail (matches SFT padding);
+    #   none = no block-padding, partial final block (no tail).
+    noisy_tail_mode: "mask"
     mask_token_id: 100
     # Block size used to build the noisy layout AND to factor the ELBO; matches
     # the model's block_size (Nemotron-Labs-Diffusion-3B = 32).

@@ -131,6 +131,8 @@ def _build_completion_only_tensors(
     pad_token_id: int,
     block_size: int | None,
     sequence_length_round: int | None,
+    noisy_tail_mode: str = "mask",
+    eos_token_id: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -141,7 +143,11 @@ def _build_completion_only_tensors(
     torch.Tensor,
 ]:
     batch_size = input_ids.shape[0]
-    if block_size is not None and block_size > 0:
+    if noisy_tail_mode == "eos" and eos_token_id is None:
+        raise ValueError(
+            "noisy_tail_mode=eos requires eos_token_id to be provided"
+        )
+    if noisy_tail_mode != "none" and block_size is not None and block_size > 0:
         noisy_valid_lengths = torch.where(
             response_lengths > 0,
             torch.div(
@@ -196,6 +202,11 @@ def _build_completion_only_tensors(
             noisy_start = NOISY_RESPONSE_OFFSET
             noisy_end = noisy_start + noisy_valid_len
             layout_input_ids[batch_idx, noisy_start:noisy_end] = int(mask_token_id)
+            if noisy_tail_mode == "eos" and noisy_valid_len > response_len:
+                layout_input_ids[
+                    batch_idx,
+                    noisy_start + response_len : noisy_start + noisy_valid_len,
+                ] = int(eos_token_id)
 
         if response_len > 0:
             response_tokens = input_ids[batch_idx, start : start + response_len]
@@ -241,6 +252,8 @@ def build_fully_masked_completion_batch(
     pad_token_id: int,
     pad_to_length: int | None = None,
     block_size: int | None = None,
+    noisy_tail_mode: str = "mask",
+    eos_token_id: int | None = None,
 ) -> BatchedDataDict[Any]:
     """Build a completion-only DiffuGRPO batch as ``[masked_response | clean]``.
 
@@ -294,6 +307,8 @@ def build_fully_masked_completion_batch(
         pad_token_id=pad_token_id,
         block_size=block_size,
         sequence_length_round=sequence_length_round,
+        noisy_tail_mode=noisy_tail_mode,
+        eos_token_id=eos_token_id,
     )
     total_length = layout_input_ids.shape[1]
     batch_size = layout_input_ids.shape[0]
@@ -336,6 +351,8 @@ def build_fully_masked_completion_loss_batch(
     pad_token_id: int,
     pad_to_length: int | None = None,
     block_size: int | None = None,
+    noisy_tail_mode: str = "mask",
+    eos_token_id: int | None = None,
 ) -> BatchedDataDict[Any]:
     batch = build_fully_masked_completion_batch(
         data,
@@ -343,6 +360,8 @@ def build_fully_masked_completion_loss_batch(
         pad_token_id=pad_token_id,
         pad_to_length=pad_to_length,
         block_size=block_size,
+        noisy_tail_mode=noisy_tail_mode,
+        eos_token_id=eos_token_id,
     )
     total_length = batch["input_ids"].shape[1]
     completion_starts = batch["diffu_grpo_completion_starts"]

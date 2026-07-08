@@ -62,6 +62,20 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
     def _coupled_cfg(self):
         return get_coupled_grpo_logprob_estimation_cfg(self.cfg)
 
+    def _noisy_tail_mode(self) -> str:
+        """How the final block-padding tail of the noisy side is built.
+
+        ``mask`` (default): tail filled with the mask token (matches generation);
+        ``eos``: tail filled with the EOS token (matches SFT padding); ``none``: no
+        block-padding, so no tail. See ``_build_completion_only_tensors``."""
+        mode = str(self._coupled_cfg().get("noisy_tail_mode", "mask"))
+        if mode not in ("mask", "eos", "none"):
+            raise ValueError(
+                "noisy_tail_mode must be one of mask, eos, none; got "
+                f"{mode!r}."
+            )
+        return mode
+
     # DiffuGRPO's inherited helpers read mask_token_id via ``_diffu_grpo_cfg``; the
     # coupled estimator carries the same key, so route them to our config.
     def _diffu_grpo_cfg(self):
@@ -110,6 +124,8 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             pad_to_length=self._diffu_grpo_sequence_length_round(),
             include_loss=True,
             num_pairs=num_pairs,
+            noisy_tail_mode=self._noisy_tail_mode(),
+            eos_token_id=self.tokenizer.eos_token_id,
         )
         # Scatter pairs 1..K-1 prev / reference logprobs into the noisy layout so
         # ``make_coupled_level_view`` can route pair = level // 2's summed [N, S] onto
@@ -260,6 +276,8 @@ class CoupledGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             pad_to_length=self._diffu_grpo_sequence_length_round(),
             include_loss=False,
             num_pairs=num_pairs,
+            noisy_tail_mode=self._noisy_tail_mode(),
+            eos_token_id=self.tokenizer.eos_token_id,
         )
         if num_levels == 0:
             empty = torch.zeros_like(data["input_ids"], dtype=torch.float32)

@@ -1,0 +1,11 @@
+# ESPO 6x6 experiment: noisy_tail_mode=none.
+#  - noisy_tail_mode "none": drop the final-block block-padding entirely (noisy region
+#    = exact response length, no mask tail). Tests whether removing the mask tail (the
+#    SFT-vs-generation tail mismatch) changes the length/EOS collapse.
+# Everything else (block_size 16, strict reward, batch/cluster) inherited from the 6x6
+# ESPO config. Requires the noisy_tail_mode knob (logprob_estimation) to be implemented.
+defaults: "grpo_sudoku6x6_espo.yaml"
+
+policy:
+  logprob_estimation:
+    noisy_tail_mode: "none"

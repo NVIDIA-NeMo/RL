@@ -27,6 +27,9 @@ from nemo_rl.algorithms.coupled_grpo_logprobs import (
     build_coupled_base,
     make_coupled_level_view,
 )
+from nemo_rl.algorithms.diffu_grpo_logprobs import (
+    build_fully_masked_completion_batch,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 MASK_TOKEN_ID = 200
@@ -193,3 +196,57 @@ def test_level0_mask_override_pins_M_without_seed():
     valid = base["coupled_grpo_valid_mask"] > 0.5
     h1 = _harvest_bool(make_coupled_level_view(base, 1, ("diffu_grpo_score_mask",)))
     assert torch.equal(h1, valid & (~h0))
+
+
+EOS_TOKEN_ID = 300
+BLOCK_SIZE = 4
+
+
+def test_noisy_tail_mode_mask_eos_none():
+    # Response lengths 4/5/3 block-padded to 4/8/4 -> tails of 0/3/1. Verify the
+    # three noisy_tail_mode variants only differ in the block-padding tail; the
+    # real response positions stay mask in every mode.
+    data = _make_data()
+    mask_base = build_fully_masked_completion_batch(
+        data, MASK_TOKEN_ID, PAD_TOKEN_ID, block_size=BLOCK_SIZE
+    )
+    eos_base = build_fully_masked_completion_batch(
+        data,
+        MASK_TOKEN_ID,
+        PAD_TOKEN_ID,
+        block_size=BLOCK_SIZE,
+        noisy_tail_mode="eos",
+        eos_token_id=EOS_TOKEN_ID,
+    )
+    none_base = build_fully_masked_completion_batch(
+        data,
+        MASK_TOKEN_ID,
+        PAD_TOKEN_ID,
+        block_size=BLOCK_SIZE,
+        noisy_tail_mode="none",
+    )
+
+    offset = int(mask_base["diffu_grpo_noisy_response_offsets"][0].item())
+    for s_idx, (_, rlen) in enumerate(LAYOUT):
+        noisy_valid = int(mask_base["diffu_grpo_noisy_valid_lengths"][s_idx].item())
+        # Response positions are mask in every mode.
+        assert torch.all(
+            mask_base["input_ids"][s_idx, offset : offset + rlen] == MASK_TOKEN_ID
+        )
+        assert torch.all(
+            eos_base["input_ids"][s_idx, offset : offset + rlen] == MASK_TOKEN_ID
+        )
+        # mask: the whole block-padded region is mask.
+        assert torch.all(
+            mask_base["input_ids"][s_idx, offset : offset + noisy_valid]
+            == MASK_TOKEN_ID
+        )
+        # eos: the tail past the response is EOS.
+        assert torch.all(
+            eos_base["input_ids"][s_idx, offset + rlen : offset + noisy_valid]
+            == EOS_TOKEN_ID
+        )
+        # none: no block-padding -> noisy_valid_length == response_length (no tail).
+        assert (
+            int(none_base["diffu_grpo_noisy_valid_lengths"][s_idx].item()) == rlen
+        )
