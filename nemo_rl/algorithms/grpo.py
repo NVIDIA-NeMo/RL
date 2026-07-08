@@ -104,6 +104,7 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
+    validate_router_replay_startup,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -1116,6 +1117,14 @@ def setup(
                 "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
             )
 
+        validate_router_replay_startup(
+            policy_config,
+            data_plane_enabled=bool(
+                (master_config.data_plane or {}).get("enabled", False)
+            ),
+            using_nemo_gym=enable_nemo_gym,
+            async_rollouts=_should_use_async_rollouts(master_config),
+        )
         configure_vllm_for_router_replay(policy_config)
         vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
 
