@@ -30,6 +30,22 @@ if TYPE_CHECKING:
     from megatron.core.models.gpt import GPTModel
 
 
+def _get_world_size_or_1(group: Optional[torch.distributed.ProcessGroup]) -> int:
+    """Return the process-group world size, defaulting to 1 before dist init.
+
+    Delegates to ``torch.distributed.get_world_size(group)``; ``group=None``
+    resolves to the default process group's size, matching the semantics of the
+    collectives being guarded.
+    """
+    if (
+        not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+    ):
+        return 1
+
+    return torch.distributed.get_world_size(group)
+
+
 def _compute_distributed_log_softmax_with_grad(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
@@ -47,22 +63,25 @@ def _compute_distributed_log_softmax_with_grad(
             the all-reduces).
     """
     logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True).detach()
-    torch.distributed.all_reduce(
-        logits_max,
-        op=torch.distributed.ReduceOp.MAX,
-        group=group,
-    )
+    world_size = _get_world_size_or_1(group)
+    if world_size > 1:
+        torch.distributed.all_reduce(
+            logits_max,
+            op=torch.distributed.ReduceOp.MAX,
+            group=group,
+        )
 
     # Subtract the maximum value.
     vocab_parallel_logits = vocab_parallel_logits - logits_max
 
     sum_exp_logits = vocab_parallel_logits.exp().sum(-1, keepdim=True).float()
 
-    sum_exp_logits = torch.distributed.nn.functional.all_reduce(
-        sum_exp_logits,
-        op=torch.distributed.ReduceOp.SUM,
-        group=group,
-    )
+    if world_size > 1:
+        sum_exp_logits = torch.distributed.nn.functional.all_reduce(
+            sum_exp_logits,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
 
     return vocab_parallel_logits - sum_exp_logits.log().to(vocab_parallel_logits.dtype)
 
@@ -96,22 +115,25 @@ def _compute_distributed_softmax(
         torch.Tensor: Softmax output with the same shape as input, normalized across the full vocabulary.
     """
     logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
-    torch.distributed.all_reduce(
-        logits_max,
-        op=torch.distributed.ReduceOp.MAX,
-        group=group,
-    )
+    world_size = _get_world_size_or_1(group)
+    if world_size > 1:
+        torch.distributed.all_reduce(
+            logits_max,
+            op=torch.distributed.ReduceOp.MAX,
+            group=group,
+        )
 
     vocab_parallel_logits = vocab_parallel_logits - logits_max
 
     exp_logits = vocab_parallel_logits.exp_()
 
     sum_exp_logits = exp_logits.sum(-1, keepdim=True)
-    torch.distributed.all_reduce(
-        sum_exp_logits,
-        op=torch.distributed.ReduceOp.SUM,
-        group=group,
-    )
+    if world_size > 1:
+        torch.distributed.all_reduce(
+            sum_exp_logits,
+            op=torch.distributed.ReduceOp.SUM,
+            group=group,
+        )
     exp_logits.div_(sum_exp_logits)
 
     return exp_logits
@@ -146,11 +168,12 @@ class DistributedLogprob(torch.autograd.Function):
         log_probs = torch.gather(log_probs, -1, masked_target.unsqueeze(-1)).squeeze(-1)
         log_probs[target_mask] = 0.0
 
-        torch.distributed.all_reduce(
-            log_probs,
-            op=torch.distributed.ReduceOp.SUM,
-            group=group,
-        )
+        if _get_world_size_or_1(group) > 1:
+            torch.distributed.all_reduce(
+                log_probs,
+                op=torch.distributed.ReduceOp.SUM,
+                group=group,
+            )
 
         if not inference_only:
             # only save for backward when we have inference only=False
@@ -233,11 +256,12 @@ class DistributedCrossEntropy(torch.autograd.Function):
         local_cross_entropy = torch.einsum(
             "...v,...v->...", target_probs, student_log_probs
         ).neg_()
-        torch.distributed.all_reduce(
-            local_cross_entropy,
-            op=torch.distributed.ReduceOp.SUM,
-            group=group,
-        )
+        if _get_world_size_or_1(group) > 1:
+            torch.distributed.all_reduce(
+                local_cross_entropy,
+                op=torch.distributed.ReduceOp.SUM,
+                group=group,
+            )
 
         if not inference_only:
             student_probs = student_log_probs.exp_()
@@ -287,6 +311,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
 
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
+        tp_world_size = _get_world_size_or_1(tp_group)
         all_log_probs = []
 
         for chunk_idx in range(num_chunks):
@@ -306,11 +331,12 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             ).squeeze(-1)
             log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
 
-            torch.distributed.all_reduce(
-                log_probs,
-                op=torch.distributed.ReduceOp.SUM,
-                group=tp_group,
-            )
+            if tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    log_probs,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=tp_group,
+                )
 
             all_log_probs.append(log_probs)
 
@@ -737,6 +763,7 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
     ) -> torch.Tensor:
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
+        tp_world_size = _get_world_size_or_1(tp_group)
         out_chunks: list[torch.Tensor] = []
 
         for chunk_idx in range(num_chunks):
@@ -754,9 +781,10 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
             local_vals = torch.gather(log_probs, dim=-1, index=li)
             local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
 
-            torch.distributed.all_reduce(
-                local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
+            if tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
+                )
 
             out_chunks.append(local_vals)
 
@@ -1761,6 +1789,7 @@ def gather_logits_at_global_indices(
     B, S, V_local = vocab_parallel_logits.shape
     if chunk_size is None:
         chunk_size = S
+    tp_world_size = _get_world_size_or_1(tp_group) if tp_group is not None else 1
 
     out_chunks: list[torch.Tensor] = []
     for s0 in range(0, S, chunk_size):
@@ -1777,7 +1806,7 @@ def gather_logits_at_global_indices(
         local_vals = torch.gather(logits_chunk, dim=-1, index=li)
         local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
 
-        if tp_group is not None:
+        if tp_world_size > 1:
             torch.distributed.all_reduce(
                 local_vals, op=torch.distributed.ReduceOp.SUM, group=tp_group
             )
@@ -1983,6 +2012,7 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
     ) -> torch.Tensor:
         B, S, _ = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
+        tp_world_size = _get_world_size_or_1(tp_group)
         out_chunks: list[torch.Tensor] = []
 
         for chunk_idx in range(num_chunks):
@@ -1993,9 +2023,10 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
             log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
             softmax_output = log_probs.exp()
             H_local = (softmax_output * log_probs).sum(dim=-1)  # [B, Sc]
-            torch.distributed.all_reduce(
-                H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
+            if tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
+                )
             out_chunks.append(H_local)
 
         H_all = torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
@@ -2018,6 +2049,7 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 
         B, S, V_local = vocab_parallel_logits.shape
         num_chunks = (int(S) + chunk_size - 1) // chunk_size
+        tp_world_size = _get_world_size_or_1(tp_group)
 
         grad_input: torch.Tensor = torch.empty_like(
             vocab_parallel_logits, dtype=torch.float32
@@ -2031,9 +2063,10 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
             log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
             softmax_output = log_probs.exp()
             H_local = (softmax_output * log_probs).sum(dim=-1)
-            torch.distributed.all_reduce(
-                H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
+            if tp_world_size > 1:
+                torch.distributed.all_reduce(
+                    H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
+                )
 
             # Inplace index into the preallocated grad_input tensor
             grad_input_chunk = grad_input[:, s0:s1, :]
@@ -2099,7 +2132,7 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
         masked_target = target - vocab_start_index
         masked_target[target_mask] = 0
-        tp_group_size = torch.distributed.get_world_size(tp_group)
+        tp_group_size = _get_world_size_or_1(tp_group)
         if tp_group_size > 1:
             original_tensor_parallel_hidden_states = (
                 tensor_parallel_hidden_states.clone()
@@ -2142,11 +2175,12 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
             all_log_probs.append(log_probs)
 
         log_probs = torch.cat(all_log_probs, dim=1)
-        torch.distributed.all_reduce(
-            log_probs,
-            op=torch.distributed.ReduceOp.SUM,
-            group=tp_group,
-        )
+        if tp_group_size > 1:
+            torch.distributed.all_reduce(
+                log_probs,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+            )
         if not inference_only:
             # only save for backward when we have inference only=False
             # save tensor_parallel_hidden_states and the output_layer to the context
@@ -2174,7 +2208,7 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
             output_weight_layer,
         ) = ctx.saved_tensors
         tp_group = ctx.tp_group
-        tp_group_size = torch.distributed.get_world_size(tp_group)
+        tp_group_size = _get_world_size_or_1(tp_group)
         if tp_group_size > 1:
             all_hidden_states = [
                 torch.zeros_like(tensor_parallel_hidden_states)
@@ -2244,12 +2278,15 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
         grad_input_hidden_states_list = list(
             torch.chunk(grad_input_hidden_states, chunks=tp_group_size, dim=0)
         )
-        torch.distributed.reduce_scatter(
-            sharded_grad_hidden_states,
-            grad_input_hidden_states_list,
-            op=torch.distributed.ReduceOp.SUM,
-            group=tp_group,
-        )
+        if tp_group_size > 1:
+            torch.distributed.reduce_scatter(
+                sharded_grad_hidden_states,
+                grad_input_hidden_states_list,
+                op=torch.distributed.ReduceOp.SUM,
+                group=tp_group,
+            )
+        else:
+            sharded_grad_hidden_states.copy_(grad_input_hidden_states_list[0])
 
         return (
             sharded_grad_hidden_states,
