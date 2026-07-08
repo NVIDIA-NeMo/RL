@@ -9,7 +9,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
@@ -27,6 +26,7 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedLogprobWithSampling,
     DistributedLogprob,
     DistributedLogprobWithSampling,
+    gather_cp_sharded_logits,
 )
 from nemo_rl.models.megatron.train import LogprobsPostProcessor, LossPostProcessor
 from nemo_rl.models.policy import PolicyConfig
@@ -292,14 +292,12 @@ class DiffuGRPOLossPostProcessor(LossPostProcessor):
             raise NotImplementedError(
                 "DiffuGRPO Megatron training requires sequence_packing.enabled=false"
             )
-        if get_context_parallel_world_size() > 1:
-            raise NotImplementedError(
-                "DiffuGRPO Megatron training currently requires context_parallel_size=1"
-            )
-
         def loss_fn_inner(
             output_tensor: torch.Tensor,
         ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+            # CP: re-gather the zigzag-sharded logits to the full sequence before
+            # extracting logprobs at global target positions.
+            output_tensor = gather_cp_sharded_logits(output_tensor)
             logprob_estimation_cfg = self.cfg.get("logprob_estimation", {})
             mask_token_id = logprob_estimation_cfg.get("mask_token_id", None)
             exclude_mask = logprob_estimation_cfg.get(
@@ -457,6 +455,8 @@ class DiffuGRPOLogprobsPostProcessor(LogprobsPostProcessor):
         cu_seqlens_padded: torch.Tensor,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         def processor_fn_inner(output_tensor):
+            # CP: re-gather the zigzag-sharded logits to the full sequence.
+            output_tensor = gather_cp_sharded_logits(output_tensor)
             logprob_estimation_cfg = self.cfg.get("logprob_estimation", {})
             mask_token_id = logprob_estimation_cfg.get("mask_token_id", None)
             exclude_mask = logprob_estimation_cfg.get(

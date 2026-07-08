@@ -17,8 +17,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
@@ -31,29 +29,12 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    allgather_cp_sharded_tensor,
     from_parallel_logits_to_same_position_logprobs,
+    gather_cp_sharded_logits,
 )
 from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.train import LogprobsPostProcessor, LossPostProcessor
 from nemo_rl.models.policy import PolicyConfig
-
-
-def _gather_cp_sharded_logits(output_tensor: torch.Tensor) -> torch.Tensor:
-    """Re-gather CP-zigzag-sharded logits ``[B, S/cp, V]`` to full ``[B, S, V]``.
-
-    The diffusion leftmost-reveal attention handles context parallelism by
-    gathering/scattering inside attention, so each CP rank's logits cover only
-    its zigzag slice of the sequence. ``just_grpo_target_positions`` are global
-    positions, so the full-sequence logits must be reconstructed before
-    extracting the per-row logprob.
-    """
-    cp_size = get_context_parallel_world_size()
-    if cp_size <= 1:
-        return output_tensor
-    return allgather_cp_sharded_tensor(
-        output_tensor, get_context_parallel_group(), seq_dim=1
-    )
 
 
 class JustGRPOLossPostProcessor(LossPostProcessor):
@@ -92,7 +73,7 @@ class JustGRPOLossPostProcessor(LossPostProcessor):
         def just_grpo_loss_fn(
             output_tensor: torch.Tensor,
         ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-            output_tensor = _gather_cp_sharded_logits(output_tensor)
+            output_tensor = gather_cp_sharded_logits(output_tensor)
             tp_grp = get_tensor_model_parallel_group()
             tp_rank = get_tensor_model_parallel_rank()
             logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
@@ -210,7 +191,7 @@ class JustGRPOLogprobsPostProcessor(LogprobsPostProcessor):
         cu_seqlens_padded: torch.Tensor,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         def processor_fn_inner(output_tensor):
-            output_tensor = _gather_cp_sharded_logits(output_tensor)
+            output_tensor = gather_cp_sharded_logits(output_tensor)
             tp_grp = get_tensor_model_parallel_group()
             tp_rank = get_tensor_model_parallel_rank()
             logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)

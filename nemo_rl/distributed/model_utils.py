@@ -17,6 +17,8 @@ from typing import Any, Optional
 import torch
 from megatron.core.models.gpt import GPTModel
 from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
@@ -1300,6 +1302,22 @@ def allgather_cp_sharded_tensor(
     tensor, cp_group, seq_dim=1
 ):  # , unpadded_seqlen=None):
     return AllGatherCPTensor.apply(tensor, cp_group, seq_dim)  # , unpadded_seqlen)
+
+
+def gather_cp_sharded_logits(output_tensor: torch.Tensor) -> torch.Tensor:
+    """Re-gather CP-zigzag-sharded logits ``[B, S/cp, V]`` to full ``[B, S, V]``.
+
+    Under unpacked context parallelism the model emits per-rank zigzag-sharded
+    logits; callers index them at global target positions, so the full-length
+    logits are reconstructed (seq_dim=1) first. No-op when cp_size <= 1. Shared
+    by the JustGRPO and DiffuGRPO Megatron post-processors.
+    """
+    cp_size = get_context_parallel_world_size()
+    if cp_size <= 1:
+        return output_tensor
+    return allgather_cp_sharded_tensor(
+        output_tensor, get_context_parallel_group(), seq_dim=1
+    )
 
 
 class AllGatherCPTensor(torch.autograd.Function):
