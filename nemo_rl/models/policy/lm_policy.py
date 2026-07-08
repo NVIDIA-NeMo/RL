@@ -323,6 +323,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+        self._workers_per_node = max(1, int(getattr(cluster, "num_gpus_per_node", 1)))
 
     @property
     def data_parallel_size(self) -> int:
@@ -1051,9 +1052,41 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("offload_before_refit")
         ray.get(futures)
 
+    def _run_post_refit_offload(self) -> list[ray.ObjectRef]:
+        max_workers_per_node = int(
+            self.cfg.get("refit_offload_max_workers_per_node") or 0
+        )
+        if (
+            max_workers_per_node <= 0
+            or max_workers_per_node >= self._workers_per_node
+        ):
+            return self.worker_group.run_all_workers_single_data("offload_after_refit")
+
+        workers = self.worker_group.workers
+        all_futures: list[ray.ObjectRef] = []
+        print(
+            "Running post-refit policy offload with "
+            f"max_workers_per_node={max_workers_per_node}",
+            flush=True,
+        )
+        for local_start in range(0, self._workers_per_node, max_workers_per_node):
+            futures = []
+            for node_start in range(0, len(workers), self._workers_per_node):
+                local_stop = min(
+                    local_start + max_workers_per_node,
+                    self._workers_per_node,
+                    len(workers) - node_start,
+                )
+                for local_idx in range(local_start, local_stop):
+                    worker = workers[node_start + local_idx]
+                    futures.append(worker.offload_after_refit.remote())
+            ray.get(futures)
+            all_futures.extend(futures)
+        return all_futures
+
     def offload_after_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
-        futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
+        futures = self._run_post_refit_offload()
         ray.get(futures)
 
     def offload_to_cpu(self) -> None:

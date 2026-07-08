@@ -29,8 +29,10 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
+    make_ipc_refit_payload_entry,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
+    unpack_ipc_refit_payload_entry,
 )
 
 
@@ -134,6 +136,41 @@ class _FakeIpcSocket:
 
     def getsockopt(self, _option):
         return 0
+
+
+def test_ipc_refit_payload_entry_uses_prepared_metadata_by_default():
+    tensor = torch.ones((2, 3), dtype=torch.bfloat16)
+    entry = make_ipc_refit_payload_entry(
+        "decoder.weight",
+        tensor,
+        metadata_in_payload=False,
+    )
+
+    assert entry == "decoder.weight"
+    name, shape, dtype = unpack_ipc_refit_payload_entry(
+        entry,
+        {"decoder.weight": (torch.Size((2, 3)), torch.bfloat16)},
+    )
+
+    assert name == "decoder.weight"
+    assert shape == torch.Size((2, 3))
+    assert dtype == torch.bfloat16
+
+
+def test_ipc_refit_payload_entry_can_embed_shape_and_dtype():
+    tensor = torch.ones((4, 5), dtype=torch.float16)
+    entry = make_ipc_refit_payload_entry(
+        "decoder.weight",
+        tensor,
+        metadata_in_payload=True,
+    )
+
+    assert entry == ("decoder.weight", (4, 5), torch.float16)
+    name, shape, dtype = unpack_ipc_refit_payload_entry(entry, {})
+
+    assert name == "decoder.weight"
+    assert shape == torch.Size((4, 5))
+    assert dtype == torch.float16
 
 
 def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):

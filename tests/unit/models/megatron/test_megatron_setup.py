@@ -24,6 +24,7 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import datetime
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1081,6 +1082,28 @@ class TestApplyPerformanceConfig:
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 
+    def test_normalizes_precision_aware_optimizer_dtype_strings(self):
+        """Test that YAML/CLI dtype strings become torch dtypes."""
+        from nemo_rl.models.megatron.setup import _normalize_optimizer_dtype_config
+
+        optimizer_cfg = _normalize_optimizer_dtype_config(
+            {
+                "params_dtype": "float32",
+                "main_params_dtype": "torch.float32",
+                "main_grads_dtype": "bf16",
+                "exp_avg_dtype": "bfloat16",
+                "exp_avg_sq_dtype": "fp16",
+                "optimizer_cpu_offload": False,
+            }
+        )
+
+        assert optimizer_cfg["params_dtype"] is torch.float32
+        assert optimizer_cfg["main_params_dtype"] is torch.float32
+        assert optimizer_cfg["main_grads_dtype"] is torch.bfloat16
+        assert optimizer_cfg["exp_avg_dtype"] is torch.bfloat16
+        assert optimizer_cfg["exp_avg_sq_dtype"] is torch.float16
+        assert optimizer_cfg["optimizer_cpu_offload"] is False
+
     def test_cpu_offload_requires_full_fraction(self):
         """Test that CPU offload requires offload_fraction=1.0."""
         from nemo_rl.models.megatron.setup import _validate_optimizer_config
@@ -1223,6 +1246,55 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.fully_parallel_save is True
         assert checkpoint_config.fully_parallel_load is True
         assert checkpoint_config.load_rng is False
+
+
+@pytest.mark.mcore
+class TestDistributedTimeoutConfig:
+    """Tests for configurable Megatron distributed timeouts."""
+
+    def test_setup_distributed_uses_configured_timeout(self, monkeypatch):
+        """setup_distributed should pass recipe timeout to the first process group."""
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        config = {"megatron_cfg": {"distributed_timeout_minutes": 30}}
+
+        with (
+            patch("nemo_rl.models.megatron.setup.configure_dynamo_cache"),
+            patch("nemo_rl.models.megatron.setup.destroy_parallel_state"),
+            patch(
+                "nemo_rl.models.megatron.setup.torch.distributed.init_process_group"
+            ) as mock_init_process_group,
+        ):
+            setup_distributed(config)
+
+        mock_init_process_group.assert_called_once_with(
+            backend="nccl",
+            device_id=torch.device("cuda:0"),
+            timeout=datetime.timedelta(minutes=30),
+        )
+
+    def test_distributed_init_config_maps_bridge_timeout(self):
+        """Bridge ConfigContainer.dist should receive the same timeout override."""
+        from nemo_rl.models.megatron.setup import _create_distributed_init_config
+
+        dist_config = _create_distributed_init_config(
+            {
+                "megatron_cfg": {
+                    "distributed_init_config": {
+                        "distributed_timeout_minutes": "45",
+                    }
+                }
+            }
+        )
+
+        assert dist_config.distributed_timeout_minutes == 45
+
+    def test_missing_timeout_preserves_default_dist_config(self):
+        """No explicit timeout means _create_megatron_config keeps Bridge defaults."""
+        from nemo_rl.models.megatron.setup import _create_distributed_init_config
+
+        assert _create_distributed_init_config({"megatron_cfg": {}}) is None
 
 
 @pytest.mark.mcore
@@ -1763,6 +1835,40 @@ class TestSetupModelConfig:
         model_cfg.__post_init__ = MagicMock()
         return model_cfg
 
+    def test_allows_cached_kimi_dynamic_vision_config_target(self, tmp_path):
+        """Kimi converted configs may use offline dynamic module cache paths."""
+        from nemo_rl.models.megatron import setup as megatron_setup
+        from nemo_rl.models.megatron.setup import (
+            _allow_kimi_dynamic_vision_config_target,
+        )
+
+        vision_target = (
+            "transformers_modules._7eb5002f6aadc958aed6a9177b7ed26bb94011bb."
+            "240787f372f63c7e.configuration_kimi_k25.KimiK25VisionConfig"
+        )
+        run_config = tmp_path / "run_config.yaml"
+        run_config.write_text(
+            "\n".join(
+                [
+                    "model:",
+                    f"  _target_: {megatron_setup._KIMI_K25_PROVIDER_TARGET}",
+                    "  hf_model_id: moonshotai/Kimi-K2.6",
+                    "  hf_config:",
+                    "    architectures:",
+                    "      - KimiK25ForConditionalGeneration",
+                    "  vision_config:",
+                    f"    _target_: {vision_target}",
+                    "",
+                ]
+            )
+        )
+
+        megatron_setup.target_allowlist.remove_exact(vision_target)
+
+        _allow_kimi_dynamic_vision_config_target(str(run_config))
+
+        assert megatron_setup.target_allowlist.is_allowed(vision_target)
+
     def test_megatron_lm_passes_hf_config_overrides_to_autoconfig(self, request):
         """hf_config_overrides must be forwarded to AutoConfig.from_pretrained for megatron_lm."""
         from nemo_rl.models.megatron.setup import setup_model_config
@@ -2066,6 +2172,7 @@ class TestSetupModelAndOptimizer:
         mock_megatron_cfg.model.vocab_size = 32000
         mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
         mock_megatron_cfg.model.tensor_model_parallel_size = 1
+        mock_megatron_cfg.tokenizer.hf_tokenizer_kwargs = None
         # Enable param gather overlap
         mock_megatron_cfg.ddp.overlap_param_gather = True
         mock_megatron_cfg.ddp.align_param_gather = True
@@ -2104,6 +2211,13 @@ class TestSetupModelAndOptimizer:
         call_kwargs = mock_get_model.call_args[1]
         # Check that pre_wrap_hook is not empty when freeze_moe_router is True
         assert len(call_kwargs.get("pre_wrap_hook", [])) > 0
+
+        assert mock_megatron_cfg.tokenizer.hf_tokenizer_kwargs[
+            "trust_remote_code"
+        ] is True
+        assert mock_megatron_cfg.tokenizer.trust_remote_code is True
+        assert mock_megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] is True
+        assert mock_megatron_cfg.tokenizer.tokenizer_hf_no_use_fast is False
 
         assert result.param_sync_func == mock_model_chunk.start_param_sync
 

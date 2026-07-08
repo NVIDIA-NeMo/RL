@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import fcntl
 import os
 import subprocess
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -48,3 +50,73 @@ def test_create_local_venv():
             # Verify the command executed successfully (return code 0)
             assert result.returncode == 0, f"Failed to import sphinx: {result.stderr}"
             assert "Sphinx package is installed" in result.stdout
+
+
+def test_create_local_venv_forwards_uv_no_install_packages():
+    create_local_venv.cache_clear()
+    with TemporaryDirectory(dir=TEST_ASSETS_DIR) as tempdir:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "NEMO_RL_VENV_DIR": tempdir,
+                    "NRL_UV_NO_INSTALL_PACKAGES": (
+                        "deep-ep,causal-conv1d,,fast-hadamard-transform"
+                    ),
+                },
+            ),
+            patch("nemo_rl.utils.venvs.subprocess.run") as run_mock,
+        ):
+            Path(tempdir, "test_venv").mkdir()
+            venv_python = create_local_venv(
+                py_executable="uv run --group mcore", venv_name="test_venv"
+            )
+
+    assert venv_python == f"{tempdir}/test_venv/bin/python"
+    sync_cmd = run_mock.call_args_list[1].args[0]
+    exec_cmd = run_mock.call_args_list[2].args[0]
+    expected_args = [
+        "--no-install-package",
+        "deep-ep",
+        "--no-install-package",
+        "causal-conv1d",
+        "--no-install-package",
+        "fast-hadamard-transform",
+    ]
+    assert sync_cmd[:2] == ["uv", "sync"]
+    assert "--locked" not in sync_cmd
+    assert "--group" in sync_cmd
+    assert "mcore" in sync_cmd
+    assert sync_cmd[-len(expected_args) :] == expected_args
+    assert exec_cmd[:3] == ["uv", "run", "--no-sync"]
+    assert "--no-install-package" not in exec_cmd
+    create_local_venv.cache_clear()
+
+
+def test_create_local_venv_can_serialize_uv_sync():
+    create_local_venv.cache_clear()
+    with TemporaryDirectory(dir=TEST_ASSETS_DIR) as tempdir:
+        lock_path = Path(tempdir) / "uv-sync.lock"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "NEMO_RL_VENV_DIR": tempdir,
+                    "NRL_SERIALIZE_UV_SYNC": "true",
+                    "NRL_UV_SYNC_LOCK_PATH": str(lock_path),
+                },
+            ),
+            patch("nemo_rl.utils.venvs.subprocess.run") as run_mock,
+            patch("fcntl.flock") as flock_mock,
+        ):
+            Path(tempdir, "test_venv").mkdir()
+            venv_python = create_local_venv(
+                py_executable="uv run --group mcore", venv_name="test_venv"
+            )
+
+    assert venv_python == f"{tempdir}/test_venv/bin/python"
+    assert run_mock.call_args_list[1].args[0][:2] == ["uv", "sync"]
+    assert run_mock.call_args_list[2].args[0][:3] == ["uv", "run", "--no-sync"]
+    assert flock_mock.call_args_list[0].args[1] == fcntl.LOCK_EX
+    assert flock_mock.call_args_list[-1].args[1] == fcntl.LOCK_UN
+    create_local_venv.cache_clear()

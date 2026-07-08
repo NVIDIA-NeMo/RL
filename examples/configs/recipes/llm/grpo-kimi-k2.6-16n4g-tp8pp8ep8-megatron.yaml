@@ -1,0 +1,138 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 10
+  max_num_steps: 10
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+  skip_reference_policy_logprobs_calculation: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+
+policy:
+  model_name: moonshotai/Kimi-K2.6
+  hf_config_overrides:
+    architectures:
+      - KimiK25ForConditionalGeneration
+  tokenizer:
+    name: ${policy.model_name}
+    trust_remote_code: true
+    chat_template: default
+    chat_template_kwargs: null
+  train_global_batch_size: 160
+  train_micro_batch_size: 1
+  generation_batch_size: 16
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  precision: bfloat16
+  offload_optimizer_for_logprob: false
+  refit_buffer_memory_ratio: 0.3
+  refit_offload_max_workers_per_node: 1
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  dtensor_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    recompute_granularity: full
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 8
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    distributed_timeout_minutes: 30
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    context_parallel_size: 1
+    sequence_parallel: true
+    defer_fp32_logits: true
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      main_params_dtype: float32
+      main_grads_dtype: bfloat16
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: bfloat16
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 1
+      lr_warmup_init: 1.0e-11
+  generation:
+    backend: vllm
+    max_new_tokens: 512
+    temperature: 0.6
+    top_p: 0.95
+    top_k: null
+    vllm_cfg:
+      async_engine: false
+      load_format: dummy
+      ipc_refit_metadata_in_payload: true
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 64
+      gpu_memory_utilization: 0.9
+      max_model_len: ${policy.max_total_sequence_length}
+      skip_tokenizer_init: false
+      enforce_eager: true
+      enable_prefix_caching: false
+    vllm_kwargs:
+      max_num_batched_tokens: 2048
+      max_num_seqs: 16
+      moe_backend: triton
+
+data:
+  max_input_seq_length: 1536
+  train:
+    dataset_name: OpenMathInstruct-2
+    split_validation_size: 0.05
+  validation: null
+  default:
+    prompt_file: examples/prompts/cot.txt
+    processor: math_hf_data_processor
+    env_name: math
+
+logger:
+  log_dir: logs/grpo-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+  num_val_samples_to_print: 2
+  monitor_gpus: false
+  wandb:
+    name: grpo-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+  tensorboard:
+    log_dir: tb_logs-grpo-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+  mlflow:
+    run_name: grpo-kimi-k2.6-16n4g-tp8pp8ep8-megatron
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 16

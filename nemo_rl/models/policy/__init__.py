@@ -374,6 +374,8 @@ class DraftConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
+    # Whether Hugging Face tokenizer loading may execute remote model code.
+    trust_remote_code: NotRequired[bool]
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]
@@ -453,6 +455,7 @@ class PolicyConfig(TypedDict):
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float]
+    refit_buffer_memory_ratio: NotRequired[float]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
@@ -466,6 +469,8 @@ class PolicyConfig(TypedDict):
     quant_calib_size: NotRequired[int | None]
     quant_batch_size: NotRequired[int | None]
     quant_sequence_length: NotRequired[int | None]
+    # If set to a positive value, limit concurrent post-refit offload calls per node.
+    refit_offload_max_workers_per_node: NotRequired[int | None]
     # If true, use standard Megatron layer specs while keeping ModelOpt
     # quantization enabled. Useful for faster QARL runs and logged in configs.
     disable_modelopt_layer_spec: NotRequired[bool]

@@ -1,0 +1,52 @@
+#!/bin/bash
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+source $SCRIPT_DIR/common.env
+export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-"9.0 10.0"}
+export NRL_UV_NO_INSTALL_PACKAGES=${NRL_UV_NO_INSTALL_PACKAGES:-deep-ep,causal-conv1d,mamba-ssm}
+# Megatron-Core's editable build writes a compiled dataset helper back into the
+# source tree; serialize repo-runtime worker venv builds across 16 nodes.
+export NRL_SERIALIZE_UV_SYNC=${NRL_SERIALIZE_UV_SYNC:-true}
+
+# ===== BEGIN CONFIG =====
+NUM_NODES=${KIMI_SFT_NODES:-16}
+GPUS_PER_NODE=${KIMI_SFT_GPUS_PER_NODE:-4}
+MAX_STEPS=${KIMI_SFT_MAX_STEPS:-1}
+STEPS_PER_RUN=${KIMI_SFT_STEPS_PER_RUN:-$MAX_STEPS}
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
+NUM_MINUTES=${KIMI_SFT_NUM_MINUTES:-120}
+# ===== END CONFIG =====
+
+exit_if_max_steps_reached
+
+# Run the experiment.
+cd $PROJECT_ROOT
+uv run examples/run_sft.py \
+    --config $CONFIG_PATH \
+    sft.max_num_steps=$MAX_STEPS \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=False \
+    logger.wandb.project=nemo-rl \
+    logger.wandb.name=$EXP_NAME \
+    logger.monitor_gpus=True \
+    logger.tensorboard_enabled=True \
+    checkpointing.enabled=False \
+    checkpointing.checkpoint_dir=$CKPT_DIR \
+    "$@" \
+    2>&1 | tee $RUN_LOG
+
+# Convert tensorboard logs to json.
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+# Only run metrics if the target step is reached.
+if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    uv run tests/check_metrics.py $JSON_METRICS \
+        'data["train/loss"]["1"] == data["train/loss"]["1"]' \
+        'data["train/loss"]["1"] < 1.0e20' \
+        'data["train/loss"]["1"] > -1.0e20' \
+        "data[\"train/loss\"][\"$MAX_STEPS\"] == data[\"train/loss\"][\"$MAX_STEPS\"]" \
+        "data[\"train/loss\"][\"$MAX_STEPS\"] < 1.0e20" \
+        "data[\"train/loss\"][\"$MAX_STEPS\"] > -1.0e20"
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
+fi

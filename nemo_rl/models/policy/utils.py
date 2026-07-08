@@ -14,6 +14,7 @@
 
 import gc
 import os
+import re
 import traceback
 from enum import Enum
 from typing import Any, Dict, Iterable, Optional
@@ -103,6 +104,37 @@ class IPCProtocol(Enum):
 
     COMPLETE = "complete"
     ACK = "ack"
+
+
+IPCRefitPayloadEntry = str | tuple[str, tuple[int, ...], torch.dtype]
+
+
+def make_ipc_refit_payload_entry(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    metadata_in_payload: bool,
+) -> IPCRefitPayloadEntry:
+    """Return a refit payload key entry with optional tensor metadata."""
+    if not metadata_in_payload:
+        return name
+    return (name, tuple(tensor.shape), tensor.dtype)
+
+
+def unpack_ipc_refit_payload_entry(
+    entry: IPCRefitPayloadEntry,
+    state_dict_info: dict[str, Any],
+) -> tuple[str, torch.Size, torch.dtype]:
+    """Resolve a refit payload entry into tensor name, shape, and dtype."""
+    if isinstance(entry, tuple):
+        name, shape, dtype = entry
+    else:
+        name = entry
+        shape, dtype = state_dict_info[name]
+
+    if not isinstance(shape, torch.Size):
+        shape = torch.Size(shape)
+    return name, shape, dtype
 
 
 # TODO: Replace this hard-coded map with a generic plugin-registration
@@ -358,8 +390,48 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
     return int(((size_bytes + alignment - 1) // alignment) * alignment)
 
 
+def _nrl_truthy_env(name: str) -> bool:
+    return os.environ.get(name, "false").lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _nrl_should_skip_expert_for_ipc_refit_rank(name: str, rank: int) -> bool:
+    if not _nrl_truthy_env("KIMI_FILTER_EXPERT_REFIT_BY_EP_RANK_FOR_SMOKE"):
+        return False
+
+    match = re.search(r"(?:^|\.)mlp\.experts\.(\d+)(?:\.|$)", name)
+    if match is None:
+        return False
+
+    try:
+        num_global_experts = int(os.environ.get("KIMI_REFIT_NUM_GLOBAL_EXPERTS", "384"))
+        ep_size = int(
+            os.environ.get(
+                "KIMI_REFIT_EXPERT_PARALLEL_SIZE",
+                os.environ.get("KIMI_VLLM_EP", "1"),
+            )
+        )
+    except ValueError:
+        return False
+
+    if num_global_experts <= 0 or ep_size <= 1 or num_global_experts % ep_size != 0:
+        return False
+
+    local_experts_per_ep_rank = num_global_experts // ep_size
+    ep_rank = rank % ep_size
+    expert_id = int(match.group(1))
+    first_local_expert = ep_rank * local_experts_per_ep_rank
+    last_local_expert = first_local_expert + local_experts_per_ep_rank
+    return not (first_local_expert <= expert_id < last_local_expert)
+
+
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
+    *,
+    metadata_in_payload: bool = False,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -376,7 +448,12 @@ def stream_weights_via_ipc_zmq_impl(
     # Divide total buffer size by 2 because we use two individual buffers (ping-pong) for overlapping communication.
     buffer_size_bytes = buffer_size_bytes // 2
 
-    def send_buffer_group_overlap(buffer, param_names, used_bytes, await_recv) -> bool:
+    def send_buffer_group_overlap(
+        buffer,
+        param_entries: list[IPCRefitPayloadEntry],
+        used_bytes: int,
+        await_recv: bool,
+    ) -> bool:
         """Send a group of parameters and return new pending_recv state."""
         # Synchronize before getting IPC handle to ensure data is ready
         torch.cuda.current_stream().synchronize()
@@ -385,8 +462,10 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        # Payload tuple: (cuda_ipc_handle, param_names, used_bytes)
-        payload = (cuda_ipc_handle, param_names, used_bytes)
+        # Payload tuple: (cuda_ipc_handle, param entries, used_bytes). When
+        # metadata_in_payload is enabled each entry is (name, shape, dtype);
+        # otherwise entries are plain names resolved from prepared metadata.
+        payload = (cuda_ipc_handle, param_entries, used_bytes)
         zmq_socket.send_pyobj(payload)
         return True  # pending_recv = True
 
@@ -416,12 +495,28 @@ def stream_weights_via_ipc_zmq_impl(
     current_buffer: torch.Tensor | None = None
 
     used_bytes = 0
-    param_names = []
+    param_entries: list[IPCRefitPayloadEntry] = []
     await_recv = False
     count_of_groups = 0
+    count_of_skipped_params = 0
+    logged_ipc_ep_filter = False
 
     try:
         for name, tensor in params_generator:
+            if _nrl_should_skip_expert_for_ipc_refit_rank(name, rank):
+                count_of_skipped_params += 1
+                if (
+                    _nrl_truthy_env("KIMI_REFIT_STREAM_PROGRESS")
+                    and not logged_ipc_ep_filter
+                ):
+                    print(
+                        f"{worker_name}: IPC refit EP-rank filter enabled "
+                        f"rank={rank} skipped_first={name}",
+                        flush=True,
+                    )
+                    logged_ipc_ep_filter = True
+                continue
+
             # Initialize device and buffers on first tensor
             if buffer_a is None:
                 buffer_device = tensor.device
@@ -439,22 +534,28 @@ def stream_weights_via_ipc_zmq_impl(
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
                 await_recv = send_buffer_group_overlap(
-                    current_buffer, param_names, used_bytes, await_recv
+                    current_buffer, param_entries, used_bytes, await_recv
                 )
                 count_of_groups += 1
 
                 # Switch buffers for ping-pong double buffering
                 current_buffer = buffer_b if current_buffer is buffer_a else buffer_a
-                used_bytes, param_names = 0, []
+                used_bytes, param_entries = 0, []
 
             # Pack tensor into current buffer
-            param_names.append(name)
+            param_entries.append(
+                make_ipc_refit_payload_entry(
+                    name,
+                    tensor,
+                    metadata_in_payload=metadata_in_payload,
+                )
+            )
             used_bytes = pack_tensor(current_buffer, tensor, used_bytes)
 
         # Send remaining tensors
-        if param_names:
+        if param_entries:
             await_recv = send_buffer_group_overlap(
-                current_buffer, param_names, used_bytes, await_recv
+                current_buffer, param_entries, used_bytes, await_recv
             )
             count_of_groups += 1
 
@@ -469,7 +570,9 @@ def stream_weights_via_ipc_zmq_impl(
 
         if rank == 0:
             print(
-                f"{worker_name}: Packed {count_of_groups} groups of tensors", flush=True
+                f"{worker_name}: Packed {count_of_groups} groups of tensors "
+                f"(skipped {count_of_skipped_params})",
+                flush=True,
             )
 
     except zmq.Again:

@@ -281,9 +281,10 @@ class MegatronPolicyWorkerImpl(
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
+        self._refit_ep_rank_filter_logged = False
 
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -1664,6 +1665,8 @@ class MegatronPolicyWorkerImpl(
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         self.refit_param_info_mcore = self._calculate_refit_param_info()
+        if self._ipc_refit_metadata_in_payload():
+            return {}
 
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
@@ -1672,6 +1675,208 @@ class MegatronPolicyWorkerImpl(
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
+
+    def _ipc_refit_metadata_in_payload(self) -> bool:
+        generation_cfg = self.cfg.get("generation", None)
+        if generation_cfg is None or generation_cfg.get("backend") != "vllm":
+            return False
+        vllm_cfg = generation_cfg.get("vllm_cfg", {})
+        if "ipc_refit_metadata_in_payload" not in vllm_cfg:
+            return False
+        return bool(vllm_cfg["ipc_refit_metadata_in_payload"])
+
+    @staticmethod
+    def _env_truthy(name: str) -> bool:
+        return str(os.environ.get(name, "")).lower() in {"1", "true", "yes", "y", "on"}
+
+    def _vllm_expert_parallel_size_for_refit(self) -> int:
+        ep_size: Any = None
+        try:
+            generation_cfg = self.cfg.get("generation", {}) or {}
+            ep_size = generation_cfg.get("vllm_cfg", {}).get("expert_parallel_size")
+        except Exception:
+            ep_size = None
+        if ep_size is None:
+            ep_size = os.environ.get(
+                "KIMI_REFIT_EXPERT_PARALLEL_SIZE", os.environ.get("KIMI_VLLM_EP", "1")
+            )
+        try:
+            return max(1, int(ep_size))
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _global_expert_id_from_refit_name(name: str) -> Optional[int]:
+        match = re.search(r"(?:^|\.)mlp\.experts\.(\d+)(?:\.|$)", name)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _should_skip_expert_for_ep_rank_refit(self, name: str) -> bool:
+        if not self._env_truthy("KIMI_FILTER_EXPERT_REFIT_BY_EP_RANK_FOR_SMOKE"):
+            return False
+
+        expert_id = self._global_expert_id_from_refit_name(name)
+        if expert_id is None:
+            return False
+
+        try:
+            num_global_experts = int(os.environ.get("KIMI_REFIT_NUM_GLOBAL_EXPERTS", "384"))
+        except ValueError:
+            return False
+
+        ep_size = self._vllm_expert_parallel_size_for_refit()
+        if num_global_experts <= 0 or ep_size <= 1 or num_global_experts % ep_size != 0:
+            return False
+
+        local_experts_per_ep_rank = num_global_experts // ep_size
+        ep_rank = self.rank % ep_size
+        first_local_expert = ep_rank * local_experts_per_ep_rank
+        last_local_expert = first_local_expert + local_experts_per_ep_rank
+
+        if not self._refit_ep_rank_filter_logged and (
+            self.rank == 0 or expert_id < local_experts_per_ep_rank
+        ):
+            print(
+                "KIMI policy-side EP-rank expert refit filter enabled: "
+                f"rank={self.rank} ep_rank={ep_rank}/{ep_size} "
+                f"local_global_experts=[{first_local_expert},{last_local_expert}) "
+                f"num_global_experts={num_global_experts}",
+                flush=True,
+            )
+            self._refit_ep_rank_filter_logged = True
+
+        return not (first_local_expert <= expert_id < last_local_expert)
+
+    def _should_skip_refit_param_name(
+        self, name: str, *, filter_experts_by_ep_rank: bool = True
+    ) -> bool:
+        skip_all_refit = self._env_truthy("KIMI_SKIP_ALL_REFIT_FOR_SMOKE")
+        skip_expert_refit = self._env_truthy("KIMI_SKIP_EXPERT_REFIT_FOR_SMOKE")
+        skip_nonexpert_refit = self._env_truthy("KIMI_SKIP_NONEXPERT_REFIT_FOR_SMOKE")
+        is_expert = ".mlp.experts." in name
+        return (
+            skip_all_refit
+            or (skip_expert_refit and is_expert)
+            or (skip_nonexpert_refit and not is_expert)
+            or (
+                filter_experts_by_ep_rank
+                and is_expert
+                and self._should_skip_expert_for_ep_rank_refit(name)
+            )
+        )
+
+    @staticmethod
+    def _cfg_get(cfg_obj: Any, key: str, default: Any = None) -> Any:
+        if cfg_obj is None:
+            return default
+        try:
+            return cfg_obj.get(key, default)
+        except Exception:
+            pass
+        try:
+            return getattr(cfg_obj, key)
+        except Exception:
+            return default
+
+    def _refit_architecture_overrides(self) -> list[str]:
+        hf_config_overrides = self._cfg_get(self.cfg, "hf_config_overrides", None)
+        if not hf_config_overrides:
+            policy_cfg = self._cfg_get(self.cfg, "policy", {}) or {}
+            hf_config_overrides = (
+                self._cfg_get(policy_cfg, "hf_config_overrides", {}) or {}
+            )
+
+        architectures = self._cfg_get(hf_config_overrides, "architectures", None)
+        if architectures is None:
+            return []
+        if isinstance(architectures, str):
+            return [architectures]
+        try:
+            return [str(architecture) for architecture in architectures]
+        except TypeError:
+            return [str(architectures)]
+
+    def _ensure_refit_bridge_architectures(self) -> None:
+        architectures = self._refit_architecture_overrides()
+        if not architectures:
+            return
+
+        child_attrs = (
+            "hf_pretrained",
+            "config",
+            "hf_config",
+            "text_config",
+            "language_config",
+        )
+        stack = [("bridge", self.megatron_bridge), ("model", self.model)]
+        visited: set[int] = set()
+        patched_paths: list[str] = []
+
+        while stack:
+            path_name, obj = stack.pop()
+            if obj is None:
+                continue
+
+            obj_id = id(obj)
+            if obj_id in visited:
+                continue
+            visited.add(obj_id)
+
+            is_config_like = (
+                hasattr(obj, "architectures")
+                or hasattr(obj, "model_type")
+                or hasattr(obj, "to_dict")
+            )
+            if is_config_like and not getattr(obj, "architectures", None):
+                try:
+                    setattr(obj, "architectures", list(architectures))
+                except Exception:
+                    pass
+                else:
+                    patched_paths.append(path_name)
+
+            for attr in child_attrs:
+                try:
+                    child = getattr(obj, attr, None)
+                except Exception:
+                    continue
+                if child is not None and child is not obj:
+                    stack.append((f"{path_name}.{attr}", child))
+
+        if self.rank == 0:
+            print(
+                "KIMI refit bridge architectures guard: "
+                f"override={architectures} patched={patched_paths}",
+                flush=True,
+            )
+
+    def _prepare_refit_conversion_tasks(self) -> None:
+        self._ensure_refit_bridge_architectures()
+        conversion_tasks = [
+            task
+            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            if task is not None
+        ]
+        filter_experts_by_ep_rank = self._env_truthy(
+            "KIMI_FILTER_EXPERT_CONVERSION_TASKS_BY_EP_RANK_FOR_SMOKE"
+        )
+        self.refit_conversion_tasks = [
+            task
+            for task in conversion_tasks
+            if not self._should_skip_refit_param_name(
+                task.param_name,
+                filter_experts_by_ep_rank=filter_experts_by_ep_rank,
+            )
+        ]
+        skipped_tasks = len(conversion_tasks) - len(self.refit_conversion_tasks)
+        if (skipped_tasks or filter_experts_by_ep_rank) and self.rank == 0:
+            print(
+                "KIMI policy-side refit conversion task filter: "
+                f"kept={len(self.refit_conversion_tasks)} skipped={skipped_tasks} "
+                f"filter_experts_by_ep_rank={filter_experts_by_ep_rank}",
+                flush=True,
+            )
 
     def _collect_mtp_metrics(self, metrics: dict[str, Any]) -> None:
         """Add Multi-Token Prediction metrics to ``metrics`` when MTP is enabled.
@@ -1721,11 +1926,7 @@ class MegatronPolicyWorkerImpl(
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        self.refit_conversion_tasks = [
-            task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
-            if task is not None
-        ]
+        self._prepare_refit_conversion_tasks()
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):
@@ -1775,24 +1976,51 @@ class MegatronPolicyWorkerImpl(
             get_vllm_qkv_scale_names,
         )
 
+        if self.refit_conversion_tasks is None:
+            self._prepare_refit_conversion_tasks()
+
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
+        skip_all_refit = self._env_truthy("KIMI_SKIP_ALL_REFIT_FOR_SMOKE")
+        skip_expert_refit = self._env_truthy("KIMI_SKIP_EXPERT_REFIT_FOR_SMOKE")
+        skip_nonexpert_refit = self._env_truthy("KIMI_SKIP_NONEXPERT_REFIT_FOR_SMOKE")
+        yielded_params = 0
+        skipped_params = 0
+        progress_enabled = self._env_truthy("KIMI_REFIT_STREAM_PROGRESS")
+
+        if progress_enabled and self.rank == 0:
+            print(
+                "KIMI policy-side refit export begin: "
+                f"tasks={len(getattr(self, 'refit_conversion_tasks', []) or [])} "
+                f"skip_all={skip_all_refit} skip_expert={skip_expert_refit} "
+                f"skip_nonexpert={skip_nonexpert_refit}",
+                flush=True,
+            )
+
         # Yield the original parameters first.
         for name, tensor in base_iter:
+            if self._should_skip_refit_param_name(name):
+                skipped_params += 1
+                continue
+            yielded_params += 1
             yield name, tensor
 
         if self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
 
-            draft_weights = export_eagle_weights_to_hf(
-                self.draft_model,
-            )
-            for name, tensor in draft_weights:
-                yield f"draft.{name}", tensor
+            if skip_all_refit or skip_nonexpert_refit:
+                skipped_params += sum(1 for _ in export_eagle_weights_to_hf(self.draft_model))
+            else:
+                draft_weights = export_eagle_weights_to_hf(
+                    self.draft_model,
+                )
+                for name, tensor in draft_weights:
+                    yielded_params += 1
+                    yield f"draft.{name}", tensor
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
@@ -1809,6 +2037,17 @@ class MegatronPolicyWorkerImpl(
             )
 
         if not use_fp8_kv_cache:
+            if (
+                (skip_all_refit or skip_expert_refit or skip_nonexpert_refit)
+                and self.rank == 0
+            ):
+                print(
+                    "KIMI policy-side refit stream filter: "
+                    f"yielded={yielded_params} skipped={skipped_params} "
+                    f"skip_all={skip_all_refit} skip_expert={skip_expert_refit} "
+                    f"skip_nonexpert={skip_nonexpert_refit}",
+                    flush=True,
+                )
             return
 
         # Append KV (and potentially Q) scale entries to match metadata.
@@ -1826,7 +2065,20 @@ class MegatronPolicyWorkerImpl(
             scale_tensor = torch.tensor(
                 scale_value, dtype=torch.float32, device="cuda"
             ).reshape(1)
+            yielded_params += 1
             yield param_name, scale_tensor
+
+        if (
+            (skip_all_refit or skip_expert_refit or skip_nonexpert_refit)
+            and self.rank == 0
+        ):
+            print(
+                "KIMI policy-side refit stream filter: "
+                f"yielded={yielded_params} skipped={skipped_params} "
+                f"skip_all={skip_all_refit} skip_expert={skip_expert_refit} "
+                f"skip_nonexpert={skip_nonexpert_refit}",
+                flush=True,
+            )
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
@@ -1847,6 +2099,7 @@ class MegatronPolicyWorkerImpl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            metadata_in_payload=self._ipc_refit_metadata_in_payload(),
         )
 
     @torch.no_grad()

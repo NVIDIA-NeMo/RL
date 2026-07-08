@@ -47,12 +47,30 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 
 logger = logging.getLogger(__name__)
 
+_KIMI_K25_ARCHITECTURES = {"KimiK25ForConditionalGeneration"}
+_KIMI_FLASHINFER_MLA_MAX_MODEL_LEN_MULTIPLE = 128
+
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
     if enable_prefix_caching is None:
         enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
     return enable_prefix_caching
+
+
+def _validate_kimi_mla_max_model_len(hf_config: Any, max_model_len: int) -> None:
+    """Fail early on Kimi lengths rejected by vLLM's FlashInfer MLA path."""
+    architectures = set(getattr(hf_config, "architectures", []) or [])
+    if not architectures.intersection(_KIMI_K25_ARCHITECTURES):
+        return
+
+    if max_model_len % _KIMI_FLASHINFER_MLA_MAX_MODEL_LEN_MULTIPLE != 0:
+        raise ValueError(
+            "Kimi K2.6 vLLM FlashInfer MLA requires "
+            f"policy.generation.vllm_cfg.max_model_len to be a multiple of "
+            f"{_KIMI_FLASHINFER_MLA_MAX_MODEL_LEN_MULTIPLE}; got {max_model_len}. "
+            "Round sequence caps up, e.g. 704 input + 512 output -> 1280."
+        )
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -349,6 +367,9 @@ class BaseVllmGenerationWorker:
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
         hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        _validate_kimi_mla_max_model_len(
+            hf_config, self.cfg["vllm_cfg"]["max_model_len"]
+        )
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
                 assert load_format == "dummy", (

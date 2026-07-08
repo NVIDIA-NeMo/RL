@@ -18,6 +18,9 @@ for model sizes under 70B at up to 32k sequence length.
 - **GLM**: GLM-4.7-Flash, GLM-5.1
 - **Llama**: Llama 3.1/3.3-8B, Llama 3.1/3.3-70B, Llama 3.2-1B
 - **Deepseek**: Deepseek-V3/R1-671B
+- **Kimi**: Kimi K2.6 (BF16 Megatron Core training with vLLM
+  dummy-load rollout and live refit; see the
+  [Kimi K2.6 guide](../guides/kimi-k2-6.md))
 - **Mistral**: Mistral-NeMo-12B
 - **Moonlight-16B-A3B**
 - **Gemma**: Gemma-3-1B/27B

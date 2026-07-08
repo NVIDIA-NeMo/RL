@@ -1966,6 +1966,7 @@ def refit_policy_generation(
     policy_generation: GenerationInterface,
     colocated_inference: bool,
     _refit_buffer_size_gb: Optional[float] = None,
+    _refit_buffer_memory_ratio: Optional[float] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
 ) -> None:
@@ -1976,6 +1977,9 @@ def refit_policy_generation(
         policy_generation: The inference engine to refit.
         _refit_buffer_size_gb: Fixed refit buffer size in GiB. If it is None,
             the buffer size is computed from remaining memory.
+        _refit_buffer_memory_ratio: Ratio of free memory to use when computing
+            a dynamic refit buffer size. If None, falls back to
+            NRL_REFIT_BUFFER_MEMORY_RATIO for backward compatibility.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
@@ -2016,7 +2020,9 @@ def refit_policy_generation(
             else:
                 # Empirically sets ratio as 30% to maximize efficiency.
                 # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
-                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
+                memory_ratio = _refit_buffer_memory_ratio
+                if memory_ratio is None:
+                    memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
                 buffer_size_bytes = int(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
@@ -2296,6 +2302,7 @@ def grpo_train(
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
+    refit_buffer_memory_ratio = master_config.policy.get("refit_buffer_memory_ratio")
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -2312,6 +2319,7 @@ def grpo_train(
                 policy_generation,
                 colocated_inference,
                 _refit_buffer_size_gb=refit_buffer_size_gb,
+                _refit_buffer_memory_ratio=refit_buffer_memory_ratio,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -2427,6 +2435,7 @@ def grpo_train(
                             policy_generation,
                             colocated_inference,
                             _refit_buffer_size_gb=refit_buffer_size_gb,
+                            _refit_buffer_memory_ratio=refit_buffer_memory_ratio,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
@@ -2878,6 +2887,7 @@ def grpo_train(
                             policy_generation,
                             colocated_inference,
                             _refit_buffer_size_gb=refit_buffer_size_gb,
+                            _refit_buffer_memory_ratio=refit_buffer_memory_ratio,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
