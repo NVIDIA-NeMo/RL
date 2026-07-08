@@ -87,6 +87,7 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
     save_checkpoint,
@@ -943,6 +944,7 @@ class DTensorPolicyWorkerImpl(
                                 total_norm=grad_norm,
                             )
                         grad_norm = torch.tensor([grad_norm])
+                        warn_if_inf_grad_norm(grad_norm)
 
                     # Update parameters
                     self.optimizer.step()
