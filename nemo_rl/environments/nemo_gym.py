@@ -14,7 +14,7 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -337,6 +337,8 @@ Depending on your data shape, you may want to change these values."""
 
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
+        prev_assistant_routed_experts: Optional[torch.Tensor] = None
+        prev_assistant_final_pos: Optional[int] = None
         batch_decode_items = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
@@ -383,6 +385,30 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                         f"routes={routed_experts.shape[0]}, expected_at_least="
                         f"{expected_tokens}."
                     )
+                # At most one surplus row is legal (the final-token route, when
+                # the backend returns it); anything beyond that means the row
+                # count comes from a different token sequence than reported and
+                # every route after the divergence would be misaligned.
+                if routed_experts.shape[0] > expected_tokens + 1:
+                    raise ValueError(
+                        "NeMo Gym returned too many routed_experts rows for a "
+                        "trainable output item: "
+                        f"routes={routed_experts.shape[0]}, "
+                        f"expected={expected_tokens} (+1 surplus final-token "
+                        "route allowed)."
+                    )
+                # Splice: vLLM never routes the final sampled token of a
+                # request, so the previous assistant turn's last route row is a
+                # placeholder — but this turn's prompt re-forwards that token,
+                # giving its real route at the same global position.
+                if (
+                    prev_assistant_routed_experts is not None
+                    and prev_assistant_final_pos is not None
+                    and prev_assistant_final_pos < routed_experts.shape[0]
+                ):
+                    prev_assistant_routed_experts[-1] = routed_experts[
+                        prev_assistant_final_pos
+                    ]
             elif self.cfg.get("require_routed_experts", False):
                 raise ValueError(
                     "policy.router_replay.enabled=true requires NeMo Gym output "
@@ -434,6 +460,8 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
             seen_token_ids.extend(new_prompt_token_ids)
             seen_token_ids.extend(generation_token_ids)
+            prev_assistant_routed_experts = assistant_message.get("routed_experts")
+            prev_assistant_final_pos = len(seen_token_ids) - 1
 
             # We pop to remove larger tensors from logging.
             batch_decode_items.append(
