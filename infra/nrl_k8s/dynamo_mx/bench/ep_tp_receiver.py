@@ -14,7 +14,7 @@ NOTE: EP>1 grouped-expert local->global remap is validated only at EP1 upstream;
 this harness is the first EP>1 exercise, so expect to iterate if experts collide.
 """
 from __future__ import annotations
-import os, socket, time
+import os, re, socket, time
 from collections import Counter
 import torch
 
@@ -26,8 +26,19 @@ from modelexpress.megatron_translator import (
 
 MODEL = os.environ.get("MODEL_ID", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 EP_SIZE = int(os.environ.get("EP_SIZE", "4"))
+NUM_EXPERTS = int(os.environ.get("NUM_EXPERTS", "128"))
+EXPERTS_PER_RANK = NUM_EXPERTS // EP_SIZE
 TARGET_TP = int(os.environ.get("TARGET_TP", "1"))
 TARGET_TP_RANK = int(os.environ.get("TARGET_TP_RANK", "0"))
+_EXP_RE = re.compile(r"(experts\.)(\d+)(\.)")
+
+
+def _globalize(hf_name: str, ep_rank: int) -> str:
+    """Offset the local expert index in an HF name to its global id:
+    experts.{L}. -> experts.{ep_rank*EXPERTS_PER_RANK + L}."""
+    def sub(m):
+        return f"{m.group(1)}{ep_rank * EXPERTS_PER_RANK + int(m.group(2))}{m.group(3)}"
+    return _EXP_RE.sub(sub, hf_name)
 GT_PATH = os.environ.get("GT_PATH", "/mnt/rl-workspace/kavink/phase-e-shape-2-qwen3-moe-groundtruth.pt")
 SHARD_AXIS_BY_ROLE = {"column": 0, "qkv_column": 0, "gated_mlp_column": 0,
                       "vocab_parallel": 0, "row": 1, "expert_column": 0,
@@ -113,50 +124,70 @@ def main() -> int:
     print(f"[rcv] PULL BALANCE (per EP source): {dict((k, round(v[0]/1e9,2)) for k,v in per_src.items())} GB", flush=True)
     print(f"[rcv] aggregate: {tot/1e9:.2f} GB in {dt_all:.2f}s = {tot*8/dt_all/1e9:.1f} Gbps", flush=True)
 
-    # ---- plan + assemble + translate ----
+    # ---- plan + assemble + translate, PER EP SOURCE (globalize expert ids) ----
+    # Each EP source names its local experts 0..31 (Megatron + HF) identically, so
+    # a single union would collide. Process each source with a name_map whose expert
+    # HF indices are offset to global (ep_rank*EXPERTS_PER_RANK + local), and
+    # accumulate. Non-expert tensors are replicated across sources -> dedupe by name.
     layout = TargetTpLayout(tp_size=TARGET_TP, tp_rank=TARGET_TP_RANK)
-    ctx = MegatronReceiverContext(target_tp_layout=layout, transformer_config=sidecar_cfg,
-                                  hf_name_map=name_map, receive_specs=receive_specs)
-
-    def _pull(src, dest):
-        # find the tensor in the owning source's scratch by matching plan name
-        for sid, bufs in scratch.items():
-            if src.mx_source_id == sid:
-                return  # scratch pre-filled; run_refit_cycle assembles from pre_assembled
-        return
-
-    print(f"[rcv] planning + translating (EP{EP_SIZE} -> TP{TARGET_TP}) ...", flush=True)
-    # flatten scratch into one pre-assembled buffer dict (name -> tensor from owning source)
-    pre = {}
-    for bufs in scratch.values():
-        for n, t in bufs.items():
-            pre.setdefault(n, t)
-    t0 = time.perf_counter()
     gt = None
     if TARGET_TP == 1 and os.path.exists(GT_PATH):
         gt = torch.load(GT_PATH, weights_only=False, mmap=True).get("hf_weights")
-    n_ok = n_seen = n_drift = 0
-    for hf_name, hf_t in run_refit_cycle(rcv, candidates=megatron_cands, context=ctx,
-                                         pull=lambda s, d: None, device=device,
-                                         pre_assembled_buffers=pre):
-        n_seen += 1
-        if gt is not None:
-            exp = gt.get(hf_name)
-            if exp is not None:
-                got = hf_t.detach().cpu()
-                e = exp.to(got.dtype) if got.dtype != exp.dtype else exp
-                if got.shape == e.shape and torch.equal(got, e):
-                    n_ok += 1
-                else:
-                    n_drift += 1
+
+    print(f"[rcv] planning + translating per EP source (EP{EP_SIZE} -> TP{TARGET_TP}) ...", flush=True)
+    hf_results: dict[str, torch.Tensor] = {}
+    t0 = time.perf_counter()
+    for c in megatron_cands:
+        ep = c.megatron_meta.ep_rank
+        specs_c: dict[str, ReceiveSpec] = {}
+        for td in (c.registry.get("tensors", []) if c.registry else []):
+            if not td.megatron_role:
+                continue
+            role = td.megatron_role
+            axis = SHARD_AXIS_BY_ROLE.get(role, int(td.shard_axis))
+            lk = td.name[len("module."):] if td.name.startswith("module.") else td.name
+            hfs = list(name_map.get(lk, [td.name]))
+            if role in ("expert_column", "expert_row"):
+                hfs = [_globalize(h, ep) for h in hfs]
+            specs_c[td.name] = ReceiveSpec(
+                megatron_name=td.name, hf_names=hfs, role=role,
+                target_shape=tuple(int(s) for s in td.global_shape),
+                target_dtype=td.dtype or "bfloat16", shard_axis=axis,
+                pp_rank=c.megatron_meta.pp_rank,
+                role_descriptor=dict(td.megatron_extras or {}),
+            )
+        nm_c = {mn: ([_globalize(h, ep) for h in hfs] if "experts" in mn else hfs)
+                for mn, hfs in name_map.items()}
+        ctx = MegatronReceiverContext(target_tp_layout=layout, transformer_config=sidecar_cfg,
+                                      hf_name_map=nm_c, receive_specs=specs_c)
+        pre = dict(scratch[c.ref.mx_source_id])
+        n_c = 0
+        for hf_name, hf_t in run_refit_cycle(rcv, candidates=[c], context=ctx,
+                                             pull=lambda s, d: None, device=device,
+                                             pre_assembled_buffers=pre):
+            if hf_name not in hf_results:
+                hf_results[hf_name] = hf_t.detach().cpu()
+                n_c += 1
+        print(f"  ep{ep}: +{n_c} new HF tensors (total {len(hf_results)})", flush=True)
     dt = time.perf_counter() - t0
-    print(f"[rcv] refit cycle: {n_seen} HF tensors in {dt:.2f}s", flush=True)
+    print(f"[rcv] refit (per-source) produced {len(hf_results)} HF tensors in {dt:.2f}s", flush=True)
+
     if gt is not None:
-        print(f"[rcv] byte-identity: {n_ok} ok / {n_drift} drift / {len(gt)} GT", flush=True)
+        n_ok = n_drift = n_missing = 0
+        for hf_name, exp in gt.items():
+            got = hf_results.get(hf_name)
+            if got is None:
+                n_missing += 1; continue
+            e = exp.to(got.dtype) if got.dtype != exp.dtype else exp
+            if got.shape == e.shape and torch.equal(got, e):
+                n_ok += 1
+            else:
+                n_drift += 1
+        print(f"[rcv] byte-identity: {n_ok} ok / {n_drift} drift / {n_missing} missing / {len(gt)} GT", flush=True)
         print("RESULT:", "PASS - EP->TP1 refit byte-identical" if n_ok == len(gt)
-              else f"PARTIAL - {n_ok}/{len(gt)} (EP expert remap likely needs work)", flush=True)
+              else f"PARTIAL - {n_ok}/{len(gt)}", flush=True)
     else:
-        print(f"RESULT: EP{EP_SIZE}->TP{TARGET_TP} refit produced {n_seen} HF tensors (no GT compare)", flush=True)
+        print(f"RESULT: EP{EP_SIZE}->TP{TARGET_TP} produced {len(hf_results)} HF tensors", flush=True)
     return 0
 
 
