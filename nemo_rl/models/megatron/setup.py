@@ -1216,14 +1216,9 @@ def setup_model_and_optimizer(
     # Must be called before initialize_megatron (before CUDA init) so the
     # persistent async-checkpoint worker subprocess is spawned in a clean process.
     # Bridge hardcodes mp_mode='spawn', the only safe option inside Ray actors
-    # (fork with Ray is an anti-pattern). Guard for older megatron-core that
-    # lacks this hook.
-    _init_async_ckpt_worker = getattr(state, "initialize_async_checkpoint_worker", None)
-    if _init_async_ckpt_worker is not None:
-        try:
-            _init_async_ckpt_worker()
-        except AttributeError:
-            pass
+    # (fork with Ray is an anti-pattern). This is a no-op unless async_save is
+    # enabled (see GlobalState.initialize_async_checkpoint_worker).
+    state.initialize_async_checkpoint_worker()
 
     megatron_cfg.dist.external_gpu_device_mapping = True
     initialize_megatron(

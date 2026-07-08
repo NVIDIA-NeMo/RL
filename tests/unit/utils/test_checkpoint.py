@@ -14,6 +14,7 @@
 import json
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -805,3 +806,152 @@ class TestDeletionSerialization:
         remaining = sorted(checkpoint_dir.glob("step_*"))
         assert len(remaining) == 1
         assert remaining[0].name == "step_2"
+
+
+class TestDeleteFailureVisibility:
+    """Old-checkpoint deletion failures must be surfaced, not silently swallowed."""
+
+    def test_warn_on_delete_failure_emits_warning(self):
+        import warnings
+
+        fut: Future = Future()
+        fut.set_exception(RuntimeError("rmtree boom"))
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            CheckpointManager._warn_on_delete_failure(fut)
+
+        assert any("prune old checkpoints" in str(w.message) for w in caught)
+        assert any("rmtree boom" in str(w.message) for w in caught)
+
+    def test_warn_on_delete_failure_silent_on_success(self):
+        import warnings
+
+        fut: Future = Future()
+        fut.set_result(None)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            CheckpointManager._warn_on_delete_failure(fut)
+
+        assert len(caught) == 0
+
+    def test_failing_prune_does_not_break_finalization(
+        self, async_checkpoint_config, checkpoint_dir, monkeypatch
+    ):
+        """A raising remove_old_checkpoints does not corrupt the finalized rename."""
+        manager = CheckpointManager(async_checkpoint_config)
+
+        def boom():
+            raise RuntimeError("simulated prune failure")
+
+        monkeypatch.setattr(manager, "remove_old_checkpoints", boom)
+
+        tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+        manager.begin_finalization(tmp, wait_fn=None)
+        # Rename must still succeed even though the background prune raises.
+        manager.finalize_pending()
+        manager.shutdown()
+
+        assert (checkpoint_dir / "step_1").exists()
+        assert not Path(tmp).exists()
+
+
+class TestContextManager:
+    """Tests for CheckpointManager as a context manager.
+
+    The owner of the checkpointer uses ``with checkpointer:`` to guarantee that
+    background async-finalization threads are flushed when leaving the block,
+    including on early return or exception.
+    """
+
+    def test_flushes_pending_on_normal_exit(
+        self, async_checkpoint_config, checkpoint_dir
+    ):
+        """A pending begin_finalization is flushed when the with-block exits."""
+        with CheckpointManager(async_checkpoint_config) as manager:
+            tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+            manager.begin_finalization(tmp, wait_fn=None)
+            # Not yet flushed inside the block.
+            assert manager.has_pending_finalization
+
+        assert (checkpoint_dir / "step_1").exists()
+        assert not Path(tmp).exists()
+
+    def test_flushes_pending_on_exception_without_masking(
+        self, async_checkpoint_config, checkpoint_dir
+    ):
+        """On exception, the checkpoint is still flushed and the error propagates."""
+        manager = CheckpointManager(async_checkpoint_config)
+        with pytest.raises(ValueError, match="training blew up"):
+            with manager:
+                tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+                manager.begin_finalization(tmp, wait_fn=None)
+                raise ValueError("training blew up")
+
+        # The successful checkpoint's rename completed despite the exception.
+        assert (checkpoint_dir / "step_1").exists()
+
+    def test_exit_does_not_mask_training_exception_on_finalize_error(
+        self, async_checkpoint_config
+    ):
+        """If flushing fails while an exception propagates, the original is kept."""
+        manager = CheckpointManager(async_checkpoint_config)
+
+        def failing_wait():
+            raise ValueError("async write failed")
+
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="training blew up"):
+                with manager:
+                    tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+                    manager.begin_finalization(tmp, wait_fn=failing_wait)
+                    raise ValueError("training blew up")
+
+        # The finalization failure is surfaced as a warning, not raised.
+        assert any("finalization failed" in str(w.message).lower() for w in caught)
+
+    def test_exit_propagates_finalize_error_on_normal_exit(
+        self, async_checkpoint_config
+    ):
+        """On a clean exit, a finalization failure is raised (not silently dropped)."""
+        manager = CheckpointManager(async_checkpoint_config)
+
+        def failing_wait():
+            raise ValueError("async write failed")
+
+        with pytest.raises(
+            RuntimeError, match="Background checkpoint finalization failed"
+        ):
+            with manager:
+                tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
+                manager.begin_finalization(tmp, wait_fn=failing_wait)
+
+
+class TestRenameCheckpointSwap:
+    """Tests for _rename_checkpoint when the target step dir already exists."""
+
+    def test_swaps_when_target_exists(self, checkpoint_manager, checkpoint_dir):
+        """A pre-existing step_N is atomically replaced by the new tmp_step_N."""
+        # First finalized checkpoint at step 1.
+        tmp1 = checkpoint_manager.init_tmp_checkpoint(1, {"loss": 0.5})
+        checkpoint_manager.finalize_checkpoint(tmp1)
+        step_dir = checkpoint_dir / "step_1"
+        assert step_dir.exists()
+        # Marker file to prove the directory contents were replaced, not merged.
+        (step_dir / "stale_marker").write_text("old")
+
+        # Re-initialize step 1 (e.g. resuming) and finalize again.
+        tmp2 = checkpoint_manager.init_tmp_checkpoint(1, {"loss": 0.2})
+        checkpoint_manager.finalize_checkpoint(tmp2)
+
+        assert step_dir.exists()
+        assert not Path(tmp2).exists()
+        # The old contents were removed by the swap (no leftover old_step_1).
+        assert not (checkpoint_dir / "old_step_1").exists()
+        assert not (step_dir / "stale_marker").exists()
+        with open(step_dir / "training_info.json") as f:
+            assert json.load(f)["loss"] == 0.2

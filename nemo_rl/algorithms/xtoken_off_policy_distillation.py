@@ -779,7 +779,10 @@ def xtoken_off_policy_distillation_train(
                             dataloader.state_dict(),
                             os.path.join(ckpt_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(ckpt_path)
+                        checkpointer.begin_finalization(
+                            ckpt_path,
+                            wait_fn=student_policy.finalize_async_save,
+                        )
 
             # ===== Logging =====
             timing_metrics: dict[str, float] = timer.get_timing_metrics(

@@ -24,7 +24,7 @@ import re
 import shutil
 import threading
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import (
     Any,
@@ -306,7 +306,13 @@ class CheckpointManager:
                 if wait_fn is not None:
                     wait_fn()
                 self._rename_checkpoint(checkpoint_path)
-                self._delete_executor.submit(self.remove_old_checkpoints)
+                # Prune old checkpoints off the critical path. Surface any
+                # failure via a done-callback so a broken delete is not silently
+                # swallowed (the discarded Future would otherwise hide it).
+                delete_future = self._delete_executor.submit(
+                    self.remove_old_checkpoints
+                )
+                delete_future.add_done_callback(self._warn_on_delete_failure)
             except Exception as e:
                 self._finalize_error = e
             finally:
@@ -337,6 +343,46 @@ class CheckpointManager:
         self.finalize_pending()
         self._delete_executor.shutdown(wait=True)
         self._delete_executor = ThreadPoolExecutor(max_workers=1)
+
+    @staticmethod
+    def _warn_on_delete_failure(future: "Future[None]") -> None:
+        """Surface background old-checkpoint deletion errors as warnings.
+
+        Deletion is best-effort cleanup that runs off the critical path, so a
+        failure should not abort training — but it must not be silent either.
+        """
+        exc = future.exception()
+        if exc is not None:
+            warnings.warn(
+                f"Failed to prune old checkpoints in the background: {exc!r}. "
+                "Training is unaffected, but stale checkpoints may remain on disk.",
+                stacklevel=2,
+            )
+
+    def __enter__(self) -> "CheckpointManager":
+        """Enter a context that guarantees shutdown() flushes on exit."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Literal[False]:
+        """Flush pending finalizations when leaving the context.
+
+        If an exception is already propagating out of the ``with`` block, the
+        flush is best-effort and never masks the original exception. On a normal
+        exit, finalization errors propagate so a failed final checkpoint is not
+        silently dropped. Always returns ``False`` so exceptions are re-raised.
+        """
+        if exc_type is not None:
+            try:
+                self.shutdown()
+            except Exception:
+                warnings.warn(
+                    "Checkpoint finalization failed while handling an exception; "
+                    "the original exception will be re-raised.",
+                    stacklevel=2,
+                )
+            return False
+        self.shutdown()
+        return False
 
     @property
     def has_pending_finalization(self) -> bool:
