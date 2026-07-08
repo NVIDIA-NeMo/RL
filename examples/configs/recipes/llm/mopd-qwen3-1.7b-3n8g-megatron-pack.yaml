@@ -93,6 +93,8 @@ data:
     processor: nemo_gym_data_processor
 env:
   should_use_nemo_gym: true
+  should_log_nemo_gym_responses_to_wandb: false
+  should_log_nemo_gym_responses_to_file: true
   nemo_gym:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml

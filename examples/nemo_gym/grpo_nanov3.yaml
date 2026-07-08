@@ -300,6 +300,8 @@ data:
 
 env:
   should_use_nemo_gym: true
+  should_log_nemo_gym_responses_to_wandb: false
+  should_log_nemo_gym_responses_to_file: true
   nemo_gym:
     # Port range for Gym HTTP servers, kept below the OS ephemeral range
     # (32768-60999) and non-overlapping with NeMo RL (11001-15000) or

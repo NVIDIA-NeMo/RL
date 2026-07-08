@@ -1840,13 +1840,12 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     return should_use_nemo_gym
 
 
-def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
-    env_config = master_config.env
-    should_log_nemo_gym_responses = bool(
-        env_config.get("should_log_nemo_gym_responses")
-    )
+def _should_log_nemo_gym_responses_to_wandb(master_config: MasterConfig) -> bool:
+    return bool(master_config.env.get("should_log_nemo_gym_responses_to_wandb"))
 
-    return should_log_nemo_gym_responses
+
+def _should_log_nemo_gym_responses_to_file(master_config: MasterConfig) -> bool:
+    return bool(master_config.env.get("should_log_nemo_gym_responses_to_file"))
 
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
@@ -2477,7 +2476,7 @@ def grpo_train(
                         del nemo_gym_rollout_result
 
                         # NeMo Gym responses can be very large and expensive to log. Here we have logic to opt-in to logging.
-                        if not _should_log_nemo_gym_responses(master_config):
+                        if not _should_log_nemo_gym_responses_to_wandb(master_config):
                             for key in list(rollout_metrics):
                                 if "full_result" in key:
                                     rollout_metrics.pop(key)
@@ -3082,7 +3081,7 @@ def grpo_train(
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
-            if not _should_log_nemo_gym_responses(master_config):
+            if _should_log_nemo_gym_responses_to_file(master_config):
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
@@ -3844,6 +3843,10 @@ def async_grpo_train(
                         for k, v in t["rollout_metrics"].items():
                             per_group_metrics.setdefault(k, []).append(v)
                     rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
+                    if not _should_log_nemo_gym_responses_to_wandb(master_config):
+                        for key in list(rollout_metrics):
+                            if "full_result" in key:
+                                rollout_metrics.pop(key)
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
@@ -4337,9 +4340,10 @@ def async_grpo_train(
             log_data["advantages"] = train_data["advantages"].tolist()
             log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
             log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
+            if _should_log_nemo_gym_responses_to_file(master_config):
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
             del train_data
             del flat_messages_content
 
