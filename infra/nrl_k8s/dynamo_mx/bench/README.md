@@ -44,3 +44,21 @@ NS=<namespace> FRONTEND=http://<dgd-frontend>:<port> \
 Reference numbers (GB200, preliminary): transport NCCL ~375 Gbps single-rail vs
 MX ~316 / ~506–529 (4-rail) / ~1.4 Tbps (intra-node NVLink); 30B registration
 11.9s→0.16s (arena); MDL load 2.15s→0.55s; end-to-end refit ~6s→~1.5s.
+
+## First-party single-purpose harnesses (2026-07-08, GB200, real Qwen3-30B-A3B)
+
+Each runs inside a vLLM+MX pod (or a pair of RDMA pods); results verified on GB200.
+
+| Harness | What it measures | Verified result |
+|---|---|---|
+| `mdl_correctness.py <model>` | corrupt→warm-reload→generate on a live vLLM engine | 4B + 30B MoE byte-identical (18,432 expert writes) |
+| `ep_live_test.py <EP>` | live EP engine: placement parity + refit correctness | EP=4 placement matches `compute_local_expert_ids`; byte-identical |
+| `wire_bench.py {publisher\|receiver}` | cross-host NIXL transport (2 RDMA pods, diff nodes) | full 61 GB in 0.54s ≈ 900 Gbps; `EP_SIZE=8` → 10.33 GB in 0.17s |
+| `elastic_bench.py {publisher\|receiver}` | decoupled/elastic/straggler timelines (N receivers) | each worker independent ~850–940 Gbps; 20s-late worker unaffected |
+| `reg_bench.py {pertensor\|arena}` | buffer registration cost | per-tensor 0.90s → arena 0.016s (~56×) |
+| `fp8_h1_test.py <fp8-model>` | fp8 warm-path (H1) diagnosis | fp8 `load_weights` not re-entrant; loaderless maps 84%; scales/DeltaNet open |
+
+The 2-pod / N-pod RDMA manifests use the workers' network annotations
+(`networking.gke.io/interfaces` for rdma-0..3, `infiniband` hostPath, `IPC_LOCK`,
+`MX_RDMA_NIC_PIN=stripe`, GPUDirect UCX env) with pod anti-affinity to force
+cross-host placement. Generate them per-run from a worker's spec.
