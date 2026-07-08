@@ -112,22 +112,7 @@ def get_score_from_vllm(samp, resp1, resp2):
     try:
         completion = client.chat.completions.create(
           model="model",
-          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response_1=resp1, response_2=resp2)}],
-          temperature=args.temperature,
-          top_p=args.top_p,
-          max_tokens=args.max_tokens,
-          #extra_body={"top_k": 20},
-          extra_body={"chat_template_kwargs": {"enable_thinking": True}},
-          stream=False
-        )
-        
-        thought = completion.choices[0].message.content
-        if thought is None:
-            return -127, None
-        
-        completion = client.chat.completions.create(
-          model="model",
-          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response_1=resp1, response_2=resp2)}] + [{"role": "assistant", "content": thought}] + [{"role": "user", "content": SCORE_PROMPT}],
+          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response_1=resp1, response_2=resp2)}] + [{"role": "user", "content": SCORE_PROMPT}],
           temperature=1.0,
           top_p=1.0,
           max_tokens=1,
@@ -156,29 +141,26 @@ def get_score_from_vllm(samp, resp1, resp2):
                 print(possible_tokens.token, math.exp(possible_tokens.logprob))
             print("##################")
         
-        return score, thought
+        return score
     except Exception as e:
         print("ERROR calling vllm: ", e, flush=True)
-        return -255, None
+        return -255
 
 
 def benchmark_single(samp, idx):
     response_1 = samp["response1"]
     response_2 = samp["response2"]
     
-    bt_prob, thought = get_score_from_vllm(samp, response_1, response_2)
-    json_return = get_json_response(thought)
-    if not isinstance(json_return, dict):
-        json_return = {'response_1_analysis': None, 'response_2_analysis': None, 'score_1': None, 'score_2': None, 'ranking': None}
+    bt_prob = get_score_from_vllm(samp, response_1, response_2)
         
     payload = {}
     payload['idx'] = idx
-    payload['response_1_analysis'] = json_return.get('response_1_analysis', None)
-    payload['response_2_analysis'] = json_return.get('response_2_analysis', None)
+    payload['response_1_analysis'] = None
+    payload['response_2_analysis'] = None
     payload['metadata'] = copy.deepcopy(samp)
-    payload['score_1'] = json_return.get('score_1', None)
-    payload['score_2'] = json_return.get('score_2', None)
-    payload['ranking'] = json_return.get('ranking', None)
+    payload['score_1'] = None
+    payload['score_2'] = None
+    payload['ranking'] = None
     payload['bt_prob'] = bt_prob
     
     return payload

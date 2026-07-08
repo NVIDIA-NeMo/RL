@@ -7,6 +7,7 @@ Created on Wed Apr 22 18:49:53 2026
 
 import argparse
 import concurrent.futures
+import threading
 import copy
 #import functools
 #import itertools
@@ -75,6 +76,9 @@ Analyze step by step following the evaluation plan, then provide your judgment a
     "ranking": <1-6>
 }}
 ```"""
+
+shared_data = {}
+master_lock = threading.Lock()
 
 
 def flatten_to_single_turn(message_log):
@@ -152,10 +156,32 @@ def benchmark_single_pos_bias(samp, idx):
     response_1 = samp["response1"]
     response_2 = samp["response2"]
     
-    thought1 = get_score_from_vllm(samp, response_1, response_2)
-    thought2 = get_score_from_vllm(samp, response_2, response_1)
-    json_return1 = get_json_response(thought1)
-    json_return2 = get_json_response(thought2)
+    samp_key = flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context']
+    with master_lock:
+        if (samp_key, response_1, response_2) in shared_data:
+            json_return1 = shared_data[(samp_key, response_1, response_2)]
+        else:
+            json_return1 = None
+    
+    if json_return1 is None:
+        thought1 = get_score_from_vllm(samp, response_1, response_2)
+        json_return1 = get_json_response(thought1)
+        
+        with master_lock:
+            shared_data[(samp_key, response_1, response_2)] = json_return1
+        
+    with master_lock:
+        if (samp_key, response_2, response_1) in shared_data:
+            json_return2 = shared_data[(samp_key, response_2, response_1)]
+        else:
+            json_return2 = None
+    
+    if json_return2 is None:
+        thought2 = get_score_from_vllm(samp, response_2, response_1)
+        json_return2 = get_json_response(thought2)
+        
+        with master_lock:
+            shared_data[(samp_key, response_2, response_1)] = json_return2
     
     if isinstance(json_return1, dict) and isinstance(json_return2, dict):
         json_return = {'response_1_analysis': json_return1['response_1_analysis'], 'response_2_analysis': json_return1['response_2_analysis'], 'score_1': 0.5 * (json_return1['score_1'] + json_return2['score_2']), 'score_2': 0.5 * (json_return1['score_2'] + json_return2['score_1']), 'ranking': 0.5 * (json_return1['ranking'] + (7 - json_return2['ranking']))}
@@ -276,10 +302,10 @@ if __name__ == "__main__":
     dataset_remaining = [(idx,x) for idx,x in enumerate(test_dataset) if idx not in existing_ids]
     
     #model_responses = []
-    with open(output_file_tmp, "a", encoding="utf_8", newline="\n", buffering=1) as fw:
+    with open(output_file_tmp, "a", encoding="utf_8", newline="\n", buffering=1, errors='replace') as fw:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
             # Submit all tasks to the executor and get Future objects
-            future_to_prompt = [executor.submit(benchmark_single_pos_bias, x, idx) for idx,x in dataset_remaining]
+            future_to_prompt = [executor.submit(benchmark_single, x, idx) for idx,x in dataset_remaining]
     
             # Iterate over completed futures as they finish
             for future in tqdm(concurrent.futures.as_completed(future_to_prompt), total=len(future_to_prompt)):

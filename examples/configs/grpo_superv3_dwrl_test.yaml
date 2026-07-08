@@ -1,12 +1,22 @@
-# GRPO Algorithm Configuration for GenRM DWRL
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo"
+  metric_name: "val:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 10
+  checkpoint_must_save_by: "00:03:30:00"
+  model_save_format: "safetensors"
+  save_consolidated: false
+
 grpo:
-  num_prompts_per_step: 8
-  num_generations_per_prompt: 4
-  num_val_generations_per_prompt: 1   # must be one for DWRL to work correctly
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  num_val_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 1
   max_num_steps: 1000000
-  normalize_rewards: false
+  normalize_rewards: true
   use_leave_one_out_baseline: true
   # Clipping bounds for normalized advantages to prevent extreme values from small std
   # Set to null to disable clipping (default), or e.g. -100/100 to clip
@@ -17,16 +27,16 @@ grpo:
   val_at_end: false
   overlong_filtering: false
   max_val_samples: null
-  val_batch_size: 32
+  val_batch_size: 256
   seed: 42
 
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
 
-  penalize_invalid_tool_call: false
+  penalize_invalid_tool_call: true
   invalid_tool_call_advantage: -5.0
-  penalize_malformed_thinking: false
+  penalize_malformed_thinking: true
   malformed_thinking_advantage: -5.0
 
   reward_shaping:
@@ -48,11 +58,6 @@ grpo:
     in_flight_weight_updates: false
     recompute_kv_cache_after_weight_updates: false
 
-  dwrl:
-    bt_prompt: "Based on your evaluation, which response is better? Answer with only a single character: 1 or 2"
-    score_token: "1"
-    opposite_token: "2"
-
   use_best_at_k: false
   best_at_k_k: 8
   best_at_k_m: 1000
@@ -67,7 +72,7 @@ grpo:
   seq_logprob_error_threshold: 2
 
 loss_fn:
-  reference_policy_kl_penalty: 0.0  # for DWRL this should always be 0
+  reference_policy_kl_penalty: 0.0
   reference_policy_kl_type: "k3"
   kl_input_clamp_value: null
   kl_output_clamp_value: null
@@ -75,8 +80,8 @@ loss_fn:
   ratio_clip_min: 0.2
   ratio_clip_max: 0.28
   ratio_clip_c: null
-  use_on_policy_kl_approximation: false
-  use_importance_sampling_correction: false
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: null
   truncated_importance_sampling_ratio_min: null
   truncated_importance_sampling_type: tis
@@ -84,33 +89,20 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false
   use_kl_in_reward: false
-  ce_penalty: 0.001
-  bt_alpha: 1.0
-
-checkpointing:
-  enabled: true
-  checkpoint_dir: "results/grpo_genrm_dwrl"
-  metric_name: "val:accuracy"
-  higher_is_better: true
-  keep_top_k: 10000
-  save_period: 10
-  checkpoint_must_save_by: "00:03:30:00"
-  model_save_format: "safetensors"
-  save_consolidated: false
 
 policy:
-  model_name: "Qwen/Qwen3-1.7B"  # Use base model, not instruct version
+  model_name: ???
   tokenizer:
     name: ${policy.model_name}
     chat_template_kwargs: null
   hf_config_overrides: {}
-  train_global_batch_size: 256
+  train_global_batch_size: 2048
   train_micro_batch_size: 1
-  generation_batch_size: 32
-  logprob_batch_size: 4
-  max_total_sequence_length: 8192
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
   precision: "bfloat16"
-  logprob_chunk_size: null
+  logprob_chunk_size: 2048
   offload_optimizer_for_logprob: false
 
   dtensor_cfg:
@@ -118,11 +110,11 @@ policy:
     enabled: true
     cpu_offload: false
     sequence_parallel: false
-    activation_checkpointing: false
+    activation_checkpointing: true
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
-  
+
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1
@@ -158,7 +150,7 @@ policy:
 
     mtp_loss_scaling_factor: 0.0
     mtp_use_repeated_layer: true
-    mtp_num_layers: null
+    mtp_num_layers: 0
     mtp_detach_heads: true
 
     optimizer:
@@ -209,8 +201,6 @@ policy:
 
     env_vars: null
 
-  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
-  # for more details on dynamic batching and sequence packing.
   dynamic_batching:
     enabled: False
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
@@ -218,15 +208,13 @@ policy:
     sequence_length_round: 64
 
   sequence_packing:
-    enabled: False
+    enabled: True
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
-  # makes the training sequence length divisible by the tensor parallel size
-  # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -267,87 +255,127 @@ policy:
       async_engine: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
-      tensor_parallel_size: 1
+      tensor_parallel_size: 4
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.5
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: False
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
-      enable_vllm_metrics_logger: false
+      enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
-      expose_http_server: false
+      expose_http_server: true
       http_server_serving_chat_kwargs:
-        enable_auto_tools: false
+        enable_auto_tools: true
         tool_parser: qwen3_coder
         reasoning_parser: nano_v3
-        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
+        reasoning_parser_plugin: /lustre/fsw/portfolios/llmservice/users/degert/code/NeMo-RL-super-v3-dwrl/nemo_rl/utils/nano_v3_reasoning_parser.py
+
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
-
+# compilation_config:
+# mode: 0
     colocated:
-      # true: generation shares training GPUs
-      # false: uses dedicated generation resources
       enabled: true
-      # only relevant when enabled is false
       resources:
-        gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
-        num_nodes: null # Decides number of nodes to be dedicated to generation
+        gpus_per_node: null
+        num_nodes: null
 
-# Data configuration
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: null  # Optional prompt template file
-  system_prompt_file: null  # Optional system prompt file
-  shuffle: true
+  max_input_seq_length: null
+  shuffle: false
   num_workers: 1
-  dataset_name: "genrm_dwrl"
-  train_data_path: "path/to/your/train.jsonl"  # Update with your data path
-  val_data_path: "path/to/your/val.jsonl"      # Optional validation data path
+  train:
+    data_path: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/data/nano-v3-posttraining-data/curriculum_v7_acrid-teal_main_rename.train.jsonl"
+  validation:
+    data_path: "/lustre/fsw/portfolios/llmservice/projects/llmservice_nemotron_nano/users/pjin/data/nano-v3-posttraining-data/curriculum_v7_acrid-teal_main_rename.val.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
 
 env:
-  should_use_nemo_gym: false
-  use_genrm_compare: false
+  should_use_nemo_gym: true
+  use_genrm_compare: true
   genrm_agent_names:
     - "genrm_simple_agent"
     - "genrm_simple_agent_reasoning_off"
-  genrm_compare_server_name: "genrm_compare"
-  genrm_dwrl:
-    num_workers: 8
-    score_weight: 1.0
-    ranking_weight: 1.0
-    use_binary_reward: false
+  genrm_compare_server_name: "dwrl_pairwise_compare_resources_server"
+  nemo_gym:
+    num_gpu_nodes: 1
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+    invalid_tool_call_patterns:
+      - "<tool_call>"
+      - "</tool_call>"
+      - "<function_call>"
+      - "</function_call>"
+    thinking_tags:
+      - "<think>"
+      - "</think>"
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/dwrl_genrm_compare_pairwise/configs/dwrl_genrm_compare_pairwise.yaml
 
-# Logger configuration
+    dwrl_pairwise_compare_resources_server:
+      resources_servers:
+        dwrl_genrm_compare_pairwise:
+          # Points to the GenRM model server defined above
+          genrm_model_server:
+            type: responses_api_models
+            name: dwrl_model
+          # GenRM request parameters
+          genrm_responses_create_params:
+            max_tokens: 16384
+            temperature: 1.0
+            top_p: 0.95
+          # Comparison settings
+          comparison_strategy: "circular"
+          num_judges_per_comparison: 1
+          use_principle: false
+          default_principle: "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt."
+          aggregator_method: "simple_tiebreaker"
+          reasoning_bonus: 0.0
+          answer_bonus: 0.0
+          top_percentile: 0.2
+          group_reasoning_length_penalty_coeff: 0.0
+          group_answer_length_penalty_coeff: 0.0
+          #group_style_penalty_coeff: 0.1
+          default_score: 3.0
+          default_ranking: 3.5
+
 logger:
-  log_dir: "logs"  # Base directory for all logs
-  num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  log_dir: "logs"
+  num_val_samples_to_print: 0
   wandb_enabled: false
   tensorboard_enabled: false
-  mlflow_enabled: false  # Disable MLflow logging
-  monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
+  mlflow_enabled: false
+  monitor_gpus: true
   swanlab_enabled: false
   wandb:
-    project: "grpo-genrm-dwrl"
-    name: "grpo-genrm-dwrl-logger"
+    project: "grpo-dev"
+    name: "grpo-dev-logger"
   tensorboard: {}
   mlflow:
-    experiment_name: "grpo-genrm-dwrl"
-    run_name: "grpo-genrm-dwrl-logger"
+    experiment_name: "grpo-dev"
+    run_name: "grpo-dev-logger"
   gpu_monitoring:
-    collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
-    flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
+    collection_interval: 10
+    flush_interval: 10
 
 cluster:
   gpus_per_node: 8
   num_nodes: 1
 
 # uncomment to enable effort level training
-#effort_levels:
-#  low_string: "{reasoning effort: low}"
-#  low_weight: 0.1
-#  low_penalty: 1
-#  low_ub: 3000
+effort_levels:
+  low_string: "{reasoning effort: low}"
+  low_weight: 0.1
+  low_penalty: 1
+  low_ub: 3000

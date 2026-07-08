@@ -153,8 +153,12 @@ args = parser.parse_args()
 final_accuracies = calculate_step_accuracies(args.path, args.dataset)
 
 if final_accuracies:
+    for_mean = []
     print("Accuracy for each step:")
     for step, acc in final_accuracies.items():
+        for_mean.append(acc)
         print(f"  Step {step}: {acc:.2%}")
+    print("\n  Overall mean: ", round(sum(for_mean) / len(for_mean), 3), flush=True)
+    print("  Overall max: ", round(max(for_mean), 3), flush=True)
 else:
     print("No matching files or data were found in the specified directory.")

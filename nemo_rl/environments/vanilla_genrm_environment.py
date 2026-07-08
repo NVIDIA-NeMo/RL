@@ -180,6 +180,15 @@ class VanillaGenRMWorker:
 
         total_l1_distance = 0.0
         num_components = 0
+        
+        if config.get("use_binary_reward", False):
+            if gt_ranking is not None and extracted["ranking"] is not None:
+                gt_pref = 0 if gt_ranking <= 3 else 1
+                pred_pref = 0 if extracted["ranking"] <= 3 else 1
+                
+                return float(gt_pref == pred_pref)
+            else:
+                return -100.0
 
         # Individual score accuracy using L1 distance
         if gt_score_1 is not None and extracted["score_1"] is not None:
@@ -226,6 +235,7 @@ class VanillaGenRMEnvironment(EnvironmentInterface):
         self.cfg.setdefault("score_weight", 1.0)
         self.cfg.setdefault("ranking_weight", 1.0)
         self.cfg.setdefault("reasoning_split_word", "</think>")
+        self.cfg.setdefault("use_binary_reward", False)
 
         # Create worker pool
         self.workers = [

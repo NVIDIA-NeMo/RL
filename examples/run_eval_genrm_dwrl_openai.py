@@ -272,7 +272,7 @@ if __name__ == "__main__":
     dataset_remaining = [(idx,x) for idx,x in enumerate(test_dataset) if idx not in existing_ids]
     
     #model_responses = []
-    with open(output_file_tmp, "a", encoding="utf_8", newline="\n", buffering=1) as fw:
+    with open(output_file_tmp, "a", encoding="utf_8", newline="\n", buffering=1, errors='replace') as fw:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
             # Submit all tasks to the executor and get Future objects
             future_to_prompt = [executor.submit(benchmark_single, x, idx) for idx,x in dataset_remaining]

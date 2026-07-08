@@ -1855,6 +1855,267 @@ class DWRLPairwiseLossFn(LossFunction):
         )
 
 
+class DWRLPairwiseBTOnlyLossFn(LossFunction):
+    """Generalized Clipped Policy Gradient loss function w/ KL regularization.
+
+    This implements:
+
+    - PPO (Clipped) - https://arxiv.org/abs/1707.06347
+    - GRPO - https://arxiv.org/abs/2402.03300
+    - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
+    - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
+    - Truly on-policy (set force_on_policy_ratio = True to force ratio = 1.0, requires one update per rollout)
+
+    Formula:
+    L(θ) = E_t [ min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t) ] - β * KL(π_θ || π_ref)
+
+    where:
+    - r_t(θ) = π_θ(a_t|s_t) / π_θ_old(a_t|s_t) is the probability ratio
+    - A_t is the advantage estimate
+    - ε is the clip parameter (ratio_clip_min/ratio_clip_max)
+        - As proposed in the DAPO paper (https://arxiv.org/pdf/2503.14476),
+          we allow setting a distinct minimum and maximum value for the clip parameter (set to the same value for PPO/GRPO/etc.)
+            - ratio_clip_min: minimum value for the clip parameter
+            - ratio_clip_max: maximum value for the clip parameter
+    - β is the KL penalty coefficient (reference_policy_kl_penalty)
+    - KL(π_θ || π_ref) is the KL divergence between the current policy and reference policy (Schulman Approx.)
+
+    For REINFORCE/RLOO (when disable_ppo_ratio=True), the formula simplifies to:
+    L(θ) = E_t [ π_θ(a_t|s_t) * A_t ] - β * KL(π_θ || π_ref)
+
+    Also supports "Dual-Clipping" from https://arxiv.org/pdf/1912.09729, which
+    imposes an additional upper bound on the probability ratio when advantages are negative.
+    This prevents excessive policy updates. $rA << 0$ -> $cA$(clipped)
+    The loss function is modified to the following when A_t < 0:
+    L(θ) = E_t [ max(min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t), c * A_t) ] - β * KL(π_θ || π_ref)
+
+    where:
+    - c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is
+      usually set as 3 empirically.
+
+    Due to potential numerical instability, we cast the logits to float32 before computing the loss.
+    """
+
+    def __init__(self, cfg: ClippedPGLossConfig):
+        self.ratio_clip_min = cfg["ratio_clip_min"]
+        self.ratio_clip_max = cfg["ratio_clip_max"]
+        self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
+        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
+        self.reference_policy_kl_type = cfg["reference_policy_kl_type"]
+        self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
+        self.kl_output_clamp_value = cfg["kl_output_clamp_value"]
+        self.disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
+        self.force_on_policy_ratio = cfg.get(
+            "force_on_policy_ratio", False
+        )  # Force ratio to 1.0
+        self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
+        self.use_importance_sampling_correction = cfg[
+            "use_importance_sampling_correction"
+        ]
+        self.truncated_importance_sampling_ratio = cfg[
+            "truncated_importance_sampling_ratio"
+        ]
+        # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
+        self.truncated_importance_sampling_type = cfg.get(
+            "truncated_importance_sampling_type"
+        )
+        # Lower bound for ICE-POP / seq-mask-tis filtering
+        self.truncated_importance_sampling_ratio_min = cfg.get(
+            "truncated_importance_sampling_ratio_min"
+        )
+        # Whether to compute importance weights per-sequence instead of per-token.
+        self.sequence_level_importance_ratios = cfg.get(
+            "sequence_level_importance_ratios",
+            False,
+        )
+        self.loss_type = (
+            LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
+        )
+        if self.sequence_level_importance_ratios:
+            assert self.loss_type == LossType.SEQUENCE_LEVEL, (
+                "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            )
+        if self.truncated_importance_sampling_ratio is not None:
+            assert self.use_importance_sampling_correction, (
+                "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
+            )
+            assert self.truncated_importance_sampling_ratio > 0, (
+                "truncated_importance_sampling_ratio should be positive"
+            )
+            assert self.truncated_importance_sampling_type in (
+                "tis",
+                "icepop",
+                "seq-mask-tis",
+            ), (
+                f"truncated_importance_sampling_type must be 'tis', 'icepop', or 'seq-mask-tis', "
+                f"got {self.truncated_importance_sampling_type}"
+            )
+            if self.truncated_importance_sampling_type == "seq-mask-tis":
+                assert not self.sequence_level_importance_ratios, (
+                    "seq-mask-tis uses token-level IS correction with sequence-level masking, "
+                    "and is incompatible with sequence_level_importance_ratios=True"
+                )
+        else:
+            # Warn user that TIS-related parameters are ignored when truncated_importance_sampling_ratio is not set
+            ignored_params = []
+            if cfg.get("truncated_importance_sampling_type") is not None:
+                ignored_params.append("truncated_importance_sampling_type")
+            if cfg.get("truncated_importance_sampling_ratio_min") is not None:
+                ignored_params.append("truncated_importance_sampling_ratio_min")
+            if ignored_params:
+                print(
+                    f"[WARN] truncated_importance_sampling_ratio is not set, so the following "
+                    f"parameters are ignored: {', '.join(ignored_params)}. "
+                    f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
+                    flush=True,
+                )
+        self.ce_penalty = cfg.get("ce_penalty", 0)
+        if self.ce_penalty is None:
+            self.ce_penalty = 0
+        self.bt_alpha = cfg.get("bt_alpha", 1.0)
+
+    def __call__(
+        self,
+        next_token_logits: Tensor,
+        data: BatchedDataDict[DWRLLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Clipped Policy Gradient RL loss function."""
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+        #advantages = data["advantages"][:, 1:]
+        thought_mask = data["thought_mask"][:, 1:]       # [B, S-1]
+        answer_mask = data["answer_mask"][:, 1:]         # [B, S-1]
+        no_position = data["no_position"]                # [1]
+        metadata = data["metadata"]                      # [B]
+        
+        # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
+        #prev_logprobs = None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        #generation_logprobs = data["generation_logprobs"][:, 1:]
+        #if self.reference_policy_kl_penalty != 0:
+        #    reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+        seq_index = data.get("seq_index", None)
+
+        #thought_valid = thought_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+        token_mask = token_mask * thought_mask
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        next_token_logits = next_token_logits.to(torch.float32)
+
+        if vocab_parallel_group is not None:
+            assert vocab_parallel_rank is not None, (
+                "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+            )
+            curr_logprobs = from_parallel_logits_to_logprobs(
+                next_token_logits,
+                data["input_ids"],
+                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+            )
+            # slice off to the correct length to remove potential CP padding
+            curr_logprobs = curr_logprobs[:, : data["input_ids"].shape[1] - 1]
+            
+            data["input_ids"][torch.arange(data["input_ids"].shape[0]), data["input_lengths"] - 1] = no_position.item()
+            
+            curr_logprobs_w_no = from_parallel_logits_to_logprobs(
+                next_token_logits,
+                data["input_ids"],
+                vocab_start_index=vocab_parallel_rank * next_token_logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * next_token_logits.shape[-1],
+                tp_group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+            )
+            # slice off to the correct length to remove potential CP padding
+            curr_logprobs_w_no = curr_logprobs_w_no[:, : data["input_ids"].shape[1] - 1]
+            
+            final_logprobs_no = curr_logprobs_w_no[answer_mask.bool()]
+        elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+            curr_logprobs = get_logprobs_from_vocab_parallel_logits(
+                next_token_logits, data["input_ids"], seq_index=seq_index
+            )
+            
+            #print("***** TERMINAL_CHECK: ", data["input_ids"][:, 1:][answer_mask.bool()], flush=True)
+            #print("***** TERMINAL_CHECK1: ", data["input_ids"][torch.arange(data["input_ids"].shape[0]), data["input_lengths"] - 1], flush=True)
+            
+            data["input_ids"][torch.arange(data["input_ids"].shape[0]), data["input_lengths"] - 1] = no_position.item()
+            #print("***** TERMINAL_CHECK2: ", data["input_ids"][torch.arange(data["input_ids"].shape[0]), data["input_lengths"] - 1], flush=True)
+            
+            curr_logprobs_w_no = get_logprobs_from_vocab_parallel_logits(
+                next_token_logits, data["input_ids"], seq_index=seq_index
+            )
+            
+            final_logprobs_no = curr_logprobs_w_no[answer_mask.bool()]
+        else:
+            next_token_logits_wo_last = next_token_logits[
+                :, :-1
+            ]  # Remove last position's logits
+            next_token_logprobs = torch.nn.functional.log_softmax(
+                next_token_logits_wo_last, dim=-1
+            )
+            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+            curr_logprobs = next_token_logprobs.gather(
+                dim=-1, index=next_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+            
+            data["input_ids"][torch.arange(data["input_ids"].shape[0]), data["input_lengths"] - 1] = no_position.item()
+            next_tokens = data["input_ids"][:, 1:].cuda()  # Skip first token
+            curr_logprobs_w_no = next_token_logprobs.gather(
+                dim=-1, index=next_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+            final_logprobs_no = curr_logprobs_w_no[answer_mask.bool()]
+            
+        
+        final_logprobs = curr_logprobs[answer_mask.bool()]
+        assert torch.equal(final_logprobs, curr_logprobs.gather(-1, (data["input_lengths"] - 2).unsqueeze(-1)).squeeze(-1)), "final_logprobs from answer_mask don't match gather on input_lengths"
+        
+        # ------------------------------------------------------------------
+        # 1. BT Loss
+        #
+        
+        # this will be shape (B,1)
+        gt = torch.tensor([1 - x['preference'] for x in metadata], dtype=final_logprobs.dtype, device=final_logprobs.device)
+        bt_loss = torch.sum(torch.nn.functional.binary_cross_entropy(final_logprobs.exp(), gt, reduction="none") * sample_mask)
+        bt_loss = bt_loss / (global_valid_seqs + 1e-8)
+        
+        #yes_no_targets = torch.tensor([9693, 2152], device=final_logprobs.device).long()
+        if self.ce_penalty is not None and self.ce_penalty > 0:
+            terminal_logprobs = torch.cat([final_logprobs, final_logprobs_no], dim=-1)
+            ce_loss = -masked_mean(
+                terminal_logprobs,
+                torch.ones_like(terminal_logprobs) * 0.5,
+                global_normalization_factor=global_valid_seqs,
+            )
+        else:
+            ce_loss = torch.zeros(1, device=final_logprobs.device)
+
+        #loss = actor_loss + kl
+        loss = self.bt_alpha * bt_loss + self.ce_penalty * ce_loss
+
+        # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
+        # by either sequence or token count, depending on particular metric.
+        # To get the true metric, you'll need to sum over the microbatch.
+        print(f"BT_LOSS [ {bt_loss.item()} ]  CE_LOSS [ {ce_loss.item()} ]", flush=True)
+        if bt_loss.isnan().any() or ce_loss.isnan().any():
+            raise RuntimeError("NAN LOSS")
+        return (
+            loss,
+            {
+                "loss": loss.item(),
+                "bt_loss": bt_loss.item(),
+                "ce_loss": ce_loss.item(),
+                "num_valid_samples": sample_mask.sum().item(),
+            },
+        )
+
+
 class NLLLoss(LossFunction):
     """Negative Log Likelihood Loss function."""
 
