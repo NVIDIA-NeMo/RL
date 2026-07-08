@@ -83,6 +83,7 @@ def _loaded(**kwargs) -> LoadedConfig:
         recipe=OmegaConf.create({"policy": {"x": 1}}),
         infra=infra,
         source_path=Path("/tmp/recipe.yaml"),
+        infra_source_path=Path("/tmp/recipe.yaml"),
     )
 
 
@@ -126,6 +127,60 @@ class TestBringUpCluster:
         )
         apply.assert_called_once()
         wait.assert_not_called()
+
+
+# =============================================================================
+# DRA prerequisites
+# =============================================================================
+
+
+class TestEnsureDraResources:
+    def test_reports_created_resources_and_attaches_owner(
+        self, monkeypatch, log
+    ) -> None:
+        log_fn, _ = log
+        loaded = _loaded()
+        owner = {
+            "apiVersion": "ray.io/v1",
+            "kind": "RayJob",
+            "name": "job",
+            "uid": "job-uid",
+            "controller": False,
+            "blockOwnerDeletion": False,
+        }
+        monkeypatch.setattr(
+            orchestrate,
+            "dra_resources_for_cluster",
+            MagicMock(
+                return_value=[
+                    ("compute-domain", "domain"),
+                    ("roce", "roce-template"),
+                ]
+            ),
+        )
+        apply_domain = MagicMock(return_value={"metadata": {"name": "domain"}})
+        apply_roce = MagicMock(return_value={})
+        monkeypatch.setattr(orchestrate.k8s, "apply_compute_domain", apply_domain)
+        monkeypatch.setattr(
+            orchestrate.k8s, "apply_resource_claim_template", apply_roce
+        )
+
+        results = orchestrate.ensure_dra_resources(
+            "training", loaded, log=log_fn, owner_ref=owner
+        )
+
+        assert results == [
+            orchestrate.EnsureDraResourceResult(
+                kind="compute-domain", name="domain", created=True
+            ),
+            orchestrate.EnsureDraResourceResult(
+                kind="roce", name="roce-template", created=False
+            ),
+        ]
+        domain_manifest = apply_domain.call_args.args[0]
+        roce_manifest = apply_roce.call_args.args[0]
+        assert domain_manifest["metadata"]["ownerReferences"] == [owner]
+        assert roce_manifest["metadata"]["ownerReferences"] == [owner]
 
 
 # =============================================================================
@@ -653,3 +708,248 @@ class TestRewriteEntrypointRecipe:
         assert "a.yaml" not in result
         # De-duplicated: same original path → one log line.
         assert sum("rewrote" in ln for ln in lines) == 1
+
+
+# DGD orchestration
+# =============================================================================
+
+
+_DGD_MANIFEST = """\
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: from-disk
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          command: ["python3", "-m", "dynamo.frontend"]
+"""
+
+
+def _loaded_with_dgd(tmp_path: Path, *, name: str | None = None) -> LoadedConfig:
+    from omegaconf import OmegaConf
+
+    manifest_path = tmp_path / "dgd.yaml"
+    manifest_path.write_text(_DGD_MANIFEST)
+    payload = _infra_payload()
+    payload["dynamo"] = {
+        "serving": {"manifest": "dgd.yaml", **({"name": name} if name else {})}
+    }
+    infra = InfraConfig.model_validate(payload)
+    return LoadedConfig(
+        recipe=OmegaConf.create({"policy": {"generation": {}}}),
+        infra=infra,
+        source_path=tmp_path / "recipe.yaml",
+        infra_source_path=tmp_path / "infra.yaml",
+    )
+
+
+class TestEnsureDgd:
+    def test_applies_when_absent_and_waits(self, tmp_path, monkeypatch, log) -> None:
+        log_fn, _ = log
+        loaded = _loaded_with_dgd(tmp_path)
+        get = MagicMock(return_value=None)
+        apply = MagicMock()
+        wait = MagicMock()
+        monkeypatch.setattr(orchestrate.dgd_mod, "get_dgd", get)
+        monkeypatch.setattr(orchestrate.dgd_mod, "apply_dgd", apply)
+        monkeypatch.setattr(orchestrate.dgd_mod, "wait_for_dgd_ready", wait)
+
+        result = orchestrate.ensure_dgd("serving", loaded, log=log_fn)
+
+        assert result == orchestrate.EnsureDgdResult(name="from-disk", created=True)
+        apply.assert_called_once()
+        wait.assert_called_once_with("from-disk", "ns-a", timeout_s=600)
+
+    def test_reuses_when_live_matches(self, tmp_path, monkeypatch, log) -> None:
+        log_fn, lines = log
+        loaded = _loaded_with_dgd(tmp_path)
+        # Build the rendered manifest first to use it as the live spec.
+        rendered = orchestrate.dgd_mod.build_dgd_manifest(
+            loaded.infra.dynamo["serving"], loaded.infra, tmp_path
+        )
+        live = {
+            "metadata": {
+                "name": "from-disk",
+                "labels": {"nrl-k8s/owner": orchestrate.get_username()},
+            },
+            "spec": rendered["spec"],
+        }
+        monkeypatch.setattr(
+            orchestrate.dgd_mod, "get_dgd", MagicMock(return_value=live)
+        )
+        apply = MagicMock()
+        wait = MagicMock()
+        monkeypatch.setattr(orchestrate.dgd_mod, "apply_dgd", apply)
+        monkeypatch.setattr(orchestrate.dgd_mod, "wait_for_dgd_ready", wait)
+
+        result = orchestrate.ensure_dgd("serving", loaded, log=log_fn)
+
+        assert result == orchestrate.EnsureDgdResult(name="from-disk", created=False)
+        apply.assert_not_called()  # already exists + matches
+        wait.assert_called_once()
+        assert any("already exists and matches" in ln for ln in lines)
+
+    def test_reused_dgd_is_never_adopted(self, tmp_path, monkeypatch, log) -> None:
+        log_fn, _ = log
+        loaded = _loaded_with_dgd(tmp_path)
+        owner_ref = {
+            "apiVersion": "ray.io/v1",
+            "kind": "RayJob",
+            "name": "new-job",
+            "uid": "new-uid",
+            "controller": False,
+            "blockOwnerDeletion": False,
+        }
+        rendered = orchestrate.dgd_mod.build_dgd_manifest(
+            loaded.infra.dynamo["serving"], loaded.infra, tmp_path
+        )
+        existing_owner = {**owner_ref, "name": "existing-job", "uid": "old-uid"}
+        live = {
+            "metadata": {
+                "name": "from-disk",
+                "labels": {"nrl-k8s/owner": orchestrate.get_username()},
+                "ownerReferences": [existing_owner],
+            },
+            "spec": rendered["spec"],
+        }
+        monkeypatch.setattr(
+            orchestrate.dgd_mod, "get_dgd", MagicMock(return_value=live)
+        )
+        apply = MagicMock()
+        monkeypatch.setattr(orchestrate.dgd_mod, "apply_dgd", apply)
+        monkeypatch.setattr(orchestrate.dgd_mod, "wait_for_dgd_ready", MagicMock())
+
+        result = orchestrate.ensure_dgd(
+            "serving", loaded, log=log_fn, owner_ref=owner_ref
+        )
+
+        assert result.created is False
+        assert live["metadata"]["ownerReferences"] == [existing_owner]
+        apply.assert_not_called()
+
+    def test_recreate_replaces_drifted(self, tmp_path, monkeypatch, log) -> None:
+        log_fn, _ = log
+        loaded = _loaded_with_dgd(tmp_path)
+        live = {
+            "metadata": {
+                "name": "from-disk",
+                "labels": {"nrl-k8s/owner": orchestrate.get_username()},
+            },
+            "spec": {"services": {}},  # drifted from rendered
+        }
+        monkeypatch.setattr(
+            orchestrate.dgd_mod, "get_dgd", MagicMock(return_value=live)
+        )
+        delete = MagicMock()
+        wait_gone = MagicMock()
+        apply = MagicMock()
+        wait = MagicMock()
+        monkeypatch.setattr(orchestrate.dgd_mod, "delete_dgd", delete)
+        monkeypatch.setattr(orchestrate.dgd_mod, "wait_for_dgd_gone", wait_gone)
+        monkeypatch.setattr(orchestrate.dgd_mod, "apply_dgd", apply)
+        monkeypatch.setattr(orchestrate.dgd_mod, "wait_for_dgd_ready", wait)
+
+        result = orchestrate.ensure_dgd("serving", loaded, log=log_fn, recreate=True)
+        assert result.created is True
+        delete.assert_called_once()
+        apply.assert_called_once()
+
+
+class TestDeleteDgd:
+    def test_resolves_name_from_manifest(self, tmp_path, monkeypatch, log) -> None:
+        log_fn, _ = log
+        loaded = _loaded_with_dgd(tmp_path)
+        delete = MagicMock()
+        monkeypatch.setattr(orchestrate.dgd_mod, "delete_dgd", delete)
+
+        orchestrate.delete_dgd("serving", loaded, log=log_fn)
+
+        delete.assert_called_once_with("from-disk", "ns-a")
+
+    def test_uses_explicit_name_override(self, tmp_path, monkeypatch, log) -> None:
+        log_fn, _ = log
+        loaded = _loaded_with_dgd(tmp_path, name="my-dgd")
+        delete = MagicMock()
+        monkeypatch.setattr(orchestrate.dgd_mod, "delete_dgd", delete)
+
+        orchestrate.delete_dgd("serving", loaded, log=log_fn)
+
+        delete.assert_called_once_with("my-dgd", "ns-a")
+
+
+class TestRunInvokesDgds:
+    def test_run_ensures_training_once_for_dgd_with_recreate(
+        self, tmp_path, monkeypatch, log
+    ) -> None:
+        log_fn, _ = log
+        loaded = _loaded_with_dgd(tmp_path)
+
+        ensure_dgd = MagicMock(return_value="from-disk")
+        monkeypatch.setattr(orchestrate, "ensure_dgd", ensure_dgd)
+        ensure_cluster = MagicMock(return_value="rc-train")
+        monkeypatch.setattr(orchestrate, "ensure_cluster", ensure_cluster)
+        monkeypatch.setattr(
+            orchestrate.k8s,
+            "get_raycluster",
+            MagicMock(return_value={"metadata": {"uid": "test-uid"}}),
+        )
+        monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
+        monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
+
+        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"), recreate=True)
+
+        ensure_dgd.assert_called_once()
+        assert ensure_dgd.call_args.args[0] == "serving"
+        ensure_cluster.assert_called_once_with(
+            "training", loaded, log=log_fn, recreate=True
+        )
+
+    def test_run_passes_owner_ref_pointing_at_training_cluster(
+        self, tmp_path, monkeypatch, log
+    ) -> None:
+        log_fn, _ = log
+        loaded = _loaded_with_dgd(tmp_path)
+
+        ensure_dgd = MagicMock(return_value="from-disk")
+        monkeypatch.setattr(orchestrate, "ensure_dgd", ensure_dgd)
+        monkeypatch.setattr(
+            orchestrate, "ensure_cluster", MagicMock(return_value="rc-train")
+        )
+        monkeypatch.setattr(
+            orchestrate.k8s,
+            "get_raycluster",
+            MagicMock(return_value={"metadata": {"uid": "rc-train-uid"}}),
+        )
+        monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
+        monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
+
+        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"))
+
+        owner_ref = ensure_dgd.call_args.kwargs["owner_ref"]
+        assert owner_ref is not None
+        assert owner_ref["kind"] == "RayCluster"
+        assert owner_ref["name"] == "rc-train"
+        assert owner_ref["uid"] == "rc-train-uid"
+        assert owner_ref["controller"] is False
+
+    def test_run_no_owner_ref_when_no_dgds(self, tmp_path, monkeypatch, log) -> None:
+        log_fn, _ = log
+        loaded = _loaded()  # no dynamo section
+
+        ensure_cluster = MagicMock(return_value="rc-train")
+        monkeypatch.setattr(orchestrate, "ensure_cluster", ensure_cluster)
+        get_rc = MagicMock()
+        monkeypatch.setattr(orchestrate.k8s, "get_raycluster", get_rc)
+        monkeypatch.setattr(orchestrate, "submit_daemon", MagicMock())
+        monkeypatch.setattr(orchestrate, "submit_training", MagicMock())
+
+        orchestrate.run(loaded, log=log_fn, repo_root=Path("/tmp"))
+
+        # Without DGDs, the early "fetch training UID" call never fires —
+        # the original lazy-bringup behaviour is preserved.
+        get_rc.assert_not_called()

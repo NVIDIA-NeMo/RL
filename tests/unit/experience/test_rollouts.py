@@ -133,6 +133,25 @@ class _DummySGLangGeneration:
         )
 
 
+class _DummyDynamoGeneration:
+    def __init__(self):
+        self.cfg = {"backend": "dynamo"}
+
+    async def generate_async(self, data, greedy=False):
+        yield (
+            0,
+            BatchedDataDict(
+                {
+                    "output_ids": torch.tensor([[1, 2]]),
+                    "logprobs": torch.zeros((1, 2), dtype=torch.float32),
+                    "generation_lengths": torch.tensor([1], dtype=torch.long),
+                    "unpadded_sequence_lengths": torch.tensor([2], dtype=torch.long),
+                    "truncated": torch.tensor([False], dtype=torch.bool),
+                }
+            ),
+        )
+
+
 def test_generate_responses_async_requires_sglang_opt_in():
     generation_input_data = BatchedDataDict(
         {
@@ -166,6 +185,30 @@ def test_generate_responses_async_allows_sglang_opt_in():
     updated_batch, generated_ids, gen_metrics = asyncio.run(
         generate_responses_async(
             _DummySGLangGeneration(use_async_rollouts=True),
+            generation_input_data,
+            batch,
+            _DummyTokenizer(),
+            input_lengths=generation_input_data["input_lengths"],
+        )
+    )
+
+    assert updated_batch["message_log"][0][-1]["content"] == "ok"
+    assert generated_ids[0].tolist() == [2]
+    assert gen_metrics["total_generated_tokens"] == 1
+
+
+def test_generate_responses_async_allows_dynamo():
+    generation_input_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1]]),
+            "input_lengths": torch.tensor([1], dtype=torch.long),
+        }
+    )
+    batch = BatchedDataDict({"message_log": [[]]})
+
+    updated_batch, generated_ids, gen_metrics = asyncio.run(
+        generate_responses_async(
+            _DummyDynamoGeneration(),
             generation_input_data,
             batch,
             _DummyTokenizer(),

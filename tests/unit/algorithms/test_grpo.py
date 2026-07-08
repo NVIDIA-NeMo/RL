@@ -35,6 +35,7 @@ from nemo_rl.algorithms.grpo import (
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
+    _should_use_nemo_gym,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -885,6 +886,7 @@ def mock_async_grpo_infrastructure(
 @pytest.mark.parametrize(
     ("generation_config", "expected"),
     [
+        ({"backend": "dynamo"}, True),
         ({"backend": "vllm", "vllm_cfg": {"async_engine": False}}, False),
         ({"backend": "vllm", "vllm_cfg": {"async_engine": True}}, True),
         (
@@ -904,6 +906,74 @@ def test_should_use_async_rollouts_selects_backend_specific_config(
     master_config.policy = {"generation": generation_config}
 
     assert _should_use_async_rollouts(master_config) is expected
+
+
+@pytest.mark.parametrize("vllm_cfg", [None, {}, {"expose_http_server": False}])
+def test_should_use_nemo_gym_requires_dynamo_token_wrapper(vllm_cfg) -> None:
+    master_config = MagicMock()
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy = {"generation": {"backend": "dynamo", "vllm_cfg": vllm_cfg}}
+
+    with pytest.raises(AssertionError, match="expose_http_server"):
+        _should_use_nemo_gym(master_config)
+
+
+def test_should_use_nemo_gym_accepts_dynamo_token_wrapper() -> None:
+    master_config = MagicMock()
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy = {
+        "generation": {"backend": "dynamo", "vllm_cfg": {"expose_http_server": True}}
+    }
+
+    assert _should_use_nemo_gym(master_config) is True
+
+
+def test_refit_policy_generation_dynamo_matches_vllm_packed_protocol(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = {}
+
+    class DummyPolicy:
+        def broadcast_weights_for_collective(
+            self, kv_scales=None, *, buffer_size_bytes=None, num_buffers=None
+        ):
+            calls["broadcast"] = {
+                "kv_scales": kv_scales,
+                "buffer_size_bytes": buffer_size_bytes,
+                "num_buffers": num_buffers,
+            }
+            return ["train"]
+
+    class DummyDynamoGeneration:
+        def update_weights_from_collective(self):
+            calls["receive"] = True
+            return ["inference"]
+
+    def fake_ray_get(refs):
+        if refs == ["inference"]:
+            return [True]
+        return refs
+
+    kv_scales = {
+        "model.layers.0.self_attn.k_scale": 1.25,
+        "model.layers.0.self_attn.v_scale": 1.5,
+    }
+    monkeypatch.setattr(grpo_mod, "DynamoGeneration", DummyDynamoGeneration)
+    monkeypatch.setattr(grpo_mod.ray, "get", fake_ray_get)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummyDynamoGeneration(),
+        colocated_inference=False,
+        kv_scales=kv_scales,
+    )
+
+    assert calls["broadcast"] == {
+        "kv_scales": kv_scales,
+        "buffer_size_bytes": grpo_mod.VLLM_PACKED_BUFFER_SIZE_BYTES,
+        "num_buffers": grpo_mod.VLLM_PACKED_NUM_BUFFERS,
+    }
+    assert calls["receive"] is True
 
 
 @contextmanager
@@ -1515,6 +1585,35 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
         # Configure mocks to skip checkpoint loading
         mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
         setup(master_config, tokenizer, dataset, None)
+
+
+def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"]["backend"] = "dynamo"
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": True,
+        "resources": {"gpus_per_node": None, "num_nodes": None},
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            AssertionError,
+            match="Dynamo generation does not support colocated inference",
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+
+    mock_logger.assert_not_called()
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(

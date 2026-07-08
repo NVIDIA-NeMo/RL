@@ -195,14 +195,34 @@ _DRA_CLAIM_PREFIX: dict[str, str] = {
 
 def _rewrite_dra_template_names(spec: dict, cluster_name: str, role: str) -> None:
     """Rewrite ``resourceClaimTemplateName`` in worker pods to deterministic names."""
+    claim_template_names = dra_claim_template_names_for_cluster(
+        cluster_name, role, spec
+    )
     for wg in spec.get("workerGroupSpecs") or []:
         pod_spec = wg.get("template", {}).get("spec")
         if not isinstance(pod_spec, dict):
             continue
         for claim in pod_spec.get("resourceClaims") or []:
-            prefix = _DRA_CLAIM_PREFIX.get(claim.get("name", ""))
+            template_name = claim_template_names.get(claim.get("name", ""))
+            if template_name:
+                claim["resourceClaimTemplateName"] = template_name
+
+
+def dra_claim_template_names_for_cluster(
+    cluster_name: str, role: str, spec: dict
+) -> dict[str, str]:
+    """Return deterministic DRA template names keyed by pod claim name."""
+    names: dict[str, str] = {}
+    for wg in spec.get("workerGroupSpecs") or []:
+        pod_spec = wg.get("template", {}).get("spec")
+        if not isinstance(pod_spec, dict):
+            continue
+        for claim in pod_spec.get("resourceClaims") or []:
+            claim_name = claim.get("name", "")
+            prefix = _DRA_CLAIM_PREFIX.get(claim_name)
             if prefix:
-                claim["resourceClaimTemplateName"] = f"{prefix}{cluster_name}-{role}"
+                names[claim_name] = f"{prefix}{cluster_name}-{role}"
+    return names
 
 
 def dra_resources_for_cluster(
@@ -213,32 +233,34 @@ def dra_resources_for_cluster(
     ``kind`` is ``"compute-domain"`` or ``"roce"``. Scans every worker pod
     template for well-known claim names.
     """
-    found: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for wg in spec.get("workerGroupSpecs") or []:
-        pod_spec = wg.get("template", {}).get("spec")
-        if not isinstance(pod_spec, dict):
-            continue
-        for claim in pod_spec.get("resourceClaims") or []:
-            claim_name = claim.get("name", "")
-            prefix = _DRA_CLAIM_PREFIX.get(claim_name)
-            if prefix and claim_name not in seen:
-                seen.add(claim_name)
-                resource_name = f"{prefix}{cluster_name}-{role}"
-                kind = "compute-domain" if "compute-domain" in prefix else "roce"
-                found.append((kind, resource_name))
-    return found
+    return [
+        (
+            "compute-domain" if claim_name == "compute-domain-channel" else "roce",
+            template_name,
+        )
+        for claim_name, template_name in dra_claim_template_names_for_cluster(
+            cluster_name, role, spec
+        ).items()
+    ]
 
 
-def build_compute_domain_manifest(name: str, namespace: str) -> dict[str, Any]:
+def build_compute_domain_manifest(
+    name: str,
+    namespace: str,
+    *,
+    owner_ref: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "name": name,
+        "namespace": namespace,
+        "labels": {**_MANAGED_BY_LABEL},
+    }
+    if owner_ref is not None:
+        metadata["ownerReferences"] = [owner_ref]
     return {
         "apiVersion": "resource.nvidia.com/v1beta1",
         "kind": "ComputeDomain",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": {**_MANAGED_BY_LABEL},
-        },
+        "metadata": metadata,
         "spec": {
             "channel": {"resourceClaimTemplate": {"name": name}},
             "numNodes": 0,
@@ -246,16 +268,24 @@ def build_compute_domain_manifest(name: str, namespace: str) -> dict[str, Any]:
     }
 
 
-def build_roce_template_manifest(name: str, namespace: str) -> dict[str, Any]:
+def build_roce_template_manifest(
+    name: str,
+    namespace: str,
+    *,
+    owner_ref: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     # TODO: expose roce count via infra config — hardcoded to 8 for now
+    metadata: dict[str, Any] = {
+        "name": name,
+        "namespace": namespace,
+        "labels": {**_MANAGED_BY_LABEL},
+    }
+    if owner_ref is not None:
+        metadata["ownerReferences"] = [owner_ref]
     return {
         "apiVersion": "resource.k8s.io/v1",
         "kind": "ResourceClaimTemplate",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": {**_MANAGED_BY_LABEL},
-        },
+        "metadata": metadata,
         "spec": {
             "spec": {
                 "devices": {

@@ -37,13 +37,15 @@ import shutil
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from omegaconf import OmegaConf
 from ray.job_submission import JobStatus, JobSubmissionClient
 
+from . import dgd as dgd_mod
 from . import k8s, submit, workdir
 from .config import LoadedConfig, get_username
 from .manifest import (
@@ -54,11 +56,12 @@ from .manifest import (
     build_service_for_deployment,
     dra_resources_for_cluster,
 )
-from .schema import ClusterSpec, CodeSource, InfraConfig, SubmitterMode
+from .schema import ClusterSpec, CodeSource, DynamoGraphSpec, InfraConfig, SubmitterMode
 from .submitters import SubmissionHandle, build_submitter, save_handle
 
 Role = Literal["generation", "gym", "training"]
 ALL_ROLES: tuple[Role, ...] = ("generation", "gym", "training")
+_LogFn = Callable[[str], None]
 
 
 @dataclass
@@ -76,6 +79,23 @@ class RunResult:
     training_job_id: str = ""
 
 
+@dataclass(frozen=True)
+class EnsureDgdResult:
+    """Outcome of ensuring a DynamoGraphDeployment."""
+
+    name: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class EnsureDraResourceResult:
+    """Outcome of ensuring one DRA prerequisite."""
+
+    kind: Literal["compute-domain", "roce"]
+    name: str
+    created: bool
+
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -89,7 +109,7 @@ def bring_up_cluster(
     role: Role,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     wait_ready: bool = True,
     ready_timeout_s: int = 900,
 ) -> str:
@@ -115,7 +135,7 @@ def ensure_cluster(
     role: Role,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     recreate: bool = False,
     wait_ready: bool = True,
     ready_timeout_s: int = 900,
@@ -206,32 +226,40 @@ def ensure_dra_resources(
     role: Role,
     loaded: LoadedConfig,
     *,
-    log: callable,
-) -> None:
-    """Create ComputeDomain / RoCE ResourceClaimTemplate if the spec needs them."""
+    log: _LogFn,
+    owner_ref: dict[str, Any] | None = None,
+) -> list[EnsureDraResourceResult]:
+    """Create the ComputeDomain / RoCE resources required by a cluster."""
     cluster = _get_cluster(loaded.infra, role)
     if cluster is None:
-        return
+        return []
     namespace = loaded.infra.namespace
     resources = dra_resources_for_cluster(cluster.name, role, cluster.spec)
+    results: list[EnsureDraResourceResult] = []
     for kind, name in resources:
         if kind == "compute-domain":
             log(f"[{role}] ensuring ComputeDomain {name}")
-            k8s.apply_compute_domain(
-                build_compute_domain_manifest(name, namespace), namespace
+            applied = k8s.apply_compute_domain(
+                build_compute_domain_manifest(name, namespace, owner_ref=owner_ref),
+                namespace,
             )
         elif kind == "roce":
             log(f"[{role}] ensuring RoCE ResourceClaimTemplate {name}")
-            k8s.apply_resource_claim_template(
-                build_roce_template_manifest(name, namespace), namespace
+            applied = k8s.apply_resource_claim_template(
+                build_roce_template_manifest(name, namespace, owner_ref=owner_ref),
+                namespace,
             )
+        results.append(
+            EnsureDraResourceResult(kind=kind, name=name, created=bool(applied))
+        )
+    return results
 
 
 def delete_dra_resources(
     role: Role,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
 ) -> None:
     """Delete DRA resources for a role."""
     cluster = _get_cluster(loaded.infra, role)
@@ -252,7 +280,7 @@ def ensure_deployment(
     dep_key: str,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
 ) -> str:
     """Apply a Kubernetes Deployment + auto-created ClusterIP Service."""
     dep = _require_deployment(loaded.infra, dep_key)
@@ -298,7 +326,7 @@ def delete_deployment(
     dep_key: str,
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
 ) -> None:
     """Delete a managed Deployment and its auto-created Service."""
     dep = _require_deployment(loaded.infra, dep_key)
@@ -310,12 +338,109 @@ def delete_deployment(
     k8s.delete_deployment(name, namespace)
 
 
+def ensure_dgd(
+    dgd_key: str,
+    loaded: LoadedConfig,
+    *,
+    log: _LogFn,
+    recreate: bool = False,
+    wait_ready: bool = True,
+    owner_ref: dict[str, Any] | None = None,
+) -> EnsureDgdResult:
+    """Apply a DynamoGraphDeployment and wait for state=successful.
+
+    Idempotent — if a live DGD with the same name exists and matches the
+    rendered manifest, reuse it. On drift, warn and reuse unless
+    ``recreate=True``. Mirrors :func:`ensure_cluster` semantics for RayClusters.
+
+    When ``owner_ref`` is provided, it's attached to the DGD's
+    ``metadata.ownerReferences`` so K8s GC cascades the DGD when the owner
+    (typically the training RayCluster) is deleted. Pass ``None`` for
+    untethered lifetimes.
+
+    Returns:
+        The resolved DGD name and whether this invocation created it.
+    """
+    spec = _require_dgd(loaded.infra, dgd_key)
+    base_dir = loaded.infra_source_path.parent
+    manifest = dgd_mod.build_dgd_manifest(
+        spec, loaded.infra, base_dir, owner_ref=owner_ref
+    )
+    name = manifest["metadata"]["name"]
+    namespace = loaded.infra.namespace
+
+    live = dgd_mod.get_dgd(name, namespace)
+    if live is not None:
+        live_owner = (live.get("metadata", {}).get("labels") or {}).get("nrl-k8s/owner")
+        me = get_username()
+        if live_owner and live_owner != me:
+            raise RuntimeError(
+                f"DynamoGraphDeployment {name} in namespace {namespace} is owned by "
+                f"'{live_owner}' (you are '{me}'). Use a different name "
+                f"(via DynamoGraphSpec.name) or ask {live_owner} to tear it down."
+            )
+
+    created = False
+    if live is None:
+        log(
+            f"[dynamo:{dgd_key}] applying DynamoGraphDeployment {name} in namespace {namespace}"
+        )
+        created = bool(dgd_mod.apply_dgd(manifest, namespace))
+        if not created:
+            log(
+                f"[dynamo:{dgd_key}] DGD {name} appeared concurrently; "
+                "reusing without changing its owner"
+            )
+    elif _spec_drifted(live.get("spec") or {}, manifest["spec"]):
+        if recreate:
+            log(
+                f"[dynamo:{dgd_key}] --recreate: DGD {name} drifted from rendered "
+                f"manifest; deleting and re-applying"
+            )
+            dgd_mod.delete_dgd(name, namespace)
+            dgd_mod.wait_for_dgd_gone(name, namespace)
+            created = bool(dgd_mod.apply_dgd(manifest, namespace))
+        else:
+            log(
+                f"[dynamo:{dgd_key}] warning: live DGD {name} drifted from rendered "
+                f"manifest; reusing as-is (pass --recreate to replace)"
+            )
+    else:
+        log(f"[dynamo:{dgd_key}] DGD {name} already exists and matches — reusing")
+
+    if wait_ready:
+        log(f"[dynamo:{dgd_key}] waiting for DGD {name} to reach state=successful ...")
+        dgd_mod.wait_for_dgd_ready(name, namespace, timeout_s=spec.readyTimeoutS)
+        log(f"[dynamo:{dgd_key}] DGD {name} is ready.")
+
+    return EnsureDgdResult(name=name, created=created)
+
+
+def delete_dgd(
+    dgd_key: str,
+    loaded: LoadedConfig,
+    *,
+    log: _LogFn,
+) -> None:
+    """Delete a managed DynamoGraphDeployment.
+
+    The dynamo operator garbage-collects the per-service Services and pods
+    via owner references — we don't need to clean those up explicitly.
+    """
+    spec = _require_dgd(loaded.infra, dgd_key)
+    base_dir = loaded.infra_source_path.parent
+    name = spec.name or dgd_mod.resolve_dgd_name(spec, base_dir)
+    namespace = loaded.infra.namespace
+    log(f"[dynamo:{dgd_key}] deleting DynamoGraphDeployment {name}")
+    dgd_mod.delete_dgd(name, namespace)
+
+
 def submit_daemon(
     role: Role,
     loaded: LoadedConfig,
     cluster_name: str,
     *,
-    log: callable,
+    log: _LogFn,
     repo_root: Path,
     replace: bool = False,
 ) -> str | None:
@@ -391,7 +516,7 @@ def submit_daemon(
 def submit_training(
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     repo_root: Path,
     replace: bool = False,
     run_id: str | None = None,
@@ -574,7 +699,7 @@ def _rewrite_entrypoint_recipe(
     repo_root: Path,
     *,
     upload: bool,
-    log: callable,
+    log: _LogFn,
 ) -> str:
     """Rewrite ``--config <path>.yaml`` flags in the train entrypoint.
 
@@ -621,7 +746,7 @@ def _rewrite_entrypoint_recipe(
 def run(
     loaded: LoadedConfig,
     *,
-    log: callable,
+    log: _LogFn,
     repo_root: Path,
     replace: bool = False,
     run_id: str | None = None,
@@ -645,11 +770,42 @@ def run(
     for dep_key in loaded.infra.deployments:
         ensure_deployment(dep_key, loaded, log=log)
 
+    # Bring up the training RayCluster *first* so we have a UID to anchor any
+    # DGD ownerReferences against — that's how DGDs get garbage-collected when
+    # the training cluster is torn down. The other roles (generation/gym) come
+    # up afterwards in the same loop and are no-ops on the second pass.
+    cluster_names: dict[Role, str] = {}
+    training_cluster_owner: dict[str, Any] | None = None
+    if _get_cluster(loaded.infra, "training") is not None and loaded.infra.dynamo:
+        training_name = ensure_cluster("training", loaded, log=log, recreate=recreate)
+        cluster_names["training"] = training_name
+        training_obj = k8s.get_raycluster(training_name, loaded.infra.namespace)
+        training_uid = (training_obj or {}).get("metadata", {}).get("uid")
+        if training_uid:
+            training_cluster_owner = dgd_mod.build_owner_reference(
+                api_version="ray.io/v1",
+                kind="RayCluster",
+                name=training_name,
+                uid=training_uid,
+            )
+
+    for dgd_key in loaded.infra.dynamo:
+        ensure_dgd(
+            dgd_key,
+            loaded,
+            log=log,
+            recreate=recreate,
+            owner_ref=training_cluster_owner,
+        )
+
     for role in ALL_ROLES:
         if _get_cluster(loaded.infra, role) is None:
             log(f"[{role}] not defined in recipe — skipping")
             continue
-        name = ensure_cluster(role, loaded, log=log, recreate=recreate)
+        name = cluster_names.get(role)
+        if name is None:
+            name = ensure_cluster(role, loaded, log=log, recreate=recreate)
+            cluster_names[role] = name
         if skip_daemons and role != "training":
             log(f"[{role}] --skip-daemons: not submitting daemon")
             continue
@@ -678,7 +834,7 @@ def _infer_disagg_job_id(infra: InfraConfig) -> str | None:
     return m.group(1) if m else None
 
 
-def _reset_endpoint_registry(loaded: LoadedConfig, *, log: callable) -> None:
+def _reset_endpoint_registry(loaded: LoadedConfig, *, log: _LogFn) -> None:
     """Delete the endpoint-registry ConfigMap for a fresh rendezvous.
 
     Ensures gym + training discover fresh URLs instead of caching
@@ -719,6 +875,17 @@ def _require_deployment(infra: InfraConfig, key: str):
     return dep
 
 
+def _get_dgd(infra: InfraConfig, key: str) -> DynamoGraphSpec | None:
+    return infra.dynamo.get(key)
+
+
+def _require_dgd(infra: InfraConfig, key: str) -> DynamoGraphSpec:
+    spec = _get_dgd(infra, key)
+    if spec is None:
+        raise ValueError(f"infra.dynamo.{key} is not defined")
+    return spec
+
+
 def _upload_paths(infra: InfraConfig) -> list[str]:
     """Resolve the list of repo-relative paths to stage for Ray uploads."""
     if infra.launch.rayUploadPaths is not None:
@@ -733,7 +900,7 @@ def _wait_job_stopped(
     client: JobSubmissionClient,
     submission_id: str,
     *,
-    log: callable,
+    log: _LogFn,
     role: Role,
     timeout_s: int = 60,
 ) -> None:
@@ -753,7 +920,7 @@ def _wait_job_stopped(
     )
 
 
-def _wait_for_http(url: str, timeout_s: int, log: callable, role: str) -> None:
+def _wait_for_http(url: str, timeout_s: int, log: _LogFn, role: str) -> None:
     log(f"[{role}] waiting for health-check {url} (timeout {timeout_s}s)")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -770,12 +937,17 @@ def _wait_for_http(url: str, timeout_s: int, log: callable, role: str) -> None:
 
 __all__ = [
     "ALL_ROLES",
+    "EnsureDgdResult",
+    "EnsureDraResourceResult",
     "RunResult",
     "bring_up_cluster",
     "default_run_id",
     "delete_deployment",
+    "delete_dgd",
     "ensure_cluster",
     "ensure_deployment",
+    "ensure_dgd",
+    "ensure_dra_resources",
     "run",
     "submit_daemon",
     "submit_training",

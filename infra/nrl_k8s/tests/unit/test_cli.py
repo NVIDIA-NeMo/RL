@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 import yaml
 from click.testing import CliRunner
-from nrl_k8s import cli
+from nrl_k8s import cli, orchestrate
 from nrl_k8s import config as cfg_mod
 
 # =============================================================================
@@ -77,6 +77,37 @@ class TestCheck:
         assert "namespace:" in result.output
         assert "ns-a" in result.output
         assert "img:1" in result.output
+
+    def test_summary_uses_manifest_dgd_name_for_ready_timeout(self, tmp_path) -> None:
+        (tmp_path / "dgd.yaml").write_text(
+            "apiVersion: nvidia.com/v1alpha1\n"
+            "kind: DynamoGraphDeployment\n"
+            "metadata:\n"
+            "  name: manifest-dgd\n"
+            "spec:\n"
+            "  services: {}\n"
+        )
+        recipe = _write_recipe(
+            tmp_path,
+            {
+                "infra": {
+                    "namespace": "ns-a",
+                    "image": "img:1",
+                    "dynamo": {
+                        "serving": {
+                            "manifest": "dgd.yaml",
+                            "readyTimeoutS": 321,
+                        }
+                    },
+                }
+            },
+        )
+
+        result = CliRunner().invoke(cli.main, ["check", str(recipe)])
+
+        assert result.exit_code == 0, result.output
+        assert "serving: manifest-dgd" in result.output
+        assert "readyTimeoutS=321" in result.output
 
     def test_summary_lists_each_declared_cluster(self, tmp_path) -> None:
         spec = {
@@ -289,6 +320,25 @@ class TestClusterDashboard:
 
 
 class TestRayJob:
+    @pytest.fixture(autouse=True)
+    def _mock_cluster_state(self, monkeypatch):
+        """Keep RayJob command tests isolated from the current Kubernetes context."""
+        monkeypatch.setattr("nrl_k8s.k8s.get_rayjob", lambda name, ns: None)
+        monkeypatch.setattr("nrl_k8s.k8s.get_raycluster", lambda name, ns: None)
+        monkeypatch.setattr(
+            "nrl_k8s.orchestrate.ensure_dra_resources", lambda *args, **kwargs: []
+        )
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.wait_for_rayjob_suspended",
+            lambda name, ns: {
+                "metadata": {"name": name, "uid": "rayjob-uid"},
+                "status": {"jobDeploymentStatus": "Suspended"},
+            },
+        )
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.set_rayjob_suspended", lambda *args, **kwargs: {}
+        )
+
     @staticmethod
     def _recipe_with_training(tmp_path: Path, entrypoint: str | None) -> Path:
         spec = {
@@ -323,6 +373,7 @@ class TestRayJob:
         assert applied == []
         assert "kind: RayJob" in result.output
         assert "entrypoint: python run.py" in result.output
+        assert "suspend: true" in result.output
 
     def test_apply_then_wait_success(self, tmp_path, monkeypatch):
         recipe = self._recipe_with_training(tmp_path, "echo")
@@ -356,6 +407,7 @@ class TestRayJob:
         assert manifest["metadata"]["name"] == "rc-train"
         assert manifest["spec"]["entrypoint"] == "echo"
         assert manifest["spec"]["shutdownAfterJobFinishes"] is True
+        assert manifest["spec"]["suspend"] is True
 
     def test_failed_job_exits_non_zero(self, tmp_path, monkeypatch):
         recipe = self._recipe_with_training(tmp_path, "echo")
@@ -394,6 +446,248 @@ class TestRayJob:
         result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob", "--dry-run"])
         assert result.exit_code == 1
         assert "entrypoint" in result.output
+
+
+class TestRayJobWithDynamo:
+    """``run --rayjob`` owns prerequisites before KubeRay starts the run."""
+
+    @staticmethod
+    def _recipe_with_dgd(tmp_path: Path) -> Path:
+        spec = {
+            "headGroupSpec": {
+                "template": {"spec": {"containers": [{"name": "h", "image": "old"}]}}
+            }
+        }
+        (tmp_path / "dgd.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "apiVersion": "nvidia.com/v1alpha1",
+                    "kind": "DynamoGraphDeployment",
+                    "metadata": {"name": "my-dgd"},
+                    "spec": {"services": {}},
+                }
+            )
+        )
+        infra = {
+            "namespace": "ns",
+            "image": "img:new",
+            "kuberay": {"training": {"name": "rc-train", "spec": spec}},
+            "dynamo": {"serving": {"manifest": "dgd.yaml", "name": "my-dgd"}},
+            "launch": {"entrypoint": "echo"},
+        }
+        return _write_recipe(tmp_path, {"infra": infra})
+
+    @staticmethod
+    def _patch_happy_path(
+        monkeypatch,
+        call_log: list[tuple[str, object]],
+        *,
+        dgd_created: bool = True,
+        dra_results: list[orchestrate.EnsureDraResourceResult] | None = None,
+    ) -> None:
+        monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+        monkeypatch.setattr("nrl_k8s.k8s.get_rayjob", lambda name, ns: None)
+
+        def _fake_apply_rayjob(manifest, ns):
+            call_log.append(("apply_rayjob", manifest["spec"]["suspend"]))
+            return manifest
+
+        monkeypatch.setattr("nrl_k8s.k8s.apply_rayjob", _fake_apply_rayjob)
+
+        def _fake_wait_suspended(job_name, namespace):
+            call_log.append(("wait_suspended", job_name))
+            return {
+                "metadata": {"name": job_name, "uid": "rayjob-uid"},
+                "status": {"jobDeploymentStatus": "Suspended"},
+            }
+
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.wait_for_rayjob_suspended", _fake_wait_suspended
+        )
+
+        def _fake_ensure_dra(*args, **kwargs):
+            call_log.append(("ensure_dra", kwargs["owner_ref"]))
+            return dra_results or []
+
+        monkeypatch.setattr(
+            "nrl_k8s.orchestrate.ensure_dra_resources", _fake_ensure_dra
+        )
+
+        def _fake_ensure_dgd(dgd_key, loaded, *, log, owner_ref):
+            call_log.append(("ensure_dgd", (dgd_key, owner_ref)))
+            return orchestrate.EnsureDgdResult(name="my-dgd", created=dgd_created)
+
+        monkeypatch.setattr("nrl_k8s.orchestrate.ensure_dgd", _fake_ensure_dgd)
+
+        def _fake_set_suspended(job_name, namespace, *, suspended):
+            call_log.append(("resume", suspended))
+            return {}
+
+        monkeypatch.setattr("nrl_k8s.k8s.set_rayjob_suspended", _fake_set_suspended)
+
+        def _fake_wait_rc_name(job_name, namespace):
+            call_log.append(("wait_rc_name", job_name))
+            return "rc-train-xyz"
+
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.wait_for_rayjob_raycluster_name", _fake_wait_rc_name
+        )
+
+        def _fake_get_rc(name, ns):
+            if name == "rc-train-xyz":
+                return {"metadata": {"name": name, "uid": "cluster-uid"}}
+            return None
+
+        monkeypatch.setattr("nrl_k8s.k8s.get_raycluster", _fake_get_rc)
+
+        def _fake_reparent(**kwargs):
+            call_log.append(("reparent", kwargs))
+
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.replace_custom_object_owner_reference", _fake_reparent
+        )
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.delete_rayjob",
+            lambda name, ns: call_log.append(("delete_rayjob", name)),
+        )
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.wait_for_rayjob_terminal",
+            lambda *a, **kw: {
+                "status": {"jobDeploymentStatus": "Complete", "jobStatus": "SUCCEEDED"}
+            },
+        )
+
+    def test_suspends_owns_resumes_and_reparents(self, tmp_path, monkeypatch) -> None:
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(monkeypatch, call_log)
+
+        result = CliRunner().invoke(
+            cli.main, ["run", str(recipe), "--rayjob", "--no-wait"]
+        )
+
+        assert result.exit_code == 0, result.output
+        operations = [call[0] for call in call_log]
+        assert operations.index("apply_rayjob") < operations.index("wait_suspended")
+        assert operations.index("wait_suspended") < operations.index("ensure_dgd")
+        assert operations.index("ensure_dgd") < operations.index("resume")
+        assert operations.index("resume") < operations.index("wait_rc_name")
+        assert operations.index("wait_rc_name") < operations.index("reparent")
+        assert next(call[1] for call in call_log if call[0] == "apply_rayjob") is True
+        assert next(call[1] for call in call_log if call[0] == "resume") is False
+
+        _, owner_at_apply = next(
+            call[1] for call in call_log if call[0] == "ensure_dgd"
+        )
+        assert owner_at_apply["kind"] == "RayJob"
+        assert owner_at_apply["uid"] == "rayjob-uid"
+
+        reparent = next(call[1] for call in call_log if call[0] == "reparent")
+        assert reparent["plural"] == "dynamographdeployments"
+        assert reparent["expected_owner_uid"] == "rayjob-uid"
+        assert reparent["owner_ref"]["kind"] == "RayCluster"
+        assert reparent["owner_ref"]["uid"] == "cluster-uid"
+
+    def test_setup_failure_deletes_owning_rayjob(self, tmp_path, monkeypatch) -> None:
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(monkeypatch, call_log)
+        monkeypatch.setattr(
+            "nrl_k8s.orchestrate.ensure_dgd",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("dgd apply exploded")
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli.main, ["run", str(recipe), "--rayjob", "--no-wait"]
+        )
+
+        assert result.exit_code == 1
+        operations = [call[0] for call in call_log]
+        assert operations[:2] == ["apply_rayjob", "wait_suspended"]
+        assert "delete_rayjob" in operations
+        assert "resume" not in operations
+
+    def test_rayjob_apply_failure_never_creates_prerequisites(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(monkeypatch, call_log)
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.apply_rayjob",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("rayjob apply exploded")
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli.main, ["run", str(recipe), "--rayjob", "--no-wait"]
+        )
+
+        assert result.exit_code == 1
+        operations = [call[0] for call in call_log]
+        assert "ensure_dra" not in operations
+        assert "ensure_dgd" not in operations
+        # CREATE never succeeded, so a colliding RayJob must not be deleted.
+        assert "delete_rayjob" not in operations
+
+    def test_reused_dgd_is_not_reparented(self, tmp_path, monkeypatch) -> None:
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(monkeypatch, call_log, dgd_created=False)
+
+        result = CliRunner().invoke(
+            cli.main, ["run", str(recipe), "--rayjob", "--no-wait"]
+        )
+
+        assert result.exit_code == 0, result.output
+        operations = [call[0] for call in call_log]
+        assert "wait_rc_name" not in operations
+        assert "reparent" not in operations
+
+    def test_created_dra_is_reparented(self, tmp_path, monkeypatch) -> None:
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(
+            monkeypatch,
+            call_log,
+            dgd_created=False,
+            dra_results=[
+                orchestrate.EnsureDraResourceResult(
+                    kind="compute-domain", name="domain", created=True
+                )
+            ],
+        )
+
+        result = CliRunner().invoke(
+            cli.main, ["run", str(recipe), "--rayjob", "--no-wait"]
+        )
+
+        assert result.exit_code == 0, result.output
+        reparent = next(call[1] for call in call_log if call[0] == "reparent")
+        assert reparent["plural"] == "computedomains"
+        assert reparent["name"] == "domain"
+
+    def test_reparent_failure_retains_ttl_fallback(self, tmp_path, monkeypatch) -> None:
+        recipe = self._recipe_with_dgd(tmp_path)
+        call_log: list[tuple[str, object]] = []
+        self._patch_happy_path(monkeypatch, call_log)
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.replace_custom_object_owner_reference",
+            lambda **kwargs: (_ for _ in ()).throw(
+                RuntimeError("resource version changed")
+            ),
+        )
+
+        result = CliRunner().invoke(
+            cli.main, ["run", str(recipe), "--rayjob", "--no-wait"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "remains owned by RayJob" in result.output
+        assert "will be removed by its TTL" in result.output
 
 
 class TestRunCommand:
@@ -441,6 +735,7 @@ class TestRunCommand:
 
         monkeypatch.setattr("nrl_k8s.orchestrate.run", _fake_run)
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+        monkeypatch.setattr("nrl_k8s.k8s.get_rayjob", lambda name, ns: None)
 
         runner = CliRunner()
         result = runner.invoke(
@@ -481,6 +776,58 @@ class TestClusterDown:
         result = runner.invoke(cli.main, ["cluster", "down", str(recipe)])
         assert result.exit_code != 0
         assert "no resources" in result.output
+
+
+# =============================================================================
+# --target resolution — including the dynamo.<key> path
+# =============================================================================
+
+
+def _loaded_with_dynamo(tmp_path: Path):
+    """Build a LoadedConfig that has a single declared DGD."""
+    from nrl_k8s.config import LoadedConfig
+    from nrl_k8s.schema import InfraConfig
+    from omegaconf import OmegaConf
+
+    infra = InfraConfig.model_validate(
+        {
+            "namespace": "ns-a",
+            "image": "img:1",
+            "dynamo": {"serving": {"manifest": "dgd.yaml", "name": "my-dgd"}},
+        }
+    )
+    return LoadedConfig(
+        recipe=OmegaConf.create({}),
+        infra=infra,
+        source_path=tmp_path / "recipe.yaml",
+        infra_source_path=tmp_path / "infra.yaml",
+    )
+
+
+class TestResolveTargets:
+    def test_dynamo_dotted_path(self, tmp_path) -> None:
+        loaded = _loaded_with_dynamo(tmp_path)
+        results = cli._resolve_targets(loaded, ("dynamo.serving",))
+        assert len(results) == 1
+        kind, key, spec = results[0]
+        assert kind == "dynamo"
+        assert key == "serving"
+        assert spec.name == "my-dgd"
+
+    def test_dynamo_unknown_key_errors(self, tmp_path) -> None:
+        loaded = _loaded_with_dynamo(tmp_path)
+        with pytest.raises(SystemExit):
+            cli._resolve_targets(loaded, ("dynamo.nope",))
+
+    def test_empty_targets_includes_dynamo(self, tmp_path) -> None:
+        loaded = _loaded_with_dynamo(tmp_path)
+        kinds = {kind for kind, _, _ in cli._resolve_targets(loaded, ())}
+        assert "dynamo" in kinds
+
+    def test_unknown_kind_errors(self, tmp_path) -> None:
+        loaded = _loaded_with_dynamo(tmp_path)
+        with pytest.raises(SystemExit):
+            cli._resolve_targets(loaded, ("clusters.foo",))
 
 
 # =============================================================================
