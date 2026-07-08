@@ -301,6 +301,15 @@ if [[ -d "${R2E_FIXES_DIR}" ]]; then
     if [[ -f "${R2E_FIXES_DIR}/fla_utils.py" ]]; then
         MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/fla_utils.py:/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/lib/python3.13/site-packages/fla/utils.py"
     fi
+    # R2E eval env-leak fix: the harness python env leaked into testbed
+    # subprocesses (testbed py3.8 pytest imported the harness's py3.12
+    # typing_extensions -> AttributeError at pytest startup -> EVERY
+    # evaluation scored resolved=false; 323/323 in one sampled batch = the
+    # true root cause of all-zero advantages). The patched LocalRuntime
+    # sanitizes the subprocess env and strips leaked .pth entries.
+    if [[ -f "${R2E_FIXES_DIR}/r2e_local_runtime.py" ]]; then
+        MOUNTS="${MOUNTS},${R2E_FIXES_DIR}/r2e_local_runtime.py:${CONTAINER_REPO_LOCATION}/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/swe_r2e_gym_setup/R2E-Gym/src/r2egym/agenthub/runtime/local.py"
+    fi
 fi
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
