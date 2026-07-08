@@ -7,7 +7,10 @@ NUM_NODES=4
 STEPS_PER_RUN=30
 MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=90
+# Note: This test's runtime variance is large: it depends on how many steps have rollouts whose
+# seqlen actually reaches 256k. In practice runs finish within ~2 hours; the
+# 4-hour cap is a safety margin for the worst case.
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
