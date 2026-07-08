@@ -256,7 +256,12 @@ class _TrainerStateRecorder:
     """
 
     def __init__(self):
+        # The merged split API carries no step identifier (one step open at
+        # a time; begin raises on double-begin). The recorder synthesizes
+        # sequential labels ("step-0000", ...) so tests can still count and
+        # order steps in the ledger.
         self._open_step_id: str | None = None
+        self._steps_begun = 0
         self._trainer_version = 0
         self._train_start_times: list[float] = []
         self._microbatch_calls: list[tuple[str, list[str], float]] = []
@@ -265,32 +270,25 @@ class _TrainerStateRecorder:
         self._prepare_logprobs_calls: list[tuple[list[str], bool, bool]] = []
         self._last_advantages: torch.Tensor | None = None
 
-    def begin(self, step_id: str) -> None:
+    def begin(self) -> None:
         if self._open_step_id is not None:
             raise RuntimeError(
                 f"begin_train_step called while step {self._open_step_id} is open"
             )
-        self._open_step_id = step_id
+        self._open_step_id = f"step-{self._steps_begun:04d}"
+        self._steps_begun += 1
 
-    def microbatch(self, step_id: str, sample_ids: list[str]) -> None:
+    def microbatch(self, sample_ids: list[str]) -> None:
         if self._open_step_id is None:
-            raise RuntimeError("train_microbatch_from_meta called with no open step")
-        if step_id != self._open_step_id:
-            raise RuntimeError(
-                f"train_microbatch_from_meta step_id={step_id!r} != open {self._open_step_id!r}"
-            )
+            raise RuntimeError("train_microbatches_from_meta called with no open step")
         now = time.monotonic()
-        self._microbatch_calls.append((step_id, list(sample_ids), now))
+        self._microbatch_calls.append((self._open_step_id, list(sample_ids), now))
         self._train_start_times.append(now)
 
-    def finish(self, step_id: str) -> dict:
+    def finish(self) -> dict:
         if self._open_step_id is None:
             raise RuntimeError("finish_train_step called with no open step")
-        if step_id != self._open_step_id:
-            raise RuntimeError(
-                f"finish_train_step step_id={step_id!r} != open {self._open_step_id!r}"
-            )
-        self._finish_calls.append(step_id)
+        self._finish_calls.append(self._open_step_id)
         self._open_step_id = None
         self._trainer_version += 1
         # NOTE: real backends (TQPolicy, MegatronPolicyWorker) do not emit a
@@ -298,8 +296,10 @@ class _TrainerStateRecorder:
         # _trainer_version only for assertions in tests.
         return {"loss": 1.0 / (self._trainer_version + 1)}
 
-    def abort(self, step_id: str) -> None:
-        self._abort_calls.append(step_id)
+    def abort(self) -> None:
+        # Mirrors the worker: idempotent no-op when no step is open.
+        if self._open_step_id is not None:
+            self._abort_calls.append(self._open_step_id)
         self._open_step_id = None
 
     def prepare_logprobs(
@@ -375,16 +375,15 @@ class DryRunTrainer:
 
     def begin_train_step(
         self,
-        step_id: str,
         loss_fn: Any = None,
         gbs: int = 0,
         mbs: int = 0,
     ) -> None:
         del loss_fn, gbs, mbs
-        ray.get(self._rec.begin.remote(step_id))
+        ray.get(self._rec.begin.remote())
 
-    def train_microbatch_from_meta(self, step_id: str, meta: KVBatchMeta) -> None:
-        ray.get(self._rec.microbatch.remote(step_id, list(meta.sample_ids)))
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
+        ray.get(self._rec.microbatch.remote(list(meta.sample_ids)))
         if self._expect_advantages:
             data = ray.get(
                 self._dp_client.get_samples.remote(
@@ -399,11 +398,11 @@ class DryRunTrainer:
         if self._microbatch_latency_s > 0:
             time.sleep(self._microbatch_latency_s)
 
-    def finish_train_step(self, step_id: str) -> dict:
-        return ray.get(self._rec.finish.remote(step_id))
+    def finish_train_step(self) -> dict:
+        return ray.get(self._rec.finish.remote())
 
-    def abort_train_step(self, step_id: str) -> None:
-        ray.get(self._rec.abort.remote(step_id))
+    def abort_train_step(self) -> None:
+        ray.get(self._rec.abort.remote())
 
     def prepare_logprobs_from_meta(
         self,
@@ -1061,12 +1060,11 @@ class TestStreamingTrainPump:
         assert result["train_steps"] == 1
         # trainer_version should be 1 (one finish_train_step call)
         assert trainer.get_trainer_version() == 1
-        # finish was called exactly once
-        finishes = trainer.get_finish_calls()
-        # SC step_id now carries a mini-batch suffix. With the default
+        # finish was called exactly once. With the default
         # train_global_batch_size (coerced to samples_per_step), there's
-        # exactly one mini-batch per outer step → suffix "-mb-00".
-        assert finishes == ["sc-step-000000-mb-00"]
+        # exactly one mini-batch (= one begin/finish cycle) per outer step.
+        finishes = trainer.get_finish_calls()
+        assert finishes == ["step-0000"]
         mbs = trainer.get_microbatch_calls()
         assert len(mbs) == 4
 
@@ -1158,18 +1156,18 @@ class TestStreamingTrainPump:
             task_name="train",
             sample_ids=["a", "b"],
         )
-        trainer.begin_train_step("step-x")
-        trainer.train_microbatch_from_meta("step-x", meta)
-        trainer.train_microbatch_from_meta("step-x", meta)
-        trainer.abort_train_step("step-x")
+        trainer.begin_train_step()
+        trainer.train_microbatches_from_meta(meta)
+        trainer.train_microbatches_from_meta(meta)
+        trainer.abort_train_step()
         assert trainer.get_open_step_id() is None
         # New begin must succeed
-        trainer.begin_train_step("step-y")
-        assert trainer.get_open_step_id() == "step-y"
+        trainer.begin_train_step()
+        assert trainer.get_open_step_id() == "step-0001"
         # Idempotent: a second abort on a closed step also clears (no raise)
-        trainer.abort_train_step("step-y")
+        trainer.abort_train_step()
         assert trainer.get_open_step_id() is None
-        trainer.abort_train_step("step-y")
+        trainer.abort_train_step()
         assert trainer.get_open_step_id() is None
 
     def test_empty_step_is_no_op(self, ray_init):
@@ -1329,10 +1327,7 @@ class TestStreamingTrainPump:
         assert result["train_steps"] == 1
         # 2 opt.steps → 2 finish calls → trainer_version advanced twice.
         assert result["trainer_version"] == 2
-        assert trainer.get_finish_calls() == [
-            "sc-step-000000-mb-00",
-            "sc-step-000000-mb-01",
-        ]
+        assert trainer.get_finish_calls() == ["step-0000", "step-0001"]
         mbs = trainer.get_microbatch_calls()
         assert len(mbs) == 4
         dispatched_ids = set()

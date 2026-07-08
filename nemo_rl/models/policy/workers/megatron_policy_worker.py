@@ -2540,7 +2540,7 @@ class MegatronPolicyWorkerImpl(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"),
     # max_concurrency=1 is load-bearing: the split-API state machine
     # (_train_step_state mutations in begin/microbatch/finish/abort) is not
-    # thread-safe. SingleController submits train_microbatch_from_meta
+    # thread-safe. SingleController submits train_microbatches_from_meta
     # without awaiting and relies on actor-mailbox serialization. Do not
     # change without auditing _train_step_state mutation sites.
     max_concurrency=1,

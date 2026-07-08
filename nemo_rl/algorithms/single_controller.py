@@ -494,13 +494,13 @@ class SingleControllerActor:
         Per step:
           - Lazy ``begin_train_step`` on first ready group.
           - Per ready group: optional ``prepare_logprobs_from_meta`` →
-            ``_advantage_stage`` → ``train_microbatch_from_meta``.
+            ``_advantage_stage`` → ``train_microbatches_from_meta``.
           - End-of-step: ``finish_train_step`` →
             single ``clear_samples`` → ``_sync_weights``.
 
         **Concurrency contract:**
-        ``self._trainer`` is a driver-side ``TQPolicy`` object (no
-        ``PolicyTrainerActor`` wrapper). Trainer calls run via
+        ``self._trainer`` is a driver-side ``TQPolicy`` object, not a Ray
+        actor. Trainer calls run via
         ``asyncio.to_thread`` and are awaited sequentially, so the worker's
         ``_train_step_state`` accumulators (``local_valid_seqs +=``,
         ``mb_losses.append``, ``all_mb_metrics.append``), which are not
@@ -610,14 +610,12 @@ class SingleControllerActor:
                             # owns only loss_fn (stable across the whole run).
                             await asyncio.to_thread(
                                 self._trainer.begin_train_step,
-                                step_id,
                                 self._loss_fn,
                             )
                             step_open = True
 
                         await asyncio.to_thread(
-                            self._trainer.train_microbatch_from_meta,
-                            step_id,
+                            self._trainer.train_microbatches_from_meta,
                             group_meta,
                         )
                         groups_dispatched += 1
@@ -649,7 +647,7 @@ class SingleControllerActor:
                     # train_results for the logger emit below.
                     with self._timed("policy_training"):
                         train_results = await asyncio.to_thread(
-                            self._trainer.finish_train_step, step_id
+                            self._trainer.finish_train_step
                         )
                 except Exception:
                     # Worker may be left with a half-open step (train_microbatch
@@ -659,9 +657,7 @@ class SingleControllerActor:
                     # abort errors so the original exception still surfaces.
                     if step_open:
                         try:
-                            await asyncio.to_thread(
-                                self._trainer.abort_train_step, step_id
-                            )
+                            await asyncio.to_thread(self._trainer.abort_train_step)
                         except Exception:
                             log.exception(
                                 "abort_train_step failed during error recovery "
