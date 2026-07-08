@@ -74,11 +74,11 @@ uv run --no-project use_existing_torch.py
 # Install dependencies
 echo "Installing dependencies..."
 uv pip install --upgrade pip
-# scikit_build_core + nanobind: build backend/deps for xgrammar (a vllm runtime dep
-# vllm pins to an exact version that may lack a prebuilt wheel here); needed since
-# -e . below runs with --no-build-isolation, which builds vllm's deps against this
-# venv's packages instead of isolated per-package build envs.
-uv pip install numpy setuptools setuptools_scm setuptools_rust scikit_build_core nanobind
+# scikit_build_core: build backend for xgrammar (a vllm runtime dep vllm pins to an
+# exact version that may lack a prebuilt wheel here); needed since -e . below runs
+# with --no-build-isolation, which builds vllm's deps against this venv's packages
+# instead of isolated per-package build envs.
+uv pip install numpy setuptools setuptools_scm setuptools_rust scikit_build_core
 uv pip install torch==2.10.0 --torch-backend=cu129
 
 # Install vLLM using precompiled wheel
