@@ -38,6 +38,7 @@ class TrtllmSpecificArgs(TypedDict):
     moe_expert_parallel_size: NotRequired[int]
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    default_chat_template_kwargs: NotRequired[dict[str, Any]]
 
 
 class TrtllmConfig(GenerationConfig):

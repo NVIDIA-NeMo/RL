@@ -259,7 +259,7 @@ Depending on your data shape, you may want to change these values."""
         self,
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
-        timer_prefix: str = "nemo_gym",
+        timer_prefix: str,
     ) -> list[dict]:
         timer = Timer()
 
@@ -447,15 +447,6 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict or not output_item_dict["generation_token_ids"]:
 >>>>>>> 1c171adc5 (fix empty gen token case)
                 continue
-
-            _prompt_ids = output_item_dict["prompt_token_ids"]
-            _seen_len = len(seen_token_ids)
-            if seen_token_ids and seen_token_ids != _prompt_ids[:_seen_len]:
-                # Find first diverging position for diagnosis
-                _first_diff = next(
-                    (i for i, (a, b) in enumerate(zip(seen_token_ids, _prompt_ids)) if a != b),
-                    min(_seen_len, len(_prompt_ids)),
-                )
 
             assert (
                 seen_token_ids

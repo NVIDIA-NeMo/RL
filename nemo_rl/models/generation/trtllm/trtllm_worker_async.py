@@ -151,10 +151,6 @@ class TrtllmAsyncGenerationWorkerImpl:
             tensor_parallel_size=tp_size,
             dtype=precision,
             max_seq_len=trtllm_cfg["max_model_len"],
-            # vLLM accepts prompts up to max_model_len (no separate input cap; it clamps output so
-            # input+output <= max_model_len). TRT-LLM defaults max_input_len=1024, which rejects long
-            # SWE-agent prompts before any tokens generate -> NeMo Gym sees "no generation data".
-            # Match the input cap to the context window so it isn't the bottleneck.
             max_input_len=trtllm_cfg["max_model_len"],
             orchestrator_type="ray",
             ray_worker_extension_cls="nemo_rl.models.generation.trtllm.trtllm_backend.NcclExtension",
@@ -238,6 +234,7 @@ class TrtllmAsyncGenerationWorkerImpl:
 
     def shutdown(self) -> bool:
         try:
+            self.stop_http_server()
             if self.llm is not None:
                 del self.llm
                 self.llm = None
@@ -247,6 +244,48 @@ class TrtllmAsyncGenerationWorkerImpl:
         except Exception as e:
             print(f"Error during TRT-LLM shutdown: {e}")
             return False
+
+    # ------------------------------------------------------------------ #
+    #  HTTP server for NeMo Gym
+    # ------------------------------------------------------------------ #
+
+    def start_http_server(self, port: int = 0) -> str:
+        """Start an OpenAI-compatible HTTP server backed by ``self.llm``."""
+        if self._http_base_url is not None:
+            return self._http_base_url
+
+        from transformers import AutoTokenizer
+
+        from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name, trust_remote_code=True,
+        )
+        self._http_thread, self._http_base_url, self._http_server = start_server(
+            llm=self.llm,
+            tokenizer=tokenizer,
+            model_name=self.model_name,
+            port=port,
+            max_seq_len=self.cfg["trtllm_cfg"]["max_model_len"],
+            default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
+                "default_chat_template_kwargs"
+            ),
+        )
+        print(
+            f"[TrtllmAsyncWorker] HTTP server started: {self._http_base_url}",
+            flush=True,
+        )
+        return self._http_base_url
+
+    def stop_http_server(self) -> None:
+        if self._http_server is not None:
+            self._http_server.should_exit = True
+            self._http_server = None
+            self._http_thread = None
+            self._http_base_url = None
+
+    async def report_dp_openai_server_base_url(self) -> Optional[str]:
+        return self._http_base_url
 
     # ------------------------------------------------------------------ #
     #  Collective RPC / refit
