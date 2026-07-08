@@ -2040,6 +2040,20 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         vllm_http_server_generated_token["token"].removeprefix("token_id:")
     )
 
+    # A prompt tokenized by this server can be reused directly by the next
+    # generation request. The chat conversation is still rendered for response
+    # and tool parsing, but prompt encoding is bypassed.
+    response = requests.post(
+        url=f"{base_urls[0]}/chat/completions",
+        json=body | {"required_full_prompt_token_ids": initial_tokenized_query_ids},
+    )
+    reused_prompt_result = response.json()
+    reused_prompt_generated_token_id = int(
+        reused_prompt_result["choices"][0]["logprobs"]["content"][0][
+            "token"
+        ].removeprefix("token_id:")
+    )
+
     async for _, generate_result in vllm_generation.generate_async(
         BatchedDataDict[GenerationDatumSpec](
             {
@@ -2056,6 +2070,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
 
     # We just check the first token here to check the alignment
     assert vllm_http_server_generated_token_id == generate_generated_token_id
+    assert reused_prompt_generated_token_id == generate_generated_token_id
 
     # Clean up
     vllm_generation.shutdown()

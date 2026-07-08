@@ -24,6 +24,10 @@ class StreamingToolCallConfig(TypedDict):
         enabled: Whether streaming tool-call prefill endpoints are enabled.
             The recommended default is false until the full environment path is
             configured.
+        tokenizer_only: Whether to repeatedly tokenize cumulative partial tool
+            output without creating a streaming prefill request. This is an
+            instrumentation mode for isolating tokenizer effects, not a
+            stateful incremental encoder; the recommended default is false.
         max_sessions: Maximum number of concurrent prefill sessions per vLLM
             replica. The recommended default is 256.
         session_ttl_seconds: Idle lifetime of a prefill session before cleanup.
@@ -46,6 +50,7 @@ class StreamingToolCallConfig(TypedDict):
     """
 
     enabled: bool
+    tokenizer_only: bool
     max_sessions: int
     session_ttl_seconds: float
     stability_margin_tokens: int

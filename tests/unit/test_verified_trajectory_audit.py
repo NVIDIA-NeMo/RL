@@ -18,13 +18,16 @@ from copy import deepcopy
 import pytest
 
 from examples.swe_bench.verified_trajectory_audit import (
+    PERF_FIELDS,
     SWE_BENCH_VERIFIED,
     AuditError,
     build_no_timeout_manifest,
+    build_prefix_manifest,
     build_subset_manifest,
     canonical_json_sha256,
     canonical_trajectory_sha256,
     compare_arms,
+    is_infrastructure_error,
     overlay_result_rows,
     read_result_jsonl,
     validate_manifest,
@@ -146,7 +149,7 @@ def test_read_result_jsonl_projects_large_trajectory_fields(tmp_path) -> None:
             "responses_create_params": projected_params,
             "reward": 0,
             "resolved": False,
-            "infrastructure_error": True,
+            "infrastructure_error": False,
             "response_error": False,
             "trajectory_sha256": canonical_trajectory_sha256(row),
             "model_patch_available": True,
@@ -154,26 +157,25 @@ def test_read_result_jsonl_projects_large_trajectory_fields(tmp_path) -> None:
             "model_patch_sha256": canonical_json_sha256(row["model_patch"]),
             "response": None,
             "instance_config": None,
-            **{
-                field: row.get(field)
-                for field in (
-                    "total_model_call_time",
-                    "openhands_run_time",
-                    "total_command_exec_time",
-                    "final_eval_time",
-                    "total_prompt_tokens",
-                    "total_completion_tokens",
-                    "num_turns",
-                    "num_tool_calls",
-                    "streaming_tool_call_eligible_actions",
-                    "streaming_tool_call_sessions_started",
-                    "streaming_tool_call_prefill_requests",
-                    "streaming_tool_call_prefill_tokens",
-                    "streaming_tool_call_overhead_seconds",
-                )
-            },
+            **{field: row.get(field) for field in PERF_FIELDS},
         }
     ]
+
+
+def test_infrastructure_error_ignores_agent_command_output() -> None:
+    row = result_row("owner__repo-1", 0)
+    row["response"]["output"] = ["Temporary failure in name resolution"]
+
+    assert is_infrastructure_error(row) is False
+
+
+def test_infrastructure_error_reads_response_error() -> None:
+    row = result_row("owner__repo-1", 0)
+    row["response"]["error"] = {
+        "message": "Container not found",
+    }
+
+    assert is_infrastructure_error(row) is True
 
 
 def test_read_result_jsonl_counts_function_calls_when_metric_is_missing(
@@ -286,6 +288,32 @@ def test_build_subset_manifest_is_hash_ranked_and_order_independent(tmp_path) ->
     assert first_metadata["selection"] == second_metadata["selection"]
     assert first_metadata["selection"]["method"] == "sha256_ranked_instance_id"
     assert first_metadata["rows"] == 2
+
+
+def test_build_prefix_manifest_preserves_source_order(tmp_path) -> None:
+    rows = [
+        manifest_row("owner__repo-3"),
+        manifest_row("owner__repo-1"),
+        manifest_row("owner__repo-2"),
+    ]
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    output = tmp_path / "prefix.jsonl"
+
+    metadata = build_prefix_manifest(
+        manifest,
+        output,
+        expected_count=3,
+        prefix_count=2,
+    )
+
+    output_rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["instance_id"] for row in output_rows] == [
+        "owner__repo-3",
+        "owner__repo-1",
+    ]
+    assert metadata["selection"]["method"] == "source_order_prefix"
+    assert metadata["rows"] == 2
 
 
 def test_canonical_trajectory_hash_ignores_request_local_ids() -> None:

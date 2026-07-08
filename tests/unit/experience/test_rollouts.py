@@ -101,6 +101,17 @@ class TestCalculateSingleMetric:
 
         assert result["test/stddev"] == 0.0
 
+    def test_requested_count_metric_includes_total(self):
+        result = _calculate_single_metric(
+            [2.0, 3.0],
+            batch_size=2,
+            key_name="swe_agent/num_tool_calls",
+            include_total=True,
+        )
+
+        assert result["swe_agent/num_tool_calls/mean"] == 2.5
+        assert result["swe_agent/num_tool_calls/total"] == 5.0
+
 
 class TestPct:
     """Unit tests for pct percentile helper."""
@@ -943,6 +954,13 @@ def test_run_async_nemo_gym_rollout(
     )
     for row in rows:
         assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
+    assert actual_result.rollout_metrics["timing/rollout/batch_prompt_count"] == len(
+        rows
+    )
+    assert (
+        actual_result.rollout_metrics["timing/rollout/batch_e2e_end_time_unix_s"]
+        >= actual_result.rollout_metrics["timing/rollout/batch_e2e_start_time_unix_s"]
+    )
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
 
@@ -968,6 +986,9 @@ def test_run_async_nemo_gym_rollout(
             # core metrics
             "timing/rollout/total": 0.0,
             "timing/rollout/run_rollouts": 0.0,
+            "timing/rollout/batch_e2e_start_time_unix_s": 0.0,
+            "timing/rollout/batch_e2e_end_time_unix_s": 0.0,
+            "timing/rollout/batch_prompt_count": 2,
             "timing/rollout/await_results": 0.0,
             "timing/rollout/postprocess_results": 0.0,
             "timing/rollout/postprocess_results_pct": 0.0,

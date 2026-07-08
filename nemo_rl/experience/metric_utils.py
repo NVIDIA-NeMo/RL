@@ -22,7 +22,10 @@ from wandb import Histogram
 
 
 def calculate_single_metric(
-    values: Sequence[float | int], batch_size: int, key_name: str
+    values: Sequence[float | int],
+    batch_size: int,
+    key_name: str,
+    include_total: bool = False,
 ) -> dict:
     """Compute summary statistics for a metric as slash-prefixed keys.
 
@@ -30,11 +33,12 @@ def calculate_single_metric(
         values: Per-sample metric values to aggregate.
         batch_size: Denominator for the mean (sum(values) / batch_size, not len(values)); stddev still uses len(values).
         key_name: Prefix for the returned metric keys (e.g. "total_reward").
+        include_total: Whether to include the sum as ``{key_name}/total``.
 
     Returns:
         Dict mapping "{key_name}/{stat}" to its value for stat in mean, max, min, median, stddev (nan for a single value), and histogram (a wandb.Histogram).
     """
-    return {
+    metrics = {
         f"{key_name}/mean": sum(values) / batch_size,
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
@@ -42,6 +46,9 @@ def calculate_single_metric(
         f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
         f"{key_name}/histogram": Histogram(values),
     }
+    if include_total:
+        metrics[f"{key_name}/total"] = sum(values)
+    return metrics
 
 
 def pct(values: Sequence[float | int], p: float) -> float:

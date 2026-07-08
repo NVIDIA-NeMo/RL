@@ -334,6 +334,13 @@ design-docs/streaming-tool-call-bug-report.md
 ```
 
 ```{toctree}
+:caption: Evaluation Reports
+:hidden:
+
+streaming-tool-call-evaluation.md
+```
+
+```{toctree}
 :caption: API Reference
 
 apidocs/index
