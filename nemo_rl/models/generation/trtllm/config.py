@@ -41,6 +41,7 @@ class TrtllmSpecificArgs(TypedDict):
     # grpo.async_grpo so they cannot diverge).
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    default_chat_template_kwargs: NotRequired[dict[str, Any]]
 
 
 class TrtllmConfig(GenerationConfig):
