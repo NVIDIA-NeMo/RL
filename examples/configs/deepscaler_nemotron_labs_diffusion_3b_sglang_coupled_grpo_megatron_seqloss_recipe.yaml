@@ -21,7 +21,7 @@
 # Still-open gaps vs DiffuCoder (see tools/nemotron_diffusion/coupled_diffugrpo_gaps.md):
 # EMA-synced reference, num_iterations(mu)=2 + wider epsilon clip, and the coupled logprob
 # 1/t weighting + fully-masked averaging.
-defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron.yaml"
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron_bs16.yaml"
 
 loss_fn:
   token_level_loss: false

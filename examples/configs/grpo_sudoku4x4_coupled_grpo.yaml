@@ -4,7 +4,7 @@
 # ESPO (coupled uses paired-row microbatching; a smoke should confirm 8 divides
 # the per-rank batch). Node count matches ESPO (its sibling).
 defaults:
-  - deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron.yaml
+  - deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron_bs16.yaml
   - grpo_sudoku4x4_base.yaml
 
 checkpointing:

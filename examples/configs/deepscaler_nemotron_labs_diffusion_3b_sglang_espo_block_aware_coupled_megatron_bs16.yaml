@@ -44,7 +44,7 @@
 # sequence-level (ESPO) formulation. Starts KL-free (reference_policy_kl_penalty:
 # 0); raise beta later (the k2 is on the NORMALIZED ELBO, off the paper's raw
 # L_hat by a 1/L^2 constant absorbed into beta).
-defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron.yaml"
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron_bs16.yaml"
 
 policy:
   worker_cls_fqn: "nemo_rl.models.policy.workers.espo_megatron_policy_worker.ESPOMegatronPolicyWorker"

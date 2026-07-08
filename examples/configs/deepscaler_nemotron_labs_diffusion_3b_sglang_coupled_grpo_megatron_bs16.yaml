@@ -10,16 +10,23 @@
 #
 # Inherits the DiffuGRPO config for the shared diffusion-model setup (SGLang
 # FastDiffuser generation, sequence budget, KL setting, batch / cluster numbers,
-# bf16 policy). CoupledGRPO does NOT change generation or the model block_size --
-# only the policy worker and the logprob estimator are swapped. The estimator
-# uses the model's (default) block_size for noisy-side block padding, inherited
-# automatically. The per-row mask seed is set in grpo.py as
+# bf16 policy). This is the block_size-16 CoupledGRPO base (renamed to _bs16 to
+# match ESPO): the model block_size is overridden to 16 and the FastDiffuser
+# decode uses the block_size-16 final_step config, so training, noisy-side
+# block padding, and generation all agree at 16. The per-row mask seed is set in grpo.py as
 # seed_base + step * 1_000_003 + row_index, so prev/reference/training logprobs
 # share one realization within a step and the mask resamples each step.
 defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_diffugrpo_megatron.yaml"
 
 policy:
   worker_cls_fqn: "nemo_rl.models.policy.workers.coupled_grpo_megatron_policy_worker.CoupledGRPOMegatronPolicyWorker"
+
+  # block_size 16 (matches ESPO's bs16). Overriding the model block_size re-runs
+  # the one-time HF->mcore conversion under a separate cache and fixes the SGLang
+  # engine block_size (not runtime-reconfigurable) at 16 for training + validation
+  # decode. CoupledGRPO is token-level, so there is no ELBO block_size to set here.
+  hf_config_overrides:
+    block_size: 16
 
   logprob_estimation:
     type: "coupled_grpo"
@@ -48,7 +55,7 @@ policy:
   # +1 sentinel (see coupled_grpo loss kl-mask handling).
   generation:
     sglang_cfg:
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-coupled-grpo/tools/nemotron_diffusion/coupled_fastdiffuser_final_step.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/coupled_confidence_dllm_bs16.yaml"
 
 checkpointing:
   checkpoint_dir: "results/grpo-nemotron-diffusion-3b-coupled-grpo-deepscaler-megatron"
