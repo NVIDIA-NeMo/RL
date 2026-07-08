@@ -119,7 +119,7 @@ def main() -> int:
     seq_bytes = sum(v[0] for v in seq.values())
     seq_dev = sum(v[2] for v in seq.values())
 
-    print("\n==== EP4 WIRE SUMMARY ====", flush=True)
+    print(f"\n==== EP{EP_SIZE} WIRE SUMMARY ====", flush=True)
     print(f"total model bytes across {EP_SIZE} EP sources: {seq_bytes/1e9:.2f} GB", flush=True)
     print(f"per-source device rate (median) : "
           f"~{sorted(v[0]*8/v[2]/1e9 for v in seq.values())[len(seq)//2]:.0f} Gbps "
