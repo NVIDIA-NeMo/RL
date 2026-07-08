@@ -22,6 +22,7 @@ On Slurm/Ray, the same adapter can own a fixed Dynamo vLLM deployment.
 
 import asyncio
 import logging
+import threading
 import time
 import warnings
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
@@ -199,6 +200,97 @@ def _parse_dynamo_completion_response(
         generated_logprobs,
         choice.get("finish_reason") == "length",
     )
+
+
+_DEFAULT_METRICS_EXCLUDE_PREFIXES = ("python_", "process_")
+
+_DYNAMO_RUNTIME_METRIC_PREFIXES = (
+    "dynamo_component_gpu_cache_usage",
+    "dynamo_component_inflight_requests",
+    "dynamo_work_handler_queue_depth",
+    "dynamo_component_requests_total",
+    "dynamo_work_handler_time_to_first_response",
+)
+_ENGINE_PASSTHROUGH_METRIC_PREFIXES = (
+    "vllm:generation_tokens",
+    "vllm:prompt_tokens_total",
+    "vllm:inter_token_latency",
+)
+_CURATED_METRICS_INCLUDE_PREFIXES = (
+    _DYNAMO_RUNTIME_METRIC_PREFIXES + _ENGINE_PASSTHROUGH_METRIC_PREFIXES
+)
+
+_CANONICAL_LOGGER_ALIASES: dict[str, list[str]] = {
+    "inflight_batch_sizes": [
+        "dynamo_component_inflight_requests",
+        "vllm_num_requests_running",
+    ],
+    "num_pending_samples": [
+        "dynamo_work_handler_queue_depth",
+        "vllm_num_requests_waiting",
+    ],
+    "kv_cache_usage_perc": [
+        "dynamo_component_gpu_cache_usage_percent",
+        "vllm_kv_cache_usage_perc",
+        "vllm_gpu_cache_usage_perc",
+    ],
+    "generation_tokens": [
+        "vllm_generation_tokens_total",
+        "vllm_generation_tokens",
+    ],
+}
+
+
+def _http_get_text(url: str, timeout_s: float) -> Optional[str]:
+    """Return a decoded HTTP response body, or None on a transport error."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as response:
+            return response.read().decode("utf-8", "replace")
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        return None
+
+
+def _parse_prometheus_metrics(
+    text: str,
+    include_prefixes: Optional[tuple[str, ...]] = None,
+    exclude_prefixes: tuple[str, ...] = _DEFAULT_METRICS_EXCLUDE_PREFIXES,
+) -> dict[str, float]:
+    """Parse Prometheus text exposition into summed scalar metric values."""
+    metrics: dict[str, float] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "{" in line:
+            name = line[: line.index("{")]
+            try:
+                value_text = line[line.rindex("}") + 1 :]
+            except ValueError:
+                continue
+        else:
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            name, value_text = parts
+        if name.endswith(("_bucket", "_created")):
+            continue
+        if include_prefixes and not name.startswith(include_prefixes):
+            continue
+        if exclude_prefixes and name.startswith(exclude_prefixes):
+            continue
+        value_parts = value_text.split()
+        if not value_parts:
+            continue
+        try:
+            value = float(value_parts[0])
+        except ValueError:
+            continue
+        key = name.replace(":", "_")
+        metrics[key] = metrics.get(key, 0.0) + value
+    return metrics
 
 
 def _discover_worker_instances(
@@ -560,6 +652,37 @@ class DynamoGeneration(GenerationInterface):
         self._refit_discovery_kwargs: Optional[dict[str, Any]] = None
         self._refit_update_info: Optional[dict[str, Any]] = None
 
+        self._metrics_enabled = bool(vllm_cfg.get("enable_vllm_metrics_logger"))
+        self._metrics_interval_s = (
+            float(vllm_cfg["vllm_metrics_logger_interval"])
+            if self._metrics_enabled
+            else 0.0
+        )
+        dynamo_extra = dynamo_cfg.model_extra or {}
+        include_prefixes = dynamo_extra.get("metrics_include_prefixes", None)
+        self._metrics_include_prefixes: Optional[tuple[str, ...]] = (
+            tuple(include_prefixes)
+            if include_prefixes is not None
+            else _CURATED_METRICS_INCLUDE_PREFIXES
+        )
+        exclude_prefixes = dynamo_extra.get("metrics_exclude_prefixes", None)
+        self._metrics_exclude_prefixes = (
+            tuple(exclude_prefixes)
+            if exclude_prefixes is not None
+            else _DEFAULT_METRICS_EXCLUDE_PREFIXES
+        )
+        self._dynamo_logger_metrics: dict[str, dict[int, list[float]]] = {}
+        self._metrics_lock = threading.Lock()
+        self._metrics_stop: Optional[threading.Event] = None
+        self._metrics_thread: Optional[threading.Thread] = None
+        self._metrics_worker_ordinals: dict[Any, int] = {}
+        self._metrics_discovery_kwargs: Optional[dict[str, Any]] = None
+        if self._metrics_enabled and requires_k8s and dynamo_cfg.dgd_name is not None:
+            self._metrics_discovery_kwargs = self._build_worker_discovery_kwargs(
+                dynamo_cfg
+            )
+            self._start_metrics_sampler()
+
     # ------------------------------------------------------------------
     # GenerationInterface — lifecycle
     # ------------------------------------------------------------------
@@ -569,6 +692,90 @@ class DynamoGeneration(GenerationInterface):
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         return True
+
+    def _start_metrics_sampler(self) -> None:
+        stop = threading.Event()
+        self._metrics_stop = stop
+        self._metrics_thread = threading.Thread(
+            target=self._metrics_loop,
+            name="dynamo-metrics-sampler",
+            daemon=True,
+        )
+        self._metrics_thread.start()
+
+    def _metrics_worker_ordinal(self, instance_id: Any) -> int:
+        ordinal = self._metrics_worker_ordinals.get(instance_id)
+        if ordinal is None:
+            ordinal = len(self._metrics_worker_ordinals)
+            self._metrics_worker_ordinals[instance_id] = ordinal
+        return ordinal
+
+    def _metrics_loop(self) -> None:
+        stop = self._metrics_stop
+        discovery_kwargs = self._metrics_discovery_kwargs
+        assert stop is not None and discovery_kwargs is not None
+
+        stop.wait(min(2.0, self._metrics_interval_s))
+        workers: list[dict[str, Any]] = []
+        last_discovery = 0.0
+        while not stop.is_set():
+            now = time.monotonic()
+            if not workers or now - last_discovery > 5.0:
+                try:
+                    discovered_workers = _discover_worker_instances(**discovery_kwargs)
+                except _WorkerDiscoveryError as error:
+                    LOGGER.warning("Dynamo metrics worker discovery failed: %s", error)
+                else:
+                    workers = discovered_workers
+                    last_discovery = now
+
+            for worker in workers:
+                text = _http_get_text(
+                    f"{worker['system_url']}/metrics",
+                    timeout_s=self._metrics_interval_s + 2.0,
+                )
+                if not text:
+                    continue
+                metrics = _parse_prometheus_metrics(
+                    text,
+                    self._metrics_include_prefixes,
+                    self._metrics_exclude_prefixes,
+                )
+                ordinal = self._metrics_worker_ordinal(worker["instance_id"])
+                with self._metrics_lock:
+                    for name, value in metrics.items():
+                        self._dynamo_logger_metrics.setdefault(name, {}).setdefault(
+                            ordinal, []
+                        ).append(value)
+            stop.wait(self._metrics_interval_s)
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Return per-worker Dynamo metric timelines for generation logging."""
+        if not getattr(self, "_metrics_enabled", False):
+            return {}
+        with self._metrics_lock:
+            metrics = {
+                name: {
+                    worker_id: list(samples)
+                    for worker_id, samples in worker_metrics.items()
+                }
+                for name, worker_metrics in self._dynamo_logger_metrics.items()
+            }
+        for alias, sources in _CANONICAL_LOGGER_ALIASES.items():
+            if alias in metrics:
+                continue
+            source = next((name for name in sources if name in metrics), None)
+            metrics[alias] = dict(metrics[source]) if source is not None else {}
+            if source is not None:
+                del metrics[source]
+        return metrics
+
+    def clear_logger_metrics(self) -> None:
+        """Clear the Dynamo metric timelines for the next logging window."""
+        if not getattr(self, "_metrics_enabled", False):
+            return
+        with self._metrics_lock:
+            self._dynamo_logger_metrics = {}
 
     def _build_worker_discovery_kwargs(self, dynamo_cfg: DynamoCfg) -> dict[str, Any]:
         """Build worker-discovery arguments for NCCL refit."""
@@ -643,7 +850,10 @@ class DynamoGeneration(GenerationInterface):
         return len(self._get_refit_workers()) * engine_world_size
 
     def shutdown(self) -> bool:
-        """Stop process-local wrappers and any driver-owned managed runtime."""
+        """Stop process-local helpers and any driver-owned managed runtime."""
+        metrics_stop = getattr(self, "_metrics_stop", None)
+        if metrics_stop is not None:
+            metrics_stop.set()
         token_wrapper_server = self._token_wrapper_server
         if token_wrapper_server is not None:
             token_wrapper_server.shutdown()

@@ -1135,3 +1135,152 @@ def test_generate_async_rejects_multi_sample_batch(monkeypatch):
 
     with pytest.raises(AssertionError, match="single samples"):
         asyncio.run(collect())
+
+
+# ---------------------------------------------------------------------------
+# Dynamo engine telemetry.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_prometheus_metrics_sanitizes_and_sums_labels():
+    text = (
+        "# HELP vllm:num_requests_running running\n"
+        'vllm:num_requests_running{model="x"} 3.0\n'
+        'vllm:request_success_total{reason="stop"} 5\n'
+        'vllm:request_success_total{reason="length"} 3\n'
+        'dynamo_component_kv_cache_hit_rate{dp_rank="0"} 0.42\n'
+    )
+
+    metrics = _dynmod._parse_prometheus_metrics(text)
+
+    assert metrics["vllm_num_requests_running"] == 3.0
+    assert metrics["vllm_request_success_total"] == 8.0
+    assert metrics["dynamo_component_kv_cache_hit_rate"] == 0.42
+    assert all(":" not in name for name in metrics)
+
+
+def test_parse_prometheus_metrics_filters_non_scalar_samples():
+    text = (
+        'vllm:ttft_seconds_bucket{le="0.1"} 5\n'
+        "vllm:ttft_seconds_sum 1.5\n"
+        "vllm:ttft_seconds_count 10\n"
+        "vllm:generation_tokens_created 1.749e9\n"
+        'python_gc_objects_collected_total{generation="0"} 100\n'
+        "process_cpu_seconds_total 1.5\n"
+        "dynamo_component_requests_total 2\n"
+    )
+
+    metrics = _dynmod._parse_prometheus_metrics(text)
+
+    assert metrics == {
+        "vllm_ttft_seconds_sum": 1.5,
+        "vllm_ttft_seconds_count": 10.0,
+        "dynamo_component_requests_total": 2.0,
+    }
+
+
+def test_parse_prometheus_metrics_include_and_exclude_prefixes():
+    text = "vllm:foo 1\ndynamo_component_keep 2\ndynamo_component_drop 3\n"
+
+    metrics = _dynmod._parse_prometheus_metrics(
+        text,
+        include_prefixes=("dynamo_component_",),
+        exclude_prefixes=("dynamo_component_drop",),
+    )
+
+    assert metrics == {"dynamo_component_keep": 2.0}
+
+
+def test_parse_prometheus_metrics_skips_malformed_lines():
+    text = "garbage\nname_only\nmissing_brace{value 1\nnot_numeric nope\nok 1\n"
+    assert _dynmod._parse_prometheus_metrics(text) == {"ok": 1.0}
+
+
+def test_http_get_text_returns_none_on_transport_error(monkeypatch):
+    def raise_url_error(*args, **kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", raise_url_error)
+
+    assert _dynmod._http_get_text("http://worker:9090/metrics", 1.0) is None
+
+
+def test_logger_metrics_disabled_by_default(in_k8s, stub_namespace):
+    generation = DynamoGeneration(cluster=None, config=_base_config())
+
+    assert generation.get_logger_metrics() == {}
+    generation.clear_logger_metrics()
+    assert generation.get_logger_metrics() == {}
+
+
+def test_logger_metrics_enabled_shape_copy_and_clear(
+    in_k8s, stub_namespace, monkeypatch
+):
+    monkeypatch.setattr(DynamoGeneration, "_start_metrics_sampler", lambda self: None)
+    cfg = _base_config(
+        metrics_include_prefixes=[],
+        metrics_exclude_prefixes=[],
+    )
+    cfg["vllm_cfg"] = {  # type: ignore[typeddict-item]
+        "enable_vllm_metrics_logger": True,
+        "vllm_metrics_logger_interval": 0.5,
+    }
+
+    generation = DynamoGeneration(cluster=None, config=cfg)
+
+    assert generation._metrics_include_prefixes == ()
+    assert generation._metrics_exclude_prefixes == ()
+    with generation._metrics_lock:
+        generation._dynamo_logger_metrics = {"custom_metric": {0: [1.0, 2.0], 1: [3.0]}}
+
+    metrics = generation.get_logger_metrics()
+    assert metrics["custom_metric"] == {0: [1.0, 2.0], 1: [3.0]}
+    metrics["custom_metric"][0].append(999.0)
+    assert generation.get_logger_metrics()["custom_metric"][0] == [1.0, 2.0]
+
+    generation.clear_logger_metrics()
+    assert "custom_metric" not in generation.get_logger_metrics()
+
+
+def test_logger_metrics_canonical_aliases_drop_raw_sources(
+    in_k8s, stub_namespace, monkeypatch
+):
+    monkeypatch.setattr(DynamoGeneration, "_start_metrics_sampler", lambda self: None)
+    cfg = _base_config()
+    cfg["vllm_cfg"] = {  # type: ignore[typeddict-item]
+        "enable_vllm_metrics_logger": True,
+        "vllm_metrics_logger_interval": 0.5,
+    }
+    generation = DynamoGeneration(cluster=None, config=cfg)
+
+    with generation._metrics_lock:
+        generation._dynamo_logger_metrics = {
+            "dynamo_component_inflight_requests": {0: [3.0, 4.0]},
+            "dynamo_work_handler_queue_depth": {0: [1.0]},
+            "dynamo_component_gpu_cache_usage_percent": {0: [0.5]},
+            "vllm_generation_tokens_total": {0: [100.0]},
+        }
+
+    metrics = generation.get_logger_metrics()
+
+    assert metrics["inflight_batch_sizes"] == {0: [3.0, 4.0]}
+    assert metrics["num_pending_samples"] == {0: [1.0]}
+    assert metrics["kv_cache_usage_perc"] == {0: [0.5]}
+    assert metrics["generation_tokens"] == {0: [100.0]}
+    assert "dynamo_component_inflight_requests" not in metrics
+
+
+def test_pickle_roundtrip_with_metrics_enabled(in_k8s, stub_namespace, monkeypatch):
+    monkeypatch.setattr(DynamoGeneration, "_start_metrics_sampler", lambda self: None)
+    cfg = _base_config()
+    cfg["vllm_cfg"] = {  # type: ignore[typeddict-item]
+        "enable_vllm_metrics_logger": True,
+        "vllm_metrics_logger_interval": 0.5,
+    }
+    generation = DynamoGeneration(cluster=None, config=cfg)
+
+    restored = pickle.loads(pickle.dumps(generation))
+
+    assert restored.get_logger_metrics() == {}
+    restored.clear_logger_metrics()
+    assert restored.shutdown() is True
