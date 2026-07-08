@@ -37,6 +37,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    VllmGenerationWorkerImpl,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -171,6 +172,38 @@ basic_lora_test_config: LoRAConfig = {
     "lora_A_init": "xavier",
     "use_triton": False,
 }
+
+
+def test_vllm_generation_install_true_on_policy_patches(monkeypatch):
+    vllm_generation = VllmGeneration.__new__(VllmGeneration)
+    vllm_generation.worker_group = MagicMock()
+    vllm_generation.worker_group.run_all_workers_single_data.return_value = [
+        "worker_future"
+    ]
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+        lambda futures: [{"megatron_style_rmsnorm": {"patched": True}}],
+    )
+
+    result = vllm_generation.install_true_on_policy_patches(
+        bf16_true_on_policy=True,
+    )
+
+    assert result == [{"megatron_style_rmsnorm": {"patched": True}}]
+    vllm_generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "install_true_on_policy_patches",
+        bf16_true_on_policy=True,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+def test_vllm_worker_install_true_on_policy_patches_rejects_async():
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock()
+
+    with pytest.raises(RuntimeError, match="sync vLLM"):
+        worker.install_true_on_policy_patches(bf16_true_on_policy=True)
 
 
 def skip_fp8_known_failures() -> None:

@@ -48,6 +48,27 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 logger = logging.getLogger(__name__)
 
 
+def _maybe_install_preinit_true_on_policy_patches() -> None:
+    if os.environ.get("NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES") != "1":
+        return
+
+    from nemo_rl.models.generation.vllm.batch_invariant import (
+        install_true_on_policy_patches,
+    )
+
+    # vLLM CustomOp instances bind forward methods during module construction,
+    # and CUDA graphs are captured during engine init. Install class-level
+    # patches before LLM construction so captured graphs see the patched path.
+    patch_info = install_true_on_policy_patches(
+        torch.nn.Module(),
+        bf16_true_on_policy=True,
+    )
+    print(
+        f"  ✓ Pre-installed vLLM true-on-policy class patches: {patch_info}",
+        flush=True,
+    )
+
+
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
     if enable_prefix_caching is None:
@@ -255,6 +276,7 @@ class BaseVllmGenerationWorker:
                 "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
+        _maybe_install_preinit_true_on_policy_patches()
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
 
         # Calculate total parallel size (TP * PP)
@@ -514,6 +536,24 @@ class BaseVllmGenerationWorker:
         torch.cuda.profiler.stop()
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+
+    def install_true_on_policy_patches(
+        self,
+        bf16_true_on_policy: bool,
+    ) -> list[dict[str, Any]]:
+        """Install vLLM BF16 true-on-policy patches."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "True-on-policy vLLM patches are currently supported only "
+                "with sync vLLM. Set policy.generation.vllm_cfg.async_engine=false."
+            )
+        results = self.llm.collective_rpc(
+            "install_true_on_policy_patches",
+            args=(bf16_true_on_policy,),
+        )
+        return cast(list[dict[str, Any]], results)
 
     @staticmethod
     def _patch_vllm_nsight_config() -> None:

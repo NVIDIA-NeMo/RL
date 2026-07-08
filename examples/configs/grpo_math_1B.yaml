@@ -122,6 +122,10 @@ policy:
   logprob_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: 512
   precision: "bfloat16"
+  # Enable BF16 true-on-policy numeric matching. This enables Megatron
+  # batch-invariant mode and BF16 parity patches for supported generation
+  # backends. Recommended default: false.
+  bf16_true_on_policy: false
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
 

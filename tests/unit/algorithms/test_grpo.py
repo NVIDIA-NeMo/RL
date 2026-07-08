@@ -31,6 +31,7 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     _apply_configured_message_level_advantage_penalties,
     _apply_message_level_advantage_penalties,
+    _configure_vllm_for_bf16_true_on_policy,
     _default_grpo_save_state,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_message_level_advantage_penalties,
@@ -68,6 +69,73 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+def test_configure_vllm_for_bf16_true_on_policy_sets_graph_only_compile():
+    generation_config = {
+        "vllm_cfg": {
+            "async_engine": False,
+            "precision": "bfloat16",
+            "enforce_eager": False,
+        },
+        "vllm_kwargs": {"compilation_config": {"existing": "kept"}},
+    }
+
+    _configure_vllm_for_bf16_true_on_policy(generation_config)
+
+    assert generation_config["vllm_kwargs"]["compilation_config"] == {
+        "existing": "kept",
+        "mode": 0,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "splitting_ops": [],
+    }
+
+
+def test_configure_vllm_for_bf16_true_on_policy_keeps_eager_mode():
+    generation_config = {
+        "vllm_cfg": {
+            "async_engine": False,
+            "precision": "bfloat16",
+            "enforce_eager": True,
+        },
+        "vllm_kwargs": {},
+    }
+
+    _configure_vllm_for_bf16_true_on_policy(generation_config)
+
+    assert generation_config["vllm_kwargs"] == {}
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg", "message"),
+    [
+        (
+            {"async_engine": True, "precision": "bfloat16"},
+            "async_engine=false",
+        ),
+        (
+            {"async_engine": False, "precision": "fp8"},
+            "precision=bfloat16",
+        ),
+    ],
+)
+def test_configure_vllm_for_bf16_true_on_policy_rejects_unsupported_vllm_cfg(
+    vllm_cfg, message
+):
+    generation_config = {"vllm_cfg": vllm_cfg, "vllm_kwargs": {}}
+
+    with pytest.raises(ValueError, match=message):
+        _configure_vllm_for_bf16_true_on_policy(generation_config)
+
+
+def test_configure_vllm_for_bf16_true_on_policy_rejects_non_dict_compile_config():
+    generation_config = {
+        "vllm_cfg": {"async_engine": False, "precision": "bfloat16"},
+        "vllm_kwargs": {"compilation_config": "invalid"},
+    }
+
+    with pytest.raises(TypeError, match="compilation_config must be a dict"):
+        _configure_vllm_for_bf16_true_on_policy(generation_config)
 
 
 @pytest.fixture

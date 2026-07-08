@@ -92,6 +92,34 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    def install_true_on_policy_patches(
+        self,
+        bf16_true_on_policy: bool,
+    ) -> dict[str, Any]:
+        """Install vLLM BF16 true-on-policy patches."""
+        from nemo_rl.models.generation.vllm.batch_invariant import (
+            install_true_on_policy_patches,
+        )
+
+        return install_true_on_policy_patches(
+            self.model_runner.model,
+            bf16_true_on_policy=bf16_true_on_policy,
+        )
+
+    def install_true_on_policy_patch_components(
+        self,
+        components: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Install selected BF16 true-on-policy patches on vLLM."""
+        from nemo_rl.models.generation.vllm.batch_invariant import (
+            install_true_on_policy_patch_components,
+        )
+
+        return install_true_on_policy_patch_components(
+            self.model_runner.model,
+            components=components,
+        )
+
     def init_collective(
         self,
         rank_prefix: int,
