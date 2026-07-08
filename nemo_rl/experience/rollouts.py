@@ -1757,6 +1757,8 @@ def run_async_nemo_gym_rollout(
     )
     if "vllm_cfg" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    elif "sglang_cfg" in policy_generation.cfg:
+        engine_max_model_len = policy_generation.cfg["sglang_cfg"]["context_length"]
     elif "mcore_generation_config" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
             "max_model_len"
@@ -1839,6 +1841,10 @@ def run_async_nemo_gym_rollout(
         if "vllm_cfg" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
                 "max_model_len"
+            ]
+        elif "sglang_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["sglang_cfg"][
+                "context_length"
             ]
         elif "mcore_generation_config" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg[
