@@ -1262,6 +1262,116 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    def test_build_dataloader_from_serializable_records(self):
+        """Collector rebuilds a StatefulDataLoader from plain records."""
+        collector = self.create_local_collector()
+        raw_data = [
+            {
+                "message_log": [{"role": "user", "content": "a"}],
+                "length": 1,
+                "loss_multiplier": 1.0,
+                "extra_env_info": {"id": 0},
+                "task_name": "test",
+                "idx": 0,
+            },
+            {
+                "message_log": [{"role": "user", "content": "b"}],
+                "length": 2,
+                "loss_multiplier": 1.0,
+                "extra_env_info": {"id": 1},
+                "task_name": "test",
+                "idx": 1,
+            },
+        ]
+
+        dataloader = collector._build_dataloader(
+            raw_data,
+            {
+                "batch_size": 2,
+                "shuffle": False,
+                "drop_last": False,
+                "num_workers": 0,
+            },
+        )
+        batch = next(iter(dataloader))
+
+        assert batch["idx"] == [0, 1]
+        assert batch["task_name"] == ["test", "test"]
+        assert batch["length"].tolist() == [1, 2]
+
+    def test_build_dataloader_loads_initial_state(self, monkeypatch):
+        """Collector forwards the initial dataloader state when rebuilding."""
+
+        class RecordingLoader:
+            def __init__(self, dataset, **kwargs):
+                self.dataset = dataset
+                self.kwargs = kwargs
+                self.loaded_state = None
+
+            def load_state_dict(self, state):
+                self.loaded_state = state
+
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "StatefulDataLoader",
+            RecordingLoader,
+        )
+        collector = self.create_local_collector()
+        dataloader_state = {"cursor": 3}
+
+        dataloader = collector._build_dataloader(
+            [{"idx": 0}],
+            {
+                "batch_size": 1,
+                "shuffle": False,
+                "drop_last": False,
+                "num_workers": 0,
+            },
+            dataloader_state,
+        )
+
+        assert dataloader.loaded_state is dataloader_state
+        assert (
+            dataloader.kwargs["collate_fn"] is trajectory_collector_mod.rl_collate_fn
+        )
+
+    def test_get_dataloader_state_returns_rebuilt_dataloader_state(self, monkeypatch):
+        """Checkpoint state comes from the dataloader rebuilt in the actor."""
+
+        class RecordingLoader:
+            def __init__(self, dataset, **kwargs):
+                self.dataset = dataset
+                self.kwargs = kwargs
+                self.loaded_state = None
+
+            def load_state_dict(self, state):
+                self.loaded_state = state
+
+            def state_dict(self):
+                return {"loaded_state": self.loaded_state}
+
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "StatefulDataLoader",
+            RecordingLoader,
+        )
+        collector = self.create_local_collector()
+        dataloader_state = {"cursor": 5}
+        collector.dataloader = collector._build_dataloader(
+            [{"idx": 0}],
+            {
+                "batch_size": 1,
+                "shuffle": False,
+                "drop_last": False,
+                "num_workers": 0,
+            },
+            dataloader_state,
+        )
+
+        assert collector.get_dataloader_state() == {
+            "loaded_state": dataloader_state
+        }
+
     def test_maybe_release_target_waits_for_spawning_to_close(self):
         """Test fast workers do not release a target while spawning is open."""
         collector = self.create_local_collector()
