@@ -45,11 +45,13 @@
 # Optional env: SKIP_TRAINING, TRAJECTORY_COLLECTION,
 #               TRAJECTORY_COLLECTION_BATCH_SIZE, TRAIN_DATA_PATH, VAL_DATA_PATH,
 #               TRAIN_NODES, TRAIN_TP, WANDB_GROUP, EXP_SUFFIX, MODEL_PATH,
-#               CONTAINER, MAX_NUM_STEPS, SBATCH_TIME, PERSISTENT_CACHE,
+#               CONTAINER, MAX_NUM_STEPS, SBATCH_TIME, SBATCH_DEPENDENCY, PERSISTENT_CACHE,
 #               BASE_LOG_DIR, LOGGER_LOG_DIR, STREAMING_TOOL_CALL,
 #               LOG_GYM_RESPONSES, TEMPERATURE, TOP_P,
 #               SNAPSHOT_POLL_INTERVAL_SECONDS,
 #               STREAMING_MIN_CHUNK_CHARS,
+#               STREAMING_INCREMENTAL_TOKENIZER_ONLY,
+#               DETAILED_RUNTIME_METRICS, BASE_CONCURRENCY,
 #               SWE_BENCH_ARTIFACT_CACHE_OFFLINE
 # Credentials are NOT sourced here — export HF_HOME / HF_TOKEN / WANDB_API_KEY yourself.
 # ============================================================================
@@ -91,12 +93,44 @@ if [ "${TRAJECTORY_COLLECTION}" = "1" ]; then
   SKIP_TRAINING=1
 fi
 STREAMING_TOOL_CALL="${STREAMING_TOOL_CALL:-0}"
+STREAMING_INCREMENTAL_TOKENIZER_ONLY="${STREAMING_INCREMENTAL_TOKENIZER_ONLY:-0}"
+DETAILED_RUNTIME_METRICS="${DETAILED_RUNTIME_METRICS:-0}"
+if [ "${STREAMING_TOOL_CALL}" != "0" ] && [ "${STREAMING_TOOL_CALL}" != "1" ]; then
+  echo "ERROR: STREAMING_TOOL_CALL must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${STREAMING_INCREMENTAL_TOKENIZER_ONLY}" != "0" ] && [ "${STREAMING_INCREMENTAL_TOKENIZER_ONLY}" != "1" ]; then
+  echo "ERROR: STREAMING_INCREMENTAL_TOKENIZER_ONLY must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${STREAMING_INCREMENTAL_TOKENIZER_ONLY}" = "1" ] && [ "${STREAMING_TOOL_CALL}" != "1" ]; then
+  echo "ERROR: STREAMING_INCREMENTAL_TOKENIZER_ONLY requires STREAMING_TOOL_CALL=1." >&2
+  exit 1
+fi
+if [ "${DETAILED_RUNTIME_METRICS}" != "0" ] && [ "${DETAILED_RUNTIME_METRICS}" != "1" ]; then
+  echo "ERROR: DETAILED_RUNTIME_METRICS must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${DETAILED_RUNTIME_METRICS}" = "1" ]; then
+  DETAILED_RUNTIME_METRICS_ENABLED=True
+else
+  DETAILED_RUNTIME_METRICS_ENABLED=False
+fi
 if [ "${STREAMING_TOOL_CALL}" = "1" ]; then
   STREAMING_TOOL_CALL_ENABLED=True
+  VLLM_STREAMING_TOOL_CALL_ENABLED=True
   STREAMING_TOOL_CALL_TAG="-streamtool"
 else
   STREAMING_TOOL_CALL_ENABLED=False
+  VLLM_STREAMING_TOOL_CALL_ENABLED=False
   STREAMING_TOOL_CALL_TAG=""
+fi
+if [ "${STREAMING_INCREMENTAL_TOKENIZER_ONLY}" = "1" ]; then
+  VLLM_STREAMING_TOOL_CALL_ENABLED=False
+  STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="-streamtokenizer"
+else
+  STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED=False
 fi
 if [ "${SKIP_TRAINING}" = "1" ]; then
   TP=8; EP=8; CP=1; PP=1; ETP=1     # model_parallel = 8 (fits 1 node), train_DP=1
@@ -112,7 +146,11 @@ MAKE_SEQ_DIVISIBLE_BY=${MIN_PAD}
 # ================= Generation-scaling: derive all sizes from R =================
 GPP=8                                            # generations per prompt (fixed)
 SAMPLES_PER_REPLICA=2                             # invariant: samples/replica/step
-BASE_CONCURRENCY=768                              # nemo-gym fan-out floor
+BASE_CONCURRENCY="${BASE_CONCURRENCY:-768}"       # nemo-gym fan-out floor
+if ! [[ "${BASE_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: BASE_CONCURRENCY must be a positive integer." >&2
+  exit 1
+fi
 REPLICAS_PER_NODE=$(( NUM_GPU / VLLM_TP ))        # = 4
 MODEL_PARALLEL=$(( TP * CP * PP ))                # = 32
 EXPERT_TMP=$(( ETP * EP * PP ))                   # = 16
@@ -248,6 +286,7 @@ LOG_GYM_RESPONSES="${LOG_GYM_RESPONSES:-true}"
 SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-nemotron_sw_post}"
 SBATCH_PARTITION="${SBATCH_PARTITION:-batch}"
 SBATCH_TIME="${SBATCH_TIME:-4:0:0}"
+SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-singleton}"
 # Optional smoke-test knob: cap training steps (appended as ++grpo.max_num_steps). Empty = use YAML default.
 MAX_NUM_STEPS="${MAX_NUM_STEPS:-}"
 
@@ -319,6 +358,9 @@ echo "  invariants    : samples/replica=${PER_REPLICA_SAMPLES}, batch/train-GPU=
 echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, pad=${MAKE_SEQ_DIVISIBLE_BY}"
 echo "Model: ${MODEL_PATH}"
 echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
+echo "Streaming tokenizer-only: ${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED}"
+echo "Detailed OpenHands runtime metrics: ${DETAILED_RUNTIME_METRICS_ENABLED}"
+echo "vLLM streaming prefill: ${VLLM_STREAMING_TOOL_CALL_ENABLED}"
 echo "Streaming snapshot poll interval: ${SNAPSHOT_POLL_INTERVAL_SECONDS}s"
 if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ]; then
   echo "Streaming min chunk chars: ${STREAMING_MIN_CHUNK_CHARS}"
@@ -459,10 +501,13 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   policy.generation.vllm_cfg.tensor_parallel_size=${VLLM_TP} \
   policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_UTIL} \
   policy.generation.vllm_cfg.skip_tokenizer_init=False \
-  policy.generation.vllm_cfg.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.enabled=${VLLM_STREAMING_TOOL_CALL_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.tokenizer_only=${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
   env.nemo_gym.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
+  env.nemo_gym.streaming_tool_call.tokenizer_only=${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED} \
   env.nemo_gym.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
+  ++env.nemo_gym.detailed_runtime_metrics=${DETAILED_RUNTIME_METRICS_ENABLED} \
   loss_fn.reference_policy_kl_penalty=${KL} \
   loss_fn.ratio_clip_min=${CLIP_MIN} \
   loss_fn.ratio_clip_max=${CLIP_MAX} \
@@ -525,10 +570,14 @@ fi
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo ""
   echo "[DRY_RUN] Not submitting. Would run:"
-  echo "[DRY_RUN]   sbatch --nodes=${TOTAL_NODES} --account=${SBATCH_ACCOUNT} --partition=${SBATCH_PARTITION} --time=${SBATCH_TIME} --gres=gpu:${NUM_GPU} ... ray.sub"
+  echo "[DRY_RUN]   sbatch --nodes=${TOTAL_NODES} --account=${SBATCH_ACCOUNT} --partition=${SBATCH_PARTITION} --time=${SBATCH_TIME} --dependency=${SBATCH_DEPENDENCY} --gres=gpu:${NUM_GPU} ... ray.sub"
   cd - > /dev/null
   exit 0
 fi
+
+# A caller may launch this helper from an existing srun allocation.  Do not
+# propagate its per-task resource bindings into the new independent batch job.
+unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK
 
 sbatch \
   --nodes="${TOTAL_NODES}" \
@@ -539,7 +588,7 @@ sbatch \
   --gres=gpu:${NUM_GPU} \
   --output="${BASE_LOG_DIR}/slurm-%j.out" \
   --exclusive \
-  --dependency=singleton \
+  --dependency="${SBATCH_DEPENDENCY}" \
   --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"180","reason":"data_loading","description":"Async GRPO SWE generation-scaling benchmark"}}' \
   ray.sub | tee /dev/stderr | grep -o '[0-9]\+' > latest_scale_gen_job_id.txt
 

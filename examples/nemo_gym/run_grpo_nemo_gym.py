@@ -39,7 +39,7 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     setup,
 )
-from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.algorithms.utils import get_tokenizer, log_generation_metrics_to_wandb
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
@@ -88,6 +88,11 @@ def collect_trajectories(
 
     print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config.policy["generation"]
+    vllm_config = generation_config.get("vllm_cfg", {})
+    should_log_generation_metrics = (
+        vllm_config.get("enable_vllm_metrics_logger", False)
+        and master_config.logger["wandb_enabled"]
+    )
     expected_trajectories = master_config.grpo["max_val_samples"]
     assert expected_trajectories is not None
     seen_instance_ids: set[str] = set()
@@ -95,6 +100,8 @@ def collect_trajectories(
 
     try:
         for batch_idx, val_batch in enumerate(val_dataloader):
+            batch_step = batch_idx + 1
+            policy_generation.clear_logger_metrics()
             nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                 policy_generation=policy_generation,
                 input_batch=val_batch,
@@ -105,6 +112,7 @@ def collect_trajectories(
                 max_rollout_turns=None,
                 greedy=False,
             )
+            generation_logger_metrics = policy_generation.get_logger_metrics()
 
             rows_to_log: list[str] = []
             for key, value in nemo_gym_rollout_result.rollout_metrics.items():
@@ -135,6 +143,31 @@ def collect_trajectories(
             # Append after every completed batch. This preserves earlier trajectories if a
             # later batch or worker fails during a long evaluation.
             logger.log_string_list_as_jsonl(rows_to_log, log_filename)
+            batch_rollout_metrics = {
+                key: value
+                for key, value in nemo_gym_rollout_result.rollout_metrics.items()
+                if "full_result" not in key
+            }
+            # Keep the training prefix so rollout-only and GRPO runs expose the same
+            # timing and rollout metric keys for direct comparison.
+            logger.log_metrics(batch_rollout_metrics, batch_step, prefix="train")
+            if should_log_generation_metrics:
+                log_generation_metrics_to_wandb(
+                    generation_logger_metrics,
+                    batch_step,
+                    vllm_config["vllm_metrics_logger_interval"],
+                    logger,
+                )
+            logger.log_metrics(
+                {
+                    "accuracy": resolved_count / len(seen_instance_ids),
+                    "num_resolved": resolved_count,
+                    "num_trajectories": len(seen_instance_ids),
+                },
+                batch_step,
+                prefix="trajectory_collection",
+                step_finished=True,
+            )
             print(
                 f"Collected {len(seen_instance_ids)}/{expected_trajectories} "
                 f"trajectories after batch {batch_idx + 1}",
@@ -150,16 +183,6 @@ def collect_trajectories(
         )
 
     accuracy = resolved_count / expected_trajectories
-    logger.log_metrics(
-        {
-            "accuracy": accuracy,
-            "num_resolved": resolved_count,
-            "num_trajectories": len(seen_instance_ids),
-        },
-        step=0,
-        prefix="trajectory_collection",
-        step_finished=True,
-    )
     print(
         f"Trajectory collection complete: {resolved_count}/{expected_trajectories} "
         f"resolved ({accuracy:.4%})",

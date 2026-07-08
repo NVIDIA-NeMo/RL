@@ -19,6 +19,7 @@ import asyncio
 import copy
 import json
 import statistics
+import time
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
@@ -1350,6 +1351,22 @@ class AsyncNemoGymRolloutResult:
     rollout_metrics: dict[str, Any]
 
 
+PER_AGENT_TOTAL_METRIC_KEYS = frozenset(
+    {
+        "num_tool_calls",
+        "streaming_tool_call_valid_prefill_actions",
+        "streaming_tool_call_valid_tokenizer_actions",
+        "streaming_tool_call_prompt_reuse_candidates",
+        "streaming_tool_call_prompt_reuse_requests",
+        "streaming_tool_call_prompt_reuse_matches",
+        "streaming_tool_call_prompt_reuse_exact_matches",
+        "streaming_tool_call_prompt_reuse_token_equivalent_matches",
+        "streaming_tool_call_prompt_reuse_mismatches",
+        "streaming_tool_call_prompt_reuse_missing",
+    }
+)
+
+
 def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     """Return thinking tags used by the Gym-side detector."""
     nemo_gym_config = env_config.get("nemo_gym")
@@ -1800,6 +1817,7 @@ def run_async_nemo_gym_rollout(
 
     timer = Timer()
     timer_prefix = "timing/rollout"
+    rollout_batch_e2e_start_time_unix_s = time.time()
     timer.start(f"{timer_prefix}/total")
 
     for rowidx, row in enumerate(nemo_gym_rows):
@@ -1961,7 +1979,10 @@ def run_async_nemo_gym_rollout(
                 if values:
                     per_agent_metrics.update(
                         calculate_single_metric(
-                            values, len(agent_results), f"{agent_name}/{key}"
+                            values,
+                            len(agent_results),
+                            f"{agent_name}/{key}",
+                            include_total=key in PER_AGENT_TOTAL_METRIC_KEYS,
                         )
                     )
 
@@ -1977,7 +1998,15 @@ def run_async_nemo_gym_rollout(
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
+    rollout_batch_e2e_end_time_unix_s = time.time()
     timer.stop(f"{timer_prefix}/total")
+    rollout_metrics.update(
+        {
+            f"{timer_prefix}/batch_e2e_start_time_unix_s": rollout_batch_e2e_start_time_unix_s,
+            f"{timer_prefix}/batch_e2e_end_time_unix_s": rollout_batch_e2e_end_time_unix_s,
+            f"{timer_prefix}/batch_prompt_count": batch_size,
+        }
+    )
     rollout_metrics.update(timer.get_timing_metrics("sum"))
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
