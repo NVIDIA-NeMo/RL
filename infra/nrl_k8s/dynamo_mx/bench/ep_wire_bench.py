@@ -45,8 +45,10 @@ def _descriptors_for(client, ref):
     return w.nixl_metadata, desc
 
 
-def _pull_one(ep, meta, desc, out):
-    """Arena-register matching buffers for one EP source and time one batched read."""
+def _setup_one(ep, desc):
+    """Build + arena-register matching device buffers for one EP source.
+    use_arena is a non-reentrant global, so all setup runs in the main thread
+    (sequentially); only the RDMA read is done concurrently later."""
     mgr = NixlTransferManager(agent_name=f"ep{ep}-wire-{socket.gethostname()}",
                               device_id=0, listen_port=0)
     mgr.initialize()
@@ -60,6 +62,11 @@ def _pull_one(ep, meta, desc, out):
     torch.cuda.synchronize()
     mgr.register_arena(arena, bufs)
     torch.cuda.synchronize()
+    return mgr, arena, bufs
+
+
+def _xfer_one(ep, mgr, meta, desc, out):
+    """Time one batched device->device RDMA read against pre-registered buffers."""
     nb, nt, dur = mgr.receive_from_source(meta, desc, timeout_seconds=600)
     torch.cuda.synchronize()
     out[ep] = (nb, nt, dur)
@@ -98,12 +105,19 @@ def main() -> int:
 
     install_pluggable_allocator()
 
-    # ---- SEQUENTIAL: one source at a time (each arena-registered + one batched read) ----
-    print(f"\n[wire] SEQUENTIAL device->device pulls (arena + stripe) ...", flush=True)
+    # Set up all sources' NIXL agents + arena-registered buffers up front
+    # (sequential; use_arena is a non-reentrant global). One agent + arena/source.
+    print(f"\n[wire] setting up {EP_SIZE} agents + arena registrations ...", flush=True)
+    handles = {}  # ep -> (mgr, arena, bufs)
+    for ep, meta, desc in sources:
+        handles[ep] = _setup_one(ep, desc)
+
+    # ---- SEQUENTIAL: one batched device->device read at a time ----
+    print(f"\n[wire] SEQUENTIAL device->device reads (arena + stripe) ...", flush=True)
     seq = {}
     t0 = time.perf_counter()
     for ep, meta, desc in sources:
-        _pull_one(ep, meta, desc, seq)
+        _xfer_one(ep, handles[ep][0], meta, desc, seq)
         nb, nt, dur = seq[ep]
         print(f"  ep{ep}: {nb/1e9:.2f} GB in {dur:.3f}s -> {nb*8/dur/1e9:.1f} Gbps", flush=True)
     seq_wall = time.perf_counter() - t0
@@ -112,10 +126,10 @@ def main() -> int:
     print(f"[wire] SEQUENTIAL: {seq_bytes/1e9:.2f} GB; device transfer sum {seq_dev:.3f}s "
           f"= {seq_bytes*8/seq_dev/1e9:.1f} Gbps; wall {seq_wall:.3f}s", flush=True)
 
-    # ---- CONCURRENT: N threads, one NIXL agent + arena each (rail sharing) ----
-    print(f"\n[wire] CONCURRENT device->device pulls ({EP_SIZE} threads) ...", flush=True)
+    # ---- CONCURRENT: N threads issue their reads simultaneously (rail sharing) ----
+    print(f"\n[wire] CONCURRENT device->device reads ({EP_SIZE} threads) ...", flush=True)
     conc = {}
-    ths = [threading.Thread(target=_pull_one, args=(ep, meta, desc, conc))
+    ths = [threading.Thread(target=_xfer_one, args=(ep, handles[ep][0], meta, desc, conc))
            for ep, meta, desc in sources]
     t0 = time.perf_counter()
     for t in ths:
