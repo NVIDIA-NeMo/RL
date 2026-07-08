@@ -365,6 +365,11 @@ policy:
       enable_chunked_prefill: true
       compilation_config:
         backend: inductor
+        # Full CUDA graphs for decode + piecewise for prefill: the agent
+        # workload is decode-dominated and compiled-but-graphless engines
+        # still left 36% of rollouts hitting the 600s agent timeout
+        # (median model-call time 238s, job 2311094).
+        cudagraph_mode: FULL_AND_PIECEWISE
         cudagraph_capture_sizes:
         - 1
         - 2
