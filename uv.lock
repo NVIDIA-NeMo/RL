@@ -63,6 +63,7 @@ constraints = [
 ]
 overrides = [
     { name = "av", marker = "sys_platform == 'never'" },
+    { name = "decord2", marker = "sys_platform == 'never'" },
     { name = "deep-ep", marker = "platform_machine == 'aarch64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" },
     { name = "deep-ep", marker = "platform_machine == 'x86_64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=29d31c095796f3c8ece47ee9cdcc167051bbeed9" },
     { name = "langchain", specifier = ">=0.3.28" },
@@ -926,20 +927,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/43/fa/6d96a0978d19e17b68d634497769987b16c8f4cd0a7a05048bec693caa6b/decorator-5.2.1.tar.gz", hash = "sha256:65f266143752f734b0a7cc83c46f4618af75b8c5911b00ccb61d0ac9b6da0360", size = 56711, upload-time = "2025-02-24T04:41:34.073Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/8c/f3147f5c4b73e7550fe5f9352eaa956ae838d5c51eb58e7a25b9f3e2643b/decorator-5.2.1-py3-none-any.whl", hash = "sha256:d316bb415a2d9e2d2b3abcc4084c6502fc09240e292cd76a76afc106a1c8e04a", size = 9190, upload-time = "2025-02-24T04:41:32.565Z" },
-]
-
-[[package]]
-name = "decord2"
-version = "3.3.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e8/37/947bc17d6a16f5c678ab2c6ba3330b20f617ec7652f103051881cf1d98d9/decord2-3.3.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:deadd17cc00b65545ef731fb5f58e05d625dc8db5fbda25edc9bd30469343413", size = 25036754, upload-time = "2026-04-06T18:09:54.204Z" },
-    { url = "https://files.pythonhosted.org/packages/61/ab/ff85679c25708844a5e1f30e8243dfdb40985b9ce04496dde84a698f4eee/decord2-3.3.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:e8d5408963552843411f2d74aac8025d0bb99c975c48b80e36c989297cf2d145", size = 27392918, upload-time = "2026-04-06T18:09:57.154Z" },
-    { url = "https://files.pythonhosted.org/packages/fe/28/7d116e141a4ec1a3a7ba3ddb7f5e5e7811a23de5468818501ec640a2995b/decord2-3.3.0-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:6c7e50d5e3b3471672641cb296bb2616348638e9ce22ecd17bfadc0897907baf", size = 25036756, upload-time = "2026-04-06T18:10:02.647Z" },
-    { url = "https://files.pythonhosted.org/packages/5e/4c/5cb20dcbb7b62d9453b8d1b18a62f02f8005b402747bbc1d7408bf5a57ce/decord2-3.3.0-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:3d87266f9a4d211a03e2ce23d64a92e84edbc4364bf36356db47031f9f2ce45e", size = 27392917, upload-time = "2026-04-06T18:10:05.232Z" },
 ]
 
 [[package]]
@@ -5469,7 +5456,6 @@ dependencies = [
     { name = "compressed-tensors", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "cuda-python", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "datasets", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
-    { name = "decord2", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
     { name = "easydict", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "einops", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "fastapi", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
