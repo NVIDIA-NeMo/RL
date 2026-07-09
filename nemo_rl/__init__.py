@@ -289,7 +289,12 @@ def _patch_transformers_tokenizer_class_set():
     discard/pop-with-default are no-ops when the entries are absent, so this is
     safe on any transformers version in the currently-supported range.
     """
-    import transformers
+    try:
+        import transformers
+    except ImportError:
+        # setuptools build isolation may import nemo_rl before transformers is
+        # installed; skip the patch there. The runtime venv always has it.
+        return
     from packaging.version import Version as PkgVersion
 
     # This whole patch exists only because Megatron-Bridge caps the transformers
