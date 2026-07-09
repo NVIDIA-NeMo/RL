@@ -450,7 +450,12 @@ env:
         swe_agents:
           agent_framework_commit: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_framework_commit}
           agent_max_turns: 30
-          swebench_agent_timeout: 600
+          # 1200s (train side stays 600): in-loop validation (val_period=5)
+          # shares engines with in-flight async train rollouts; at 600s the
+          # contention pushed 93% of val rollouts into timeout (job 2319965,
+          # val@14 measured 0.78% vs 24.9% train-side). Doubling the val agent
+          # budget compensates for the contention latency.
+          swebench_agent_timeout: 1200
           swebench_tests_timeout: 180
           concurrency: 128
           base_results_dir: /logs/nemo_gym/swe_agents_val
