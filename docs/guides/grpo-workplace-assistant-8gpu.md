@@ -45,6 +45,307 @@ The main implementation is in:
 - `3rdparty/Gym-workspace/Gym/nemo_gym/`: token-only response conversion needed
   to continue multi-turn tool calls without returning sampling log probabilities.
 
+## Architecture and code flow
+
+### Component ownership
+
+The implementation deliberately separates untrusted request transport from the
+trusted code that decides what reaches training.
+
+| Component | Process | Responsibility |
+| --- | --- | --- |
+| `grpo_train_sync` | training driver | Validate the supported configuration, create the secret and cursor actor, and attach writers |
+| `TQPolicy` | training driver | Bootstrap TransferQueue and register the staging and canonical partitions |
+| `SyncRolloutActor` | Ray rollout actor | Mint sample identities, invoke Gym, finalize staged turns, and publish canonical rows |
+| NeMo Gym | Gym Ray actor and HTTP services | Run the multi-turn agent/environment loop and forward opaque rollout metadata |
+| `VllmAsyncGenerationWorkerImpl` | vLLM model-owner Ray worker | Verify request identity and prefix continuity, then write one staging delta per generated turn |
+| `RolloutCursorRegistry` | dedicated Ray actor | Serialize reservations and commits for each sample |
+| `assemble_staged_batch` | rollout actor | Read, verify, and assemble staging rows into trainer-facing tensors |
+| GRPO/GDPO advantage estimator | training driver | Exclude rejected placeholders from baselines and normalization |
+
+The Gym services can route successive turns to different HTTP workers. Cursor
+state is therefore not stored in a vLLM worker. The dedicated registry is the
+single authority for the next turn number, committed token length, prefix
+hash, active lease, and terminal failure state.
+
+### Setup lifecycle
+
+The writer is attached once when `grpo_train_sync` starts:
+
+1. `examples/nemo_gym/run_grpo_nemo_gym.py::_select_trainer` selects
+   `grpo_train_sync` when `data_plane.enabled=true`.
+2. `TQPolicy` bootstraps the configured TransferQueue backend and registers
+   the normal `train` partition for canonical rows.
+3. `grpo_train_sync` validates that this is synchronous NeMo Gym GRPO using
+   async vLLM, a supported advantage estimator, and no router replay.
+4. `TQPolicy.prepare_rollout_writer` registers `rollout_staging` with the
+   per-turn tensor fields.
+5. The driver creates a random 32-byte HMAC secret and a
+   `RolloutCursorRegistry` Ray actor.
+6. `VllmGeneration.configure_rollout_writer` sends the validated data-plane
+   config, cursor handle, and secret only to vLLM model-owner workers.
+7. `SyncRolloutActor` receives the same cursor handle and secret so it can mint
+   identities and later request finalization manifests.
+
+The secret is runtime state. It is never placed in YAML, Gym data, manifests,
+or TransferQueue rows.
+
+### Sample identity and trust boundary
+
+At the start of `SyncRolloutActor.rollout_to_tq`, one `group_id` is created per
+original prompt and one `sample_id` per generation:
+
+```text
+group_id  = 7d89...                         # one prompt
+sample_id = 7d89..._g0                      # generation 0
+sample_id = 7d89..._g1                      # generation 1
+```
+
+`_attach_rollout_contexts` adds a `RolloutContext` to the request's existing
+`metadata.extra_body`. The signed fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `sample_id` | Stable identity of one generated trajectory |
+| `group_id` | Groups generations that share the same GRPO prompt |
+| `weight_version` | Training step whose policy weights produced the rollout |
+| `nonce` | Random context identity |
+| `issued_at`, `expires_at` | Bounded context lifetime |
+| `version` | Wire-contract version |
+| `signature` | HMAC-SHA256 over every preceding field |
+
+Gym forwards this object opaquely. It does not decide a sample ID, turn number,
+cursor length, or staging key. On each chat request,
+`VllmAsyncGenerationWorkerImpl._prepare_rollout_request` reconstructs the
+context and calls `validate_rollout_context` before accepting it.
+
+### Per-turn write path
+
+Each model call follows this sequence:
+
+1. vLLM finishes chat-template rendering and obtains the exact
+   `prompt_token_ids` that will be sent to the model.
+2. `_prepare_rollout_request` derives an idempotency key from `sample_id` and
+   the complete prompt tokens.
+3. `RolloutCursorRegistry.reserve_turn` returns a `TurnReservation` containing
+   `turn`, `lease`, `prev_len`, and `prev_hash`.
+4. For turns after the first, Gym echoes the model-produced historical prefix
+   in `required_prefix_token_ids`. The worker requires its length and hash to
+   match the committed cursor and requires the rendered model prompt to start
+   with those exact tokens.
+5. vLLM generates one response. `_stage_rollout_response` extracts generated
+   token IDs and sampling log probabilities from the non-streaming response.
+6. `build_staging_delta` removes the already committed prefix. It emits only
+   newly introduced prompt tokens plus newly generated tokens.
+7. The worker synchronously writes the delta to
+   `<sample_id>/t<turn>` in `rollout_staging`.
+8. Only after the write succeeds does the worker call `commit_turn` with the
+   new total length and full-prefix hash.
+9. The HTTP response returns token IDs to Gym so a later tool turn can preserve
+   the exact model prefix. In direct mode it removes sampling log probabilities
+   from the HTTP payload because their authoritative copy is already staged.
+
+The staging schema is intentionally small:
+
+| Field | Dtype | Meaning |
+| --- | --- | --- |
+| `token_ids_delta` | `int64` | New environment/prompt tokens followed by generated tokens |
+| `token_mask_delta` | `float32` | `0` for prompt/environment tokens and `1` for trainable generated tokens |
+| `generation_logprobs_delta` | `float32` | `0` for prompt/environment tokens and the sampling log probability for generated tokens |
+
+TransferQueue tags also record sample, group, turn, weight version, request
+nonce, previous/new lengths, previous/new hashes, and lease state. Correctness
+does not depend on trusting those tags: the finalizer uses the signed cursor
+manifest and recomputes tensor-derived hashes.
+
+### Cursor state machine
+
+`RolloutCursorStateMachine` is single-threaded inside the Ray actor. Each
+sample owns one `SampleCursor` and at most one active reservation.
+
+```text
+                    reserve_turn
+          +--------------------------------+
+          |                                v
+no cursor/committed -----------------> reserved
+                                         |   |
+                              commit_turn |   | fail_turn
+                                         v   v
+                                     committed failed
+                                         |
+                                         +----> next reserve_turn
+```
+
+The important transitions are:
+
+- A new request nonce reserves `next_turn` and captures the current
+  `committed_length` and `prefix_hash`.
+- Retrying the same nonce before commit returns the same reservation. After
+  lease expiry it receives a new lease for the same turn.
+- A different request while a turn is active fails the entire sample as a
+  concurrent request.
+- Committing requires the current lease and a strictly growing token length.
+- Retrying an already committed request fails the sample as a duplicate.
+- Once failed, a sample cannot reserve another turn.
+
+This policy prefers rejecting one trajectory over accepting ambiguous tokens.
+Other samples in the batch remain usable.
+
+### Finalization and canonical publication
+
+After Gym finishes the trajectories, `SyncRolloutActor` calls
+`assemble_staged_batch` with the expected sample IDs, group IDs, and weight
+version. For each sample, the finalizer:
+
+1. gets an immutable `FinalizationManifest` from the cursor;
+2. requires at least one committed turn and no active or failed cursor;
+3. requires contiguous turn numbers beginning at zero;
+4. verifies group identity and weight version on every turn;
+5. verifies the previous length/hash chain;
+6. reads every staging key, polling only until `finalize_timeout_s`;
+7. verifies equal tensor lengths, binary token masks, and finite log
+   probabilities;
+8. appends each delta and recomputes the full token hash after every turn; and
+9. verifies the terminal length and terminal prefix hash.
+
+Verified rows are padded to the legacy batch width and form the canonical
+training tensors: `input_ids`, `input_lengths`, `generation_logprobs`,
+`token_mask`, and `sample_mask`. Reward and other driver-carry fields still
+come from the trusted Gym result.
+
+If a row fails verification, the finalizer substitutes a one-token padded row
+and sets `trajectory_valid_mask=0` and `sample_mask=0`. It also zeros that
+row's total and component rewards. `grpo_train_sync` passes the validity mask
+into GRPO or GDPO baseline calculation and advantage estimation, then applies
+it again before clipping and writeback as a fail-safe.
+
+In shadow mode, `compare_shadow_candidate` requires every valid direct tensor
+and driver-carry tensor to equal the legacy path. In direct mode, the verified
+candidate is authoritative. Both modes publish only the canonical
+`sample_id` to the `train` partition; staging keys never appear in trainer
+metadata.
+
+After canonical publication succeeds, the rollout actor clears the staging
+keys and cursor entries. Training workers consume the canonical row through
+the existing `TQPolicy` read/logprob/train pipeline.
+
+## Two-turn rollout example
+
+This simplified example follows one generation, `group-a_g0`, through two
+model calls. Token values are illustrative, but the shapes and masks match the
+implementation.
+
+### Turn 0: initial assistant tool call
+
+The rendered initial prompt is:
+
+```text
+prompt_token_ids    = [101, 102, 103]
+generated_token_ids = [201, 202]
+generated_logprobs  = [-0.10, -0.20]
+```
+
+The initial cursor has committed length zero and the well-known empty-prefix
+hash:
+
+```text
+reservation = {
+  turn: 0,
+  prev_len: 0,
+  prev_hash: EMPTY_PREFIX_HASH,
+  lease: "lease-0"
+}
+```
+
+`build_staging_delta` has no old prefix to remove, so the worker writes:
+
+```text
+key                         = group-a_g0/t0
+token_ids_delta             = [101, 102, 103, 201, 202]
+token_mask_delta            = [  0,   0,   0,   1,   1]
+generation_logprobs_delta   = [0.0, 0.0, 0.0, -0.10, -0.20]
+```
+
+The worker commits:
+
+```text
+new_len  = 5
+new_hash = hash_token_ids([101, 102, 103, 201, 202])
+```
+
+Gym receives the token IDs, executes the requested tool, and adds its tool
+result to the next prompt. In direct mode Gym does not receive the sampling
+log probabilities.
+
+### Turn 1: answer after the tool result
+
+Suppose chat-template rendering adds tool-result tokens `[301, 302]`, then the
+model generates `[401, 402]`:
+
+```text
+required_prefix_token_ids = [101, 102, 103, 201, 202]
+prompt_token_ids = [101, 102, 103, 201, 202, 301, 302]
+generated_token_ids = [401, 402]
+generated_logprobs = [-0.30, -0.40]
+```
+
+The cursor returns:
+
+```text
+reservation = {
+  turn: 1,
+  prev_len: 5,
+  prev_hash: hash_token_ids([101, 102, 103, 201, 202]),
+  lease: "lease-1"
+}
+```
+
+The worker verifies that the required prefix is exactly the first five prompt
+tokens. `build_staging_delta` removes those five committed tokens and writes
+only the tool-result and new assistant tokens:
+
+```text
+key                         = group-a_g0/t1
+token_ids_delta             = [301, 302, 401, 402]
+token_mask_delta            = [  0,   0,   1,   1]
+generation_logprobs_delta   = [0.0, 0.0, -0.30, -0.40]
+```
+
+The second commit records:
+
+```text
+new_len  = 9
+new_hash = hash_token_ids(
+  [101, 102, 103, 201, 202, 301, 302, 401, 402]
+)
+```
+
+### Final canonical row
+
+The finalizer reads `group-a_g0/t0` and `group-a_g0/t1`, verifies both cursor
+links and hashes, and concatenates them:
+
+```text
+input_ids = [101, 102, 103, 201, 202, 301, 302, 401, 402]
+token_mask = [0, 0, 0, 1, 1, 0, 0, 1, 1]
+generation_logprobs = [0.0, 0.0, 0.0, -0.10, -0.20,
+                       0.0, 0.0, -0.30, -0.40]
+input_lengths = 9
+sample_mask = 1
+trajectory_valid_mask = 1
+```
+
+`kv_first_write` publishes that row under canonical key `group-a_g0` in the
+`train` partition. The rollout actor then deletes `group-a_g0/t0`,
+`group-a_g0/t1`, and the cursor entry. Policy logprob and training workers see
+the same canonical schema they use for ordinary synchronous TransferQueue
+training; they do not need to understand turns or staging.
+
+If turn 1 had the wrong prefix, a missing staging row, or a mismatched hash,
+the canonical row would instead have `sample_mask=0` and
+`trajectory_valid_mask=0`, while sibling generations from `group-a` could
+still train normally.
+
 ## Supported modes
 
 | Mode | Overrides | Purpose |
