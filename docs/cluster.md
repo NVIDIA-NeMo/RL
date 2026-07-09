@@ -143,10 +143,11 @@ sbatch ray.sub \
     into the container and will override the container's default `UV_CACHE_DIR`.
 * - `CPUS_PER_WORKER`
   - CPUs each Ray worker node claims. If unset, `ray.sub` auto-detects this from
-    Slurm (the `CPUTot` of the allocated nodes) so that Ray sees every CPU on the
-    node. Detection asserts all allocated nodes report the same CPU count and
-    errors out otherwise; set this explicitly to override (e.g. for a
-    heterogeneous allocation).
+    Slurm (the `CPUTot` of the first allocated node) so that Ray sees every CPU
+    on the node. Detection assumes a homogeneous allocation (all nodes have the
+    same CPU count) and only queries a single node to avoid hammering the Slurm
+    controller with one RPC per node; set this explicitly for a heterogeneous
+    allocation or to override detection.
 * - `GPUS_PER_NODE=8`
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
