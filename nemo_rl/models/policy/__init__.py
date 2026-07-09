@@ -306,6 +306,9 @@ class MegatronConfig(TypedDict):
     moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Create gloo process groups during Megatron distributed init.
+    # Omitted: use the Megatron Bridge default.
+    use_gloo_process_groups: NotRequired[bool]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.

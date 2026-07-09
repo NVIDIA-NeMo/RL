@@ -24,6 +24,9 @@
 
 set -eoux pipefail
 
+# Record job-start epoch so Python can measure pre-Python overhead
+export NRL_JOB_START_EPOCH=$(date +%s.%N)
+
 ########################################################
 # Function to detect if SLURM cluster uses GRES
 ########################################################
@@ -43,6 +46,39 @@ maybe_gres_arg() {
   
   # No GRES support detected
   echo ""
+}
+
+########################################################
+# Function to detect the number of CPUs per node from SLURM
+########################################################
+detect_cpus_per_node() {
+  # Query SLURM for the total number of CPUs (CPUTot) on every allocated node.
+  # With --exclusive whole-node allocations (the default for this script) this
+  # is the full CPU count of the node, which is what we want to claim per worker
+  # so Ray sees every CPU. We assert that all allocated nodes report the same
+  # CPUTot: a heterogeneous allocation breaks the single CPUS_PER_WORKER
+  # assumption and is treated as a user error. On any failure we exit (no
+  # heuristic fallback); set CPUS_PER_WORKER explicitly to override.
+  local node raw cpus expected_cpus=""
+  for node in $(scontrol show hostnames "$SLURM_JOB_NODELIST"); do
+    # Parse "CPUTot=<n>" out of the single-line (`-o`) node description using
+    # pure bash parameter expansion (no grep/awk pipeline) so we don't trip
+    # `set -e`/`pipefail` on a non-matching or short-circuited pipe.
+    raw=$(scontrol show node "$node" -o 2>/dev/null || true)
+    cpus=${raw#*CPUTot=}
+    cpus=${cpus%% *}
+    if ! [[ "$cpus" =~ ^[0-9]+$ ]] || [[ "$cpus" -le 0 ]]; then
+      echo "Error: Could not determine CPUTot for node '$node' from SLURM. Set CPUS_PER_WORKER explicitly to override." >&2
+      exit 1
+    fi
+    if [[ -z "$expected_cpus" ]]; then
+      expected_cpus=$cpus
+    elif [[ "$cpus" -ne "$expected_cpus" ]]; then
+      echo "Error: Heterogeneous CPU counts across allocated nodes (node '$node' reports CPUTot=$cpus but expected $expected_cpus). NeMo-RL assumes a homogeneous allocation; set CPUS_PER_WORKER explicitly to override." >&2
+      exit 1
+    fi
+  done
+  echo "$expected_cpus"
 }
 
 ########################################################
@@ -178,8 +214,78 @@ COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
-# Number of CPUs per worker node
-CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
+# Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
+# explicitly, auto-detect it from SLURM so we claim every CPU the node actually
+# has (instead of the old GPUS_PER_NODE * 16 heuristic, which under-claims on
+# nodes with more cores). Detection exits with an error if it cannot determine a
+# single consistent CPU count; set CPUS_PER_WORKER explicitly to override.
+if [[ -n "${CPUS_PER_WORKER:-}" ]]; then
+  echo "[INFO] Using user-provided CPUS_PER_WORKER=$CPUS_PER_WORKER."
+else
+  CPUS_PER_WORKER=$(detect_cpus_per_node)
+  echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of allocated nodes)."
+fi
+
+# ---------------------------------------------------------------------------
+# GCS burst-tolerance tuning for larger jobs
+#
+# During init, the burst of actor creation triggers thousands of RegisterWorker
+# RPCs to the single GCS server on the head node. The burst of traffic causes
+# overloads which create cascading failures: GCS RPC queue backs up -> workers
+# timeout during registration -> raylet kills them -> NCCL collectives hang.
+#
+# These settings increase GCS throughput, extend timeouts to survive the burst,
+# and reduce background RPC noise during init. Set via RAY_<config_name> env
+# vars which Ray reads at process startup.
+#
+# Config reference: https://github.com/ray-project/ray/blob/master/src/ray/common/ray_config_def.h
+# ---------------------------------------------------------------------------
+
+# --- GCS RPC thread pools ---
+# Size the GCS gRPC pools from the head node's core count (CPUS_PER_WORKER, the
+# per-node CPUTot resolved above) so they scale with the hardware instead of a
+# fixed guess. Ray's own default is hardware_concurrency / 4; we use the full
+# core count for the request-poll pool and half for the reply pool to drain
+# registration bursts faster on high-core-count nodes (e.g. 128 on H100, 144 on
+# GB200/Grace).
+# gcs_server_rpc_server_thread_num: threads that poll for incoming gRPC requests.
+# num_server_call_thread: threads that send gRPC replies.
+# gcs_max_active_rpcs_per_handler auto-scales to rpc_thread_num * 100.
+export RAY_gcs_server_rpc_server_thread_num="${RAY_gcs_server_rpc_server_thread_num:-$CPUS_PER_WORKER}"
+export RAY_num_server_call_thread="${RAY_num_server_call_thread:-$(( CPUS_PER_WORKER / 2 > 0 ? CPUS_PER_WORKER / 2 : 1 ))}"
+
+# --- Registration and RPC timeouts ---
+# With thread tuning, GCS should drain even the worst burst in ~60s. 120s gives
+# 2x margin while keeping failure detection under 2 minutes.
+#
+# worker_register_timeout_seconds (default 60s): raylet kills unregistered
+#   workers after this timeout.
+# gcs_rpc_server_connect_timeout_s (default 5s): initial GCS connection
+#   timeout. Extremely tight at scale — workers fail to get cluster ID.
+# gcs_rpc_server_reconnect_timeout_s (default 60s): max reconnection wait.
+# gcs_server_request_timeout_seconds (default 60s): synchronous GCS requests.
+export RAY_worker_register_timeout_seconds="${RAY_worker_register_timeout_seconds:-120}"
+export RAY_gcs_rpc_server_connect_timeout_s="${RAY_gcs_rpc_server_connect_timeout_s:-120}"
+export RAY_gcs_rpc_server_reconnect_timeout_s="${RAY_gcs_rpc_server_reconnect_timeout_s:-120}"
+export RAY_gcs_server_request_timeout_seconds="${RAY_gcs_server_request_timeout_seconds:-120}"
+
+# --- Reduce background RPC noise during init ---
+# raylet_report_resources_period_milliseconds (default 100ms): at many nodes
+#   the resource-report RPCs/sec hitting GCS add up quickly. 500ms reduces
+#   this 5x, freeing GCS capacity during the burst.
+# task_events_report_interval_ms (default 1000ms): task status pushed to GCS
+#   for dashboard observability. 5000ms reduces this 5x. Dashboard will show
+#   slightly stale task status during init — acceptable tradeoff.
+export RAY_raylet_report_resources_period_milliseconds="${RAY_raylet_report_resources_period_milliseconds:-500}"
+export RAY_task_events_report_interval_ms="${RAY_task_events_report_interval_ms:-5000}"
+
+# --- Cap idle task worker pool ---
+# num_workers_soft_limit (default -1 = number of CPUs): on high-core-count nodes
+#   the raylet accumulates many idle worker processes, each holding a GCS
+#   connection. This is a deliberately low fixed cap (not scaled with cores) —
+#   our task workers are short-lived (port discovery, GPU ID queries), so 16
+#   concurrent per node is plenty.
+export RAY_num_workers_soft_limit="${RAY_num_workers_soft_limit:-16}"
 
 # The head is retried a few times. Workers may need more attempts since they can
 # race the head's GCS coming up: `ray start --address` fails until GCS is listening.
@@ -318,6 +424,34 @@ else
   if [[ -n "\$_hostname_digits" ]]; then
     TOPO_RANK=\$(( 10#\$_hostname_digits ))
   fi
+fi
+
+# Write GPU→cpulist mapping for NUMA binding.
+# IMPORTANT: The env var name NRL_GPU_CPU_AFFINITY_FILE and default path must stay
+# in sync with GPU_CPU_AFFINITY_PATH in nemo_rl/distributed/numa_utils.py.
+export NRL_GPU_CPU_AFFINITY_FILE="/tmp/nrl_gpu_cpu_affinity"
+# nvidia-smi topo -m's CPU Affinity column is unreliable on GB200 (empty for
+# GPUs not directly attached to the socket). Use NUMA Affinity (always
+# populated, at field NF-1 since GPU NUMA ID is last) and look up the
+# node-local CPU list from sysfs. On GB200 the NUMA Affinity column can be a
+# list like "0,2-17" (the GPU-local CPU NUMA node plus the GPU's HBM NUMA
+# nodes); take the first entry, which is the local CPU NUMA node.
+nvidia-smi topo -m 2>/dev/null | awk '/^GPU[0-9]/ {
+  gpu = \$1; sub(/GPU/, "", gpu)
+  numa = \$(NF-1)
+  sub(/[,-].*/, "", numa)
+  if (numa ~ /^[0-9]+\$/) print gpu, numa
+}' | while read -r _gpu _numa; do
+  _cpulist=\$(cat "/sys/devices/system/node/node\${_numa}/cpulist" 2>/dev/null)
+  if [[ -n "\$_cpulist" ]]; then
+    echo "\${_gpu}:\${_cpulist}"
+  fi
+done > "\$NRL_GPU_CPU_AFFINITY_FILE" || true
+if [[ -s "\$NRL_GPU_CPU_AFFINITY_FILE" ]]; then
+  echo "NUMA affinity map written to \$NRL_GPU_CPU_AFFINITY_FILE:"
+  cat "\$NRL_GPU_CPU_AFFINITY_FILE"
+else
+  echo "WARNING: Could not generate NUMA affinity map (nvidia-smi topo unavailable)"
 fi
 
 # Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
@@ -537,6 +671,10 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
     fi
     sleep 5
   done
+
+  # Record the wall-clock epoch when the Ray cluster became ready so the driver
+  # and training process can measure post-ready initialization timing.
+  export NRL_RAY_READY_EPOCH=\$(date +%s.%N)
 
   set +e
   bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
