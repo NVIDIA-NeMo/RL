@@ -2690,6 +2690,25 @@ def grpo_train(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    # Mask samples flagged by the environment (keep for advantage, mask for gradient)
+                    if "mask_sample" in repeated_batch:
+                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                        mask_sample = repeated_batch["mask_sample"]
+
+                        if isinstance(mask_sample, list):
+                            mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+                        mask_sample_bool = mask_sample.bool()
+
+                        num_masked = int(mask_sample_bool.sum().item())
+                        if num_masked > 0:
+                            print(
+                                f"  📊 mask_sample filtering: masking {num_masked}/{len(mask_sample_bool)} env-flagged samples",
+                                flush=True,
+                            )
+                        loss_multiplier[mask_sample_bool] = 0
+                        repeated_batch["loss_multiplier"] = loss_multiplier
+
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -3998,6 +4017,25 @@ def async_grpo_train(
                                 truncated = torch.tensor(truncated, dtype=torch.bool)
 
                             loss_multiplier[truncated] = 0
+                            repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    # Mask samples flagged by the environment (keep for advantage, mask for gradient)
+                    with timer.time("mask_sample_filter"):
+                        if "mask_sample" in repeated_batch:
+                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                            mask_sample = repeated_batch["mask_sample"]
+
+                            if isinstance(mask_sample, list):
+                                mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+                            mask_sample_bool = mask_sample.bool()
+
+                            num_masked = int(mask_sample_bool.sum().item())
+                            if num_masked > 0:
+                                print(
+                                    f"  📊 mask_sample filtering: masking {num_masked}/{len(mask_sample_bool)} env-flagged samples",
+                                    flush=True,
+                                )
+                            loss_multiplier[mask_sample_bool] = 0
                             repeated_batch["loss_multiplier"] = loss_multiplier
 
                     # Add loss mask to each message
