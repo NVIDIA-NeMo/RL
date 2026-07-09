@@ -660,7 +660,18 @@ class VllmInternalWorkerExtension:
                     )
 
             if self._mx_megatron_mode:
-                return self._update_weights_via_mx_megatron(
+                # Converged path (default): drive the native tier-2
+                # MxVllmWeightUpdater, which delivers full HF weights (vLLM
+                # slices per-TP at load) and supports EP-gather (EP trainer ->
+                # lower-EP / non-EP rollout) with per-source global expert remap.
+                # Set MX_MEGATRON_LEGACY_RECEIVER=1 to use the older bespoke
+                # planner path (matched-TP fast path + mixed-TP sliced pull, no
+                # EP-gather) as a rollback.
+                if os.environ.get("MX_MEGATRON_LEGACY_RECEIVER", "0") == "1":
+                    return self._update_weights_via_mx_megatron(
+                        candidates=candidates, version=int(version), mx_config=mx_config,
+                    )
+                return self._update_weights_via_mx_native(
                     candidates=candidates, version=int(version), mx_config=mx_config,
                 )
 
@@ -767,6 +778,97 @@ class VllmInternalWorkerExtension:
                     batch,
                     timeout_seconds=mx_config.timeout_seconds,
                 )
+
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_via_mx_native"
+    )
+    def _update_weights_via_mx_native(
+        self,
+        *,
+        candidates: list,
+        version: int,
+        mx_config: Any,
+    ) -> bool:
+        """Converged Megatron-MX receive via the native tier-2 updater.
+
+        Delegates to :class:`modelexpress.engines.vllm.weight_update.MxVllmWeightUpdater`,
+        which delivers **full HF weights** (target TP1 -> vLLM's loader slices to
+        this rank's TP at load) and, when the trainer spans multiple EP ranks,
+        gathers experts across sources with per-source local->global expert remap
+        (``experts.<local>`` -> ``experts.<global>``, publisher advertises the
+        global id). Reuses our existing ``self._mx_receiver`` so there's one NIXL
+        agent per worker.
+
+        Correctness-first: full-HF delivery works for matched-TP, mixed-TP
+        (TP1 trainer -> TP2 rollout), and EP-gather uniformly. EP byte-pruning
+        (pull only this rank's experts) is a bandwidth optimization deferred to a
+        follow-up that introspects the rollout's live EP layout.
+        """
+        from modelexpress.engines.vllm.weight_update import (
+            MxInitInfo,
+            MxUpdateInfo,
+            MxVllmWeightUpdater,
+        )
+
+        model_name = (
+            self.model_config.model
+            if hasattr(self.model_config, "model")
+            else getattr(
+                self.model_runner.vllm_config.model_config, "model", "unknown"
+            )
+        )
+        if getattr(self, "_mx_updater", None) is None:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            self._mx_updater = MxVllmWeightUpdater()
+            self._mx_updater.initialize_weight_update_setup(
+                MxInitInfo(
+                    mx_server_url=mx_config.mx_server_url,
+                    model_name=model_name,
+                    worker_rank=rank,
+                    device_id=self.device.index,
+                    same_rank_only=mx_config.same_rank_only,
+                    tree_scale_out=bool(getattr(mx_config, "tree_scale_out", False)),
+                ),
+                existing_receiver=self._mx_receiver,
+            )
+            print(
+                f"[mx-native] rank={self._mx_receiver.worker_rank} converged "
+                f"tier-2 updater initialized (reusing existing receiver)"
+            )
+
+        # Full-HF gather (moe_expert_filter=False): every rank pulls the full
+        # expert set and vLLM's loader slices per-TP/EP at load. Correct for all
+        # topologies; EP byte-pruning is a later optimization.
+        upd = MxUpdateInfo(
+            version=int(version),
+            min_version=int(version),
+            timeout_seconds=mx_config.timeout_seconds,
+            moe_expert_filter=False,
+        )
+        try:
+            self._mx_updater.start_weight_update(int(version))
+            self._mx_updater.update_weights(upd, load_weights=self._load_weights)
+            self._mx_updater.finish_weight_update(int(version))
+        except Exception as e:
+            print(
+                f"Error in _update_weights_via_mx_native: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return False
+
+        torch.cuda.current_stream().synchronize()
+        self._maybe_process_fp8_kv_cache()
+        if mx_config.tree_scale_out:
+            self._mx_receiver.publish_self_as_source(
+                version=int(version), model_name=model_name
+            )
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_via_mx_megatron"
