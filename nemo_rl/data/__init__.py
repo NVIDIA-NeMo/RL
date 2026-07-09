@@ -62,6 +62,14 @@ class DataConfig(TypedDict):
     use_multiple_dataloader: NotRequired[bool]
     num_prompts_per_dataloader: NotRequired[int]
     custom_dataloader: NotRequired[str]
+    # Optional: JSON file (from tools/build_length_ordering.py) mapping first-turn
+    # prompt_token_hash -> output-length rank. When set, the single training
+    # dataset is reordered shortest-output-first; pair with shuffle=false so that
+    # lower-output-length steps run before higher-output-length steps.
+    length_order_json: NotRequired[str | None]
+    # Where to place dataset prompts absent from length_order_json: "last"
+    # (default) or "first".
+    length_order_unseen: NotRequired[str]
     # dataset configs
     train: ResponseDatasetConfig | PreferenceDatasetConfig | list[ResponseDatasetConfig]
     validation: NotRequired[

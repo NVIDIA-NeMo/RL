@@ -166,6 +166,25 @@ def main() -> None:
         tokenizer, config.data, env_configs=None
     )
 
+    # Optional: reorder the training dataset shortest-output-first using a length
+    # ordering derived from a prior rollout trace (tools/build_length_ordering.py).
+    # This makes lower-output-length steps run before higher-output-length steps.
+    length_order_json = config.data.get("length_order_json")
+    if length_order_json:
+        from nemo_rl.data.length_ordering import build_length_ordered_dataset
+
+        train_dataset = build_length_ordered_dataset(
+            train_dataset,
+            length_order_json,
+            unseen=config.data.get("length_order_unseen", "last"),
+        )
+        if config.data.get("shuffle"):
+            print(
+                "length_order_json is set: forcing data.shuffle=false so the "
+                "shortest-output-first ordering is preserved."
+            )
+        config.data["shuffle"] = False
+
     # Validation dataset config setup.
     if config.grpo["max_val_samples"] is not None:
         raise ValueError(
