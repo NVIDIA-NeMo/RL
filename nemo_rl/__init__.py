@@ -295,6 +295,8 @@ def _patch_transformers_tokenizer_class_set():
     # upper bound below 5.9 today, which forces us onto a transformers version
     # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
     # its transformers upper bound to >=5.12, we can drop this workaround.
+    # TODO(#2764): remove this patch (and the assert below) once MBridge relaxes
+    # its transformers upper bound past the deepseek_v3 fix (~transformers 5.12).
     assert transformers.__version__ < "5.12.0", (
         f"transformers {transformers.__version__} detected. "
         "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
