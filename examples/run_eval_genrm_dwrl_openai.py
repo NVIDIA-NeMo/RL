@@ -41,10 +41,12 @@ DWRL_PROMPT_TEMPLATE = """You are an expert evaluation judge specializing in the
 {response}
 [The End of Response]
 
-Please act as an impartial judge and evaluate the quality of the response provided by an AI assistant to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistant's response, compare the assistant's response with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's response is helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's response when needed. Finally, identify any missing important information in the assistant's response which would be beneficial to include when responding to the user prompt.
+#### Evaluation Plan ####
+{principle}
 
 #### Scoring Guidelines ####
-Based on the evaluation plan above, assign scores using these scales:
+Based on the evaluation plan above, assign a score using these scales:
+
 **Individual Helpfulness Scores (1-5):**
 - 5: Extremely Helpful - Completely aligned with what the user was asking for
 - 4: Mostly Helpful - Generally useful with minor room for improvement
@@ -57,14 +59,14 @@ Analyze step by step following the evaluation plan, then provide your judgment a
 ```json
 {{
     "response_analysis": "Your detailed analysis of the Response based on the evaluation plan",
-    "score": <1-5>
+    "score_1": <1-5>
 }}
 ```"""
 
 #SCORE_PROMPT = 'Based on your evaluation, is the response helpful and harmless? Answer with only a single word: yes or no'
 SCORE_PROMPT = 'Based on your evaluation, is the original response good? Answer with only a single word: yes or no'
 YES_TOKEN = "yes"
-
+DEFAULT_PRINCIPLE = "Please act as an impartial judge and evaluate the quality of the response provided by an AI assistant to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistant's response, compare the assistant's response with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's response is helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's response when needed. Finally, identify any missing important information in the assistant's response which would be beneficial to include when responding to the user prompt."
 
 def flatten_to_single_turn(message_log):
     ret = ""
@@ -94,11 +96,11 @@ def get_json_response(response):
         return resp_no_thinking2
 
 
-def get_score_from_vllm(samp, response):
+def get_score_from_vllm(samp, response, principle):
     try:
         completion = client.chat.completions.create(
           model="model",
-          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response=response)}],
+          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response=response, principle=principle)}],
           temperature=args.temperature,
           top_p=args.top_p,
           max_tokens=args.max_tokens,
@@ -113,7 +115,7 @@ def get_score_from_vllm(samp, response):
         
         completion = client.chat.completions.create(
           model="model",
-          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response=response)}] + [{"role": "assistant", "content": thought}] + [{"role": "user", "content": SCORE_PROMPT}],
+          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response=response, principle=principle)}] + [{"role": "assistant", "content": thought}] + [{"role": "user", "content": SCORE_PROMPT}],
           temperature=1.0,
           top_p=1.0,
           max_tokens=1,
@@ -151,10 +153,10 @@ def get_score_from_vllm(samp, response):
 def benchmark_single(samp, idx):
     response_1 = samp["response1"]
     response_2 = samp["response2"]
-    #preference = samp["preference"]
+    principle = samp.get("principle", DEFAULT_PRINCIPLE)
     
-    score_1, thought_1 = get_score_from_vllm(samp, response_1)
-    score_2, thought_2 = get_score_from_vllm(samp, response_2)
+    score_1, thought_1 = get_score_from_vllm(samp, response_1, principle)
+    score_2, thought_2 = get_score_from_vllm(samp, response_2, principle)
     
     #gt = 0 if overall_preference < 0 else 1
     

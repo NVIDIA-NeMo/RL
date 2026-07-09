@@ -47,7 +47,7 @@ from nemo_rl.data.datasets.preference_datasets.reward_benchmarks import HelpStee
 #    GenRMEnvironment,
 #    format_scoring_stage_prompt,
 #)
-from nemo_rl.environments.genrm_environment import GenRMEnvironment
+#from nemo_rl.environments.genrm_environment import GenRMEnvironment
 from nemo_rl.environments.vanilla_genrm_environment import VanillaGenRMEnvironment
 
 TokenizerType = PreTrainedTokenizerBase
@@ -63,10 +63,12 @@ DWRL_PROMPT_TEMPLATE = """You are an expert evaluation judge specializing in the
 {response}
 [The End of Response]
 
-Please act as an impartial judge and evaluate the quality of the response provided by an AI assistant to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistant's response, compare the assistant's response with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's response is helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's response when needed. Finally, identify any missing important information in the assistant's response which would be beneficial to include when responding to the user prompt.
+#### Evaluation Plan ####
+{principle}
 
 #### Scoring Guidelines ####
 Based on the evaluation plan above, assign a score using these scales:
+
 **Individual Helpfulness Scores (1-5):**
 - 5: Extremely Helpful - Completely aligned with what the user was asking for
 - 4: Mostly Helpful - Generally useful with minor room for improvement
@@ -83,6 +85,7 @@ Analyze step by step following the evaluation plan, then provide your judgment a
 }}
 ```"""
 
+DEFAULT_PRINCIPLE = "Please act as an impartial judge and evaluate the quality of the response provided by an AI assistant to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistant's response, compare the assistant's response with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's response is helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's response when needed. Finally, identify any missing important information in the assistant's response which would be beneficial to include when responding to the user prompt."
 
 def flatten_to_single_turn(message_log):
     ret = ""
@@ -131,6 +134,7 @@ def dwrl_preference_data_processor(
     context = datum_dict.get("context", "")
     resp1 = datum_dict.get("response1", "")
     resp2 = datum_dict.get("response2", "")
+    principle = datum_dict.get("principle", DEFAULT_PRINCIPLE)
     pref_binary = datum_dict["preference"]
     if pref_binary == 0:
         chosen = resp1
@@ -139,8 +143,8 @@ def dwrl_preference_data_processor(
         chosen = resp2
         reject = resp1
     
-    prompt_chosen = DWRL_PROMPT_TEMPLATE.format(context=context, response=chosen)
-    prompt_reject = DWRL_PROMPT_TEMPLATE.format(context=context, response=reject)
+    prompt_chosen = DWRL_PROMPT_TEMPLATE.format(context=context, response=chosen, principle=principle)
+    prompt_reject = DWRL_PROMPT_TEMPLATE.format(context=context, response=reject, principle=principle)
 
     # Prepare metadata for environment
     metadata = copy.deepcopy(datum_dict)

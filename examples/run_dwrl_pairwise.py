@@ -63,10 +63,12 @@ DWRL_PROMPT_TEMPLATE = """You are an expert evaluation judge specializing in com
 {response_2}
 [The End of Response 2]
 
-Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt.
+#### Evaluation Plan ####
+{principle}
 
 #### Scoring Guidelines ####
 Based on the evaluation plan above, assign scores using these scales:
+
 **Individual Helpfulness Scores (1-5):**
 - 5: Extremely Helpful - Completely aligned with what the user was asking for
 - 4: Mostly Helpful - Generally useful with minor room for improvement
@@ -93,6 +95,8 @@ Analyze step by step following the evaluation plan, then provide your judgment a
     "ranking": <1-6>
 }}
 ```"""
+
+DEFAULT_PRINCIPLE = "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers which would be beneficial to include when responding to the user prompt."
 
 def flatten_to_single_turn(message_log):
     ret = ""
@@ -142,8 +146,9 @@ def dwrl_pairwise_data_processor(
     context = datum_dict.get("context", "")
     resp1 = datum_dict.get("response1", "")
     resp2 = datum_dict.get("response2", "")
+    principle = datum_dict.get("principle", DEFAULT_PRINCIPLE)
     
-    prompt_str = DWRL_PROMPT_TEMPLATE.format(context=context, response_1=resp1, response_2=resp2)
+    prompt_str = DWRL_PROMPT_TEMPLATE.format(context=context, response_1=resp1, response_2=resp2, principle=principle)
 
     # Prepare metadata for environment
     metadata = copy.deepcopy(datum_dict)

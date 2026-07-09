@@ -90,9 +90,6 @@ If there are two responses, give the relative ranking score in the format of:
 \\boxed{{z}} if there exists 2 responses
 [The End of Ranking Score]
 You don't need to give a ranking score if only one response is provided."""
-
-
-
          
 
 def format_genrm_prompt(context: str, response1: str, response2: Optional[str] = None) -> str:
@@ -557,6 +554,8 @@ class HelpSteer3LocalDataset(torch.utils.data.Dataset):
                         "response1": one["args"]["response1"],
                         "response2": one["args"]["response2"],
                     }
+                    if "principle" in one["args"]:
+                        example["principle"] = one["args"]["principle"]
                     examples.append(example)
 
                     if double_swap:
@@ -571,6 +570,8 @@ class HelpSteer3LocalDataset(torch.utils.data.Dataset):
                             "response1": one["args"]["response2"],
                             "response2": one["args"]["response1"],
                         }
+                        if "principle" in one["args"]:
+                            example["principle"] = one["args"]["principle"]
                         examples.append(example)
 
                     if split == "validation":

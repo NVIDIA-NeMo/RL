@@ -36,6 +36,10 @@ evaluate_genrm_all_steps_pairwise.sh
 evaluate_genrm_all_steps_vllm_pairwise.sh
 evaluate_genrm_one_step_dwrl_pairwise.sh
 evaluate_genrm_one_step_vllm_pairwise.sh
+evaluate_genrm_all_steps_vllm_pairwise_bt_only.sh
+evaluate_genrm_all_steps_vllm_pairwise_genrm.sh
+evaluate_genrm_one_step_vllm_pairwise_bt_only.sh
+evaluate_genrm_one_step_vllm_pairwise_genrm.sh
 
 # Cache
 uv_cache/
