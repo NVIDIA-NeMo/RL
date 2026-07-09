@@ -2,7 +2,7 @@
 
 Model-family guidance for post-training with NeMo RL. Each family hub links to
 version-specific pages covering recipe selection, recommended generation settings,
-and known issues. Recipe YAMLs under `examples/configs/recipes/` remain the source of
+and known issues. Recipe YAML files under `examples/configs/recipes/` remain the source of
 truth; these pages explain *when and why* to choose a recipe.
 
 For the full list of supported models, see
