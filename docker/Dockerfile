@@ -179,7 +179,8 @@ fi
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
-# The venv is symlinked to avoid bloating the layer size
+# Hardlink mode: venv entries share inodes with the uv cache, so no disk is duplicated
+# while every .dist-info/METADATA file is physically accessible in the venv path.
 UV_LINK_MODE=hardlink uv sync --locked --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --locked --extra vllm --no-install-project
@@ -187,14 +188,28 @@ fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --locked --extra sglang --no-install-project
 fi
-uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
-uv sync --link-mode symlink --locked --extra modelopt --no-install-project
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --extra mcore --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --extra automodel --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --extra modelopt --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+
+# Ensure every .dist-info has a METADATA file so downstream `uv pip install` calls
+# can run dependency resolution without failing. Source-built packages (git deps,
+# editable installs) occasionally produce .dist-info entries without METADATA;
+# generate a minimal Name/Version stub for any that are still missing after the sync.
+for dist_info in /opt/nemo_rl_venv/lib/python*/site-packages/*.dist-info; do
+    meta="${dist_info}/METADATA"
+    [ -f "$meta" ] && continue
+    stem=$(basename "${dist_info}" .dist-info)
+    ver="${stem##*-}"
+    name="${stem%-*}"
+    printf 'Metadata-Version: 2.1\nName: %s\nVersion: %s\n' "${name//_/-}" "${ver}" > "${meta}"
+    echo "Generated minimal METADATA for ${dist_info}"
+done
 
 echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
