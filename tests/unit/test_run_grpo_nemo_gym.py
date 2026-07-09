@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -75,6 +89,23 @@ def test_collect_trajectories_logs_rollout_and_generation_metrics(monkeypatch):
     assert policy_generation.get_logger_metrics.call_count == 2
     policy_generation.finish_generation.assert_called_once_with()
     assert logger.log_string_list_as_jsonl.call_count == 2
+    logged_batches = [
+        [json.loads(row) for row in log_call.args[0]]
+        for log_call in logger.log_string_list_as_jsonl.call_args_list
+    ]
+    assert [
+        batch[0]["trajectory_collection_batch_index"] for batch in logged_batches
+    ] == [
+        0,
+        1,
+    ]
+    assert all(
+        batch[0]["trajectory_collection_batch_position"] == 0
+        for batch in logged_batches
+    )
+    assert all(
+        batch[0]["trajectory_collection_batch_size"] == 1 for batch in logged_batches
+    )
 
     rollout_log_calls = [
         log_call

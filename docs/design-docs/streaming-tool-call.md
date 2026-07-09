@@ -15,9 +15,9 @@ OpenHands checkout used by the SWE harness:
   only after a second extending snapshot reaches `min_chunk_chars`.
 - `LocalRuntime` requires strict append-only snapshot growth. A terminal-screen
   rewrite or any streaming exception falls back to the baseline path.
-- The Gym model proxy fully retokenizes every cumulative candidate through the
-  same preprocessing as normal chat completions and preserves its existing
-  sticky client cookie.
+- The Gym model proxy preserves its existing sticky client cookie. Legacy
+  prefill/tokenizer-only mode fully retokenizes cumulative candidates; exact
+  incremental mode routes ordered candidates to backend tokenizer state.
 - The vLLM worker commits only the longest token prefix proven stable by two
   consecutive candidates, minus a configurable token holdback.
 - Each session has serialized appends, a one-item engine input queue, a global
@@ -27,25 +27,32 @@ OpenHands checkout used by the SWE harness:
   updates or cache resets. Sleep keeps admission paused until wake-up.
 - Tool completion closes the speculative request after exact final-prefix
   validation. The next model turn still uses the unchanged normal chat endpoint.
-- In tokenizer-only mode, tool completion stores the authoritative final
-  `/tokenize` result as a bounded one-shot candidate. The next matching model
-  turn consumes those token IDs for generation and prompt logging, without a
-  speculative prefill or a second tokenizer encode.
+- In tokenizer-only mode, tool completion stores exact final prompt tokens as
+  a bounded one-shot candidate. Legacy mode obtains them from `/tokenize`;
+  exact incremental mode obtains them from the incremental encoder unless a
+  checkpoint is due. The next matching model turn consumes those token IDs for
+  generation and prompt logging, without a speculative prefill or another
+  tokenizer encode.
+- Exact incremental-tokenizer mode keeps bounded, ordered state in the NeMo-RL
+  vLLM HTTP server. It re-encodes only the final mutable pre-tokenizer segment
+  and changed normalized-text tail between full-tokenizer checkpoints.
+- Sequence zero and every configured checkpoint interval use the unchanged
+  full tokenizer. Finalization checkpoints only when its sequence is due or the
+  session is already invalid; otherwise it returns the encoder's exact token
+  IDs and removes the session. Any checkpoint mismatch permanently disables
+  incremental work for that action.
 - The tokenizer request retains only the newest assistant token-logging triplet
   so NeMo-RL's authoritative historical-prefix replacement still runs. A
   separate canonical comparison copy removes all token-logging fields.
 
-The OpenHands integration is stored as the base
-`responses_api_agents/swe_agents/patches/streaming_tool_call.patch`, followed
-by the incremental `streaming_tool_call_observability.patch` and
-`streaming_tool_call_admission_observability.patch` in the Gym submodule. The
-setup path applies the compatible missing suffix of that patch chain to a new
-or cached checkout without forcing a venv rebuild.
+The OpenHands integration is stored as an ordered patch chain in
+`responses_api_agents/swe_agents/patches/`, ending with
+`streaming_tool_call_exact_incremental_tokenizer.patch`. The setup path applies
+the compatible missing suffix to a new or cached checkout without forcing a
+venv rebuild.
 
 The following items from the broader design are not implemented in v1:
 
-- tokenizer state that incrementally encodes only new text,
-- suffix-revision handling through a mutable text frontier,
 - a global pending-token limit or KV-cache/queue high-water admission control,
 - a maximum application chunk size or background TTL cleanup task,
 - cancellation of an already in-flight HTTP prefill request when the tool
@@ -304,21 +311,23 @@ snapshot. If truncation or terminal rendering rewrites already observed text,
 the strict append-only check falls back rather than trying to maintain a mutable
 head/tail frontier.
 
-True incremental tokenizer state that encodes only a new suffix, including BPE
-boundary repair, is not implemented. V1 performs incremental prefill, not
-incremental encoding. The `tokenizer_only` experiment still fully retokenizes
-each admitted cumulative prompt, but it now reuses the authoritative final
-tokenization in the next model call. This tests whether moving and deduplicating
-tokenizer work helps without issuing speculative generation/prefill requests;
-it is not yet the suffix-only encoder designed below.
+The original tokenizer-only implementation fully retokenized each admitted
+cumulative prompt. The optional exact incremental mode described below now
+replaces that intermediate work with mutable-tail repair and passes the exact
+incrementally constructed final IDs to one-shot prompt reuse. A periodic or
+invalid-session final revision still uses the authoritative full tokenizer. It
+does not issue speculative generation or prefill requests.
 
 ## Implemented Tokenizer-Only Prompt Reuse
 
 At tool completion, `LocalRuntime` reconstructs the unchanged authoritative
 `CmdOutputObservation`, sends one final tokenizer-only request, and receives a
-one-shot `reuse_id`. The Gym vLLM model proxy stores the exact preprocessed
-prompt fields, token IDs, sticky backend-client identity, and expiry time. The
-final request carries the YAML-configured `max_sessions` and
+one-shot `reuse_id`. In legacy mode that request runs ordinary `/tokenize`. In
+exact incremental mode the stateful backend returns its current exact IDs,
+unless the revision is checkpoint-due or the session has fallen back. The Gym
+vLLM model proxy stores the exact preprocessed prompt fields, token IDs, sticky
+backend-client identity, and expiry time. The final request carries the
+YAML-configured `max_sessions` and
 `session_ttl_seconds`; candidates are lazily expired, bounded by that shared
 limit, and consumed at most once.
 
@@ -354,17 +363,22 @@ formatting, reasoning, tool parsing, multimodal metadata, context-length
 validation, and max-output-token clamping, but supplies the stored tokens to
 the renderer instead of calling tokenizer encode. Gym also uses the same IDs
 for logged `prompt_token_ids`, eliminating its previous second `/tokenize`
-request. Thus one authoritative final tokenization replaces the generation
-path's tokenizer encode plus Gym's duplicate logging tokenization.
+request. Legacy tokenizer-only mode therefore uses one authoritative final
+tokenization in place of the generation encode plus Gym's duplicate logging
+encode. Exact incremental mode also removes that final full encode when no
+checkpoint is due.
 
-This handoff cannot change trajectory tokens when either gate is obeyed: the
-token IDs came from the same backend `/tokenize` endpoint, and the fast gate
-requires canonical prompt equality while the fallback gate requires complete
-token equality. It does not trust an approximate string prefix or a
-client-provided token list. The direct vLLM field is internal to the trusted
-Gym-to-worker request and is never exposed as an arbitrary OpenHands token
-override. The unchanged NeMo-RL monotonic-token assertion remains the final
-end-to-end guard.
+For legacy tokenizer-only mode, this handoff cannot change trajectory tokens
+when either gate is obeyed: the token IDs came from the same backend
+`/tokenize` endpoint, and the fast gate requires canonical prompt equality
+while the fallback gate requires complete token equality. Exact incremental
+mode instead relies on the exact offset-repair algorithm below, with periodic
+full-token checkpoints and fallback. It never trusts an approximate string
+prefix or a client-provided token list. The direct vLLM field is internal to
+the trusted Gym-to-worker request and is never exposed as an arbitrary
+OpenHands token override. The unchanged NeMo-RL monotonic-token assertion
+guards historical model-token continuity; rollout accuracy and fixed-trace
+token equality remain required gates for checkpoint-free final IDs.
 
 ```mermaid
 sequenceDiagram
@@ -373,8 +387,13 @@ sequenceDiagram
     participant V as NeMo-RL vLLM HTTP server
 
     O->>G: final tokenizer-only request(authoritative observation)
-    G->>V: /tokenize(exact final chat)
-    V-->>G: prompt_token_ids
+    alt legacy or checkpoint-due final
+        G->>V: /tokenize(exact final chat)
+        V-->>G: prompt_token_ids
+    else valid exact-incremental final
+        G->>V: incremental finalize(exact final chat)
+        V-->>G: exact incremental prompt_token_ids
+    end
     G-->>O: opaque one-shot reuse_id
     O->>G: next chat completion + reuse_id
     G->>G: canonical prompt + sticky-client comparison
@@ -395,9 +414,11 @@ sequenceDiagram
     end
 ```
 
-## Proposed Exact Incremental Tokenizer
+## Implemented Exact Incremental Tokenizer
 
-Status: detailed design; not implemented by the current `tokenizer_only` path.
+Status: implemented behind
+`streaming_tool_call.exact_incremental_tokenizer=false` and under repeated
+rollout validation.
 
 The tokenizer cannot prevent a recent token suffix from changing when more
 characters arrive. Byte-level BPE merges, Unicode normalization, the
@@ -407,104 +428,117 @@ token from entering the committed vLLM KV prefix.
 
 ### Placement and interface
 
-The incremental tokenizer state belongs in the NeMo Gym model proxy selected by
-the existing sticky client cookie. That layer owns the authoritative chat
-template, tokenizer, and `_replace_prefix_tokens()` preprocessing; OpenHands
-should continue to send cumulative text snapshots without making tokenizer
-decisions.
+The NeMo-RL vLLM HTTP server owns the state because it owns the exact fast
+tokenizer, chat renderer, and `_replace_prefix_tokens()` preprocessing. The Gym
+model proxy uses its existing sticky client cookie to route every action to the
+same data-parallel server. OpenHands continues to send cumulative snapshots and
+makes no token-boundary decisions.
 
-The proxy exposes one stateful tokenizer session per tool action:
+The backend exposes one stateful session per admitted tool action:
 
 ```text
-initialize(chat_without_final_tool_output, tokenizer_fingerprint)
-append(sequence_no, cumulative_tool_output) -> stable_token_suffix
-finalize(authoritative_final_chat) -> exact_prefix_match
+start(sequence_no=0, rendered_prompt, authoritative_token_ids)
+append(sequence_no, rendered_prompt, optional_authoritative_token_ids)
+finalize(sequence_no, rendered_prompt, optional_authoritative_token_ids)
 abort(reason)
 ```
 
 The session records:
 
-- tokenizer, chat-template, special-token, and model-weight fingerprints;
-- the last accepted cumulative UTF-8 tool text and sequence number;
-- immutable prompt-prefix token IDs from prior conversation turns;
-- `committed_token_ids`, which may never be revised;
-- a mutable text/token tail with tokenizer offset or pre-tokenizer state;
-- the previous verified candidate token IDs and stable frontier;
-- checkpoint, rollback, mismatch, and encoded-byte counters.
+- the last normalized rendered prompt, exact token IDs, and token offsets;
+- authoritative historical-prefix tokens whose offsets are intentionally
+  unmapped and may never be crossed by a repair frontier;
+- exact backend pre-tokenizer offsets for the rendered text;
+- the last accepted sequence, prompt, idempotent result, and expiry time; and
+- encoded-character/token, reused-token, rollback-token, checkpoint-token, and
+  checkpoint-mismatch counters.
 
-The chat renderer must expose the prompt as an immutable prefix, the growing
-tool-output field, and an unstable closing suffix. The closing suffix is never
-committed while the tool is running because appending tool text moves its token
-boundary.
+Sessions are bounded by `max_sessions`, expire lazily after
+`session_ttl_seconds`, accept ordered sequences, and return the previous result
+for an identical same-sequence retry. A changed retry or sequence gap fails
+open.
 
 ### Append and commit algorithm
 
 For each distinct cumulative snapshot:
 
-1. Require `new_text.startswith(previous_text)`. A terminal rewrite immediately
-   aborts speculative work and uses the baseline final request.
-2. Coalesce snapshots while an append is in flight; process only the newest
-   revision after the configured character/time bucket is reached.
-3. Feed only the newly appended UTF-8 bytes to a tokenizer-specific streaming
-   adapter. The adapter retains the last open pre-tokenizer segment and a
-   mutable token tail; it finalizes only lexical segments whose right boundary
-   is proven closed.
-4. Roll back and re-encode the mutable tail whenever new bytes change its token
-   segmentation. A fixed character lookback alone is not considered safe: a
-   tokenizer adapter must expose an exact stable boundary, otherwise this path
-   falls back to cumulative retokenization.
-5. Form the new verified candidate from the immutable prompt prefix, committed
-   tokens, repaired tail, and new tokens. Require it to start with every
-   `committed_token_id`.
-6. Compute the longest common token prefix with the previous verified candidate
-   and intersect it with the adapter's stable boundary. Subtract
-   `stability_margin_tokens`; only the remaining new suffix is commit-eligible.
-7. Periodically run the unchanged full tokenizer as a checkpoint. A mismatch
-   inside the mutable tail rolls back and repairs that tail. A mismatch touching
-   committed tokens aborts the streaming session because already-prefilled KV
-   cannot be edited safely.
-8. Submit only newly committed token IDs to the resumable prefill request. Empty
-   stable suffixes update tokenizer state without issuing vLLM work.
+1. Render the same complete chat request as `/tokenize` and normalize it with
+   the tokenizer backend. Qwen uses NFC; any other non-empty normalizer is
+   rejected at session construction.
+2. Find the exact normalized-character longest common prefix between the
+   previous and new rendered prompts. This deliberately handles an appended
+   Unicode combining character changing already-normalized text.
+3. Move the repair frontier left to the start of the pre-tokenizer segment that
+   contains the change. Also move it left across any partial added-token string
+   such as a split `<|im_end|>`.
+4. Align the frontier to the first affected tokenizer offset. If that token
+   starts inside an earlier pre-tokenizer segment, move left again until both
+   token and pre-token boundaries agree. Crossing an unmapped authoritative
+   historical token is forbidden and triggers fallback.
+5. Retain every token whose mapped end offset is at or before the final repair
+   frontier. Encode only `new_normalized_prompt[repair_start:]`, offset its
+   mappings back into the full prompt, and concatenate it with the retained
+   authoritative token prefix.
+6. On sequence zero and every
+   `incremental_tokenizer_checkpoint_interval` appends, run ordinary `/tokenize`
+   and compare the complete token-ID list. A mismatch increments the mismatch
+   counter and permanently switches that action to full checkpoints; it never
+   trusts the incremental list again.
+7. On finalization, run ordinary `/tokenize` only if that sequence is
+   checkpoint-due or the session is invalid. Otherwise return a copy of the
+   encoder's current token IDs to Gym for the one-shot prompt-reuse candidate.
+   Delete the session in either case. The IDs reach generation only after the
+   existing canonical prompt and sticky-backend reuse gates pass.
 
 ```mermaid
 flowchart TD
-    A["New cumulative tool snapshot"] --> B{"Text extends previous snapshot?"}
-    B -- No --> X["Abort speculative session<br/>use normal final request"]
-    B -- Yes --> C["Append new bytes to tokenizer adapter<br/>rollback and re-encode mutable tail"]
-    C --> D{"Candidate still starts with<br/>all committed token IDs?"}
-    D -- No --> X
-    D -- Yes --> E["Stable frontier = adapter boundary<br/>intersect token LCP; subtract holdback"]
-    E --> F["Commit only newly proven stable tokens"]
-    F --> G{"Checkpoint or tool completion?"}
-    G -- No --> A
-    G -- Yes --> H["Full authoritative tokenization"]
-    H --> I{"Committed IDs are an exact prefix?"}
-    I -- No --> X
-    I -- Yes --> J["Mark tokenizer/prefill action valid<br/>normal final generation may reuse KV"]
+    A["New cumulative rendered prompt"] --> B["NFC normalize and find exact char LCP"]
+    B --> C["Rollback to added-token, token-offset,<br/>and pre-tokenizer boundaries"]
+    C --> D["Reuse tokens before frontier;<br/>encode only repaired tail"]
+    D --> E{"Periodic checkpoint or invalid session?"}
+    E -- No --> J{"Final?"}
+    E -- Yes --> F["Unchanged full /tokenize"]
+    F --> G{"Complete token IDs equal?"}
+    G -- No --> H["Disable incremental state;<br/>full checkpoints only"]
+    G -- Yes --> I["Reset offsets from authoritative checkpoint"]
+    H --> J
+    I --> J
+    J -- No --> A
+    J -- Yes --> K["Return checkpoint or exact incremental IDs;<br/>delete session and register reuse candidate"]
 ```
 
 ### Finalization and correctness invariant
 
 Tool completion always constructs the unchanged authoritative final
-`CmdOutputObservation` and fully tokenizes the normal final chat request. Let
-`C` be the committed speculative tokens and `F` the authoritative final prompt
-tokens. Reuse is allowed only when:
+`CmdOutputObservation`. Let `I` be the incrementally constructed token list and
+`F` the full-tokenizer result for the same rendered prompt. Correctness requires:
 
 ```python
-F[: len(C)] == C
+I == F
 ```
 
-Tentative-tail changes are expected and repaired. A change before `len(C)` is a
-hard invariant violation: abort the speculative request, increment the mismatch
-and fallback counters, and run the normal final request without relying on its
-KV state. This preserves trajectory tokens and accuracy even if the incremental
-adapter is wrong; only speculative performance is lost.
+Tentative-tail changes are expected and repaired. Every configured periodic
+checkpoint evaluates this invariant. Any inequality is a hard invariant
+violation for optimization state: mark the action invalid, increment
+mismatch/fallback counters, and use only ordinary full-tokenizer results
+thereafter.
+
+A checkpoint-free final revision does not evaluate `I == F` at runtime; doing
+so was the redundant critical-path work this optimization removes. Its safety
+therefore comes from the exact normalization, pre-tokenizer, added-token, and
+token-offset repair rules plus prior checkpoints—not from a final comparison.
+This is a deliberate performance/correctness tradeoff: production-tokenizer
+fixed traces must prove final equality, checkpoint mismatches must remain zero,
+and repeated rollout reward must stay within the predeclared accuracy gate. A
+regression in the algorithm after the last checkpoint could otherwise change
+the supplied final IDs. Consequently, zero runtime checkpoint mismatch is
+necessary but not sufficient evidence for checkpoint-free final correctness.
 
 ### Supported tokenizers and fallback
 
-The first implementation should be an explicit adapter for the production Qwen
-byte-level BPE tokenizer and pre-tokenizer. A generic Hugging Face tokenizer is
-eligible only if it exposes enough state or offsets to prove a stable boundary.
+The implementation explicitly requires a fast Hugging Face tokenizer with
+backend offsets, a backend pre-tokenizer, and either NFC or no normalizer. It is
+validated against the production Qwen byte-level BPE tokenizer.
 Unsupported normalization, template mutation, offset ambiguity, tokenizer
 fingerprint change, sequence gap, or context-length exhaustion falls back to
 the existing cumulative-retokenization path. No heuristic fixed-size byte or
@@ -512,18 +546,23 @@ token window is allowed to commit KV without an exact checkpoint.
 
 ### Complexity and acceptance tests
 
-Current cumulative retokenization processes roughly
+Full cumulative retokenization processes roughly
 `sum(len(prompt_at_revision))` input, which becomes quadratic as a command grows.
-The target path processes the final prompt once plus mutable-tail repairs and
-occasional full checkpoints. It must retain snapshot coalescing so a 50 ms poll
-does not imply one tokenizer or HTTP request.
+The implemented path processes mutable-tail repairs plus periodic checkpoints.
+Full chat rendering, normalization, and HTTP serialization remain. Periodic
+full checkpoints remain, but normal finalization no longer adds an
+unconditional full tokenization. The optimization removes repeated BPE
+encoding of the stable prefix and, on a fast final, its last redundant full
+encode. Snapshot coalescing remains, so a 50 ms poll does not imply one
+tokenizer or HTTP request.
 
 Required tests include Unicode split points, byte fallback, whitespace and
 regex pre-tokenizer boundaries, adversarial BPE merges, terminal rewrites,
 30,000-character observation truncation, chat-template finalization, randomized
 chunk boundaries, checkpoint mismatch, and exact equality with one-shot final
-tokenization. The feature remains fail-open until every committed prefix passes
-the final invariant.
+tokenization. Runtime checkpoint failures remain fail-open;
+production-tokenizer fixed traces and rollout accuracy are the independent
+gates for a checkpoint-free final revision.
 
 ## Runtime Output Streaming
 
@@ -547,7 +586,8 @@ the first admission decision.
 The callback must receive observation-like content, not raw PTY bytes. This
 keeps cumulative tokenization candidates aligned with the formatting that will
 eventually reach `ConversationMemory`. Completion metadata remains final-only
-and is included by authoritative final tokenization.
+and is included in the final rendered prompt before either full-checkpoint or
+exact incremental encoding.
 
 The non-streaming `/execute_action` endpoint and all disabled behavior remain
 unchanged.
@@ -646,6 +686,8 @@ policy:
       streaming_tool_call: &streaming_tool_call
         enabled: false
         tokenizer_only: false
+        exact_incremental_tokenizer: false
+        incremental_tokenizer_checkpoint_interval: 8
         max_sessions: 256
         session_ttl_seconds: 900
         stability_margin_tokens: 8
@@ -677,8 +719,11 @@ V1 exports these per-sample metrics through the SWE agent result and W&B:
 - prefill requests and accepted prefill tokens,
 - valid prefill actions with at least one completed chunk and an exact final
   committed-prefix match,
-- valid tokenizer-only actions whose admitted full-retokenization requests all
-  completed without fallback,
+- exact incremental-tokenizer actions and valid tokenizer-only actions whose
+  ordered requests completed without mismatch or fallback,
+- incremental requests, cumulative full-prompt token counts, actually encoded
+  characters/tokens, reused tokens, mutable-tail rollback tokens, checkpoints,
+  checkpoint tokens, and checkpoint mismatches,
 - final tokenizer candidates, next-call reuse requests, canonical exact
   matches, token-equivalent matches, true prompt/token mismatches, and
   missing/expired one-shot candidates,
@@ -714,9 +759,8 @@ The following planned observability is not implemented yet:
 - enabled tool calls by action type,
 - fallback reason labels (the aggregate fallback count is implemented),
 - snapshot byte distributions,
-- cumulative-tokenizer CPU time,
-- incremental-tokenizer mutable-tail rollback and re-encoded token counts,
-- full-tokenizer checkpoint and checkpoint-mismatch counts,
+- server-side tokenizer CPU time separated from HTTP/rendering time (the
+  client-side incremental request duration is implemented),
 - stable and committed token distributions,
 - chunk size distribution,
 - prefill request queue and execution time,
@@ -949,6 +993,19 @@ reduces aggregate rollout throughput is not sufficient.
 
 ### Current validation evidence
 
+The production Qwen fixed-trace verifier
+`examples/swe_bench/verify_incremental_tokenizer.py` checks every intermediate
+token list against complete tokenization, including a checkpoint-free final
+revision. With 30,000 output characters,
+256-character snapshots, and five Unicode/BPE/special-token edge families, it
+verified 128 incremental steps. Across 118 main snapshots, suffix-only work
+encoded 37,362 versus 1,831,860 cumulative characters and 10,162 versus 532,434
+tokens. Three-run mean tokenizer time was 0.2222 versus 0.5337 seconds: 97.96%
+fewer encoded characters, 98.09% fewer encoded tokens, and 58.36% less tokenizer
+wall time. Fifteen full checkpoints had zero mismatches; the final revision
+made no checkpoint and still matched all 8,973 one-shot tokens. This is
+tokenizer evidence, not rollout E2E evidence.
+
 On 2026-07-09, the repaired tokenizer-only exact-reuse path completed a
 four-trajectory smoke and a 16-trajectory SWE-Verified rollout on two
 interactive nodes with four vLLM replicas. Both used temperature zero, top-p
@@ -966,9 +1023,40 @@ baseline, Slurm `13580674` / [`8o58r22x`](https://wandb.ai/nvidia/swe-benchmark/
 recorded 1523.9629 seconds on the identical 16-row manifest. Strict accuracy
 was 1/16 on versus 2/16 off. The on arm made 1650 model calls and 1563 tool
 calls versus 1483 and 1446 off, and no trajectory hashes matched. The timing
-delta therefore describes the two saved asynchronous workloads, not a causal
-per-action tokenizer speedup or an accuracy-parity result. The standalone
-evaluation report contains the complete paired metrics and experiment history.
+delta is now rejected for accuracy and performance comparison: the on
+trajectory file contains `AgentRuntimeTimeoutError` in 4/16 rows while off has
+zero. STC-009 identified a streaming-only bridge bug that omitted the requested
+HTTP timeout. The 25/25 exact handoffs remain mechanical evidence only. The
+standalone evaluation and bug reports contain the full evidence.
+
+After the timeout fix, a new frozen first-16 diagnostic completed 16/16 rows in
+all three arms with zero synthetic timeout markers. Off, conservative-final,
+and fast-final each resolved 2/16. Their canonical batch E2E values were
+1816.26, 987.94, and 1002.78 seconds respectively, but the off arm contains one
+1801.44-second OpenHands trajectory dominated by 1580.82 seconds in the action
+server, so the wall differences are not causal. Fast final reduced checkpoints
+per admitted exact action from 1.97 to 1.00, tokenizer seconds per exact action
+by 73.4%, checkpoint tokens per action by 79.8%, and post-command tokenizer
+tail per eligible action by 85.1%. Repeated fixed first64 validation is
+complete at the rollout/W&B level.
+
+The two fixed first64 repetitions each emitted all 64 rows without synthetic
+action-timeout or checkpoint-mismatch markers. Per-arm batch E2E was 1971.91 /
+1466.24 seconds in repetition 1 and 1633.07 / 1826.51 seconds in repetition 2
+(off / fast-final on). The mean change is -8.66%, but the individual deltas
+reverse sign (-25.64%, +11.85%) because one tail trajectory controls each
+batch. Strict resolved totals are 27/128 off and 23/128 on across two trials of
+the same 64 instances, so accuracy parity is not established.
+
+Across both repetitions, the on arms execute 11.01% fewer command actions.
+After normalizing by action count, controller command-action seconds increase
+6.38% and actual action-server seconds increase 0.53%. Exact incremental
+tokenization therefore does not make commands execute faster; historical
+aggregate command reductions reflect different agent work and STC-009 in the
+invalid runs. Mechanically, 741/12,499 eligible actions are valid (5.93%), all
+735 consumed reuse requests are exact matches, and 1,111 checkpoints report
+zero mismatch. The standalone evaluation report contains full runtime,
+transport, work-count, and admission tables.
 
 An earlier canonical attempt removed token-logging fields from both comparison
 and tokenizer requests. That made raw prompts compare equal but disabled
@@ -1280,8 +1368,17 @@ unchanged final action responses are covered by tests.
 
 Status: v1 complete with cumulative full-candidate retokenization. The session
 protocol, Gym sticky proxying, final-prefix validation, cancellation, and
-unchanged normal final model call are implemented. True incremental encoding is
-still future work.
+unchanged normal final model call are implemented.
+
+### Phase 2b: Exact incremental tokenizer
+
+Status: implementation, focused correctness tests, fixed-trace equality, and
+two repeated first64 rollout/W&B trials and their strict paired audits are
+complete. Intermediate BPE encoding uses exact mutable-tail repair, periodic
+complete checkpoints, checkpoint-free fast finalization for valid sessions,
+and fail-open fallback. It creates no generation or prefill request of its own;
+exact final IDs are handed to the unchanged next generation request through
+one-shot prompt reuse.
 
 ### Phase 3: Performance tuning
 

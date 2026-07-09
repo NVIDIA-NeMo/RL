@@ -274,12 +274,13 @@ from accuracy/performance comparison tables:
 
 ## 2. Streaming Tokenizer
 
-The historical Streaming Tokenizer experiment repeatedly fully tokenizes the
-cumulative prompt while the tool action is running. It is a tokenizer-only
-instrumentation mode, not the proposed stateful incremental tokenizer: it
-creates no streaming prefill request, starts no streaming session, and retains
-the ordinary final model request. The zero prefill count distinguishes this
-experiment from full Streaming Tool Call.
+Streaming Tokenizer creates no streaming prefill request, starts no streaming
+generation session, and retains the ordinary final model request. The
+historical implementation repeatedly fully tokenized the cumulative prompt.
+The new exact incremental variant re-encodes only the mutable rendered-prompt
+tail between authoritative checkpoints. Both have zero prefill requests; the
+exact variant is distinguished by explicit encoded/reused/rollback/checkpoint
+metrics and mandatory full-token equality at finalization.
 
 ### Complete SWE-Verified off/tokenizer-only pairs
 
@@ -510,6 +511,15 @@ generation path before expecting a direct performance benefit.
 
 ### July 9 authoritative final-token reuse
 
+**Experiment-integrity correction:** the exact-reuse on arm below contains an
+`AgentRuntimeTimeoutError` marker in 4/16 rows, while its frozen off baseline
+contains zero. The streaming action bridge passed 300 seconds to its coroutine
+wait but omitted that timeout from the underlying HTTP request, allowing the
+short session default to terminate valid long commands. The table is retained
+as implementation-history evidence only; its accuracy, command-time, and E2E
+deltas are not valid feature comparisons. See STC-009 in
+`docs/design-docs/streaming-tool-call-bug-report.md`.
+
 The tokenizer-only path now keeps the final `/tokenize` result and hands it to
 the immediately following generation request. It still fully retokenizes each
 admitted cumulative snapshot; it is not a suffix-only stateful tokenizer. The
@@ -543,7 +553,7 @@ separate lightweight comparison copy. The existing strict monotonic-token
 assertion remains enabled and passed for all 20 trajectories in the repaired
 smoke and final runs.
 
-The final 16-row run and frozen off baseline use the same first-16 manifest,
+The affected 16-row run and frozen off baseline use the same first-16 manifest,
 SHA-256
 `9309be0ea9dce987fc509d47845abef3fd3d28cce524e030a889f9fdef92b82a`,
 temperature zero, top-p one, `shuffle=False`, four vLLM replicas, one batch,
@@ -551,7 +561,7 @@ temperature zero, top-p one, `shuffle=False`, four vLLM replicas, one batch,
 is
 `results/streaming_tool_call_verified/20260708T205300Z_exact_final/comparison_vs_20260708T162321Z_off.json`.
 
-| Metric, all 16 rows | Streaming off | Tokenizer-only exact reuse | Change |
+| Historical affected metric, all 16 rows | Streaming off | Tokenizer-only exact reuse | Change |
 | --- | ---: | ---: | ---: |
 | Strict resolved | 2/16 (12.50%) | 1/16 (6.25%) | -6.25 pp |
 | Paired outcomes | both 1, off-only 1 | on-only 0, neither 14 | diagnostic only |
@@ -573,32 +583,206 @@ all 25 matched the canonical prompt and sticky backend exactly. There were
 zero token-equivalent fallbacks, true prompt mismatches, missing candidates,
 prefill requests, or streaming sessions.
 
-The batch and mean-runtime reductions are real measurements of these saved
-runs, but they are not a causal speedup estimate. The on arm made 167 more
-model calls and 117 more tool calls, all 16 trajectory hashes differed, the
-Hermes warning counts differed substantially, and strict reward flipped on one
-instance. Temperature zero does not make the asynchronous multi-replica agent
-deterministic. With only 25 admitted actions among 1523 eligible actions and 16
-trajectories, this run proves the handoff mechanism and shows promising batch
-timing; it does not establish accuracy parity or isolate the per-action latency
-saved by reuse. A fixed-trace or request-replay microbenchmark is still needed
-for causal tokenizer savings, and a substantially larger repeated paired run
-is needed for an accuracy gate.
+The values are measurements of the saved artifacts, but the timeout bug makes
+their between-arm deltas unusable. Independently, the on arm made 167 more model
+calls and 117 more tool calls, all trajectories differed, and strict reward
+flipped on one instance. The 25/25 exact reuse events remain useful mechanical
+handoff evidence; this pair does not establish accuracy parity or a speedup.
+
+### July 9 exact suffix-only tokenizer
+
+The suffix-only implementation places bounded ordered state in the NeMo-RL
+vLLM HTTP server. Sequence zero and every eighth revision run the ordinary full
+tokenizer. A checkpoint mismatch permanently disables incremental work for that
+action and falls back to full checkpoints. The initial conservative version
+also fully tokenized every final revision; the fast-final version removes that
+unconditional critical-path encode and returns the exact incremental IDs when
+the final sequence is not checkpoint-due and the session remains valid.
+
+The fixed-trace verifier uses the production Qwen3-30B tokenizer, 30,000 output
+characters, 256-character snapshots, and edge cases for NFC composition, BPE
+word merges, partial `<|im_end|>`, whitespace/newline boundaries, and Hangul.
+It performs 128 exact comparisons, including a checkpoint-free final revision.
+
+| Fixed-trace metric | Full cumulative tokenization | Exact suffix-only | Reduction |
+| --- | ---: | ---: | ---: |
+| Verified incremental comparisons | N/A | 128/128 | exact equality |
+| Main snapshots | 118 | 118 | same trace |
+| Encoded characters | 1,831,860 | 37,362 | 97.96% |
+| Encoded tokens | 532,434 | 10,162 | 98.09% |
+| Three-run mean tokenizer time | 0.5337 s | 0.2222 s | 58.36% |
+| Full-token checkpoints | N/A | 15 | final checkpoint count 0 |
+| Final tokens | 8,973 | 8,973 | exact equality |
+
+This isolates tokenizer BPE work. It does not include full chat rendering,
+normalization, JSON transport, OpenHands runtime, or vLLM generation and is not
+an E2E speedup claim. The persisted result is
+`results/streaming_tool_call_exact_tokenizer/fast_final_fixed_trace.json`; the
+reproducible entry point is
+`examples/swe_bench/verify_incremental_tokenizer.py`.
+
+The final compute-node gate passed 10/10 incremental-tokenizer unit tests, the
+rollout-only batch-attribution test, 16/16 relevant patched OpenHands tests,
+the Gym patch-chain test, the Gym incremental-tokenizer proxy test, Ruff, and
+shell syntax checks. A 2-GPU live HTTP test in Slurm `13628327` failed before
+starting either HTTP endpoint: both Ray actors stopped in
+`torch.cuda.get_device_capability()` because the allocated node exposed driver
+version 12020, which is older than the installed PyTorch CUDA build requires.
+This is an environment-gate failure, not final-token evidence; the production
+Qwen fixed trace and completed rollout arms provide the successful live-path
+evidence above and below.
+
+The action-HTTP-timeout fix was then validated on the frozen first-16 manifest
+(SHA-256
+`9309be0ea9dce987fc509d47845abef3fd3d28cce524e030a889f9fdef92b82a`).
+All arms used temperature zero, top-p one, `shuffle=False`, four TP2 vLLM
+replicas, concurrency 16, 50 ms polling, and a 256-character threshold. vLLM
+eager mode was **not** enabled: startup logs show `enforce_eager=False`,
+`VLLM_COMPILE`, `FULL_AND_PIECEWISE` CUDA Graph, capture sizes
+`[1, 2, 4, 8, 16, 32, 64]`, prefix caching, and chunked prefill.
+
+| Fixed first-16 diagnostic | Off [`buzltmsj`](https://wandb.ai/nvidia/swe-benchmark/runs/buzltmsj) | Conservative final [`p631zz1o`](https://wandb.ai/nvidia/swe-benchmark/runs/p631zz1o) | Fast final [`16cr0y05`](https://wandb.ai/nvidia/swe-benchmark/runs/16cr0y05) |
+| --- | ---: | ---: | ---: |
+| Complete trajectories | 16/16 | 16/16 | 16/16 |
+| Strict resolved | 2/16 | 2/16 | 2/16 |
+| `AgentRuntimeTimeoutError` rows | 0 | 0 | 0 |
+| `train/timing/rollout/total` | 1816.26 s | 987.94 s | 1002.78 s |
+| Exact incremental actions | 0 | 227 | 29 |
+| Full-token checkpoints | 0 | 448 | 29 |
+| Checkpoint mismatches | 0 | 0 | 0 |
+| Incremental-tokenizer seconds | 0 | 233.41 s | 7.92 s |
+| Post-command tokenizer tail | 0 | 228.89 s | 29.06 s |
+
+The off arm's batch wall is dominated by one 1801.44-second OpenHands
+trajectory whose action server consumed 1580.82 seconds; model calls consumed
+only 69.38 seconds. The three arms also followed different action paths, so the
+1816/988/1003-second wall differences are not causal feature speedups. The
+useful comparison is mechanical: fast final reduced checkpoints per admitted
+exact action from 1.97 to 1.00, tokenizer seconds per exact action by 73.4%,
+checkpoint tokens per exact action by 79.8%, and post-command tokenizer tail
+per eligible action by 85.1%. Admission itself changed with trajectory path and
+must not be compared as feature coverage in this 16-row diagnostic.
+
+Repeated rollout validation uses the frozen first 16 and first 64 rows of the
+474-row no-observed-timeout SWE-Verified manifest. The first64 protocol keeps
+four ordered batches of 16, four vLLM replicas on one generation node, one
+rollout-only no-op training node, concurrency 64, temperature zero, top-p one,
+50 ms polling, a 256-character threshold, and checkpoint interval eight. Each
+off/on conclusion requires two independent repetitions. Aggregate results are
+reported after all four arms complete; paired instance classification is
+reported only after its separate audit succeeds. The two earlier
+exact-tokenizer first64 on arms are rejected because of STC-009. The fixed
+fast-final runs are:
+
+- repetition 1: off Slurm `13621383` / W&B
+  [`wuq8xmp0`](https://wandb.ai/nvidia/swe-benchmark/runs/wuq8xmp0), on Slurm
+  `13621384` / [`2iyn1lks`](https://wandb.ai/nvidia/swe-benchmark/runs/2iyn1lks);
+- repetition 2: off Slurm `13624636` /
+  [`1skba83c`](https://wandb.ai/nvidia/swe-benchmark/runs/1skba83c), on Slurm
+  `13624637` / [`kmx7dmke`](https://wandb.ai/nvidia/swe-benchmark/runs/kmx7dmke).
+
+All four arms emitted 64/64 rows with zero explicit infrastructure errors and
+zero `AgentRuntimeTimeoutError` markers. Both repetitions have complete strict
+paired audits generated on interactive compute nodes.
+
+| Metric | Rep 1 off | Rep 1 on | Rep 2 off | Rep 2 on | Two-repetition comparison |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Strict resolved | 12/64 | 13/64 | 15/64 | 10/64 | 27/128 vs 23/128 (-3.125 pp) |
+| `train/timing/rollout/total` | 1971.91 s | 1466.24 s | 1633.07 s | 1826.51 s | mean -8.66% |
+| Mean OpenHands run time | 920.93 s | 616.55 s | 640.90 s | 625.78 s | -20.46% |
+| Max OpenHands run time | 1802.17 s | 1402.77 s | 1565.85 s | 1801.47 s | tail direction reversed |
+| Tool calls | 7,588 | 6,347 | 7,572 | 6,881 | -12.74% |
+| Model calls | 7,548 | 6,360 | 7,725 | 6,936 | -12.94% |
+| Command actions | 7,097 | 6,164 | 7,359 | 6,701 | -11.01% |
+| Model seconds / call | 6.050 | 4.608 | 3.751 | 3.963 | -12.59% aggregate |
+| Command-action seconds / call | 1.006 | 0.971 | 1.081 | 1.239 | **+6.38% aggregate** |
+| Command-server seconds / call | 0.937 | 0.829 | 1.013 | 1.120 | **+0.53% aggregate** |
+| Response body bytes | 1.629 GB | 1.288 GB | 1.661 GB | 1.378 GB | -18.99% |
+
+| Strict paired outcome | Rep 1 | Rep 2 | Combined repeated observations |
+| --- | ---: | ---: | ---: |
+| Both resolved | 9 | 7 | 16 |
+| Off only | 3 | 8 | 11 |
+| On only | 4 | 3 | 7 |
+| Neither resolved | 48 | 46 | 94 |
+
+The rep2 audit is persisted as
+`results/streaming_tool_call_exact_tokenizer/20260709T193000Z-fast-final-r2-first64/audit.json`;
+its per-instance outcomes are in the adjacent `paired.jsonl`.
+
+The batch result is not stable enough for a causal E2E speedup claim. The two
+paired E2E changes have opposite signs: -25.64% and +11.85%. The repeated on
+arms follow nearly identical completion curves through most of the batch, but
+one 1801-second trajectory determines repetition 2's final wall. The two off
+arms also differ by 17.2% despite almost identical tool-call counts. Report the
+two-repetition mean (-8.66%) as an observation with tail variance, not as an
+isolated tokenizer gain.
+
+The command-timer question is now resolved more rigorously. Aggregate command
+time falls because the on trajectories execute 11.01% fewer command actions.
+After normalization, outer command-action time is 6.38% higher per action and
+actual action-server time is 0.53% higher per action. The exact incremental
+tokenizer therefore does **not** make command execution faster. Historical
+command-time reductions came from different agent work and, in the invalid
+arms, STC-009's premature HTTP timeout.
+
+The accuracy direction also changes across repetitions (+1/64, then -5/64).
+Across two trials over the same 64 distinct instances, off resolves 27/128
+observations and on 23/128. This -3.125 pp observation does not clear an
+accuracy-parity gate; the repeated rows are not 128 distinct dataset examples.
+
+#### Fast-final mechanism coverage
+
+| Metric | Rep 1 on | Rep 2 on | Combined |
+| --- | ---: | ---: | ---: |
+| Eligible command actions | 6,065 | 6,434 | 12,499 |
+| Exact incremental actions | 451 | 303 | 754 |
+| Valid tokenizer actions | 440 | 301 | 741 (5.93% of eligible) |
+| Full-token checkpoints | 577 | 534 | 1,111 (1.47 / exact action) |
+| Checkpoint mismatches | 0 | 0 | 0 |
+| Prompt-reuse candidates | 440 | 301 | 741 |
+| Prompt-reuse requests / exact matches | 435 / 435 | 300 / 300 | 735 / 735 |
+| Prompt-reuse mismatches | 0 | 0 | 0 |
+| Fallbacks | 44 | 39 | 83 |
+| Incremental-tokenizer seconds | 522.84 s | 469.75 s | 992.59 s |
+| Post-command tokenizer tail | 399.38 s | 294.08 s | 693.46 s |
+| Prefill requests / sessions | 0 / 0 | 0 / 0 | 0 / 0 |
+
+The final path is mechanically healthy: no checkpoint mismatch, all 735 reuse
+requests are canonical exact matches, and no prefill work is created. Admission
+varies from 7.25% to 4.68% with the action path, so 5.93% combined is a workload
+coverage measurement rather than a fixed feature rate.
+
+#### Where batch E2E exceeds OpenHands time
+
+The new boundary and transport metrics replace the earlier approximation. For
+the four arms, `rollout/total - transport/request_span` is only 37.50, 37.08,
+43.00, and 18.89 seconds. The larger gap to max OpenHands time includes Gym
+wrapper/evaluation work, response serialization and transfer, JSON decode, and
+NeMo-RL result conversion. Each arm returns 1.29--1.66 GB.
+
+`postprocess_results` sums 512--679 seconds of CPU work, but it overlaps other
+in-flight agents: the collector awaits one completed task, converts it, and
+then awaits the next. It must not be added to the slowest trajectory. The
+conversion path compares cumulative prompt-token prefixes, creates PyTorch
+tensors, extends the historical token list, and fully decodes prompt and
+generation IDs for every assistant turn. Large cumulative histories make this
+a material non-vLLM cost. In the observed batch wall, most of that work is
+hidden behind still-running agents; the transport-span delta above is the net
+unhidden remainder.
 
 ## Comparison and decision status
 
 | Dimension | Streaming Tool Call | Streaming Tokenizer |
 | --- | --- | --- |
-| Work performed before final request | Remote resumable prefill; 3,531--10,944 prefill requests in the complete off/on pairs | Repeated cumulative full-prompt tokenization only; zero prefill requests and sessions |
-| Primary performance observation | Recovered rollout elapsed changed by +0.04% to -14.2%; OpenHands run time improved 10.0--15.6%; command time improved 27.1--47.5% across four complete historical off/on pairs | Historical three-repeat aggregate: recovered rollout elapsed -1.48%, OpenHands -4.9%, command -29.0%. July 8 diagnostic: canonical batch E2E -1.45%. July 9 exact-reuse diagnostic: canonical batch E2E -33.88% and OpenHands -17.81%, with materially different trajectories and work counts. |
-| Model-call observation | -3.7% to +1.1% across historical complete pairs | +0.65% in the historical three-repeat aggregate; -13.23% mean time with +11.26% calls in the July 9 exact-reuse run |
-| Strict-accuracy observation | -0.84 to +2.34 pp across historical complete pairs | Historical aggregate -0.26 pp; July 9 exact-reuse diagnostic -6.25 pp on 16 examples |
-| What remains unproven | Accuracy parity, exact trajectory parity, and an error-normalized end-to-end gain | Accuracy parity and a causal performance gain. Exact final-token reuse is now proven for 25/25 admitted actions, but the encoder still fully retokenizes cumulative snapshots and coverage was only 1.64%. |
+| Work performed before final request | Remote resumable prefill; 3,531--10,944 prefill requests in the complete off/on pairs | Exact mutable-tail tokenization plus periodic checkpoints; zero prefill requests and sessions |
+| Primary performance observation | Recovered rollout elapsed changed by +0.04% to -14.2%; OpenHands run time improved 10.0--15.6%; command time improved 27.1--47.5% across four complete historical off/on pairs | Fixed trace: tokenizer time -58.36%. Two fixed first64 repetitions: mean batch E2E -8.66%, but individual deltas -25.64% and +11.85%. Command-server seconds/action +0.53%; no command-execution speedup. |
+| Model-call observation | -3.7% to +1.1% across historical complete pairs | Two fixed first64 repetitions executed 12.94% fewer model calls; model seconds/call was 12.59% lower, with different action and prompt distributions. |
+| Strict-accuracy observation | -0.84 to +2.34 pp across historical complete pairs | Fixed first16 2/16 in every arm. Two first64 trials over the same instances: off 27/128, on 23/128 (-3.125 pp); parity not established. |
+| What remains unproven | Accuracy parity and an error-normalized end-to-end gain | Accuracy parity and a causal rollout performance gain. Final-token equality, zero checkpoint mismatches, and 735/735 exact reuse requests are proven; E2E remains tail- and workload-dependent. |
 
-Neither feature clears an accuracy or deterministic-parity gate yet. For
-tokenizer-only, the final authoritative token result is no longer discarded,
-and its one-shot handoff is mechanically validated. The next tests should
-separate two remaining questions: use fixed request traces to measure the
-latency saved by exact token reuse, and use larger repeated, error-stable
-off/on rollouts to evaluate strict accuracy. Suffix-only incremental tokenizer
-state remains a separate future optimization.
+Neither feature clears an accuracy gate yet. For tokenizer-only, the one-shot
+handoff and checkpoint-free final-token equality are mechanically validated.
+The repeated fixed runs show that the optimization removes tokenizer work but
+does not reduce command-server cost per action; larger predeclared accuracy
+trials and a tail-robust E2E statistic are still required.
