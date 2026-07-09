@@ -1811,6 +1811,24 @@ def _build_async_grpo_train_data(
     return train_data
 
 
+def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
+    """Zero loss_multiplier where mask_sample is True and return the count."""
+    if "mask_sample" not in repeated_batch:
+        return 0
+
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    mask_sample = repeated_batch["mask_sample"]
+
+    if isinstance(mask_sample, list):
+        mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+    mask_sample_bool = mask_sample.bool()
+
+    num_masked = int(mask_sample_bool.sum().item())
+    loss_multiplier[mask_sample_bool] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return num_masked
+
+
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     """Determine if NeMo-Gym should be used for rollouts and validation based on the configuration."""
     env_config = master_config.env
@@ -2684,6 +2702,10 @@ def grpo_train(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
+                    metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
+
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -3820,6 +3842,8 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with timer.time("total_step_time"):
+                num_mask_sample_filtered = 0
+
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
                 with timer.time("exposed_generation"):
@@ -3954,6 +3978,11 @@ def async_grpo_train(
 
                             loss_multiplier[truncated] = 0
                             repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    with timer.time("mask_sample_filter"):
+                        num_mask_sample_filtered = _apply_mask_sample_filter(
+                            repeated_batch
+                        )
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -4228,6 +4257,7 @@ def async_grpo_train(
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
+                    "num_mask_sample_filtered": num_mask_sample_filtered,
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
