@@ -349,19 +349,24 @@ Depending on your data shape, you may want to change these values."""
         # A missing-routes item (e.g. Gym's error-recovery dummy) is sentinel-filled
         # so Megatron's fallback handles it instead of crashing the run — but that
         # needs the [num_moe_layers, topk] shape, which only a sibling item that DID
-        # carry routes can provide. Scan for one up front; if none exists the whole
-        # batch is trace-less, a genuine misconfiguration that still raises below.
+        # carry routes can provide. Read it from the raw [tokens][layers][topk]
+        # nested-list structure (cheap ``len``s — do NOT tensor-convert the whole
+        # array here, it is re-converted per item below). If no item carries
+        # routes the batch is trace-less, a misconfiguration that still raises.
         routed_experts_layer_topk: Optional[tuple[int, int]] = None
         for _scan_item in nemo_gym_result["response"]["output"]:
             _scan_routes = _scan_item.get("routed_experts")
-            if _scan_routes is not None:
-                _scan_tensor = torch.as_tensor(_scan_routes, dtype=torch.int32)
-                if _scan_tensor.dim() == 3:
-                    routed_experts_layer_topk = (
-                        int(_scan_tensor.shape[1]),
-                        int(_scan_tensor.shape[2]),
-                    )
-                    break
+            if (
+                _scan_routes
+                and isinstance(_scan_routes[0], list)
+                and _scan_routes[0]
+                and isinstance(_scan_routes[0][0], list)
+            ):
+                routed_experts_layer_topk = (
+                    len(_scan_routes[0]),
+                    len(_scan_routes[0][0]),
+                )
+                break
 
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
