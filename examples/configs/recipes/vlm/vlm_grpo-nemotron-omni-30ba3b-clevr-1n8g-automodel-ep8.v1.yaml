@@ -1,0 +1,69 @@
+defaults: ../../vlm_grpo_3B.yaml
+grpo:
+  num_prompts_per_step: 32
+  val_at_start: true
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  train_global_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  dynamic_batching:
+    enabled: false
+  dtensor_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        dispatcher: deepep
+        experts: torch_mm
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  generation:
+    max_new_tokens: 4096
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    vllm_cfg:
+      tensor_parallel_size: 8
+      enforce_eager: true
+      max_model_len: 8192
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 2
+      max_num_batched_tokens: 16384
+      mamba_ssm_cache_dtype: float32
+      skip_mm_profiling: true
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: triton
+data:
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot_nemotron_omni.txt
+logger:
+  wandb_enabled: true
+  wandb:
+    project: grpo-vlm
+    name: nemotron-omni-grpo-clevr-4k
+cluster:
+  gpus_per_node: 8

@@ -28,8 +28,11 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    # Use ModelOpt MXFP8 quantization when precision is fp8.
+    is_mx: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
+    enable_return_routed_experts: NotRequired[bool]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
     use_tqdm: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
@@ -55,3 +58,8 @@ class VllmConfig(GenerationConfig):
 
     # quantization config
     quant_cfg: NotRequired[str | None]
+    # When set with ``quant_cfg``, initialize rollout vLLM with real ModelOpt
+    # NVFP4 kernels and stream packed quantized weights instead of fake-quant
+    # modules. This is intended for ModelOpt NVFP4 rollout experiments.
+    real_quant: NotRequired[bool]
+    real_quant_ignore: NotRequired[list[str]]

@@ -63,6 +63,9 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
+    if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
+        raise ValueError("refit_buffer_size_gb must be > 0")
+
     if not colocated:
         if generation_backend == SGLANG_BACKEND:
             raise NotImplementedError(
@@ -93,10 +96,9 @@ def create_weight_synchronizer(
         return HTTPWeightSynchronizer(
             policy=policy,
             generation=generation,
+            refit_buffer_size_gb=refit_buffer_size_gb,
         )
 
-    if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:
-        raise ValueError("refit_buffer_size_gb must be > 0")
     from nemo_rl.weight_sync.ipc_weight_synchronizer import (
         IPCWeightSynchronizer,
     )

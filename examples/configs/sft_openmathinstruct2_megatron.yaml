@@ -42,3 +42,4 @@ logger:
     name: llama8b
 cluster:
   num_nodes: 2
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

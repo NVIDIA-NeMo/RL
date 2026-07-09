@@ -70,7 +70,7 @@ To train with FP8, you need to set the Megatron path and configure it using the 
 
 ## Compatibility Note for Deepseek-Style FP8 Training
 
-The TransformerEngine implementation for this recipe requires **cuda version ≥ 12.9**. The latest nemo-rl depends on torch 2.8.0 + cuda 12.9 (since this [commit](https://github.com/NVIDIA-NeMo/RL/commit/3f36d14b53e906b27c01c06e36dbbd2b8eb300cd)). Users should check-out code to latest and build container from `docker/Dockerfile` ([instructions](docker.md)). 
+The TransformerEngine implementation for this recipe requires **CUDA version ≥ 12.9**. The current NeMo RL container uses CUDA 13.2 (via `docker/Dockerfile`), which satisfies this requirement. Users on older setups should check out the latest code and build the container from `docker/Dockerfile` ([instructions](docker.md)).
 
 If you are using nemo-rl before this [commit](https://github.com/NVIDIA-NeMo/RL/commit/3f36d14b53e906b27c01c06e36dbbd2b8eb300cd), you will see the following error when trying to use fp8 training:
 

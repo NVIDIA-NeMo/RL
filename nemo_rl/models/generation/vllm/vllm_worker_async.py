@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import logging
 import threading
 import time
 import uuid
@@ -39,8 +40,15 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+from nemo_rl.models.generation.vllm.utils import (
+    attach_routed_experts_to_chat_response_choices,
+    format_prompt_for_vllm_generation,
+    model_dump_chat_response_with_routed_experts,
+    pad_and_align_routed_expert_indices,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _replace_prefix_tokens(
@@ -183,6 +191,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
+        # Defaults for HTTP server state; overwritten by _create_engine()
+        # when the worker is a model owner and the model is actually loaded.
+        self.server_thread = None
+        self.base_url = None
+        self.http_server = None
+
         super().__init__(
             config,
             bundle_indices,
@@ -203,6 +217,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         self.llm = None
         self.vllm_device_ids = None
+
+    def _return_routed_experts_enabled(self) -> bool:
+        engine_args = getattr(self, "llm_async_engine_args", None)
+        if bool(getattr(engine_args, "enable_return_routed_experts", False)):
+            return True
+        return bool(
+            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
 
     def _reserve_port(self) -> None:
         """Bind and listen on a TCP socket to reserve a free port from the OS.
@@ -274,7 +296,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             # Must run after AsyncLLM.from_engine_args and before
             # _setup_vllm_server spawns the uvicorn thread.
@@ -401,7 +422,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.generation_tokens = []
 
     async def post_init_async(self):
+        if self.llm is not None:
+            await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
+        if self._mtp_load_from_disk:
+            await self.llm.collective_rpc(
+                "load_mtp_weights_from_disk", args=(self.model_name,)
+            )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -656,7 +683,45 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
         # belongs on the render subclass.
-        class NeMoRLOpenAIServingChat(OpenAIServingChat):
+        worker_self = self
+
+        class NeMoRLOpenAIServingChatMixin:
+            async def chat_completion_full_generator(
+                self,
+                request,
+                result_generator,
+                *args,
+                **kwargs,
+            ):
+                final_res = None
+
+                async def capture_result_generator():
+                    nonlocal final_res
+                    async for res in result_generator:
+                        final_res = res
+                        yield res
+
+                response = await super().chat_completion_full_generator(
+                    request,
+                    capture_result_generator(),
+                    *args,
+                    **kwargs,
+                )
+                if (
+                    not worker_self._return_routed_experts_enabled()
+                    or not isinstance(response, ChatCompletionResponse)
+                    or final_res is None
+                ):
+                    return response
+
+                return attach_routed_experts_to_chat_response_choices(
+                    response,
+                    final_res,
+                    device=torch.device("cpu"),
+                    logger=LOGGER,
+                )
+
+        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
             pass
 
         class NeMoRLOpenAIServingRender(NeMoRLOpenAIServingMixin, OpenAIServingRender):
@@ -738,7 +803,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(content=generator.model_dump())
+                return JSONResponse(
+                    content=model_dump_chat_response_with_routed_experts(generator)
+                )
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
 
@@ -1056,6 +1123,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             generation_details = final_request_output.outputs[0]
             generated_token_ids = list(generation_details.token_ids)
             num_generated_tokens = len(generated_token_ids)
+            return_routed_experts = self._return_routed_experts_enabled()
 
             original_input_ids_single_row = input_ids_batch[sample_idx]
             final_output_tensor_len = current_input_actual_length + num_generated_tokens
@@ -1131,15 +1199,58 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
             )
 
-            result_batch = BatchedDataDict[GenerationOutputSpec](
-                {
-                    "output_ids": output_ids_single_item_batched,
-                    "logprobs": logprobs_single_item,
-                    "generation_lengths": generation_lengths_tensor,
-                    "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                    "truncated": truncated_tensor,
-                }
+            result_dict = {
+                "output_ids": output_ids_single_item_batched,
+                "logprobs": logprobs_single_item,
+                "generation_lengths": generation_lengths_tensor,
+                "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                "truncated": truncated_tensor,
+            }
+            routed_experts, r3_stats = pad_and_align_routed_expert_indices(
+                final_request_output,
+                generation_details,
+                valid_length=unpadded_total_length,
+                padded_length=final_output_tensor_len,
+                device=original_input_ids_single_row.device,
+                require_complete_routed_experts=return_routed_experts,
+                return_stats=True,
             )
+            if return_routed_experts and routed_experts is None:
+                raise RuntimeError(
+                    "vLLM was asked to return routed experts but the generation output "
+                    "did not include routed_experts."
+                )
+            if return_routed_experts:
+                if r3_stats["missing_routes"] > 0:
+                    LOGGER.warning(
+                        "R3 router replay fallback: vLLM returned incomplete "
+                        "routed_experts for sample_idx=%d, missing_token_routes=%d, "
+                        "actual_routes=%d, expected_routes=%d. Megatron will use its "
+                        "own router for those missing token routes.",
+                        sample_idx,
+                        r3_stats["missing_routes"],
+                        r3_stats["actual_routes"],
+                        r3_stats["expected_routes"],
+                    )
+                result_dict["r3_routed_experts_missing_routes"] = torch.tensor(
+                    [r3_stats["missing_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+                result_dict["r3_routed_experts_expected_routes"] = torch.tensor(
+                    [r3_stats["expected_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+                result_dict["r3_routed_experts_actual_routes"] = torch.tensor(
+                    [r3_stats["actual_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+            if routed_experts is not None:
+                result_dict["routed_experts"] = routed_experts.unsqueeze(0)
+
+            result_batch = BatchedDataDict[GenerationOutputSpec](result_dict)
 
             return (sample_idx, result_batch)
 

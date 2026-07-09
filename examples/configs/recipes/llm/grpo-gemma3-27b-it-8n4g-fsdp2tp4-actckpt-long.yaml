@@ -14,4 +14,4 @@ logger:
     name: grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long
 cluster:
   gpus_per_node: 4
-
+  segment_size: 8
