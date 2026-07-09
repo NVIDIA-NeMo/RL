@@ -289,12 +289,7 @@ def _patch_transformers_tokenizer_class_set():
     discard/pop-with-default are no-ops when the entries are absent, so this is
     safe on any transformers version in the currently-supported range.
     """
-    try:
-        import transformers
-    except ImportError:
-        # setuptools build isolation may import nemo_rl before transformers is
-        # installed; skip the patch there. The runtime venv always has it.
-        return
+    import transformers
     from packaging.version import Version as PkgVersion
 
     # This whole patch exists only because Megatron-Bridge caps the transformers
@@ -319,7 +314,8 @@ def _patch_transformers_tokenizer_class_set():
     TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
 
 
-_patch_transformers_tokenizer_class_set()
+if not _is_build_isolation():
+    _patch_transformers_tokenizer_class_set()
 
 
 # Need to set PYTHONPATH to include transformers downloaded modules.
