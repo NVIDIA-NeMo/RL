@@ -11,11 +11,11 @@ For the full list of supported Qwen models, see
 
 - **[Qwen3.5](qwen3-5.md)** — LLM and VLM recipes for `Qwen3.5-9B-Base`,
   `Qwen3.5-35B-A3B-Base`, and `Qwen3.5-397B-A17B` on the Megatron and AutoModel
-  backends. Covers backend/parallelism support, example recipes, and the
-  `flash-linear-attention` performance requirement.
+  backends. This guide covers backend and parallelism support, example recipes, and the
+  `flash-linear-attention` performance notes.
 
 Subpages for other Qwen versions are added as distinct, recipe-backed guidance
-accumulates. Until then, the GRPO, evaluation, and recipe YAMLs remain the source of
+accumulates. Until then, the GRPO, evaluation, and recipe YAML files remain the source of
 truth for those models.
 
 > [!NOTE]

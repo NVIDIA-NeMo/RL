@@ -17,16 +17,16 @@ of supported models, see [Model Support](../../../about/model-support.md).
 
 ## Support Status
 
-We track model support in two stages:
+Model support is tracked in two stages:
 
 | Stage | Meaning |
 | --- | --- |
-| **Functional Ready** | Runnable end-to-end and numerically validated with an initial training run. |
-| **Long-run convergence validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
+| **Functionally Ready** | Runnable end-to-end and numerically validated with an initial training run. |
+| **Long-Run Convergence Validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
 The Qwen3.5 family is supported on both the Megatron (MCore) and AutoModel (DTensor)
 backends. The specific configurations shipped as [example recipes](#example-recipes)
-below are the ones that have been **long-run convergence validated**. Other variants
+below are the ones that have been **Long-Run Convergence Validated**. Other variants
 and configurations are runnable but have not all been validated for long-run
 convergence.
 
@@ -44,15 +44,15 @@ Notes on backends and parallelism:
 
 - **Megatron (MCore)** supports the widest parallelism for Qwen3.5 MoE, including
   Context Parallel (CP) for longer sequences (see [#2312](https://github.com/NVIDIA-NeMo/RL/pull/2312)).
-- **AutoModel (DTensor)** supports Expert Parallel (EP). For Qwen3.5 MoE + CP on
-  AutoModel, the TE backend plus `flash-linear-attention` is required; **dense
-  Qwen3.5 does not support CP on AutoModel** (set `cp_size = 1`). See
-  [Performance: flash-linear-attention](#performance-flash-linear-attention).
+- **AutoModel (DTensor)** supports Expert Parallel (EP). For Qwen3.5 MoE and Context Parallel on
+  AutoModel, the TE backend and `flash-linear-attention` are required; **dense
+  Qwen3.5 does not support Context Parallel on AutoModel** (set `cp_size = 1`). See
+  [`flash-linear-attention` Performance](#flash-linear-attention-performance).
 
 ## Example Recipes
 
-The recipes below are example starting points. Recipe YAMLs under
-`examples/configs/recipes/` are the source of truth; check the YAML for the
+The recipes below are example starting points. Recipe YAML files under
+`examples/configs/recipes/` are the source of truth; check the YAML file for the
 authoritative settings.
 
 | Model | Modality | Algorithm | Backend | Scale | Recipe |
@@ -68,16 +68,16 @@ authoritative settings.
 > [!NOTE]
 > Qwen3.5 thinking-mode and long-reasoning runs need a large generation budget. If
 > `policy.generation.max_new_tokens` (and the matching `policy.max_total_sequence_length`
-> / `policy.generation.vllm_cfg.max_model_len`) is too small, the reasoning trace can
-> be truncated before the final answer, and evaluation accuracy can appear near zero
+> or `policy.generation.vllm_cfg.max_model_len`) are too small, the reasoning trace might
+> be truncated before the final answer, and evaluation accuracy might appear near zero
 > even when training metrics look normal. Use `max_new_tokens >= 8192` for reasoning
 > tasks. See [#2725](https://github.com/NVIDIA-NeMo/RL/issues/2725).
 
-## Choosing a Recipe
+## Choose a Recipe
 
-### Small LLM smoke run
+### Small LLM Smoke Run
 
-Use the 9B Megatron recipe when validating setup, launch mechanics, logging, and
+Use the 9B Megatron recipe to validate the setup, launch mechanics, logging, and
 checkpointing.
 
 ```sh
@@ -87,7 +87,7 @@ uv run examples/run_grpo.py \
 
 ### 35B-A3B GRPO (Megatron or AutoModel)
 
-Pick the backend you want to validate. Megatron supports the widest parallelism
+Select the backend you want to validate. Megatron supports the widest parallelism
 (including CP); AutoModel uses Expert Parallel on the DTensor backend.
 
 ```sh
@@ -110,10 +110,10 @@ uv run examples/run_grpo.py \
   policy.generation.vllm_cfg.max_model_len=9216
 ```
 
-### DAPO-style GRPO (long reasoning, ready out of the box)
+### DAPO-Style GRPO (Long Reasoning, Ready Out of the Box)
 
 The 4n8g DAPO recipe already sets `max_new_tokens: 8192` and
-`max_total_sequence_length: 9216`, so it is a good starting point for long-reasoning
+`max_total_sequence_length: 9216`, and serves as a suitable starting point for long-reasoning
 runs. See the [DAPO guide](../../dapo.md) for algorithm details.
 
 ```sh
@@ -123,7 +123,7 @@ uv run examples/run_grpo.py \
 
 ### Large MoE (397B-A17B)
 
-The 397B-A17B Megatron recipe targets 32 nodes (256 GPUs) with TP8 PP8 EP32 and
+The 397B-A17B Megatron recipe targets 32 nodes (256 GPUs) with TP8, PP8, and EP32 and
 `max_new_tokens: 8192`.
 
 ```sh
@@ -133,7 +133,7 @@ uv run examples/run_grpo.py \
 
 ### VLM (Geo3K)
 
-The VLM recipes target the Geo3K task. They train the vision tower per their
+The VLM recipes target the Geo3K task. They train the vision tower according to their
 `freeze_config` (see [Model Quirks](../../../model-quirks.md)).
 
 ```sh
@@ -141,32 +141,29 @@ uv run examples/run_grpo.py \
   --config examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml
 ```
 
-## Performance: flash-linear-attention
+## `flash-linear-attention` Performance
 
 Qwen3.5 relies on `flash-linear-attention` (FLA) and `causal-conv1d` kernels for
 full speed. There are two distinct cases:
 
-- **Performance fallback (AutoModel / DTensor).** Several `nemo-automodel` kernels
-  dispatch to FLA when it is importable and fall back to slower PyTorch
-  implementations otherwise. Without FLA, Qwen3.5 (dense or MoE) trains roughly **2x
-  slower** on the AutoModel path, with no error. The `-megatron` recipes use MCore
+- **Performance fallback on AutoModel and DTensor.** Several `nemo-automodel` kernels
+  dispatch to FLA if it is importable and otherwise fall back to slower PyTorch
+  implementations. Without FLA, Qwen3.5 (dense or MoE) trains roughly **two times
+  slower** on the AutoModel path, without raising an error. The `-megatron` recipes use Megatron Core
   kernels directly and are not affected. See
   [#2722](https://github.com/NVIDIA-NeMo/RL/issues/2722) and
   [#2324](https://github.com/NVIDIA-NeMo/RL/issues/2324).
-- **Hard requirement (AutoModel Qwen3.5 MoE + Context Parallel).** When
+- **Hard requirement for AutoModel Qwen3.5 MoE and Context Parallel.** When
   `context_parallel_size > 1` for a Qwen3.5 MoE model on the AutoModel backend,
   NeMo RL requires FLA and raises `ImportError` if it is missing (see the `import
-  fla` guard in `nemo_rl/models/automodel/setup.py`). CP for Qwen3.5 MoE on
-  AutoModel also requires the TE backend; **dense Qwen3.5 does not support CP on
-  AutoModel** — set `cp_size = 1`.
+  fla` guard in the `nemo_rl/models/automodel/setup.py` file). Context Parallel for Qwen3.5 MoE on
+  AutoModel also requires the TE backend; **dense Qwen3.5 does not support Context Parallel on
+  AutoModel** (set `cp_size = 1`).
 
 > [!NOTE]
-> The container does not yet install FLA in the AutoModel worker venv by default.
-> The root-cause fix is upstream [Automodel#1894](https://github.com/NVIDIA-NeMo/Automodel/pull/1894),
-> which moves FLA out of the dev-only group so `nemo-automodel[moe]` pulls it in;
-> tracked on the NeMo RL side by [#2324](https://github.com/NVIDIA-NeMo/RL/issues/2324).
-> Until that bump lands, install it in the AutoModel venv:
->
-> ```sh
-> pip install flash-linear-attention
-> ```
+> Starting with the v0.7.0 release container, FLA is installed in the AutoModel
+> worker virtual environment by default: the `automodel` extra depends on
+> `nemo-automodel[moe]`, which includes `flash-linear-attention` and
+> `causal-conv1d` (see [Automodel#1894](https://github.com/NVIDIA-NeMo/Automodel/pull/1894),
+> previously tracked on the NeMo RL side by [#2324](https://github.com/NVIDIA-NeMo/RL/issues/2324)).
+> No manual installation is needed.
