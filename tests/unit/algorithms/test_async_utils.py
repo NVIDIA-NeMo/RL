@@ -40,7 +40,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     add_grpo_token_loss_masks_and_generation_logprobs,
-    extract_initial_prompt_messages,
+    get_idx_grouping,
 )
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1576,180 +1576,56 @@ class TestAsyncUtilsIntegration:
         ray.kill(buffer)
 
 
-class TestPromptExtraction:
-    """Test cases for prompt extraction logic used in async GRPO advantage calculation.
+class TestPromptGrouping:
+    """Test cases for the ``(task_name, idx)`` grouping key used in GRPO
+    advantage estimation, plus the GRPO loss-mask helper.
 
-    These tests verify that the length-based prompt extraction correctly handles
-    multi-turn conversation prompts where the original prompt itself contains
-    assistant messages (conversation history).
+    ``get_idx_grouping`` replaces the older prompt-token-sequence grouping,
+    which is broken for multi-turn environments (all tasks share the same
+    initial prompt tokens) and for multi-dataset batches (idx values collide
+    across datasets). task_name disambiguates both cases.
     """
 
-    def test_prompt_extraction_with_multi_turn_history(self):
-        """Test that prompt extraction correctly handles prompts containing assistant messages.
-
-        This tests the fix for multi-turn conversation prompts where the original prompt
-        from the dataset itself contains assistant messages (conversation history).
-        The extraction should use the length field to identify original prompt messages,
-        not break at the first assistant message.
-        """
-        # Create a multi-turn prompt with assistant messages in the history
-        # Original prompt: user -> assistant -> user (3 messages, 15 tokens total)
-        original_prompt_messages = [
-            {
-                "role": "user",
-                "content": "What is 2+2?",
-                "token_ids": torch.tensor([1, 2, 3, 4, 5]),
-            },
-            {
-                "role": "assistant",
-                "content": "4",
-                "token_ids": torch.tensor([6, 7, 8, 9, 10]),
-            },
-            {
-                "role": "user",
-                "content": "Now what is 3+3?",
-                "token_ids": torch.tensor([11, 12, 13, 14, 15]),
-            },
-        ]
-
-        # Generated response (added after original prompt)
-        generated_message = {
-            "role": "assistant",
-            "content": "6",
-            "token_ids": torch.tensor([16, 17, 18]),
+    def test_single_dataset_groups_by_idx(self):
+        """With a single task_name, responses group by idx alone."""
+        batch = {
+            "idx": [0, 0, 1, 1],
+            "task_name": ["math", "math", "math", "math"],
         }
+        grouping = get_idx_grouping(batch)
 
-        # Full message_log after generation
-        full_message_log = original_prompt_messages + [generated_message]
+        assert grouping.shape == (4, 2)
+        assert grouping.dtype == torch.long
+        # Same idx -> same group; different idx -> different group.
+        assert torch.equal(grouping[0], grouping[1])
+        assert torch.equal(grouping[2], grouping[3])
+        assert not torch.equal(grouping[0], grouping[2])
 
-        # Original prompt length = sum of token_ids in original prompt
-        original_prompt_length = sum(
-            len(m["token_ids"]) for m in original_prompt_messages
-        )  # 15
-
-        message_logs = [full_message_log]
-        original_prompt_lengths = torch.tensor([original_prompt_length])
-
-        result = extract_initial_prompt_messages(message_logs, original_prompt_lengths)
-        initial_prompt_log = result[0]
-
-        # Should extract all 3 original messages, NOT break at first assistant
-        assert len(initial_prompt_log) == 3, (
-            f"Expected 3 messages (user, assistant, user), got {len(initial_prompt_log)}. "
-            "The extraction should NOT break at the first assistant message when it's part of the original prompt."
-        )
-
-        assert initial_prompt_log[0]["role"] == "user"
-        assert initial_prompt_log[1]["role"] == "assistant"
-        assert initial_prompt_log[2]["role"] == "user"
-        assert generated_message not in initial_prompt_log
-
-    def test_prompt_extraction_with_single_turn(self):
-        """Test that prompt extraction works correctly for single-turn prompts (regression test)."""
-        original_prompt_messages = [
-            {
-                "role": "user",
-                "content": "What is 2+2?",
-                "token_ids": torch.tensor([1, 2, 3, 4, 5]),
-            },
-        ]
-
-        generated_message = {
-            "role": "assistant",
-            "content": "4",
-            "token_ids": torch.tensor([6, 7, 8]),
+    def test_multi_dataset_idx_collision_disambiguated_by_task_name(self):
+        """Same idx from different datasets must not group together."""
+        batch = {
+            "idx": [0, 0, 0, 0],
+            "task_name": ["math", "math", "code", "code"],
         }
+        grouping = get_idx_grouping(batch)
 
-        full_message_log = original_prompt_messages + [generated_message]
-        original_prompt_length = sum(
-            len(m["token_ids"]) for m in original_prompt_messages
-        )
+        # Identical idx, but different task_name -> different group.
+        assert torch.equal(grouping[0], grouping[1])
+        assert torch.equal(grouping[2], grouping[3])
+        assert not torch.equal(grouping[0], grouping[2])
 
-        result = extract_initial_prompt_messages(
-            [full_message_log], torch.tensor([original_prompt_length])
-        )
-        initial_prompt_log = result[0]
-
-        assert len(initial_prompt_log) == 1
-        assert initial_prompt_log[0]["role"] == "user"
-        assert generated_message not in initial_prompt_log
-
-    def test_prompt_extraction_with_system_message(self):
-        """Test prompt extraction with system message included."""
-        original_prompt_messages = [
-            {
-                "role": "system",
-                "content": "You are a math tutor.",
-                "token_ids": torch.tensor([1, 2, 3]),
-            },
-            {
-                "role": "user",
-                "content": "What is 2+2?",
-                "token_ids": torch.tensor([4, 5, 6, 7]),
-            },
-        ]
-
-        generated_message = {
-            "role": "assistant",
-            "content": "4",
-            "token_ids": torch.tensor([8, 9]),
+    def test_none_task_name_is_normalised(self):
+        """task_name=None (e.g. the math processor) normalises to a sortable key."""
+        batch = {
+            "idx": [0, 1, 0],
+            "task_name": [None, None, None],
         }
+        grouping = get_idx_grouping(batch)
 
-        full_message_log = original_prompt_messages + [generated_message]
-        original_prompt_length = sum(
-            len(m["token_ids"]) for m in original_prompt_messages
-        )
-
-        result = extract_initial_prompt_messages(
-            [full_message_log], torch.tensor([original_prompt_length])
-        )
-        initial_prompt_log = result[0]
-
-        assert len(initial_prompt_log) == 2
-        assert initial_prompt_log[0]["role"] == "system"
-        assert initial_prompt_log[1]["role"] == "user"
-        assert generated_message not in initial_prompt_log
-
-    def test_prompt_extraction_complex_multi_turn(self):
-        """Test prompt extraction with complex multi-turn history (multiple assistant turns)."""
-        original_prompt_messages = [
-            {
-                "role": "system",
-                "content": "Math tutor",
-                "token_ids": torch.tensor([1, 2]),
-            },
-            {"role": "user", "content": "2+2?", "token_ids": torch.tensor([3, 4])},
-            {"role": "assistant", "content": "4", "token_ids": torch.tensor([5, 6])},
-            {"role": "user", "content": "3+3?", "token_ids": torch.tensor([7, 8])},
-            {"role": "assistant", "content": "6", "token_ids": torch.tensor([9, 10])},
-            {"role": "user", "content": "4+4?", "token_ids": torch.tensor([11, 12])},
-        ]
-
-        generated_message = {
-            "role": "assistant",
-            "content": "8",
-            "token_ids": torch.tensor([13, 14]),
-        }
-
-        full_message_log = original_prompt_messages + [generated_message]
-        original_prompt_length = sum(
-            len(m["token_ids"]) for m in original_prompt_messages
-        )
-
-        result = extract_initial_prompt_messages(
-            [full_message_log], torch.tensor([original_prompt_length])
-        )
-        initial_prompt_log = result[0]
-
-        assert len(initial_prompt_log) == 6, (
-            f"Expected 6 messages, got {len(initial_prompt_log)}. "
-            "All history messages should be included in the prompt."
-        )
-
-        expected_roles = ["system", "user", "assistant", "user", "assistant", "user"]
-        actual_roles = [m["role"] for m in initial_prompt_log]
-        assert actual_roles == expected_roles
-        assert generated_message not in initial_prompt_log
+        assert grouping.shape == (3, 2)
+        # All None -> single task id, so grouping reduces to idx.
+        assert torch.equal(grouping[0], grouping[2])
+        assert not torch.equal(grouping[0], grouping[1])
 
     def test_grpo_loss_mask_excludes_assistant_prompt_history(self):
         """Test that assistant messages in the original prompt are not trained on."""
