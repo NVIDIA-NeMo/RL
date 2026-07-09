@@ -2120,6 +2120,27 @@ def compute_and_apply_seq_logprob_error_masking(
             )
             masked_correct_pct = masked_correct_count / num_masked_seqs
 
+            # [lp-mask-debug] Per-sequence (length, error, reward) for masked
+            # seqs + summary stats for kept seqs, to attribute the growing
+            # train/gen logprob divergence (length-accumulated numerics vs
+            # policy drift). One line per step; parsed offline.
+            seq_lens = mask.sum(dim=-1)
+            masked_rows = [
+                (int(seq_lens[i]), float(seq_mult_prob_error[i]), float(rewards.view(-1)[i]))
+                for i in torch.nonzero(diff_mask_bool).flatten().tolist()
+            ]
+            kept_bool = seq_error_mask.bool() & valid_seq_mask
+            kept_lens = seq_lens[kept_bool]
+            print(
+                "[lp-mask-debug] masked(len,err,rew)="
+                + ";".join(f"{l},{e:.2f},{r:.0f}" for l, e, r in masked_rows[:200])
+                + f" | kept_len mean={float(kept_lens.float().mean()):.0f}"
+                f" p90={float(kept_lens.float().quantile(0.9)):.0f}"
+                f" max={int(kept_lens.max())}"
+                f" | masked_len mean={sum(r[0] for r in masked_rows)/len(masked_rows):.0f}",
+                flush=True,
+            )
+
         # Compute after-mask metrics (only for sequences that passed the threshold)
         kept_mask = seq_error_mask.bool() & valid_seq_mask
         if kept_mask.sum() > 0:
