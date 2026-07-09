@@ -904,10 +904,13 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("recipe", "num_bits"),
-    [("kv_cache_fp8.yaml", (4, 3)), ("kv_cache_nvfp4.yaml", (2, 1))],
+    ("recipe", "accepted_num_bits"),
+    [
+        ("kv_cache_fp8.yaml", ((4, 3), "e4m3")),
+        ("kv_cache_nvfp4.yaml", ((2, 1), "e2m1")),
+    ],
 )
-def test_resolve_kv_cache_quant_recipe(recipe, num_bits):
+def test_resolve_kv_cache_quant_recipe(recipe, accepted_num_bits):
     repo_root = Path(__file__).resolve().parents[4]
 
     config = resolve_quant_cfg(
@@ -919,13 +922,13 @@ def test_resolve_kv_cache_quant_recipe(recipe, num_bits):
     assert config["quant_cfg"][0] == {"quantizer_name": "*", "enable": False}
     assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
     assert kv_config["enable"] is True
-    assert kv_config["cfg"]["num_bits"] == num_bits
+    # ModelOpt loaders may preserve ExMy strings or normalize them to tuples.
+    assert kv_config["cfg"]["num_bits"] in accepted_num_bits
     if recipe == "kv_cache_nvfp4.yaml":
-        assert kv_config["cfg"]["block_sizes"] == {
-            -1: 16,
-            "type": "dynamic",
-            "scale_bits": (4, 3),
-        }
+        block_sizes = kv_config["cfg"]["block_sizes"]
+        assert block_sizes[-1] == 16
+        assert block_sizes["type"] == "dynamic"
+        assert block_sizes["scale_bits"] in ((4, 3), "e4m3")
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
