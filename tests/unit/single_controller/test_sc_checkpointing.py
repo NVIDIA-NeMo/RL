@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for Phase 1 SC checkpointing.
+"""Unit tests for SC checkpointing.
 
-Covers (checkpointing-plan.md, Phase 1 "Testing"):
+Covers (weight and dataloader testing):
   - counter restore from save_state (train_steps / trainer_version /
-    max_rollout_version invariant);
+    max_rollout_version invariant, current_epoch);
   - save trigger + write path through _train_pump with fakes (period
     boundary, last step, timeout, disabled);
   - metric_name behavior (val:* warn-and-save, train:* value recorded);
+  - dataloader state: train_dataloader.pt written at save, position
+    round-trip through a real StatefulDataLoader, dataset-swap guard,
+    setup restore wiring + missing-file fresh-position fallback;
   - setup_single_controller resume-path wiring (get_resume_paths forwarded
     to the trainer factory, save_state loaded from training_info.json).
 """
@@ -34,6 +37,9 @@ from typing import Any, Optional
 from unittest.mock import MagicMock
 
 import pytest
+import torch
+import yaml
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.grpo import _default_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -44,6 +50,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerBundle,
     setup_single_controller,
 )
+from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.utils.checkpoint import CheckpointManager
 
@@ -168,6 +175,26 @@ class _FakeRolloutManager:
         self.weight_versions.append(version)
 
 
+# Default position sentinel the fake dataloader reports via state_dict().
+_SENTINEL_DL_STATE = {"fake_position": 42}
+
+
+class _FakeDataloader(list):
+    """List-backed dataloader with the StatefulDataLoader state_dict surface.
+
+    The save block snapshots ``self._dataloader.state_dict()``; return a
+    sentinel dict so tests can assert the exact object written to
+    train_dataloader.pt.
+    """
+
+    def __init__(self, batches: Any = (), state: Optional[dict[str, Any]] = None):
+        super().__init__(batches)
+        self._state = dict(state) if state is not None else dict(_SENTINEL_DL_STATE)
+
+    def state_dict(self) -> dict[str, Any]:
+        return dict(self._state)
+
+
 # ── builders ─────────────────────────────────────────────────────────────────
 
 
@@ -237,6 +264,7 @@ def _make_bundle(
     *,
     trainer: Optional[_FakeTrainer] = None,
     save_state: Optional[dict[str, Any]] = None,
+    dataloader: Optional[_FakeDataloader] = None,
 ) -> SingleControllerBundle:
     return SingleControllerBundle(
         gen_handle=object(),
@@ -245,7 +273,7 @@ def _make_bundle(
         train_cluster=None,
         inference_cluster=None,
         dp_client=_FakeDPClient(),
-        dataloader=[],
+        dataloader=dataloader if dataloader is not None else _FakeDataloader(),
         weight_synchronizer=_FakeWeightSynchronizer(),
         advantage_estimator=None,
         loss_fn=object(),
@@ -288,6 +316,7 @@ class TestCounterRestore:
     def test_restore_from_step_n(self, tmp_path):
         save_state = _default_grpo_save_state()
         save_state["current_step"] = 7
+        save_state["current_epoch"] = 2
         save_state["consumed_samples"] = 42
         save_state["total_valid_tokens"] = 1234
 
@@ -298,6 +327,7 @@ class TestCounterRestore:
         # Fresh-start invariant: _max_rollout_version == _trainer_version - 1.
         assert actor._max_rollout_version == 6
         assert actor._consumed_samples == 42
+        assert actor._current_epoch == 2
         assert actor._total_valid_tokens == 1234
 
     def test_fresh_start_defaults(self, tmp_path):
@@ -307,6 +337,7 @@ class TestCounterRestore:
         assert actor._trainer_version == 0
         assert actor._max_rollout_version == -1
         assert actor._consumed_samples == 0
+        assert actor._current_epoch == 0
         assert actor._total_valid_tokens == 0
 
     def test_old_checkpoint_without_total_valid_tokens(self, tmp_path):
@@ -490,6 +521,8 @@ def _write_checkpoint(
     save_state: dict[str, Any],
     *,
     with_optimizer: bool = True,
+    dataloader_state: Optional[dict[str, Any]] = None,
+    config: Optional[dict[str, Any]] = None,
 ) -> Path:
     step_dir = ckpt_dir / f"step_{step}"
     (step_dir / "policy" / "weights").mkdir(parents=True)
@@ -497,6 +530,11 @@ def _write_checkpoint(
         (step_dir / "policy" / "optimizer").mkdir(parents=True)
     with open(step_dir / "training_info.json", "w") as f:
         json.dump(save_state, f)
+    if dataloader_state is not None:
+        torch.save(dataloader_state, step_dir / "train_dataloader.pt")
+    if config is not None:
+        with open(step_dir / "config.yaml", "w") as f:
+            yaml.safe_dump(config, f)
     return step_dir
 
 
@@ -574,7 +612,11 @@ class TestGetResumePaths:
 
 
 class TestSetupResumeWiring:
-    def test_setup_forwards_latest_resume_paths(self, patched_factories, tmp_path):
+    def test_setup_forwards_latest_resume_paths(
+        self,
+        patched_factories,  # noqa: F811
+        tmp_path,
+    ):
         ckpt_dir = tmp_path / "ckpts"
         _write_checkpoint(ckpt_dir, 1, {**_STEP_3_SAVE_STATE, "current_step": 1})
         step_3 = _write_checkpoint(ckpt_dir, 3, _STEP_3_SAVE_STATE)
@@ -589,7 +631,11 @@ class TestSetupResumeWiring:
         # training_info.json is loaded into the bundle for the actor.
         assert bundle.save_state == _STEP_3_SAVE_STATE
 
-    def test_setup_fresh_start_passes_none_paths(self, patched_factories, tmp_path):
+    def test_setup_fresh_start_passes_none_paths(
+        self,
+        patched_factories,  # noqa: F811
+        tmp_path,
+    ):
         ckpt_dir = tmp_path / "empty_ckpts"
         ckpt_dir.mkdir()
         mc = _setup_master_config(str(ckpt_dir))
@@ -601,7 +647,11 @@ class TestSetupResumeWiring:
         assert trainer_kwargs["optimizer_path"] is None
         assert bundle.save_state == _default_grpo_save_state()
 
-    def test_setup_forwards_pretrained_checkpoint(self, patched_factories, tmp_path):
+    def test_setup_forwards_pretrained_checkpoint(
+        self,
+        patched_factories,  # noqa: F811
+        tmp_path,
+    ):
         mc = _setup_master_config(str(tmp_path / "ckpts"))
         pretrained = {"path": "/some/ckpt", "format": "megatron_bridge"}
         mc.checkpointing["pretrained_checkpoint"] = pretrained
@@ -609,3 +659,116 @@ class TestSetupResumeWiring:
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert mc.policy["pretrained_checkpoint"] == pretrained
+
+
+def _make_int_dataloader() -> StatefulDataLoader:
+    """8 ints, batch_size=2 → batches [0,1], [2,3], [4,5], [6,7]."""
+    return StatefulDataLoader(
+        list(range(8)),
+        batch_size=2,
+        shuffle=False,
+        drop_last=True,
+        num_workers=0,
+    )
+
+
+class TestDataloaderState:
+    def test_save_writes_dataloader_state(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+        save_state = _default_grpo_save_state()
+        save_state["current_epoch"] = 3
+        dataloader = _FakeDataloader(state={"fake_position": 7})
+
+        _run_train_pump(mc, _make_bundle(save_state=save_state, dataloader=dataloader))
+
+        ckpt_dir = tmp_path / "checkpoints"
+        dl_state_path = ckpt_dir / "step_2" / "train_dataloader.pt"
+        assert dl_state_path.exists()
+        # The snapshot taken at save time round-trips through torch.save.
+        assert torch.load(dl_state_path) == {"fake_position": 7}
+        # current_epoch flows save_state → actor → training_info.json.
+        assert _training_info(ckpt_dir, 2)["current_epoch"] == 3
+
+    def test_stateful_dataloader_position_roundtrip(self, tmp_path):
+        data_config = {"train": [{"dataset_name": "math_train"}]}
+        dataloader = _make_int_dataloader()
+        it = iter(dataloader)
+        assert [next(it).tolist() for _ in range(2)] == [[0, 1], [2, 3]]
+
+        step_dir = _write_checkpoint(
+            tmp_path,
+            5,
+            _default_grpo_save_state(),
+            dataloader_state=dataloader.state_dict(),
+            config={"data": {"train": [{"dataset_name": "math_train"}]}},
+        )
+
+        restored = _make_int_dataloader()
+        load_dataloader_state(restored, str(step_dir), data_config)
+
+        # Resumes at batch k+1, not from the top.
+        assert next(iter(restored)).tolist() == [4, 5]
+
+    def test_dataset_swap_skips_restore(self, tmp_path):
+        dataloader = _make_int_dataloader()
+        it = iter(dataloader)
+        assert [next(it).tolist() for _ in range(2)] == [[0, 1], [2, 3]]
+
+        step_dir = _write_checkpoint(
+            tmp_path,
+            5,
+            _default_grpo_save_state(),
+            dataloader_state=dataloader.state_dict(),
+            config={"data": {"train": [{"dataset_name": "old_dataset"}]}},
+        )
+
+        restored = _make_int_dataloader()
+        load_dataloader_state(
+            restored, str(step_dir), {"train": [{"dataset_name": "new_dataset"}]}
+        )
+
+        # Restore skipped on dataset swap: the new dataset starts from index 0.
+        assert next(iter(restored)).tolist() == [0, 1]
+
+    def test_setup_restores_dataloader_state(
+        self,
+        patched_factories,  # noqa: F811
+        tmp_path,
+    ):
+        ckpt_dir = tmp_path / "ckpts"
+        sentinel = {"fake_position": 123}
+        _write_checkpoint(ckpt_dir, 3, _STEP_3_SAVE_STATE, dataloader_state=sentinel)
+        mc = _setup_master_config(str(ckpt_dir))
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        fake_dataloader = patched_factories["dataloader"]
+        fake_dataloader.load_state_dict.assert_called_once()
+        assert fake_dataloader.load_state_dict.call_args.args[0] == sentinel
+
+    def test_setup_missing_dataloader_state_starts_fresh(
+        self,
+        patched_factories,  # noqa: F811
+        tmp_path,
+        monkeypatch,
+    ):
+        # Pre-Phase-2 checkpoint: training_info.json + policy/ but no
+        # train_dataloader.pt. Setup must warn and keep the fresh position
+        # while still forwarding the weight resume paths.
+        ckpt_dir = tmp_path / "ckpts"
+        step_3 = _write_checkpoint(ckpt_dir, 3, _STEP_3_SAVE_STATE)
+        mc = _setup_master_config(str(ckpt_dir))
+        printed: list[str] = []
+        # Repo addopts run pytest with -s, so capsys sees nothing; record
+        # print calls instead.
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+        )
+
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["dataloader"].load_state_dict.assert_not_called()
+        assert any("No dataloader state found" in line for line in printed)
+        trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
+        assert trainer_kwargs["weights_path"] == step_3 / "policy" / "weights"

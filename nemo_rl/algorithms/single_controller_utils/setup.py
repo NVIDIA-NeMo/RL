@@ -21,6 +21,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,7 +43,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.utils import setup_response_data
+from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -329,6 +330,21 @@ def setup_single_controller(
         drop_last=True,
         num_workers=data_config["num_workers"],
     )
+    if last_checkpoint_path is not None:
+        dataloader_state_path = os.path.join(
+            last_checkpoint_path, "train_dataloader.pt"
+        )
+        if os.path.exists(dataloader_state_path):
+            print(
+                f"📦 Restoring dataloader state from checkpoint: {dataloader_state_path}"
+            )
+            load_dataloader_state(dataloader, last_checkpoint_path, data_config)
+        else:
+            # Pre-Phase-2 checkpoints have no dataloader state.
+            print(
+                f"⚠️ No dataloader state found at {dataloader_state_path}. "
+                "Starting with a fresh dataloader position."
+            )
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config, dataloader)

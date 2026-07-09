@@ -130,10 +130,11 @@ class SingleControllerActor:
         )
         self._timeout.start_iterations()
 
-        # Loaded (or default) GRPOSaveState; keys SC does not own yet
-        # (current_epoch, ...) pass through to saved checkpoints untouched.
+        # Loaded (or default) GRPOSaveState; keys SC does not own
+        # (val_reward, ...) pass through to saved checkpoints untouched.
         self._save_state: GRPOSaveState = bundle.save_state
         self._consumed_samples: int = bundle.save_state["consumed_samples"]
+        self._current_epoch: int = bundle.save_state["current_epoch"]
         self._total_valid_tokens: int = bundle.save_state.get(
             "total_valid_tokens", 0
         )  # Default to 0 for backward compatibility with older checkpoints
@@ -345,8 +346,7 @@ class SingleControllerActor:
                 sem.release()
 
         max_epochs = self._master_config.grpo["max_num_epochs"]
-        epoch = 0
-        while max_epochs is None or epoch < max_epochs:
+        while max_epochs is None or self._current_epoch < max_epochs:
             for prompt_batch in self._dataloader:
                 # over_sampling=False: batch-level gate on max_rollout_version.
                 if not over_sampling:
@@ -378,9 +378,9 @@ class SingleControllerActor:
                     )
                     self._dispatched_rollouts.add(task)
                     task.add_done_callback(self._dispatched_rollouts.discard)
-            epoch += 1
+            self._current_epoch += 1
 
-        print(f"rollout_pump: completed {epoch} epoch(s)", flush=True)
+        print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
         """Drain stale groups, sample, train, drop.
@@ -553,8 +553,15 @@ class SingleControllerActor:
                     save_state = self._save_state
                     save_state["current_step"] = self._train_steps
                     save_state["total_steps"] = self._train_steps
+                    save_state["current_epoch"] = self._current_epoch
                     save_state["consumed_samples"] = self._consumed_samples
                     save_state["total_valid_tokens"] = self._total_valid_tokens
+                    # Snapshot synchronously — no await between the save
+                    # decision and here — so it cannot interleave with
+                    # _rollout_pump iterating this same dataloader (asyncio
+                    # single-threading makes the snapshot race-free); the
+                    # slow torch.save happens off-loop below.
+                    dataloader_state = self._dataloader.state_dict()
                     # SC has no validation loop yet; keep the legacy shape so
                     # wiring it in later only replaces this None.
                     val_metrics: Optional[dict[str, Any]] = None
@@ -615,6 +622,11 @@ class SingleControllerActor:
                                 checkpoint_path, "policy", "tokenizer"
                             ),
                             checkpointing_cfg=self._master_config.checkpointing,
+                        )
+                        await asyncio.to_thread(
+                            torch.save,
+                            dataloader_state,
+                            os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         await asyncio.to_thread(
                             self._checkpointer.finalize_checkpoint, checkpoint_path
