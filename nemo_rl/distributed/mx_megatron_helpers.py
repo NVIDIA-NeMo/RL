@@ -311,6 +311,7 @@ def detect_megatron_role(
     tp_size: int,
     ep_size: int,
     ep_rank: int,
+    num_local_experts: int | None = None,
     num_attention_heads: int | None = None,
     num_kv_heads: int | None = None,
     head_dim: int | None = None,
@@ -363,6 +364,15 @@ def detect_megatron_role(
         if expert_idx is not None:
             # Per-expert grouped tensor. Each `weight<N>` is one expert's
             # full local shard; the receiver runs per_expert assembly.
+            #
+            # `weight<N>` is LOCAL to this EP rank (every rank names its
+            # experts 0..num_local-1). Advertise the GLOBAL expert id so a
+            # receiver gathering across EP ranks (EP-trainer -> non-EP / lower-EP
+            # rollout) can place experts without collision and the EP filter can
+            # route by global ownership. global = ep_rank*num_local + local.
+            global_idx = expert_idx
+            if num_local_experts:
+                global_idx = ep_rank * int(num_local_experts) + expert_idx
             mod_class = _module_class_name(_enclosing_module(name, model))
             sub_role = (
                 ROLE_EXPERT_ROW if "RowParallel" in mod_class else ROLE_EXPERT_COLUMN
@@ -371,10 +381,11 @@ def detect_megatron_role(
                 role=sub_role,
                 is_expert=True,
                 expert_axis=0,
-                owned_expert_ids={expert_idx},
+                owned_expert_ids={global_idx},
                 descriptor_extras={
                     "expert_axis": "0",
-                    "expert_id": str(expert_idx),
+                    "expert_id": str(global_idx),
+                    "local_expert_id": str(expert_idx),
                     "expert_layout": "grouped",
                 },
             )
@@ -466,6 +477,7 @@ def collect_megatron_publish_set(
     ep_size: int,
     ep_rank: int,
     tp_rank: int,
+    num_local_experts: int | None = None,
     num_attention_heads: int | None = None,
     num_kv_heads: int | None = None,
     head_dim: int | None = None,
@@ -526,6 +538,7 @@ def collect_megatron_publish_set(
             tp_size=tp_size,
             ep_size=ep_size,
             ep_rank=ep_rank,
+            num_local_experts=num_local_experts,
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,

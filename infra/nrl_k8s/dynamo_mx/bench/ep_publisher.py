@@ -95,6 +95,12 @@ num_heads = getattr(tcfg, "num_attention_heads", None)
 kv_groups = getattr(tcfg, "num_query_groups", None) or num_heads
 hidden = getattr(tcfg, "hidden_size", None)
 kv_channels = getattr(tcfg, "kv_channels", None) or (hidden // num_heads if num_heads else None)
+num_experts_total = (getattr(tcfg, "num_moe_experts", None)
+                     or getattr(tcfg, "num_experts", None))
+num_local_experts = (int(num_experts_total) // EP) if num_experts_total else None
+print(f"[pub r{RANK}] num_experts_total={num_experts_total} ep={EP} "
+      f"num_local_experts={num_local_experts} (global expert_id = ep_rank*num_local + local)",
+      flush=True)
 pub.set_megatron_sidecar({
     "megatron_transformer_config": {"num_attention_heads": num_heads,
         "num_query_groups": kv_groups, "kv_channels": kv_channels, "hidden_size": hidden},
@@ -105,6 +111,7 @@ added = 0
 roles: Counter = Counter()
 for name, local, spec, extras in collect_megatron_publish_set(
     model, tp_size=1, pp_size=1, pp_rank=0, ep_size=EP, ep_rank=ep_rank, tp_rank=0,
+    num_local_experts=num_local_experts,
     num_attention_heads=num_heads, num_kv_heads=kv_groups, head_dim=kv_channels,
     target_dtype=torch.bfloat16,
 ):
