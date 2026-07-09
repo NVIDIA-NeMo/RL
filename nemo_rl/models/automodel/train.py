@@ -243,7 +243,27 @@ def _tp_rank_for_fused_linear_logprobs(tp_group: Any) -> int:
     return 0
 
 
-def _lm_head_weight_for_fused_linear_logprobs(lm_head: nn.Module) -> torch.Tensor:
+def _tp_size_for_fused_linear_logprobs(tp_group: Any) -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(tp_group)
+    return 1
+
+
+def _dtensor_weight_is_tp_vocab_sharded(output_weight: DTensor) -> bool:
+    mesh_dim_names = output_weight.device_mesh.mesh_dim_names
+    if mesh_dim_names is None:
+        return False
+
+    for mesh_dim_name, placement in zip(mesh_dim_names, output_weight.placements):
+        if isinstance(placement, Shard) and placement.dim == 0:
+            return mesh_dim_name == "tp"
+
+    return False
+
+
+def _lm_head_weight_for_fused_linear_logprobs(
+    lm_head: nn.Module,
+) -> tuple[torch.Tensor, bool]:
     output_weight = getattr(lm_head, "weight", None)
     if output_weight is None:
         raise RuntimeError(
@@ -251,13 +271,22 @@ def _lm_head_weight_for_fused_linear_logprobs(lm_head: nn.Module) -> torch.Tenso
             "does not expose a weight tensor."
         )
     if isinstance(output_weight, DTensor):
-        output_weight = output_weight.to_local()
+        local_vocab_is_tp_partition = _dtensor_weight_is_tp_vocab_sharded(
+            output_weight
+        )
+        output_weight = (
+            output_weight.to_local()
+            if local_vocab_is_tp_partition
+            else output_weight.full_tensor()
+        )
+    else:
+        local_vocab_is_tp_partition = True
     if not torch.is_tensor(output_weight):
         raise RuntimeError(
             "policy.use_fused_linear_logprobs=True but the resolved LM head "
             "weight is not a tensor."
         )
-    return output_weight
+    return output_weight, local_vocab_is_tp_partition
 
 
 def _compute_fused_linear_logprobs(
@@ -294,7 +323,9 @@ def _compute_fused_linear_logprobs(
             "fused linear logprob LM-head metadata."
         )
     lm_head = _get_module_by_path(model, lm_head_path)
-    output_weight = _lm_head_weight_for_fused_linear_logprobs(lm_head)
+    output_weight, local_vocab_is_tp_partition = (
+        _lm_head_weight_for_fused_linear_logprobs(lm_head)
+    )
 
     if sampling_params is not None and sampling_params.temperature != 1.0:
         output_weight = output_weight / sampling_params.temperature
@@ -307,16 +338,27 @@ def _compute_fused_linear_logprobs(
             "logprob chunk size was configured."
         )
 
+    tp_size = _tp_size_for_fused_linear_logprobs(tp_group)
+    if not local_vocab_is_tp_partition and tp_size > 1:
+        raise RuntimeError(
+            "policy.use_fused_linear_logprobs=True requires the LM-head weight "
+            "to be vocab-sharded on the tp mesh dimension when tensor "
+            "parallelism is enabled."
+        )
+
     tp_rank = _tp_rank_for_fused_linear_logprobs(tp_group)
     local_vocab_size = int(output_weight.shape[0])
+    vocab_start_index = (
+        tp_rank * local_vocab_size if local_vocab_is_tp_partition else 0
+    )
     tensor_parallel_hidden_states = hidden_states.transpose(0, 1).contiguous()
     return from_parallel_hidden_states_to_logprobs(
         tensor_parallel_hidden_states=tensor_parallel_hidden_states,
         output_weight_layer=output_weight,
         runtime_gather_output=False,
         target=input_ids.to(hidden_states.device),
-        vocab_start_index=tp_rank * local_vocab_size,
-        vocab_end_index=(tp_rank + 1) * local_vocab_size,
+        vocab_start_index=vocab_start_index,
+        vocab_end_index=vocab_start_index + local_vocab_size,
         tp_group=tp_group,
         inference_only=not torch.is_grad_enabled(),
         cp_group=None,

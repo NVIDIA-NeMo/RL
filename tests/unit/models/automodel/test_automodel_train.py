@@ -17,12 +17,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 try:
     import nemo_automodel  # noqa: F401
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
+
+import nemo_rl.models.automodel.train as automodel_train
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
@@ -68,6 +70,88 @@ def mock_loss_fn():
     loss_fn.return_value = (torch.tensor(0.5), {"loss": 0.5})
     loss_fn.input_type = LossInputType.LOGIT
     return loss_fn
+
+
+class _FakeDeviceMesh:
+    def __init__(self, mesh_dim_names):
+        self.mesh_dim_names = mesh_dim_names
+
+
+class _FakeWeightDTensor:
+    def __init__(
+        self,
+        *,
+        local_tensor: torch.Tensor,
+        full_tensor: torch.Tensor,
+        placements,
+        mesh_dim_names,
+    ):
+        self._local_tensor = local_tensor
+        self._full_tensor = full_tensor
+        self.placements = placements
+        self.device_mesh = _FakeDeviceMesh(mesh_dim_names)
+        self.to_local_calls = 0
+        self.full_tensor_calls = 0
+
+    def to_local(self):
+        self.to_local_calls += 1
+        return self._local_tensor
+
+    def full_tensor(self):
+        self.full_tensor_calls += 1
+        return self._full_tensor
+
+
+@pytest.mark.automodel
+def test_lm_head_weight_for_fused_logprobs_uses_to_local_for_tp_vocab_dtensor(
+    monkeypatch,
+):
+    monkeypatch.setattr(automodel_train, "DTensor", _FakeWeightDTensor)
+    local_tensor = torch.randn(4, 3)
+    full_tensor = torch.randn(8, 3)
+    weight = _FakeWeightDTensor(
+        local_tensor=local_tensor,
+        full_tensor=full_tensor,
+        placements=[Shard(0)],
+        mesh_dim_names=["tp"],
+    )
+    lm_head = torch.nn.Module()
+    lm_head.weight = weight
+
+    output_weight, local_vocab_is_tp_partition = (
+        automodel_train._lm_head_weight_for_fused_linear_logprobs(lm_head)
+    )
+
+    assert output_weight is local_tensor
+    assert local_vocab_is_tp_partition is True
+    assert weight.to_local_calls == 1
+    assert weight.full_tensor_calls == 0
+
+
+@pytest.mark.automodel
+def test_lm_head_weight_for_fused_logprobs_uses_full_tensor_for_dp_dtensor(
+    monkeypatch,
+):
+    monkeypatch.setattr(automodel_train, "DTensor", _FakeWeightDTensor)
+    local_tensor = torch.randn(4, 3)
+    full_tensor = torch.randn(8, 3)
+    weight = _FakeWeightDTensor(
+        local_tensor=local_tensor,
+        full_tensor=full_tensor,
+        placements=[Shard(0)],
+        mesh_dim_names=["dp"],
+    )
+    lm_head = torch.nn.Module()
+    lm_head.weight = weight
+
+    output_weight, local_vocab_is_tp_partition = (
+        automodel_train._lm_head_weight_for_fused_linear_logprobs(lm_head)
+    )
+
+    assert output_weight is full_tensor
+    assert local_vocab_is_tp_partition is False
+    assert weight.to_local_calls == 0
+    assert weight.full_tensor_calls == 1
 
 
 @pytest.fixture
