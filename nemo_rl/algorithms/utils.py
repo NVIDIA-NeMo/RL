@@ -855,7 +855,10 @@ def print_performance_metrics(
     # FLOPS
     # =====================================================
 
-    if "total_flops" in train_results:
+    packing_enabled = master_config.policy.get("sequence_packing", {}).get(
+        "enabled", False
+    )
+    if "total_flops" in train_results and not packing_enabled:
         # Prefer the CUDA-synchronized elapsed time recorded inside the Megatron worker
         # over the driver-side policy_training timer, which returns as soon as the Ray
         # future is submitted and can be much shorter than actual GPU compute time.
