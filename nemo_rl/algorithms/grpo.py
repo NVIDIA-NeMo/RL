@@ -17,6 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import dataclass, fields
 from typing import Any, Optional, TypeVar, cast
 
 import numpy as np
@@ -28,6 +29,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
@@ -119,17 +121,6 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = False
 
 
-class AdvEstimatorConfig(BaseModel, extra="allow"):
-    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
-
-    name: str = "grpo"  # "grpo", "gdpo", or "reinforce_plus_plus"
-    # GRPO specific
-    normalize_rewards: Optional[bool] = None
-    use_leave_one_out_baseline: Optional[bool] = None
-    # Reinforce++ specific
-    minus_baseline: Optional[bool] = None
-
-
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
@@ -154,7 +145,7 @@ class GRPOConfig(BaseModel, extra="allow"):
     use_dynamic_sampling: bool = False
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
-    dynamic_sampling_max_gen_batches: int = 5
+    dynamic_sampling_max_gen_batches: int = 10
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: float = 1.0
@@ -169,21 +160,42 @@ class GRPOConfig(BaseModel, extra="allow"):
     adv_estimator: Optional[AdvEstimatorConfig] = None
 
 
-class GRPOSaveState(BaseModel, extra="allow"):
-    consumed_samples: int = 0
-    current_step: int = 0
-    current_epoch: int = 0
-    total_steps: int = 0
-    total_valid_tokens: int = (
-        0  # Track total number of non-padding tokens during training
+@dataclass
+class GRPOSaveState:
+    consumed_samples: int
+    current_step: int
+    current_epoch: int
+    total_steps: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
+    val_reward: float  # May be removed when no validation metrics are available
+
+
+def _initial_grpo_save_state() -> GRPOSaveState:
+    return GRPOSaveState(
+        consumed_samples=0,
+        current_step=0,
+        current_epoch=0,
+        total_steps=0,
+        total_valid_tokens=0,
+        val_reward=-99999999.0,
     )
-    val_reward: float = (
-        -99999999.0
-    )  # Optional field - may not be present during training
 
 
-def _default_grpo_save_state() -> GRPOSaveState:
-    return GRPOSaveState()
+def _load_grpo_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> GRPOSaveState:
+    if loaded_state is None:
+        return _initial_grpo_save_state()
+
+    # Backward compatibility: older checkpoints may not contain these fields.
+    loaded_state = loaded_state.copy()
+    loaded_state.setdefault("total_valid_tokens", 0)
+    loaded_state.setdefault("val_reward", -99999999.0)
+    # Checkpoints may carry dynamic validation metrics; regenerate them after resume.
+    known_fields = {field.name for field in fields(GRPOSaveState)}
+    return GRPOSaveState(
+        **{key: value for key, value in loaded_state.items() if key in known_fields}
+    )
 
 
 class GRPOLoggerConfig(LoggerConfig):
@@ -266,14 +278,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        grpo_save_state = (
-            GRPOSaveState(**loaded_state)
-            if isinstance(loaded_state, dict)
-            else loaded_state
-        )
-    else:
-        grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _load_grpo_save_state(loaded_state)
 
     # ==========================
     #           Data
@@ -2042,7 +2047,7 @@ def grpo_train(
                             flush=True,
                         )
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, grpo_save_state, master_config
+                            total_steps + 1, vars(grpo_save_state), master_config
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -3117,7 +3122,7 @@ def async_grpo_train(
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            step + 1, grpo_save_state, master_config
+                            step + 1, vars(grpo_save_state), master_config
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
