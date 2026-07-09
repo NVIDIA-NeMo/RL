@@ -54,6 +54,18 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.weight_transfer_remote_sparse import (
+    G_VLLM_REFIT_API_KEY_HEADER,
+    G_VLLM_REFIT_FLUSH_PATH,
+    G_VLLM_REFIT_S3_MANIFEST_PATH,
+)
+from nemo_rl.utils.weight_transfer_zmq import (
+    G_VLLM_REFIT_CHECKSUM_HEADER,
+    G_VLLM_REFIT_PAYLOAD_HEADER,
+    G_VLLM_REFIT_PRODUCER_HEADER,
+    G_VLLM_REFIT_TRANSFER_HEADER,
+    G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
+)
 
 model_name = "Qwen/Qwen3-0.6B"
 # Define basic vLLM test config
@@ -275,6 +287,42 @@ def test_sparse_refit_queue_does_not_deduplicate_failed_enqueue() -> None:
     assert worker._refit_apply_pending_payloads == []
 
 
+def test_sparse_refit_collective_response_merges_verification_metrics() -> None:
+    response = BaseVllmGenerationWorker._refit_collective_response(
+        [
+            {
+                "receiver_total_s": 1.0,
+                "verification_candidates": 4,
+                "verification_samples": 2,
+                "verification_exact_mismatches": 1,
+                "verification_mismatches": 0,
+                "verification_abs_sum": 0.25,
+                "verification_max_abs": 0.25,
+            },
+            {
+                "receiver_total_s": 2.0,
+                "verification_candidates": 4,
+                "verification_samples": 3,
+                "verification_exact_mismatches": 2,
+                "verification_mismatches": 1,
+                "verification_abs_sum": 0.5,
+                "verification_max_abs": 0.4,
+            },
+        ]
+    )
+
+    assert response == {
+        "ok": True,
+        "receiver_total_s": 2.0,
+        "verification_candidates": 4,
+        "verification_samples": 5,
+        "verification_exact_mismatches": 3,
+        "verification_mismatches": 1,
+        "verification_abs_sum": 0.75,
+        "verification_max_abs": 0.4,
+    }
+
+
 def test_sparse_refit_queue_releases_condition_while_backpressured() -> None:
     first: Future[dict[str, Any]] = Future()
     second: Future[dict[str, Any]] = Future()
@@ -393,6 +441,177 @@ async def test_async_sparse_refit_batch_bridges_to_async_collective(
 
 
 @pytest.mark.asyncio
+async def test_sparse_refit_payload_handlers_decode_and_enqueue(monkeypatch) -> None:
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    enqueue = MagicMock(
+        side_effect=[
+            {"ok": True, "payloads": 1},
+            {"ok": True, "payloads": 1},
+        ]
+    )
+    worker._enqueue_sparse_payload_apply = enqueue
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.download_s3_refit_payload",
+        lambda _manifest: b"s3-payload",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker.decode_sparse_payload",
+        lambda _body, _checksum: b"zmq-payload",
+    )
+
+    s3_result = await worker._apply_s3_manifest_payload(
+        {"key": "object-key", "checksum": "checksum"}
+    )
+    assert s3_result["ok"]
+    assert s3_result["receiver_s3_download_s"] >= 0.0
+
+    invalid_request = types.SimpleNamespace(headers={}, body=AsyncMock())
+    with pytest.raises(ValueError, match="Missing or invalid"):
+        await worker._apply_zmq_payload(invalid_request)
+
+    request = types.SimpleNamespace(
+        headers={
+            G_VLLM_REFIT_TRANSFER_HEADER: "transfer",
+            G_VLLM_REFIT_PRODUCER_HEADER: "2",
+            G_VLLM_REFIT_PAYLOAD_HEADER: "3",
+            G_VLLM_REFIT_CHECKSUM_HEADER: "checksum",
+        },
+        body=AsyncMock(return_value=b"compressed"),
+    )
+    zmq_result = await worker._apply_zmq_payload(request)
+    assert zmq_result["ok"]
+    assert zmq_result["receiver_zmq_decode_s"] >= 0.0
+    assert enqueue.call_args_list == [
+        call(b"s3-payload", ("object-key", -1, -1), "checksum"),
+        call(b"zmq-payload", ("transfer", 2, 3), "checksum"),
+    ]
+
+
+def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    worker.cfg = {
+        "vllm_cfg": {
+            "async_engine": True,
+            "http_refit_api_key_env_var": "NRL_TEST_REFIT_KEY",
+        }
+    }
+    worker._refit_async_loop = None
+    worker._apply_s3_manifest_payload = AsyncMock(
+        return_value={"ok": True, "payloads": 1}
+    )
+    worker._apply_zmq_payload = AsyncMock(side_effect=RuntimeError("apply failed"))
+    worker._flush_queued_sparse_payloads = MagicMock(
+        return_value={"ok": True, "payloads": 2}
+    )
+    app = FastAPI()
+    worker._setup_vllm_refit_api_server(app)
+    headers = {G_VLLM_REFIT_API_KEY_HEADER: "secret"}
+
+    with TestClient(app) as client:
+        unauthorized = client.post(G_VLLM_REFIT_S3_MANIFEST_PATH, json={})
+        s3_response = client.post(
+            G_VLLM_REFIT_S3_MANIFEST_PATH,
+            json={"key": "key"},
+            headers=headers,
+        )
+        flush_response = client.post(G_VLLM_REFIT_FLUSH_PATH, headers=headers)
+        zmq_response = client.post(
+            G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
+            content=b"payload",
+            headers=headers,
+        )
+
+    assert unauthorized.status_code == 403
+    assert unauthorized.json() == {"ok": False, "error": "unauthorized"}
+    assert s3_response.status_code == 200
+    assert s3_response.json() == {"ok": True, "payloads": 1}
+    assert flush_response.status_code == 200
+    assert flush_response.json() == {"ok": True, "payloads": 2}
+    assert zmq_response.status_code == 500
+    assert zmq_response.json() == {"ok": False, "error": "apply failed"}
+    assert worker._refit_async_loop is not None
+    worker._apply_s3_manifest_payload.assert_awaited_once_with({"key": "key"})
+    worker._apply_zmq_payload.assert_awaited_once()
+    worker._flush_queued_sparse_payloads.assert_called_once_with()
+
+
+def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
+    monkeypatch,
+) -> None:
+    import uvicorn
+
+    from nemo_rl.models.generation.vllm import vllm_worker as worker_module
+
+    configs = []
+    servers = []
+
+    def make_config(app, **kwargs):
+        config = types.SimpleNamespace(app=app, **kwargs)
+        configs.append(config)
+        return config
+
+    class Server:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.should_exit = False
+            self.ran = threading.Event()
+            servers.append(self)
+
+        def run(self) -> None:
+            self.ran.set()
+
+    monkeypatch.setattr(uvicorn, "Config", make_config)
+    monkeypatch.setattr(uvicorn, "Server", Server)
+    monkeypatch.setattr(worker_module, "_get_free_port_local", lambda *_args: 12345)
+    monkeypatch.setattr(worker_module, "_get_node_ip_local", lambda: "10.0.0.1")
+    collect = MagicMock()
+    empty_cache = MagicMock()
+    monkeypatch.setattr(worker_module.gc, "collect", collect)
+    monkeypatch.setattr(worker_module.torch.cuda, "empty_cache", empty_cache)
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {
+        "vllm_cfg": {"http_refit_server_port": None},
+        "port_range_low": 10000,
+        "port_range_high": 11000,
+    }
+    worker._setup_vllm_refit_api_server = MagicMock()
+    worker._refit_http_server = None
+    worker._setup_vllm_refit_server()
+
+    assert len(configs) == 1
+    assert configs[0].host == "0.0.0.0"
+    assert configs[0].port == 12345
+    assert servers[0].ran.wait(timeout=1.0)
+    assert worker.report_refit_server_base_url() == "http://10.0.0.1:12345"
+    worker._setup_vllm_refit_api_server.assert_called_once_with(configs[0].app)
+
+    relay = MagicMock()
+    llm = MagicMock()
+    worker._zmq_refit_server = (relay, "tcp://relay")
+    worker._flush_queued_sparse_payloads = MagicMock()
+    worker._refit_apply_executor = MagicMock()
+    worker.llm = llm
+    worker.tokenizer = object()
+
+    assert worker.shutdown() is True
+    relay.close.assert_called_once_with()
+    worker._flush_queued_sparse_payloads.assert_called_once_with()
+    worker._refit_apply_executor.shutdown.assert_called_once_with(wait=True)
+    assert servers[0].should_exit is True
+    assert worker._refit_http_server is None
+    llm.collective_rpc.assert_called_once_with("cleanup", args=())
+    assert worker.llm is None
+    assert worker.tokenizer is None
+    collect.assert_called_once_with()
+    empty_cache.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {"refit_transport": "vllm_zmq_sparse"}
@@ -405,7 +624,10 @@ async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
 
     assert worker.vllm_device_ids == ["0"]
     assert worker._refit_workers_share_node is True
-    worker.llm.collective_rpc.assert_awaited_once_with("report_node_hostname", args=())
+    assert worker.llm.collective_rpc.await_args_list == [
+        call("bind_numa", args=()),
+        call("report_node_hostname", args=()),
+    ]
 
 
 def test_async_sparse_refit_exposes_zmq_relay(monkeypatch) -> None:
