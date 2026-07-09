@@ -22,7 +22,8 @@ import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
     DistillationConfig,
     MasterConfig,
-    _default_distillation_save_state,
+    _initial_distillation_save_state,
+    _load_distillation_save_state,
     check_vocab_equality,
     distillation_train,
     validate,
@@ -195,11 +196,51 @@ def mock_components():
     }
 
 
+def test_load_distillation_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    loaded_state = {
+        "total_steps": 13,
+        "current_epoch": 1,
+        "current_step": 3,
+        "consumed_samples": 32,
+        "val:accuracy": 0.75,
+    }
+
+    save_state = _load_distillation_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "total_steps": 13,
+        "current_epoch": 1,
+        "current_step": 3,
+        "val_reward": -99999999.0,
+        "consumed_samples": 32,
+        "total_valid_tokens": 0,
+    }
+    assert "total_valid_tokens" not in loaded_state
+    assert not hasattr(save_state, "val:accuracy")
+
+
+def test_distillation_save_state_checkpoint_round_trip():
+    save_state = _initial_distillation_save_state()
+    save_state.current_step = 4
+    save_state.total_steps = 4
+    save_state.total_valid_tokens = 128
+    save_state.val_reward = 0.8
+    setattr(save_state, "val:accuracy", 0.8)
+
+    restored_state = _load_distillation_save_state(vars(save_state))
+
+    assert restored_state.current_step == 4
+    assert restored_state.total_steps == 4
+    assert restored_state.total_valid_tokens == 128
+    assert restored_state.val_reward == 0.8
+    assert not hasattr(restored_state, "val:accuracy")
+
+
 def test_distillation_train_max_steps(mock_components):
     """Test that training terminates correctly when maximum steps are reached."""
     mock_components["master_config"].distillation.max_num_steps = 5
 
-    distillation_save_state = _default_distillation_save_state()
+    distillation_save_state = _initial_distillation_save_state()
 
     # Run training
     distillation_train(
@@ -226,7 +267,7 @@ def test_exit_on_timeout(mock_components, capsys):
     # Set max steps to large number
     mock_components["master_config"].distillation.max_num_steps = 100
 
-    distillation_save_state = _default_distillation_save_state()
+    distillation_save_state = _initial_distillation_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
     with patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class:

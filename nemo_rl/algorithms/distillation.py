@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import warnings
+from dataclasses import dataclass, fields
 from typing import Any, Optional, TypeVar, cast
 
 import numpy as np
@@ -88,21 +89,42 @@ class DistillationConfig(BaseModel, extra="allow"):
     seed: int = 42
 
 
-class DistillationSaveState(BaseModel, extra="allow"):
-    total_steps: int = 0  # Track total number of steps across all epochs
-    current_epoch: int = 0  # Track current epoch
-    current_step: int = 0  # Track step within current epoch
-    val_reward: float = (
-        -99999999.0
-    )  # Can be any metric. Setted to 'accuracy' by default in validation.
-    consumed_samples: int = 0
-    total_valid_tokens: int = (
-        0  # Track total number of non-padding tokens during training
+@dataclass
+class DistillationSaveState:
+    total_steps: int  # Track total number of steps across all epochs
+    current_epoch: int  # Track current epoch
+    current_step: int  # Track step within current epoch
+    val_reward: float  # Can be any metric; defaults to accuracy in validation
+    consumed_samples: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
+
+
+def _initial_distillation_save_state() -> DistillationSaveState:
+    return DistillationSaveState(
+        total_steps=0,
+        current_epoch=0,
+        current_step=0,
+        val_reward=-99999999.0,
+        consumed_samples=0,
+        total_valid_tokens=0,
     )
 
 
-def _default_distillation_save_state() -> DistillationSaveState:
-    return DistillationSaveState()
+def _load_distillation_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> DistillationSaveState:
+    if loaded_state is None:
+        return _initial_distillation_save_state()
+
+    # Backward compatibility: older checkpoints may not contain these fields.
+    loaded_state = loaded_state.copy()
+    loaded_state.setdefault("total_valid_tokens", 0)
+    loaded_state.setdefault("val_reward", -99999999.0)
+    # Checkpoints may carry dynamic validation metrics; regenerate them after resume.
+    known_fields = {field.name for field in fields(DistillationSaveState)}
+    return DistillationSaveState(
+        **{key: value for key, value in loaded_state.items() if key in known_fields}
+    )
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -230,14 +252,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if loaded_state is not None:
-        distillation_save_state = (
-            DistillationSaveState(**loaded_state)
-            if isinstance(loaded_state, dict)
-            else loaded_state
-        )
-    else:
-        distillation_save_state = _default_distillation_save_state()
+    distillation_save_state = _load_distillation_save_state(loaded_state)
 
     # ==========================
     #           Data
@@ -836,7 +851,9 @@ def distillation_train(
                             flush=True,
                         )
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, distillation_save_state, master_config
+                            total_steps + 1,
+                            vars(distillation_save_state),
+                            master_config,
                         )
                         student_policy.save_checkpoint(
                             weights_path=os.path.join(
