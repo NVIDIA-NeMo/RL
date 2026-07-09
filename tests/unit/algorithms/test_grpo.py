@@ -36,8 +36,9 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
-    _default_grpo_save_state,
+    _initial_grpo_save_state,
     _initial_policy_generation_stale,
+    _load_grpo_save_state,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_logprob_skip_flags,
     _resolve_message_level_advantage_penalties,
@@ -343,6 +344,52 @@ def mock_grpo_components():
         "val_task_to_env": val_task_to_env,
         "master_config": master_config,
     }
+
+
+def test_load_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _load_grpo_save_state({}) == _initial_grpo_save_state()
+
+    loaded_state = {
+        "consumed_samples": 32,
+        "current_step": 3,
+        "current_epoch": 1,
+        "total_steps": 13,
+        "val:accuracy": 0.75,
+    }
+
+    save_state = _load_grpo_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "consumed_samples": 32,
+        "current_step": 3,
+        "current_epoch": 1,
+        "total_steps": 13,
+        "total_valid_tokens": 0,
+        "val_reward": -99999999.0,
+    }
+    assert "total_valid_tokens" not in loaded_state
+    assert not hasattr(save_state, "val:accuracy")
+
+
+def test_grpo_save_state_checkpoint_round_trip():
+    save_state = _initial_grpo_save_state()
+    save_state.current_step = 4
+    save_state.total_steps = 4
+    save_state.total_valid_tokens = 128
+    save_state.val_reward = 0.8
+    setattr(save_state, "val:accuracy", 0.8)
+
+    restored_state = _load_grpo_save_state(vars(save_state))
+
+    assert restored_state.current_step == 4
+    assert restored_state.total_steps == 4
+    assert restored_state.total_valid_tokens == 128
+    assert restored_state.val_reward == 0.8
+    assert not hasattr(restored_state, "val:accuracy")
+
+
+def test_grpo_config_dynamic_sampling_default_matches_exemplar():
+    assert GRPOConfig().dynamic_sampling_max_gen_batches == 10
 
 
 def _mock_seq_logprob_error_result() -> dict[str, object]:
@@ -2099,7 +2146,7 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
         mock_grpo_components["val_task_to_env"],
         mock_grpo_components["logger"],
         mock_grpo_components["checkpointer"],
-        _default_grpo_save_state(),
+        _initial_grpo_save_state(),
         master_config,
     )
 
@@ -2187,7 +2234,7 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
             mock_grpo_components["val_task_to_env"],
             mock_grpo_components["logger"],
             checkpointer,
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )
 
@@ -2245,7 +2292,7 @@ def test_grpo_ft_save_period_triggers_periodic_saves(
                 mock_grpo_components["val_task_to_env"],
                 mock_grpo_components["logger"],
                 checkpointer,
-                _default_grpo_save_state(),
+                _initial_grpo_save_state(),
                 master_config,
             )
     else:
@@ -2276,7 +2323,7 @@ def test_grpo_ft_save_period_triggers_periodic_saves(
                 mock_grpo_components["val_task_to_env"],
                 mock_grpo_components["logger"],
                 checkpointer,
-                _default_grpo_save_state(),
+                _initial_grpo_save_state(),
                 master_config,
             )
 
@@ -2307,7 +2354,7 @@ def test_grpo_train_skips_reference_policy_logprobs(mock_grpo_components, train_
     if train_func == async_grpo_train:
         master_config.policy["generation"]["colocated"]["enabled"] = False
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
         "max_gen_tokens": 20,
@@ -2402,7 +2449,7 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
                 mock_grpo_components["val_task_to_env"],
                 mock_grpo_components["logger"],
                 mock_grpo_components["checkpointer"],
-                _default_grpo_save_state(),
+                _initial_grpo_save_state(),
                 master_config,
             )
     else:
@@ -2432,7 +2479,7 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
                 mock_grpo_components["val_task_to_env"],
                 mock_grpo_components["logger"],
                 mock_grpo_components["checkpointer"],
-                _default_grpo_save_state(),
+                _initial_grpo_save_state(),
                 master_config,
             )
 
@@ -2531,7 +2578,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
     if train_func == async_grpo_train:
         master_config.policy["generation"]["colocated"]["enabled"] = False
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
     mock_rollout_metrics = {
         "mean_gen_tokens_per_sample": 10.0,
         "max_gen_tokens": 20,
@@ -3009,7 +3056,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     master_config = mock_grpo_components["master_config"]
     master_config.grpo.max_num_steps = 12
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
 
     # Async GRPO requires non-colocated inference
     if train_func == async_grpo_train:
@@ -3083,7 +3130,7 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
     master_config.grpo.max_num_epochs = 2
     master_config.grpo.max_num_steps = 100
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
 
     # Mock rollout functions to return proper metrics
     mock_rollout_metrics = {
@@ -3135,7 +3182,7 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
     master_config.grpo.max_num_steps = 100
     master_config.grpo.max_num_epochs = 10
 
-    grpo_save_state = _default_grpo_save_state()
+    grpo_save_state = _initial_grpo_save_state()
 
     # Async GRPO requires non-colocated inference
     if train_func == async_grpo_train:
