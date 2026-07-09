@@ -67,17 +67,28 @@ tok_60          pos_60     60         -6.830355    -6.830397    0.000041
 
 import argparse
 import copy
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
 
 import ray
 import torch
+from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
+from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 def parse_args():
@@ -222,6 +233,7 @@ def setup_configs(args, tokenizer):
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -574,8 +586,215 @@ def cleanup_resources(vllm_inference_policy):
     print("Cleanup completed successfully!")
 
 
-def main():
-    """Main execution function."""
+def init_sglang(inference_cluster, generation_config):
+    """Initialize SGLang generation workers and snapshot/reset weights for verification.
+
+    Args:
+        inference_cluster: Ray virtual cluster for inference workers.
+        generation_config: SGLang generation config (typed as SGLangConfig).
+
+    Returns:
+        Tuple of (SGLangGeneration instance, initialization wall time in seconds).
+    """
+    t0 = time.perf_counter()
+    pg = SGLangGeneration(
+        cluster=inference_cluster,
+        sglang_cfg=generation_config,
+    )
+    pg.check_weights(action="snapshot")
+    pg.check_weights(action="reset")
+    pg.finish_generation()
+    return pg, time.perf_counter() - t0
+
+
+def initialize_generation_with_policy(
+    init_generation_fn: Callable,
+    init_policy_fn: Callable,
+    init_time_key: str,
+    colocated_inference: bool,
+    worker_init_timing_metrics: dict,
+    policy: Policy | None = None,
+):
+    """Initialize SGLang generation + policy, then run the weight-equality check.
+
+    Verifier-only variant: after both sides are up and refit metadata is
+    exchanged, this always refits the policy weights into SGLang and calls
+    `check_weights(action="compare")` against the snapshot taken in
+    `init_sglang`. Production GRPO uses its own copy in `grpo.setup`.
+
+    Args:
+        init_generation_fn: Callable returning (engine, init_time_s).
+        init_policy_fn: Callable returning (policy, init_time_s).
+        init_time_key: Metrics key for generation init time.
+        colocated_inference: Whether inference is colocated with training.
+        worker_init_timing_metrics: Dict populated with init/parallel timing.
+        policy: Optional pre-initialized policy; if set, init_policy_fn is skipped.
+
+    Returns:
+        Tuple of (policy_generation, policy).
+    """
+    use_parallel_init = not colocated_inference and policy is None
+
+    if use_parallel_init:
+        print(
+            "  ⚡ Using parallel worker initialization (non-colocated mode)",
+            flush=True,
+        )
+        parallel_start_time = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            generation_future = executor.submit(init_generation_fn)
+            policy_future = executor.submit(init_policy_fn)
+            policy_generation, generation_time = generation_future.result()
+            policy, policy_time = policy_future.result()
+        parallel_wall_time = time.perf_counter() - parallel_start_time
+
+        worker_init_timing_metrics[init_time_key] = generation_time
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+        worker_init_timing_metrics["parallel_init_enabled"] = True
+    else:
+        print(
+            "  ⚙️  Using sequential worker initialization (colocated mode)",
+            flush=True,
+        )
+        policy_generation, generation_time = init_generation_fn()
+        worker_init_timing_metrics[init_time_key] = generation_time
+
+        if policy is None:
+            policy, policy_time = init_policy_fn()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        worker_init_timing_metrics["parallel_init_enabled"] = 0.0
+
+    state_dict_info = policy.prepare_refit_info()
+    policy_generation.prepare_refit_info(state_dict_info)
+
+    refit_policy_generation(
+        policy=policy,
+        policy_generation=policy_generation,
+        colocated_inference=colocated_inference,
+    )
+    policy_generation.check_weights(action="compare")
+    policy_generation.finish_generation()
+    policy.prepare_for_training()
+
+    return policy_generation, policy
+
+
+def parse_sglang_args():
+    """Parse args for the sglang weight-check flow: --config + hydra-style overrides."""
+    parser = argparse.ArgumentParser(
+        description="SGLang weight-update verification via the same YAML config GRPO uses"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to the YAML config file (same file used by run_grpo.py).",
+    )
+    args, overrides = parser.parse_known_args()
+    return args, overrides
+
+
+def main_sglang():
+    """Load the GRPO YAML config and run the SGLang weight-equality check.
+
+    Mirrors run_grpo.py's config-loading pipeline and grpo.setup's colocated
+    cluster bootstrap, but skips dataset/loss/logger/checkpointer/grpo_state
+    since the verifier only needs to refit weights once and diff against the
+    pre-reset snapshot. Generation backend must be sglang.
+    """
+    args, overrides = parse_sglang_args()
+
+    register_omegaconf_resolvers()
+    config = load_config(args.config)
+    print(f"Loaded configuration from: {args.config}")
+    if overrides:
+        print(f"Overrides: {overrides}")
+        config = parse_hydra_overrides(config, overrides)
+    master_config = OmegaConf.to_container(config, resolve=True)
+
+    init_ray()
+
+    tokenizer = get_tokenizer(master_config["policy"]["tokenizer"])
+
+    policy_config = master_config["policy"]
+    generation_config = master_config["policy"]["generation"]
+    cluster_config = master_config["cluster"]
+    assert generation_config is not None, "policy.generation must be set in the config"
+    assert generation_config["backend"] == "sglang", (
+        f"refit_verifier sglang mode requires backend=sglang, got "
+        f"{generation_config['backend']!r}"
+    )
+    assert generation_config["colocated"]["enabled"], (
+        "refit_verifier sglang mode currently only supports colocated inference"
+    )
+
+    generation_config = configure_generation_config(generation_config, tokenizer)
+    generation_config["model_name"] = policy_config["model_name"]
+    generation_config["sglang_cfg"].setdefault(
+        "model_path", policy_config["model_name"]
+    )
+
+    policy_nodes = cluster_config["num_nodes"]
+    policy_gpus_per_node = cluster_config["gpus_per_node"]
+    cluster = RayVirtualCluster(
+        name="refit_verifier_cluster",
+        bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
+        use_gpus=True,
+        num_gpus_per_node=policy_gpus_per_node,
+        max_colocated_worker_groups=2,
+    )
+    print(
+        f"  ✓ Ray cluster initialized with {policy_nodes} nodes "
+        f"× {policy_gpus_per_node} GPUs/node",
+        flush=True,
+    )
+
+    def init_policy_fn():
+        t0 = time.perf_counter()
+        p = Policy(
+            cluster=cluster,
+            config=policy_config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+            init_optimizer=False,
+        )
+        return p, time.perf_counter() - t0
+
+    worker_init_timing_metrics: dict = {}
+    policy_generation, _ = initialize_generation_with_policy(
+        init_generation_fn=lambda: init_sglang(cluster, generation_config),
+        init_policy_fn=init_policy_fn,
+        init_time_key="sglang_init_time_s",
+        colocated_inference=True,
+        worker_init_timing_metrics=worker_init_timing_metrics,
+    )
+
+    print("\n--- SGLang weight-check timing ---")
+    for k, v in worker_init_timing_metrics.items():
+        print(f"  {k}: {v}")
+
+    policy_generation.shutdown()
+    print("SGLang weight-check completed successfully!")
+
+
+def _is_sglang_mode() -> bool:
+    """Detect the sglang flow by the presence of --config in argv.
+
+    The vLLM path has no --config argument, so its presence unambiguously
+    signals the YAML-driven sglang flow. Inspecting sys.argv here keeps
+    the existing vLLM path byte-identical.
+    """
+    import sys
+
+    for tok in sys.argv[1:]:
+        if tok == "--config" or tok.startswith("--config="):
+            return True
+    return False
+
+
+def main_vllm():
+    """VLLM weight-check flow."""
     # Parse command line arguments
     args = parse_args()
 
@@ -622,6 +841,13 @@ def main():
     # Cleanup
     cleanup_resources(vllm_inference_policy)
 
+
+def main():
+    """Dispatch to the sglang or vllm weight-check flow."""
+    if _is_sglang_mode():
+        main_sglang()
+    else:
+        main_vllm()
     print("Script completed successfully!")
 
 

@@ -1,0 +1,4 @@
+defaults: grpo-qwen3-8B-base-1n8g-fsdp2-lora.yaml
+data_plane:
+  enabled: true
+  backend: mooncake_cpu

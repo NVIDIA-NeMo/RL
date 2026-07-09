@@ -38,6 +38,8 @@ To enable DTensor (FSDP2) training:
 1. Set `policy.dtensor_cfg.enabled=True`.
 2. Refer to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml) for a configuration example.
 
+For multi-node runs, set `policy.dtensor_cfg.dp_replicate_size > 1` on the DTensor v2 backend to enable Hybrid Sharded Data Parallel (HSDP). This keeps FSDP collectives intra-node and only replicates gradients across nodes. See [HSDP (`dp_replicate_size`)](fsdp2-parallel-plan.md#hsdp-dp_replicate_size).
+
 ## Configuration Examples
 
 For comprehensive examples of each algorithm and backend, see the [examples/configs/recipes/llm](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes/llm) folder. This directory contains ready-to-use configurations for various supported combinations.

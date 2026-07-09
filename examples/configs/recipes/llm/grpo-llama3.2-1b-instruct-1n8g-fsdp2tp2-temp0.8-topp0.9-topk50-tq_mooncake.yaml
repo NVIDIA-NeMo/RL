@@ -1,0 +1,4 @@
+defaults: grpo-llama3.2-1b-instruct-1n8g-fsdp2tp2-temp0.8-topp0.9-topk50.yaml
+data_plane:
+  enabled: true
+  backend: mooncake_cpu

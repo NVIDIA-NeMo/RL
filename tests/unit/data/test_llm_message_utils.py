@@ -378,6 +378,81 @@ def test_batch_pad_message_log_custom_pad_value(
     )
 
 
+@pytest.mark.parametrize("make_sequence_length_divisible_by", [1, 8])
+def test_batched_message_log_to_flat_message_carries_routed_experts(
+    make_sequence_length_divisible_by: int,
+) -> None:
+    """Router replay (R3): a per-message ``routed_experts`` tensor must survive
+    the flat-message batching as a 4D ``[B, S, L, K]`` tensor, right-padded and
+    row-aligned to ``token_ids``.
+
+    This is the precondition the ``data_plane.enabled=false`` R3 path depends on:
+    ``grpo_train`` copies ``flat_messages["routed_experts"]`` into
+    ``train_data`` / ``logprob_data`` (gated on ``router_replay_enabled``), and
+    the Megatron worker expects exactly a 4D ``[batch, seq, num_moe_layers,
+    topk]`` tensor (``nemo_rl/models/megatron/data.py``). If the key were dropped
+    or reshaped here, the dp-off copy would silently no-op and training would
+    fail late in the worker's router-replay guard.
+    """
+    num_layers, topk = 2, 4
+
+    def routes(start: int, n: int) -> torch.Tensor:
+        # Row i is the constant value (start + i) across all [L, K] entries, so
+        # padding (which is 0) is distinguishable from real routes.
+        vals = torch.arange(start, start + n, dtype=torch.long)
+        return vals.view(n, 1, 1).expand(n, num_layers, topk).contiguous()
+
+    message_log_batch: list[LLMMessageLogType] = [
+        [  # sample 0: 2 tokens, single message (shorter -> gets right-padded)
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1, 2]),
+                "routed_experts": routes(10, 2),
+            },
+        ],
+        [  # sample 1: 3 tokens spread across two messages -> concatenated
+            {
+                "role": "user",
+                "token_ids": torch.tensor([3, 4]),
+                "routed_experts": routes(20, 2),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([5]),
+                "routed_experts": routes(30, 1),
+            },
+        ],
+    ]
+
+    flat, input_lengths = batched_message_log_to_flat_message(
+        message_log_batch,
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+
+    # The key survives batching and is a 4D [B, S, L, K] tensor whose seq dim
+    # matches token_ids (so DP-sharding applies one permutation to both).
+    assert "routed_experts" in flat
+    routed = flat["routed_experts"]
+    token_ids = flat["token_ids"]
+    batch_size, seq_len = token_ids.shape
+    assert batch_size == 2
+    assert seq_len % make_sequence_length_divisible_by == 0
+    assert routed.shape == (batch_size, seq_len, num_layers, topk)
+    assert routed.dim() == 4
+    assert input_lengths.tolist() == [2, 3]
+
+    # Valid prefix rows match the per-message concat, in token order...
+    assert torch.equal(routed[0, 0], routes(10, 1)[0])
+    assert torch.equal(routed[0, 1], routes(11, 1)[0])
+    assert torch.equal(routed[1, 0], routes(20, 1)[0])
+    assert torch.equal(routed[1, 1], routes(21, 1)[0])
+    assert torch.equal(routed[1, 2], routes(30, 1)[0])
+    # ...and the tail is right-padded with zeros (the worker repairs these pad
+    # rows to a valid route, arange(K), before feeding mcore).
+    assert torch.all(routed[0, 2:] == 0)
+    assert torch.all(routed[1, 3:] == 0)
+
+
 @pytest.mark.parametrize(
     "model_id, chat_log_transform",
     [

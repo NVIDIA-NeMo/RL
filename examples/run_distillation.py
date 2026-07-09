@@ -90,6 +90,7 @@ def main() -> None:
         student_policy,
         teacher_policy,
         student_generation,
+        _nemo_gym,
         dataloader,
         val_dataloader,
         loss_fn,

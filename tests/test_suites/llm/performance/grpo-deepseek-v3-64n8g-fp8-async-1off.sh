@@ -20,6 +20,12 @@ NUM_MINUTES=240
 
 exit_if_max_steps_reached
 
+# envvars for better fp8 inference performance
+export VLLM_USE_FLASHINFER_MOE_FP8=1
+export VLLM_FLASHINFER_MOE_BACKEND=latency
+export VLLM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl
+export VLLM_ALLREDUCE_USE_FLASHINFER=1
+
 # Run the experiment
 cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
