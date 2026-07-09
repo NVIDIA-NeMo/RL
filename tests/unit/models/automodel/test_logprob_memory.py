@@ -68,6 +68,31 @@ def test_local_logprobs_chunking_matches_full_selected_logprobs(chunk_size):
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_local_logprobs_accepts_cpu_input_ids_with_cuda_logits(chunk_size):
+    torch.manual_seed(13)
+    logits = torch.randn(2, 5, 11, device="cuda")
+    input_ids = torch.tensor(
+        [
+            [0, 2, 4, 6, 8],
+            [1, 3, 5, 7, 9],
+        ]
+    )
+
+    processor = _make_processor(chunk_size=chunk_size)
+    actual = processor._compute_local_logprobs(logits.clone(), input_ids)
+
+    next_tokens = input_ids[:, 1:].to(logits.device)
+    expected_logits = logits[:, : next_tokens.shape[1], :].to(torch.float32)
+    expected = torch.nn.functional.log_softmax(expected_logits, dim=-1).gather(
+        dim=-1,
+        index=next_tokens.unsqueeze(-1),
+    ).squeeze(-1)
+
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("chunk_size", [None, 2])
 def test_local_logprobs_empty_sequence_returns_empty_tensor(chunk_size):
     processor = _make_processor(chunk_size=chunk_size)

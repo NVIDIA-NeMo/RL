@@ -813,7 +813,7 @@ class LogprobsPostProcessor:
         # Input shapes:
         #   logits: [batch_size, sequence_length, vocab_size] - logits for each position
         #   token_ids: [batch_size, sequence_length] - actual tokens
-        next_tokens = input_ids[:, 1:]
+        next_tokens = input_ids[:, 1:].to(logits.device)
         target_seq_len = int(next_tokens.shape[1])
 
         if target_seq_len == 0:
