@@ -16,7 +16,6 @@ import gc
 import os
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from functools import partial
 from typing import Any, Iterator, Optional, TypeVar
 
 import ray
@@ -72,6 +71,10 @@ from nemo_rl.models.megatron.setup import (
     validate_and_set_config,
     validate_model_paths,
 )
+from nemo_rl.models.megatron.train import (
+    LossPostProcessor,
+    megatron_forward_backward,
+)
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
@@ -80,114 +83,6 @@ from nemo_rl.models.value.interfaces import ValueOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-
-def forward_step_value(
-    state,
-    global_valid_seqs,
-    global_valid_toks,
-    data_iterator,
-    model,
-    *,
-    loss_fn,
-    pack_sequences=False,
-    defer_fp32_logits=None,
-    cp_normalize=True,
-    num_microbatches=1,
-    policy_cfg=None,
-):
-    """Forward step for the value model.
-
-    The LM head is replaced at build time by a ``LinearForLastLayer``
-    (hidden_size -> 1) value head (see ``create_value_head_hook``), so
-    ``model(...)`` returns per-token values directly — the head already gathers
-    sequence-parallel shards.
-    """
-    from nemo_rl.algorithms.loss import SequencePackingLossWrapper
-
-    straggler_timer = state.straggler_timer
-
-    # Get the pre-processed microbatch from the iterator
-    processed_mb = next(data_iterator)
-
-    data_dict = processed_mb.data_dict
-    input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
-    attention_mask = processed_mb.attention_mask
-    position_ids = processed_mb.position_ids
-    packed_seq_params = processed_mb.packed_seq_params
-
-    additional_kwargs = {}
-    if packed_seq_params is not None:
-        additional_kwargs["packed_seq_params"] = packed_seq_params
-    if defer_fp32_logits:
-        additional_kwargs["fp32_output"] = False
-
-    with straggler_timer:
-        output_tensor = model(
-            input_ids=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            **additional_kwargs,
-        )
-
-    is_packed = pack_sequences and packed_seq_params is not None
-
-    # Head-owning stage returns values; others pass hidden states through.
-    if is_pipeline_last_stage(ignore_virtual=True):
-        if is_packed:
-            # Packed [1, T // CP, 1] -> [1, T // CP]. The per-sequence shift (and CP
-            # all-gather) happens in the loss wrapper's prepare_fn below.
-            output_tensor = output_tensor.squeeze(-1)
-        else:
-            # [B, S]: shift right by 1 so values[t] = V(state before token t).
-            values = output_tensor.squeeze(-1)
-            output_tensor = torch.cat(
-                [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
-            )
-
-    if is_packed:
-        loss_fn = SequencePackingLossWrapper(
-            loss_fn=loss_fn,
-            prepare_fn=_value_packed_loss_prepare_fn,
-            cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-            cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-            context_parallel_group=get_context_parallel_group(),
-        )
-
-    loss_data = data_dict
-
-    # MseValueLossFn only accepts (logits, data, global_valid_seqs, global_valid_toks).
-    # Unlike ClippedPGLossFn, it does not need vocab_parallel or context_parallel args.
-    loss_fn_wrapped = partial(
-        loss_fn,
-        data=loss_data,
-        global_valid_seqs=global_valid_seqs,
-        global_valid_toks=global_valid_toks,
-    )
-
-    if cp_normalize:
-        cp_size = parallel_state.get_context_parallel_world_size()
-        orig_loss_fn_wrapped = loss_fn_wrapped
-
-        def _div_by_cp_size(*args, **kwargs):
-            loss, metrics = orig_loss_fn_wrapped(*args, **kwargs)
-            return loss / cp_size, metrics
-
-        loss_fn_wrapped = _div_by_cp_size
-
-    # Counteract Megatron schedules.py's default (* cp_size / num_microbatches) loss
-    # averaging so per-microbatch losses (each normalized by global_valid_toks) are
-    # summed, not averaged. Mirrors the policy LossPostProcessor.
-    cp_size = parallel_state.get_context_parallel_world_size()
-    loss_fn_before_mcore_scaling = loss_fn_wrapped
-
-    def _counteract_mcore_loss_averaging(*args, **kwargs):
-        loss, metrics = loss_fn_before_mcore_scaling(*args, **kwargs)
-        return loss * num_microbatches / cp_size, metrics
-
-    loss_fn_wrapped = _counteract_mcore_loss_averaging
-
-    return output_tensor, loss_fn_wrapped
 
 
 def _install_value_head_load_skip(chunk: GPTModel) -> None:
@@ -287,7 +182,7 @@ def _unpack_value_sequences(
     return out
 
 
-def _value_packed_loss_prepare_fn(
+def _value_loss_prepare_fn(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
     loss_fn: Optional[LossFunction] = None,
@@ -295,14 +190,15 @@ def _value_packed_loss_prepare_fn(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> tuple[dict[str, torch.Tensor], BatchedDataDict[Any]]:
-    """Prepare one packed sequence's value-head output for ``MseValueLossFn``.
+    """Prepare the value-head output for ``MseValueLossFn`` (LossPostProcessor prepare_fn).
 
-    ``SequencePackingLossWrapper`` hands us a single sequence's CP-sharded value
-    slice ``[1, padded_len // CP]``. All-gather across CP to ``[1, padded_len]``,
-    shift right by one (``values[t] = V(state before token t)``), and truncate to
-    the sequence's unpadded length so it lines up with ``data["returns"]``.
+    All-gather across CP (packed only — CP requires packing), shift right by one
+    so ``values[t] = V(state before token t)``, then truncate to ``data["returns"]``.
     """
     values = logits
+    # Drop the value head's trailing singleton ([..., 1]).
+    if values.ndim > 2 and values.shape[-1] == 1:
+        values = values.squeeze(-1)
     cp_size = (
         1
         if context_parallel_group is None
@@ -394,6 +290,15 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         torch.cuda.set_device(local_rank)
 
         apply_transformer_engine_patch()
+
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Pin to this worker's GPU-local CPUs/memory before model load, matching
+        # the policy workers. local_rank (== ray.get_gpu_ids()[0]) is the physical
+        # GPU index that keys the affinity file. Pass it explicitly:
+        # CUDA_VISIBLE_DEVICES lists all node devices here
+        # (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1).
+        bind_to_gpu_numa(local_rank)
 
         self.cfg = config
         self.rank = get_rank_safe()
@@ -560,11 +465,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             self.model.train()
 
         with ctx:
-            forward_step = partial(
-                forward_step_value,
-                loss_fn=loss_fn,
-                policy_cfg=None,
-            )
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
@@ -601,27 +501,25 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
-                    # Forward-backward pass
-                    forward_backward_func = get_forward_backward_func()
-                    losses_reduced = forward_backward_func(
-                        forward_step_func=partial(
-                            forward_step,
-                            self.mcore_state,
-                            global_valid_seqs,
-                            global_valid_toks,
-                            pack_sequences=self.cfg.get("sequence_packing", {}).get(
-                                "enabled", False
-                            ),
-                            defer_fp32_logits=self.defer_fp32_logits,
-                            num_microbatches=num_microbatches,
-                        ),
-                        data_iterator=data_iterator,
+                    # Reuse the policy LossPostProcessor; prepare_fn does the
+                    # value-specific right-shift + CP all-gather.
+                    loss_post_processor = LossPostProcessor(
+                        loss_fn=loss_fn,
+                        cfg=self._policy_like_cfg,
+                        num_microbatches=num_microbatches,
+                        prepare_fn=_value_loss_prepare_fn,
+                    )
+                    losses_reduced = megatron_forward_backward(
                         model=self.model,
+                        data_iterator=data_iterator,
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
-                        micro_batch_size=micro_batch_size_actual,
-                        decoder_seq_length=padded_seq_length,
+                        mbs=micro_batch_size_actual,
+                        post_processing_fn=loss_post_processor,
                         forward_only=eval_mode,
+                        defer_fp32_logits=self.defer_fp32_logits,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
                     )
 
                 # Empty unused memory

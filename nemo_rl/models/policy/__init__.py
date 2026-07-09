@@ -18,6 +18,55 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
+def _patch_transformers_tokenizer_class_set():
+    """Undo the transformers block on deepseek_v3 tokenizers.
+
+    Root cause: transformers 5.4-5.11 lists "deepseek_v3" in two internal
+    registries -- MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (a set) and
+    TOKENIZER_MAPPING_NAMES (a dict pinning it to "TokenizersBackend"). Together
+    they force the fast tokenizer backend and suppress trust_remote_code, so
+    AutoTokenizer can only load via a local tokenizer.json. Models like
+    Moonlight-16B-A3B ship no tokenizer.json (only tiktoken.model + a remote-code
+    TikTokenTokenizer), so offline loading fails.
+
+    Removing both entries restores the trust_remote_code / auto_map path.
+    discard/pop-with-default are no-ops when the entries are absent, so this is
+    safe on any transformers version in the currently-supported range.
+
+    Placed here (nemo_rl/models/policy/__init__.py) so it fires exactly once
+    per process the first time any policy code is imported -- covers the driver
+    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron / DTensor /
+    DTensor v2 all import from nemo_rl.models.policy) without polluting nemo_rl
+    consumers that don't touch tokenizers.
+    """
+    import transformers
+    from packaging.version import Version as PkgVersion
+
+    # This whole patch exists only because Megatron-Bridge caps the transformers
+    # upper bound below 5.9 today, which forces us onto a transformers version
+    # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
+    # its transformers upper bound to >=5.12, we can drop this workaround.
+    # TODO: remove this patch (and the assert below) once MBridge relaxes its
+    # transformers upper bound past the deepseek_v3 fix (~transformers 5.12).
+    # https://github.com/NVIDIA-NeMo/RL/issues/2764
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.12.0"), (
+        f"transformers {transformers.__version__} detected. "
+        "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
+        "Check if the upstream fix now applies and remove this patch if so."
+    )
+
+    from transformers.models.auto.tokenization_auto import (
+        MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
+        TOKENIZER_MAPPING_NAMES,
+    )
+
+    MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
+    TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
+
+
+_patch_transformers_tokenizer_class_set()
+
+
 class LoRAConfigDisabled(TypedDict):
     enabled: Literal[False]
 
@@ -306,6 +355,9 @@ class MegatronConfig(TypedDict):
     moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Create gloo process groups during Megatron distributed init.
+    # Omitted: use the Megatron Bridge default.
+    use_gloo_process_groups: NotRequired[bool]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
@@ -325,20 +377,18 @@ class MegatronConfig(TypedDict):
     gradient_accumulation_fusion: NotRequired[bool]
     # Enable fused weighted squared ReLU when the architecture supports it.
     use_fused_weighted_squared_relu: NotRequired[bool]
-    # When True, uses chunked linear cross-entropy fusion loss to compute loss
-    # directly from hidden states, avoiding materialization of the full
-    # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak
-    # GPU memory, extending the maximum trainable sequence length (e.g. from <65K
-    # to >100K tokens). Only applicable to SFT with NLLLoss.
-    use_linear_ce_fusion_loss: NotRequired[bool]
-    # Number of tokens per chunk when computing the fused linear CE loss.
+    # When True, computes per-token logprobs with a chunked linear cross-entropy
+    # fusion kernel directly from hidden states, avoiding materialization of the
+    # full [batch, seq_len, vocab_size] logit tensor. This significantly reduces
+    # peak GPU memory, extending the maximum trainable sequence length (e.g. from
+    # <65K to >100K tokens). Supported for SFT, DPO, and GRPO. Not compatible with
+    # context parallelism, sequence packing, or top-k/top-p training-time filtering.
+    use_fused_linear_logprobs: NotRequired[bool]
+    # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
-    linear_ce_fusion_chunk_size: NotRequired[int]
-    # When mtp_num_layers=0, Multi-Token Prediction is disabled. Set to null/None to
-    # disable MTP on hybrid (e.g. NemotronH) models: their forward gates MTP on
-    # `mtp_num_layers is not None`, so 0 still enters the MTP block and asserts
-    # `mtp_num_layers > 0`; None makes that check False and skips MTP entirely.
-    mtp_num_layers: NotRequired[int | None]
+    fused_linear_logprobs_chunk_size: NotRequired[int]
+    # When mtp_num_layers=0, Multi-Token Prediction is disabled.
+    mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
     mtp_loss_scaling_factor: NotRequired[float]
     # When True, repeat a single MTP layer mtp_num_layers times instead of using distinct layers.

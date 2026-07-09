@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ from huggingface_hub import snapshot_download
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.data.datasets.utils import (
     get_huggingface_cache_path,
+    load_audio_from_file,
     load_dataset_from_path,
 )
 
@@ -116,20 +117,16 @@ class DailyOmniDataset(RawDataset):
         return prompt
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        video_dir = os.path.join(self.hf_cache_dir, "Videos", data["video_id"])
+        video_path = os.path.join(video_dir, data["video_id"] + "_video.mp4")
+        audio_path = os.path.join(video_dir, data["video_id"] + "_audio.wav")
+        # Audio + video flow as two independent content items so the
+        # Qwen2.5-Omni chat template renders both <|VIDEO|> and <|AUDIO|>
+        # placeholders (Daily-Omni is an audio-visual benchmark).
         user_content = [
-            {
-                "type": "video",
-                "video": os.path.join(
-                    self.hf_cache_dir,
-                    "Videos",
-                    data["video_id"],
-                    data["video_id"] + "_video.mp4",
-                ),
-            },
-            {
-                "type": "text",
-                "text": self.get_prompt(data),
-            },
+            {"type": "video", "video": video_path},
+            {"type": "audio", "audio": load_audio_from_file(audio_path)},
+            {"type": "text", "text": self.get_prompt(data)},
         ]
         return {
             "messages": [

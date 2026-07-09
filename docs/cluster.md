@@ -141,8 +141,13 @@ sbatch ray.sub \
     and reuse across container runs. This variable should point to a path on a shared 
     filesystem accessible by all nodes (head and workers). This path will be mounted 
     into the container and will override the container's default `UV_CACHE_DIR`.
-* - `CPUS_PER_WORKER=128`
-  - CPUs each Ray worker node claims. Default is `16 * GPUS_PER_NODE`.
+* - `CPUS_PER_WORKER`
+  - CPUs each Ray worker node claims. If unset, `ray.sub` auto-detects this from
+    Slurm (the `CPUTot` of the first allocated node) so that Ray sees every CPU
+    on the node. Detection assumes a homogeneous allocation (all nodes have the
+    same CPU count) and only queries a single node to avoid hammering the Slurm
+    controller with one RPC per node; set this explicitly for a heterogeneous
+    allocation or to override detection.
 * - `GPUS_PER_NODE=8`
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`

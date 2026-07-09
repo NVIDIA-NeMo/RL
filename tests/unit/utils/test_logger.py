@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import shutil
 import tempfile
 from unittest.mock import MagicMock, call, patch
@@ -27,6 +28,7 @@ from nemo_rl.utils.logger import (
     TensorboardLogger,
     WandbLogger,
     flatten_dict,
+    log_container_init_timing,
     print_message_log_samples,
 )
 
@@ -2056,6 +2058,35 @@ class TestLogger:
 
         mock_subplots.assert_not_called()
         backend_logger.log_plot.assert_not_called()
+
+
+class TestLogContainerInitTiming:
+    def test_warns_when_job_start_unset(self, monkeypatch, caplog, capsys):
+        monkeypatch.delenv("NRL_JOB_START_EPOCH", raising=False)
+        with caplog.at_level(logging.WARNING):
+            log_container_init_timing()
+        assert "NRL_JOB_START_EPOCH not set" in caplog.text
+        assert "CONTAINER INIT TIMING" not in capsys.readouterr().out
+
+    def test_prints_total_only(self, monkeypatch, capsys):
+        monkeypatch.delenv("SLURM_JOB_START_TIME", raising=False)
+        monkeypatch.delenv("NRL_RAY_READY_EPOCH", raising=False)
+        monkeypatch.setenv("NRL_JOB_START_EPOCH", "1.0")
+        log_container_init_timing()
+        out = capsys.readouterr().out
+        assert "CONTAINER INIT TIMING" in out and "total:" in out
+        assert "slurm_prologue" not in out and "cluster_startup" not in out
+
+    def test_prints_full_breakdown(self, monkeypatch, capsys):
+        monkeypatch.setenv("SLURM_JOB_START_TIME", "1.0")
+        monkeypatch.setenv("NRL_JOB_START_EPOCH", "2.0")
+        monkeypatch.setenv("NRL_RAY_READY_EPOCH", "3.0")
+        log_container_init_timing()
+        out = capsys.readouterr().out
+        assert "slurm_prologue: 1.0s" in out
+        assert "cluster_startup (orchestrator+container+ray): 1.0s" in out
+        assert "driver_startup (launch+python+imports):" in out
+        assert "total:" in out
 
 
 def test_print_message_log_samples(capsys):
