@@ -921,17 +921,17 @@ def _create_checkpoint_config(
         optimizer_path: Path to the optimizer state (None if not resuming optimizer).
         load_main_params_from_ckpt: Load optimizer main params from the checkpoint.
         ckpt_cfg: MegatronCheckpointConfig dict from YAML (``megatron_cfg.checkpoint``).
-            The whole block is optional. GRPO exemplar / nemo_gym configs set
-            ``async_save: true`` explicitly. ``async_save`` defaults to ``False`` when
-            absent (sync save, pre-existing behavior) because nemo-rl uses it for
-            save-path logic as well as passing through to Megatron Bridge.
-            ``ckpt_assume_constant_structure`` is only forwarded when set in YAML;
-            otherwise Megatron Bridge's own default applies.
+            ``async_save`` is required (the exemplar configs own its value — no
+            call-site default); nemo-rl branches on it for the save-path logic and
+            forwards it to Megatron Bridge. ``ckpt_assume_constant_structure`` and
+            the parallel-IO fields are optional and forwarded only when explicitly
+            set in YAML; when absent, Megatron Bridge's own ``CheckpointConfig``
+            default applies.
     """
     cfg = ckpt_cfg or {}
-    # async_save is always resolved: nemo-rl branches on it (save-path fallback) and
-    # passes it to CheckpointConfig. Default False preserves pre-existing sync behavior.
-    async_save = cfg.get("async_save", False)
+    # async_save is required: the exemplar configs own its value, so there is no
+    # call-site default. nemo-rl branches on it (save-path logic) and forwards it.
+    async_save = cfg["async_save"]
 
     # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
     # On a fresh run (no prior checkpoint), weights_path is None, so fall back to
