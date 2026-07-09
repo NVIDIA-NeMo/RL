@@ -57,7 +57,12 @@ def _normalize_packing_tensors_for_broadcast(
 
     if not torch.cuda.is_available():
         return tensors
-    target_device = torch.device("cuda", torch.cuda.current_device())
+    target_device = next(
+        (tensor.device for tensor in tensors if tensor.is_cuda),
+        None,
+    )
+    if target_device is None:
+        target_device = torch.device("cuda", torch.cuda.current_device())
 
     return [
         tensor

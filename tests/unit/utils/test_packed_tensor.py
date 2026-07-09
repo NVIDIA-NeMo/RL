@@ -110,11 +110,11 @@ def test_normalize_packing_tensors_cpu_only_with_cuda():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_normalize_packing_tensors_mixed_devices_use_current_cuda_device():
-    """Test that mixed CPU/CUDA pieces normalize to the current CUDA device."""
+def test_normalize_packing_tensors_mixed_devices_use_existing_cuda_device():
+    """Test that mixed CPU/CUDA pieces normalize to an existing CUDA device."""
     cuda_tensor = torch.arange(4, 8, dtype=torch.uint8, device="cuda")
     tensors = [torch.arange(4, dtype=torch.uint8), cuda_tensor]
-    expected_device = torch.device("cuda", torch.cuda.current_device())
+    expected_device = cuda_tensor.device
 
     normalized = _normalize_packing_tensors_for_broadcast(tensors)
 
@@ -124,6 +124,31 @@ def test_normalize_packing_tensors_mixed_devices_use_current_cuda_device():
     ]
     assert torch.equal(
         torch.cat(normalized).cpu(), torch.arange(8, dtype=torch.uint8)
+    )
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="requires at least two CUDA devices",
+)
+def test_normalize_packing_tensors_preserves_non_current_cuda_device():
+    """Test that an existing CUDA piece selects the target device."""
+    current_device = torch.cuda.current_device()
+    other_device_index = 1 if current_device == 0 else 0
+    other_device = torch.device("cuda", other_device_index)
+
+    cuda_tensor = torch.arange(4, 8, dtype=torch.uint8, device=other_device)
+    tensors = [torch.arange(4, dtype=torch.uint8), cuda_tensor]
+
+    normalized = _normalize_packing_tensors_for_broadcast(tensors)
+
+    assert [tensor.device for tensor in normalized] == [
+        other_device,
+        other_device,
+    ]
+    assert torch.equal(
+        torch.cat(normalized).cpu(),
+        torch.arange(8, dtype=torch.uint8),
     )
 
 
