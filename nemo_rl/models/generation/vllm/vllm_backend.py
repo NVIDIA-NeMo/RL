@@ -299,19 +299,31 @@ class VllmInternalWorkerExtension:
             E = module.local_num_experts
             hidden_size = module.moe_config.hidden_dim
             intermediate_size = module.moe_config.intermediate_size_per_partition
-            up_dim = 2 * intermediate_size if module.moe_config.is_act_and_mul else intermediate_size
+            up_dim = (
+                2 * intermediate_size
+                if module.moe_config.is_act_and_mul
+                else intermediate_size
+            )
             # replace_parameter preserves the weight_loader attribute from the old param
             if w13.ndim != 3:
                 replace_parameter(
                     module,
                     "w13_weight",
-                    torch.empty(E, up_dim, hidden_size, dtype=w13.dtype, device=w13.device),
+                    torch.empty(
+                        E, up_dim, hidden_size, dtype=w13.dtype, device=w13.device
+                    ),
                 )
             if w2.ndim != 3:
                 replace_parameter(
                     module,
                     "w2_weight",
-                    torch.empty(E, hidden_size, intermediate_size, dtype=w2.dtype, device=w2.device),
+                    torch.empty(
+                        E,
+                        hidden_size,
+                        intermediate_size,
+                        dtype=w2.dtype,
+                        device=w2.device,
+                    ),
                 )
 
     def load_mtp_weights_from_disk(self, model_path: str) -> bool:
@@ -511,6 +523,7 @@ class VllmInternalWorkerExtension:
             )
 
             from vllm.config import set_current_vllm_config
+
             # Process weights after loading
             from vllm.model_executor.model_loader.utils import (
                 process_weights_after_loading,
