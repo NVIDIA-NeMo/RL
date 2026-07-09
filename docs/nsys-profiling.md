@@ -28,6 +28,26 @@ format is colon separated integers representing `start:stop`, where `start` is i
 export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 ```
 
+### Extra Nsys Options (Optional)
+
+Set `NRL_NSYS_EXTRA_OPTIONS` to a JSON object to add or override nsys CLI flags on top of
+the built-in defaults. Keys are the nsys flag names (without leading `--`); values are the
+flag values (string, or anything Ray's nsight runtime_env accepts). User-supplied keys win
+on conflict with the built-in defaults (`t`, `o`, `stop-on-exit`, `capture-range`,
+`capture-range-end`, `cuda-graph-trace`).
+
+```bash
+export NRL_NSYS_EXTRA_OPTIONS='{"gpu-metrics-device": "all", "cuda-memory-usage": "true", "cpuctxsw": "none"}'
+```
+
+Common additions:
+- `gpu-metrics-device`: sample SM/memory utilization counters (e.g. `"all"` or a specific device id).
+- `cuda-memory-usage`: track host/device memory allocations (`"true"`).
+- `cpuctxsw`: control CPU context-switch sampling (`"none"`, `"process-tree"`).
+
+Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object
+payload raises at startup so misconfiguration surfaces immediately.
+
 ### Pattern Format
 
 - Use shell-style wildcards (`*`, `?`, `[seq]`, `[!seq]`)
@@ -86,7 +106,7 @@ When profiling is enabled, it generates the following logs and files:
    vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
    ```
-If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, the `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` will be empty, and the `worker_process_<PID>.nsys-rep` are nsight profiles from vllm's ray distributed executors (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
+If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, nsight is NOT applied to the outer `VllmGenerationWorker` to avoid interfering with Ray's compiled DAG. Instead, `ray_workers_use_nsight` is enabled and vLLM's default nsight config is monkey-patched to use `capture-range=cudaProfilerApi` (deferred capture). This means the internal TP workers run under nsys with near-zero overhead until `start_gpu_profiling()` triggers `cudaProfilerStart()` on each worker via `collective_rpc`. The `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` files are the nsight profiles from the internal TP workers. (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
 
 3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node. Ensure you check both `ls /tmp/ray/session_[0-9]*/logs/nsight` and `ls /tmp/ray/session_latest/logs/nsight` for the profiles, since the "latest" pointer may be stale.
 

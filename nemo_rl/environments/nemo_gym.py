@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
@@ -36,6 +38,30 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
+def get_nemo_gym_uv_cache_dir() -> str | None:
+    """Return the uv cache directory inside a container, or None outside one.
+
+    Inside a container (NRL_CONTAINER=1), returns the uv cache location so Gym
+    stores its caches in the expected shared path. Returns None outside a
+    container, meaning the caller should omit this arg and let Gym create the
+    cache locally (the default when you may not be able to write to /opt).
+    """
+    if not os.environ.get("NRL_CONTAINER"):
+        return None
+    return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
+
+
+def get_nemo_gym_venv_dir() -> str | None:
+    """Return the NeMo Gym venv directory from NEMO_GYM_VENV_DIR, or None.
+
+    Returns the value of NEMO_GYM_VENV_DIR if set, otherwise None. When None
+    the caller should omit this arg and let Gym create venvs locally (the
+    default when a container is not used since you may not be able to write
+    to /opt).
+    """
+    return os.environ.get("NEMO_GYM_VENV_DIR")
+
+
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
@@ -51,6 +77,9 @@ class NemoGymConfig(TypedDict):
     thinking_tags: NotRequired[
         List[str] | None
     ]  # Thinking tags to check for malformed usage
+    require_routed_experts: NotRequired[
+        bool
+    ]  # Require Gym output items to carry R3 routed_experts
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -120,6 +149,13 @@ class NemoGym(EnvironmentInterface):
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
 
+    def _spinup(self) -> None:
+        """Start the NeMo-Gym head server and rollout collection helper.
+
+        Deferred from __init__ so the actor can be created cheaply (and
+        scheduled onto reserved nodes) and spun up explicitly once the vLLM
+        server URLs are available, overlapping with vLLM model loading.
+        """
         self.node_ip = _get_node_ip_local()
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
@@ -133,9 +169,14 @@ class NemoGym(EnvironmentInterface):
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
         assert __file__.endswith(RELATIVE_PATH)
 
-        initial_global_config_dict = (
-            self.cfg.get("initial_global_config_dict") or dict()
+        # Make a shallow copy so that NeMo-RL-side keys we pop or add below
+        # do not mutate the caller's config dict (config.env["nemo_gym"]).
+        initial_global_config_dict = dict(
+            self.cfg.get("initial_global_config_dict") or {}
         )
+        # Strip NeMo-RL-only training knobs that must not be forwarded to the
+        # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
+        initial_global_config_dict.pop("effort_levels", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -210,9 +251,6 @@ Depending on your data shape, you may want to change these values."""
             port=self.head_server_port,
         )
         self.rch = RolloutCollectionHelper()
-
-    def health_check(self) -> bool:
-        return True
 
     async def run_rollouts(
         self,
@@ -308,15 +346,48 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
             generation_token_ids = output_item_dict.pop("generation_token_ids")
             generation_log_probs = output_item_dict.pop("generation_log_probs")
+            routed_experts_raw = output_item_dict.pop("routed_experts", None)
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
-            nemo_rl_message_log.append(
-                {
-                    "role": "user",
-                    "content": "",
-                    "token_ids": torch.tensor(new_prompt_token_ids),
-                }
-            )
+            routed_experts = None
+            if routed_experts_raw is not None:
+                routed_experts = torch.as_tensor(routed_experts_raw, dtype=torch.int32)
+                if routed_experts.dim() != 3:
+                    raise ValueError(
+                        "NeMo Gym returned routed_experts with invalid shape. "
+                        "Expected [tokens, num_moe_layers, topk], got "
+                        f"{tuple(routed_experts.shape)}."
+                    )
+                expected_tokens = len(prompt_token_ids) + len(generation_token_ids)
+                if routed_experts.shape[0] < expected_tokens:
+                    raise ValueError(
+                        "NeMo Gym returned too few routed_experts rows for a "
+                        "trainable output item: "
+                        f"routes={routed_experts.shape[0]}, expected_at_least="
+                        f"{expected_tokens}."
+                    )
+            elif self.cfg.get("require_routed_experts", False):
+                raise ValueError(
+                    "policy.router_replay.enabled=true requires NeMo Gym output "
+                    "items to include routed_experts, but the field was missing. "
+                    "Make sure the Gym repo includes routed_experts propagation "
+                    "and the NeMo-RL vLLM OpenAI-compatible server is configured "
+                    "with enable_return_routed_experts."
+                )
+
+            prompt_start = len(seen_token_ids)
+            prompt_end = len(prompt_token_ids)
+            generation_start = prompt_end
+            generation_end = prompt_end + len(generation_token_ids)
+
+            user_message = {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor(new_prompt_token_ids),
+            }
+            if routed_experts is not None:
+                user_message["routed_experts"] = routed_experts[prompt_start:prompt_end]
+            nemo_rl_message_log.append(user_message)
             # Valid tool calls go through the structured API (tool_calls field) and get
             # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
             # the call was invalid and never executed — flag it so training can penalize it.
@@ -330,16 +401,19 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 )
             )
 
-            nemo_rl_message_log.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "token_ids": torch.tensor(generation_token_ids),
-                    "generation_logprobs": torch.tensor(generation_log_probs),
-                    "is_invalid_tool_call": is_invalid_tool_call,
-                    "has_malformed_thinking": has_malformed_thinking,
-                }
-            )
+            assistant_message = {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor(generation_token_ids),
+                "generation_logprobs": torch.tensor(generation_log_probs),
+                "is_invalid_tool_call": is_invalid_tool_call,
+                "has_malformed_thinking": has_malformed_thinking,
+            }
+            if routed_experts is not None:
+                assistant_message["routed_experts"] = routed_experts[
+                    generation_start:generation_end
+                ]
+            nemo_rl_message_log.append(assistant_message)
 
             seen_token_ids.extend(new_prompt_token_ids)
             seen_token_ids.extend(generation_token_ids)

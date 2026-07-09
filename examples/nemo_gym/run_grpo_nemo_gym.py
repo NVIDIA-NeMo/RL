@@ -15,13 +15,13 @@
 import argparse
 import os
 import pprint
+import time
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
 import wandb.util
 
 wandb.util.VALUE_BYTES_LIMIT = 10_000_000
 
-import ray
 from omegaconf import OmegaConf
 from wandb import Table
 
@@ -42,10 +42,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
-    NemoGymConfig,
     setup_nemo_gym_config,
 )
-from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
@@ -53,7 +51,8 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.timer import Timer
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -119,7 +118,10 @@ def collect_trajectories(
 
 def main() -> None:
     """Main entry point."""
-    # Parse arguments
+    main_start = time.perf_counter()
+    log_container_init_timing()
+    rl_init_timer = Timer(context={"worker": "driver"})
+
     register_omegaconf_resolvers()
     args, overrides = parse_args()
 
@@ -129,16 +131,17 @@ def main() -> None:
             "grpo_workplace_assistant_nemotron_nano_v2_9b.yaml",
         )
 
-    config = load_config(args.config)
-    print(f"Loaded configuration from: {args.config}")
+    with rl_init_timer.time("config"):
+        config = load_config(args.config)
+        print(f"Loaded configuration from: {args.config}")
 
-    if overrides:
-        print(f"Overrides: {overrides}")
-        config = parse_hydra_overrides(config, overrides)
+        if overrides:
+            print(f"Overrides: {overrides}")
+            config = parse_hydra_overrides(config, overrides)
 
-    config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
-    print("Applied CLI overrides")
+        config = OmegaConf.to_container(config, resolve=True)
+        config = MasterConfig(**config)
+        print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
     config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
@@ -148,26 +151,27 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    # setup tokenizer
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
-    assert config.policy["generation"] is not None, (
-        "A generation config is required for GRPO"
-    )
-    config.policy["generation"] = configure_generation_config(
-        config.policy["generation"], tokenizer
-    )
+    with rl_init_timer.time("tokenizer"):
+        tokenizer = get_tokenizer(config.policy["tokenizer"])
+        assert config.policy["generation"] is not None, (
+            "A generation config is required for GRPO"
+        )
+        config.policy["generation"] = configure_generation_config(
+            config.policy["generation"], tokenizer
+        )
 
-    # NeMo-Gym specific config setup.
-    setup_nemo_gym_config(config, tokenizer)
+        # NeMo-Gym specific config setup.
+        setup_nemo_gym_config(config, tokenizer)
 
     # We assert here since this is right after the final config has been materialized.
     assert _should_use_nemo_gym(config)
 
     # NeMo-Gym environment needs to get dp_openai_server_base_urls from policy_generation, so we don't setup env here.
-    print("\n▶ Setting up data...")
-    train_dataset, val_dataset = setup_response_data(
-        tokenizer, config.data, env_configs=None
-    )
+    with rl_init_timer.time("data"):
+        print("\n▶ Setting up data...")
+        train_dataset, val_dataset = setup_response_data(
+            tokenizer, config.data, env_configs=None
+        )
 
     # Validation dataset config setup.
     if config.grpo["max_val_samples"] is not None:
@@ -190,44 +194,45 @@ The validation set you pass in will directly be used for validation with no addi
     print("Final config:")
     pprint.pprint(config)
 
-    init_ray()
+    with rl_init_timer.time("ray_connect"):
+        init_ray()
 
-    (
-        policy,
-        policy_generation,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
-
+    # `is_trajectory_collection` is a NeMo-RL-side control-flow knob; pop it
+    # before setup() so it is not forwarded into NeMo-Gym's global config (the
+    # gym actor is now created inside setup()).
     is_trajectory_collection = (
         config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
     )
-    # Pop NeMo-RL-side detection knobs out of the env dict so they reach NemoGymConfig
-    # as top-level fields (where the detector reads them) and are not forwarded into
-    # NeMo-Gym's own global config.
-    invalid_tool_call_patterns = config.env["nemo_gym"].pop(
-        "invalid_tool_call_patterns", None
-    )
-    thinking_tags = config.env["nemo_gym"].pop("thinking_tags", None)
-    nemo_gym_config = NemoGymConfig(
-        model_name=policy_generation.cfg["model_name"],
-        base_urls=policy_generation.dp_openai_server_base_urls,
-        invalid_tool_call_patterns=invalid_tool_call_patterns,
-        thinking_tags=thinking_tags,
-        initial_global_config_dict=config.env["nemo_gym"],
-    )
-    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
-    # Blocking wait for NeMo-Gym to spin up
-    ray.get(nemo_gym.health_check.remote())
 
-    # Bind task_to_env and val_task_to_env for nemo_gym env
-    # Hardcode here to match `run_async_nemo_gym_rollout`
+    with rl_init_timer.time("setup"):
+        (
+            policy,
+            policy_generation,
+            nemo_gym,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            teacher_worker_groups,
+            alias_to_group_alias,
+        ) = setup(config, tokenizer, train_dataset, val_dataset)
+
+    rl_init_timer.record("total", time.perf_counter() - main_start)
+    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+    print("\n" + "=" * 60)
+    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+    for label, value in sorted(rl_init_metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {label}: {value:.1f}s")
+    print("=" * 60 + "\n", flush=True)
+
+    # NeMo-Gym is spun up inside setup() (overlapped with vLLM model load).
+    # Bind task_to_env and val_task_to_env for the nemo_gym env.
+    # Hardcode here to match `run_async_nemo_gym_rollout`.
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
@@ -291,6 +296,8 @@ The validation set you pass in will directly be used for validation with no addi
             grpo_save_state=grpo_state,
             master_config=master_config,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            teacher_worker_groups=teacher_worker_groups,
+            alias_to_group_alias=alias_to_group_alias,
         )
     else:
         print("🚀 Running synchronous GRPO training")

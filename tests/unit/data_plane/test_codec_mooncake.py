@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 
-from nemo_rl.data_plane.codec import pack_per_token_field
+from nemo_rl.data_plane.codec import pack_per_token_field, to_nested_by_length
 
 from ._rollout_shapes import make_rollout_batch
 
@@ -80,8 +80,8 @@ def test_pack_per_token_field_truncates_sp_padding() -> None:
     """pack_per_token_field slices each row to its own length, dropping SP padding.
 
     mcore SP rounds the forward output's seq dim up to a multiple of TP, so
-    val.shape[1] > max(lengths). maybe_pack_jagged would skip this field
-    (wrong shape); pack_per_token_field handles it correctly.
+    val.shape[1] > max(lengths). pack_per_token_field handles this by slicing
+    each row to its real length.
     """
 
     n, max_len, sp_extra = 4, 8, 3  # val is wider by sp_extra tokens
@@ -105,31 +105,29 @@ def test_pack_per_token_field_truncates_sp_padding() -> None:
         )
 
 
-def test_pack_per_token_field_exact_fit_equals_maybe_pack_jagged() -> None:
-    """When val.shape[1] == max(lengths), pack_per_token_field and
-    maybe_pack_jagged produce identical jagged outputs.
+def test_pack_per_token_field_exact_fit_matches_to_nested_by_length() -> None:
+    """When val.shape[1] == max(lengths), pack_per_token_field matches
+    to_nested_by_length.
 
     This is the 'no SP padding' case — the two helpers must agree when
     the input is already exactly the right width.
     """
-    from nemo_rl.data_plane.codec import maybe_pack_jagged, pack_per_token_field
-
     n = 4
     lengths = torch.tensor([3, 5, 2, 4], dtype=torch.long)
     max_len = int(lengths.max().item())
     val = torch.randn(n, max_len)
 
     out_pack = pack_per_token_field(val, lengths)
-    out_maybe = maybe_pack_jagged(val, lengths)
+    out_nested = to_nested_by_length(val, lengths)
 
     assert out_pack.is_nested
-    assert out_maybe.is_nested
+    assert out_nested.is_nested
 
     rows_pack = list(out_pack.unbind())
-    rows_maybe = list(out_maybe.unbind())
-    for i, (rp, rm) in enumerate(zip(rows_pack, rows_maybe)):
-        assert torch.equal(rp, rm), (
-            f"Row {i} differs between pack_per_token_field and maybe_pack_jagged "
+    rows_nested = list(out_nested.unbind())
+    for i, (rp, rn) in enumerate(zip(rows_pack, rows_nested)):
+        assert torch.equal(rp, rn), (
+            f"Row {i} differs between pack_per_token_field and to_nested_by_length "
             "on an exact-fit input."
         )
 

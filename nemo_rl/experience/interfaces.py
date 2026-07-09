@@ -22,8 +22,8 @@ from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 class Completion:
     """A single generated completion for one prompt."""
 
-    message_log: LLMMessageLogType
-    env_extras: dict[str, Any]
+    message_log: LLMMessageLogType | VLMMessageLogType
+    env_extras: Optional[dict[str, Any]]
     truncated: bool
     reward: float
 

@@ -74,6 +74,30 @@ def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
     assert restored_devices == ["cuda"]
 
 
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = MagicMock()
+    worker.model.update_moe_gate_bias = MagicMock()
+
+    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
+
+    worker.model.update_moe_gate_bias.assert_called_once_with()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_update_moe_gate_bias_noop_when_unsupported():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    # A real module without the hook: getattr(..., None) must short-circuit so
+    # models that do not expose update_moe_gate_bias are unaffected.
+    worker.model = nn.Linear(1, 1)
+
+    # Should be a no-op and must not raise.
+    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
+
+
 def create_test_config(
     model_name: str,
     tp: int = 1,

@@ -13,12 +13,15 @@
 # limitations under the License.
 
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from nemo_rl.evals.eval import (
     eval_cons_k,
     eval_pass_k,
+    run_env_eval,
 )
 
 
@@ -33,6 +36,38 @@ def test_eval_pass_k_basic():
     expected = 2 / 3
     assert isinstance(average_score, float)
     assert average_score == pytest.approx(expected, rel=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("generation_config", "expected_use_async"),
+    [
+        ({"backend": "sglang"}, False),
+        ({"backend": "sglang", "use_async_rollouts": False}, False),
+        ({"backend": "sglang", "use_async_rollouts": True}, True),
+        ({"backend": "vllm", "vllm_cfg": {"async_engine": False}}, False),
+        ({"backend": "vllm", "vllm_cfg": {"async_engine": True}}, True),
+    ],
+)
+def test_run_env_eval_selects_backend_specific_async_path(
+    monkeypatch, generation_config, expected_use_async
+):
+    captured = {}
+
+    async def fake_run_env_eval_impl(
+        vllm_generation, dataloader, env, master_config, use_async=False
+    ):
+        captured["use_async"] = use_async
+
+    monkeypatch.setattr("nemo_rl.evals.eval._run_env_eval_impl", fake_run_env_eval_impl)
+
+    run_env_eval(
+        vllm_generation=object(),
+        dataloader=object(),
+        env=object(),
+        master_config=SimpleNamespace(generation=generation_config),
+    )
+
+    assert captured["use_async"] is expected_use_async
 
 
 def test_eval_pass_k_all_correct():

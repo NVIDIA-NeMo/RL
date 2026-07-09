@@ -768,6 +768,47 @@ class RayGpuMonitorLogger:
             self.metrics_buffer = []
 
 
+def _merge_generation_logger_workers(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Merge per-worker async-vLLM generation-logger lists into one list per metric.
+
+    ``generation_logger_metrics`` is ``{metric: {worker_id: [samples]}}``; merging
+    across workers gives a cluster-level view and avoids one curve per (worker,
+    statistic). Returns a shallow copy; the input dict is not mutated.
+    """
+    glm = metrics.get("generation_logger_metrics")
+    if not isinstance(glm, dict):
+        return metrics
+    merged: dict[str, Any] = {}
+    for metric, per_worker in glm.items():
+        if isinstance(per_worker, dict):
+            combined: list[Any] = []
+            for samples in per_worker.values():
+                combined.extend(samples if isinstance(samples, list) else [samples])
+            merged[metric] = combined
+        else:
+            merged[metric] = per_worker
+    return {**metrics, "generation_logger_metrics": merged}
+
+
+def _summarize_list(values: list[Any]) -> dict[str, float]:
+    """Reduce a list to bounded summary stats for scalar-only backends (MLflow)."""
+    nums = [
+        v
+        for v in values
+        if isinstance(v, (int, float, np.integer, np.floating))
+        and not isinstance(v, bool)
+    ]
+    if not nums:
+        return {}
+    arr = np.asarray(nums, dtype=np.float64)
+    return {
+        "mean": float(arr.mean()),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(arr.max()),
+    }
+
+
 class MLflowLogger(LoggerInterface):
     """MLflow logger backend."""
 
@@ -842,14 +883,25 @@ class MLflowLogger(LoggerInterface):
             prefix: Optional prefix for metric names
             step_metric: Optional step metric name (ignored in MLflow)
         """
+        # MLflow is scalar-only: the default flatten expands lists into one key
+        # per index, which explodes the metric-key space for per-event lists
+        # (async vLLM generation metrics, per-sample histograms). Merge the
+        # per-worker generation-logger lists, then summarize each list into a few
+        # bounded stats logged at the real training step. Keys use "/" so the
+        # MLflow UI nests them into collapsible groups instead of a flat wall.
+        metrics = _merge_generation_logger_workers(metrics)
         metrics_to_log = {}
-        flattened_metrics = flatten_dict(metrics)
-        for name, value in flattened_metrics.items():
+        for name, value in flatten_dict(metrics, sep="/", expand_lists=False).items():
             if prefix:
                 name = f"{prefix}/{name}"
-            metrics_to_log[name] = value
+            if isinstance(value, list):
+                for suffix, stat in _summarize_list(value).items():
+                    metrics_to_log[f"{name}/{suffix}"] = stat
+            else:
+                metrics_to_log[name] = value
 
-        mlflow.log_metrics(metrics_to_log, step=step, run_id=self.run_id)
+        if metrics_to_log:
+            mlflow.log_metrics(metrics_to_log, step=step, run_id=self.run_id)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to MLflow.
@@ -1239,7 +1291,9 @@ class Logger(LoggerInterface):
             self.gpu_monitor.stop()
 
 
-def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
+def flatten_dict(
+    d: Mapping[str, Any], sep: str = ".", expand_lists: bool = True
+) -> dict[str, Any]:
     """Flatten a nested dictionary.
 
     Handles nested dictionaries and lists by creating keys with separators.
@@ -1248,6 +1302,8 @@ def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
     Args:
         d: Dictionary to flatten
         sep: Separator to use between nested keys
+        expand_lists: If True (default), expand list values into one key per
+            index. If False, keep each list intact under its stable key.
 
     Returns:
         Flattened dictionary with compound keys
@@ -1273,7 +1329,7 @@ def flatten_dict(d: Mapping[str, Any], sep: str = ".") -> dict[str, Any]:
 
             if isinstance(value, dict):
                 _flatten(value, new_key)
-            elif isinstance(value, list):
+            elif isinstance(value, list) and expand_lists:
                 for i, item in enumerate(value):
                     list_key = f"{new_key}{sep}{i}"
                     if isinstance(item, dict):
@@ -1560,3 +1616,43 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
     os.makedirs(new_log_dir, exist_ok=True)
 
     return new_log_dir
+
+
+def log_container_init_timing() -> None:
+    """Log pre-Python container timing from environment variables.
+
+    Reads epoch timestamps set by the launch script (ray.sub) and prints
+    the Container Init breakdown.  Missing variables are silently skipped
+    so this is safe to call in any environment.
+    """
+    now = time.time()
+    slurm_start = os.environ.get("SLURM_JOB_START_TIME")
+    job_start = os.environ.get("NRL_JOB_START_EPOCH")
+    ray_ready = os.environ.get("NRL_RAY_READY_EPOCH")
+
+    if not job_start:
+        logging.warning(
+            "Cannot detect container startup time: NRL_JOB_START_EPOCH not set. "
+            "Ensure the launch script exports this variable for init timing."
+        )
+        return
+
+    job_start_f = float(job_start)
+    total = now - job_start_f
+
+    print("\n" + "=" * 60)
+    print(" " * 14 + "CONTAINER INIT TIMING")
+
+    if slurm_start:
+        prologue = job_start_f - float(slurm_start)
+        print(f"  slurm_prologue: {prologue:.1f}s")
+        total = now - float(slurm_start)
+
+    if ray_ready:
+        ray_ready_f = float(ray_ready)
+        cluster = ray_ready_f - job_start_f
+        driver_startup = now - ray_ready_f
+        print(f"  cluster_startup (orchestrator+container+ray): {cluster:.1f}s")
+        print(f"  driver_startup (launch+python+imports): {driver_startup:.1f}s")
+    print(f"  total: {total:.1f}s")
+    print("=" * 60 + "\n", flush=True)

@@ -288,19 +288,21 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         env: Environment that scores responses.
         master_config: Configuration settings.
     """
-    # Check if async engine is enabled and run appropriate version
-    if master_config.generation["vllm_cfg"]["async_engine"]:
-        asyncio.run(
-            _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=True
-            )
+    generation_config = master_config.generation
+    backend = generation_config.get("backend", "")
+    if backend == "sglang":
+        use_async = bool(generation_config.get("use_async_rollouts", False))
+    elif backend == "vllm":
+        use_async = bool(
+            generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
     else:
-        asyncio.run(
-            _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=False
-            )
+        use_async = False
+    asyncio.run(
+        _run_env_eval_impl(
+            vllm_generation, dataloader, env, master_config, use_async=use_async
         )
+    )
 
 
 async def _run_env_eval_impl(
@@ -342,6 +344,11 @@ async def _run_env_eval_impl(
                 if images is not None and len(images[i]) > 0:
                     multi_modal_data["image"] = (
                         images[i][0] if len(images[i]) == 1 else images[i]
+                    )
+                videos = batch.get("vllm_videos", None)
+                if videos is not None and len(videos[i]) > 0:
+                    multi_modal_data["video"] = (
+                        videos[i][0] if len(videos[i]) == 1 else videos[i]
                     )
                 if multi_modal_data:
                     prompt_dict["multi_modal_data"] = multi_modal_data

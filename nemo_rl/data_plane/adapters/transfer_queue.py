@@ -459,15 +459,27 @@ class TQDataPlaneClient(DataPlaneClient):
         # ProcessRequestThread (no try/except around the while-loop).
         # Registering everything from a single driver thread before any
         # client request races with a put removes the trigger entirely.
+        #
+        # Use a unique KV key instead of ``client.put``'s default row id
+        # (``0@field`` at the Mooncake storage layer). Mooncake does not
+        # support upsert, so repeated schema warmups can collide with
+        # stale metadata from a previous registration.
         if not fields:
             return
-        client = tq.get_client()
+        schema_key = (
+            f"__schema__:{partition_id}:{os.getpid()}:{id(self)}:{time.time_ns()}"
+        )
         dummy_td = TensorDict(
             {f: torch.zeros(1) for f in fields},
             batch_size=[1],
         )
-        meta = client.put(data=dummy_td, partition_id=partition_id)
-        client.clear_samples(metadata=meta)
+        tq.kv_batch_put(
+            keys=[schema_key],
+            partition_id=partition_id,
+            fields=dummy_td,
+            tags=[{}],
+        )
+        tq.kv_clear(keys=[schema_key], partition_id=partition_id)
 
     def claim_meta(
         self,

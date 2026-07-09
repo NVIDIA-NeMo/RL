@@ -264,7 +264,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
-          version: "0.9.1"
+          version: "0.11.18"
           enable-cache: true
           prune-cache: false
       # Faster than uv python install since it caches python alongside runner
@@ -296,7 +296,9 @@ jobs:
     name: Wait in test approval queue
     needs: [pre-flight, lint-check]
     runs-on: ubuntu-latest
-    environment: test
+    environment:
+      name: test
+      deployment: false
     if: >-
       ${{
         always() &&
@@ -697,6 +699,8 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Megatron_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Megatron_4
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SGLang
@@ -710,6 +714,8 @@ jobs:
           - script: L1_Functional_Tests_GRPO_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SFT
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_PPO
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
@@ -762,6 +768,8 @@ jobs:
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Megatron_3
             runner: ${{ vars.GB200_RUNNER }}
+          - script: L1_Functional_Tests_Megatron_4
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_SGLang
@@ -776,11 +784,15 @@ jobs:
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_SFT
             runner: ${{ vars.GB200_RUNNER }}
+          - script: L1_Functional_Tests_PPO
+            runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Other_1
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Other_2
+            runner: ${{ vars.GB200_RUNNER }}
+          - script: L1_Functional_Tests_GB200_MXFP8
             runner: ${{ vars.GB200_RUNNER }}
     needs: [pre-flight, build-container-gb200, cicd-unit-tests, functional-test-script-check, org-member-pre-flight, gb200-config, cicd-wait-in-queue]
     runs-on: ${{ matrix.runner }}
@@ -828,7 +840,11 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Megatron_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_Megatron_4
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_AutoModel
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_SGLang
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
@@ -839,6 +855,8 @@ jobs:
           - script: L1_Functional_Tests_GRPO_3
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SFT
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_PPO
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
@@ -977,7 +995,9 @@ jobs:
     name: Notify nightly test failure
     runs-on: ubuntu-latest
     needs: [CI_QA_Gate]
-    environment: main
+    environment:
+      name: main
+      deployment: false
     if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
     steps:
       - name: Send Slack notification

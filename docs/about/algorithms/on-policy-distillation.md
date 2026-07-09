@@ -22,6 +22,35 @@ uv run python examples/run_distillation.py \
   cluster.gpus_per_node=8
 ```
 
+### On-policy Distillation with NeMo Gym
+
+On-policy distillation can use NeMo Gym for multi-step or multi-turn rollout collection. In this mode, NeMo RL exposes the student vLLM generation worker as an OpenAI-compatible HTTP server, NeMo Gym runs the environment interaction, and the resulting student samples are used for teacher-logit distillation.
+
+Use the NeMo Gym distillation entrypoint with the example config. The checked-in config uses placeholder dataset paths, so override them for your local data:
+
+```sh
+uv run python examples/nemo_gym/run_distillation_nemo_gym.py \
+  --config examples/nemo_gym/distillation_qwen3_0_6b.yaml \
+  data.train.data_path=/path/to/train.jsonl \
+  data.validation.data_path=/path/to/validation.jsonl
+```
+
+The config must enable the vLLM async HTTP server and NeMo Gym:
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+
+env:
+  should_use_nemo_gym: true
+```
+
+NeMo Gym controls the rollout turn count from its environment and agent configuration. The standard distillation `distillation.max_rollout_turns` setting is not used by the NeMo Gym rollout path.
+
 ## On-policy Distillation Multi-node
 
 ```sh

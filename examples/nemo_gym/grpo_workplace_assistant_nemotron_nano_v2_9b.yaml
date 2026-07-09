@@ -128,6 +128,7 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     optimizer:
       optimizer: "adam"
@@ -286,7 +287,8 @@ data:
 
 env:
   should_use_nemo_gym: true
-  should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
+  # true: skip expensive train_data_step*.jsonl; false: write jsonl (heavy). Prefer true if disk is tight.
+  should_log_nemo_gym_responses: true
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
     # Port range for Gym HTTP servers, kept below the OS ephemeral range
     # (32768-60999) and non-overlapping with NeMo RL (11001-15000) or
