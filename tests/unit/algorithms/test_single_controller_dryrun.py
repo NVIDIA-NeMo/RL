@@ -267,7 +267,7 @@ class _TrainerStateRecorder:
         self._microbatch_calls: list[tuple[str, list[str], float]] = []
         self._finish_calls: list[str] = []
         self._abort_calls: list[str] = []
-        self._prepare_logprobs_calls: list[tuple[list[str], bool, bool]] = []
+        self._logprob_refresh_calls: list[tuple[str, list[str]]] = []
         self._last_advantages: torch.Tensor | None = None
 
     def begin(self) -> None:
@@ -302,15 +302,8 @@ class _TrainerStateRecorder:
             self._abort_calls.append(self._open_step_id)
         self._open_step_id = None
 
-    def prepare_logprobs(
-        self,
-        sample_ids: list[str],
-        refresh_policy_logprobs: bool,
-        refresh_reference_logprobs: bool,
-    ) -> None:
-        self._prepare_logprobs_calls.append(
-            (list(sample_ids), refresh_policy_logprobs, refresh_reference_logprobs)
-        )
+    def logprob_refresh(self, kind: str, sample_ids: list[str]) -> None:
+        self._logprob_refresh_calls.append((kind, list(sample_ids)))
 
     def append_advantages(self, advantages: torch.Tensor) -> None:
         if self._last_advantages is None:
@@ -338,8 +331,8 @@ class _TrainerStateRecorder:
     def get_abort_calls(self) -> list[str]:
         return list(self._abort_calls)
 
-    def get_prepare_logprobs_calls(self) -> list[tuple[list[str], bool, bool]]:
-        return list(self._prepare_logprobs_calls)
+    def get_logprob_refresh_calls(self) -> list[tuple[str, list[str]]]:
+        return list(self._logprob_refresh_calls)
 
     def get_last_advantages(self) -> torch.Tensor | None:
         return self._last_advantages
@@ -404,20 +397,23 @@ class DryRunTrainer:
     def abort_train_step(self) -> None:
         ray.get(self._rec.abort.remote())
 
-    def prepare_logprobs_from_meta(
+    def get_logprobs_from_meta(
         self,
         meta: KVBatchMeta,
-        *,
-        refresh_policy_logprobs: bool = False,
-        refresh_reference_logprobs: bool = False,
+        micro_batch_size: int | None = None,
+        timer: Any = None,
     ) -> None:
-        ray.get(
-            self._rec.prepare_logprobs.remote(
-                list(meta.sample_ids),
-                refresh_policy_logprobs,
-                refresh_reference_logprobs,
-            )
-        )
+        del micro_batch_size, timer
+        ray.get(self._rec.logprob_refresh.remote("policy", list(meta.sample_ids)))
+
+    def get_reference_policy_logprobs_from_meta(
+        self,
+        meta: KVBatchMeta,
+        micro_batch_size: int | None = None,
+        timer: Any = None,
+    ) -> None:
+        del micro_batch_size, timer
+        ray.get(self._rec.logprob_refresh.remote("reference", list(meta.sample_ids)))
 
     # ── test-side inspection (reads the shared recorder) ────────────────
 
@@ -439,8 +435,8 @@ class DryRunTrainer:
     def get_abort_calls(self) -> list[str]:
         return ray.get(self._rec.get_abort_calls.remote())
 
-    def get_prepare_logprobs_calls(self) -> list[tuple[list[str], bool, bool]]:
-        return ray.get(self._rec.get_prepare_logprobs_calls.remote())
+    def get_logprob_refresh_calls(self) -> list[tuple[str, list[str]]]:
+        return ray.get(self._rec.get_logprob_refresh_calls.remote())
 
     def get_last_advantages(self) -> torch.Tensor | None:
         return ray.get(self._rec.get_last_advantages.remote())
@@ -568,15 +564,15 @@ class TestSingleControllerDryRun:
             advantage_estimator,
         )
 
-    def test_prepare_logprobs_called_before_advantage_stage(self, ray_init):
-        """SC fires prepare_logprobs_from_meta with config-driven flags.
+    def test_logprob_refresh_called_before_advantage_stage(self, ray_init):
+        """SC drives the logprob getters directly, gated by config.
 
         When ``advantage_policy_logprobs_field`` / ``advantage_reference_logprobs_field``
         are set on the config, the train_pump must call
-        ``trainer.prepare_logprobs_from_meta(meta, refresh_policy_logprobs=...,
-        refresh_reference_logprobs=...)`` exactly once per consumed group,
-        before advantage estimation. With both fields None, the hook must
-        not fire at all.
+        ``trainer.get_logprobs_from_meta`` / ``get_reference_policy_logprobs_from_meta``
+        exactly once per consumed group, before advantage estimation — SC
+        owns the which-columns decision (yuki, #2700 review). With both
+        fields None, neither getter fires.
         """
         # Case 1: both flags set
         dp_client = FakeDataPlaneActor.remote()
@@ -595,12 +591,13 @@ class TestSingleControllerDryRun:
             advantage_reference_logprobs_field="reference_logprobs",
         )
         ray.get(ctrl.run.remote(), timeout=30)
-        calls = trainer.get_prepare_logprobs_calls()
-        assert len(calls) == 2, f"expected 2 logprob refresh calls, got {calls}"
-        for sample_ids, refresh_policy, refresh_ref in calls:
-            assert refresh_policy is True
-            assert refresh_ref is True
-            assert len(sample_ids) > 0
+        calls = trainer.get_logprob_refresh_calls()
+        policy_calls = [ids for kind, ids in calls if kind == "policy"]
+        ref_calls = [ids for kind, ids in calls if kind == "reference"]
+        # one refresh of each kind per consumed group (2 groups)
+        assert len(policy_calls) == 2, f"got {calls}"
+        assert len(ref_calls) == 2, f"got {calls}"
+        assert all(len(ids) > 0 for ids in policy_calls + ref_calls)
 
         # Case 2: only policy field set
         dp_client2 = FakeDataPlaneActor.remote()
@@ -617,13 +614,11 @@ class TestSingleControllerDryRun:
             advantage_policy_logprobs_field="policy_logprobs",
         )
         ray.get(ctrl2.run.remote(), timeout=30)
-        calls2 = trainer2.get_prepare_logprobs_calls()
-        assert len(calls2) == 2
-        for _, refresh_policy, refresh_ref in calls2:
-            assert refresh_policy is True
-            assert refresh_ref is False
+        calls2 = trainer2.get_logprob_refresh_calls()
+        assert len([1 for kind, _ in calls2 if kind == "policy"]) == 2
+        assert not any(kind == "reference" for kind, _ in calls2)
 
-        # Case 3: neither field set → hook must not fire
+        # Case 3: neither field set → neither getter fires
         dp_client3 = FakeDataPlaneActor.remote()
         gen3 = DryRunGenWorker.remote(gen_latency_s=0.01)
         trainer3 = DryRunTrainer(dp_client3, train_latency_s=0.01)
@@ -637,14 +632,14 @@ class TestSingleControllerDryRun:
             group_size=1,
         )
         ray.get(ctrl3.run.remote(), timeout=30)
-        calls3 = trainer3.get_prepare_logprobs_calls()
+        calls3 = trainer3.get_logprob_refresh_calls()
         assert calls3 == [], (
-            "prepare_logprobs_from_meta must not be called when both "
+            "no logprob getter may be called when both "
             f"advantage_*_logprobs_field are None; got {calls3}"
         )
 
     def test_loss_driven_logprob_refresh_without_advantage_fields(self, ray_init):
-        """Loss flags alone must trigger prepare_logprobs_from_meta.
+        """Loss flags alone must trigger the logprob getters.
 
         The loss can consume prev/reference logprob columns even when the
         advantage estimator does not (sync GRPO refreshes reference
@@ -668,12 +663,9 @@ class TestSingleControllerDryRun:
             refresh_reference_logprobs_for_loss=True,
         )
         ray.get(ctrl.run.remote(), timeout=30)
-        calls = trainer.get_prepare_logprobs_calls()
-        assert len(calls) == 2, f"expected 2 logprob refresh calls, got {calls}"
-        for sample_ids, refresh_policy, refresh_ref in calls:
-            assert refresh_policy is True
-            assert refresh_ref is True
-            assert len(sample_ids) > 0
+        calls = trainer.get_logprob_refresh_calls()
+        assert len([1 for kind, _ in calls if kind == "policy"]) == 2, f"got {calls}"
+        assert len([1 for kind, _ in calls if kind == "reference"]) == 2, f"got {calls}"
 
         # Case 2: reference-only loss flag (KL penalty without IS correction)
         dp_client2 = FakeDataPlaneActor.remote()
@@ -690,11 +682,9 @@ class TestSingleControllerDryRun:
             refresh_reference_logprobs_for_loss=True,
         )
         ray.get(ctrl2.run.remote(), timeout=30)
-        calls2 = trainer2.get_prepare_logprobs_calls()
-        assert len(calls2) == 2
-        for _, refresh_policy, refresh_ref in calls2:
-            assert refresh_policy is False
-            assert refresh_ref is True
+        calls2 = trainer2.get_logprob_refresh_calls()
+        assert not any(kind == "policy" for kind, _ in calls2)
+        assert len([1 for kind, _ in calls2 if kind == "reference"]) == 2
 
     def test_advantage_stage_writes_advantages_before_train(self, ray_init):
         """SC computes advantages from DataPlane inputs and writes them back."""

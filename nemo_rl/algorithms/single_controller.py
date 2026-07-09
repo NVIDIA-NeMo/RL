@@ -493,7 +493,8 @@ class SingleControllerActor:
 
         Per step:
           - Lazy ``begin_train_step`` on first ready group.
-          - Per ready group: optional ``prepare_logprobs_from_meta`` →
+          - Per ready group: optional logprob refresh
+            (``get_logprobs_from_meta`` / ``get_reference_policy_logprobs_from_meta``) →
             ``_advantage_stage`` → ``train_microbatches_from_meta``.
           - End-of-step: ``finish_train_step`` →
             single ``clear_samples`` → ``_sync_weights``.
@@ -540,132 +541,118 @@ class SingleControllerActor:
                 step_open = False
                 step_min_weight_version: int | None = None
 
-                # Per-cycle error path: a mid-cycle worker failure
-                # (microbatch OOM, NaN-guard trip, prepare_logprobs failure,
-                # begin/finish failure) calls abort_train_step on the worker
-                # to drop partial state, clears the consumed-ids ledger,
-                # then re-raises. TODO(sc): retry policy is a follow-up.
-                try:
-                    while groups_dispatched < groups_per_minibatch:
-                        await asyncio.sleep(0)
-                        await self._claim_available_meta()
-                        evicted_meta = await self._evict_stale_claimed()
-                        if evicted_meta is not None:
-                            evicted_groups = count_groups(
-                                evicted_meta,
-                                group_size=self._cfg.group_size,
-                            )
-                            for _ in range(evicted_groups):
-                                self._buffer_capacity.release()
+                # No SC-side error handling here (yuki, #2700 review):
+                # a mid-cycle worker failure propagates out of run() —
+                # the worker restores its own hooks on failure (see
+                # megatron_policy_worker), and abort_train_step + a retry
+                # policy return with fault-tolerance support.
+                while groups_dispatched < groups_per_minibatch:
+                    await asyncio.sleep(0)
+                    await self._claim_available_meta()
+                    evicted_meta = await self._evict_stale_claimed()
+                    if evicted_meta is not None:
+                        evicted_groups = count_groups(
+                            evicted_meta,
+                            group_size=self._cfg.group_size,
+                        )
+                        for _ in range(evicted_groups):
+                            self._buffer_capacity.release()
 
-                        group_indices = None
-                        if (
-                            self._claimed_meta is not None
-                            and self._claimed_meta.size > 0
-                        ):
-                            group_indices = self._sampler.select_one_group(
-                                self._claimed_meta,
-                                trainer_version=self._trainer_version,
-                                group_size=self._cfg.group_size,
-                            )
+                    group_indices = None
+                    if self._claimed_meta is not None and self._claimed_meta.size > 0:
+                        group_indices = self._sampler.select_one_group(
+                            self._claimed_meta,
+                            trainer_version=self._trainer_version,
+                            group_size=self._cfg.group_size,
+                        )
 
-                        if group_indices is None:
-                            if self._rollout_done:
-                                # No group is selectable and no more samples
-                                # will arrive: flush groups that can never
-                                # complete so the emptiness check fires
-                                # instead of spinning forever.
-                                await self._flush_incomplete_groups()
-                                if (
-                                    self._claimed_meta is None
-                                    or self._claimed_meta.size == 0
-                                ):
-                                    rollout_exhausted = True
-                                    break
-                            await asyncio.sleep(0.005)
-                            continue
+                    if group_indices is None:
+                        if self._rollout_done:
+                            # No group is selectable and no more samples
+                            # will arrive: flush groups that can never
+                            # complete so the emptiness check fires
+                            # instead of spinning forever.
+                            await self._flush_incomplete_groups()
+                            if (
+                                self._claimed_meta is None
+                                or self._claimed_meta.size == 0
+                            ):
+                                rollout_exhausted = True
+                                break
+                        await asyncio.sleep(0.005)
+                        continue
 
-                        group_meta = self._claimed_meta.subset(group_indices)
-                        self._claimed_meta = self._claimed_meta.drop(group_indices)
+                    group_meta = self._claimed_meta.subset(group_indices)
+                    self._claimed_meta = self._claimed_meta.drop(group_indices)
 
-                        if logprobs_required:
-                            # Trainer writes refreshed prev_lp / ref_lp back to
-                            # the TQ partition under the configured field names.
-                            # Block here: advantage estimation downstream reads them.
-                            with self._timed("prepare_logprobs"):
+                    if logprobs_required:
+                        # Trainer writes refreshed prev_lp / ref_lp back to
+                        # the TQ partition under the configured field names.
+                        # SC decides which columns to refresh and calls the
+                        # getters directly (yuki, #2700 review — no dispatcher
+                        # indirection). Block here: advantage estimation
+                        # downstream reads them.
+                        with self._timed("prepare_logprobs"):
+                            if refresh_policy_logprobs:
                                 await asyncio.to_thread(
-                                    self._trainer.prepare_logprobs_from_meta,
+                                    self._trainer.get_logprobs_from_meta,
                                     group_meta,
-                                    refresh_policy_logprobs=refresh_policy_logprobs,
-                                    refresh_reference_logprobs=refresh_reference_logprobs,
+                                )
+                            if refresh_reference_logprobs:
+                                await asyncio.to_thread(
+                                    self._trainer.get_reference_policy_logprobs_from_meta,
+                                    group_meta,
                                 )
 
-                        # Advantage stage — inline in the train pump, not a
-                        # standalone pump task.
-                        with self._timed("advantage_stage"):
-                            group_meta = await self._advantage_stage(group_meta)
-
-                        if not step_open:
-                            # gbs/mbs default to worker-side cfg when None; SC
-                            # owns only loss_fn (stable across the whole run).
-                            await asyncio.to_thread(
-                                self._trainer.begin_train_step,
-                                self._loss_fn,
-                            )
-                            step_open = True
-
-                        await asyncio.to_thread(
-                            self._trainer.train_microbatches_from_meta,
-                            group_meta,
-                        )
-                        groups_dispatched += 1
-                        self._buffer_capacity.release()
-                        self._step_consumed_sample_ids.extend(group_meta.sample_ids)
-                        group_min_v = min_weight_version(group_meta)
-                        if group_min_v is not None:
-                            step_min_weight_version = (
-                                group_min_v
-                                if step_min_weight_version is None
-                                else min(step_min_weight_version, group_min_v)
-                            )
+                    # Advantage stage — inline in the train pump, not a
+                    # standalone pump task.
+                    with self._timed("advantage_stage"):
+                        group_meta = await self._advantage_stage(group_meta)
 
                     if not step_open:
-                        # No groups consumed this mini-batch — either rollouts
-                        # exhausted before any group arrived, or the outer
-                        # loop broke without dispatching. Skip finish/cleanup.
-                        log.info(
-                            "train_pump: rollout exhausted at mb %d "
-                            "(no groups for this opt.step)",
-                            mb_idx,
+                        # gbs/mbs default to worker-side cfg when None; SC
+                        # owns only loss_fn (stable across the whole run).
+                        await asyncio.to_thread(
+                            self._trainer.begin_train_step,
+                            self._loss_fn,
                         )
-                        break
+                        step_open = True
 
-                    # finish_train_step returns step metrics. trainer_version
-                    # is driver-owned (workers don't emit it) and bumps after
-                    # this call succeeds. The new value propagates to rollouts
-                    # via _sync_weights at end of the outer step. Capture
-                    # train_results for the logger emit below.
-                    with self._timed("policy_training"):
-                        train_results = await asyncio.to_thread(
-                            self._trainer.finish_train_step
+                    await asyncio.to_thread(
+                        self._trainer.train_microbatches_from_meta,
+                        group_meta,
+                    )
+                    groups_dispatched += 1
+                    self._buffer_capacity.release()
+                    self._step_consumed_sample_ids.extend(group_meta.sample_ids)
+                    group_min_v = min_weight_version(group_meta)
+                    if group_min_v is not None:
+                        step_min_weight_version = (
+                            group_min_v
+                            if step_min_weight_version is None
+                            else min(step_min_weight_version, group_min_v)
                         )
-                except Exception:
-                    # Worker may be left with a half-open step (train_microbatch
-                    # partially mutated _train_step_state, or begin/finish
-                    # itself raised). Best-effort: tell the worker to drop
-                    # state so the next attempt can begin cleanly. Swallow
-                    # abort errors so the original exception still surfaces.
-                    if step_open:
-                        try:
-                            await asyncio.to_thread(self._trainer.abort_train_step)
-                        except Exception:
-                            log.exception(
-                                "abort_train_step failed during error recovery "
-                                "(step=%s)",
-                                step_id,
-                            )
-                    self._step_consumed_sample_ids = []
-                    raise
+
+                if not step_open:
+                    # No groups consumed this mini-batch — either rollouts
+                    # exhausted before any group arrived, or the outer
+                    # loop broke without dispatching. Skip finish/cleanup.
+                    log.info(
+                        "train_pump: rollout exhausted at mb %d "
+                        "(no groups for this opt.step)",
+                        mb_idx,
+                    )
+                    break
+
+                # finish_train_step returns step metrics. trainer_version
+                # is driver-owned (workers don't emit it) and bumps after
+                # this call succeeds. The new value propagates to rollouts
+                # via _sync_weights at end of the outer step. Capture
+                # train_results for the logger emit below.
+                with self._timed("policy_training"):
+                    train_results = await asyncio.to_thread(
+                        self._trainer.finish_train_step
+                    )
 
                 # finish_train_step succeeded → opt.step ran on the worker,
                 # model weights are advanced. Bump the version immediately so
