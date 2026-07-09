@@ -93,8 +93,18 @@ RUN GITHUB_ARTIFACTORY=github.com \
 ARG UV_VERSION=0.11.18
 ARG PYTHON_VERSION=3.13.13
 ENV PATH="/root/.local/bin:$PATH"
+# `uv python install` (run as root) lands under /root/.local/share/uv/python with
+# perms that are not necessarily executable/traversable by non-root users. Since
+# this Python is what /opt/nemo_rl_venv's bin/python3 ultimately symlinks to,
+# any downstream process running as a non-root user (e.g. a Ray cluster launched
+# as a regular user) hits `exec: python3: Permission denied` even though `ls`/
+# `which` report the symlink chain as present. Open up read+execute for all
+# users on the whole uv-managed Python tree so it's usable regardless of the
+# runtime container user.
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
-    uv python install ${PYTHON_VERSION}
+    uv python install ${PYTHON_VERSION} && \
+    chmod -R a+rX /root/.local/share/uv/python
+
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
@@ -260,6 +270,53 @@ ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_P
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+
+# Pre-build the megatron-core `helpers_cpp` C++ extension.
+# megatron-core is an editable install and this extension is optional, so `uv sync`
+# never builds the .so. At runtime Megatron-Bridge's initialize_megatron always
+# invokes `make -C .../datasets`; without a pre-built .so every worker recompiles
+# in its own Ray venv -- and if that compile ever fails/desyncs it surfaces as an
+# opaque `torch.distributed.barrier()` NCCL timeout in initialize_megatron.
+#
+# This must run *after* the `COPY --from=nemo-rl ... /opt/nemo-rl` above, because
+# that copy re-materializes the source tree (from a fresh clone that has no .so)
+# and would clobber anything built earlier in the hermetic stage.
+#
+# The datasets `Makefile` hard-codes the interpreter as `python3` (via
+# `python3 -m pybind11 --includes` and `python3-config --extension-suffix`). The
+# uv-managed CPython 3.13 that owns this venv (a) is not necessarily first on
+# PATH -- the Ubuntu base image ships its own /usr/bin/python3 (3.12) -- and
+# (b) exposes no `python3-config` inside the venv's own bin/ (the script only
+# lives in the uv python-build-standalone install dir). Either mismatch makes
+# `make` emit a binary with the wrong (or empty) ABI suffix that Python can
+# never import.
+#
+# Fix it at the root:
+#   1. Symlink the venv's `python3-config` to the real script in the uv python
+#      install (absolute path, arch-derived so both x86_64 and aarch64 work).
+#   2. Put the venv first on PATH so the Makefile's bare `python3`/`python3-config`
+#      resolve to the 3.13 interpreter, producing the correctly ABI-suffixed
+#      `helpers_cpp.cpython-313-<arch>-linux-gnu.so`.
+#   3. Verify via `uv run` (not a bare `python3`), because megatron-core is an
+#      editable install that is only importable through the project environment.
+# /opt/nemo_rl_venv/bin is already first on PATH via the ENV set earlier in the
+# `hermetic` stage (line ~202: `ENV PATH="/opt/nemo_rl_venv/bin:$PATH"`), which
+# this `release` stage inherits. So `make` below already resolves `python3`/
+# `python3-config` to the venv's symlinked 3.13 interpreter without needing to
+# re-set PATH inline.
+RUN /opt/nemo_rl_venv/bin/python3 -m pip install pybind11 && \
+    UV_PY_ARCH="$(uname -m)" && \
+    ln -sf "/root/.local/share/uv/python/cpython-${PYTHON_VERSION}-linux-${UV_PY_ARCH}-gnu/bin/python3-config" \
+        /opt/nemo_rl_venv/bin/python3-config && \
+    cd /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron/core/datasets && \
+    rm -f helpers_cpp*.so && \
+    make && \
+    cd /opt/nemo-rl && \
+    UV_LINK_MODE=symlink uv run --extra mcore python -c "import megatron.core.datasets.helpers_cpp"
+
+
+
+
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
