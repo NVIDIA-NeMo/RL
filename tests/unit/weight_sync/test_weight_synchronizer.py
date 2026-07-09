@@ -239,6 +239,40 @@ class TestIPCWeightSynchronizer:
 
 
 class TestVllmRemoteSparseWeightSynchronizer:
+    def test_init_communicator_requires_receiver_endpoints(self):
+        policy = MagicMock()
+        generation = MagicMock()
+        generation.report_refit_server_base_urls.return_value = []
+        sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport="s3")
+
+        with pytest.raises(ValueError, match="endpoints are missing"):
+            sync.init_communicator()
+
+    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
+    def test_shutdown_cancels_pending_work_and_stops_zmq(self, mock_ray):
+        policy = MagicMock()
+        generation = MagicMock()
+        sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport="zmq")
+        init_ref, commit_ref = MagicMock(), MagicMock()
+        sync._baseline_init_refs = [init_ref]
+        sync._baseline_commit_refs = [commit_ref]
+        sync._refit_urls = ["http://receiver"]
+        sync._targets = ["tcp://relay"]
+        sync._stale = False
+
+        sync.mark_stale()
+        sync.shutdown()
+
+        assert mock_ray.cancel.call_count == 2
+        mock_ray.cancel.assert_any_call(init_ref, force=False)
+        mock_ray.cancel.assert_any_call(commit_ref, force=False)
+        generation.stop_zmq_sparse_refit_relays.assert_called_once_with()
+        assert sync.is_stale
+        assert sync._baseline_init_refs is None
+        assert sync._baseline_commit_refs is None
+        assert sync._refit_urls == []
+        assert sync._targets == []
+
     @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
     def test_fails_before_transfer_when_kv_cache_invalidation_fails(self, _mock_ray):
         policy = MagicMock()
