@@ -1,8 +1,7 @@
 # Qwen3.5
 
 This page collects NeMo RL guidance for Qwen3.5 LLM and VLM post-training. Use it to
-choose a starting recipe, install the dependencies needed for full performance, and
-understand Qwen3.5-specific setup.
+choose a starting recipe and understand Qwen3.5-specific setup.
 
 ## When to Use This Page
 
@@ -60,7 +59,7 @@ authoritative settings.
 | Qwen3.5-9B-Base | LLM | GRPO | Megatron | 1n8g | [`grpo-qwen3.5-9b-1n8g-megatron.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | Megatron | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16tp2cp2.yaml) |
 | Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 2n8g | [`grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.yaml) |
-| Qwen3.5-35B-A3B-Base | LLM | DAPO-style GRPO | AutoModel | 4n8g | [`grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml) |
+| Qwen3.5-35B-A3B-Base | LLM | GRPO | AutoModel | 4n8g | [`grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml) |
 | Qwen3.5-397B-A17B | LLM | GRPO | Megatron | 32n8g | [`grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml`](../../../../examples/configs/recipes/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.yaml) |
 | Qwen3.5-35B-A3B-Base | VLM | GRPO | Megatron | 2n8g | [`vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml) |
 | Qwen3.5-35B-A3B-Base | VLM | GRPO | AutoModel | 2n8g | [`vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml`](../../../../examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.yaml) |
@@ -110,11 +109,11 @@ uv run examples/run_grpo.py \
   policy.generation.vllm_cfg.max_model_len=9216
 ```
 
-### DAPO-Style GRPO (Long Reasoning, Ready Out of the Box)
+### Long-Reasoning GRPO (Ready Out of the Box)
 
-The 4n8g DAPO recipe already sets `max_new_tokens: 8192` and
-`max_total_sequence_length: 9216`, and serves as a suitable starting point for long-reasoning
-runs. See the [DAPO guide](../../dapo.md) for algorithm details.
+The 4n8g `grpo-qwen3.5-35ba3b-dapo-4n8g-automodel` recipe already sets
+`max_new_tokens: 8192` and `max_total_sequence_length: 9216`, and serves as a
+suitable starting point for long-reasoning runs.
 
 ```sh
 uv run examples/run_grpo.py \
