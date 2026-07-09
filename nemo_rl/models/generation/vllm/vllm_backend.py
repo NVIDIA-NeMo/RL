@@ -92,6 +92,25 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    def bind_numa(self) -> bool:
+        """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
+
+        Invoked via ``collective_rpc`` on each vLLM TP worker once the engine
+        (and CUDA) is up, so the worker's physical GPU id is resolved from its
+        local device index (see ``resolve_visible_gpu_id``).
+        """
+        import torch
+
+        from nemo_rl.distributed.numa_utils import (
+            bind_to_gpu_numa,
+            resolve_visible_gpu_id,
+        )
+
+        gpu_id = resolve_visible_gpu_id(torch.cuda.current_device())
+        if gpu_id is None:
+            return False
+        return bind_to_gpu_numa(gpu_id)
+
     def init_collective(
         self,
         rank_prefix: int,
