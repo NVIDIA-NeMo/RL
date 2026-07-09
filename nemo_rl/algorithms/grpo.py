@@ -4180,6 +4180,15 @@ def async_grpo_train(
                 ):
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
+                    # Also DRAIN in-flight rollouts before validating: pause only
+                    # stops new launches, and the ~hundreds of in-flight train
+                    # rollouts otherwise share the engines with the val burst,
+                    # pushing val agents into their timeout (val@14 measured
+                    # 0.78% and val@5 6.6% under contention vs 25-39% train-side
+                    # solve rates in the same windows). Draining keeps the run
+                    # fully async while making every val point measure the model
+                    # on idle engines.
+                    ray.get(trajectory_collector.wait_for_pending_generations.remote())
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
