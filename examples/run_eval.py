@@ -47,18 +47,19 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer, data_config, env_configs):
+def setup_data(tokenizer, data_config, env_configs, is_multimodal=False):
     print("Setting up data...")
 
     # load dataset
     base_dataset = load_eval_dataset(data_config)
     rekeyed_ds = base_dataset.rekeyed_ds
 
-    # Determine env from config: use explicit env_name if provided,
-    # otherwise fall back to the single key in env_configs.
+    # Mirrors nemo_rl/data/utils.py: use data.env_name to look up the env
+    # config block and determine the registered environment class.
     env_key = next(iter(env_configs))
     env_name = data_config.get("env_name", env_key)
-    env = create_env(env_name=env_name, env_config=env_configs[env_key])
+    registered_env_name = "vlm" if is_multimodal else env_name
+    env = create_env(env_name=registered_env_name, env_config=env_configs[env_name])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
@@ -113,7 +114,7 @@ def main():
         dataset,
         env,
         tokenizer,
-    ) = setup_data(tokenizer, config.data, config.env)
+    ) = setup_data(tokenizer, config.data, config.env, is_multimodal=is_multimodal)
 
     # Setup
     (

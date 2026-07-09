@@ -14,7 +14,6 @@
 
 import math
 import random
-import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -32,10 +31,11 @@ from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
 
 
-def get_gdpo_reward_component_keys(batch) -> list:
-    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
-    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
-    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
+def get_gdpo_reward_component_keys(batch) -> list[str]:
+    """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
+    return sorted(
+        k for k in batch.keys() if isinstance(k, str) and k.startswith("reward/")
+    )
 
 
 def calculate_kl(
@@ -44,6 +44,7 @@ def calculate_kl(
     kl_type: str = "k3",
     input_clamp_value: float | None = 20.0,
     output_clamp_value: float | None = 10.0,
+    importance_sampling_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two logprobs.
 
@@ -57,13 +58,26 @@ def calculate_kl(
                            If None, no clamping is applied.
         output_clamp_value: Optional clamping value for kl to prevent numerical instability.
                            If None, no clamping is applied.
+        importance_sampling_weights: Optional per-token importance weights. When
+                                     provided, weights are multiplied into the KL
+                                     before output clamping. If input clamping
+                                     applies to a token, the corresponding weight
+                                     is detached so the clamp suppresses both KL
+                                     and sampling-weight gradients.
 
     Returns:
         torch.Tensor: Per-token KL penalty values (b, s)
     """
     logr = logprobs_reference - logprobs
     if input_clamp_value is not None:
-        logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        logr_clamped = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        if importance_sampling_weights is not None:
+            importance_sampling_weights = torch.where(
+                logr == logr_clamped,
+                importance_sampling_weights,
+                importance_sampling_weights.detach(),
+            )
+        logr = logr_clamped
 
     if kl_type == "k1":
         kl = -logr
@@ -77,6 +91,9 @@ def calculate_kl(
     else:
         raise ValueError(f"Invalid KL type: {kl_type}")
 
+    if importance_sampling_weights is not None:
+        kl = importance_sampling_weights * kl
+
     if output_clamp_value is not None:
         kl = kl.clamp(min=-output_clamp_value, max=output_clamp_value)
 
@@ -88,6 +105,7 @@ def calculate_baseline_and_std_per_prompt(
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
+    std_rewards: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
@@ -99,10 +117,17 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
                                   the baseline is for (from RLOO https://arxiv.org/abs/2402.14740)
+    std_rewards: tensor (b,)      Optional separate reward tensor used only for the std
+                                  calculation. Defaults to `rewards`. Useful for DAPO,
+                                  which needs std on the raw task metric for dynamic
+                                  sampling filtering while keeping baseline on the
+                                  shaped reward.
 
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
+    if std_rewards is None:
+        std_rewards = rewards
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
@@ -141,19 +166,28 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
-            prompt_baseline_square = (
+            std_prompt_baseline = (
+                prompt_baseline
+                if std_rewards is rewards
+                else torch.matmul(
+                    baseline_mask_matrix,
+                    std_rewards[prompt_idx] * valid_mask[prompt_idx],
+                )
+                / num_valid
+            )
+            std_prompt_baseline_square = (
                 torch.matmul(
                     baseline_mask_matrix,
-                    torch.pow(rewards[prompt_idx], 2) * valid_mask[prompt_idx],
+                    torch.pow(std_rewards[prompt_idx], 2) * valid_mask[prompt_idx],
                 )
                 / num_valid
             )
 
             baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = prompt_baseline_square
+            sq_baseline[prompt_idx] = std_prompt_baseline_square
             std[prompt_idx] = (
                 (
-                    (prompt_baseline_square - prompt_baseline.square())
+                    (std_prompt_baseline_square - std_prompt_baseline.square())
                     * (num_valid / (num_valid - 1))
                 )
                 .sqrt()
@@ -220,6 +254,23 @@ def mask_out_neg_inf_logprobs(
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
     return logprobs
+
+
+def masked_var(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    mean: Optional[torch.Tensor | float] = None,
+    unbiased: bool = True,
+) -> torch.Tensor:
+    if mean is None:
+        mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values.pow(2), mask)
+
+    if unbiased:
+        normalization_factor = torch.sum(mask)
+        variance = variance * (normalization_factor / (normalization_factor - 1))
+    return variance
 
 
 def set_seed(seed: int) -> None:
@@ -473,16 +524,27 @@ def print_performance_metrics(
     # =====================================================
     # Generate Token Imbalance Visualization
     # =====================================================
-    def visualize_per_worker_load(per_worker_token_counts: dict[int, int]) -> float:
+    def visualize_per_worker_load(
+        per_worker_token_counts: dict[int, int],
+    ) -> Optional[float]:
         per_worker_token_counts_list = [
             v for k, v in sorted(per_worker_token_counts.items())
         ]
+        print("  • Visualizing Token Imbalance per Generation Worker:")
+        if not per_worker_token_counts_list:
+            print("    - No per-worker generation load data available.")
+            return None
+
+        max_token_count = max(per_worker_token_counts_list)
+        if max_token_count <= 0:
+            print("    - No generated tokens recorded per worker.")
+            return None
+
         per_worker_load_ratio = [
-            v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
+            v / max_token_count for v in per_worker_token_counts_list
         ]
         max_rows_to_print = 1000
         bar_length = 20
-        print("  • Visualizing Token Imbalance per Generation Worker:")
         for i in range(min(len(per_worker_token_counts_list), max_rows_to_print)):
             print(
                 f"    - Generated Tokens from Worker {i:3.0f}:"
@@ -515,7 +577,8 @@ def print_performance_metrics(
 
         if per_worker_token_counts is not None:
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
-            performance_metrics["average_token_imbalance"] = average_token_imbalance
+            if average_token_imbalance is not None:
+                performance_metrics["average_token_imbalance"] = average_token_imbalance
 
     if "mean_total_tokens_per_sample" in metrics:
         print(
@@ -646,24 +709,26 @@ def print_performance_metrics(
     # Throughputs
     # =====================================================
 
-    policy_and_reference_logprobs_time = timing_metrics["policy_and_reference_logprobs"]
-    policy_training_time = timing_metrics["policy_training"]
+    policy_and_reference_logprobs_time = timing_metrics.get(
+        "policy_and_reference_logprobs", 0
+    )
+    policy_training_time = timing_metrics.get("policy_training", 0)
     total_time = timing_metrics["total_step_time"]
     refit_time = (
         timing_metrics["weight_sync"]
         if "weight_sync" in timing_metrics
-        else timing_metrics["prepare_for_generation/total"]
+        else timing_metrics.get("prepare_for_generation/total", 0)
     )
-    if "generation" in timing_metrics:  # Sync GRPO
+    if "generation" in timing_metrics:  # Sync
         generation_time = timing_metrics["generation"]
-    else:  # Async GRPO
+    else:  # Async
         # If the training time is greater than the generation time, we include the idle time caused by training as part of the generation time.
         # if training time > generation time, generation time = training time
         # if training time < generation time, generation time = training time + exposed generation time
         generation_time = (
-            timing_metrics["exposed_generation"]
-            + timing_metrics["policy_and_reference_logprobs"]
-            + timing_metrics["policy_training"]
+            timing_metrics.get("exposed_generation", 0)
+            + policy_and_reference_logprobs_time
+            + policy_training_time
         )
 
     num_nodes = master_config.cluster["num_nodes"]
@@ -672,11 +737,10 @@ def print_performance_metrics(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
-    grpo_config = master_config.grpo
+    grpo_config = getattr(master_config, "grpo", {})
     if (
         "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
     ) and not colocated_inference:
-        # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
@@ -696,9 +760,15 @@ def print_performance_metrics(
             training_worker_idle_time_ratio
         )
 
-    number_of_samples_per_step = (
-        grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
+    # Detect which algorithm config key is being used
+    algo_config = (
+        getattr(master_config, "grpo", None)
+        or getattr(master_config, "ppo", None)
+        or {}
     )
+    number_of_samples_per_step = algo_config.get(
+        "num_prompts_per_step", 1
+    ) * algo_config.get("num_generations_per_prompt", 1)
 
     if colocated_inference:
         training_num_gpus = total_num_gpus
@@ -716,28 +786,39 @@ def print_performance_metrics(
         )
         training_num_gpus = total_num_gpus - generation_num_gpus
 
+    total_num_tokens = metrics.get("total_num_tokens", 0)
+
     e2e_samples_per_sec_per_gpu = (
         number_of_samples_per_step / total_time / total_num_gpus
+        if total_time > 0
+        else 0
     )
 
     e2e_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / total_time / total_num_gpus
+        total_num_tokens / total_time / total_num_gpus if total_time > 0 else 0
     )
     policy_training_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / policy_training_time / training_num_gpus
+        total_num_tokens / policy_training_time / training_num_gpus
+        if policy_training_time > 0
+        else 0
     )
     policy_and_reference_logprobs_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / policy_and_reference_logprobs_time
-        / training_num_gpus
+        total_num_tokens / policy_and_reference_logprobs_time / training_num_gpus
+        if policy_and_reference_logprobs_time > 0
+        else 0
+    )
+    training_worker_group_time = (
+        policy_training_time + policy_and_reference_logprobs_time
     )
     training_worker_group_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / (policy_training_time + policy_and_reference_logprobs_time)
-        / training_num_gpus
+        total_num_tokens / training_worker_group_time / training_num_gpus
+        if training_worker_group_time > 0
+        else 0
     )
     generation_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / generation_time / generation_num_gpus
+        total_num_tokens / generation_time / generation_num_gpus
+        if generation_time > 0
+        else 0
     )
 
     print("  • Throughputs (per GPU):")
@@ -849,3 +930,95 @@ def log_generation_metrics_to_wandb(
             name=generation_metric,
             timeline_interval=timeline_interval,
         )
+
+
+WALL_CLOCK_EFFICIENCY_CATEGORIES = [
+    "init/total",
+    "idle/buffer_starvation",
+    "idle/refit_bubble",
+    "idle/validation",
+]
+
+THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES = [
+    "idle/buffer_full_backoff",
+    "idle/generation_limit_pause",
+    "idle/refit_event_wait",
+    "wasted/failed_trajectory",
+]
+
+EFFICIENCY_CATEGORIES = (
+    WALL_CLOCK_EFFICIENCY_CATEGORIES + THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES
+)
+
+
+def print_efficiency_summary(
+    efficiency_metrics: dict[str, float],
+    total_wall_time_s: float,
+    step: int,
+) -> dict[str, float]:
+    """Print a summary table of efficiency metrics and return loggable dict.
+
+    Wall-clock categories (driver-side idle) are used for the efficiency
+    percentage.  Collector-side categories are summed across concurrent
+    threads and reported separately as thread-seconds so they are not
+    compared directly against a single wall-clock denominator.
+
+    Args:
+        efficiency_metrics: Dict mapping category labels to total seconds spent.
+        total_wall_time_s: Total wall-clock time in seconds since training began.
+        step: Current training step number.
+
+    Returns:
+        Dict of metrics suitable for logging to WandB/TensorBoard, including
+        per-category seconds and percentages, total waste, and efficiency_pct.
+    """
+    print(f"\n📊 Efficiency Summary (Step {step}):")
+    print(f"  {'Category':<35} {'Time (s)':>10} {'% of Wall':>10}")
+    print(f"  {'─' * 57}")
+
+    loggable: dict[str, float] = {}
+
+    for category in WALL_CLOCK_EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        pct = (duration / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+        print(f"  {category:<35} {duration:>10.2f} {pct:>9.2f}%")
+        loggable[f"efficiency/{category}_s"] = duration
+        loggable[f"efficiency/{category}_pct"] = pct
+
+    thread_seconds_total = 0.0
+    for category in THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        thread_seconds_total += duration
+        print(f"  {category + ' (thread-s)':<35} {duration:>10.2f} {'n/a':>10}")
+        loggable[f"efficiency/{category}_s"] = duration
+
+    wall_waste = sum(
+        efficiency_metrics.get(cat, 0.0) for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES
+    )
+    if total_wall_time_s > 0 and wall_waste > total_wall_time_s:
+        wall_waste = total_wall_time_s
+
+    productive = max(0.0, total_wall_time_s - wall_waste)
+    efficiency_pct = (
+        (productive / total_wall_time_s * 100) if total_wall_time_s > 0 else 100.0
+    )
+    efficiency_pct = min(100.0, max(0.0, efficiency_pct))
+    waste_pct = (wall_waste / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+    waste_pct = min(100.0, max(0.0, waste_pct))
+
+    print(f"  {'─' * 57}")
+    print(
+        f"  {'Collector thread-seconds (info)':<35} "
+        f"{thread_seconds_total:>10.2f} {'n/a':>10}"
+    )
+    print(f"  {'Wall-clock waste':<35} {wall_waste:>10.2f} {waste_pct:>9.2f}%")
+    print(f"  {'Productive time':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%")
+    print(f"  {'Efficiency':<35} {'':>10} {efficiency_pct:>9.2f}%")
+
+    loggable["efficiency/thread_seconds_total_s"] = thread_seconds_total
+    loggable["efficiency/total_waste_s"] = wall_waste
+    loggable["efficiency/productive_time_s"] = productive
+    loggable["efficiency/efficiency_pct"] = efficiency_pct
+    loggable["efficiency/total_wall_time_s"] = total_wall_time_s
+
+    return loggable

@@ -233,7 +233,7 @@ Figure 6 reports the KL divergence between the logits produced by the Hugging Fa
 The broader research community has proposed multiple strategies to mitigate these issues. We have referred to a list of publications:
 
 * [Defeating the Training-Inference Mismatch via FP16](https://arxiv.org/pdf/2510.26788)
-* [Accumulator accuracy](https://docs.pytorch.org/docs/stable/notes/cuda.html#reduced-precision-reduction-in-bf16-gemms)
+* [Accumulator accuracy](https://docs.pytorch.org/docs/2.12/notes/cuda.html#reduced-precision-reduction-in-bf16-gemms)
 * [Systematic Outliers in Large Language Models](https://arxiv.org/abs/2502.06415)
 * [Training-Inference Mismatch](https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda)
 

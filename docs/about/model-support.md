@@ -15,7 +15,7 @@ for model sizes under 70B at up to 32k sequence length.
 **LLMs**:
 
 - **Qwen**: Qwen3.5-9B/35B-A3B/397B-A17B, Qwen3-1.5B/8B/32B, Qwen3-30B-A3B, Qwen3-235B-A22B, Qwen2.5-1.5B/7B/32B
-- **GLM**: GLM-4.7-Flash
+- **GLM**: GLM-4.7-Flash, GLM-5.1
 - **Llama**: Llama 3.1/3.3-8B, Llama 3.1/3.3-70B, Llama 3.2-1B
 - **Deepseek**: Deepseek-V3/R1-671B
 - **Mistral**: Mistral-NeMo-12B

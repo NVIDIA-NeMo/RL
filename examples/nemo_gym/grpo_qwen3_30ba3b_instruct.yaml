@@ -63,6 +63,24 @@ policy:
         tool_parser: hermes
         # Enable the appropriate reasoning parser here. Since this model is an instruct model, we comment it out.
         # reasoning_parser: deepseek_r1
+    mcore_generation_config:
+      async_engine: false
+      max_model_len: ${policy.max_total_sequence_length}
+      cuda_graph_impl: "local"
+      inference_cuda_graph_scope: "block"
+      buffer_size_gb: 10
+      num_cuda_graphs: 4
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      enable_chunked_prefill: true
+      enable_prefix_caching: false
+      max_tokens: 16384
+      kv_cache_management_mode: "persist"
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: "nvshmem"
+      parsers: []
+      expose_http_server: false
 
   # Needs to be set to whatever backend TP size.
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
@@ -71,7 +89,6 @@ policy:
     enabled: true
     empty_unused_memory_level: 1
     activation_checkpointing: true
-    converter_type: "LlamaForCausalLM"  # This arg is deprecated, and we can set it to anything.
     tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
     # We set this to 8, the number of GPUs in one node

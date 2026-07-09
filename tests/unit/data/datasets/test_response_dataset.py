@@ -22,6 +22,10 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import load_response_dataset
 from nemo_rl.data.datasets.response_datasets.clevr import format_clevr_cogent_dataset
 from nemo_rl.data.datasets.response_datasets.geometry3k import format_geometry3k_dataset
+from nemo_rl.data.datasets.response_datasets.intent import (
+    IntentDataset,
+    _format_options,
+)
 
 
 def create_sample_data(input_key, output_key, is_save_to_disk=False, file_ext=".json"):
@@ -187,7 +191,15 @@ def test_open_assistant_dataset():
 
 @pytest.mark.parametrize(
     "dataset_name",
-    ["DAPOMath17K", "DAPOMathAIME2024", "DeepScaler", "AIME2024", "squad"],
+    [
+        "DAPOMath17K",
+        "DAPOMathAIME2024",
+        "DeepScaler",
+        "squad",
+        "AIME2024",
+        "AIME2025",
+        "AIME2026",
+    ],
 )
 def test_build_in_dataset(dataset_name, tokenizer):
     # load the dataset
@@ -209,11 +221,17 @@ def test_build_in_dataset(dataset_name, tokenizer):
         assert first_example["messages"][1]["content"] == "540"
     elif dataset_name == "DeepScaler":
         assert first_example["messages"][1]["content"] == "-\\frac{2}{3}"
+    elif dataset_name == "squad":
+        assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"
     elif dataset_name == "AIME2024":
         assert first_example["messages"][1]["content"] == "204"
         assert len(dataset.dataset) == 480
-    elif dataset_name == "squad":
-        assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"
+    elif dataset_name == "AIME2025":
+        assert first_example["messages"][1]["content"] == "70"
+        assert len(dataset.dataset) == 480
+    elif dataset_name == "AIME2026":
+        assert first_example["messages"][1]["content"] == "277"
+        assert len(dataset.dataset) == 480
 
     # check the combined message
     chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
@@ -353,7 +371,49 @@ def test_dailyomni_dataset():
     # check the content
     assert first_example["messages"][0]["role"] == "user"
     assert first_example["messages"][0]["content"][0]["type"] == "video"
-    assert first_example["messages"][0]["content"][1]["type"] == "text"
+    assert first_example["messages"][0]["content"][1]["type"] == "audio"
+    assert first_example["messages"][0]["content"][2]["type"] == "text"
     assert first_example["messages"][1]["role"] == "assistant"
 
     assert first_example["messages"][1]["content"] == "B"
+
+
+# ---------------------------------------------------------------------------
+# IntentTrain / IntentBench dataset (audio+video). The full content-shape
+# contract (one {type:video} + {type:audio} + text per prompt) is exercised
+# end to end by the nightly recipe
+# tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.sh
+# (the unit-level video+audio check needs ffmpeg to fabricate an mp4). The
+# tests below cover the loader contracts that do not require the ~16 GB
+# archives or ffmpeg.
+# ---------------------------------------------------------------------------
+
+
+def test_intent_invalid_split_raises():
+    with pytest.raises(ValueError, match="Invalid split"):
+        IntentDataset(split="test")
+
+
+def test_intent_rejects_system_prompt():
+    # The think/answer instruction is baked into the user prompt, so a system
+    # prompt is unsupported and must fail loudly (before any download).
+    with pytest.raises(ValueError, match="does not support a system prompt"):
+        IntentDataset(split="train", system_prompt_file="some_system_prompt.txt")
+
+
+def test_intent_rejects_prompt_file():
+    with pytest.raises(ValueError, match="does not support a prompt file"):
+        IntentDataset(split="train", prompt_file="some_prompt.txt")
+
+
+def test_intent_format_options():
+    # No options -> empty string (question stem only).
+    assert _format_options(None) == ""
+    assert _format_options([]) == ""
+    # List of options -> rendered under an "Options:" header.
+    rendered = _format_options(["A. yes", "B. no"])
+    assert rendered == " Options:\nA. yes\nB. no"
+    # String repr of a list (as some manifests store it) is parsed too.
+    assert _format_options("['A. yes', 'B. no']") == " Options:\nA. yes\nB. no"
+    # Unparseable string falls back to raw rendering (no crash).
+    assert _format_options("not a list") == " Options:\nnot a list"

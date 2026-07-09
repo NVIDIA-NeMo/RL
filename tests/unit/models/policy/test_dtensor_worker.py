@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pprint
-import time
 
 import pytest
 import ray
@@ -27,7 +26,41 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.flops_tracker import FLOPTracker, get_default_hf_config
 from tests.unit.test_utils import SimpleLossFn
+
+
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+
+    def train(self):
+        self.train_called = True
+
+
+def test_dtensor_prepare_for_training_restores_optimizer(monkeypatch):
+    from nemo_rl.models.policy.workers.dtensor_policy_worker import (
+        DTensorPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(DTensorPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.cpu_offload = False
+    worker.move_to_cuda = lambda model: model
+    worker.move_optimizer_to_device = lambda device: restored_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    DTensorPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
 
 
 def create_test_config(
@@ -1046,7 +1079,7 @@ class TestTwoGPUCluster:
     ):
         """Test that the returned FLOPS is within a reasonable range using dtensor backend.
 
-        Performs 2 warmup iterations and measures FLOPS for the next 3 iterations.
+        Performs 2 warmup iterations and checks FLOPS for the next 3 iterations.
         """
         batch_size = 8
         seq_len = 128
@@ -1101,12 +1134,9 @@ class TestTwoGPUCluster:
             for warmup_step in range(2):
                 results = policy.train(data, loss_fn)
 
-            # Measure FLOPS on the third iteration
-            print("Measuring FLOPS on 3 iterations...")
-            time_begin = time.time()
+            print("Checking FLOPS on 3 iterations...")
             for train_step in range(3):
                 results = policy.train(data, loss_fn)
-            runtime_sec = time.time() - time_begin
 
             # Check if FLOPS tracking is available
             if policy.flops_tracker is not None:
@@ -1120,13 +1150,18 @@ class TestTwoGPUCluster:
                 )
                 assert total_flops > 0, "total_flops should be positive"
 
-                total_tflops = total_flops / 1e12 / 3
-                print(f"Total FLOPS: {total_flops:.2e} ({total_tflops:.4f} TFLOPS)")
-
-                flop_count_total = total_flops * runtime_sec
-                assert 1e9 < flop_count_total < 5e10, (
-                    "Total FLOPS should be within 1e9 and 5e10"
+                expected_tracker = FLOPTracker.from_config(
+                    config["model_name"], get_default_hf_config(config["model_name"])
                 )
+                expected_tracker.track_batch(input_lengths.tolist())
+                expected_total_flops = expected_tracker.total_flops
+
+                assert total_flops == pytest.approx(expected_total_flops, rel=0.05), (
+                    f"Expected {expected_total_flops:.2e} FLOPS, got {total_flops:.2e}"
+                )
+
+                total_tflops = total_flops / 1e12
+                print(f"Total FLOPS: {total_flops:.2e} ({total_tflops:.4f} TFLOPS)")
 
                 if "theoretical_tflops" in results:
                     theoretical_tflops = results["theoretical_tflops"]

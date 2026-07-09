@@ -48,6 +48,12 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 13
+  generation:
+    vllm_kwargs:
+      # vLLM 0.20's FlashInfer TRTLLM MoE backend stores bf16 expert
+      # weights in a blocked runtime layout that its load_weights path cannot
+      # refit. Use TRITON to keep the refit-compatible 3D MoE layout.
+      moe_backend: triton
 data:
   max_input_seq_length: 4096
 cluster:

@@ -15,6 +15,7 @@
 import argparse
 import os
 import pprint
+import time
 
 from omegaconf import OmegaConf
 
@@ -28,7 +29,24 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.timer import Timer
+
+
+def _select_trainer(master_config: MasterConfig):
+    """Pick the synchronous trainer based on ``data_plane.enabled``.
+
+    Factored out so test_architecture_invariants can verify dispatch
+    without the full setup() path.
+    """
+    dp_cfg = master_config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+        print("🚀 Running synchronous GRPO training (TransferQueue)")
+        return grpo_train_sync
+    print("🚀 Running synchronous GRPO training (legacy)")
+    return grpo_train
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -46,6 +64,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     """Main entry point."""
+    main_start = time.perf_counter()
+    log_container_init_timing()
+
+    rl_init_timer = Timer(context={"worker": "driver"})
+
     # Parse arguments
     register_omegaconf_resolvers()
     args, overrides = parse_args()
@@ -55,16 +78,17 @@ def main() -> None:
             os.path.dirname(__file__), "configs", "grpo_math_1B.yaml"
         )
 
-    config = load_config(args.config)
-    print(f"Loaded configuration from: {args.config}")
+    with rl_init_timer.time("config"):
+        config = load_config(args.config)
+        print(f"Loaded configuration from: {args.config}")
 
-    if overrides:
-        print(f"Overrides: {overrides}")
-        config = parse_hydra_overrides(config, overrides)
+        if overrides:
+            print(f"Overrides: {overrides}")
+            config = parse_hydra_overrides(config, overrides)
 
-    config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
-    print("Applied CLI overrides")
+        config = OmegaConf.to_container(config, resolve=True)
+        config = MasterConfig(**config)
+        print("Applied CLI overrides")
 
     # Print config
     print("Final config:")
@@ -78,40 +102,77 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    init_ray()
+    with rl_init_timer.time("ray_connect"):
+        init_ray()
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config.policy["tokenizer"])
-    assert config.policy["generation"] is not None, (
-        "A generation config is required for GRPO"
-    )
-    has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
-    config.policy["generation"] = configure_generation_config(
-        config.policy["generation"],
-        tokenizer,
-        has_refit_draft_weights=has_refit_draft_weights,
-    )
+    with rl_init_timer.time("tokenizer"):
+        tokenizer = get_tokenizer(config.policy["tokenizer"])
+        assert config.policy["generation"] is not None, (
+            "A generation config is required for GRPO"
+        )
+        has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
+        megatron_cfg = config.policy.get("megatron_cfg") or {}
+        trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
+        config.policy["generation"] = configure_generation_config(
+            config.policy["generation"],
+            tokenizer,
+            has_refit_draft_weights=has_refit_draft_weights,
+            trains_mtp=trains_mtp,
+        )
 
     # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config.data, config.env)
+    with rl_init_timer.time("data"):
+        dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
+            tokenizer, config.data, config.env
+        )
 
-    (
-        policy,
-        policy_generation,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    # Pick the policy factory at the launcher level so the legacy trainer
+    # stays data-plane-agnostic (architectural invariant — see
+    # tests/data_plane/unit/test_architecture_invariants.py).
+    _dp_cfg = config.data_plane or {}
+    if _dp_cfg.get("enabled", False):
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def _make_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+
+        _policy_factory = _make_policy
+    else:
+        _policy_factory = None  # setup() defaults to plain Policy
+
+    with rl_init_timer.time("setup"):
+        (
+            policy,
+            policy_generation,
+            _nemo_gym,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            teacher_worker_groups,
+            alias_to_group_alias,
+        ) = setup(
+            config,
+            tokenizer,
+            dataset,
+            val_dataset,
+            policy_factory=_policy_factory,
+        )
+
+    rl_init_timer.record("total", time.perf_counter() - main_start)
+
+    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+    print("\n" + "=" * 60)
+    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+    for label, value in sorted(rl_init_metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {label}: {value:.1f}s")
+    print("=" * 60 + "\n", flush=True)
 
     # Check if async mode is enabled
     if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
@@ -163,12 +224,14 @@ def main() -> None:
             grpo_save_state=grpo_state,
             master_config=master_config,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            teacher_worker_groups=teacher_worker_groups,
+            alias_to_group_alias=alias_to_group_alias,
         )
     else:
-        print("🚀 Running synchronous GRPO training")
-
-        # Run standard GRPO training
-        grpo_train(
+        # Two parallel synchronous trainers (verl-style — main_ppo.py vs
+        # main_ppo_sync.py). data_plane.enabled selects which one runs.
+        trainer = _select_trainer(master_config)
+        trainer(
             policy,
             policy_generation,
             dataloader,
