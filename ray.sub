@@ -215,13 +215,13 @@ COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
 # explicitly, auto-detect it from SLURM so we claim every CPU the node actually
 # has (instead of the old GPUS_PER_NODE * 16 heuristic, which under-claims on
-# nodes with more cores). Detection exits with an error if it cannot determine a
-# single consistent CPU count; set CPUS_PER_WORKER explicitly to override.
+# nodes with more cores). Detection queries a single node and assumes a
+# homogeneous allocation; set CPUS_PER_WORKER explicitly to override.
 if [[ -n "${CPUS_PER_WORKER:-}" ]]; then
   echo "[INFO] Using user-provided CPUS_PER_WORKER=$CPUS_PER_WORKER."
 else
   CPUS_PER_WORKER=$(detect_cpus_per_node)
-  echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of allocated nodes)."
+  echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of first allocated node)."
 fi
 
 # ---------------------------------------------------------------------------
