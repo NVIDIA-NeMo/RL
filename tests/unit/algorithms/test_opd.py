@@ -415,8 +415,10 @@ def test_create_advantage_estimator_opd_branch():
     import warnings
     from types import SimpleNamespace
 
-    from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
-    from nemo_rl.algorithms.advantage_estimator import AdvEstimatorConfig
+    from nemo_rl.algorithms.advantage_estimator import (
+        AdvEstimatorConfig,
+        OPDAdvantageEstimator,
+    )
     from nemo_rl.algorithms.grpo import GRPOConfig, _create_advantage_estimator
 
     # loss_fn not MOPD-configured -> the 3 recommendation warnings fire.
