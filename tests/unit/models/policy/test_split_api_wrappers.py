@@ -193,3 +193,52 @@ class TestTQPolicySplitFanout:
             "abort_train_step_presharded"
         )
         mock_ray.get.assert_called_once_with(["f0", "f1"])
+
+
+class TestPrepareLogprobsFromMeta:
+    """SC's per-group logprob refresh hook: a thin flag-gated dispatcher
+    over get_logprobs_from_meta / get_reference_policy_logprobs_from_meta."""
+
+    def test_both_flags_dispatch_both(self):
+        p = object.__new__(TQPolicy)
+        meta = _meta()
+        with (
+            patch.object(TQPolicy, "get_logprobs_from_meta") as mock_policy_lp,
+            patch.object(
+                TQPolicy, "get_reference_policy_logprobs_from_meta"
+            ) as mock_ref_lp,
+        ):
+            out = p.prepare_logprobs_from_meta(
+                meta,
+                refresh_policy_logprobs=True,
+                refresh_reference_logprobs=True,
+            )
+        assert out is None  # workers write back to TQ; no Ray payload
+        mock_policy_lp.assert_called_once()
+        assert mock_policy_lp.call_args.args[0] is meta
+        mock_ref_lp.assert_called_once()
+        assert mock_ref_lp.call_args.args[0] is meta
+
+    def test_single_flag_dispatches_only_that_refresh(self):
+        p = object.__new__(TQPolicy)
+        with (
+            patch.object(TQPolicy, "get_logprobs_from_meta") as mock_policy_lp,
+            patch.object(
+                TQPolicy, "get_reference_policy_logprobs_from_meta"
+            ) as mock_ref_lp,
+        ):
+            p.prepare_logprobs_from_meta(_meta(), refresh_reference_logprobs=True)
+        mock_policy_lp.assert_not_called()
+        mock_ref_lp.assert_called_once()
+
+    def test_no_flags_is_a_no_op(self):
+        p = object.__new__(TQPolicy)
+        with (
+            patch.object(TQPolicy, "get_logprobs_from_meta") as mock_policy_lp,
+            patch.object(
+                TQPolicy, "get_reference_policy_logprobs_from_meta"
+            ) as mock_ref_lp,
+        ):
+            p.prepare_logprobs_from_meta(_meta())
+        mock_policy_lp.assert_not_called()
+        mock_ref_lp.assert_not_called()
