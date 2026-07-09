@@ -202,7 +202,7 @@ policy:
     scale_loss_by_dp_cp_size: false
 
     # MTP — disabled
-    mtp_loss_scaling_factor: 0.0
+    mtp_loss_scaling_factor: 0.3
     mtp_use_repeated_layer: true
     # null disables MTP entirely (matches the upstream mtp=0 run's behavior). This
     # checkout's hybrid model gates MTP on `mtp_num_layers is not None`
@@ -211,7 +211,7 @@ policy:
     # PARALLEL NCCL collective timeout). null makes that check False -> MTP is skipped
     # on all ranks, no partial-rank EP collective. Requires the schema change making
     # MegatronConfig.mtp_num_layers accept None (nemo_rl/models/policy/__init__.py).
-    mtp_num_layers: null
+    mtp_num_layers: 5
     mtp_detach_heads: true
 
     optimizer:
