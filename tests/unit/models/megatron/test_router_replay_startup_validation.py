@@ -30,7 +30,9 @@ from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 register_omegaconf_resolvers()
 
 REPO_ROOT = Path(__file__).parents[4]
-QWEN30B_MEGATRON_YAML = REPO_ROOT / "examples/configs/grpo_math_qwen30ba3b_megatron.yaml"
+QWEN30B_MEGATRON_YAML = (
+    REPO_ROOT / "examples/configs/grpo_math_qwen30ba3b_megatron.yaml"
+)
 
 MOE_HF_CONFIG = SimpleNamespace(num_experts=128)
 DENSE_HF_CONFIG = SimpleNamespace()

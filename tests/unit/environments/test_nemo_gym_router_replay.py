@@ -182,15 +182,39 @@ def test_single_turn_final_token_route_unchanged():
     assert message_log[1]["routed_experts"].tolist() == _routes_from(3, 0)[2:3]
 
 
-def test_surplus_final_token_route_is_accepted():
+def test_surplus_route_rows_raise():
+    # expected tokens for turn 2 = 7; any surplus is an exact-count mismatch.
     result = _two_turn_result()
-    # expected tokens for turn 2 = 7; one surplus row is the legal final-token route
     result["response"]["output"][1]["routed_experts"] = _routes_from(8, 1000)
-    _postprocess(result)
+    with pytest.raises(ValueError, match="row count does not match"):
+        _postprocess(result)
 
 
-def test_more_than_one_surplus_route_row_raises():
+def test_too_few_route_rows_raise():
     result = _two_turn_result()
-    result["response"]["output"][1]["routed_experts"] = _routes_from(9, 1000)
-    with pytest.raises(ValueError, match="too many routed_experts rows"):
+    result["response"]["output"][1]["routed_experts"] = _routes_from(6, 1000)
+    with pytest.raises(ValueError, match="row count does not match"):
+        _postprocess(result)
+
+
+def test_missing_routes_on_one_item_are_sentinel_filled_not_fatal():
+    # One healthy item (provides the [layers, topk] shape) plus one trace-less
+    # item (Gym's error-recovery dummy). The dummy must be sentinel-filled, not
+    # crash the run.
+    result = _two_turn_result()
+    result["response"]["output"][1].pop("routed_experts")
+    message_log = _postprocess(result)["message_log"]
+    # turn-2 (dummy) assistant message: routes are all the -1 sentinel.
+    dummy_assistant = message_log[3]
+    routes = dummy_assistant["routed_experts"]
+    assert (routes == -1).all()
+    # shape borrowed from the healthy sibling: [layers=1, topk=2] per _routes_from.
+    assert routes.shape[1:] == (1, 2)
+
+
+def test_all_items_missing_routes_still_raises():
+    result = _two_turn_result()
+    for item in result["response"]["output"]:
+        item.pop("routed_experts")
+    with pytest.raises(ValueError, match="no item in the batch carried them"):
         _postprocess(result)

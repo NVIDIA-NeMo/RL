@@ -29,6 +29,11 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
+# Local copy of the R3 missing-route sentinel (canonical def in
+# nemo_rl.models.generation.vllm.utils) — kept local so the Gym actor stays free
+# of generation-module imports. Must stay -1 to match Megatron's replay fallback.
+_R3_MISSING_ROUTE_SENTINEL = -1
+
 # Kept local (not imported from models.generation) so the gym actor stays free of
 # generation-module imports. Must cover every name resolve_routed_experts_dtype
 # can produce.
@@ -340,6 +345,24 @@ Depending on your data shape, you may want to change these values."""
         prev_assistant_routed_experts: Optional[torch.Tensor] = None
         prev_assistant_final_pos: Optional[int] = None
         batch_decode_items = []
+
+        # A missing-routes item (e.g. Gym's error-recovery dummy) is sentinel-filled
+        # so Megatron's fallback handles it instead of crashing the run — but that
+        # needs the [num_moe_layers, topk] shape, which only a sibling item that DID
+        # carry routes can provide. Scan for one up front; if none exists the whole
+        # batch is trace-less, a genuine misconfiguration that still raises below.
+        routed_experts_layer_topk: Optional[tuple[int, int]] = None
+        for _scan_item in nemo_gym_result["response"]["output"]:
+            _scan_routes = _scan_item.get("routed_experts")
+            if _scan_routes is not None:
+                _scan_tensor = torch.as_tensor(_scan_routes, dtype=torch.int32)
+                if _scan_tensor.dim() == 3:
+                    routed_experts_layer_topk = (
+                        int(_scan_tensor.shape[1]),
+                        int(_scan_tensor.shape[2]),
+                    )
+                    break
+
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -377,25 +400,17 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                         "Expected [tokens, num_moe_layers, topk], got "
                         f"{tuple(routed_experts.shape)}."
                     )
+                # The route array is engine-derived and already padded to the full
+                # prompt+generation length, so it must match the (independently
+                # tokenize-derived) token count exactly. Any difference means the
+                # two came from different token sequences and every route after
+                # the divergence — and the splice below — would be misaligned.
                 expected_tokens = len(prompt_token_ids) + len(generation_token_ids)
-                if routed_experts.shape[0] < expected_tokens:
+                if routed_experts.shape[0] != expected_tokens:
                     raise ValueError(
-                        "NeMo Gym returned too few routed_experts rows for a "
-                        "trainable output item: "
-                        f"routes={routed_experts.shape[0]}, expected_at_least="
-                        f"{expected_tokens}."
-                    )
-                # At most one surplus row is legal (the final-token route, when
-                # the backend returns it); anything beyond that means the row
-                # count comes from a different token sequence than reported and
-                # every route after the divergence would be misaligned.
-                if routed_experts.shape[0] > expected_tokens + 1:
-                    raise ValueError(
-                        "NeMo Gym returned too many routed_experts rows for a "
-                        "trainable output item: "
-                        f"routes={routed_experts.shape[0]}, "
-                        f"expected={expected_tokens} (+1 surplus final-token "
-                        "route allowed)."
+                        "NeMo Gym routed_experts row count does not match the "
+                        "trainable output item's token count: "
+                        f"routes={routed_experts.shape[0]}, expected={expected_tokens}."
                     )
                 # Splice: vLLM never routes the final sampled token of a
                 # request, so the previous assistant turn's last route row is a
@@ -410,12 +425,37 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                         prev_assistant_final_pos
                     ]
             elif self.cfg.get("require_routed_experts", False):
-                raise ValueError(
-                    "policy.router_replay.enabled=true requires NeMo Gym output "
-                    "items to include routed_experts, but the field was missing. "
-                    "Make sure the Gym repo includes routed_experts propagation "
-                    "and the NeMo-RL vLLM OpenAI-compatible server is configured "
-                    "with enable_return_routed_experts."
+                # A single trace-less item (e.g. Gym's error-recovery dummy for a
+                # rollout that ended without a valid assistant message) should not
+                # kill the whole run. Sentinel-fill it so Megatron's missing-route
+                # fallback replays natural routing for these tokens, and surface it
+                # via r3/train_fallback_token_route_fraction. Only a fully
+                # trace-less batch (no sibling shape to fill from) is a real
+                # misconfiguration and still raises.
+                if routed_experts_layer_topk is None:
+                    raise ValueError(
+                        "policy.router_replay.enabled=true requires NeMo Gym "
+                        "output items to include routed_experts, but no item in "
+                        "the batch carried them. Make sure the Gym repo includes "
+                        "routed_experts propagation and the NeMo-RL vLLM "
+                        "OpenAI-compatible server is configured with "
+                        "enable_return_routed_experts."
+                    )
+                num_layers, topk = routed_experts_layer_topk
+                # Must match the dtype the sibling (real) routes are cast to above
+                # so the sentinel-filled and real tensors concatenate/replay
+                # identically — resolved the same way as the real-route branch.
+                sentinel_dtype = _ROUTED_EXPERTS_DTYPES[
+                    self.cfg.get("routed_experts_dtype", "int16")
+                ]
+                routed_experts = torch.full(
+                    (
+                        len(prompt_token_ids) + len(generation_token_ids),
+                        num_layers,
+                        topk,
+                    ),
+                    _R3_MISSING_ROUTE_SENTINEL,
+                    dtype=sentinel_dtype,
                 )
 
             prompt_start = len(seen_token_ids)
