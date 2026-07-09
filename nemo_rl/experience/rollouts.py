@@ -1363,6 +1363,16 @@ PER_AGENT_TOTAL_METRIC_KEYS = frozenset(
         "streaming_tool_call_prompt_reuse_token_equivalent_matches",
         "streaming_tool_call_prompt_reuse_mismatches",
         "streaming_tool_call_prompt_reuse_missing",
+        "streaming_tool_call_exact_incremental_tokenizer_actions",
+        "streaming_tool_call_incremental_tokenizer_requests",
+        "streaming_tool_call_incremental_tokenizer_tokens",
+        "streaming_tool_call_incremental_tokenizer_encoded_chars",
+        "streaming_tool_call_incremental_tokenizer_encoded_tokens",
+        "streaming_tool_call_incremental_tokenizer_reused_tokens",
+        "streaming_tool_call_incremental_tokenizer_rollback_tokens",
+        "streaming_tool_call_incremental_tokenizer_checkpoints",
+        "streaming_tool_call_incremental_tokenizer_checkpoint_tokens",
+        "streaming_tool_call_incremental_tokenizer_checkpoint_mismatches",
     }
 )
 

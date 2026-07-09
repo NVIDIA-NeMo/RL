@@ -43,6 +43,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.incremental_tokenizer import (
+    ExactIncrementalTokenizerSessionManager,
+    IncrementalTokenizerError,
+)
 from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallError,
     StreamingToolCallPrefillManager,
@@ -1043,6 +1047,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ):
             required_prefix_token_ids: Optional[List[int]] = None
 
+        class NeMoRLIncrementalTokenizeChatRequest(NeMoRLTokenizeChatRequest):
+            session_id: str
+            sequence_no: int
+            final: bool = False
+
         NeMoRLTokenizeRequest = Union[
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
@@ -1066,6 +1075,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             **serving_tokenization_kwargs
         )
 
+        streaming_config = self.cfg["vllm_cfg"].get("streaming_tool_call")
+        incremental_tokenizer_manager = None
+        if streaming_config and streaming_config.get("exact_incremental_tokenizer"):
+            incremental_tokenizer_manager = ExactIncrementalTokenizerSessionManager(
+                tokenizer=openai_serving_tokenization.renderer.get_tokenizer(),
+                max_sessions=streaming_config["max_sessions"],
+                session_ttl_seconds=streaming_config["session_ttl_seconds"],
+                checkpoint_interval=streaming_config[
+                    "incremental_tokenizer_checkpoint_interval"
+                ],
+            )
+
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
             generator = await openai_serving_tokenization.create_tokenize(
@@ -1078,6 +1099,122 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
             elif isinstance(generator, TokenizeResponse):
                 return JSONResponse(content=generator.model_dump())
+
+        async def get_authoritative_token_ids(
+            request: NeMoRLIncrementalTokenizeChatRequest,
+            raw_request: Request,
+        ) -> list[int] | JSONResponse:
+            generator = await openai_serving_tokenization.create_tokenize(
+                request, raw_request
+            )
+            if isinstance(generator, ErrorResponse):
+                return JSONResponse(
+                    content=generator.model_dump(),
+                    status_code=generator.error.code,
+                )
+            return list(generator.tokens)
+
+        async def render_incremental_prompt(
+            request: NeMoRLIncrementalTokenizeChatRequest,
+        ) -> str:
+            tool_dicts = (
+                None
+                if request.tools is None
+                else [tool.model_dump() for tool in request.tools]
+            )
+            merged_template_kwargs = merge_kwargs(
+                None,
+                dict(
+                    tools=tool_dicts,
+                    tokenize=is_mistral_tokenizer(
+                        openai_serving_tokenization.renderer.tokenizer
+                    ),
+                ),
+            )
+            chat_params = request.build_chat_params(
+                openai_serving_tokenization.chat_template,
+                openai_serving_tokenization.chat_template_content_format,
+            ).with_defaults(merged_template_kwargs)
+            (
+                _,
+                prompt,
+            ) = await openai_serving_tokenization.renderer.render_messages_async(
+                request.messages,
+                chat_params,
+            )
+            rendered_prompt = prompt.get("prompt")
+            if not isinstance(rendered_prompt, str):
+                raise HTTPException(
+                    status_code=422,
+                    detail="incremental tokenization requires a text prompt",
+                )
+            return rendered_prompt
+
+        @app.post("/incremental_tokenize")
+        async def incremental_tokenize(
+            request: NeMoRLIncrementalTokenizeChatRequest,
+            raw_request: Request,
+        ):
+            manager = incremental_tokenizer_manager
+            if manager is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="exact incremental tokenization is not enabled",
+                )
+            try:
+                rendered_prompt = await render_incremental_prompt(request)
+                if request.sequence_no == 0:
+                    authoritative_token_ids = await get_authoritative_token_ids(
+                        request,
+                        raw_request,
+                    )
+                    if isinstance(authoritative_token_ids, JSONResponse):
+                        return authoritative_token_ids
+                    result = manager.start(
+                        session_id=request.session_id,
+                        sequence_no=request.sequence_no,
+                        rendered_prompt=rendered_prompt,
+                        authoritative_token_ids=authoritative_token_ids,
+                    )
+                else:
+                    checkpoint_due = manager.requires_checkpoint(
+                        session_id=request.session_id,
+                        sequence_no=request.sequence_no,
+                    )
+                    authoritative_token_ids = None
+                    if checkpoint_due:
+                        authoritative_token_ids = await get_authoritative_token_ids(
+                            request,
+                            raw_request,
+                        )
+                        if isinstance(authoritative_token_ids, JSONResponse):
+                            return authoritative_token_ids
+                    if request.final:
+                        result = manager.finalize(
+                            session_id=request.session_id,
+                            sequence_no=request.sequence_no,
+                            rendered_prompt=rendered_prompt,
+                            authoritative_token_ids=authoritative_token_ids,
+                        )
+                    else:
+                        result = manager.append(
+                            session_id=request.session_id,
+                            sequence_no=request.sequence_no,
+                            rendered_prompt=rendered_prompt,
+                            authoritative_token_ids=authoritative_token_ids,
+                        )
+            except IncrementalTokenizerError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+            return asdict(result)
+
+        @app.post("/incremental_tokenize/abort")
+        async def abort_incremental_tokenize(
+            request: StreamingToolCallAbortRequest,
+        ):
+            manager = incremental_tokenizer_manager
+            if manager is None:
+                return {"aborted": False}
+            return {"aborted": manager.abort(request.session_id)}
 
         ########################################
         # Streaming tool-call prefill endpoints

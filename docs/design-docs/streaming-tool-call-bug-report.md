@@ -20,7 +20,12 @@ issues are:
 3. external `raw.githubusercontent.com` DNS failures are asymmetric between
    arms; and
 4. a normal request can exceed the model context by one token and become an
-   empty assistant result.
+   empty assistant result; and
+5. two July 9 exact-tokenizer on arms used the bridge timeout as a coroutine
+   wait limit but omitted it from the underlying action-server HTTP request.
+
+Item 5 is fixed and regression-tested, but it invalidates those two historical
+on arms for performance and accuracy comparison.
 
 The retry overlay is useful diagnosis, but must not be presented as a clean,
 atomic paired accuracy measurement. See [Non-bugs and protocol constraints](#non-bugs-and-protocol-constraints)
@@ -50,6 +55,7 @@ streaming sessions. `Unknown` is deliberately not treated as `No`.
 | STC-006 | **Yes — audit-only** | Retry overlay is independent of the feature flag and can replace rows for either arm. |
 | STC-007 | **Not observed in archived off logs** | The three inspected off drivers do not contain the `server_thread` teardown error. This is not proof of absence; it remains unconfirmed without a targeted off teardown test. |
 | STC-008 | **No — feature-specific** | The failed path required active FastAPI/Uvicorn-owned streaming sessions to be cancelled from the Ray refit loop. Disabled streaming creates no such session. |
+| STC-009 | **No — feature-specific** | `_send_action_server_request()` delegates to the new async bridge only when `streaming_tool_call.enabled=True`; the disabled branch calls the unchanged parent request path. The two affected exact-tokenizer on arms contain the timeout marker in 28/64 and 29/64 rows, while their paired off arms contain zero matching rows. |
 
 ### Streaming-off evidence
 
@@ -321,6 +327,66 @@ loop and adds a pause barrier. `13278330` then completed five refits.
 regression. Add/retain an automated multi-refit integration regression that
 creates active streaming sessions, crosses the pause barrier, and verifies
 weight synchronization on every refit.
+
+### STC-009 — Streaming action bridge dropped the HTTP request timeout
+
+**Severity:** P0 experiment-integrity bug<br>
+**Status:** Resolved; targeted tests and two replacement first64 pairs pass<br>
+**Affected artifacts:** exact-tokenizer first64 on jobs `13600551` and
+`13608623`
+
+The streaming-only branch of `LocalRuntime._send_action_server_request()` used
+the requested action timeout only as the outer `call_async_from_sync()` wait
+limit. `_execute_action_request()` then called `self.session.post()` without a
+`timeout=` argument, so the session's much shorter default HTTP timeout could
+terminate a valid long-running command first. OpenHands reported the requested
+300-second value even when that was not the timer that fired:
+
+```text
+AgentRuntimeTimeoutError: Runtime failed to return execute_action before the
+requested timeout of 300.0s
+```
+
+This marker appears in 28 of 64 persisted rows in
+`20260709T084700Z-exact-incremental-r1-first64/exact_tokenizer_on` and 29 of 64
+rows in `20260709T122500Z-exact-incremental-r2-first64/exact_tokenizer_on`.
+Their paired streaming-off files contain no matching rows. Because later model
+turns can quote an earlier failure, these row counts are incidence counts, not
+independent action-timeout counts.
+
+The source defect and fix are visible in
+`streaming_tool_call_action_timeout.patch`:
+
+```diff
+-return call_async_from_sync(self._execute_action_request, timeout, action)
++return call_async_from_sync(
++    self._execute_action_request,
++    timeout,
++    action,
++    request_timeout=timeout,
++)
+ ...
+-self.session.post(url, json=payload)
++self.session.post(url, json=payload, timeout=request_timeout)
+```
+
+If the caller supplies no bridge timeout, the fixed implementation derives an
+HTTP deadline from `action.timeout + 5`. The streaming-disabled branch still
+delegates directly to `ActionExecutionClient` and is not affected by this
+defect.
+
+Targeted Slurm tests passed in jobs `13617443` (4 tests), `13617511` (11 tests),
+and `13617627` (1 test). The first fixed 16-row off/on pair completed with zero
+`AgentRuntimeTimeoutError` markers in both arms. Two fixed repeated first64
+pairs (`13621383` / `13621384` and `13624636` / `13624637`) then emitted 64/64
+rows in every arm with zero matching markers. STC-009 is therefore resolved;
+the standalone evaluation report treats the replacement performance and
+accuracy results separately from this bug's exit criterion.
+
+**Acceptance test:** With streaming enabled, a mocked action request receives
+the exact bridge timeout at `session.post`; a command longer than the session
+default but shorter than its action timeout completes; paired fixed rollouts
+contain no synthetic action-timeout marker.
 
 ## Non-bugs and protocol constraints
 

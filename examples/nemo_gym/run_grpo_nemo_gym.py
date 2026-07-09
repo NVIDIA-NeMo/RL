@@ -128,8 +128,13 @@ def collect_trajectories(
                     f"Trajectory batch {batch_idx} did not contain any full Gym results"
                 )
 
-            for serialized_result in rows_to_log:
+            attributed_rows: list[str] = []
+            batch_size = len(rows_to_log)
+            for batch_position, serialized_result in enumerate(rows_to_log):
                 result = json.loads(serialized_result)
+                result["trajectory_collection_batch_index"] = batch_idx
+                result["trajectory_collection_batch_position"] = batch_position
+                result["trajectory_collection_batch_size"] = batch_size
                 instance_id = result["responses_create_params"]["metadata"][
                     "instance_id"
                 ]
@@ -139,6 +144,9 @@ def collect_trajectories(
                     )
                 seen_instance_ids.add(instance_id)
                 resolved_count += int(result["reward"] == 1)
+                attributed_rows.append(json.dumps(result, separators=(",", ":")))
+
+            rows_to_log = attributed_rows
 
             # Append after every completed batch. This preserves earlier trajectories if a
             # later batch or worker fails during a long evaluation.
