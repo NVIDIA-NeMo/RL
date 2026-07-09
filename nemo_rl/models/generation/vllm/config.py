@@ -26,8 +26,16 @@ class StreamingToolCallConfig(TypedDict):
             configured.
         tokenizer_only: Whether to repeatedly tokenize cumulative partial tool
             output without creating a streaming prefill request. This is an
-            instrumentation mode for isolating tokenizer effects, not a
-            stateful incremental encoder; the recommended default is false.
+            instrumentation mode for isolating tokenizer effects. The
+            recommended default is false.
+        exact_incremental_tokenizer: Whether tokenizer-only mode keeps an exact
+            backend session and re-encodes only the mutable prompt tail between
+            full checkpoints. The recommended default is false.
+        incremental_tokenizer_checkpoint_interval: Number of ordered partial
+            snapshots between full authoritative tokenizer checkpoints. A
+            valid session may finalize from its incrementally constructed
+            tokens without an additional checkpoint. The recommended default
+            is 8.
         max_sessions: Maximum number of concurrent prefill sessions per vLLM
             replica. The recommended default is 256.
         session_ttl_seconds: Idle lifetime of a prefill session before cleanup.
@@ -51,6 +59,8 @@ class StreamingToolCallConfig(TypedDict):
 
     enabled: bool
     tokenizer_only: bool
+    exact_incremental_tokenizer: NotRequired[bool]
+    incremental_tokenizer_checkpoint_interval: NotRequired[int]
     max_sessions: int
     session_ttl_seconds: float
     stability_margin_tokens: int

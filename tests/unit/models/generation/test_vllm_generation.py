@@ -1549,6 +1549,19 @@ def test_vllm_http_server(cluster, tokenizer):
 
     # Set to greedy for test reproducibility.
     generation_config["temperature"] = 0.0
+    generation_config["vllm_cfg"]["streaming_tool_call"] = {
+        "enabled": False,
+        "tokenizer_only": True,
+        "exact_incremental_tokenizer": True,
+        "incremental_tokenizer_checkpoint_interval": 8,
+        "max_sessions": 8,
+        "session_ttl_seconds": 60,
+        "stability_margin_tokens": 8,
+        "min_chunk_chars": 16,
+        "snapshot_poll_interval_seconds": 0.05,
+        "flush_interval_seconds": 0.25,
+        "request_timeout_seconds": 60,
+    }
 
     # Create vLLM generation
     vllm_generation = VllmGeneration(cluster, generation_config)
@@ -1663,6 +1676,40 @@ def test_vllm_http_server(cluster, tokenizer):
         "token_strs": None,
     }
     assert expected_result == actual_result
+
+    # Check that exact suffix-only tokenization stays identical to the ordinary
+    # tokenizer while avoiding a full-tokenizer checkpoint at finalization.
+    incremental_url = f"{base_urls[0]}/../incremental_tokenize"
+    incremental_body = {
+        "model": generation_config["model_name"],
+        "messages": [{"role": "user", "content": "partial"}],
+        "session_id": "incremental-http-test",
+        "sequence_no": 0,
+    }
+    first_step = requests.post(url=incremental_url, json=incremental_body).json()
+    incremental_body["messages"][0]["content"] = "partial output"
+    incremental_body["sequence_no"] = 1
+    middle_step = requests.post(url=incremental_url, json=incremental_body).json()
+    incremental_body["messages"][0]["content"] = "partial output final"
+    incremental_body["sequence_no"] = 2
+    incremental_body["final"] = True
+    final_step = requests.post(url=incremental_url, json=incremental_body).json()
+    final_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": incremental_body["messages"],
+        },
+    ).json()["tokens"]
+
+    assert first_step["checkpoint_count"] == 1
+    assert middle_step["encoded_chars"] > 0
+    assert middle_step["reused_tokens"] > 0
+    assert middle_step["incremental_valid"] is True
+    assert final_step["tokens"] == final_tokens
+    assert final_step["checkpoint_count"] == 0
+    assert final_step["checkpoint_mismatches"] == 0
+    assert final_step["incremental_valid"] is True
 
     # Clean up
     vllm_generation.shutdown()

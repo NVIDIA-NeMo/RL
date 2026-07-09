@@ -30,6 +30,10 @@ NUM_VLLM_REPLICAS="${NUM_VLLM_REPLICAS:-32}"
 TRAJECTORY_COLLECTION_BATCH_SIZE="${TRAJECTORY_COLLECTION_BATCH_SIZE:-128}"
 EXPECTED_COUNT="${EXPECTED_COUNT:-500}"
 PREWARM_SWEBENCH_ARTIFACTS="${PREWARM_SWEBENCH_ARTIFACTS:-1}"
+EXACT_INCREMENTAL_TOKENIZER="${EXACT_INCREMENTAL_TOKENIZER:-0}"
+INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL="${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL:-8}"
+DETAILED_RUNTIME_METRICS="${DETAILED_RUNTIME_METRICS:-1}"
+BASE_CONCURRENCY="${BASE_CONCURRENCY:-${EXPECTED_COUNT}}"
 # Each PAIR_ARMS entry accepts
 # name:streaming_enabled[:snapshot_poll_seconds[:min_chunk_chars[:tokenizer_only]]].
 SNAPSHOT_POLL_INTERVAL_SECONDS="${SNAPSHOT_POLL_INTERVAL_SECONDS:-0.1}"
@@ -63,6 +67,10 @@ submit_arm() {
   local snapshot_poll_interval_seconds="$3"
   local min_chunk_chars="$4"
   local tokenizer_only="$5"
+  local exact_incremental_tokenizer="${EXACT_INCREMENTAL_TOKENIZER}"
+  if [ "${streaming_enabled}" != "1" ] || [ "${tokenizer_only}" != "1" ]; then
+    exact_incremental_tokenizer=0
+  fi
   local experiment_name="streamtool-verified-temp0-r${NUM_VLLM_REPLICAS}-${RUN_ID}-${arm}"
 
   REPO_ROOT="${REPO_ROOT}" \
@@ -75,6 +83,10 @@ submit_arm() {
   TOP_P=1.0 \
   STREAMING_MIN_CHUNK_CHARS="${min_chunk_chars}" \
   STREAMING_INCREMENTAL_TOKENIZER_ONLY="${tokenizer_only}" \
+  EXACT_INCREMENTAL_TOKENIZER="${exact_incremental_tokenizer}" \
+  INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL="${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL}" \
+  DETAILED_RUNTIME_METRICS="${DETAILED_RUNTIME_METRICS}" \
+  BASE_CONCURRENCY="${BASE_CONCURRENCY}" \
   SWE_BENCH_ARTIFACT_CACHE_OFFLINE="${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}" \
   STREAMING_TOOL_CALL="${streaming_enabled}" \
   SNAPSHOT_POLL_INTERVAL_SECONDS="${snapshot_poll_interval_seconds}" \

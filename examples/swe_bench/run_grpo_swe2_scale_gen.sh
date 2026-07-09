@@ -51,6 +51,8 @@
 #               SNAPSHOT_POLL_INTERVAL_SECONDS,
 #               STREAMING_MIN_CHUNK_CHARS,
 #               STREAMING_INCREMENTAL_TOKENIZER_ONLY,
+#               EXACT_INCREMENTAL_TOKENIZER,
+#               INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL,
 #               DETAILED_RUNTIME_METRICS, BASE_CONCURRENCY,
 #               SWE_BENCH_ARTIFACT_CACHE_OFFLINE
 # Credentials are NOT sourced here — export HF_HOME / HF_TOKEN / WANDB_API_KEY yourself.
@@ -94,6 +96,8 @@ if [ "${TRAJECTORY_COLLECTION}" = "1" ]; then
 fi
 STREAMING_TOOL_CALL="${STREAMING_TOOL_CALL:-0}"
 STREAMING_INCREMENTAL_TOKENIZER_ONLY="${STREAMING_INCREMENTAL_TOKENIZER_ONLY:-0}"
+EXACT_INCREMENTAL_TOKENIZER="${EXACT_INCREMENTAL_TOKENIZER:-0}"
+INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL="${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL:-8}"
 DETAILED_RUNTIME_METRICS="${DETAILED_RUNTIME_METRICS:-0}"
 if [ "${STREAMING_TOOL_CALL}" != "0" ] && [ "${STREAMING_TOOL_CALL}" != "1" ]; then
   echo "ERROR: STREAMING_TOOL_CALL must be 0 or 1." >&2
@@ -105,6 +109,18 @@ if [ "${STREAMING_INCREMENTAL_TOKENIZER_ONLY}" != "0" ] && [ "${STREAMING_INCREM
 fi
 if [ "${STREAMING_INCREMENTAL_TOKENIZER_ONLY}" = "1" ] && [ "${STREAMING_TOOL_CALL}" != "1" ]; then
   echo "ERROR: STREAMING_INCREMENTAL_TOKENIZER_ONLY requires STREAMING_TOOL_CALL=1." >&2
+  exit 1
+fi
+if [ "${EXACT_INCREMENTAL_TOKENIZER}" != "0" ] && [ "${EXACT_INCREMENTAL_TOKENIZER}" != "1" ]; then
+  echo "ERROR: EXACT_INCREMENTAL_TOKENIZER must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${EXACT_INCREMENTAL_TOKENIZER}" = "1" ] && [ "${STREAMING_INCREMENTAL_TOKENIZER_ONLY}" != "1" ]; then
+  echo "ERROR: EXACT_INCREMENTAL_TOKENIZER requires STREAMING_INCREMENTAL_TOKENIZER_ONLY=1." >&2
+  exit 1
+fi
+if ! [[ "${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL must be a positive integer." >&2
   exit 1
 fi
 if [ "${DETAILED_RUNTIME_METRICS}" != "0" ] && [ "${DETAILED_RUNTIME_METRICS}" != "1" ]; then
@@ -131,6 +147,11 @@ if [ "${STREAMING_INCREMENTAL_TOKENIZER_ONLY}" = "1" ]; then
   STREAMING_TOOL_CALL_TAG="-streamtokenizer"
 else
   STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED=False
+fi
+if [ "${EXACT_INCREMENTAL_TOKENIZER}" = "1" ]; then
+  EXACT_INCREMENTAL_TOKENIZER_ENABLED=True
+else
+  EXACT_INCREMENTAL_TOKENIZER_ENABLED=False
 fi
 if [ "${SKIP_TRAINING}" = "1" ]; then
   TP=8; EP=8; CP=1; PP=1; ETP=1     # model_parallel = 8 (fits 1 node), train_DP=1
@@ -361,6 +382,8 @@ echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
 echo "Streaming tokenizer-only: ${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED}"
 echo "Detailed OpenHands runtime metrics: ${DETAILED_RUNTIME_METRICS_ENABLED}"
 echo "vLLM streaming prefill: ${VLLM_STREAMING_TOOL_CALL_ENABLED}"
+echo "Exact incremental tokenizer: ${EXACT_INCREMENTAL_TOKENIZER_ENABLED}"
+echo "Incremental tokenizer checkpoint interval: ${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL}"
 echo "Streaming snapshot poll interval: ${SNAPSHOT_POLL_INTERVAL_SECONDS}s"
 if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ]; then
   echo "Streaming min chunk chars: ${STREAMING_MIN_CHUNK_CHARS}"
@@ -503,9 +526,13 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   policy.generation.vllm_cfg.skip_tokenizer_init=False \
   policy.generation.vllm_cfg.streaming_tool_call.enabled=${VLLM_STREAMING_TOOL_CALL_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.tokenizer_only=${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.exact_incremental_tokenizer=${EXACT_INCREMENTAL_TOKENIZER_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.incremental_tokenizer_checkpoint_interval=${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL} \
   policy.generation.vllm_cfg.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
   env.nemo_gym.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
   env.nemo_gym.streaming_tool_call.tokenizer_only=${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED} \
+  env.nemo_gym.streaming_tool_call.exact_incremental_tokenizer=${EXACT_INCREMENTAL_TOKENIZER_ENABLED} \
+  env.nemo_gym.streaming_tool_call.incremental_tokenizer_checkpoint_interval=${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL} \
   env.nemo_gym.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
   ++env.nemo_gym.detailed_runtime_metrics=${DETAILED_RUNTIME_METRICS_ENABLED} \
   loss_fn.reference_policy_kl_penalty=${KL} \
