@@ -274,6 +274,45 @@ def _patch_nsight_file():
 _patch_nsight_file()
 
 
+def _patch_transformers_tokenizer_class_set():
+    """Undo the transformers block on deepseek_v3 tokenizers.
+
+    Root cause: transformers 5.4-5.11 lists "deepseek_v3" in two internal
+    registries -- MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (a set) and
+    TOKENIZER_MAPPING_NAMES (a dict pinning it to "TokenizersBackend"). Together
+    they force the fast tokenizer backend and suppress trust_remote_code, so
+    AutoTokenizer can only load via a local tokenizer.json. Models like
+    Moonlight-16B-A3B ship no tokenizer.json (only tiktoken.model + a remote-code
+    TikTokenTokenizer), so offline loading fails.
+
+    Removing both entries restores the trust_remote_code / auto_map path.
+    discard/pop-with-default are no-ops when the entries are absent, so this is
+    safe on any transformers version in the currently-supported range.
+    """
+    import transformers
+
+    # This whole patch exists only because Megatron-Bridge caps the transformers
+    # upper bound below 5.9 today, which forces us onto a transformers version
+    # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
+    # its transformers upper bound to >=5.12, we can drop this workaround.
+    assert transformers.__version__ < "5.12.0", (
+        f"transformers {transformers.__version__} detected. "
+        "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
+        "Check if the upstream fix now applies and remove this patch if so."
+    )
+
+    from transformers.models.auto.tokenization_auto import (
+        MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
+        TOKENIZER_MAPPING_NAMES,
+    )
+
+    MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
+    TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
+
+
+_patch_transformers_tokenizer_class_set()
+
+
 # Need to set PYTHONPATH to include transformers downloaded modules.
 # Assuming the cache directory is the same cross venvs.
 def patch_transformers_module_dir(env_vars: dict[str, str]):
