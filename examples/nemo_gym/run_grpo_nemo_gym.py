@@ -53,6 +53,16 @@ from nemo_rl.utils.config import (
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
+def _select_trainer(master_config: MasterConfig):
+    """Select the TQ-mediated synchronous trainer when configured."""
+    dp_cfg = master_config.data_plane
+    if dp_cfg is not None and dp_cfg.enabled:
+        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+        return grpo_train_sync
+    return grpo_train
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
@@ -196,6 +206,17 @@ The validation set you pass in will directly be used for validation with no addi
         config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
     )
 
+    dp_cfg = config.data_plane
+    if dp_cfg is not None and dp_cfg.enabled:
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def _make_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=dp_cfg)
+
+        policy_factory = _make_policy
+    else:
+        policy_factory = None
+
     (
         policy,
         policy_generation,
@@ -210,7 +231,13 @@ The validation set you pass in will directly be used for validation with no addi
         master_config,
         teacher_worker_groups,
         alias_to_group_alias,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
+    ) = setup(
+        config,
+        tokenizer,
+        train_dataset,
+        val_dataset,
+        policy_factory=policy_factory,
+    )
 
     # NeMo-Gym is spun up inside setup() (overlapped with vLLM model load).
     # Bind task_to_env and val_task_to_env for the nemo_gym env.
@@ -284,8 +311,8 @@ The validation set you pass in will directly be used for validation with no addi
     else:
         print("🚀 Running synchronous GRPO training")
 
-        # Run standard GRPO training
-        grpo_train(
+        trainer = _select_trainer(master_config)
+        trainer(
             policy,
             policy_generation,
             dataloader,

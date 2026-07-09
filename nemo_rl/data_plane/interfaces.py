@@ -37,55 +37,70 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
+from typing import Annotated, Any, Callable, Literal, Sequence
 
+from pydantic import BaseModel, Field
 from tensordict import TensorDict
 
 
-class DataPlaneConfig(TypedDict):
+class ObservabilityConfig(BaseModel, extra="allow"):
+    """Optional data-plane operation metrics middleware."""
+
+    enabled: bool = False
+    # Runtime-only injection; callable values are intentionally omitted from
+    # serialized config and YAML exemplars.
+    callback: Callable[[dict[str, Any]], None] | None = Field(
+        default=None, exclude=True
+    )
+
+
+class RolloutWriterConfig(BaseModel, extra="allow"):
+    """Direct NeMo Gym rollout writer configuration.
+
+    Attributes:
+        enabled: Enable vLLM-to-data-plane staging writes.
+        mode: ``shadow`` compares direct candidates with the legacy writer;
+            ``direct`` makes the finalizer authoritative.
+        staging_partition: Partition containing uncommitted per-turn deltas.
+        finalize_timeout_s: Maximum time to wait for expected staging rows.
+        cursor_ttl_s: Lifetime of inactive cursor state.
+        max_pending_writes_per_worker: Reserved bound for the deferred async
+            writer; synchronous mode does not enqueue writes.
+        require_signed_context: Reject unsigned rollout contexts.
+    """
+
+    enabled: bool = False
+    mode: Literal["shadow", "direct"] = "shadow"
+    staging_partition: str = "rollout_staging"
+    finalize_timeout_s: Annotated[float, Field(gt=0)] = 30.0
+    cursor_ttl_s: Annotated[float, Field(gt=0)] = 3600.0
+    max_pending_writes_per_worker: Annotated[int, Field(gt=0)] = 64
+    require_signed_context: bool = True
+
+
+class DataPlaneConfig(BaseModel, extra="allow"):
     """Feature-gated config; defaults to disabled.
 
     ``backend`` is the storage backend *inside* TransferQueue; it is owned by
     the TQ adapter, not by NeMo-RL. ``impl`` selects which adapter we go
     through.
 
-    Required keys (always set in exemplar YAML — never defaulted in code):
-    ``enabled``, ``impl``, ``backend``, ``storage_capacity``,
-    ``num_storage_units``, ``claim_meta_poll_interval_s``,
-    ``global_segment_size``, ``local_buffer_size``.
-
-    ``global_segment_size`` / ``local_buffer_size`` are only *read* when
-    ``backend == "mooncake_cpu"``; the simple backend ignores them.
-    They are required (not NotRequired) so the YAML carries the full
-    schema and there are no hidden Python defaults.
+    Defaults live on this model and are mirrored in the exemplar YAML. The
+    mooncake sizing fields are ignored by the simple backend.
     """
 
-    enabled: bool
-    impl: Literal["transfer_queue"]
-    backend: Literal["simple", "mooncake_cpu"]
-    storage_capacity: int
-    num_storage_units: int
-    claim_meta_poll_interval_s: float
-    global_segment_size: int
-    local_buffer_size: int
-    controller_address: NotRequired[str]
-    ack_timeout_ms: NotRequired[int]
-    observability: NotRequired["ObservabilityConfig"]
-
-
-class ObservabilityConfig(TypedDict):
-    """Optional middleware that records per-op metrics on the client.
-
-    Off by default. When ``enabled=True`` the factory wraps the chosen
-    adapter with :class:`MetricsDataPlaneClient`. ``callback`` is
-    injected programmatically (callables don't round-trip through
-    YAML) — set ``cfg["observability"]["callback"] = my_fn`` before
-    :func:`build_data_plane_client` to plug into wandb / file / log.
-    Default callback prints one line per op for debug.
-    """
-
-    enabled: bool
-    callback: NotRequired[Callable[[dict[str, Any]], None]]
+    enabled: bool = False
+    impl: Literal["transfer_queue"] = "transfer_queue"
+    backend: Literal["simple", "mooncake_cpu"] = "simple"
+    storage_capacity: Annotated[int, Field(gt=0)] = 1_000_000
+    num_storage_units: Annotated[int, Field(gt=0)] = 2
+    claim_meta_poll_interval_s: Annotated[float, Field(gt=0)] = 0.5
+    global_segment_size: Annotated[int, Field(gt=0)] = 549_755_813_888
+    local_buffer_size: Annotated[int, Field(gt=0)] = 68_719_476_736
+    controller_address: str | None = None
+    ack_timeout_ms: Annotated[int, Field(gt=0)] | None = None
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    rollout_writer: RolloutWriterConfig = Field(default_factory=RolloutWriterConfig)
 
 
 @dataclass

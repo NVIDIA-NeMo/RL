@@ -37,8 +37,8 @@ def _select_trainer(master_config: MasterConfig):
     Factored out so test_architecture_invariants can verify dispatch
     without the full setup() path.
     """
-    dp_cfg = master_config.data_plane or {}
-    if dp_cfg.get("enabled", False):
+    dp_cfg = master_config.data_plane
+    if dp_cfg is not None and dp_cfg.enabled:
         from nemo_rl.algorithms.grpo_sync import grpo_train_sync
 
         print("🚀 Running synchronous GRPO training (TransferQueue)")
@@ -122,8 +122,8 @@ def main() -> None:
     # Pick the policy factory at the launcher level so the legacy trainer
     # stays data-plane-agnostic (architectural invariant — see
     # tests/data_plane/unit/test_architecture_invariants.py).
-    _dp_cfg = config.data_plane or {}
-    if _dp_cfg.get("enabled", False):
+    _dp_cfg = config.data_plane
+    if _dp_cfg is not None and _dp_cfg.enabled:
         from nemo_rl.models.policy.tq_policy import TQPolicy
 
         def _make_policy(**kwargs):

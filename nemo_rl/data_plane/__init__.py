@@ -13,8 +13,8 @@
 # limitations under the License.
 """NeMo-RL data-plane package.
 
-The public surface is intentionally tiny: an ABC, a meta dataclass, a
-config TypedDict, and a factory. Everything else is an implementation
+The public surface is intentionally tiny: an ABC, a meta dataclass,
+validated config models, and a factory. Everything else is an implementation
 detail of a specific adapter.
 """
 
@@ -24,6 +24,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
     KVBatchMeta,
+    RolloutWriterConfig,
 )
 from nemo_rl.data_plane.observability import MetricsDataPlaneClient, log_event
 
@@ -31,6 +32,7 @@ __all__ = [
     "DataPlaneClient",
     "DataPlaneConfig",
     "KVBatchMeta",
+    "RolloutWriterConfig",
     "MetricsDataPlaneClient",
     "build_data_plane_client",
     "log_event",

@@ -477,8 +477,18 @@ data_plane:
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
   global_segment_size: 549755813888  # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
-  # observability:                    # NotRequired
-  #   enabled: false
+  controller_address: null
+  ack_timeout_ms: null
+  observability:
+    enabled: false
+  rollout_writer:
+    enabled: false                    # opt in to direct NeMo Gym staging writes
+    mode: shadow                      # shadow compares; direct is authoritative
+    staging_partition: rollout_staging
+    finalize_timeout_s: 30
+    cursor_ttl_s: 3600
+    max_pending_writes_per_worker: 64 # reserved for the deferred async writer
+    require_signed_context: true
 
 # Multi-Teacher On-Policy Distillation (MOPD): distills from one or more teacher
 # models into the policy via token-level teacher-minus-student logprob advantages,

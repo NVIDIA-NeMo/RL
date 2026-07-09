@@ -123,6 +123,7 @@ policy:
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
     defer_fp32_logits: false
+    moe_per_layer_logging: false
     moe_permute_fusion: true
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
@@ -340,3 +341,25 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 1  # Single node by default; set to 2+ for multi-node training
+
+data_plane:
+  enabled: false
+  impl: transfer_queue
+  backend: simple
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888
+  local_buffer_size: 68719476736
+  controller_address: null
+  ack_timeout_ms: null
+  observability:
+    enabled: true
+  rollout_writer:
+    enabled: false
+    mode: shadow
+    staging_partition: rollout_staging
+    finalize_timeout_s: 30
+    cursor_ttl_s: 3600
+    max_pending_writes_per_worker: 64
+    require_signed_context: true

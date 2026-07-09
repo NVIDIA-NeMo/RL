@@ -102,6 +102,7 @@ class VllmGeneration(GenerationInterface):
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load
+        self._rollout_metrics_enabled = False
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -512,6 +513,144 @@ class VllmGeneration(GenerationInterface):
 
         # Save device UUIDs
         self.device_uuids = self._report_device_id()
+
+    def configure_rollout_writer(self, dp_cfg, cursor, secret: bytes) -> None:
+        """Attach direct rollout writers after the data plane is available."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "configure_rollout_writer",
+            dp_cfg=dp_cfg,
+            cursor=cursor,
+            secret=secret,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def configure_rollout_metrics(self, enabled: bool) -> None:
+        """Enable identical transport measurements for legacy and direct modes."""
+        self._rollout_metrics_enabled = enabled
+        futures = self.worker_group.run_all_workers_single_data(
+            "configure_rollout_metrics",
+            enabled=enabled,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def clear_rollout_transport_metrics(self) -> None:
+        """Clear per-step transport metrics on each model-owner worker."""
+        if not self._rollout_metrics_enabled:
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_rollout_transport_metrics",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def get_rollout_transport_metrics(self) -> dict[str, Any]:
+        """Aggregate per-worker HTTP, cursor, staging, CPU, and RSS metrics."""
+        if not self._rollout_metrics_enabled:
+            return {}
+        futures: list[ray.ObjectRef] = []
+        for dp_idx in range(self.worker_group.dp_size):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+            futures.append(
+                self.worker_group.run_single_worker_single_data(
+                    "get_rollout_transport_metrics", worker_idx=worker_idx
+                )
+            )
+        workers = [metrics for metrics in ray.get(futures) if metrics]
+        aggregate: dict[str, Any] = {
+            "workers": workers,
+            "http_request_count": 0,
+            "http_response_count": 0,
+            "encoded_request_bytes": 0,
+            "encoded_response_bytes": 0,
+            "encoded_response_bytes_without_token_ids": 0,
+            "encoded_response_bytes_without_logprobs": 0,
+            "encoded_response_base_bytes": 0,
+            "http_request_ms": [],
+            "chat_request_count": 0,
+            "chat_response_count": 0,
+            "chat_encoded_request_bytes": 0,
+            "chat_encoded_response_bytes": 0,
+            "chat_encoded_response_bytes_without_token_ids": 0,
+            "chat_encoded_response_bytes_without_logprobs": 0,
+            "chat_encoded_response_base_bytes": 0,
+            "chat_request_ms": [],
+            "tokenize_request_count": 0,
+            "tokenize_response_count": 0,
+            "tokenize_encoded_request_bytes": 0,
+            "tokenize_encoded_response_bytes": 0,
+            "tokenize_encoded_response_bytes_without_token_ids": 0,
+            "tokenize_encoded_response_bytes_without_logprobs": 0,
+            "tokenize_encoded_response_base_bytes": 0,
+            "tokenize_request_ms": [],
+            "last_response_completed_monotonic_s": 0.0,
+            "cursor_reserve_ms": [],
+            "staging_put_ms": [],
+            "staging_put_bytes": 0,
+            "cursor_commit_ms": [],
+            "process_cpu_s": 0.0,
+            "peak_rss_bytes": 0,
+            "data_plane_events": [],
+            "max_client_peak_bytes_outstanding": 0,
+        }
+        sample_workers: dict[str, set[str]] = defaultdict(set)
+        for worker in workers:
+            worker_id = worker["worker_id"]
+            for sample_id in worker.get("sample_ids", []):
+                sample_workers[sample_id].add(worker_id)
+            for name in (
+                "http_request_count",
+                "http_response_count",
+                "encoded_request_bytes",
+                "encoded_response_bytes",
+                "encoded_response_bytes_without_token_ids",
+                "encoded_response_bytes_without_logprobs",
+                "encoded_response_base_bytes",
+                "chat_request_count",
+                "chat_response_count",
+                "chat_encoded_request_bytes",
+                "chat_encoded_response_bytes",
+                "chat_encoded_response_bytes_without_token_ids",
+                "chat_encoded_response_bytes_without_logprobs",
+                "chat_encoded_response_base_bytes",
+                "tokenize_request_count",
+                "tokenize_response_count",
+                "tokenize_encoded_request_bytes",
+                "tokenize_encoded_response_bytes",
+                "tokenize_encoded_response_bytes_without_token_ids",
+                "tokenize_encoded_response_bytes_without_logprobs",
+                "tokenize_encoded_response_base_bytes",
+                "staging_put_bytes",
+                "process_cpu_s",
+            ):
+                aggregate[name] += worker.get(name, 0)
+            aggregate["peak_rss_bytes"] = max(
+                aggregate["peak_rss_bytes"], worker.get("peak_rss_bytes", 0)
+            )
+            aggregate["last_response_completed_monotonic_s"] = max(
+                aggregate["last_response_completed_monotonic_s"],
+                worker.get("last_response_completed_monotonic_s", 0.0),
+            )
+            aggregate["max_client_peak_bytes_outstanding"] = max(
+                aggregate["max_client_peak_bytes_outstanding"],
+                worker.get("data_plane_snapshot", {}).get("peak_bytes_outstanding", 0),
+            )
+            for name in (
+                "http_request_ms",
+                "chat_request_ms",
+                "tokenize_request_ms",
+                "cursor_reserve_ms",
+                "staging_put_ms",
+                "cursor_commit_ms",
+                "data_plane_events",
+            ):
+                aggregate[name].extend(worker.get(name, []))
+        aggregate["distinct_workers_per_sample"] = {
+            sample_id: len(worker_ids)
+            for sample_id, worker_ids in sample_workers.items()
+        }
+        return aggregate
 
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting
@@ -1040,6 +1179,7 @@ class VllmGeneration(GenerationInterface):
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting."""
         self.clear_vllm_logger_metrics()
+        self.clear_rollout_transport_metrics()
 
     def get_logger_metrics(self) -> dict[str, Any]:
         """Get logger metrics for performance reporting."""

@@ -3486,9 +3486,11 @@ def async_grpo_train(
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
-    if router_replay_enabled(master_config.policy) and (
-        master_config.data_plane or {}
-    ).get("enabled", False):
+    if (
+        router_replay_enabled(master_config.policy)
+        and master_config.data_plane is not None
+        and master_config.data_plane.enabled
+    ):
         raise NotImplementedError(
             "policy.router_replay.enabled=true with async GRPO is currently "
             "supported only when data_plane.enabled=false. Async + TQ support "

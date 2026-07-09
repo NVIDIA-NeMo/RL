@@ -135,6 +135,14 @@ Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent reco
 Train Qwen3-30B-A3B-Thinking into a SWE agent with a pivot stage plus end-to-end agentic RL on SWE-bench.
 :::
 
+:::{grid-item-card} {octicon}`briefcase` Workplace Assistant GRPO
+:link: guides/grpo-workplace-assistant-8gpu
+:link-type: doc
+
+Understand the direct vLLM-to-TransferQueue rollout writer and run controlled
+legacy, shadow, and direct Workplace Assistant experiments on eight GPUs.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
@@ -276,6 +284,7 @@ guides/grpo.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
+guides/grpo-workplace-assistant-8gpu.md
 guides/grpo-audio.md
 guides/grpo-audio-visual.md
 guides/rm.md

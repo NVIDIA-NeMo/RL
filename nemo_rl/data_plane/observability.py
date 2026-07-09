@@ -28,6 +28,7 @@ bytes currently held in TQ, i.e. put minus cleared) and
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import asdict, dataclass
 from time import monotonic
 from typing import Any, Callable, Literal, TypedDict
@@ -94,6 +95,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._inner = inner
         self._on_event = on_event or (lambda _: None)
         self._stats = DataPlaneStats()
+        self._events: list[DataPlaneEvent] = []
+        self._lock = threading.Lock()
         # Nested per-partition / per-key live byte counts. Populated on
         # successful ``put_samples``; popped on successful ``clear_samples``.
         # Bounded by the live key population, not cumulative traffic.
@@ -101,15 +104,27 @@ class MetricsDataPlaneClient(DataPlaneClient):
 
     def snapshot(self) -> dict[str, Any]:
         """Return cumulative totals plus live byte / key outstanding counts."""
-        out = asdict(self._stats)
-        out["n_keys_outstanding"] = sum(
-            len(d) for d in self._bytes_by_partition.values()
-        )
+        with self._lock:
+            out = asdict(self._stats)
+            out["n_keys_outstanding"] = sum(
+                len(d) for d in self._bytes_by_partition.values()
+            )
         return out
+
+    def events_snapshot(self) -> list[DataPlaneEvent]:
+        """Return a copy of all operation events observed by this client."""
+        with self._lock:
+            return [dict(event) for event in self._events]  # type: ignore[misc]
+
+    def clear_events(self) -> None:
+        """Clear retained operation events without resetting lifetime counters."""
+        with self._lock:
+            self._events.clear()
 
     def bytes_outstanding_by_partition(self) -> dict[str, int]:
         """Per-partition breakdown of currently-held bytes."""
-        return {p: sum(d.values()) for p, d in self._bytes_by_partition.items()}
+        with self._lock:
+            return {p: sum(d.values()) for p, d in self._bytes_by_partition.items()}
 
     def _record_put(self, partition_id: str, keys: list[str], n_bytes: int) -> None:
         """Attribute put bytes per key so a later ``clear_samples`` can subtract.
@@ -124,14 +139,15 @@ class MetricsDataPlaneClient(DataPlaneClient):
         """
         if not keys or n_bytes <= 0:
             return
-        per_key, remainder = divmod(n_bytes, len(keys))
-        partition_dict = self._bytes_by_partition.setdefault(partition_id, {})
-        for i, key in enumerate(keys):
-            share = per_key + (1 if i < remainder else 0)
-            partition_dict[key] = partition_dict.get(key, 0) + share
-        self._stats.bytes_outstanding += n_bytes
-        if self._stats.bytes_outstanding > self._stats.peak_bytes_outstanding:
-            self._stats.peak_bytes_outstanding = self._stats.bytes_outstanding
+        with self._lock:
+            per_key, remainder = divmod(n_bytes, len(keys))
+            partition_dict = self._bytes_by_partition.setdefault(partition_id, {})
+            for i, key in enumerate(keys):
+                share = per_key + (1 if i < remainder else 0)
+                partition_dict[key] = partition_dict.get(key, 0) + share
+            self._stats.bytes_outstanding += n_bytes
+            if self._stats.bytes_outstanding > self._stats.peak_bytes_outstanding:
+                self._stats.peak_bytes_outstanding = self._stats.bytes_outstanding
 
     def _record_clear(self, partition_id: str, keys: list[str] | None) -> None:
         """Reverse the put accounting for ``keys``.
@@ -143,19 +159,20 @@ class MetricsDataPlaneClient(DataPlaneClient):
             partition_id: Partition the keys were dropped from.
             keys: Uids dropped; ``None`` means the whole partition was cleared.
         """
-        partition_dict = self._bytes_by_partition.get(partition_id)
-        if partition_dict is None:
-            return
-        if keys is None:
-            freed = sum(partition_dict.values())
-            del self._bytes_by_partition[partition_id]
-        else:
-            freed = 0
-            for key in keys:
-                freed += partition_dict.pop(key, 0)
-            if not partition_dict:
+        with self._lock:
+            partition_dict = self._bytes_by_partition.get(partition_id)
+            if partition_dict is None:
+                return
+            if keys is None:
+                freed = sum(partition_dict.values())
                 del self._bytes_by_partition[partition_id]
-        self._stats.bytes_outstanding -= freed
+            else:
+                freed = 0
+                for key in keys:
+                    freed += partition_dict.pop(key, 0)
+                if not partition_dict:
+                    del self._bytes_by_partition[partition_id]
+            self._stats.bytes_outstanding -= freed
 
     def _run(
         self,
@@ -215,16 +232,18 @@ class MetricsDataPlaneClient(DataPlaneClient):
             "wall_ms": (monotonic() - t0) * 1000.0,
             "status": status,
         }
+        with self._lock:
+            self._events.append(event)
+            if status == "ok":
+                self._stats.total_bytes += n_bytes
+                self._stats.total_keys += n_keys
+                self._stats.total_ops += 1
+                if op == "put" and n_keys:
+                    per_key = n_bytes // n_keys
+                    self._stats.last_put_bytes_per_key = per_key
+                    if per_key > self._stats.max_bytes_per_key_seen:
+                        self._stats.max_bytes_per_key_seen = per_key
         self._on_event(event)
-        if status == "ok":
-            self._stats.total_bytes += n_bytes
-            self._stats.total_keys += n_keys
-            self._stats.total_ops += 1
-            if op == "put" and n_keys:
-                per_key = n_bytes // n_keys
-                self._stats.last_put_bytes_per_key = per_key
-                if per_key > self._stats.max_bytes_per_key_seen:
-                    self._stats.max_bytes_per_key_seen = per_key
 
     def register_partition(
         self,

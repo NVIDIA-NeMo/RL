@@ -40,11 +40,13 @@ import ray
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane import KVBatchMeta, build_data_plane_client
 from nemo_rl.data_plane.column_io import read_columns, round_up, write_columns
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GLOBAL_FORWARD_PAD_SEQLEN,
     LP_SEED_FIELDS,
+    ROLLOUT_STAGING_FIELDS,
     fields_with_optional_routed_experts,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -85,7 +87,7 @@ class TQPolicy(Policy):
     """TQ-mediated counterpart to :class:`Policy`.
 
     Constructor accepts an additional ``dp_cfg`` (the
-    ``master_config["data_plane"]`` dict). Bootstraps the controller on
+    validated ``master_config.data_plane`` model). Bootstraps the controller on
     the driver and forwards ``setup_data_plane(dp_cfg)`` to every worker
     so they can attach as clients (``bootstrap=False``).
 
@@ -99,7 +101,7 @@ class TQPolicy(Policy):
     def __init__(
         self,
         *args: Any,
-        dp_cfg: dict[str, Any],
+        dp_cfg: DataPlaneConfig,
         tq_partition_id: str = "train",
         **kwargs: Any,
     ) -> None:
@@ -166,6 +168,18 @@ class TQPolicy(Policy):
             num_samples=num_samples,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
             grpo_group_size=group_size,
+        )
+
+    def prepare_rollout_writer(self) -> None:
+        """Register the direct writer's staging schema before generation."""
+        writer_cfg = self.dp_cfg.rollout_writer
+        if not writer_cfg.enabled:
+            return
+        self.dp_client.register_partition(
+            partition_id=writer_cfg.staging_partition,
+            fields=list(ROLLOUT_STAGING_FIELDS),
+            num_samples=self.dp_cfg.storage_capacity,
+            consumer_tasks=[],
         )
 
     def prepare_val_partition(

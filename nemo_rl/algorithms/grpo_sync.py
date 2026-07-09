@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import gc
 import os
+import secrets
 import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -43,6 +44,11 @@ import numpy as np
 import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
+
+from nemo_rl.algorithms.advantage_estimator import (
+    GDPOAdvantageEstimator,
+    GRPOAdvantageEstimator,
+)
 
 # Re-imports from grpo so this file is a thin trainer-only fork.
 from nemo_rl.algorithms.grpo import (
@@ -75,6 +81,7 @@ from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
+from nemo_rl.experience.rollout_writer import RolloutCursorRegistry
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -112,6 +119,22 @@ def _raise_if_message_level_advantage_penalties_enabled(
         "data_plane.enabled=true yet. Disable "
         f"{', '.join(f'grpo.{key}' for key in unsupported_keys)} or use the "
         "legacy GRPO trainer."
+    )
+
+
+def _raise_if_rollout_writer_advantage_estimator_unsupported(
+    advantage_estimator: Any,
+) -> None:
+    """Reject estimators that do not exclude invalid rollout-writer rows."""
+    if isinstance(
+        advantage_estimator,
+        (GRPOAdvantageEstimator, GDPOAdvantageEstimator),
+    ):
+        return
+    raise ValueError(
+        "data_plane.rollout_writer currently supports only the GRPO and GDPO "
+        "advantage estimators because rejected trajectories must be excluded "
+        "from every baseline and normalization statistic"
     )
 
 
@@ -276,6 +299,7 @@ def validate_sync(
                     finish_generation=False,
                     task_to_env_override=val_task_to_env,
                     carry_keys=["total_reward", "turn_roles", "turn_contents"],
+                    weight_version=step,
                 )
             )
             roles = driver_carry["turn_roles"]
@@ -443,7 +467,7 @@ def grpo_train_sync(
     # entry-guard so users running this trainer with the legacy policy
     # see a clear error rather than an opaque AttributeError.
     dp_cfg = master_config.data_plane
-    if not dp_cfg or not dp_cfg["enabled"]:
+    if not dp_cfg or not dp_cfg.enabled:
         raise ValueError(
             "grpo_train_sync requires master_config['data_plane']['enabled']=True. "
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer if you don't "
@@ -464,6 +488,47 @@ def grpo_train_sync(
             "grpo_train_sync requires a TQ-mediated policy "
             "(nemo_rl.models.policy.tq_policy.TQPolicy). examples/run_grpo.py "
             "constructs it via the policy_factory when data_plane.enabled=True."
+        )
+
+    rollout_cursor = None
+    rollout_secret = None
+    writer_cfg = dp_cfg.rollout_writer
+    if dp_cfg.observability.enabled:
+        configure_rollout_metrics = getattr(
+            policy_generation, "configure_rollout_metrics", None
+        )
+        if configure_rollout_metrics is not None:
+            configure_rollout_metrics(enabled=True)
+    if writer_cfg.enabled:
+        _raise_if_rollout_writer_advantage_estimator_unsupported(adv_estimator)
+        generation_cfg = master_config.policy["generation"]
+        if not _should_use_nemo_gym(master_config):
+            raise ValueError("data_plane.rollout_writer requires NeMo Gym")
+        if (
+            generation_cfg["backend"] != "vllm"
+            or not generation_cfg["vllm_cfg"]["async_engine"]
+        ):
+            raise ValueError(
+                "data_plane.rollout_writer requires the async vLLM HTTP backend"
+            )
+        if master_config.grpo.get("async_grpo", {}).get("enabled"):
+            raise ValueError("data_plane.rollout_writer supports synchronous GRPO only")
+        if (master_config.policy.get("router_replay") or {}).get("enabled"):
+            raise ValueError(
+                "data_plane.rollout_writer does not yet support router replay"
+            )
+        if not writer_cfg.require_signed_context and writer_cfg.mode == "direct":
+            raise ValueError("direct rollout writes require signed contexts")
+        policy.prepare_rollout_writer()
+        rollout_secret = secrets.token_bytes(32)
+        rollout_cursor = RolloutCursorRegistry.remote(
+            lease_ttl_s=writer_cfg.finalize_timeout_s,
+            cursor_ttl_s=writer_cfg.cursor_ttl_s,
+        )
+        if not hasattr(policy_generation, "configure_rollout_writer"):
+            raise ValueError("generation backend cannot attach a rollout writer")
+        policy_generation.configure_rollout_writer(
+            dp_cfg, rollout_cursor, rollout_secret
         )
 
     # TQ-resident tensors live on CPU; baseline/std are computed on the
@@ -492,6 +557,8 @@ def grpo_train_sync(
         task_to_env=task_to_env,
         master_config=master_config,
         dp_cfg=dp_cfg,
+        rollout_cursor=rollout_cursor,
+        rollout_secret=rollout_secret,
     )
 
     if val_at_start and current_step == 0:
@@ -653,6 +720,7 @@ def grpo_train_sync(
                             partition_id=policy.tq_partition_id,
                             group_size=master_config.grpo["num_generations_per_prompt"],
                             first_iter=(dynamic_sampling_num_gen_batches == 1),
+                            weight_version=total_steps,
                         )
                     )
 
@@ -683,11 +751,17 @@ def grpo_train_sync(
                             driver_carry,
                             master_config.grpo["reward_shaping"],
                         )
+                    validity = driver_carry["trajectory_valid_mask"]
+                    driver_carry["total_reward"] = (
+                        driver_carry["total_reward"] * validity
+                    )
+                    for reward_key in get_gdpo_reward_component_keys(driver_carry):
+                        driver_carry[reward_key] = driver_carry[reward_key] * validity
                     driver_carry["baseline"], driver_carry["std"] = (
                         calculate_baseline_and_std_per_prompt(
                             driver_carry["prompt_ids_for_adv"],
                             driver_carry["total_reward"],
-                            torch.ones_like(driver_carry["total_reward"]),
+                            driver_carry["trajectory_valid_mask"],
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
@@ -771,6 +845,7 @@ def grpo_train_sync(
                 input_lengths = driver_carry["input_lengths"]
                 prompt_ids_for_adv = driver_carry["prompt_ids_for_adv"]
                 loss_multiplier = driver_carry["loss_multiplier"]
+                trajectory_valid_mask = driver_carry["trajectory_valid_mask"]
                 truncated = driver_carry["truncated"]
                 length = driver_carry["length"]
 
@@ -861,11 +936,16 @@ def grpo_train_sync(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
+                        validity_mask=trajectory_valid_mask,
                         repeated_batch=adv_inputs,
                         logprobs_policy=prev_logprobs,
                         logprobs_reference=reference_policy_logprobs,
                     )
                     del prompt_ids_for_adv
+
+                    # Estimators also apply this mask internally, but keep the
+                    # trainer boundary fail-safe before clipping and writeback.
+                    advantages = advantages * trajectory_valid_mask.unsqueeze(-1)
 
                     _log_mixed_rewards_and_advantages_information(
                         logger=logger,

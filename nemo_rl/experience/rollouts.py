@@ -26,6 +26,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 import ray
 import torch
 from pydantic import BaseModel
@@ -1742,6 +1743,8 @@ def run_async_nemo_gym_rollout(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
+    direct_mode: bool = False,
+    collect_transport_metrics: bool = False,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
@@ -1806,23 +1809,52 @@ def run_async_nemo_gym_rollout(
 
     with timer.time(f"{timer_prefix}/run_rollouts"):
         nemo_gym_environment = task_to_env["nemo_gym"]
-        results, rollout_loop_timing_metrics = ray.get(
+        rollout_result = ray.get(
             nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
+                nemo_gym_rows,
+                tokenizer,
+                timer_prefix,
+                direct_mode,
+                effort_config,
+                reward_penalty_config,
+                thinking_tags,
+                collect_transport_metrics,
             )
         )
+        if direct_mode:
+            results, rollout_loop_timing_metrics, direct_postprocess = rollout_result
+        else:
+            results, rollout_loop_timing_metrics = rollout_result
+            direct_postprocess = None
 
-        # Tensorize all token ids
-        for r in results:
-            _tensorize_by_key(r["input_message_log"], "token_ids")
-            _tensorize_by_key(r["message_log"], "token_ids")
-            _tensorize_by_key(
-                [m for m in r["message_log"] if m["role"] == "assistant"],
-                "generation_logprobs",
-            )
+        if not direct_mode:
+            # Tensorize all token ids
+            def tensorize_results() -> None:
+                for r in results:
+                    _tensorize_by_key(r["input_message_log"], "token_ids")
+                    _tensorize_by_key(r["message_log"], "token_ids")
+                    _tensorize_by_key(
+                        [m for m in r["message_log"] if m["role"] == "assistant"],
+                        "generation_logprobs",
+                    )
+
+            if collect_transport_metrics:
+                with timer.time(f"{timer_prefix}/legacy_tensorize"):
+                    tensorize_results()
+            else:
+                tensorize_results()
 
     # Length-based reward shaping for low-effort prompts
-    shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
+    if direct_mode:
+        assert direct_postprocess is not None
+        shaping = _EffortShapingMetrics(
+            length_rewards_low=direct_postprocess["length_rewards_low"],
+            rewards_low=direct_postprocess["rewards_low"],
+            low_lengths=direct_postprocess["low_lengths"],
+            high_lengths=direct_postprocess["high_lengths"],
+        )
+    else:
+        shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
     length_rewards_low = shaping.length_rewards_low
     rewards_low = shaping.rewards_low
     low_lengths = shaping.low_lengths
@@ -1831,7 +1863,11 @@ def run_async_nemo_gym_rollout(
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         reward_penalty_config, tokenizer, thinking_tags=thinking_tags
     )
-    penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
+    penalty_counts = (
+        direct_postprocess["penalty_counts"]
+        if direct_mode
+        else apply_reward_penalties(results, resolved_reward_penalty_config)
+    )
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -1848,21 +1884,30 @@ def run_async_nemo_gym_rollout(
             max_total_tokens_per_sample = policy_generation.cfg[
                 "max_total_sequence_length"
             ]
-        all_sample_metrics = [
-            {
-                "total_reward": r["full_result"]["reward"],
-                "assistant_tokens": sum(
-                    len(m["token_ids"])
-                    for m in r["message_log"]
-                    if m["role"] == "assistant"
-                ),
-                "total_tokens": sum(len(m["token_ids"]) for m in r["message_log"]),
-                "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
-                "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
-                == max_total_tokens_per_sample,
-            }
-            for r in results
-        ]
+        all_sample_metrics = []
+        for r in results:
+            total_tokens = (
+                r["total_tokens"]
+                if direct_mode
+                else sum(len(m["token_ids"]) for m in r["message_log"])
+            )
+            all_sample_metrics.append(
+                {
+                    "total_reward": r["full_result"]["reward"],
+                    "assistant_tokens": r["assistant_tokens"]
+                    if direct_mode
+                    else sum(
+                        len(m["token_ids"])
+                        for m in r["message_log"]
+                        if m["role"] == "assistant"
+                    ),
+                    "total_tokens": total_tokens,
+                    "turn_count": r["turn_count"]
+                    if direct_mode
+                    else sum(1 for m in r["message_log"] if m["role"] == "user"),
+                    "hit_max_tokens": total_tokens == max_total_tokens_per_sample,
+                }
+            )
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
@@ -1945,7 +1990,9 @@ def run_async_nemo_gym_rollout(
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
         {
-            "message_log": [r["input_message_log"] for r in results],
+            "message_log": input_batch["message_log"]
+            if direct_mode
+            else [r["input_message_log"] for r in results],
         }
     )
     batched_flat, _ = batched_message_log_to_flat_message(
@@ -1954,28 +2001,68 @@ def run_async_nemo_gym_rollout(
     )
     input_ids = batched_flat["token_ids"]
 
-    final_batch = BatchedDataDict[DatumSpec](
+    final_batch_data = {
+        "agent_ref": [r["agent_ref"] for r in results],
+        # length is used downstream for mean_prompt_length
+        "length": torch.tensor(
+            [r["initial_prompt_tokens"] for r in results]
+            if direct_mode
+            else [len(r["input_message_log"][0]["token_ids"]) for r in results]
+        ),
+        "loss_multiplier": input_batch["loss_multiplier"],
+        # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
+        # extra_env_info: dict[str, Any]
+        # idx: int
+        # task_name: NotRequired[str]
+        # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
+        # Extra information not in the DatumSpec used by the GRPO algorithm
+        "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
+        # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
+        "truncated": torch.tensor(
+            [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
+        ),
+    }
+    reward_component_keys = sorted(
         {
-            "agent_ref": [r["agent_ref"] for r in results],
-            "message_log": [r["message_log"] for r in results],
-            # length is used downstream for mean_prompt_length
-            "length": torch.tensor(
-                [len(r["input_message_log"][0]["token_ids"]) for r in results]
-            ),
-            "loss_multiplier": input_batch["loss_multiplier"],
-            # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
-            # extra_env_info: dict[str, Any]
-            # idx: int
-            # task_name: NotRequired[str]
-            # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
-            # Extra information not in the DatumSpec used by the GRPO algorithm
-            "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
-            # Add truncated field to match other rollout paths (reusing hit_max_tokens logic)
-            "truncated": torch.tensor(
-                [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
-            ),
+            key
+            for result in results
+            for key in get_gdpo_reward_component_keys(result["full_result"])
         }
     )
+    for key in reward_component_keys:
+        missing_rows = [
+            index
+            for index, result in enumerate(results)
+            if key not in result["full_result"]
+        ]
+        if missing_rows:
+            raise ValueError(
+                f"NeMo Gym reward component {key!r} is missing from rows {missing_rows}"
+            )
+        final_batch_data[key] = torch.tensor(
+            [result["full_result"][key] for result in results]
+        )
+    if direct_mode:
+        final_batch_data.update(
+            {
+                "input_lengths": torch.tensor(
+                    [r["total_tokens"] for r in results], dtype=torch.int64
+                ),
+                "response_token_lengths": torch.tensor(
+                    [r["first_response_tokens"] for r in results],
+                    dtype=torch.int64,
+                ),
+                "turn_roles": np.asarray(
+                    [r["turn_roles"] for r in results], dtype=object
+                ),
+                "turn_contents": np.asarray(
+                    [r["turn_contents"] for r in results], dtype=object
+                ),
+            }
+        )
+    else:
+        final_batch_data["message_log"] = [r["message_log"] for r in results]
+    final_batch = BatchedDataDict[DatumSpec](final_batch_data)
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(

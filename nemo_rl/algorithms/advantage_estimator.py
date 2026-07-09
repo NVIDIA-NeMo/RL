@@ -63,10 +63,13 @@ class GRPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
+        validity_mask = kwargs.get("validity_mask")
+        if validity_mask is None:
+            validity_mask = torch.ones_like(rewards)
         baseline, std = calculate_baseline_and_std_per_prompt(
             prompt_ids,
             rewards,
-            torch.ones_like(rewards),
+            validity_mask,
             leave_one_out_baseline=self.use_leave_one_out_baseline,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
@@ -79,7 +82,7 @@ class GRPOAdvantageEstimator:
                 std.unsqueeze(-1)[non_zero_std_mask] + epsilon
             )
 
-        return advantages.expand(mask.shape)
+        return advantages.expand(mask.shape) * validity_mask.unsqueeze(-1)
 
 
 class GDPOAdvantageEstimator:
@@ -119,7 +122,9 @@ class GDPOAdvantageEstimator:
                 f"This batch has {len(reward_component_keys)} component(s): {reward_component_keys}. "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
-        valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
+        valid = kwargs.get("validity_mask")
+        if valid is None:
+            valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
         leave_one_out = self.use_leave_one_out_baseline
         assert prompt_ids.shape[0] == valid.shape[0], (
             "prompt_ids must match reward batch size; "
@@ -145,12 +150,17 @@ class GDPOAdvantageEstimator:
             advantage_parts.append(adv_k)
 
         advantages = sum(advantage_parts)
-        # Normalize combined advantage to zero mean and unit std
-        adv_std = advantages.std()
+        # Normalize only over valid trajectories. Rejected placeholders must
+        # not change the scale or mean of surviving samples.
+        valid_advantages = advantages[valid.bool()]
+        adv_std = valid_advantages.std() if valid_advantages.numel() > 1 else 0
         if adv_std > 0:
-            advantages = (advantages - advantages.mean()) / adv_std
+            advantages[valid.bool()] = (
+                valid_advantages - valid_advantages.mean()
+            ) / adv_std
         else:
-            advantages = advantages - advantages.mean()
+            advantages[valid.bool()] = valid_advantages - valid_advantages.mean()
+        advantages[~valid.bool()] = 0
 
         return advantages.expand(mask.shape)
 

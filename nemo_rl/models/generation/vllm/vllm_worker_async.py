@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import resource
 import threading
 import time
 import uuid
@@ -26,6 +27,7 @@ import ray
 import torch
 import uvicorn
 from fastapi import FastAPI
+from tensordict import TensorDict
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -120,18 +122,32 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
-    # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
+    if len(template_token_ids) <= len(template_prefix_token_ids):
+        LOGGER.warning(
+            "Chat-template reconstruction produced a non-growing trajectory "
+            "(prefix=%d tokens, full=%d tokens). Falling back to the fully "
+            "retokenized prompt; this may introduce off-policy token drift.",
+            len(template_prefix_token_ids),
+            len(template_token_ids),
+        )
+        return template_token_ids
 
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
+    # Some chat templates use model-specific assistant/tool delimiters instead
+    # of EOS. When no EOS is present and the render through the last assistant
+    # message is an exact prefix of the full render, its length is the
+    # unambiguous seam: preserve the model-produced prefix verbatim and append
+    # only the newly rendered suffix. If any EOS exists, retain the established
+    # EOS path below because the template may need to add EOS/newline boundary
+    # tokens that are absent from the model-produced prefix.
+    if (
+        eos_token_id not in template_prefix_token_ids
+        and template_token_ids[: len(template_prefix_token_ids)]
+        == template_prefix_token_ids
+    ):
+        return (
+            model_prefix_token_ids
+            + template_token_ids[len(template_prefix_token_ids) :]
+        )
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -140,17 +156,13 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             template_cut_start = pos
             break
 
-    # This should never be the case, but
-    assert (
-        template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
+    if template_cut_start < 0:
+        LOGGER.warning(
+            "No EOS token ID was found in the chat-templated prefix. Falling "
+            "back to the fully retokenized prompt; this may introduce "
+            "off-policy token drift."
+        )
+        return template_token_ids
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
@@ -196,6 +208,19 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._rollout_writer_cfg: Any = None
+        self._rollout_writer_secret: bytes | None = None
+        self._rollout_cursor: Any = None
+        self._rollout_dp_client: Any = None
+        self._rollout_requests: dict[int, Any] = {}
+        self._rollout_prompt_tokens: dict[int, list[int]] = {}
+        self._rollout_response_tokens: dict[
+            int, tuple[list[int], list[int], list[float]]
+        ] = {}
+        self._rollout_metrics_enabled = False
+        self._rollout_metrics_lock = threading.Lock()
+        self._rollout_transport_metrics: dict[str, Any] = {}
+        self._rollout_metrics_cpu_start_s = time.process_time()
 
         super().__init__(
             config,
@@ -224,6 +249,345 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             return True
         return bool(
             self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
+
+    def configure_rollout_writer(self, dp_cfg, cursor, secret: bytes) -> None:
+        """Attach the direct rollout writer after TQ has bootstrapped."""
+        from nemo_rl.data_plane import build_data_plane_client
+
+        self._rollout_writer_cfg = dp_cfg.rollout_writer
+        self._rollout_writer_secret = secret
+        self._rollout_cursor = cursor
+        self._rollout_dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+
+    def configure_rollout_metrics(self, enabled: bool) -> None:
+        """Enable lightweight in-memory transport metrics for A/B benchmarks."""
+        self._rollout_metrics_enabled = enabled
+        self.clear_rollout_transport_metrics()
+
+    def clear_rollout_transport_metrics(self) -> None:
+        """Reset per-step transport counters without touching model metrics."""
+        with self._rollout_metrics_lock:
+            self._rollout_transport_metrics = {
+                "http_request_count": 0,
+                "http_response_count": 0,
+                "encoded_request_bytes": 0,
+                "encoded_response_bytes": 0,
+                "encoded_response_bytes_without_token_ids": 0,
+                "encoded_response_bytes_without_logprobs": 0,
+                "encoded_response_base_bytes": 0,
+                "http_request_ms": [],
+                "chat_request_count": 0,
+                "chat_response_count": 0,
+                "chat_encoded_request_bytes": 0,
+                "chat_encoded_response_bytes": 0,
+                "chat_encoded_response_bytes_without_token_ids": 0,
+                "chat_encoded_response_bytes_without_logprobs": 0,
+                "chat_encoded_response_base_bytes": 0,
+                "chat_request_ms": [],
+                "tokenize_request_count": 0,
+                "tokenize_response_count": 0,
+                "tokenize_encoded_request_bytes": 0,
+                "tokenize_encoded_response_bytes": 0,
+                "tokenize_encoded_response_bytes_without_token_ids": 0,
+                "tokenize_encoded_response_bytes_without_logprobs": 0,
+                "tokenize_encoded_response_base_bytes": 0,
+                "tokenize_request_ms": [],
+                "last_response_completed_monotonic_s": 0.0,
+                "cursor_reserve_ms": [],
+                "staging_put_ms": [],
+                "staging_put_bytes": 0,
+                "cursor_commit_ms": [],
+                "sample_ids": [],
+            }
+            self._rollout_metrics_cpu_start_s = time.process_time()
+        if self._rollout_dp_client is not None and hasattr(
+            self._rollout_dp_client, "clear_events"
+        ):
+            self._rollout_dp_client.clear_events()
+
+    def get_rollout_transport_metrics(self) -> dict[str, Any]:
+        """Return one worker's current transport, CPU, and RSS measurements."""
+        if not self._rollout_metrics_enabled:
+            return {}
+        with self._rollout_metrics_lock:
+            metrics = copy.deepcopy(self._rollout_transport_metrics)
+            cpu_start_s = self._rollout_metrics_cpu_start_s
+        metrics["worker_id"] = str(ray.get_runtime_context().get_actor_id())
+        metrics["process_cpu_s"] = time.process_time() - cpu_start_s
+        metrics["peak_rss_bytes"] = (
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+        )
+        if self._rollout_dp_client is not None and hasattr(
+            self._rollout_dp_client, "events_snapshot"
+        ):
+            metrics["data_plane_events"] = self._rollout_dp_client.events_snapshot()
+            metrics["data_plane_snapshot"] = self._rollout_dp_client.snapshot()
+        return metrics
+
+    def _record_rollout_transport(self, name: str, value: Any) -> None:
+        if not getattr(self, "_rollout_metrics_enabled", False):
+            return
+        with self._rollout_metrics_lock:
+            current = self._rollout_transport_metrics[name]
+            if isinstance(current, list):
+                current.append(value)
+            elif name == "last_response_completed_monotonic_s":
+                self._rollout_transport_metrics[name] = max(current, value)
+            else:
+                self._rollout_transport_metrics[name] = current + value
+
+    def _record_http_request(self, endpoint: str, encoded_bytes: int) -> None:
+        """Record an exact inbound JSON body for one instrumented endpoint."""
+        self._record_rollout_transport("http_request_count", 1)
+        self._record_rollout_transport("encoded_request_bytes", encoded_bytes)
+        self._record_rollout_transport(f"{endpoint}_request_count", 1)
+        self._record_rollout_transport(
+            f"{endpoint}_encoded_request_bytes", encoded_bytes
+        )
+
+    def _record_http_response(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        response,
+        request_started: float,
+    ) -> None:
+        """Record one exact outbound JSON body and endpoint service time."""
+        if not self._rollout_metrics_enabled:
+            return
+        from nemo_rl.experience.rollout_writer import encoded_response_payload_sizes
+
+        payload_sizes = encoded_response_payload_sizes(payload)
+        payload_sizes["encoded_response_bytes"] = len(response.body)
+        for metric_name, value in payload_sizes.items():
+            self._record_rollout_transport(metric_name, value)
+            self._record_rollout_transport(f"{endpoint}_{metric_name}", value)
+        request_ms = (time.perf_counter() - request_started) * 1000
+        self._record_rollout_transport("http_response_count", 1)
+        self._record_rollout_transport("http_request_ms", request_ms)
+        self._record_rollout_transport(f"{endpoint}_response_count", 1)
+        self._record_rollout_transport(f"{endpoint}_request_ms", request_ms)
+        self._record_rollout_transport(
+            "last_response_completed_monotonic_s", time.monotonic()
+        )
+
+    async def _prepare_rollout_request(
+        self, request, prompt_token_ids: list[int], tokenizer=None
+    ) -> None:
+        """Validate identity, reserve a turn, and verify the echoed prefix."""
+        if self._rollout_writer_cfg is None or not self._rollout_writer_cfg.enabled:
+            return
+        # vLLM 0.20 shares this preprocessor with the /tokenize endpoint.
+        # Tokenization requests are not generation turns and intentionally do
+        # not carry a rollout context.
+        if not hasattr(request, "nemo_rl_rollout_context"):
+            return
+        self._rollout_prompt_tokens[id(request)] = list(prompt_token_ids)
+        from nemo_rl.experience.rollout_writer import (
+            RolloutContext,
+            RolloutContextError,
+            RolloutRequestState,
+            derive_request_nonce,
+            hash_token_ids,
+            validate_rollout_context,
+        )
+
+        payload = getattr(request, "nemo_rl_rollout_context", None)
+        if payload is None:
+            LOGGER.error("Rollout request has no signed context; serving uncollected")
+            return
+        if getattr(request, "stream", False):
+            raise RolloutContextError("rollout writer does not support streaming")
+        try:
+            context = RolloutContext.from_dict(payload)
+            if self._rollout_writer_secret is None:
+                raise RuntimeError("rollout writer secret was not configured")
+            validate_rollout_context(context, secret=self._rollout_writer_secret)
+        except RolloutContextError:
+            LOGGER.exception("Invalid rollout context; serving request uncollected")
+            return
+        request_nonce = derive_request_nonce(context.sample_id, prompt_token_ids)
+        reserve_started = time.perf_counter()
+        try:
+            reservation = await self._rollout_cursor.reserve_turn.remote(
+                context.sample_id, request_nonce
+            )
+        except ray.exceptions.RayError:
+            LOGGER.exception(
+                "Could not reserve a rollout turn for %s; serving uncollected",
+                context.sample_id,
+            )
+            return
+        finally:
+            self._record_rollout_transport(
+                "cursor_reserve_ms", (time.perf_counter() - reserve_started) * 1000
+            )
+
+        echoed_prefix = getattr(request, "required_prefix_token_ids", None) or []
+        prefix_matches = (
+            len(echoed_prefix) == reservation.prev_len
+            and hash_token_ids(echoed_prefix) == reservation.prev_hash
+            and prompt_token_ids[: reservation.prev_len] == echoed_prefix
+        )
+        if not prefix_matches:
+            divergent = 0
+            shared = min(len(echoed_prefix), reservation.prev_len)
+            while (
+                divergent < shared
+                and prompt_token_ids[divergent] == echoed_prefix[divergent]
+            ):
+                divergent += 1
+            window_start = max(0, divergent - 8)
+            window_end = divergent + 8
+            expected_window = echoed_prefix[window_start:window_end]
+            actual_window = prompt_token_ids[window_start:window_end]
+            expected_text = (
+                repr(tokenizer.decode(expected_window)) if tokenizer is not None else ""
+            )
+            actual_text = (
+                repr(tokenizer.decode(actual_window)) if tokenizer is not None else ""
+            )
+            reason = (
+                f"prefix_mismatch:first_divergent_token={divergent}:"
+                f"expected_tokens={expected_window}:actual_tokens={actual_window}:"
+                f"expected_text={expected_text}:actual_text={actual_text}"
+            )
+            await self._rollout_cursor.fail_turn.remote(
+                context.sample_id, reservation.lease, reason=reason
+            )
+            LOGGER.error("%s; serving request uncollected", reason)
+            return
+
+        self._rollout_requests[id(request)] = RolloutRequestState(
+            context=context,
+            reservation=reservation,
+            prompt_token_ids=list(prompt_token_ids),
+        )
+
+    async def _stage_rollout_response(self, request, response) -> None:
+        """Synchronously stage a generated turn and commit its cursor."""
+        request_state = self._rollout_requests.get(id(request))
+        if request_state is None:
+            return
+        from nemo_rl.experience.rollout_writer import (
+            build_staging_delta,
+            extract_generation_token_info,
+            hash_token_ids,
+        )
+
+        response_dict = response.model_dump()
+        choices = response_dict.get("choices", [])
+        if len(choices) != 1:
+            raise ValueError(
+                f"rollout writer requires exactly one choice, got {len(choices)}"
+            )
+        choice = choices[0]
+        generated_ids, generated_logprobs = extract_generation_token_info(choice)
+        prompt_ids = request_state.prompt_token_ids
+        reservation = request_state.reservation
+        full_ids = prompt_ids + generated_ids
+        try:
+            token_ids_delta, token_mask_delta, logprobs_delta = build_staging_delta(
+                prompt_token_ids=prompt_ids,
+                generated_token_ids=generated_ids,
+                generated_logprobs=generated_logprobs,
+                prev_len=reservation.prev_len,
+            )
+        except ValueError:
+            reason = "invalid_staging_delta"
+            await self._rollout_cursor.fail_turn.remote(
+                request_state.context.sample_id,
+                reservation.lease,
+                reason=reason,
+            )
+            raise
+
+        staging_key = f"{request_state.context.sample_id}/t{reservation.turn}"
+        fields = TensorDict(
+            {
+                "token_ids_delta": torch.tensor([token_ids_delta], dtype=torch.int64),
+                "token_mask_delta": torch.tensor(
+                    [token_mask_delta], dtype=torch.float32
+                ),
+                "generation_logprobs_delta": torch.tensor(
+                    [logprobs_delta], dtype=torch.float32
+                ),
+            },
+            batch_size=[1],
+        )
+        tags = [
+            {
+                "sample_id": request_state.context.sample_id,
+                "group_id": request_state.context.group_id,
+                "turn": reservation.turn,
+                "weight_version": request_state.context.weight_version,
+                "request_nonce": reservation.request_nonce,
+                "prev_len": reservation.prev_len,
+                "new_len": len(full_ids),
+                "prev_hash": reservation.prev_hash,
+                "new_hash": hash_token_ids(full_ids),
+                "lease_state": "written",
+                "full_snapshot": False,
+            }
+        ]
+        try:
+            staging_started = time.perf_counter()
+            self._rollout_dp_client.put_samples(
+                sample_ids=[staging_key],
+                partition_id=self._rollout_writer_cfg.staging_partition,
+                fields=fields,
+                tags=tags,
+            )
+        except Exception as error:
+            await self._rollout_cursor.fail_turn.remote(
+                request_state.context.sample_id,
+                reservation.lease,
+                reason=f"staging_write_failed:{type(error).__name__}",
+            )
+            raise
+        finally:
+            self._record_rollout_transport(
+                "staging_put_ms", (time.perf_counter() - staging_started) * 1000
+            )
+        staging_bytes = sum(
+            value.numel() * value.element_size() for value in fields.values()
+        )
+        self._record_rollout_transport("staging_put_bytes", staging_bytes)
+
+        commit_started = time.perf_counter()
+        try:
+            await self._rollout_cursor.commit_turn.remote(
+                request_state.context.sample_id,
+                reservation.lease,
+                staging_key=staging_key,
+                new_len=len(full_ids),
+                new_hash=hash_token_ids(full_ids),
+                group_id=request_state.context.group_id,
+                weight_version=request_state.context.weight_version,
+            )
+        except Exception:
+            try:
+                await self._rollout_cursor.fail_turn.remote(
+                    request_state.context.sample_id,
+                    reservation.lease,
+                    reason="cursor_commit_failed",
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Failed to mark rollout %s after cursor commit failure",
+                    request_state.context.sample_id,
+                )
+            raise
+        finally:
+            self._record_rollout_transport(
+                "cursor_commit_ms", (time.perf_counter() - commit_started) * 1000
+            )
+        self._record_rollout_transport("sample_ids", request_state.context.sample_id)
+        self._rollout_response_tokens[id(request)] = (
+            list(prompt_ids),
+            generated_ids,
+            generated_logprobs,
         )
 
     def _reserve_port(self) -> None:
@@ -609,6 +973,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                             actual_request_max_tokens,
                             res[1][0]["prompt_token_ids"],
                         )
+                    await worker_self._prepare_rollout_request(
+                        request,
+                        res[1][0]["prompt_token_ids"],
+                        tokenizer=self.renderer.tokenizer,
+                    )
                     return res
 
                 last_assistant_message_idx = None
@@ -666,6 +1035,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         final_prompt_token_ids,
                     )
 
+                await worker_self._prepare_rollout_request(
+                    request,
+                    final_prompt_token_ids,
+                    tokenizer=self.renderer.tokenizer,
+                )
+
                 return res
 
         ########################################
@@ -677,6 +1052,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
+            nemo_rl_rollout_context: Optional[dict[str, Any]] = None
 
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
@@ -705,6 +1081,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     *args,
                     **kwargs,
                 )
+                if isinstance(response, ChatCompletionResponse):
+                    await worker_self._stage_rollout_response(request, response)
                 if (
                     not worker_self._return_routed_experts_enabled()
                     or not isinstance(response, ChatCompletionResponse)
@@ -763,6 +1141,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
+            request_started = time.perf_counter()
+            if worker_self._rollout_metrics_enabled:
+                worker_self._record_http_request("chat", len(await raw_request.body()))
             # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
             # Right now we explicitly assert set this to -1.
             assert request.top_k in (None, -1), (
@@ -776,36 +1157,102 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             assert request.top_p == generation_config["top_p"]
 
             try:
-                generator = await openai_serving_chat.create_chat_completion(
-                    request, raw_request
-                )
-            except VLLMValidationError as e:
-                # vLLM 0.20 raises VLLMValidationError for prompts exceeding
-                # max_model_len during tokenization, instead of returning an
-                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
-                # detect context-length overflow and handle it gracefully.
-                return JSONResponse(
-                    content={
+                try:
+                    generator = await openai_serving_chat.create_chat_completion(
+                        request, raw_request
+                    )
+                except VLLMValidationError as e:
+                    # vLLM 0.20 raises VLLMValidationError for prompts exceeding
+                    # max_model_len during tokenization, instead of returning an
+                    # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
+                    # detect context-length overflow and handle it gracefully.
+                    response_content = {
                         "error": {
                             "message": str(e),
                             "type": "invalid_request_error",
                             "code": 400,
                         }
-                    },
-                    status_code=400,
-                )
+                    }
+                    response = JSONResponse(
+                        content=response_content,
+                        status_code=400,
+                    )
+                    worker_self._record_http_response(
+                        "chat", response_content, response, request_started
+                    )
+                    return response
 
-            if isinstance(generator, ErrorResponse):
-                return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.error.code
-                )
+                if isinstance(generator, ErrorResponse):
+                    response_content = generator.model_dump()
+                    response = JSONResponse(
+                        content=response_content, status_code=generator.error.code
+                    )
+                    worker_self._record_http_response(
+                        "chat", response_content, response, request_started
+                    )
+                    return response
 
-            elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(
-                    content=model_dump_chat_response_with_routed_experts(generator)
-                )
+                if isinstance(generator, ChatCompletionResponse):
+                    response_content = model_dump_chat_response_with_routed_experts(
+                        generator
+                    )
+                    if (
+                        worker_self._rollout_writer_cfg is not None
+                        and worker_self._rollout_writer_cfg.enabled
+                    ):
+                        token_info = worker_self._rollout_response_tokens.get(
+                            id(request)
+                        )
+                        if token_info is None:
+                            from nemo_rl.experience.rollout_writer import (
+                                extract_generation_token_info,
+                            )
 
-            return StreamingResponse(content=generator, media_type="text/event-stream")
+                            prompt_ids = worker_self._rollout_prompt_tokens.get(
+                                id(request)
+                            )
+                            if prompt_ids is None:
+                                raise RuntimeError(
+                                    "rollout response has no preprocessed prompt tokens"
+                                )
+                            generated_ids, generated_logprobs = (
+                                extract_generation_token_info(
+                                    response_content["choices"][0]
+                                )
+                            )
+                        else:
+                            prompt_ids, generated_ids, generated_logprobs = token_info
+                        response_message = response_content["choices"][0]["message"]
+                        response_message["prompt_token_ids"] = prompt_ids
+                        response_message["generation_token_ids"] = generated_ids
+                        response_message["generation_log_probs"] = generated_logprobs
+
+                    if (
+                        worker_self._rollout_writer_cfg is not None
+                        and worker_self._rollout_writer_cfg.enabled
+                        and worker_self._rollout_writer_cfg.mode == "direct"
+                    ):
+                        from nemo_rl.experience.rollout_writer import (
+                            strip_direct_response_logprobs,
+                        )
+
+                        response_content = strip_direct_response_logprobs(
+                            response_content
+                        )
+                    response = JSONResponse(content=response_content)
+                    worker_self._record_http_response(
+                        "chat", response_content, response, request_started
+                    )
+                    return response
+
+                return StreamingResponse(
+                    content=generator, media_type="text/event-stream"
+                )
+            finally:
+                # Non-streaming Gym requests complete inside this endpoint.
+                worker_self._rollout_requests.pop(id(request), None)
+                worker_self._rollout_prompt_tokens.pop(id(request), None)
+                worker_self._rollout_response_tokens.pop(id(request), None)
 
         ########################################
         # /tokenize endpoint
@@ -842,16 +1289,31 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
+            request_started = time.perf_counter()
+            if worker_self._rollout_metrics_enabled:
+                worker_self._record_http_request(
+                    "tokenize", len(await raw_request.body())
+                )
             generator = await openai_serving_tokenization.create_tokenize(
                 request, raw_request
             )
 
             if isinstance(generator, ErrorResponse):
-                return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.error.code
+                response_content = generator.model_dump()
+                response = JSONResponse(
+                    content=response_content, status_code=generator.error.code
                 )
+                worker_self._record_http_response(
+                    "tokenize", response_content, response, request_started
+                )
+                return response
             elif isinstance(generator, TokenizeResponse):
-                return JSONResponse(content=generator.model_dump())
+                response_content = generator.model_dump()
+                response = JSONResponse(content=response_content)
+                worker_self._record_http_response(
+                    "tokenize", response_content, response, request_started
+                )
+                return response
 
         ########################################
         # Logging

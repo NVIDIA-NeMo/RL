@@ -408,15 +408,10 @@ global_forward_pad_seqlen = round_up(1320, 64) = 1344
 
 ## Configuration
 
-The data plane is configured via a `data_plane:` block in the master
-YAML (`examples/configs/...`). **YAML is the single source of truth
-for defaults** — the adapter has no hidden `cfg.get(key, default)`
-fallbacks. The canonical exemplar is
-`examples/configs/grpo_math_1B.yaml`.
-
-All eight keys below are **required** when `enabled=true`. Recipes
-under `examples/configs/recipes/**/*.yaml` inherit them via
-`defaults:` from the exemplar.
+The data plane is configured via a `data_plane:` block in the master YAML
+(`examples/configs/...`). `DataPlaneConfig` and its nested Pydantic models are
+the source of truth for defaults; the canonical exemplar mirrors those values
+in `examples/configs/grpo_math_1B.yaml`.
 
 ```yaml
 data_plane:
@@ -428,9 +423,24 @@ data_plane:
   claim_meta_poll_interval_s: 0.5      # blocking-claim poll cadence
   global_segment_size: 549755813888    # 512 GiB — used when backend == "mooncake_cpu"
   local_buffer_size:   68719476736     # 64 GiB  — used when backend == "mooncake_cpu"
-  # observability:                     # NotRequired
-  #   enabled: false
+  controller_address: null
+  ack_timeout_ms: null
+  observability:
+    enabled: false
+  rollout_writer:
+    enabled: false                     # NeMo Gym vLLM-to-TQ staging writes
+    mode: shadow                       # "shadow" or "direct"
+    staging_partition: rollout_staging
+    finalize_timeout_s: 30
+    cursor_ttl_s: 3600
+    max_pending_writes_per_worker: 64
+    require_signed_context: true
 ```
+
+`rollout_writer` is synchronous in its initial implementation and applies only
+to synchronous NeMo Gym GRPO with the async vLLM HTTP backend. See
+`docs/guides/grpo-workplace-assistant-8gpu.md` for its trust and finalization
+contract and a result-free comparison protocol.
 
 Backend choice:
 - **`simple`** — ZMQ-backed; lowest setup overhead. Default for tests

@@ -207,9 +207,9 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 
     base = OmegaConf.load(str(resources.files("transfer_queue") / "config.yaml"))
 
-    backend = cfg["backend"]
-    storage_capacity = cfg["storage_capacity"]
-    num_storage_units = cfg["num_storage_units"]
+    backend = cfg.backend
+    storage_capacity = cfg.storage_capacity
+    num_storage_units = cfg.num_storage_units
 
     # polling_mode=True: controller returns empty BatchMeta instead of raising
     # TimeoutError when no samples are ready yet. The client-side blocking
@@ -276,8 +276,8 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
             "backend": {
                 "storage_backend": "MooncakeStore",
                 "MooncakeStore": {
-                    "global_segment_size": int(cfg["global_segment_size"]),
-                    "local_buffer_size": int(cfg["local_buffer_size"]),
+                    "global_segment_size": int(cfg.global_segment_size),
+                    "local_buffer_size": int(cfg.local_buffer_size),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
@@ -411,7 +411,7 @@ class TQDataPlaneClient(DataPlaneClient):
         #      that merge). Drop this once the wheel includes the fix.
         #   3. KV-path 1D promotion — works around TQ's
         #      extract_field_schema schema/data mismatch for 1D fields.
-        if cfg["backend"] == "mooncake_cpu":
+        if cfg.backend == "mooncake_cpu":
             local_ip = _get_local_node_ip()
             if local_ip:
                 # Force-assign per-process: Ray actors inherit env vars
@@ -426,13 +426,13 @@ class TQDataPlaneClient(DataPlaneClient):
         # is unaffected). Writer unsqueezes 1D → (N, 1) on put; reader
         # squeezes the trailing 1 back on get. Drop when upstream TQ
         # unifies the schema/data shapes for 1D fields.
-        self._promote_1d = cfg["backend"] == "mooncake_cpu"
+        self._promote_1d = cfg.backend == "mooncake_cpu"
 
         if bootstrap:
             _init_tq(cfg)
         else:
             _connect_existing()
-        self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
+        self._poll_interval_s = cfg.claim_meta_poll_interval_s
         self._closed = False
 
     # ── (A) task-mediated ───────────────────────────────────────────────

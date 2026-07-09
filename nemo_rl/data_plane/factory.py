@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+from typing import Any, Mapping
+
 from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneConfig
 
 
 def build_data_plane_client(
-    cfg: DataPlaneConfig | None, *, bootstrap: bool = True
+    cfg: DataPlaneConfig | Mapping[str, Any] | None, *, bootstrap: bool = True
 ) -> DataPlaneClient:
     """Construct the configured data-plane client.
 
@@ -39,29 +41,50 @@ def build_data_plane_client(
         A configured ``DataPlaneClient``; wrapped in
         :class:`MetricsDataPlaneClient` when observability is enabled.
     """
-    if cfg is None or not cfg["enabled"]:
+    if cfg is None:
         raise ValueError(
             "build_data_plane_client called with data_plane disabled. "
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer "
             "(which never engages the data plane) for that case."
         )
 
-    impl = cfg["impl"]
+    if isinstance(cfg, DataPlaneConfig):
+        resolved_cfg = cfg
+    else:
+        if not cfg.get("enabled"):
+            raise ValueError(
+                "build_data_plane_client called with data_plane disabled. "
+                "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer "
+                "(which never engages the data plane) for that case."
+            )
+        impl_value = cfg.get("impl")
+        if impl_value != "transfer_queue":
+            raise ValueError(f"unknown data_plane impl: {impl_value!r}")
+        resolved_cfg = DataPlaneConfig.model_validate(cfg)
+
+    if not resolved_cfg.enabled:
+        raise ValueError(
+            "build_data_plane_client called with data_plane disabled. "
+            "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer "
+            "(which never engages the data plane) for that case."
+        )
+
+    impl = resolved_cfg.impl
     if impl == "transfer_queue":
         from nemo_rl.data_plane.adapters.transfer_queue import TQDataPlaneClient
 
-        client: DataPlaneClient = TQDataPlaneClient(cfg, bootstrap=bootstrap)
+        client: DataPlaneClient = TQDataPlaneClient(resolved_cfg, bootstrap=bootstrap)
     else:
         raise ValueError(f"unknown data_plane impl: {impl!r}")
 
-    obs = cfg.get("observability") or {}
-    if obs.get("enabled", False):
+    obs = resolved_cfg.observability
+    if obs.enabled:
         from nemo_rl.data_plane.observability import (
             MetricsDataPlaneClient,
             log_event,
         )
 
-        on_event = obs.get("callback") or log_event
+        on_event = obs.callback or log_event
         # pyrefly: obs.get returns Any, can't narrow to the expected callback type.
         client = MetricsDataPlaneClient(client, on_event=on_event)  # type: ignore[bad-argument-type]
     return client

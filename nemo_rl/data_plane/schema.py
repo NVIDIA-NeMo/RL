@@ -63,6 +63,14 @@ DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS, "multi_modal_inputs")
 
 ROUTED_EXPERTS_FIELD = "routed_experts"
 
+# Per-turn fields written by the direct NeMo Gym rollout writer. Staging rows
+# are never returned in trainer metadata.
+ROLLOUT_STAGING_FIELDS = (
+    "token_ids_delta",
+    "token_mask_delta",
+    "generation_logprobs_delta",
+)
+
 
 def fields_with_optional_routed_experts(
     fields: Sequence[str],

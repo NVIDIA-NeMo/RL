@@ -11,12 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import os
+import resource
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
+import ray.cloudpickle as ray_cloudpickle
 import torch
 from transformers import PreTrainedTokenizerBase
 
@@ -29,6 +33,8 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
+LOGGER = logging.getLogger(__name__)
+
 DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "<tool_call>",
     "</tool_call>",
@@ -36,6 +42,36 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+_NEMOTRON_NANO_V2_MODEL = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+_NEMOTRON_NANO_V2_ASSISTANT_TEMPLATE = (
+    "{%- elif message['role'] == 'assistant' -%}"
+    "{%- if '</think>' in content -%}"
+    "{%- set content = content.split('</think>')[1].strip() %}"
+    "{%- endif -%}"
+    "{{- '<SPECIAL_11>Assistant\n' + content.strip() }}"
+)
+_NEMOTRON_NANO_V2_APPEND_ONLY_ASSISTANT_TEMPLATE = (
+    "{%- elif message['role'] == 'assistant' -%}"
+    "{%- if '</think>' in content -%}"
+    "{%- set content = content.split('</think>')[1].strip() %}"
+    "{%- endif -%}"
+    "{{- '<SPECIAL_11>Assistant\n' -}}"
+    "{%- if ns.enable_thinking is defined and ns.enable_thinking is false -%}"
+    "{{- '<think></think>' -}}"
+    "{%- endif -%}"
+    "{{- content.strip() }}"
+)
+
+
+def _logical_tensor_bytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, dict):
+        return sum(_logical_tensor_bytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_logical_tensor_bytes(item) for item in value)
+    return 0
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -257,8 +293,17 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
-    ) -> list[dict]:
+        direct_mode: bool = False,
+        effort_config: Any = None,
+        reward_penalty_config: Any = None,
+        thinking_tags: list[str] | tuple[str, ...] | None = None,
+        collect_transport_metrics: bool = False,
+    ) -> (
+        tuple[list[dict], dict[str, Any]]
+        | tuple[list[dict], dict[str, Any], dict[str, Any]]
+    ):
         timer = Timer()
+        process_cpu_started = time.process_time()
 
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
@@ -314,7 +359,131 @@ Depending on your data shape, you may want to change these values."""
             100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
         )
 
+        pre_compaction_bytes = 0
+        if collect_transport_metrics:
+            pre_compaction_bytes = len(ray_cloudpickle.dumps(nemo_rl_results))
+
+        if direct_mode:
+            # Reward shaping and penalties still need the exact token-bearing
+            # message log. Apply them inside the trusted Gym actor before the
+            # terminal result is compacted for the Ray return path.
+            from nemo_rl.experience.rollouts import (
+                _apply_effort_shaping,
+                apply_reward_penalties,
+                resolve_reward_penalty_config,
+            )
+
+            shaping = _apply_effort_shaping(
+                nemo_rl_results, nemo_gym_examples, effort_config
+            )
+            penalty_counts = apply_reward_penalties(
+                nemo_rl_results,
+                resolve_reward_penalty_config(
+                    reward_penalty_config,
+                    tokenizer,
+                    thinking_tags=thinking_tags,
+                ),
+            )
+            nemo_rl_results = [
+                self._compact_direct_result(result) for result in nemo_rl_results
+            ]
+            if collect_transport_metrics:
+                timing_metrics.update(
+                    {
+                        "transport/gym_terminal_pre_compaction_bytes": pre_compaction_bytes,
+                        "transport/gym_terminal_result_bytes": len(
+                            ray_cloudpickle.dumps(nemo_rl_results)
+                        ),
+                        "transport/gym_terminal_logical_tensor_bytes": _logical_tensor_bytes(
+                            nemo_rl_results
+                        ),
+                        "process/gym_cpu_s": time.process_time() - process_cpu_started,
+                        "process/gym_peak_rss_bytes": resource.getrusage(
+                            resource.RUSAGE_SELF
+                        ).ru_maxrss
+                        * 1024,
+                    }
+                )
+            return (
+                nemo_rl_results,
+                timing_metrics,
+                {
+                    "length_rewards_low": shaping.length_rewards_low,
+                    "rewards_low": shaping.rewards_low,
+                    "low_lengths": shaping.low_lengths,
+                    "high_lengths": shaping.high_lengths,
+                    "penalty_counts": penalty_counts,
+                },
+            )
+
+        if collect_transport_metrics:
+            timing_metrics.update(
+                {
+                    "transport/gym_terminal_pre_compaction_bytes": pre_compaction_bytes,
+                    "transport/gym_terminal_result_bytes": pre_compaction_bytes,
+                    "transport/gym_terminal_logical_tensor_bytes": _logical_tensor_bytes(
+                        nemo_rl_results
+                    ),
+                    "process/gym_cpu_s": time.process_time() - process_cpu_started,
+                    "process/gym_peak_rss_bytes": resource.getrusage(
+                        resource.RUSAGE_SELF
+                    ).ru_maxrss
+                    * 1024,
+                }
+            )
         return nemo_rl_results, timing_metrics
+
+    @staticmethod
+    def _compact_direct_result(result: dict) -> dict:
+        """Drop token payloads before the terminal Gym-to-NeMo-RL RPC."""
+        message_log = result["message_log"]
+        assistant_messages = [
+            message for message in message_log if message["role"] == "assistant"
+        ]
+        output_items = result["full_result"].get("response", {}).get("output", [])
+        turn_contents = []
+        for item in output_items:
+            generation_text = item.get("generation_str")
+            if generation_text:
+                turn_contents.append(generation_text)
+
+        stripped_keys = {
+            "prompt_token_ids",
+            "generation_token_ids",
+            "token_ids",
+            "generation_log_probs",
+            "generation_logprobs",
+            "logprobs",
+            "top_logprobs",
+        }
+
+        def _strip_token_payloads(value):
+            if isinstance(value, dict):
+                return {
+                    key: _strip_token_payloads(item)
+                    for key, item in value.items()
+                    if key not in stripped_keys
+                }
+            if isinstance(value, list):
+                return [_strip_token_payloads(item) for item in value]
+            return value
+
+        return {
+            "full_result": _strip_token_payloads(result["full_result"]),
+            "total_tokens": sum(len(message["token_ids"]) for message in message_log),
+            "assistant_tokens": sum(
+                len(message["token_ids"]) for message in assistant_messages
+            ),
+            "first_response_tokens": (
+                len(assistant_messages[0]["token_ids"]) if assistant_messages else 0
+            ),
+            "initial_prompt_tokens": len(result["input_message_log"][0]["token_ids"]),
+            "turn_count": sum(
+                1 for message in message_log if message["role"] == "user"
+            ),
+            "turn_roles": ["assistant"] * len(turn_contents),
+            "turn_contents": turn_contents,
+        }
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
@@ -335,17 +504,26 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
-                seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
-Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
-"""
-
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
+            if seen_token_ids != prompt_token_ids[: len(seen_token_ids)]:
+                LOGGER.warning(
+                    "NeMo Gym returned a prompt whose tokens do not extend the "
+                    "previous trajectory. Resetting the accumulated message log "
+                    "to the returned prompt and training only subsequent "
+                    "generations; earlier generation log-probabilities no longer "
+                    "align with the retokenized history."
+                )
+                nemo_rl_message_log.clear()
+                seen_token_ids.clear()
+
             generation_token_ids = output_item_dict.pop("generation_token_ids")
-            generation_log_probs = output_item_dict.pop("generation_log_probs")
+            generation_log_probs = output_item_dict.pop("generation_log_probs", None)
+            if generation_log_probs is None:
+                # Direct rollout mode stores the authoritative sampling
+                # log-probabilities in TQ and returns token IDs only for the
+                # next-turn echo. These zeros are an internal shape bridge;
+                # the trusted finalizer replaces them before publication.
+                generation_log_probs = [0.0] * len(generation_token_ids)
             routed_experts_raw = output_item_dict.pop("routed_experts", None)
             new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
 
@@ -474,7 +652,60 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 ########################################
 
 
+def _patch_nemotron_nano_v2_chat_template(chat_template: str) -> str:
+    """Keep the no-thinking assistant prefill stable after it becomes history."""
+    if _NEMOTRON_NANO_V2_APPEND_ONLY_ASSISTANT_TEMPLATE in chat_template:
+        return chat_template
+    occurrences = chat_template.count(_NEMOTRON_NANO_V2_ASSISTANT_TEMPLATE)
+    if occurrences != 1:
+        raise ValueError(
+            "The NVIDIA-Nemotron-Nano-9B-v2 chat template no longer matches "
+            "the model-specific append-only workaround. Expected exactly one "
+            "historical-assistant template fragment, found "
+            f"{occurrences}. Refuse to start NeMo Gym rollouts until the "
+            "workaround is updated for the upstream template."
+        )
+    return chat_template.replace(
+        _NEMOTRON_NANO_V2_ASSISTANT_TEMPLATE,
+        _NEMOTRON_NANO_V2_APPEND_ONLY_ASSISTANT_TEMPLATE,
+        1,
+    )
+
+
+def _apply_nemotron_nano_v2_chat_template_workaround(config, tokenizer) -> None:
+    """Install the narrow Nano-v2 append-only template in every tokenizer path."""
+    policy_config = config.policy
+    if policy_config.get("model_name") != _NEMOTRON_NANO_V2_MODEL:
+        return
+
+    generation_config = policy_config["generation"]
+    vllm_config = generation_config["vllm_cfg"]
+    if "http_server_serving_chat_kwargs" not in vllm_config:
+        vllm_config["http_server_serving_chat_kwargs"] = {}
+    serving_chat_kwargs = vllm_config["http_server_serving_chat_kwargs"]
+    configured_template = serving_chat_kwargs.get("chat_template")
+    effective_template = (
+        configured_template
+        if configured_template is not None
+        else getattr(tokenizer, "chat_template", None)
+    )
+    if not isinstance(effective_template, str):
+        raise ValueError(
+            "NVIDIA-Nemotron-Nano-9B-v2 requires a string chat template for "
+            "the model-specific append-only Gym workaround."
+        )
+
+    patched_template = _patch_nemotron_nano_v2_chat_template(effective_template)
+    tokenizer.chat_template = patched_template
+    serving_chat_kwargs["chat_template"] = patched_template
+    LOGGER.info(
+        "Applied the NVIDIA-Nemotron-Nano-9B-v2 append-only no-thinking "
+        "assistant-history workaround"
+    )
+
+
 def setup_nemo_gym_config(config, tokenizer) -> None:
+    _apply_nemotron_nano_v2_chat_template_workaround(config, tokenizer)
     generation_config = config.policy["generation"]
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
