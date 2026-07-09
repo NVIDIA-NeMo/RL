@@ -23,14 +23,20 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, cast
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.grpo import _create_advantage_estimator, _should_use_nemo_gym
+from nemo_rl.algorithms.grpo import (
+    GRPOSaveState,
+    _create_advantage_estimator,
+    _default_grpo_save_state,
+    _should_use_nemo_gym,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -45,6 +51,7 @@ from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -69,6 +76,7 @@ class SingleControllerBundle:
     rollout_manager: RolloutManager
     tq_buffer: TQReplayBuffer
     partition_id: str
+    save_state: GRPOSaveState
 
 
 def _build_clusters(
@@ -169,6 +177,9 @@ def _build_trainer(
     master_config: MasterConfig,
     tokenizer,
     processor,
+    *,
+    weights_path: Optional[Path],
+    optimizer_path: Optional[Path],
 ):
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -184,8 +195,8 @@ def _build_trainer(
         config=master_config.policy,
         tokenizer=tokenizer,
         processor=processor,
-        weights_path=None,
-        optimizer_path=None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
@@ -270,6 +281,10 @@ def setup_single_controller(
         "single_controller_utils.setup requires policy.generation in master_config"
     )
 
+    checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
+    if checkpointing_pretrained is not None:
+        master_config.policy["pretrained_checkpoint"] = checkpointing_pretrained
+
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
             "single_controller_utils does not support "
@@ -277,6 +292,18 @@ def setup_single_controller(
         )
 
     set_seed(grpo_config["seed"])
+
+    # ==========================
+    # Checkpointing
+    # ==========================
+    checkpointer = CheckpointManager(master_config.checkpointing)
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    save_state = cast(
+        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
+    )
+    if save_state is None:
+        save_state = _default_grpo_save_state()
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     # ==========================
     # Setup Dataset & Environments
@@ -315,7 +342,14 @@ def setup_single_controller(
         # Colocated: vLLM prefers a clean GPU at load time, so generation
         # comes up before the policy.
         generation = _build_generation(inference_cluster, master_config)
-        policy = _build_trainer(train_cluster, master_config, tokenizer, processor)
+        policy = _build_trainer(
+            train_cluster,
+            master_config,
+            tokenizer,
+            processor,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+        )
     else:
         # Non-colocated: generation + policy run on disjoint GPUs, so
         # bring them up in parallel.
@@ -324,7 +358,13 @@ def setup_single_controller(
                 _build_generation, inference_cluster, master_config
             )
             policy_future = executor.submit(
-                _build_trainer, train_cluster, master_config, tokenizer, processor
+                _build_trainer,
+                train_cluster,
+                master_config,
+                tokenizer,
+                processor,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
             )
             generation = gen_future.result()
             policy = policy_future.result()
@@ -399,4 +439,5 @@ def setup_single_controller(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=partition_id,
+        save_state=save_state,
     )
