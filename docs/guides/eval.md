@@ -2,12 +2,14 @@
 
 This document explains how to use an evaluation script for assessing model capabilities.
 
+For a shorter quick-start version, see the [evaluation overview](../about/evaluation.md). This guide is the detailed reference for configuration, supported benchmarks, and example outputs.
+
 ## Prepare for Evaluation
 
-To prepare for evaluation, first ensure your model is in the correct format, which may involve an optional conversion of PyTorch DCP checkpoints to the HuggingFace format. Following this, you need to prepare the evaluation configuration, which includes defining prompt templates and any custom settings required to run the evaluation.
+To prepare for evaluation, first ensure your model is in the correct format, which may involve an optional conversion of PyTorch DCP checkpoints to the Hugging Face format. Following this, you need to prepare the evaluation configuration, which includes defining prompt templates and any custom settings required to run the evaluation.
 
 ### Convert DCP to HF (Optional)
-If you have trained a model and saved the checkpoint in the Pytorch DCP format, you first need to convert it to the HuggingFace format before running evaluation.
+If you have trained a model and saved the checkpoint in the PyTorch DCP format, you first need to convert it to the Hugging Face format before running evaluation.
 
 Use the `examples/converters/convert_dcp_to_hf.py` script. You'll need the path to the training configuration file (`config.yaml`), the DCP checkpoint directory, and specify an output path for the HF format model.
 
@@ -37,9 +39,9 @@ For open-source models, we recommend setting `tokenizer.chat_template=default`, 
 
 ## Run the Evaluation Script
 
-We will use the `run_eval.py` script to run an evaluation using a model directly from the HuggingFace Hub or from a local path that is already in HuggingFace format.
+We will use the `run_eval.py` script to run an evaluation using a model directly from the Hugging Face Hub or from a local path that is already in Hugging Face format.
 
-Note that the evaluation script only supports the HuggingFace format model. If you haven't converted your DCP format model, you should back to [Convert DCP to HF](#convert-dcp-to-hf-optional) and follow the guide to convert your model.
+Note that the evaluation script only supports the Hugging Face format model. If you haven't converted your DCP format model, you should go back to [Convert DCP to HF](#convert-dcp-to-hf-optional) and follow the guide to convert your model.
 
 ```sh
 # Run evaluation script with default config (examples/configs/evals/eval.yaml)
