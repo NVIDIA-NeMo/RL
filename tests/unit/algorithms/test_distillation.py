@@ -475,7 +475,7 @@ def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
 def test_validate_function(mock_components):
     """Test independent validation function to ensure validation logic correctness."""
 
-    def _mock_rollout(policy_generation, input_batch, **kwargs):
+    def _mock_rollout(policy_generation, input_batch, tokenizer, task_to_env, **kwargs):
         return input_batch, {"mean_gen_tokens_per_sample": 5.0}
 
     with (

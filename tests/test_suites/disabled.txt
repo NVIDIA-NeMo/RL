@@ -7,3 +7,6 @@ tests/test_suites/llm/grpo-qwen3.5-35ba3b-2n8g-automodel-ep16.sh
 
 # Disable this due to know vLLM bug with Qwen3.5: https://github.com/vllm-project/vllm/issues/37856
 tests/test_suites/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.sh
+
+# Requires external user-simulation and judge servers (USER_SERVER_HOST:8100); not available in CI.
+tests/test_suites/llm/grpo_tau_bench_local.sh
