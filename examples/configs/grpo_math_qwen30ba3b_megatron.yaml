@@ -17,11 +17,6 @@ policy:
   precision: "bfloat16"
   router_replay:
     enabled: false
-  # Sync-TQ only. Depth 0 fetches packed microbatches on demand; depth 1
-  # overlaps preparation of the next all-field microbatch with training.
-  train_microbatch_prefetch:
-    enabled: false
-    depth: 1
 
   dtensor_cfg:
     enabled: false
