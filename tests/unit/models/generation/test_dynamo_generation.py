@@ -1213,6 +1213,152 @@ def test_logger_metrics_disabled_by_default(in_k8s, stub_namespace):
     assert generation.get_logger_metrics() == {}
 
 
+def test_ray_managed_metrics_use_fixed_runtime_workers(monkeypatch):
+    from nemo_rl.models.generation.dynamo import managed_runtime as runtime_module
+
+    workers = [
+        {"instance_id": "worker-a", "system_url": "http://10.0.0.1:29000"},
+        {"instance_id": "worker-b", "system_url": "http://10.0.0.2:29001"},
+    ]
+    calls = []
+
+    class FakeManagedRuntime:
+        frontend_url = "http://10.0.0.10:8000/v1"
+
+        def __init__(self, **kwargs):
+            calls.append("runtime")
+
+        def refit_workers(self):
+            return workers
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    monkeypatch.setattr(runtime_module, "ManagedDynamoRuntime", FakeManagedRuntime)
+    monkeypatch.setattr(
+        DynamoGeneration,
+        "_start_metrics_sampler",
+        lambda self: calls.append("sampler"),
+    )
+    cfg = _base_config()
+    cfg["dynamo_cfg"] = {  # type: ignore[typeddict-item]
+        "deployment": "ray",
+        "engine_world_size": 4,
+    }
+    cfg["vllm_cfg"] = {  # type: ignore[typeddict-item]
+        "enable_vllm_metrics_logger": True,
+        "vllm_metrics_logger_interval": 0.5,
+    }
+
+    generation = DynamoGeneration(cluster=object(), config=cfg)
+
+    assert generation._metrics_workers == workers
+    assert generation._metrics_discovery_kwargs is None
+    assert calls == ["runtime", "sampler"]
+    assert generation.shutdown() is True
+    assert calls[-1] == "shutdown"
+
+
+def test_ray_managed_metrics_sample_two_workers_without_discovery(monkeypatch):
+    from nemo_rl.models.generation.dynamo import managed_runtime as runtime_module
+
+    workers = [
+        {"instance_id": "worker-a", "system_url": "http://10.0.0.1:29000"},
+        {"instance_id": "worker-b", "system_url": "http://10.0.0.2:29001"},
+    ]
+
+    class FakeManagedRuntime:
+        frontend_url = "http://10.0.0.10:8000/v1"
+
+        def __init__(self, **kwargs):
+            pass
+
+        def refit_workers(self):
+            return workers
+
+        def shutdown(self):
+            pass
+
+    class OneIterationStop:
+        def __init__(self):
+            self.wait_count = 0
+
+        def wait(self, timeout):
+            self.wait_count += 1
+
+        def is_set(self):
+            return self.wait_count >= 2
+
+    monkeypatch.setattr(runtime_module, "ManagedDynamoRuntime", FakeManagedRuntime)
+    monkeypatch.setattr(DynamoGeneration, "_start_metrics_sampler", lambda self: None)
+    monkeypatch.setattr(
+        _dynmod,
+        "_discover_worker_instances",
+        lambda **kwargs: pytest.fail("Ray-managed metrics must not use DGD discovery"),
+    )
+    requested_urls = []
+
+    def fake_get_text(url, timeout_s):
+        requested_urls.append(url)
+        value = 1 if "29000" in url else 2
+        return f"dynamo_component_inflight_requests {value}\n"
+
+    monkeypatch.setattr(_dynmod, "_http_get_text", fake_get_text)
+    cfg = _base_config()
+    cfg["dynamo_cfg"] = {  # type: ignore[typeddict-item]
+        "deployment": "ray",
+        "engine_world_size": 4,
+    }
+    cfg["vllm_cfg"] = {  # type: ignore[typeddict-item]
+        "enable_vllm_metrics_logger": True,
+        "vllm_metrics_logger_interval": 0.5,
+    }
+    generation = DynamoGeneration(cluster=object(), config=cfg)
+    generation._metrics_stop = OneIterationStop()
+
+    generation._metrics_loop()
+
+    assert requested_urls == [
+        "http://10.0.0.1:29000/metrics",
+        "http://10.0.0.2:29001/metrics",
+    ]
+    assert generation.get_logger_metrics()["inflight_batch_sizes"] == {
+        0: [1.0],
+        1: [2.0],
+    }
+    assert generation._metrics_worker_ordinal("worker-b") == 1
+    assert generation._metrics_worker_ordinal("worker-a") == 0
+
+
+def test_stop_metrics_sampler_joins_thread():
+    calls = []
+
+    class FakeStop:
+        def set(self):
+            calls.append("set")
+
+    class FakeThread:
+        alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout):
+            calls.append(("join", timeout))
+            self.alive = False
+
+    generation = object.__new__(DynamoGeneration)
+    generation._metrics_stop = FakeStop()
+    generation._metrics_thread = FakeThread()
+    generation._metrics_interval_s = 0.5
+
+    generation._stop_metrics_sampler()
+
+    assert calls == ["set", ("join", 5.0)]
+    assert generation._metrics_stop is None
+    assert generation._metrics_thread is None
+
+
 def test_logger_metrics_enabled_shape_copy_and_clear(
     in_k8s, stub_namespace, monkeypatch
 ):
@@ -1282,5 +1428,8 @@ def test_pickle_roundtrip_with_metrics_enabled(in_k8s, stub_namespace, monkeypat
     restored = pickle.loads(pickle.dumps(generation))
 
     assert restored.get_logger_metrics() == {}
+    assert restored._metrics_enabled is False
+    assert restored._metrics_thread is None
+    assert restored._metrics_workers is None
     restored.clear_logger_metrics()
     assert restored.shutdown() is True

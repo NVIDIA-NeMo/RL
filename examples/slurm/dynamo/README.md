@@ -73,3 +73,29 @@ examples/swe_bench/run_grpo_nano_v3_5_swe_dynamo_hsg_e2e.sh
 
 The launcher uses account `coreai_tritoninference_triton3`, keeps caches,
 results, and logs below the HSG workspace root, and disables W&B for acceptance.
+
+## HSG Nemotron Nano SWE R2 with W&B
+
+The R2 recipe reuses the accepted HSG image and doubles both the allocation and
+the useful batch: four 4-GPU training nodes, two TP4 Dynamo inference nodes,
+PPS2/GPP2/GBS4, and four optimizer steps. Ray-managed Dynamo samples the fixed
+workers' unique system URLs directly; Kubernetes deployments retain DGD-based
+metrics discovery.
+
+Provide the W&B credential only in the launcher environment. The launcher
+requires it, enables online logging, and does not place it in the command or
+dry-run output:
+
+```bash
+WANDB_API_KEY='<key>' \
+EXP_NAME="nano-v3-5-swe-dynamo-r2-wandb-$(date +%Y%m%d-%H%M%S)" \
+SLURM_ACCOUNT=coreai_tritoninference_triton3 \
+SLURM_PARTITION=batch \
+WALLTIME=04:00:00 \
+MAX_NUM_STEPS=4 \
+bash examples/swe_bench/run_grpo_nano_v3_5_swe_dynamo_hsg_r2_wandb.sh
+```
+
+The W&B project is `nemo-rl-dynamo-swe`. The run includes normal training and
+timing metrics plus curated per-worker `generation_metrics/*` timelines sampled
+every 0.5 seconds.

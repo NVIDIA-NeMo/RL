@@ -677,11 +677,24 @@ class DynamoGeneration(GenerationInterface):
         self._metrics_thread: Optional[threading.Thread] = None
         self._metrics_worker_ordinals: dict[Any, int] = {}
         self._metrics_discovery_kwargs: Optional[dict[str, Any]] = None
-        if self._metrics_enabled and requires_k8s and dynamo_cfg.dgd_name is not None:
-            self._metrics_discovery_kwargs = self._build_worker_discovery_kwargs(
-                dynamo_cfg
-            )
-            self._start_metrics_sampler()
+        self._metrics_workers: Optional[list[dict[str, Any]]] = None
+        if self._metrics_enabled:
+            if dynamo_cfg.deployment == "ray":
+                if self._managed_runtime is None:
+                    raise RuntimeError(
+                        "Ray-managed Dynamo metrics require the driver-owned runtime."
+                    )
+                self._metrics_workers = self._managed_runtime.refit_workers()
+                if not self._metrics_workers:
+                    raise RuntimeError(
+                        "Ray-managed Dynamo metrics require at least one vLLM worker."
+                    )
+                self._start_metrics_sampler()
+            elif requires_k8s and dynamo_cfg.dgd_name is not None:
+                self._metrics_discovery_kwargs = self._build_worker_discovery_kwargs(
+                    dynamo_cfg
+                )
+                self._start_metrics_sampler()
 
     # ------------------------------------------------------------------
     # GenerationInterface — lifecycle
@@ -713,14 +726,19 @@ class DynamoGeneration(GenerationInterface):
     def _metrics_loop(self) -> None:
         stop = self._metrics_stop
         discovery_kwargs = self._metrics_discovery_kwargs
-        assert stop is not None and discovery_kwargs is not None
+        fixed_workers = self._metrics_workers
+        assert stop is not None
+        assert fixed_workers is not None or discovery_kwargs is not None
 
         stop.wait(min(2.0, self._metrics_interval_s))
-        workers: list[dict[str, Any]] = []
+        workers = list(fixed_workers or [])
         last_discovery = 0.0
         while not stop.is_set():
             now = time.monotonic()
-            if not workers or now - last_discovery > 5.0:
+            if fixed_workers is None and (
+                not workers or now - last_discovery > 5.0
+            ):
+                assert discovery_kwargs is not None
                 try:
                     discovered_workers = _discover_worker_instances(**discovery_kwargs)
                 except _WorkerDiscoveryError as error:
@@ -734,6 +752,8 @@ class DynamoGeneration(GenerationInterface):
                     f"{worker['system_url']}/metrics",
                     timeout_s=self._metrics_interval_s + 2.0,
                 )
+                if stop.is_set():
+                    break
                 if not text:
                     continue
                 metrics = _parse_prometheus_metrics(
@@ -748,6 +768,22 @@ class DynamoGeneration(GenerationInterface):
                             ordinal, []
                         ).append(value)
             stop.wait(self._metrics_interval_s)
+
+    def _stop_metrics_sampler(self) -> None:
+        stop = getattr(self, "_metrics_stop", None)
+        thread = getattr(self, "_metrics_thread", None)
+        if stop is not None:
+            stop.set()
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+        ):
+            thread.join(timeout=max(5.0, self._metrics_interval_s + 3.0))
+            if thread.is_alive():
+                LOGGER.warning("Dynamo metrics sampler did not stop before shutdown.")
+        self._metrics_stop = None
+        self._metrics_thread = None
 
     def get_logger_metrics(self) -> dict[str, Any]:
         """Return per-worker Dynamo metric timelines for generation logging."""
@@ -851,9 +887,7 @@ class DynamoGeneration(GenerationInterface):
 
     def shutdown(self) -> bool:
         """Stop process-local helpers and any driver-owned managed runtime."""
-        metrics_stop = getattr(self, "_metrics_stop", None)
-        if metrics_stop is not None:
-            metrics_stop.set()
+        self._stop_metrics_sampler()
         token_wrapper_server = self._token_wrapper_server
         if token_wrapper_server is not None:
             token_wrapper_server.shutdown()
@@ -889,6 +923,17 @@ class DynamoGeneration(GenerationInterface):
         self._token_wrapper_server = None
         self._managed_runtime = None
         self._owns_managed_runtime = False
+        self._metrics_enabled = False
+        self._metrics_interval_s = 0.0
+        self._metrics_include_prefixes = None
+        self._metrics_exclude_prefixes = _DEFAULT_METRICS_EXCLUDE_PREFIXES
+        self._dynamo_logger_metrics = {}
+        self._metrics_lock = threading.Lock()
+        self._metrics_stop = None
+        self._metrics_thread = None
+        self._metrics_worker_ordinals = {}
+        self._metrics_discovery_kwargs = None
+        self._metrics_workers = None
         # Refit state is process-local; Ray copies must rediscover the worker fleet.
         self._refit_workers = None
         self._refit_discovery_kwargs = None
