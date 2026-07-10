@@ -1710,9 +1710,7 @@ def test_async_collector_dataloader_payload_materializes_dataset(
     dataloader = StatefulDataLoader(records, batch_size=4, shuffle=False)
 
     raw_data, dataloader_config, dataloader_state = (
-        grpo_mod._get_async_collector_dataloader_payload(
-            dataloader, master_config
-        )
+        grpo_mod._get_async_collector_dataloader_payload(dataloader, master_config)
     )
 
     assert raw_data == list(records)

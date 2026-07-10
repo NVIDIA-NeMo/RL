@@ -1331,9 +1331,7 @@ class TestAsyncTrajectoryCollector:
         )
 
         assert dataloader.loaded_state is dataloader_state
-        assert (
-            dataloader.kwargs["collate_fn"] is trajectory_collector_mod.rl_collate_fn
-        )
+        assert dataloader.kwargs["collate_fn"] is trajectory_collector_mod.rl_collate_fn
 
     def test_get_dataloader_state_returns_rebuilt_dataloader_state(self, monkeypatch):
         """Checkpoint state comes from the dataloader rebuilt in the actor."""
@@ -1368,9 +1366,7 @@ class TestAsyncTrajectoryCollector:
             dataloader_state,
         )
 
-        assert collector.get_dataloader_state() == {
-            "loaded_state": dataloader_state
-        }
+        assert collector.get_dataloader_state() == {"loaded_state": dataloader_state}
 
     def test_maybe_release_target_waits_for_spawning_to_close(self):
         """Test fast workers do not release a target while spawning is open."""
