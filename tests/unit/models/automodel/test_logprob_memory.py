@@ -85,10 +85,14 @@ def test_local_logprobs_accepts_cpu_input_ids_with_cuda_logits(chunk_size):
 
     next_tokens = input_ids[:, 1:].to(logits.device)
     expected_logits = logits[:, : next_tokens.shape[1], :].to(torch.float32)
-    expected = torch.nn.functional.log_softmax(expected_logits, dim=-1).gather(
-        dim=-1,
-        index=next_tokens.unsqueeze(-1),
-    ).squeeze(-1)
+    expected = (
+        torch.nn.functional.log_softmax(expected_logits, dim=-1)
+        .gather(
+            dim=-1,
+            index=next_tokens.unsqueeze(-1),
+        )
+        .squeeze(-1)
+    )
 
     torch.testing.assert_close(actual, expected)
 
