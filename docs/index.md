@@ -41,7 +41,7 @@ Explore the current features and upcoming enhancements in NeMo RL, including dis
 :link: about/tips-and-tricks
 :link-type: doc
 
-Troubleshooting common issues including missing submodules, Ray dashboard access, and debugging techniques.
+Troubleshooting common issues including missing submodules and memory fragmentation.
 :::
 
 ::::
@@ -73,10 +73,10 @@ Learn how to evaluate your models using built-in evaluation datasets and custom 
 :::
 
 :::{grid-item-card} {octicon}`server` Cluster Setup
-:link: about/clusters
+:link: cluster
 :link-type: doc
 
-Configure and deploy NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
+Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
 :::
 
 ::::
@@ -215,9 +215,12 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 
 ::::
 
+## Full Documentation Index
+
+The complete table of contents below lists all pages, including guide, development, and design-doc pages that are not shown in the cards above.
+
 ```{toctree}
 :caption: About
-:hidden:
 
 about/overview
 about/performance-summary
@@ -236,7 +239,6 @@ about/tips-and-tricks
 
 ```{toctree}
 :caption: Environment Start
-:hidden:
 
 local-workstation.md
 cluster.md
@@ -245,14 +247,12 @@ cluster.md
 
 ```{toctree}
 :caption: E2E Examples
-:hidden:
 
 guides/sft-openmathinstruct2.md
 ```
 
 ```{toctree}
 :caption: Guides
-:hidden:
 
 guides/nemotron-3-nano.md
 guides/nemotron-3-nano-omni.md
@@ -288,14 +288,12 @@ guides/ft-launcher-guide.md
 
 ```{toctree}
 :caption: Containers
-:hidden:
 
 docker.md
 ```
 
 ```{toctree}
 :caption: Development
-:hidden:
 
 ci-cd.md
 testing.md
@@ -308,7 +306,6 @@ guides/use-custom-vllm.md
 
 ```{toctree}
 :caption: Design Docs
-:hidden:
 
 design-docs/design-and-philosophy.md
 design-docs/padding.md
@@ -328,7 +325,6 @@ design-docs/nemo-gym-integration.md
 
 ```{toctree}
 :caption: API Reference
-:hidden:
 
 apidocs/index
 ```
