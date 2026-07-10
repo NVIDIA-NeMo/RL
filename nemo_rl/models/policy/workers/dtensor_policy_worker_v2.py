@@ -14,6 +14,7 @@
 
 import contextlib
 import gc
+import time
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -32,6 +33,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
     to_local_if_dtensor,
 )
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
+from tensordict import TensorDict
 from torch import nn
 from torch.distributed.tensor import DTensor
 
@@ -445,6 +447,7 @@ class DTensorPolicyWorkerV2Impl(
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
+            data_plane_client=self._dp_client,
         )
 
         # Create train context factory
@@ -995,6 +998,121 @@ class DTensorPolicyWorkerV2Impl(
         # (ports the sync added upstream for the single-buffer export path).
         torch.cuda.synchronize()
         return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
+
+    def get_full_logits_tq(
+        self,
+        data: BatchedDataDict[Any],
+        transfer_id: str,
+        partition_id: str,
+        micro_batch_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Teacher forward with each TP/CP logit shard written to TransferQueue."""
+        forward_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+        sequence_dim, seq_dim_size = check_sequence_dim(data)
+        target_local_seq = (
+            seq_dim_size // self.cp_size if self.cp_size > 1 else seq_dim_size
+        )
+        self.model.eval()
+        post_processor = FullLogitsPostProcessor(
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            enable_seq_packing=self.enable_seq_packing,
+        )
+        tp_rank = self.tp_mesh.get_local_rank() if self.tp_mesh is not None else 0
+        cp_rank = self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
+        dp_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
+        world_rank = torch.distributed.get_rank()
+        full_seq_len = target_local_seq * self.cp_size
+        global_seq_start = cp_rank * full_seq_len // self.cp_size
+        per_sample_handles: list[dict[str, Any]] = []
+        sample_offset = 0
+        bytes_written = 0
+        put_time_s = 0.0
+        with torch.no_grad():
+            data.to("cuda")
+            processed_iterator, iterator_len = get_microbatch_iterator(
+                data,
+                self.cfg,
+                forward_batch_size,
+                self.dp_mesh,
+                tokenizer=self.tokenizer,
+                cp_size=self.cp_size,
+            )
+            for buf_idx, processed_mb in enumerate(processed_iterator):
+                processed_inputs = processed_mb.processed_inputs
+                with get_train_context(
+                    cp_size=self.cp_size,
+                    cp_mesh=self.cp_mesh,
+                    cp_buffers=processed_inputs.cp_buffers,
+                    sequence_dim=sequence_dim,
+                    dtype=self.dtype,
+                    autocast_enabled=self.autocast_enabled,
+                ):
+                    vals, _metrics, _ = forward_with_post_processing_fn(
+                        model=self.model,
+                        post_processing_fn=post_processor,
+                        processed_mb=processed_mb,
+                        is_reward_model=False,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                    )
+                if buf_idx >= iterator_len:
+                    continue
+                pad_needed = target_local_seq - vals.shape[1]
+                if pad_needed > 0:
+                    vals = torch.nn.functional.pad(vals, (0, 0, 0, pad_needed))
+                batch_size_mb, seq_len_mb, local_vocab_size = vals.shape
+                cpu_vals = vals.detach().to("cpu").contiguous()
+                keys = [
+                    f"{transfer_id}:rank{world_rank}:sample{sample_offset + i}"
+                    for i in range(batch_size_mb)
+                ]
+                start = time.perf_counter()
+                self._require_dp_client().put_samples(
+                    sample_ids=keys,
+                    partition_id=partition_id,
+                    fields=TensorDict({"logits": cpu_vals}, batch_size=[batch_size_mb]),
+                )
+                put_time_s += time.perf_counter() - start
+                bytes_written += cpu_vals.numel() * cpu_vals.element_size()
+                full_vocab_size = local_vocab_size * self.tp_size
+                for i, key in enumerate(keys):
+                    per_sample_handles.append(
+                        {
+                            "tq_key": key,
+                            "partition_id": partition_id,
+                            "actual_shape": (seq_len_mb, local_vocab_size),
+                            "dtype": cpu_vals.dtype,
+                            "tp_rank": tp_rank,
+                            "cp_rank": cp_rank,
+                            "tp_size": self.tp_size,
+                            "cp_size": self.cp_size,
+                            "world_rank": world_rank,
+                            "vocab_start_index": tp_rank * local_vocab_size,
+                            "vocab_end_index": (tp_rank + 1) * local_vocab_size,
+                            "global_seq_start": global_seq_start,
+                            "full_vocab_size": full_vocab_size,
+                            "full_seq_len": full_seq_len,
+                            "vocab_sharded": self.tp_size > 1,
+                            "sequence_sharded": self.cp_size > 1,
+                        }
+                    )
+                sample_offset += batch_size_mb
+                del vals, cpu_vals
+        return {
+            "per_sample_handles": per_sample_handles,
+            "dp_rank": dp_rank,
+            "put_time_s": put_time_s,
+            "bytes_written": bytes_written,
+        }
 
     def release_ipc_buffer(self) -> None:
         """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""

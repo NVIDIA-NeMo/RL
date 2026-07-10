@@ -24,6 +24,7 @@ from ray.util.queue import Queue as RayQueue
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane.interfaces import DataPlaneClient, DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -104,6 +105,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         skip_weight_load: bool = False,
     ):
         self.debug_payload_metrics = False
+        self.dp_client: Optional[DataPlaneClient] = None
         if weights_path:
             weights_path = os.path.abspath(weights_path)
         if optimizer_path:
@@ -752,6 +754,68 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         worker_results = self.worker_group.get_all_worker_results(futures)
         return aggregate_per_sample_handles(worker_results)
 
+    def initialize_data_plane(self, cfg: DataPlaneConfig) -> None:
+        """Bootstrap a driver data-plane client and attach every policy worker."""
+        from nemo_rl.data_plane import build_data_plane_client
+
+        self.dp_client = build_data_plane_client(cfg, bootstrap=True)
+        futures = self.worker_group.run_all_workers_single_data(
+            "setup_data_plane", cfg=cfg
+        )
+        ray.get(futures)
+
+    def attach_workers_to_data_plane(self, cfg: DataPlaneConfig) -> None:
+        """Attach this policy's workers to an already bootstrapped data plane."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "setup_data_plane", cfg=cfg
+        )
+        ray.get(futures)
+
+    def get_full_logits_tq(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        *,
+        transfer_id: str,
+        partition_id: str,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, float]]:
+        """Run teacher forward and persist per-rank full-logit shards in TQ."""
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "get_full_logits_tq does not support dynamic batching or sequence packing"
+            )
+        dp_size = self.data_parallel_size
+        with timer.time("get_full_logits_tq/shard_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        with timer.time("get_full_logits_tq/submit") if timer else nullcontext():
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_full_logits_tq",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=["pipeline_parallel"],
+                common_kwargs={
+                    "transfer_id": transfer_id,
+                    "partition_id": partition_id,
+                    "micro_batch_size": micro_batch_size,
+                },
+            )
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        metrics = {
+            "teacher_transfer_put_time_s": float(
+                sum(result["put_time_s"] for result in worker_results)
+            ),
+            "teacher_transfer_put_bytes": float(
+                sum(result["bytes_written"] for result in worker_results)
+            ),
+        }
+        return aggregate_per_sample_handles(worker_results), metrics
+
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""
         futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")
@@ -1245,6 +1309,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if not hasattr(self, "worker_group"):
             return True
         try:
+            if self.dp_client is not None:
+                self.dp_client.close()
+                self.dp_client = None
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
         except ray.exceptions.RayActorError:

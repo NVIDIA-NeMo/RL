@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 import os
+import uuid
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -52,13 +53,13 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.algorithms.x_token import TokenAligner
 from nemo_rl.algorithms.x_token.utils import (
     assert_teacher_student_batch_grid,
-    assert_xtoken_ipc_node_local,
     pad_distillation_val_batch,
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.cross_tokenizer_collate import CrossTokenizerCollator
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
@@ -101,7 +102,7 @@ def xtoken_non_student_seq_keys(
     """
     keys: set[str] = set()
     for i in range(loss_fn.num_teachers):
-        keys.add(f"teacher_{i}_full_logits_ipc")
+        keys.add(f"teacher_{i}_full_logits_tq")
         if loss_fn.projection_matrix_paths[i] is not None:  # cross-tokenizer
             keys.add(f"teacher_{i}_input_ids")
             keys.add(f"teacher_{i}_token_mask")
@@ -205,6 +206,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    data_plane: Optional[DataPlaneConfig] = None
 
 
 # ===============================================================================
@@ -422,8 +424,6 @@ def setup(
     # order) and tile it cleanly into per-DP-rank chunks and whole microbatches.
     # assert_teacher_student_batch_grid checks both (GBS agreement + tiling).
     student_dp = student_policy.data_parallel_size
-    student_tp = policy_config["dtensor_cfg"]["tensor_parallel_size"]
-    student_cp = policy_config["dtensor_cfg"]["context_parallel_size"]
     # Each teacher may differ from the student (and from each other) in
     # DP/MBS/TP/CP, so check the batch grid and node-local IPC layout per
     # teacher. Train and validation share the grid (the student reuses its train
@@ -440,19 +440,11 @@ def setup(
             student_mbs=policy_config["train_micro_batch_size"],
             teacher_mbs=tc["train_micro_batch_size"],
         )
-        # Node-local CUDA IPC: on >1 node it only works when teacher/student
-        # share DP and a node-aligned model-parallel group, else a student rank
-        # would read teacher shards from another node.
-        assert_xtoken_ipc_node_local(
-            num_nodes=cluster_config["num_nodes"],
-            gpus_per_node=cluster_config["gpus_per_node"],
-            student_tp=student_tp,
-            student_cp=student_cp,
-            teacher_tp=tc["dtensor_cfg"]["tensor_parallel_size"],
-            teacher_cp=tc["dtensor_cfg"]["context_parallel_size"],
-            student_dp=student_dp,
-            teacher_dp=teacher_dp,
-        )
+    if master_config.data_plane is None or not master_config.data_plane["enabled"]:
+        raise ValueError("x-token TQ transport requires data_plane.enabled=true")
+    student_policy.initialize_data_plane(master_config.data_plane)
+    for teacher_policy in teacher_policies:
+        teacher_policy.attach_workers_to_data_plane(master_config.data_plane)
 
     # ==========================
     #         Loss
@@ -501,18 +493,19 @@ def setup(
 
 
 def export_teacher_logits_and_pack(
+    student_policy: Policy,
     teacher_policies: list[Policy],
     loss_fn: CrossTokenizerDistillationLossFn,
     batch: BatchedDataDict[Any],
     teacher_mbs: list[int],
     *,
     timer: Optional[Timer] = None,
-) -> BatchedDataDict[Any]:
+) -> tuple[BatchedDataDict[Any], dict[str, float]]:
     """Serially run each teacher's forward and pack the student ``train_data``.
 
     Teachers run one at a time (collocated): each is onloaded for inference,
-    forwarded, then offloaded. Every teacher ships full-vocab logits over CUDA
-    IPC (``teacher_{i}_full_logits_ipc``) — the loss derives the microbatch-global
+    forwarded, then offloaded. Every teacher writes full-vocab logit shards to
+    TransferQueue (``teacher_{i}_full_logits_tq``) — the loss derives the microbatch-global
     top-k subset student-side, so there is no top-K transport. A same-vocab
     teacher (``projection_matrix_paths[i] is None``) reuses the student tokens
     and rides no extra alignment; a cross-tokenizer teacher's own tokenization
@@ -526,6 +519,13 @@ def export_teacher_logits_and_pack(
         "input_lengths": batch["input_lengths"],
         "token_mask": batch["token_mask"],
         "sample_mask": batch["sample_mask"],
+    }
+    if student_policy.dp_client is None:
+        raise RuntimeError("x-token TQ transport was not initialized")
+    transfer_id = uuid.uuid4().hex
+    transfer_metrics = {
+        "teacher_transfer_put_time_s": 0.0,
+        "teacher_transfer_put_bytes": 0.0,
     }
     for i, teacher_policy in enumerate(teacher_policies):
         same_vocab = loss_fn.projection_matrix_paths[i] is None
@@ -560,15 +560,50 @@ def export_teacher_logits_and_pack(
                 train_data[f"alignment_{i}_{field}"] = batch[f"alignment_{i}_{field}"]
 
         teacher_policy.prepare_for_lp_inference()
-        handles = teacher_policy.get_full_logits_ipc(
-            teacher_data, micro_batch_size=teacher_mbs[i], timer=timer
+        partition_id = f"xtoken_teacher_{i}"
+        teacher_mp = teacher_policy.sharding_annotations.get_axis_size(
+            "tensor_parallel"
+        ) * teacher_policy.sharding_annotations.get_axis_size("context_parallel")
+        student_policy.dp_client.register_partition(
+            partition_id=partition_id,
+            fields=["logits"],
+            num_samples=teacher_data.size * teacher_mp,
+            consumer_tasks=[],
         )
-        train_data[f"teacher_{i}_full_logits_ipc"] = handles
-        # Free the teacher's PARAMS to CPU; the persistent IPC buffers live in
-        # worker state and survive this call.
+        handles, teacher_transfer_metrics = teacher_policy.get_full_logits_tq(
+            teacher_data,
+            transfer_id=f"{transfer_id}:teacher{i}",
+            partition_id=partition_id,
+            micro_batch_size=teacher_mbs[i],
+            timer=timer,
+        )
+        for name, value in teacher_transfer_metrics.items():
+            transfer_metrics[name] += value
+        train_data[f"teacher_{i}_full_logits_tq"] = handles
         teacher_policy.offload_after_refit()
 
-    return BatchedDataDict(train_data)
+    return BatchedDataDict(train_data), transfer_metrics
+
+
+def clear_teacher_logits_tq(
+    student_policy: Policy,
+    train_data: BatchedDataDict[Any],
+    num_teachers: int,
+) -> None:
+    """Clear the exact TQ keys referenced by a completed student batch."""
+    if student_policy.dp_client is None:
+        return
+    for i in range(num_teachers):
+        entries = train_data[f"teacher_{i}_full_logits_tq"]
+        keys = list(
+            dict.fromkeys(
+                shard["tq_key"]
+                for entry in entries
+                for shard in entry["teacher_shards"]
+            )
+        )
+        partition_id = entries[0]["teacher_shards"][0]["partition_id"]
+        student_policy.dp_client.clear_samples(keys, partition_id)
 
 
 def xtoken_off_policy_distillation_train(
@@ -640,11 +675,16 @@ def xtoken_off_policy_distillation_train(
             with timer.time("total_step_time"):
                 with timer.time("teacher_forward"):
                     # Serial per-teacher forward; each teacher ships full-vocab
-                    # logits over IPC (``teacher_{i}_full_logits_ipc``) and the
+                    # logits through TQ (``teacher_{i}_full_logits_tq``) and the
                     # loss derives the microbatch-global top-k subset
                     # student-side. Packs the per-teacher alignment payload too.
-                    train_data = export_teacher_logits_and_pack(
-                        teacher_policies, loss_fn, batch, teacher_mbs, timer=timer
+                    train_data, transfer_metrics = export_teacher_logits_and_pack(
+                        student_policy,
+                        teacher_policies,
+                        loss_fn,
+                        batch,
+                        teacher_mbs,
+                        timer=timer,
                     )
 
                 with timer.time("training_prep"):
@@ -658,16 +698,10 @@ def xtoken_off_policy_distillation_train(
                             timer=timer,
                             check_dim_skip_keys=skip_keys,
                         )
-                    except Exception:
-                        # Free every teacher's producer IPC buffer before
-                        # propagating so a failed step doesn't leak teacher
-                        # logits. The happy path keeps the buffers persistent
-                        # across steps (reused via copy_) and releases once at
-                        # loop exit — releasing every step would free + realloc
-                        # the large teacher logits buffers and fragment into OOM.
-                        for teacher_policy in teacher_policies:
-                            teacher_policy.release_ipc_buffer()
-                        raise
+                    finally:
+                        clear_teacher_logits_tq(
+                            student_policy, train_data, loss_fn.num_teachers
+                        )
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -700,6 +734,7 @@ def xtoken_off_policy_distillation_train(
                     "grad_norm": train_results["grad_norm"].numpy(),
                 }
                 metrics.update(train_results["all_mb_metrics"])
+                metrics.update(transfer_metrics)
                 # Reduce per-microbatch metrics to per-step scalars. The
                 # P-KL path emits kl_loss/ce_loss/kl_loss_scale/proj_accuracy;
                 # the gold-loss path emits kl_common/l1_uncommon. Either set
@@ -943,8 +978,13 @@ def validate(
             target_size = math.ceil(batch.size / pad_quantum) * pad_quantum
             batch = pad_distillation_val_batch(batch, target_size)
 
-            train_data = export_teacher_logits_and_pack(
-                teacher_policies, loss_fn, batch, teacher_mbs, timer=timer
+            train_data, _transfer_metrics = export_teacher_logits_and_pack(
+                student_policy,
+                teacher_policies,
+                loss_fn,
+                batch,
+                teacher_mbs,
+                timer=timer,
             )
             student_policy.prepare_for_training()
             try:
@@ -958,6 +998,10 @@ def validate(
                 for teacher_policy in teacher_policies:
                     teacher_policy.release_ipc_buffer()
                 raise
+            finally:
+                clear_teacher_logits_tq(
+                    student_policy, train_data, loss_fn.num_teachers
+                )
             losses.append(float(np.mean(results["loss"].numpy())))
             mb_metrics = results.get("all_mb_metrics", {})
             if "kl_loss" in mb_metrics:

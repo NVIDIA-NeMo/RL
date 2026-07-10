@@ -286,3 +286,16 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 1
+
+# TransferQueue carries every teacher-logit shard in this experimental branch.
+# mooncake_cpu is required for cross-node transport; student workers fetch the
+# shards directly and reconstruct their local CP window before loss evaluation.
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: "mooncake_cpu"
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888
+  local_buffer_size: 68719476736

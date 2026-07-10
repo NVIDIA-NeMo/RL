@@ -44,6 +44,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.data_plane.interfaces import DataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -566,6 +567,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        data_plane_client: Optional[DataPlaneClient] = None,
     ):
         """Initialize LossPostProcessor.
 
@@ -589,6 +591,7 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.data_plane_client = data_plane_client
 
     def __call__(
         self,
@@ -623,7 +626,9 @@ class LossPostProcessor:
 
         # Wrap prepare_loss_input with sampling_params
         prepare_loss_input_wrapped = partial(
-            prepare_loss_input, sampling_params=self.sampling_params
+            prepare_loss_input,
+            sampling_params=self.sampling_params,
+            data_plane_client=self.data_plane_client,
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:

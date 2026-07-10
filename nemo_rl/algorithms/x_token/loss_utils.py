@@ -38,6 +38,7 @@ Used by both :mod:`token_aligner` and
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, fields
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -45,6 +46,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
+from nemo_rl.data_plane.interfaces import DataPlaneClient
 from nemo_rl.distributed.model_utils import (
     cp_load_balanced_to_contiguous,
     cp_shift_next,
@@ -604,6 +606,75 @@ def rebuild_teacher_full_logits_from_ipc(
     return torch.stack(rebuilt, dim=0)
 
 
+def rebuild_teacher_full_logits_from_tq(
+    per_sample_entries: list[dict[str, Any]],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    device: int,
+    data_plane_client: DataPlaneClient,
+) -> tuple[torch.Tensor, float, int]:
+    """Fetch TQ-resident teacher shards and rebuild this student CP window."""
+    start = time.perf_counter()
+    student_cp_rank = (
+        torch.distributed.get_rank(cp_group) if cp_group is not None else 0
+    )
+    student_cp_size = (
+        torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    )
+    entry_matches: list[list[tuple[Any, ...]]] = []
+    shard_keys: list[str] = []
+    seen_keys: set[str] = set()
+    for entry in per_sample_entries:
+        teacher_shards = entry["teacher_shards"]
+        full_seq_len = int(teacher_shards[0]["full_seq_len"])
+        matches = collect_overlapping_teacher_shards(
+            teacher_shards,
+            student_cp_rank=student_cp_rank,
+            student_cp_size=student_cp_size,
+            full_seq_len=full_seq_len,
+        )
+        entry_matches.append(matches)
+        for shard, *_slices in matches:
+            key = shard["tq_key"]
+            if key not in seen_keys:
+                seen_keys.add(key)
+                shard_keys.append(key)
+    if not shard_keys:
+        raise ValueError("TQ teacher-logit entries contain no shard keys")
+    partition_id = per_sample_entries[0]["teacher_shards"][0]["partition_id"]
+    td = data_plane_client.get_samples(
+        sample_ids=shard_keys,
+        partition_id=partition_id,
+        select_fields=["logits"],
+    )
+    fetched = td["logits"]
+    by_key = {key: fetched[i] for i, key in enumerate(shard_keys)}
+    bytes_fetched = sum(t.numel() * t.element_size() for t in by_key.values())
+
+    rebuilt: list[torch.Tensor] = []
+    for entry, matches in zip(per_sample_entries, entry_matches):
+        teacher_shards = entry["teacher_shards"]
+        full_seq_len = int(teacher_shards[0]["full_seq_len"])
+        full_vocab_size = int(teacher_shards[0]["full_vocab_size"])
+        if full_seq_len % student_cp_size != 0:
+            raise ValueError(
+                f"full_seq_len={full_seq_len} is not divisible by "
+                f"student_cp_size={student_cp_size}"
+            )
+        dest = torch.zeros(
+            (full_seq_len // student_cp_size, full_vocab_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        for shard, src_seq, src_vocab, dest_seq, dest_vocab in matches:
+            src = by_key[shard["tq_key"]]
+            dest[dest_seq, dest_vocab] = src[src_seq, src_vocab].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            )
+        rebuilt.append(dest)
+    torch.cuda.current_stream().synchronize()
+    return torch.stack(rebuilt, dim=0), time.perf_counter() - start, bytes_fetched
+
+
 def valid_chunk_mask(
     s_sizes: torch.Tensor,
     t_sizes: torch.Tensor,
@@ -976,12 +1047,14 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     projection_matrix_paths: list[Optional[str]],
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    data_plane_client: Optional[DataPlaneClient] = None,
 ) -> tuple[
     torch.Tensor,
     Dict[int, torch.Tensor],
     Dict[int, LocalizedAlignment],
     Optional[torch.distributed.ProcessGroup],
     Optional[torch.distributed.ProcessGroup],
+    dict[str, float],
 ]:
     """Build the per-teacher cross-tokenizer distillation loss pieces from student logits + IPC teacher data.
 
@@ -1029,13 +1102,34 @@ def prepare_xtoken_cross_tokenizer_loss_input(
     sample_mask = to_local_if_dtensor(data["sample_mask"])
 
     teacher_full_logits_by_idx: Dict[int, torch.Tensor] = {}
+    transport_stats = {
+        "teacher_transfer_time_s": 0.0,
+        "teacher_transfer_bytes": 0.0,
+    }
     aligns_by_idx: Dict[int, LocalizedAlignment] = {}
     for i, proj_path in enumerate(projection_matrix_paths):
-        teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
-            data[f"teacher_{i}_full_logits_ipc"],
-            cp_group=cp_group,
-            device=device,
-        )
+        tq_key = f"teacher_{i}_full_logits_tq"
+        if tq_key in data:
+            if data_plane_client is None:
+                raise RuntimeError(
+                    "TQ teacher logits require a data-plane client on the student worker"
+                )
+            teacher_full_logits, elapsed_s, bytes_fetched = (
+                rebuild_teacher_full_logits_from_tq(
+                    data[tq_key],
+                    cp_group=cp_group,
+                    device=device,
+                    data_plane_client=data_plane_client,
+                )
+            )
+            transport_stats["teacher_transfer_time_s"] += elapsed_s
+            transport_stats["teacher_transfer_bytes"] += float(bytes_fetched)
+        else:
+            teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
+                data[f"teacher_{i}_full_logits_ipc"],
+                cp_group=cp_group,
+                device=device,
+            )
         teacher_full_logits_by_idx[i] = teacher_full_logits
         if proj_path is None:
             # Same-tokenizer teacher: identity token alignment, no chunk
@@ -1069,4 +1163,5 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         aligns_by_idx,
         tp_group,
         cp_group,
+        transport_stats,
     )
