@@ -26,6 +26,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollouts import (
+    _calculate_agent_result_metrics,
     _calculate_single_metric,
     _tensorize_by_key,
     calculate_rewards,
@@ -561,16 +562,9 @@ class AsyncNemoGymRolloutImpl:
 
         # Agent-level metrics.
         agent_extras = [c.env_extras for c in completions]
-        for key in agent_extras[0].keys():
-            values = [
-                float(r[key])  # type: ignore
-                for r in agent_extras
-                if isinstance(r.get(key), (bool, int, float))
-            ]
-            if values:
-                rollout_metrics.update(
-                    _calculate_single_metric(values, n, f"{agent_name}/{key}")
-                )
+        rollout_metrics.update(
+            _calculate_agent_result_metrics(agent_extras, agent_name)
+        )
         rollout_metrics[f"{agent_name}/full_result"] = Table(
             data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
             columns=["Full result"],
