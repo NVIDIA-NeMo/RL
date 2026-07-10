@@ -54,6 +54,7 @@ class SparseDeltaStreamResult(TypedDict):
 
 @cache
 def _s3_client(region: str) -> Any:
+    # Keep the AWS runtime unloaded for ZeroMQ-only jobs.
     from awscrt.auth import AwsCredentialsProvider
     from awscrt.io import ClientBootstrap, DefaultHostResolver, EventLoopGroup
     from awscrt.s3 import S3Client, create_default_s3_signing_config
@@ -79,6 +80,7 @@ def _s3_client(region: str) -> Any:
 
 class _S3ObjectStore:
     def __init__(self, *, bucket: str, region: str) -> None:
+        # Keep the AWS runtime unloaded for ZeroMQ-only jobs.
         from awscrt.s3 import S3RequestType
 
         self.bucket = bucket
@@ -93,6 +95,7 @@ class _S3ObjectStore:
         ).finished_future.result()
 
     def get(self, key: str) -> bytes:
+        # Keep the AWS runtime unloaded for ZeroMQ-only jobs.
         from awscrt.http import HttpHeaders
 
         body = bytearray()
@@ -129,6 +132,7 @@ class _S3ObjectStore:
         ).finished_future.result()
 
     def _request(self, method: str, key: str, body: bytes | None = None) -> Any:
+        # Keep the AWS runtime unloaded for ZeroMQ-only jobs.
         from awscrt.http import HttpHeaders, HttpRequest
 
         headers = HttpHeaders(

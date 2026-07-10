@@ -26,6 +26,33 @@ from nemo_rl.utils.weight_transfer_remote_sparse import flush_vllm_refit_urls
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
+def validate_vllm_remote_sparse_refit(
+    config: Any,
+    *,
+    colocated: bool,
+    megatron_enabled: bool,
+) -> str | None:
+    """Validate the optional transport without exposing its rules to GRPO."""
+    transport = config.get("refit_transport")
+    if transport not in (None, "vllm_s3_sparse", "vllm_zmq_sparse"):
+        raise ValueError(f"Unsupported vLLM refit transport {transport!r}.")
+    vllm_cfg = config["vllm_cfg"]
+    if transport is not None and (
+        colocated
+        or not megatron_enabled
+        or vllm_cfg["precision"] == "fp8"
+        or vllm_cfg["kv_cache_dtype"].startswith("fp8")
+        or not config.get("delta_compression")
+        or config.get("quant_cfg")
+        or config.get("real_quant")
+    ):
+        raise ValueError(
+            f"{transport} requires a non-colocated Megatron policy, BF16/FP16 "
+            "vLLM, delta compression, and an unquantized rollout."
+        )
+    return transport
+
+
 class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
     def __init__(
         self,
@@ -74,9 +101,10 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             succeeded = False
             try:
                 transfer_id = uuid.uuid4().hex
-                refs = self._policy.stream_remote_sparse_weights(
-                    self._transport,
-                    self._targets,
+                refs = self._run_policy_workers(
+                    "stream_remote_sparse_weights",
+                    transport=self._transport,
+                    targets=self._targets,
                     transfer_id=transfer_id,
                     api_key_env_var=self._api_key_env_var,
                     timeout_s=self._request_timeout_s,
@@ -166,7 +194,10 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                             timeout_s=min(self._request_timeout_s, 60.0),
                         )
                 self._baseline_commit_refs = (
-                    self._policy.finish_remote_sparse_delta_sync(succeeded)
+                    self._policy.worker_group.run_all_workers_single_data(
+                        "finish_remote_sparse_delta_sync",
+                        succeeded=succeeded,
+                    )
                 )
         self._stale = False
         return {
@@ -191,16 +222,46 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
     def mark_stale(self) -> None:
         self._stale = True
 
-    def init_communicator(self) -> None:
-        self._baseline_init_refs = self._policy.init_remote_sparse_delta_baseline(
-            self._transport
+    def _run_policy_workers(self, method_name: str, **kwargs: Any) -> list[Any]:
+        worker_group = self._policy.worker_group
+        worker_count = len(worker_group.workers)
+        return worker_group.run_all_workers_multiple_data(
+            method_name,
+            common_kwargs={**kwargs, "shard_count": worker_count},
+            shard_rank=list(range(worker_count)),
         )
-        self._refit_urls = self._generation.report_refit_server_base_urls()
+
+    def _run_generation_workers(self, method_name: str, **kwargs: Any) -> list[Any]:
+        worker_group = self._generation.worker_group
+        if not worker_group or not worker_group.workers:
+            raise RuntimeError("vLLM worker group is not initialized.")
+        return ray.get(
+            worker_group.run_all_workers_single_data(
+                method_name,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                **kwargs,
+            )
+        )
+
+    def init_communicator(self) -> None:
+        self._baseline_init_refs = self._run_policy_workers(
+            "init_remote_sparse_delta_baseline",
+            transport=self._transport,
+        )
+        self._refit_urls = [
+            url
+            for url in self._run_generation_workers("report_refit_server_base_url")
+            if url
+        ]
         self._targets = self._refit_urls
         if self._transport == "zmq":
-            self._targets = self._generation.start_zmq_sparse_refit_relays(
-                self._refit_urls
-            )
+            self._targets = [
+                address
+                for address in self._run_generation_workers(
+                    "start_zmq_sparse_refit_relay", refit_urls=self._refit_urls
+                )
+                if address
+            ]
         if not self._refit_urls or not self._targets:
             raise ValueError(
                 f"vLLM {self._transport} sparse refit endpoints are missing."
@@ -213,7 +274,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         ):
             ray.cancel(ref, force=False)
         if self._transport == "zmq":
-            self._generation.stop_zmq_sparse_refit_relays()
+            self._run_generation_workers("stop_zmq_sparse_refit_relay")
         self._baseline_init_refs = None
         self._baseline_commit_refs = None
         self._refit_urls = []

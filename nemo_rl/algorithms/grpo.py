@@ -115,9 +115,6 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
-from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
-    VllmRemoteSparseWeightSynchronizer,
-)
 
 # ===============================================================================
 # Configuration
@@ -902,9 +899,7 @@ def setup(
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
-    refit_transport = (
-        generation_config.get("refit_transport") if backend == "vllm" else None
-    )
+    refit_transport = None
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
@@ -1093,23 +1088,18 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
-        vllm_cfg = generation_config["vllm_cfg"]
-        if refit_transport not in (None, "vllm_s3_sparse", "vllm_zmq_sparse"):
-            raise ValueError(f"Unsupported vLLM refit transport {refit_transport!r}.")
-        if refit_transport is not None:
-            if (
-                colocated_inference
-                or not policy_config["megatron_cfg"]["enabled"]
-                or vllm_cfg["precision"] == "fp8"
-                or vllm_cfg["kv_cache_dtype"].startswith("fp8")
-                or not generation_config.get("delta_compression")
-                or generation_config.get("quant_cfg")
-                or generation_config.get("real_quant")
-            ):
-                raise ValueError(
-                    f"{refit_transport} requires a non-colocated Megatron policy, "
-                    "BF16/FP16 vLLM, delta compression, and an unquantized rollout."
-                )
+        if generation_config.get("refit_transport") is not None:
+            # Keep optional remote transport dependencies off the default path.
+            from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
+                VllmRemoteSparseWeightSynchronizer,
+                validate_vllm_remote_sparse_refit,
+            )
+
+            refit_transport = validate_vllm_remote_sparse_refit(
+                generation_config,
+                colocated=colocated_inference,
+                megatron_enabled=policy_config["megatron_cfg"]["enabled"],
+            )
 
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config.use_importance_sampling_correction, (
@@ -2061,12 +2051,10 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
-    if (
-        isinstance(policy_generation, VllmGeneration)
-        and policy_generation.weight_synchronizer is not None
-    ):
+    synchronizer = getattr(policy_generation, "weight_synchronizer", None)
+    if synchronizer is not None:
         return (
-            policy_generation.weight_synchronizer.sync_weights(
+            synchronizer.sync_weights(
                 timer=timer,
                 kv_scales=kv_scales,
             )

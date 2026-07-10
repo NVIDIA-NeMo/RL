@@ -63,6 +63,7 @@ from nemo_rl.models.megatron.data import (
 )
 from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_loss_metrics_from_last_stage,
+    broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
@@ -97,13 +98,6 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.weight_transfer_remote_sparse import (
-    SparseDeltaStreamResult,
-    init_sparse_delta_baseline_from_iterator,
-    stream_sparse_delta_payloads_via_s3_manifest,
-)
-from nemo_rl.utils.weight_transfer_sparse_codec import DeltaCompressionTracker
-from nemo_rl.utils.weight_transfer_zmq import stream_sparse_delta_payloads_via_zmq
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -369,9 +363,14 @@ class MegatronPolicyWorkerImpl(
         delta_config = None
         if generation_config is not None and generation_config["backend"] == "vllm":
             delta_config = cast(VllmConfig, generation_config).get("delta_compression")
-        self.delta_weight_transfer_tracker = (
-            DeltaCompressionTracker(delta_config) if delta_config else None
-        )
+        self._remote_sparse_refit = None
+        if delta_config:
+            # Keep codec and remote transport state out of standard policy workers.
+            from nemo_rl.models.policy.workers.megatron_remote_sparse_refit import (
+                MegatronRemoteSparseRefit,
+            )
+
+            self._remote_sparse_refit = MegatronRemoteSparseRefit(self, delta_config)
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
@@ -1746,12 +1745,7 @@ class MegatronPolicyWorkerImpl(
         shard_count: int,
         transport: str,
     ) -> None:
-        """Initialize the source-side baseline for remote sparse refit."""
-        tracker = self.delta_weight_transfer_tracker
-        assert tracker is not None
-        init_sparse_delta_baseline_from_iterator(
-            self._iter_params_with_optional_kv_scales(),
-            delta_tracker=tracker,
+        self._require_remote_sparse_refit().initialize_baseline(
             shard_rank=shard_rank,
             shard_count=shard_count,
             transport=transport,
@@ -1769,34 +1763,21 @@ class MegatronPolicyWorkerImpl(
         timeout_s: float,
         shard_rank: int,
         shard_count: int,
-    ) -> SparseDeltaStreamResult:
-        """Stream compressed sparse deltas through the selected value plane."""
-        tracker = self.delta_weight_transfer_tracker
-        assert tracker is not None
-        streamer = {
-            "s3": stream_sparse_delta_payloads_via_s3_manifest,
-            "zmq": stream_sparse_delta_payloads_via_zmq,
-        }.get(transport)
-        if streamer is None:
-            raise ValueError(
-                f"Unsupported remote sparse refit transport {transport!r}."
-            )
-        result = streamer(
-            self._iter_params_with_optional_kv_scales(),
-            delta_tracker=tracker,
-            refit_targets=targets,
+    ) -> dict[str, int]:
+        return self._require_remote_sparse_refit().stream(
+            transport,
+            targets,
             transfer_id=transfer_id,
             api_key_env_var=api_key_env_var,
             timeout_s=timeout_s,
             shard_rank=shard_rank,
             shard_count=shard_count,
         )
-        # HF export can enqueue work on auxiliary streams. Drain the device before
-        # this actor returns so every policy rank resumes training from the same
-        # completed CUDA boundary.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        return result
+
+    def _require_remote_sparse_refit(self) -> Any:
+        if self._remote_sparse_refit is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        return self._remote_sparse_refit
 
     def _get_refit_conversion_tasks(self) -> list[Any]:
         if self.refit_conversion_tasks is None:
@@ -1805,13 +1786,7 @@ class MegatronPolicyWorkerImpl(
         return self.refit_conversion_tasks
 
     def finish_remote_sparse_delta_sync(self, *, succeeded: bool) -> None:
-        tracker = self.delta_weight_transfer_tracker
-        if tracker is None:
-            raise RuntimeError("Sparse delta tracker is not initialized.")
-        if succeeded:
-            tracker.on_sync_succeeded()
-        else:
-            tracker.on_sync_failed()
+        self._require_remote_sparse_refit().finish(succeeded)
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -1830,7 +1805,7 @@ class MegatronPolicyWorkerImpl(
         conversion_tasks = self._get_refit_conversion_tasks()
         param_info = []
 
-        def calculate_size_in_bytes(param, mapping):
+        def calculate_size_in_bytes(param, tp_size, ep_size):
             if param is None:
                 # need to broadcast for other pp ranks
                 size_in_bytes = None
@@ -1845,15 +1820,11 @@ class MegatronPolicyWorkerImpl(
                 }
                 scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
                 size_in_bytes = (
-                    param.element_size()
-                    * param.numel()
-                    * mapping.tp_size
-                    * (mapping.ep_size if mapping.is_expert else 1)
-                    * scale
+                    param.element_size() * param.numel() * tp_size * ep_size * scale
                 )
 
-            # Match Megatron Bridge export semantics for tied or replicated weights.
-            return mapping.broadcast_obj_from_pp_rank(size_in_bytes)
+            # Broadcast size_in_bytes across pipeline parallel ranks
+            return broadcast_obj_from_pp_rank(size_in_bytes)
 
         for task in conversion_tasks:
             param_info.append(
@@ -1861,7 +1832,8 @@ class MegatronPolicyWorkerImpl(
                     task.param_name,
                     calculate_size_in_bytes(
                         task.param_weight,
-                        task.mapping,
+                        task.mapping.tp_size,
+                        task.mapping.ep_size if task.mapping.is_expert else 1,
                     ),
                 )
             )
