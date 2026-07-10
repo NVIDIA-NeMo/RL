@@ -104,9 +104,7 @@ def test_normalize_packing_tensors_cpu_only_with_cuda():
         expected_device,
         expected_device,
     ]
-    assert torch.equal(
-        torch.cat(normalized).cpu(), torch.arange(8, dtype=torch.uint8)
-    )
+    assert torch.equal(torch.cat(normalized).cpu(), torch.arange(8, dtype=torch.uint8))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -122,9 +120,7 @@ def test_normalize_packing_tensors_mixed_devices_use_existing_cuda_device():
         expected_device,
         expected_device,
     ]
-    assert torch.equal(
-        torch.cat(normalized).cpu(), torch.arange(8, dtype=torch.uint8)
-    )
+    assert torch.equal(torch.cat(normalized).cpu(), torch.arange(8, dtype=torch.uint8))
 
 
 @pytest.mark.skipif(
@@ -181,9 +177,7 @@ def test_packed_broadcast_producer_handles_mixed_device_iterator():
     total_broadcasted_bytes = sum(
         tensor.numel() for tensor in mock_group.broadcasted_tensors
     )
-    expected_bytes = sum(
-        tensor.numel() * tensor.element_size() for _, tensor in params
-    )
+    expected_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in params)
     assert total_broadcasted_bytes == expected_bytes
 
 
@@ -195,8 +189,7 @@ def test_packed_broadcast_producer_normal_flush_with_mixed_devices():
     so this covers the non-final packing path with mixed-device inputs.
     """
     params = [
-        (f"cpu_w{i}", torch.randn(10, 10, dtype=torch.float32))
-        for i in range(10)
+        (f"cpu_w{i}", torch.randn(10, 10, dtype=torch.float32)) for i in range(10)
     ] + [
         (f"cuda_w{i}", torch.randn(10, 10, dtype=torch.float32, device="cuda"))
         for i in range(10)
@@ -221,9 +214,7 @@ def test_packed_broadcast_producer_normal_flush_with_mixed_devices():
     total_broadcasted_bytes = sum(
         tensor.numel() for tensor in mock_group.broadcasted_tensors
     )
-    expected_bytes = sum(
-        tensor.numel() * tensor.element_size() for _, tensor in params
-    )
+    expected_bytes = sum(tensor.numel() * tensor.element_size() for _, tensor in params)
     assert total_broadcasted_bytes == expected_bytes
 
 
