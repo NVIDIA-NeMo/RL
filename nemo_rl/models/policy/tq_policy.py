@@ -67,6 +67,16 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
+    # train_from_meta returns the axis-zero worker for each DP replica, so
+    # these are intentionally source-side metrics rather than all-rank stats.
+    if "train_route_prefetch_source_metrics" in results[0]:
+        out["train_route_prefetch_source_metrics"] = [
+            {
+                "rank": result["rank"],
+                **result["train_route_prefetch_source_metrics"],
+            }
+            for result in results
+        ]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)
     for r in results:
         for k, v in r["all_mb_metrics"].items():

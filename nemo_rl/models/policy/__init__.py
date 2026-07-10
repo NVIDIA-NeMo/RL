@@ -484,10 +484,14 @@ class DynamicBatchingConfig(TypedDict):
 
 class RouterReplayConfigDisabled(TypedDict):
     enabled: Literal[False]
+    train_route_prefetch: NotRequired[Literal[False]]
 
 
 class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
+    # Fetch sync-TQ train_presharded routed_experts one packed microbatch ahead.
+    # Requires sequence packing. Split async/TQ and prev/ref paths are unchanged.
+    train_route_prefetch: NotRequired[bool]
 
 
 class PolicyConfig(TypedDict):

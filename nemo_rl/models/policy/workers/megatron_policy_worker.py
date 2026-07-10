@@ -20,6 +20,7 @@ import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import replace
 from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,8 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -76,6 +79,12 @@ from nemo_rl.models.megatron.setup import (
     setup_reference_model_state,
     validate_and_set_config,
     validate_model_paths,
+)
+from nemo_rl.models.megatron.train_route_prefetch import (
+    TQ_SAMPLE_IDS_FIELD,
+    TrainRoutePrefetchGroups,
+    TrainRoutePrefetcher,
+    initialize_train_route_prefetch_groups,
 )
 from nemo_rl.models.megatron.train import (
     LogprobsPostProcessor,
@@ -109,10 +118,11 @@ def _should_use_router_replay(
     data: BatchedDataDict[Any],
     stage: str,
     require: bool,
+    deferred_routes: bool = False,
 ) -> bool:
     if not enabled or not require:
         return False
-    if "routed_experts" in data:
+    if "routed_experts" in data or deferred_routes:
         return True
     raise RuntimeError(
         "policy.router_replay.enabled=true requires routed_experts for "
@@ -224,6 +234,72 @@ class MegatronPolicyWorkerImpl(
         self._replica_group_cache = groups[my_dp_rank]
         return self._replica_group_cache
 
+    @wrap_with_nvtx_name("policy_worker/train_presharded")
+    def train_presharded(
+        self,
+        meta: KVBatchMeta,
+        loss_fn: Any,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Train with routes fetched one packed microbatch ahead when enabled."""
+        if not self._train_route_prefetch_enabled:
+            return super().train_presharded(
+                meta,
+                loss_fn=loss_fn,
+                eval_mode=eval_mode,
+                gbs=gbs,
+                mbs=mbs,
+            )
+        if self._train_route_prefetch_groups is None:
+            raise RuntimeError(
+                "train route prefetch groups were not initialized during "
+                "Megatron worker construction"
+            )
+        if meta.fields is None or ROUTED_EXPERTS_FIELD not in meta.fields:
+            raise RuntimeError(
+                "train route prefetch requires routed_experts in the train "
+                "KVBatchMeta field selection"
+            )
+
+        base_meta = replace(
+            meta,
+            fields=[field for field in meta.fields if field != ROUTED_EXPERTS_FIELD],
+        )
+        data = self._fetch(base_meta)
+        data = self._attach_or_repack_pack_metadata(data, meta)
+        data[TQ_SAMPLE_IDS_FIELD] = list(meta.sample_ids)
+
+        prefetcher = TrainRoutePrefetcher(
+            client=self._require_dp_client(),
+            meta=meta,
+            groups=self._train_route_prefetch_groups,
+        )
+        try:
+            result = self.train(
+                data,
+                loss_fn=loss_fn,
+                eval_mode=eval_mode,
+                gbs=gbs,
+                mbs=mbs,
+                route_iterator=prefetcher,
+            )
+            prefetcher.assert_complete()
+            result["train_route_prefetch_source_metrics"] = prefetcher.metrics()
+        except Exception as train_error:
+            try:
+                prefetcher.close()
+            except Exception as close_error:
+                train_error.add_note(
+                    "route-prefetch cleanup also failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        else:
+            prefetcher.close()
+            return result
+
     @staticmethod
     def configure_worker(
         num_gpus: int | float,
@@ -289,6 +365,24 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        router_replay_cfg = config.get("router_replay")
+        self._train_route_prefetch_enabled = bool(
+            router_replay_cfg is not None
+            and router_replay_cfg.get("train_route_prefetch")
+        )
+        self._train_route_prefetch_groups: Optional[TrainRoutePrefetchGroups] = None
+        if self._train_route_prefetch_enabled:
+            if not self._router_replay_enabled:
+                raise ValueError(
+                    "policy.router_replay.train_route_prefetch=true requires "
+                    "policy.router_replay.enabled=true"
+                )
+            sequence_packing_cfg = config.get("sequence_packing")
+            if sequence_packing_cfg is None or not sequence_packing_cfg["enabled"]:
+                raise ValueError(
+                    "policy.router_replay.train_route_prefetch=true currently "
+                    "requires policy.sequence_packing.enabled=true"
+                )
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -432,6 +526,11 @@ class MegatronPolicyWorkerImpl(
             self.model,
             self.optimizer,
         )
+        if self._train_route_prefetch_enabled:
+            # Actor construction is already world-collective through Megatron
+            # setup. Create every prefetch group here so a later per-rank TQ
+            # connection failure cannot strand healthy ranks in new_group().
+            self._train_route_prefetch_groups = initialize_train_route_prefetch_groups()
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
@@ -543,13 +642,15 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        route_iterator: Optional[Iterator[Any]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
         ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
         workers (cross-tokenizer ride-along tensors whose dim 1 is not the
         student sequence axis). Megatron doesn't run cross-tokenizer, so it
-        must be None.
+        must be None. ``route_iterator`` is used only by the synchronous TQ
+        train entrypoint to inject packed-microbatch router-replay payloads.
         """
         assert check_dim_skip_keys is None, (
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
@@ -641,6 +742,7 @@ class MegatronPolicyWorkerImpl(
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
                     delegate_pack_to_model=self.delegate_pack_to_model,
+                    route_iterator=route_iterator,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -687,6 +789,7 @@ class MegatronPolicyWorkerImpl(
                         data=batch,
                         stage="train",
                         require=True,
+                        deferred_routes=route_iterator is not None,
                     )
                     with maybe_r3_trace_stage("train", enabled=use_router_replay):
                         losses_reduced = megatron_forward_backward(

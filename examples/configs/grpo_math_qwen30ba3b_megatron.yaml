@@ -17,6 +17,8 @@ policy:
   precision: "bfloat16"
   router_replay:
     enabled: false
+    # Sync-TQ train-only depth-one prefetch for packed routed_experts.
+    train_route_prefetch: false
 
   dtensor_cfg:
     enabled: false

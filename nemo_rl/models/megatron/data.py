@@ -28,9 +28,14 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.models.megatron.train_route_prefetch import (
+    TQ_SAMPLE_IDS_FIELD,
+    PrefetchedRoutes,
+)
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
+    trace_tq_prefetch_payload,
 )
 
 
@@ -80,6 +85,60 @@ class ProcessedMicrobatch:
     mtp_loss_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
+
+
+def inject_prefetched_routes(
+    raw_iterator: Iterator[BatchedDataDict[Any]],
+    route_iterator: Iterator[PrefetchedRoutes],
+) -> Iterator[BatchedDataDict[Any]]:
+    """Attach one prefetched route payload to each raw packed microbatch.
+
+    Injection happens before H2D, physical packing, and context-parallel
+    sharding. The private sample-id sidecar verifies that the TQ key plan and
+    Megatron's raw iterator still describe exactly the same rows.
+    """
+    for data_dict in raw_iterator:
+        try:
+            prefetched = next(route_iterator)
+        except StopIteration as error:
+            raise RuntimeError(
+                "route prefetch ended before the raw microbatch iterator"
+            ) from error
+
+        if TQ_SAMPLE_IDS_FIELD not in data_dict:
+            raise RuntimeError(
+                f"route-prefetched microbatch is missing {TQ_SAMPLE_IDS_FIELD!r}"
+            )
+        actual_sample_ids = tuple(data_dict.pop(TQ_SAMPLE_IDS_FIELD))
+        if actual_sample_ids != prefetched.sample_ids:
+            raise RuntimeError(
+                "route-prefetch sample order mismatch: raw microbatch has "
+                f"{actual_sample_ids}, prefetched routes have "
+                f"{prefetched.sample_ids}"
+            )
+        if "routed_experts" in data_dict:
+            raise RuntimeError(
+                "route-prefetched microbatch already contains routed_experts"
+            )
+        if prefetched.routed_experts.shape[0] != data_dict.size:
+            raise RuntimeError(
+                "route-prefetch batch mismatch: routes have "
+                f"{prefetched.routed_experts.shape[0]} rows but raw microbatch "
+                f"has {data_dict.size}"
+            )
+        if prefetched.routed_experts.shape[1] != data_dict["input_ids"].shape[1]:
+            raise RuntimeError(
+                "route-prefetch sequence mismatch: routes have length "
+                f"{prefetched.routed_experts.shape[1]} but input_ids have length "
+                f"{data_dict['input_ids'].shape[1]}"
+            )
+
+        data_dict["routed_experts"] = prefetched.routed_experts
+        trace_tq_prefetch_payload(
+            keys=prefetched.sample_ids,
+            data=data_dict,
+        )
+        yield data_dict
 
 
 def make_processed_microbatch_iterator(
@@ -148,6 +207,7 @@ def get_microbatch_iterator(
     straggler_timer: StragglerDetector,
     seq_length_key: Optional[str] = None,
     delegate_pack_to_model: bool = False,
+    route_iterator: Optional[Iterator[PrefetchedRoutes]] = None,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -160,6 +220,8 @@ def get_microbatch_iterator(
         cfg: Configuration dictionary
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
+        route_iterator: Optional train-only iterator yielding routes for each raw
+            packed microbatch before H2D and physical packing.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -201,6 +263,9 @@ def get_microbatch_iterator(
     else:
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
+
+    if route_iterator is not None:
+        raw_iterator = inject_prefetched_routes(raw_iterator, route_iterator)
 
     # Wrap the raw iterator with processing
     processed_iterator = make_processed_microbatch_iterator(

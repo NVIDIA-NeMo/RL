@@ -549,6 +549,69 @@ def test_raise_if_message_level_advantage_penalties_enabled_raises_when_set(
         _raise_if_message_level_advantage_penalties_enabled(master_config)
 
 
+def test_summarize_train_route_prefetch_source_metrics() -> None:
+    from nemo_rl.algorithms.grpo_sync import (
+        _summarize_train_route_prefetch_source_metrics,
+    )
+
+    train_results = {
+        "train_route_prefetch_source_metrics": [
+            {
+                "rank": 0,
+                "tq_get_s": 1.0,
+                "materialize_s": 0.2,
+                "pp_leader_broadcast_s": 0.3,
+                "h2d_s": 0.1,
+                "consumer_wait_s": 0.4,
+                "stage_broadcast_s": 0.5,
+                "tq_get_calls": 2.0,
+                "materialized_route_bytes": 100.0,
+                "ready_count": 1.0,
+                "consume_count": 1.0,
+                "ready_fraction": 1.0,
+            },
+            {
+                "rank": 16,
+                "tq_get_s": 2.0,
+                "materialize_s": 0.1,
+                "pp_leader_broadcast_s": 0.6,
+                "h2d_s": 0.2,
+                "consumer_wait_s": 0.25,
+                "stage_broadcast_s": 0.4,
+                "tq_get_calls": 4.0,
+                "materialized_route_bytes": 300.0,
+                "ready_count": 1.0,
+                "consume_count": 3.0,
+                "ready_fraction": 1.0 / 3.0,
+            },
+        ]
+    }
+
+    summary = _summarize_train_route_prefetch_source_metrics(train_results)
+
+    assert summary == {
+        "route_prefetch_source/tq_get_s_max": 2.0,
+        "route_prefetch_source/materialize_s_max": 0.2,
+        "route_prefetch_source/pp_leader_broadcast_s_max": 0.6,
+        "route_prefetch_source/h2d_s_max": 0.2,
+        "route_prefetch_source/consumer_wait_s_max": 0.4,
+        "route_prefetch_source/stage_broadcast_s_max": 0.5,
+        "route_prefetch_source/tq_get_calls_sum": 6.0,
+        "route_prefetch_source/materialized_route_bytes_sum": 400.0,
+        "route_prefetch_source/ready_count_sum": 2.0,
+        "route_prefetch_source/consume_count_sum": 4.0,
+        "route_prefetch_source/ready_fraction": 0.5,
+    }
+
+
+def test_summarize_train_route_prefetch_source_metrics_noops_when_absent() -> None:
+    from nemo_rl.algorithms.grpo_sync import (
+        _summarize_train_route_prefetch_source_metrics,
+    )
+
+    assert _summarize_train_route_prefetch_source_metrics({}) == {}
+
+
 def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
     from nemo_rl.algorithms import grpo_sync as grpo_sync_mod
 

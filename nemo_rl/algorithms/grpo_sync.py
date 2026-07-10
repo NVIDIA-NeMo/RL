@@ -115,6 +115,50 @@ def _raise_if_message_level_advantage_penalties_enabled(
     )
 
 
+def _summarize_train_route_prefetch_source_metrics(
+    train_results: dict[str, Any],
+) -> dict[str, float]:
+    """Flatten development-only route-prefetch metrics for step logging.
+
+    The sharded policy dispatch returns only PP=TP=CP=0 for each DP replica,
+    so these are explicitly source-side diagnostics rather than all-stage
+    measurements. DP replicas execute concurrently: duration totals use the
+    slowest source, while calls, bytes, and counts describe job-wide work.
+    """
+    sources = train_results.get("train_route_prefetch_source_metrics")
+    if not sources:
+        return {}
+
+    prefix = "route_prefetch_source"
+    timing_fields = (
+        "tq_get_s",
+        "materialize_s",
+        "pp_leader_broadcast_s",
+        "h2d_s",
+        "consumer_wait_s",
+        "stage_broadcast_s",
+    )
+    summary = {
+        f"{prefix}/{field}_max": max(float(source[field]) for source in sources)
+        for field in timing_fields
+    }
+    for field in (
+        "tq_get_calls",
+        "materialized_route_bytes",
+        "ready_count",
+        "consume_count",
+    ):
+        summary[f"{prefix}/{field}_sum"] = sum(
+            float(source[field]) for source in sources
+        )
+
+    consume_count = summary[f"{prefix}/consume_count_sum"]
+    summary[f"{prefix}/ready_fraction"] = (
+        summary[f"{prefix}/ready_count_sum"] / consume_count if consume_count else 0.0
+    )
+    return summary
+
+
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
 # on std != 0, accumulate survivors across iterations, slice on overflow.
@@ -1062,6 +1106,9 @@ def grpo_train_sync(
                     else:
                         print(f"Skipping aggregation for {k} ({type(v)})")
 
+                metrics.update(
+                    _summarize_train_route_prefetch_source_metrics(train_results)
+                )
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
