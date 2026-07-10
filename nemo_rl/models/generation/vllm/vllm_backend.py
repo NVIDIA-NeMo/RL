@@ -779,6 +779,27 @@ class VllmInternalWorkerExtension:
                     timeout_seconds=mx_config.timeout_seconds,
                 )
 
+    def _introspect_rollout_ep_layout(self) -> tuple[int, int, int]:
+        """Read the live vLLM rollout's expert-parallel layout from its FusedMoE
+        layers (ground truth). Returns (ep_world_size, ep_rank, num_experts).
+
+        Falls back to (1, 0, <num_experts or 0>) when the rollout is not
+        expert-parallel or introspection fails — i.e. the caller then delivers the
+        full expert set (no pruning), preserving the proven behavior.
+        """
+        try:
+            model = self.model_runner.model
+            for m in model.modules():
+                # vLLM FusedMoE exposes ep_size/ep_rank and the global expert count.
+                if hasattr(m, "expert_map") and hasattr(m, "global_num_experts"):
+                    ep_size = int(getattr(m, "ep_size", 1) or 1)
+                    ep_rank = int(getattr(m, "ep_rank", 0) or 0)
+                    num_experts = int(getattr(m, "global_num_experts", 0) or 0)
+                    return ep_size, ep_rank, num_experts
+        except Exception as e:  # noqa: BLE001
+            print(f"[mx-native] EP-layout introspection failed ({e}); full gather")
+        return 1, 0, 0
+
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_via_mx_native"
     )
@@ -840,14 +861,33 @@ class VllmInternalWorkerExtension:
                 f"tier-2 updater initialized (reusing existing receiver)"
             )
 
-        # Full-HF gather (moe_expert_filter=False): every rank pulls the full
-        # expert set and vLLM's loader slices per-TP/EP at load. Correct for all
-        # topologies; EP byte-pruning is a later optimization.
+        # EP byte-pruning: honor cluster.weight_sync.mx_config.moe_expert_filter,
+        # but only actually filter when the LIVE rollout is expert-parallel
+        # (ep_world_size > 1). At EP1 the rollout rank owns all experts, so the
+        # filter is a no-op and we deliver the full set (the proven path). The EP
+        # layout is introspected from the running vLLM FusedMoE layers (ground
+        # truth), not assumed, so we never pull the wrong expert subset.
+        ep_ws, ep_rank_i, n_exp = self._introspect_rollout_ep_layout()
+        do_filter = (
+            bool(getattr(mx_config, "moe_expert_filter", False))
+            and ep_ws > 1
+            and n_exp > 0
+        )
+        print(
+            f"[mx-native] rank={self._mx_receiver.worker_rank} rollout EP layout: "
+            f"ep_world_size={ep_ws} ep_rank={ep_rank_i} num_experts={n_exp} "
+            f"moe_expert_filter(cfg={getattr(mx_config, 'moe_expert_filter', False)})"
+            f"->{do_filter}"
+        )
         upd = MxUpdateInfo(
             version=int(version),
             min_version=int(version),
             timeout_seconds=mx_config.timeout_seconds,
-            moe_expert_filter=False,
+            moe_expert_filter=do_filter,
+            ep_world_size=int(ep_ws),
+            ep_rank=int(ep_rank_i),
+            num_experts=int(n_exp),
+            expert_placement="linear",
         )
         try:
             self._mx_updater.start_weight_update(int(version))
