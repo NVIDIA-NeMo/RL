@@ -406,11 +406,20 @@ class BaseVllmGenerationWorker:
 
             logger.info("Successfully patched hermes tool parser for thread-safety.")
 
-        _patch_vllm_init_workers_ray()
-        logger.info("Successfully patched vllm _init_workers_ray.")
+        if os.environ.get("NRL_VLLM_PY_EXECUTABLE"):
+            # Custom vLLM runtime (e.g. a source tree on PYTHONPATH): do not
+            # rewrite its source files. The ray-executor patch is only needed
+            # for TP/PP>1 nested ray workers; apply the equivalent change in
+            # the custom tree deliberately if needed.
+            logger.info(
+                "NRL_VLLM_PY_EXECUTABLE set; skipping vllm source patches."
+            )
+        else:
+            _patch_vllm_init_workers_ray()
+            logger.info("Successfully patched vllm _init_workers_ray.")
 
-        _patch_vllm_llama_eagle3_own_lm_head()
-        _patch_vllm_hermes_tool_parser_thread_safety()
+            _patch_vllm_llama_eagle3_own_lm_head()
+            _patch_vllm_hermes_tool_parser_thread_safety()
 
         try:
             import vllm

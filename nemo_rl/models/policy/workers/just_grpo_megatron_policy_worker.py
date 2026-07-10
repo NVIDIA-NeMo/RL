@@ -2,6 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 
+import os
 from contextlib import AbstractContextManager
 from typing import Any, Iterator, Optional
 
@@ -155,8 +156,44 @@ class JustGRPOMegatronPolicyWorkerImpl(DiffusionMegatronPolicyWorkerImpl):
         )
         train_reveal_batch_size = cfg["train_reveal_batch_size"]
         reveal_count = pad_reveal_batch_to_multiple(batch, train_reveal_batch_size)
+        megatron_batch = self._drop_non_sequence_reveal_metadata(batch)
+
+        # Rows whose behavior logprob is non-finite are unscoreable
+        # (e.g. a token the policy assigns ~0 probability under the
+        # recompute); mask them out and keep the tensor finite so
+        # ratios never see inf/NaN.
+        prev_lp = megatron_batch.get("prev_logprobs")
+        if prev_lp is not None and torch.is_tensor(prev_lp):
+            finite = torch.isfinite(prev_lp)
+            if not bool(finite.all()):
+                n_bad = int((~finite).sum())
+                print(
+                    f"[JustGRPO] masking {n_bad} reveal rows with "
+                    "non-finite behavior logprobs"
+                )
+                for mk in ("just_grpo_row_mask", "just_grpo_loss_mask"):
+                    if mk in megatron_batch:
+                        megatron_batch[mk] = megatron_batch[mk] * finite.float()
+                megatron_batch["prev_logprobs"] = torch.nan_to_num(
+                    prev_lp, nan=0.0, posinf=0.0, neginf=-30.0
+                )
+
+        dump_dir = os.environ.get("NRL_JG_DUMP_TRAIN_BATCH")
+        if dump_dir:
+            rank = torch.distributed.get_rank()
+            fpath = os.path.join(dump_dir, f"jg_train_batch_rank{rank}.pt")
+            os.makedirs(dump_dir, exist_ok=True)
+            torch.save(
+                {
+                    k: (v.cpu() if torch.is_tensor(v) else v)
+                    for k, v in megatron_batch.items()
+                },
+                fpath,
+            )
+            print(f"[NRL_JG_DUMP] rank {rank} saved {fpath}")
+
         return (
-            self._drop_non_sequence_reveal_metadata(batch),
+            megatron_batch,
             self._cfg_without_sequence_packing(),
             train_reveal_batch_size,
             {"reveal_count": reveal_count},

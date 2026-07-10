@@ -17,7 +17,12 @@ import os
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
-VLLM_EXECUTABLE = (
+# NRL_VLLM_PY_EXECUTABLE: absolute path to a pre-provisioned python for the
+# vLLM generation workers only (e.g. a venv carrying a custom vLLM). A plain
+# path (non-"uv" string) is used directly as the Ray py_executable, so no
+# per-actor venv is built. Also skips the vLLM source monkey-patches in
+# vllm_worker.py.
+VLLM_EXECUTABLE = os.environ.get("NRL_VLLM_PY_EXECUTABLE") or (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM
 )
 SGLANG_EXECUTABLE = (
