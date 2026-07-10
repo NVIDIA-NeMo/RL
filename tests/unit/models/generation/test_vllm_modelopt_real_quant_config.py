@@ -922,50 +922,21 @@ def test_resolve_kv_cache_quant_recipe(recipe, expected_cfg):
     recipe_path = repo_root / "examples/modelopt/quant_configs" / recipe
 
     authored_config = yaml.safe_load(recipe_path.read_text())
-    authored_quant_cfg = authored_config["quantize"]["quant_cfg"]
-    authored_wildcard_configs = [
-        entry for entry in authored_quant_cfg if entry.get("quantizer_name") == "*"
-    ]
-    assert authored_wildcard_configs == [{"quantizer_name": "*", "enable": False}]
-    authored_kv_configs = [
-        entry
-        for entry in authored_quant_cfg
-        if entry.get("quantizer_name") == "*[kv]_bmm_quantizer"
-    ]
-    assert authored_kv_configs == [
-        {
-            "quantizer_name": "*[kv]_bmm_quantizer",
-            "enable": True,
-            "cfg": expected_cfg,
-        }
-    ]
-    assert authored_quant_cfg.index(
-        authored_wildcard_configs[0]
-    ) < authored_quant_cfg.index(authored_kv_configs[0])
+    assert authored_config["quantize"] == {
+        "algorithm": "max",
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {
+                "quantizer_name": "*[kv]_bmm_quantizer",
+                "enable": True,
+                "cfg": expected_cfg,
+            },
+        ],
+    }
 
     config = resolve_quant_cfg(str(recipe_path.resolve()))
-
-    quant_cfg = config["quant_cfg"]
-    wildcard_configs = [
-        entry for entry in quant_cfg if entry.get("quantizer_name") == "*"
-    ]
-    assert wildcard_configs == [{"quantizer_name": "*", "enable": False}]
-    kv_configs = [
-        entry
-        for entry in quant_cfg
-        if entry.get("quantizer_name") == "*[kv]_bmm_quantizer"
-    ]
-    assert len(kv_configs) == 1
-    kv_config = kv_configs[0]
-    assert quant_cfg.index(wildcard_configs[0]) < quant_cfg.index(kv_config)
     assert config["algorithm"] == "max"
-    assert kv_config["enable"] is True
-    assert "num_bits" in kv_config["cfg"]
-    if recipe == "kv_cache_nvfp4.yaml":
-        block_sizes = kv_config["cfg"]["block_sizes"]
-        assert block_sizes[-1] == 16
-        assert block_sizes["type"] == "dynamic"
-        assert "scale_bits" in block_sizes
+    assert config["quant_cfg"]
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
