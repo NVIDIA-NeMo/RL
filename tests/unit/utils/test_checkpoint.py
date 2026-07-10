@@ -38,6 +38,7 @@ def checkpoint_config(checkpoint_dir):
         "checkpoint_dir": checkpoint_dir,
         "metric_name": "loss",
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": 3,
         "save_optimizer": True,
     }
@@ -333,6 +334,7 @@ def test_checkpoint_without_keep_top_k(tmp_path):
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": None,
         "save_optimizer": True,
     }
@@ -433,6 +435,7 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": None,  # Keep all checkpoints
         "save_optimizer": True,
     }
@@ -477,6 +480,7 @@ def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": None,  # Keep all checkpoints
         "save_optimizer": True,
     }
@@ -519,6 +523,7 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "accuracy",
         "higher_is_better": True,
+        "save_period": 1,
         "keep_top_k": None,  # Keep all
         "save_optimizer": True,
     }
@@ -549,6 +554,7 @@ def async_checkpoint_config(checkpoint_dir):
         "checkpoint_dir": checkpoint_dir,
         "metric_name": None,
         "higher_is_better": False,
+        "save_period": 1,
         "keep_top_k": None,
         "save_optimizer": True,
     }
@@ -673,6 +679,7 @@ class TestShutdown:
             "checkpoint_dir": checkpoint_dir,
             "metric_name": None,
             "higher_is_better": False,
+            "save_period": 1,
             "keep_top_k": 1,
             "save_optimizer": True,
         }
@@ -764,6 +771,7 @@ class TestDeletionSerialization:
             "checkpoint_dir": checkpoint_dir,
             "metric_name": None,
             "higher_is_better": False,
+            "save_period": 1,
             "keep_top_k": 2,
             "save_optimizer": True,
         }
@@ -789,6 +797,7 @@ class TestDeletionSerialization:
             "checkpoint_dir": checkpoint_dir,
             "metric_name": None,
             "higher_is_better": False,
+            "save_period": 1,
             "keep_top_k": 1,
             "save_optimizer": True,
         }
@@ -955,3 +964,232 @@ class TestRenameCheckpointSwap:
         assert not (step_dir / "stale_marker").exists()
         with open(step_dir / "training_info.json") as f:
             assert json.load(f)["loss"] == 0.2
+
+
+# ---------------------------------------------------------------------------
+# Fault tolerance (ft_keep_latest_k / ft_save_period) retention tests
+# ---------------------------------------------------------------------------
+
+
+class TestFTKeepLatestK:
+    """Tests for the ft_keep_latest_k / periodic union retention policy.
+
+    A checkpoint survives if ANY retention rule keeps it:
+    - periodic (save_period-aligned) checkpoints — all when keep_top_k is None,
+      else only the top-k best among them,
+    - ft_keep_latest_k most recent checkpoints (recency only),
+    - the latest checkpoint (when exclude_latest=True).
+    When both keep_top_k and ft_keep_latest_k are None, nothing is deleted.
+    """
+
+    def _make_manager(
+        self,
+        checkpoint_dir,
+        keep_top_k=None,
+        ft_keep_latest_k=None,
+        metric_name=None,
+        higher_is_better=False,
+        save_period=1,
+    ):
+        config = {
+            "enabled": True,
+            "checkpoint_dir": checkpoint_dir,
+            "metric_name": metric_name,
+            "higher_is_better": higher_is_better,
+            "save_period": save_period,
+            "keep_top_k": keep_top_k,
+            "ft_keep_latest_k": ft_keep_latest_k,
+            "save_optimizer": True,
+        }
+        return CheckpointManager(config)
+
+    @staticmethod
+    def _remaining_steps(checkpoint_dir):
+        return sorted(int(p.name.split("_")[1]) for p in checkpoint_dir.glob("step_*"))
+
+    def test_both_none_keeps_everything(self, checkpoint_dir):
+        """When both policies are None, no checkpoints are deleted."""
+        manager = self._make_manager(checkpoint_dir)
+        for step in range(1, 6):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [1, 2, 3, 4, 5]
+
+    def test_ft_keep_1_only(self, checkpoint_dir):
+        """ft_keep_latest_k=1 with no periodic checkpoints keeps only the most recent."""
+        # save_period=100 so no steps in range are periodic — isolates ft behavior
+        manager = self._make_manager(
+            checkpoint_dir, ft_keep_latest_k=1, save_period=100
+        )
+        for step in range(1, 6):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [5]
+
+    def test_ft_keep_2_only(self, checkpoint_dir):
+        """ft_keep_latest_k=2 with no periodic checkpoints keeps the two most recent."""
+        manager = self._make_manager(
+            checkpoint_dir, ft_keep_latest_k=2, save_period=100
+        )
+        for step in range(1, 8):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [6, 7]
+
+    def test_keep_top_k_only(self, checkpoint_dir):
+        """keep_top_k=2 alone keeps the 2 most recent (no metric, save_period=1)."""
+        manager = self._make_manager(checkpoint_dir, keep_top_k=2)
+        for step in range(1, 6):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [4, 5]
+
+    def test_union_of_both_policies(self, checkpoint_dir):
+        """A checkpoint survives if either policy retains it (here they overlap)."""
+        manager = self._make_manager(checkpoint_dir, keep_top_k=1, ft_keep_latest_k=1)
+        for step in range(1, 10):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [9]
+
+    def test_union_with_metric_picks_different_sets(self, checkpoint_dir):
+        """Metric-based top-k and recency-based ft pick different checkpoints; union kept."""
+        manager = self._make_manager(
+            checkpoint_dir,
+            keep_top_k=1,
+            ft_keep_latest_k=1,
+            metric_name="reward",
+            higher_is_better=True,
+        )
+        data = [
+            (1, {"reward": 0.5}),
+            (2, {"reward": 0.9}),  # best by metric
+            (3, {"reward": 0.3}),
+            (4, {"reward": 0.1}),
+            (5, {"reward": 0.2}),
+            (6, {"reward": 0.4}),  # most recent
+        ]
+        for step, info in data:
+            tmp = manager.init_tmp_checkpoint(step, info)
+            manager.finalize_checkpoint(tmp)
+
+        # keep_top_k=1 by metric -> step 2; ft_keep_latest_k=1 / exclude_latest -> step 6
+        assert self._remaining_steps(checkpoint_dir) == [2, 6]
+
+    def test_union_with_overlap(self, checkpoint_dir):
+        """Overlapping protections are not double-counted."""
+        manager = self._make_manager(
+            checkpoint_dir,
+            keep_top_k=2,
+            ft_keep_latest_k=2,
+            metric_name="reward",
+            higher_is_better=True,
+        )
+        data = [
+            (1, {"reward": 0.1}),
+            (2, {"reward": 0.2}),
+            (3, {"reward": 0.3}),
+            (4, {"reward": 0.9}),  # top-2 by metric
+            (5, {"reward": 0.8}),  # top-2 by metric AND latest-2
+            (6, {"reward": 0.4}),  # latest-2 AND most recent
+        ]
+        for step, info in data:
+            tmp = manager.init_tmp_checkpoint(step, info)
+            manager.finalize_checkpoint(tmp)
+
+        # top-2 by metric -> {4, 5}; latest-2 -> {5, 6}; union -> {4, 5, 6}
+        assert self._remaining_steps(checkpoint_dir) == [4, 5, 6]
+
+    def test_periodic_retention_all_when_no_keep_top_k(self, checkpoint_dir):
+        """With keep_top_k=None, every save_period-aligned checkpoint is retained."""
+        # save_period=2, ft_keep_latest_k=1: periodic {2,4,6} plus latest {6}.
+        manager = self._make_manager(checkpoint_dir, ft_keep_latest_k=1, save_period=2)
+        for step in range(1, 7):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [2, 4, 6]
+
+    def test_periodic_retention_limited_by_keep_top_k(self, checkpoint_dir):
+        """keep_top_k caps how many periodic checkpoints survive; ft adds recency."""
+        # save_period=2 -> periodic {2,4,6,8}; keep_top_k=1 (no metric) -> newest periodic {8};
+        # ft_keep_latest_k=1 -> {8}; latest -> {8}. Non-periodic never retained here.
+        manager = self._make_manager(
+            checkpoint_dir, keep_top_k=1, ft_keep_latest_k=1, save_period=2
+        )
+        for step in range(1, 9):
+            tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
+            manager.finalize_checkpoint(tmp)
+
+        assert self._remaining_steps(checkpoint_dir) == [8]
+
+    def test_metric_topk_over_periodic_plus_ft(self, checkpoint_dir):
+        """Top-k by metric (over periodic checkpoints) is retained alongside ft.
+
+        Combines a periodic save_period, metric-based keep_top_k, and
+        ft_keep_latest_k for crash recovery. The best periodic checkpoint by
+        metric must survive even when it is not the most recent, in addition to
+        the ft recency checkpoint.
+        """
+        manager = self._make_manager(
+            checkpoint_dir,
+            keep_top_k=1,
+            ft_keep_latest_k=1,
+            metric_name="reward",
+            higher_is_better=True,
+            save_period=2,
+        )
+        # save_period=2 -> periodic {2, 4, 6, 8}. Step 4 is the best periodic by
+        # metric; the odd (non-periodic) steps have higher-looking values but are
+        # not eligible for metric top-k (only ft recency could keep them).
+        data = [
+            (1, {"reward": 0.95}),  # non-periodic, high metric -> NOT metric-eligible
+            (2, {"reward": 0.5}),
+            (3, {"reward": 0.99}),  # non-periodic, highest metric -> NOT eligible
+            (4, {"reward": 0.9}),  # best PERIODIC by metric
+            (5, {"reward": 0.2}),
+            (6, {"reward": 0.3}),
+            (7, {"reward": 0.25}),
+            (8, {"reward": 0.4}),  # most recent (periodic)
+        ]
+        for step, info in data:
+            tmp = manager.init_tmp_checkpoint(step, info)
+            manager.finalize_checkpoint(tmp)
+
+        # keep_top_k=1 by metric over periodic {2,4,6,8} -> step 4 (reward 0.9).
+        # ft_keep_latest_k=1 / exclude_latest -> step 8.
+        # The high-metric non-periodic steps (1, 3) are correctly NOT retained.
+        assert self._remaining_steps(checkpoint_dir) == [4, 8]
+
+    def test_metric_topk_with_ft_keeps_best_and_recent_disjoint(self, checkpoint_dir):
+        """save_period=1 (all periodic): top-k best by metric plus ft recency.
+
+        Ensures the best-by-metric checkpoints and the most-recent (ft) ones are
+        both retained when they are disjoint sets.
+        """
+        manager = self._make_manager(
+            checkpoint_dir,
+            keep_top_k=2,
+            ft_keep_latest_k=2,
+            metric_name="reward",
+            higher_is_better=True,
+        )
+        data = [
+            (1, {"reward": 0.9}),  # top-2 by metric
+            (2, {"reward": 0.8}),  # top-2 by metric
+            (3, {"reward": 0.1}),
+            (4, {"reward": 0.2}),
+            (5, {"reward": 0.3}),  # latest-2
+            (6, {"reward": 0.4}),  # latest-2 / most recent
+        ]
+        for step, info in data:
+            tmp = manager.init_tmp_checkpoint(step, info)
+            manager.finalize_checkpoint(tmp)
+
+        # top-2 by metric -> {1, 2}; ft latest-2 -> {5, 6}; union -> {1, 2, 5, 6}.
+        assert self._remaining_steps(checkpoint_dir) == [1, 2, 5, 6]

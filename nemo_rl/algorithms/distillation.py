@@ -947,10 +947,15 @@ def distillation_train(
                 consumed_samples += master_config.distillation["num_prompts_per_step"]
                 timeout.mark_iteration()
 
+                ft_save_period = master_config.checkpointing.get("ft_save_period")
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 # +1 because total_steps is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
