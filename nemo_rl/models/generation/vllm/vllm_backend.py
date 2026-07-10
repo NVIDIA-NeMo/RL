@@ -800,6 +800,33 @@ class VllmInternalWorkerExtension:
             print(f"[mx-native] EP-layout introspection failed ({e}); full gather")
         return 1, 0, 0
 
+    def _introspect_rollout_tp_layout(self) -> tuple[int, int]:
+        """Return this vLLM worker's tensor-parallel (world size, rank)."""
+        try:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            return (
+                int(get_tensor_model_parallel_world_size()),
+                int(get_tensor_model_parallel_rank()),
+            )
+        except Exception as e:  # noqa: BLE001
+            tp_size = int(
+                getattr(
+                    self.model_runner.vllm_config.parallel_config,
+                    "tensor_parallel_size",
+                    1,
+                )
+                or 1
+            )
+            print(
+                f"[mx-native] TP-layout introspection failed ({e}); "
+                f"falling back to tp_size={tp_size}, rank=0"
+            )
+            return tp_size, 0
+
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_via_mx_native"
     )
@@ -868,6 +895,7 @@ class VllmInternalWorkerExtension:
         # layout is introspected from the running vLLM FusedMoE layers (ground
         # truth), not assumed, so we never pull the wrong expert subset.
         ep_ws, ep_rank_i, n_exp = self._introspect_rollout_ep_layout()
+        tp_ws, tp_rank_i = self._introspect_rollout_tp_layout()
         do_filter = (
             bool(getattr(mx_config, "moe_expert_filter", False))
             and ep_ws > 1
@@ -876,6 +904,7 @@ class VllmInternalWorkerExtension:
         print(
             f"[mx-native] rank={self._mx_receiver.worker_rank} rollout EP layout: "
             f"ep_world_size={ep_ws} ep_rank={ep_rank_i} num_experts={n_exp} "
+            f"tp_world_size={tp_ws} tp_rank={tp_rank_i} "
             f"moe_expert_filter(cfg={getattr(mx_config, 'moe_expert_filter', False)})"
             f"->{do_filter}"
         )
@@ -888,6 +917,8 @@ class VllmInternalWorkerExtension:
             ep_rank=int(ep_rank_i),
             num_experts=int(n_exp),
             expert_placement="linear",
+            tp_world_size=int(tp_ws),
+            tp_rank=int(tp_rank_i),
         )
         try:
             self._mx_updater.start_weight_update(int(version))
