@@ -289,6 +289,13 @@ class MegatronConfigDisabled(TypedDict):
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Optional passthrough of extra fields onto megatron-bridge's
+    # CheckpointConfig (applied by _create_checkpoint_config). Lets callers
+    # opt into features NeMo-RL doesn't surface explicitly — e.g. inline HF
+    # export via {also_save_hf_checkpoint: true, hf_distributed_save: true,
+    # ckpt_format: torch_dist, non_persistent_ckpt_type: global}. hf_source_path
+    # defaults to the policy model name when omitted.
+    checkpoint: NotRequired[dict[str, Any]]
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
