@@ -202,6 +202,7 @@ project-includes = [
   "nemo_rl/utils/weight_transfer_remote_sparse.py",
   "nemo_rl/utils/weight_transfer_sparse_codec.py",
   "nemo_rl/utils/weight_transfer_zmq.py",
+  "tools/refit_bandwidth_calculator.py",
   "tools/model_diagnostics/1.max_model_len_respected.py",
   "tools/model_diagnostics/2.long_generation_decode_vs_prefill.py",
   "tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py",
