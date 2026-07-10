@@ -21,8 +21,7 @@ policy:
   train_micro_batch_size: 1
   generation_batch_size: 2
   logprob_batch_size: 1
-  max_total_sequence_length: 4096
-  make_sequence_length_divisible_by: 1
+  max_total_sequence_length: 4096  
   dtensor_cfg:
     enabled: true
     _v2: true
@@ -58,7 +57,6 @@ teacher:
   train_global_batch_size: 2
   logprob_batch_size: 1
   max_total_sequence_length: 4096
-  make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: true
     _v2: true

@@ -107,6 +107,7 @@ def create_dtensor_config(
             "weight_decay": 0.01,
             "betas": [0.9, 0.999],
         },
+        "make_sequence_length_divisible_by": 1,
     }
 
 

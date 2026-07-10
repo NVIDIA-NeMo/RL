@@ -205,7 +205,8 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  # ensures divisibility by 2*TP*CP (required for context parallel load balancing)
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.dtensor_cfg.tensor_parallel_size}, ${policy.dtensor_cfg.context_parallel_size}}, 2}
   max_grad_norm: 1.0
 
   optimizer:
@@ -277,7 +278,7 @@ value:
   train_global_batch_size: ${policy.train_global_batch_size}
   train_micro_batch_size: ${policy.train_micro_batch_size}
   max_total_sequence_length: ${policy.max_total_sequence_length}
-  make_sequence_length_divisible_by: ${value.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${mul:${mul:${value.dtensor_cfg.tensor_parallel_size}, ${value.dtensor_cfg.context_parallel_size}}, 2}
   precision: "bfloat16"
 
   reward_model_cfg:
