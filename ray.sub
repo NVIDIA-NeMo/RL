@@ -251,9 +251,20 @@ fi
 # GB200/Grace).
 # gcs_server_rpc_server_thread_num: threads that poll for incoming gRPC requests.
 # num_server_call_thread: threads that send gRPC replies.
-# gcs_max_active_rpcs_per_handler auto-scales to rpc_thread_num * 100.
+# gcs_server_rpc_client_thread_num (default max(1, cores/4)): threads the GCS
+#   uses as a gRPC client to send replies back to raylets. Match it to the
+#   inbound server pool so the reply path does not become the bottleneck once
+#   the request pool is widened.
 export RAY_gcs_server_rpc_server_thread_num="${RAY_gcs_server_rpc_server_thread_num:-$CPUS_PER_WORKER}"
 export RAY_num_server_call_thread="${RAY_num_server_call_thread:-$(( CPUS_PER_WORKER / 2 > 0 ? CPUS_PER_WORKER / 2 : 1 ))}"
+export RAY_gcs_server_rpc_client_thread_num="${RAY_gcs_server_rpc_client_thread_num:-$CPUS_PER_WORKER}"
+
+# --- GCS active RPC headroom ---
+# gcs_max_active_rpcs_per_handler (default gcs_server_rpc_server_thread_num*100):
+#   max concurrent in-flight RPCs per GCS handler. Give 2x the auto default so
+#   the handler queue does not cap out when thousands of actors register
+#   simultaneously without staggering.
+export RAY_gcs_max_active_rpcs_per_handler="${RAY_gcs_max_active_rpcs_per_handler:-$(( CPUS_PER_WORKER * 200 ))}"
 
 # --- Registration and RPC timeouts ---
 # With thread tuning, GCS should drain even the worst burst in ~60s. 120s gives
@@ -287,6 +298,35 @@ export RAY_task_events_report_interval_ms="${RAY_task_events_report_interval_ms:
 #   our task workers are short-lived (port discovery, GPU ID queries), so 16
 #   concurrent per node is plenty.
 export RAY_num_workers_soft_limit="${RAY_num_workers_soft_limit:-16}"
+
+# --- Reduce gRPC keepalive overhead ---
+# grpc_keepalive_time_ms (default 10s): interval between keepalive pings to the
+#   GCS. At many nodes these pings alone are a steady GCS load; 60s cuts the
+#   rate 6x during the init burst.
+# grpc_keepalive_timeout_ms (default 20s): keepalive ACK timeout. Keep it >= the
+#   ping interval so GCS load spikes don't trip false dead-connection detection.
+export RAY_grpc_keepalive_time_ms="${RAY_grpc_keepalive_time_ms:-60000}"
+export RAY_grpc_keepalive_timeout_ms="${RAY_grpc_keepalive_timeout_ms:-60000}"
+
+# --- Disable observability features not needed at scale ---
+# enable_timeline (default true): every actor/task creation emits a timeline
+#   event to GCS. Disabling removes thousands of GCS writes during init.
+# event_stats (default true): internal event-loop statistics collection.
+#   Disabling trims per-event overhead in the GCS event loop.
+export RAY_enable_timeline="${RAY_enable_timeline:-false}"
+export RAY_event_stats="${RAY_event_stats:-false}"
+
+# --- Reduce syncer, heartbeat, and health-check background traffic ---
+# ray_syncer_message_refresh_interval_ms (default 3s): periodic cross-node state
+#   refresh via ray_syncer. 10s reduces this 3x.
+# core_worker_internal_heartbeat_ms (default 1s): worker->raylet heartbeat.
+#   Thousands of workers at 1s add indirect GCS load via raylet aggregation;
+#   5s is sufficient.
+# health_check_period_ms (default 3s): node->GCS health checks. 10s cuts the
+#   aggregate rate; slower node-failure detection is acceptable during init.
+export RAY_ray_syncer_message_refresh_interval_ms="${RAY_ray_syncer_message_refresh_interval_ms:-10000}"
+export RAY_core_worker_internal_heartbeat_ms="${RAY_core_worker_internal_heartbeat_ms:-5000}"
+export RAY_health_check_period_ms="${RAY_health_check_period_ms:-10000}"
 
 # The head is retried a few times. Workers may need more attempts since they can
 # race the head's GCS coming up: `ray start --address` fails until GCS is listening.
