@@ -3,16 +3,6 @@ grpo:
   async_grpo:
     enabled: true
     in_flight_weight_updates: true
-  # The base grpo_nanov3.yaml enables overlong_filtering, which zeroes the
-  # loss_multiplier (sample mask) for any rollout that hits max_new_tokens. On
-  # this small recipe the Nano-v3 reasoning model + workplace_assistant prompts
-  # (system prompt + tool schema + <think> trace + tool call) essentially always
-  # exceed the short sequence budget, so every sample was filtered out. With an
-  # all-zero sample mask, masked_mean() returns exactly 0 for the loss and for
-  # the logprob-error metrics (token_mult_prob_error / gen_kl_error) while reward
-  # stayed nonzero (i.e. training was a silent no-op). Disable it here (matching
-  # grpo_workplace_assistant_nemotron_nano_v2_9b.yaml) so truncated rollouts
-  # still contribute their generated tokens and the metrics are meaningful.
   overlong_filtering: false
 checkpointing:
   checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-async-gym
@@ -21,20 +11,8 @@ policy:
   tokenizer:
     name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   train_global_batch_size: 16
-  # Kept at 2048 to fit the 8-GPU training node: sequence_packing is disabled
-  # below, so every training microbatch is padded to this length. A larger budget
-  # (e.g. 8192) OOMs MegatronPolicyWorker.train() here. Nano-v3 reasoning + tool
-  # rollouts still routinely truncate at 2048, but with overlong_filtering off
-  # (see above) their generated tokens are trained on, so the logprob-error
-  # metrics remain meaningful.
   max_total_sequence_length: 2048
   megatron_cfg:
-    # The base grpo_nanov3.yaml sizes the TRAINING parallelism for the full
-    # 32-node cluster (tp2 * pp2 * cp4 = 16-way model parallel). In this 2-node
-    # recipe, non-colocated generation takes one whole node, leaving only 1 node
-    # (8 GPUs) for training, so the model-parallel product (PP * CP * TP) must fit
-    # within 8. Drop PP/CP to 1 (keeping tp2 * ep8) to match the sibling
-    # grpo-nanov3-30BA3B-2n8g-megatron_generation recipe (PP * CP * TP = 2, DP = 4).
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
   sequence_packing:
