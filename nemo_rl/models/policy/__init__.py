@@ -484,14 +484,18 @@ class DynamicBatchingConfig(TypedDict):
 
 class RouterReplayConfigDisabled(TypedDict):
     enabled: Literal[False]
-    train_route_prefetch: NotRequired[Literal[False]]
 
 
 class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
-    # Fetch sync-TQ train_presharded routed_experts one packed microbatch ahead.
-    # Requires sequence packing. Split async/TQ and prev/ref paths are unchanged.
-    train_route_prefetch: NotRequired[bool]
+
+
+class TrainMicrobatchPrefetchConfig(TypedDict):
+    """Sync-TQ train fetch granularity and lookahead."""
+
+    enabled: bool
+    # 0 fetches on demand; 1 overlaps preparation of the next microbatch.
+    depth: NotRequired[Literal[0, 1]]
 
 
 class PolicyConfig(TypedDict):
@@ -515,6 +519,7 @@ class PolicyConfig(TypedDict):
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
+    train_microbatch_prefetch: NotRequired[TrainMicrobatchPrefetchConfig]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]

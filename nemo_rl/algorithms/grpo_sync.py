@@ -115,28 +115,27 @@ def _raise_if_message_level_advantage_penalties_enabled(
     )
 
 
-def _summarize_train_route_prefetch_source_metrics(
+def _summarize_train_microbatch_prefetch_source_metrics(
     train_results: dict[str, Any],
 ) -> dict[str, float]:
-    """Flatten development-only route-prefetch metrics for step logging.
+    """Flatten development-only microbatch-prefetch metrics for step logging.
 
     The sharded policy dispatch returns only PP=TP=CP=0 for each DP replica,
     so these are explicitly source-side diagnostics rather than all-stage
     measurements. DP replicas execute concurrently: duration totals use the
     slowest source, while calls, bytes, and counts describe job-wide work.
     """
-    sources = train_results.get("train_route_prefetch_source_metrics")
+    sources = train_results.get("train_microbatch_prefetch_source_metrics")
     if not sources:
         return {}
 
-    prefix = "route_prefetch_source"
+    prefix = "microbatch_prefetch_source"
     timing_fields = (
         "tq_get_s",
         "materialize_s",
-        "pp_leader_broadcast_s",
-        "h2d_s",
+        "distribute_s",
         "consumer_wait_s",
-        "stage_broadcast_s",
+        "first_microbatch_ready_s",
     )
     summary = {
         f"{prefix}/{field}_max": max(float(source[field]) for source in sources)
@@ -144,7 +143,7 @@ def _summarize_train_route_prefetch_source_metrics(
     }
     for field in (
         "tq_get_calls",
-        "materialized_route_bytes",
+        "materialized_payload_bytes",
         "ready_count",
         "consume_count",
     ):
@@ -155,6 +154,9 @@ def _summarize_train_route_prefetch_source_metrics(
     consume_count = summary[f"{prefix}/consume_count_sum"]
     summary[f"{prefix}/ready_fraction"] = (
         summary[f"{prefix}/ready_count_sum"] / consume_count if consume_count else 0.0
+    )
+    summary[f"{prefix}/queued_payload_peak_bytes_max"] = max(
+        float(source["queued_payload_peak_bytes"]) for source in sources
     )
     return summary
 
@@ -947,6 +949,8 @@ def grpo_train_sync(
                         meta,
                         loss_fn=loss_fn,
                         timer=timer,
+                        sample_mask=sample_mask,
+                        token_mask=token_mask,
                     )
 
                 if sync_kv_scales:
@@ -1107,7 +1111,7 @@ def grpo_train_sync(
                         print(f"Skipping aggregation for {k} ({type(v)})")
 
                 metrics.update(
-                    _summarize_train_route_prefetch_source_metrics(train_results)
+                    _summarize_train_microbatch_prefetch_source_metrics(train_results)
                 )
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics

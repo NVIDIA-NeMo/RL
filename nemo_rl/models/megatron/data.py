@@ -14,7 +14,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional, Tuple
+from typing import Any, Iterator, Optional, Sequence, Tuple
 
 import torch
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -28,14 +28,9 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
-from nemo_rl.models.megatron.train_route_prefetch import (
-    TQ_SAMPLE_IDS_FIELD,
-    PrefetchedRoutes,
-)
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
-    trace_tq_prefetch_payload,
 )
 
 
@@ -85,60 +80,6 @@ class ProcessedMicrobatch:
     mtp_loss_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
-
-
-def inject_prefetched_routes(
-    raw_iterator: Iterator[BatchedDataDict[Any]],
-    route_iterator: Iterator[PrefetchedRoutes],
-) -> Iterator[BatchedDataDict[Any]]:
-    """Attach one prefetched route payload to each raw packed microbatch.
-
-    Injection happens before H2D, physical packing, and context-parallel
-    sharding. The private sample-id sidecar verifies that the TQ key plan and
-    Megatron's raw iterator still describe exactly the same rows.
-    """
-    for data_dict in raw_iterator:
-        try:
-            prefetched = next(route_iterator)
-        except StopIteration as error:
-            raise RuntimeError(
-                "route prefetch ended before the raw microbatch iterator"
-            ) from error
-
-        if TQ_SAMPLE_IDS_FIELD not in data_dict:
-            raise RuntimeError(
-                f"route-prefetched microbatch is missing {TQ_SAMPLE_IDS_FIELD!r}"
-            )
-        actual_sample_ids = tuple(data_dict.pop(TQ_SAMPLE_IDS_FIELD))
-        if actual_sample_ids != prefetched.sample_ids:
-            raise RuntimeError(
-                "route-prefetch sample order mismatch: raw microbatch has "
-                f"{actual_sample_ids}, prefetched routes have "
-                f"{prefetched.sample_ids}"
-            )
-        if "routed_experts" in data_dict:
-            raise RuntimeError(
-                "route-prefetched microbatch already contains routed_experts"
-            )
-        if prefetched.routed_experts.shape[0] != data_dict.size:
-            raise RuntimeError(
-                "route-prefetch batch mismatch: routes have "
-                f"{prefetched.routed_experts.shape[0]} rows but raw microbatch "
-                f"has {data_dict.size}"
-            )
-        if prefetched.routed_experts.shape[1] != data_dict["input_ids"].shape[1]:
-            raise RuntimeError(
-                "route-prefetch sequence mismatch: routes have length "
-                f"{prefetched.routed_experts.shape[1]} but input_ids have length "
-                f"{data_dict['input_ids'].shape[1]}"
-            )
-
-        data_dict["routed_experts"] = prefetched.routed_experts
-        trace_tq_prefetch_payload(
-            keys=prefetched.sample_ids,
-            data=data_dict,
-        )
-        yield data_dict
 
 
 def make_processed_microbatch_iterator(
@@ -200,6 +141,22 @@ def make_processed_microbatch_iterator(
         )
 
 
+def _validate_prefetched_microbatches(
+    raw_iterator: Iterator[BatchedDataDict[Any]],
+    *,
+    expected_seq_dim_size: int,
+) -> Iterator[BatchedDataDict[Any]]:
+    """Validate each streamed payload before H2D and Megatron packing."""
+    for microbatch in raw_iterator:
+        _, seq_dim_size = get_and_validate_seqlen(microbatch)
+        if seq_dim_size != expected_seq_dim_size:
+            raise ValueError(
+                "prefetched microbatch sequence dimension mismatch: expected "
+                f"{expected_seq_dim_size}, got {seq_dim_size}"
+            )
+        yield microbatch
+
+
 def get_microbatch_iterator(
     data: BatchedDataDict[Any],
     cfg: dict[str, Any],
@@ -207,7 +164,9 @@ def get_microbatch_iterator(
     straggler_timer: StragglerDetector,
     seq_length_key: Optional[str] = None,
     delegate_pack_to_model: bool = False,
-    route_iterator: Optional[Iterator[PrefetchedRoutes]] = None,
+    prefetched_raw_iterator: Optional[Iterator[BatchedDataDict[Any]]] = None,
+    prefetched_microbatch_lengths: Optional[Sequence[int]] = None,
+    prefetched_forward_pad_seqlen: Optional[int] = None,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -220,8 +179,11 @@ def get_microbatch_iterator(
         cfg: Configuration dictionary
         mbs: Microbatch size
         seq_length_key: Key for sequence lengths in data dict (auto-detected if None)
-        route_iterator: Optional train-only iterator yielding routes for each raw
-            packed microbatch before H2D and physical packing.
+        prefetched_raw_iterator: Optional train-only iterator yielding complete,
+            already-materialized raw microbatches.
+        prefetched_microbatch_lengths: Packed token lengths from the driver plan.
+        prefetched_forward_pad_seqlen: Common padded sequence dimension used
+            while materializing each fetched microbatch.
 
     Returns:
         Tuple containing the iterator and metadata
@@ -236,20 +198,22 @@ def get_microbatch_iterator(
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
 
-    _, seq_dim_size = get_and_validate_seqlen(data)
-
-    # Auto-detect seq_length_key if not provided
-    if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
-        seq_length_key = "input_lengths"
-
-    if cfg["dynamic_batching"]["enabled"]:
-        raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
-        data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-    elif cfg["sequence_packing"]["enabled"]:
-        raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
-        data_iterator_len, pack_seq_dim_size = (
-            data.get_microbatch_iterator_for_packable_sequences_len()
+    if prefetched_raw_iterator is not None:
+        if not cfg["sequence_packing"]["enabled"]:
+            raise ValueError(
+                "train microbatch prefetch currently requires sequence packing"
+            )
+        if not prefetched_microbatch_lengths:
+            raise ValueError("prefetched microbatch lengths cannot be empty")
+        if prefetched_forward_pad_seqlen is None or prefetched_forward_pad_seqlen <= 0:
+            raise ValueError("prefetched forward pad sequence length must be positive")
+        raw_iterator = _validate_prefetched_microbatches(
+            prefetched_raw_iterator,
+            expected_seq_dim_size=int(prefetched_forward_pad_seqlen),
         )
+        data_iterator_len = len(prefetched_microbatch_lengths)
+        pack_seq_dim_size = max(int(x) for x in prefetched_microbatch_lengths)
+        seq_dim_size = int(prefetched_forward_pad_seqlen)
         (
             pad_factor,
             pad_packed_seq_to_multiple_of,
@@ -260,12 +224,35 @@ def get_microbatch_iterator(
             pack_seq_dim_size,
         )
         micro_batch_size = 1
+        seq_length_key = "input_lengths"
     else:
-        raw_iterator = data.make_microbatch_iterator(mbs)
-        data_iterator_len = data.size // mbs
+        _, seq_dim_size = get_and_validate_seqlen(data)
 
-    if route_iterator is not None:
-        raw_iterator = inject_prefetched_routes(raw_iterator, route_iterator)
+        # Auto-detect seq_length_key if not provided
+        if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
+            seq_length_key = "input_lengths"
+
+        if cfg["dynamic_batching"]["enabled"]:
+            raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+            data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+        elif cfg["sequence_packing"]["enabled"]:
+            raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
+            data_iterator_len, pack_seq_dim_size = (
+                data.get_microbatch_iterator_for_packable_sequences_len()
+            )
+            (
+                pad_factor,
+                pad_packed_seq_to_multiple_of,
+                pad_full_seq_to,
+            ) = _get_pack_sequence_parameters_for_megatron(
+                cfg["megatron_cfg"],
+                cfg["make_sequence_length_divisible_by"],
+                pack_seq_dim_size,
+            )
+            micro_batch_size = 1
+        else:
+            raw_iterator = data.make_microbatch_iterator(mbs)
+            data_iterator_len = data.size // mbs
 
     # Wrap the raw iterator with processing
     processed_iterator = make_processed_microbatch_iterator(

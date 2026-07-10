@@ -23,6 +23,8 @@ MICRO_BATCH_INDICES = "micro_batch_indices"
 MICRO_BATCH_LENGTHS = "micro_batch_lengths"
 ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
 GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
+GLOBAL_VALID_SEQS_PER_GB = "global_valid_seqs_per_gb"
+GLOBAL_VALID_TOKS_PER_GB = "global_valid_toks_per_gb"
 
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"

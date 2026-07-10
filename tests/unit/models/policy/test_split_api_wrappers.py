@@ -132,14 +132,14 @@ class TestTQPolicySplitFanout:
                 "global_loss": 1.0,
                 "grad_norm": 0.5,
                 "all_mb_metrics": {"loss": [0.1]},
-                "train_route_prefetch_source_metrics": {
+                "train_microbatch_prefetch_metrics": {
                     "consumer_wait_s": wait_s,
                 },
             }
 
         out = _aggregate_train_results([_result(0, 0.1), _result(16, 0.2)])
 
-        assert out["train_route_prefetch_source_metrics"] == [
+        assert out["train_microbatch_prefetch_source_metrics"] == [
             {"rank": 0, "consumer_wait_s": 0.1},
             {"rank": 16, "consumer_wait_s": 0.2},
         ]

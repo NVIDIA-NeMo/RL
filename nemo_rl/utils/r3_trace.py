@@ -453,12 +453,13 @@ def trace_tq_prefetch_payload(
     keys: Sequence[str],
     data: Any,
 ) -> None:
-    """Trace a train microbatch without counting it as a new RL step.
+    """Trace a prefetched train microbatch without starting a new RL step.
 
     The full-shard fetch path calls :func:`trace_tq_fetch_payload` once per
-    step. Route prefetch instead injects once per packed microbatch, so its
-    step identity comes from the surrounding ``r3_trace_stage("train")``
-    context and only the microbatch counter advances.
+    step. All-field prefetch delivers one packed microbatch at a time, so its
+    step identity comes from the surrounding ``r3_trace_stage("train")`` context
+    and only the microbatch counter advances. The function is a no-op when the
+    optional routed-experts field is absent.
     """
     ctx = _current_context()
     if (
