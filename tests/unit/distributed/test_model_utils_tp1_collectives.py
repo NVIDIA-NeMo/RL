@@ -18,8 +18,8 @@ import torch
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
-    ChunkedDistributedLogprob,
     ChunkedDistributedHiddenStatesToLogprobs,
+    ChunkedDistributedLogprob,
     DistributedCrossEntropy,
     DistributedLogprob,
     _compute_distributed_log_softmax_with_grad,
@@ -44,9 +44,7 @@ def _forbid_collectives(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(torch.distributed, "all_reduce", _raise_if_called)
     monkeypatch.setattr(torch.distributed, "reduce_scatter", _raise_if_called)
     monkeypatch.setattr(torch.distributed, "all_gather", _raise_if_called)
-    monkeypatch.setattr(
-        torch.distributed.nn.functional, "all_reduce", _raise_if_called
-    )
+    monkeypatch.setattr(torch.distributed.nn.functional, "all_reduce", _raise_if_called)
 
 
 def test_world_size_helper_passes_none_to_default_group(monkeypatch):

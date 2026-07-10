@@ -37,10 +37,7 @@ def _get_world_size_or_1(group: Optional[torch.distributed.ProcessGroup]) -> int
     resolves to the default process group's size, matching the semantics of the
     collectives being guarded.
     """
-    if (
-        not torch.distributed.is_available()
-        or not torch.distributed.is_initialized()
-    ):
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return 1
 
     return torch.distributed.get_world_size(group)
