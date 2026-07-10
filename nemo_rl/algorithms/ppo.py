@@ -15,10 +15,12 @@ import gc
 import os
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
+import ray
 import torch
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -34,6 +36,7 @@ from nemo_rl.algorithms.grpo import (
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
+    compute_and_apply_seq_logprob_error_masking,
     extract_initial_prompt_messages,
     refit_policy_generation,
     scale_rewards,
@@ -60,7 +63,12 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+    get_ray_cluster_topology,
+    prepare_segment_topology,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -139,6 +147,9 @@ class PPOConfig(TypedDict):
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
     policy_training_start_step: NotRequired[int]
+    # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
+    # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
+    seq_logprob_error_threshold: float | None
 
 
 class PPOSaveState(TypedDict):
@@ -349,16 +360,12 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    assert colocated_inference, (
-        "PPO currently requires colocated generation (vLLM / SGLang sharing GPUs "
-        "with the policy worker). Set policy.generation.colocated.enabled=true. "
-        "Non-colocated PPO is not yet supported."
-    )
     reward_model_enabled = (
         "env_name" in data_config and data_config["env_name"] == "reward_model"
     )
 
     total_nodes = cluster_config["num_nodes"]
+    segment_size = cluster_config.get("segment_size")
     if reward_model_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
         rm_nodes = rm_resource["num_nodes"]
@@ -376,31 +383,158 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
-    if total_nodes == 1:
-        policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
-        assert policy_gpus_per_node > 0, (
-            "policy.generation.colocated.resources.gpus_per_node must be > 0 "
-            "when cluster.num_nodes = 1, "
-            f"but got {policy_gpus_per_node}."
+    if colocated_inference:
+        if total_nodes == 1:
+            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+            assert policy_gpus_per_node > 0, (
+                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+                "when cluster.num_nodes = 1, "
+                f"but got {policy_gpus_per_node}."
+            )
+        else:
+            policy_gpus_per_node = cluster_config["gpus_per_node"]
+
+        node_resource_constraints, _, _ = prepare_segment_topology(
+            segment_size, policy_nodes
+        )
+        cluster = RayVirtualCluster(
+            name="grpo_policy_cluster",
+            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=policy_gpus_per_node,
+            max_colocated_worker_groups=1
+            if generation_config["backend"] == "megatron"
+            else 3,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
+        )
+        train_cluster = cluster
+        inference_cluster = cluster
+        print(
+            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
+            flush=True,
         )
     else:
-        policy_gpus_per_node = cluster_config["gpus_per_node"]
+        # Train resources are reduced below to carve out dedicated generation
+        # (inference) resources from the same overall cluster.
+        train_gpus_per_node = cluster_config["gpus_per_node"]
+        train_nodes = policy_nodes
 
-    cluster = RayVirtualCluster(
-        name="grpo_policy_cluster",
-        bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
-        use_gpus=True,
-        num_gpus_per_node=policy_gpus_per_node,
-        max_colocated_worker_groups=1
-        if generation_config["backend"] == "megatron"
-        else 3,
-    )
-    train_cluster = cluster
-    inference_cluster = cluster
-    print(
-        f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
-        flush=True,
-    )
+        inference_resources = generation_config["colocated"]["resources"]
+        inference_gpus_per_node = inference_resources["gpus_per_node"]
+        inference_nodes = inference_resources["num_nodes"]
+
+        if policy_nodes == 1:
+            # Train and inference share the single node.
+            assert (
+                inference_gpus_per_node is not None and inference_gpus_per_node > 0
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
+                "when policy_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_gpus_per_node}."
+            )
+            assert inference_nodes is None or inference_nodes == 1, (
+                "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
+                "when policy_nodes = 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+            inference_nodes = 1
+            reward_gpus_to_subtract = (
+                rm_gpus_per_node if total_nodes == 1 and reward_model_enabled else 0
+            )
+            train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
+            assert train_gpus_per_node > 0, (
+                "Not enough GPUs for training: "
+                f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
+                + (
+                    f" - rm_gpus_per_node:{rm_gpus_per_node}"
+                    if total_nodes == 1 and reward_model_enabled
+                    else ""
+                )
+            )
+        else:
+            # Train, inference, and reward model each get dedicated whole nodes.
+            assert inference_nodes > 0, (
+                "policy.generation.colocated.resources.num_nodes must be > 0 "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got {inference_nodes}."
+            )
+            assert (
+                inference_gpus_per_node is not None
+                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+            ), (
+                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
+                "when cluster.num_nodes > 1 and inference is non-colocated, "
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+            )
+            train_nodes -= inference_nodes
+
+        assert train_nodes > 0 and inference_nodes > 0, (
+            "Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
+            f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
+        )
+
+        # NVLink-domain-aware node constraints for the training cluster only;
+        # unlike GRPO, PPO does not (yet) split a single generation instance
+        # across multiple nodes, so the inference cluster below gets no
+        # topology constraints and falls back to default PACK placement.
+        node_resource_constraints = None
+        if segment_size is not None:
+            topology = get_ray_cluster_topology()
+            num_alive_nodes = len(topology)
+            required_nodes = train_nodes + inference_nodes
+            assert num_alive_nodes >= required_nodes, (
+                "Not enough alive Ray nodes for all roles: "
+                f"need {required_nodes} (train={train_nodes} + inference={inference_nodes}), "
+                f"but only {num_alive_nodes} alive nodes found"
+            )
+            node_resource_constraints, _, _ = prepare_segment_topology(
+                segment_size, train_nodes, topology=topology, role="training"
+            )
+
+        # Value shares train_cluster with policy (2 worker groups timesharing
+        # the same GPUs, offloaded/reloaded in turn); generation lives on its
+        # own inference_cluster.
+        train_cluster = RayVirtualCluster(
+            name="ppo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=2,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
+        )
+        if node_resource_constraints is not None:
+            train_cluster.get_placement_groups()
+        print(
+            f"  ✓ Ray train cluster initialized with {train_nodes} nodes with {train_gpus_per_node} GPUs per node",
+            flush=True,
+        )
+
+        if segment_size is not None and inference_nodes > 1:
+            print(
+                f"  ⚠ segment_size={segment_size} is set but PPO does not (yet) apply "
+                f"NVLink-domain-aware placement to a {inference_nodes}-node inference "
+                "cluster; falling back to default PACK placement for generation.",
+                flush=True,
+            )
+        inference_cluster = RayVirtualCluster(
+            name="ppo_inference_cluster",
+            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+            use_gpus=True,
+            num_gpus_per_node=inference_gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+        )
+        print(
+            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
+            flush=True,
+        )
 
     # ==========================
     #   Training and Inference
@@ -531,52 +665,95 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
-    def initialize_generation_with_policy(
-        init_generation_fn,
-        generation_name: str,
-        init_time_key: str,
-        worker_init_timing_metrics: dict,
-    ):
-        """Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
+    def init_policy_and_value():
+        """Initialize policy then value, sequentially, freeing GPU between each.
 
-        Args:
-            init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
-            generation_name: Name of the generation engine ("vLLM" or "SGLang")
-            init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
-            worker_init_timing_metrics: Dictionary to store timing metrics
-
-        Returns:
-            Tuple of (policy_generation, policy)
+        Used as one unit of work (against ``train_cluster``) both in the
+        colocated sequential path and as the "train" half of the
+        non-colocated parallel path below.
         """
-        # Initialize generation engine first so it claims its GPU memory
-        # before policy/value workers are constructed; then policy, then value.
-        print("  ⚙️  Initializing workers (colocated mode)", flush=True)
-
-        policy_generation, generation_time = init_generation_fn()
-        worker_init_timing_metrics[init_time_key] = generation_time
-
         policy, policy_time = init_policy()
         # Block until the policy worker's __init__ completes and offload to
         # CPU, freeing GPU for value model initialization. Policy will be
         # reloaded before the vLLM refit step below.
         policy.offload_to_cpu()
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
         print("  ⚙️  Initializing value model for GAE...", flush=True)
         value_model, value_time = init_value()
         # Block until the value worker's __init__ completes and offload
         # model + optimizer to CPU. Without this, __init__ runs asynchronously
-        # in the Ray actor and may overlap with vLLM generation, causing
-        # GPU OOM.
+        # in the Ray actor and may overlap with generation, causing GPU OOM.
         value_model.finish_training()
-        worker_init_timing_metrics["value_init_time_s"] = value_time
         print(f"  ✓ Value model initialized in {value_time:.2f}s", flush=True)
+
+        return policy, policy_time, value_model, value_time
+
+    def initialize_generation_with_policy(
+        init_generation_fn,
+        generation_name: str,
+        init_time_key: str,
+        colocated_inference: bool,
+        worker_init_timing_metrics: dict,
+    ):
+        """Generic function to initialize a generation engine (vLLM or SGLang) along with policy and value.
+
+        Args:
+            init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
+            generation_name: Name of the generation engine ("vLLM" or "SGLang")
+            init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
+            colocated_inference: Whether inference shares GPUs with training
+            worker_init_timing_metrics: Dictionary to store timing metrics
+
+        Returns:
+            Tuple of (policy_generation, policy, value_model)
+        """
+        if colocated_inference:
+            # Initialize generation engine first so it claims its GPU memory
+            # before policy/value workers are constructed; then policy, then value.
+            print("  ⚙️  Initializing workers (colocated mode)", flush=True)
+
+            policy_generation, generation_time = init_generation_fn()
+            worker_init_timing_metrics[init_time_key] = generation_time
+
+            policy, policy_time, value_model, value_time = init_policy_and_value()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["value_init_time_s"] = value_time
+        else:
+            # Generation lives on a disjoint inference_cluster, so it can
+            # initialize in parallel with the policy+value chain on
+            # train_cluster instead of waiting for GPU memory to free up.
+            print(
+                "  ⚡ Using parallel worker initialization (non-colocated mode)",
+                flush=True,
+            )
+            parallel_start_time = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                generation_future = executor.submit(init_generation_fn)
+                policy_value_future = executor.submit(init_policy_and_value)
+                policy_generation, generation_time = generation_future.result()
+                policy, policy_time, value_model, value_time = (
+                    policy_value_future.result()
+                )
+            parallel_wall_time = time.perf_counter() - parallel_start_time
+
+            worker_init_timing_metrics[init_time_key] = generation_time
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["value_init_time_s"] = value_time
+            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
+            worker_init_timing_metrics["parallel_init_enabled"] = True
 
         return policy_generation, policy, value_model
 
     assert backend in ("vllm", "sglang"), (
         f"PPO requires vllm or sglang generation backend; got {backend!r}. "
         "The megatron generation backend is not supported."
+    )
+    assert colocated_inference or backend == "vllm", (
+        "Non-colocated PPO currently requires the vLLM generation backend. "
+        "SGLangGeneration.init_collective() is a no-op, so the training side's "
+        "NCCL collective rendezvous would hang waiting for peers that never "
+        "join. Set policy.generation.backend=vllm or "
+        "policy.generation.colocated.enabled=true."
     )
 
     if backend == "vllm":
@@ -612,6 +789,7 @@ def setup(
             init_generation_fn=init_vllm,
             generation_name="vLLM",
             init_time_key="vllm_init_time_s",
+            colocated_inference=colocated_inference,
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
@@ -631,6 +809,7 @@ def setup(
             init_generation_fn=init_sglang,
             generation_name="SGLang",
             init_time_key="sglang_init_time_s",
+            colocated_inference=colocated_inference,
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
@@ -644,6 +823,28 @@ def setup(
 
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
+
+    # Non-colocated inference has no shared GPU memory for weight refit, so
+    # establish an NCCL collective spanning train_cluster + inference_cluster
+    # up front; refit_policy_generation() broadcasts weights over it later.
+    if not colocated_inference:
+        t0 = time.perf_counter()
+        ip, port = train_cluster.get_master_address_and_port()
+        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
+        train_world_size = train_cluster.world_size()
+        inference_world_size = inference_nodes * inference_gpus_per_node
+        world_size = train_world_size + inference_world_size
+
+        futures_train = policy.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )
+        futures_inference = policy_generation.init_collective(
+            ip, port, world_size, train_world_size=train_world_size
+        )
+        ray.get(futures_train + futures_inference)
+        worker_init_timing_metrics["collective_init_time_s"] = (
+            time.perf_counter() - t0
+        )
 
     # Reload policy weights to GPU before refit (they may have been offloaded
     # during setup to free GPU for value model initialization).
@@ -1226,6 +1427,40 @@ def ppo_train(
 
                     policy.finish_inference()
 
+                # Seq-level logprob error metrics/masking (train/inference mismatch
+                # diagnostics; always computed so a threshold can be tuned from the
+                # logged metrics even before it's enabled).
+                #
+                # NOTE: when the threshold masks a sequence, this only zeroes
+                # train_data["sample_mask"], which takes effect at the loss level
+                # (ClippedPGLossFn/MseValueLossFn both read sample_mask directly).
+                # It does NOT get combined into the `mask` GAE receives below
+                # (adv_kwargs["mask"] = train_data["token_mask"] alone) — the same
+                # pre-existing characteristic overlong_filtering's loss_multiplier
+                # masking already has in PPO, unlike GRPO which explicitly combines
+                # token_mask * sample_mask before advantage computation. So a masked
+                # sequence's tokens still contribute to GAE's whitening/bootstrap
+                # statistics even though they're excluded from the loss.
+                #
+                # Unlike GRPO, PPO never skips real prev_logprobs computation (no
+                # force_on_policy_ratio placeholder-zero path), so it's always safe
+                # to call this unconditionally. If PPO ever grows such a skip path,
+                # port GRPO's companion guard (grpo.py's force_on_policy_ratio +
+                # seq_logprob_error_threshold conflict warning) alongside it.
+                seq_logprob_error_threshold = master_config.ppo.get(
+                    "seq_logprob_error_threshold", None
+                )
+                seq_error_result = compute_and_apply_seq_logprob_error_masking(
+                    train_data=train_data,
+                    rewards=rewards,
+                    seq_logprob_error_threshold=seq_logprob_error_threshold,
+                )
+                seq_logprob_error_metrics = seq_error_result
+                if "num_masked_seqs" in seq_logprob_error_metrics:
+                    seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"] = (
+                        seq_logprob_error_metrics.pop("num_masked_seqs")
+                    )
+
                 # Build prompt IDs for advantage estimation (groups responses from same prompt).
                 # Use the token-length-based extractor so multi-turn prompts containing
                 # assistant messages still resolve to the original prompt only.
@@ -1489,6 +1724,9 @@ def ppo_train(
                 if "global_valid_toks" in metrics:
                     total_valid_tokens += metrics["global_valid_toks"]
 
+                # Always log sequence-level error metrics (useful for deciding threshold)
+                metrics.update(seq_logprob_error_metrics)
+
                 ## Checkpointing
                 consumed_samples += master_config.ppo["num_prompts_per_step"]
                 timeout.mark_iteration()
@@ -1610,11 +1848,29 @@ def ppo_train(
                 reduction_op="sum"
             )  # type: ignore
 
+            # track example with high token mult prob error above 1.05
+            # (metrics["token_mult_prob_error"] is only populated when
+            # train_results is not None, i.e. outside critic-only warmup steps)
+            if metrics.get("token_mult_prob_error", 0) > 1.05:
+                logger.log_plot_token_mult_prob_error(
+                    {
+                        "prompt_lengths": repeated_batch["length"],
+                        "full_lengths": input_lengths,
+                        "generation_logprobs": train_data["generation_logprobs"],
+                        "prev_logprobs": train_data["prev_logprobs"],
+                        "token_mask": train_data["token_mask"],
+                        "sample_mask": train_data["sample_mask"],
+                    },
+                    total_steps + 1,
+                    name="train/token_mult_prob_error_plot_sample",
+                )
+
             del train_data
 
             print("\n📊 Training Results:")
             if train_results is not None:
                 print(f"  • Policy Loss: {metrics.get('loss', 'N/A')}")
+                print(f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}")
             if value_results is not None:
                 print(f"  • Critic Loss: {metrics.get('critic/loss', 'N/A')}")
                 print(f"  • Critic Grad Norm: {metrics.get('critic/grad_norm', 'N/A')}")

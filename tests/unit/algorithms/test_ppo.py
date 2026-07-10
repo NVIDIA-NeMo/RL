@@ -693,3 +693,275 @@ def test_create_advantage_estimator_requires_adv_estimator_key():
 
     with pytest.raises(KeyError):
         _create_advantage_estimator(master_config)
+
+
+# ===============================================================================
+# Non-colocated generation (setup())
+# ===============================================================================
+
+
+def _build_ppo_master_config():
+    """Minimal PPO MasterConfig sufficient to drive setup() end to end.
+
+    Uses model_construct (like test_grpo.py's mock_grpo_components) so nested
+    sub-configs can stay plain dicts instead of satisfying full pydantic/TypedDict
+    validation. Individual tests mutate fields in place before calling setup().
+    """
+    from nemo_rl.algorithms.ppo import MasterConfig
+
+    return MasterConfig.model_construct(
+        **{
+            "policy": {
+                "model_name": "fake-model",
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
+                "max_total_sequence_length": 128,
+                "generation": {
+                    "backend": "vllm",
+                    "model_name": "fake-model",
+                    "colocated": {
+                        "enabled": True,
+                        "resources": {"gpus_per_node": None, "num_nodes": None},
+                    },
+                    "vllm_cfg": {
+                        "precision": "bfloat16",
+                        "kv_cache_dtype": "auto",
+                    },
+                    "vllm_kwargs": {},
+                },
+            },
+            "value": {
+                "megatron_cfg": {"enabled": False},
+                "dtensor_cfg": {"enabled": True, "context_parallel_size": 1},
+                "sequence_packing": {"enabled": False},
+                "dynamic_batching": {"enabled": False},
+            },
+            "loss_fn": ClippedPGLossConfig(),
+            "value_loss_fn": MseValueLossConfig(),
+            "env": {},
+            "data": {"shuffle": False, "num_workers": 0},
+            "ppo": {
+                "seed": 42,
+                "batch_multiplier": 1,
+                "num_prompts_per_step": 1,
+                "use_dynamic_sampling": False,
+                "val_period": 0,
+                "val_at_start": False,
+                "val_at_end": False,
+                "ppo_epochs": 1,
+                "max_num_steps": 1,
+                "max_num_epochs": 1,
+            },
+            "logger": {},
+            "cluster": {"num_nodes": 1, "gpus_per_node": 2},
+            "checkpointing": {},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "num_nodes,inference_num_nodes",
+    [
+        pytest.param(1, None, id="single_node"),
+        pytest.param(2, 1, id="multi_node"),
+    ],
+)
+def test_ppo_noncolocated_requires_explicit_gpus_per_node(
+    num_nodes, inference_num_nodes
+):
+    """Non-colocated PPO must set an explicit inference GPU count, whether
+    train and inference share a single node or each get dedicated nodes."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.ppo import setup
+
+    master_config = _build_ppo_master_config()
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": None, "num_nodes": inference_num_nodes},
+    }
+    master_config.cluster["num_nodes"] = num_nodes
+    master_config.cluster["gpus_per_node"] = 8
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with (
+        patch("nemo_rl.algorithms.ppo.Logger"),
+        patch("nemo_rl.algorithms.ppo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.ppo.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="policy.generation.colocated.resources.gpus_per_node must be explicitly set",
+        ),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_checkpointer.return_value.load_training_info.return_value = None
+        setup(master_config, tokenizer, dataset, None)
+
+
+def test_ppo_noncolocated_rejects_sglang_backend():
+    """SGLangGeneration.init_collective() is a no-op, so non-colocated PPO must
+    fail loudly at setup() rather than hang forever waiting for the training
+    side's NCCL collective to be joined by peers that never connect."""
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.ppo import setup
+
+    master_config = _build_ppo_master_config()
+    master_config.policy["generation"]["backend"] = "sglang"
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": 1, "num_nodes": None},
+    }
+    master_config.cluster["num_nodes"] = 1
+    master_config.cluster["gpus_per_node"] = 2
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=10)
+
+    with (
+        patch("nemo_rl.algorithms.ppo.Logger"),
+        patch("nemo_rl.algorithms.ppo.CheckpointManager") as mock_checkpointer,
+        patch("nemo_rl.algorithms.ppo.StatefulDataLoader"),
+        pytest.raises(
+            AssertionError,
+            match="Non-colocated PPO currently requires the vLLM generation backend",
+        ),
+    ):
+        mock_checkpointer.return_value.get_latest_checkpoint_path.return_value = None
+        mock_checkpointer.return_value.load_training_info.return_value = None
+        setup(master_config, tokenizer, dataset, None)
+
+
+@pytest.mark.parametrize("colocated", [True, False])
+def test_ppo_setup_cluster_split_matches_colocation_mode(monkeypatch, colocated):
+    """train_cluster/inference_cluster identity and worker-group budget by mode.
+
+    Colocated: train_cluster is inference_cluster (single shared pool of
+    generation+policy+value). Non-colocated: they are distinct clusters, and
+    train_cluster must budget for 2 co-timesharing worker groups (policy +
+    value) since generation now lives on its own inference_cluster.
+    """
+    from unittest.mock import MagicMock
+
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    class DummyLogger:
+        def log_hyperparams(self, *_args, **_kwargs):
+            pass
+
+        def log_metrics(self, *_args, **_kwargs):
+            pass
+
+    class DummyCheckpointer:
+        def get_latest_checkpoint_path(self):
+            return None
+
+        def load_training_info(self, _path):
+            return None
+
+    class DummyLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    class DummyCluster:
+        instances = []
+
+        def __init__(self, *_args, max_colocated_worker_groups=1, **_kwargs):
+            self.max_colocated_worker_groups = max_colocated_worker_groups
+            DummyCluster.instances.append(self)
+
+        def world_size(self):
+            return 1
+
+        def get_master_address_and_port(self):
+            return "127.0.0.1", 1234
+
+        def get_placement_groups(self):
+            return []
+
+    class DummyPolicy:
+        def offload_to_cpu(self):
+            pass
+
+        def print_node_ip_and_gpu_id(self):
+            pass
+
+        def init_collective(self, *_args, **_kwargs):
+            return []
+
+        def prepare_for_training(self):
+            pass
+
+        def prepare_refit_info(self):
+            return {}
+
+    class DummyValue:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def finish_training(self):
+            pass
+
+    class DummyVllmGeneration:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def finish_generation(self):
+            pass
+
+        def prepare_refit_info(self, _state):
+            pass
+
+        def init_collective(self, *_args, **_kwargs):
+            return []
+
+    DummyCluster.instances = []
+    monkeypatch.setattr(ppo_mod, "Logger", lambda *_a, **_k: DummyLogger())
+    monkeypatch.setattr(
+        ppo_mod, "CheckpointManager", lambda *_a, **_k: DummyCheckpointer()
+    )
+    monkeypatch.setattr(ppo_mod, "StatefulDataLoader", DummyLoader)
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(ppo_mod, "Policy", lambda *_a, **_k: DummyPolicy())
+    monkeypatch.setattr(ppo_mod, "Value", lambda *_a, **_k: DummyValue())
+    monkeypatch.setattr(
+        ppo_mod, "VllmGeneration", lambda *_a, **_k: DummyVllmGeneration()
+    )
+    monkeypatch.setattr(ppo_mod.ray, "get", lambda x: x)
+
+    master_config = _build_ppo_master_config()
+    if colocated:
+        master_config.policy["generation"]["colocated"] = {
+            "enabled": True,
+            "resources": {"gpus_per_node": None, "num_nodes": None},
+        }
+    else:
+        master_config.policy["generation"]["colocated"] = {
+            "enabled": False,
+            "resources": {"gpus_per_node": 1, "num_nodes": None},
+        }
+    master_config.cluster["num_nodes"] = 1
+    master_config.cluster["gpus_per_node"] = 2
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+
+    _, _, _, (train_cluster, inference_cluster), *_ = ppo_mod.setup(
+        master_config, tokenizer, dataset, None
+    )
+
+    if colocated:
+        assert train_cluster is inference_cluster
+        assert train_cluster.max_colocated_worker_groups == 3
+    else:
+        assert train_cluster is not inference_cluster
+        assert train_cluster.max_colocated_worker_groups == 2
+        assert inference_cluster.max_colocated_worker_groups == 1

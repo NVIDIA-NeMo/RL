@@ -38,9 +38,11 @@ We define a [ValueInterface](../../nemo_rl/models/value/interfaces.py) that cont
 
 The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **DTensor backend** (`value.dtensor_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
 
-### Colocated Architecture
+### Colocated and Non-Colocated Architecture
 
-PPO uses a colocated architecture where the **policy**, **value model**, and **vLLM generation engine** share the same set of GPUs. GPU memory is managed by offloading models to CPU between stages: the value model is loaded to GPU only during its inference and training phases, then offloaded to make room for other components.
+By default, PPO uses a colocated architecture where the **policy**, **value model**, and **vLLM/SGLang generation engine** share the same set of GPUs. GPU memory is managed by offloading models to CPU between stages: the value model is loaded to GPU only during its inference and training phases, then offloaded to make room for other components.
+
+PPO also supports **non-colocated generation**, where the generation engine runs on a dedicated set of GPUs separate from training (`policy.generation.colocated.enabled: false`, with `policy.generation.colocated.resources.{gpus_per_node,num_nodes}` sizing the dedicated generation resources). In this mode the policy and value model still share a single `train_cluster` (offloaded to CPU between each other as in the colocated case), while generation runs concurrently on its own `inference_cluster`; weights are synchronized via an NCCL broadcast collective spanning both clusters instead of the CUDA-IPC/ZMQ path used when colocated. Non-colocated generation currently requires the vLLM backend — `setup()` asserts this explicitly, since SGLang does not yet implement the collective rendezvous or weight refit needed for non-colocated mode.
 
 ### Value Model Configuration
 

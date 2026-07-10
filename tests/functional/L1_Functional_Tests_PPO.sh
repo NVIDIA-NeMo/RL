@@ -36,6 +36,7 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/ppo_automodel.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/ppo_non_colocated.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
