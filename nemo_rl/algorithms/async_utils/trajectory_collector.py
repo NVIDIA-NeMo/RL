@@ -12,15 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+import concurrent.futures
 import threading as _threading
 import time
+from collections import defaultdict
 from typing import Any, Optional
 
 import ray
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -28,6 +34,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -44,14 +51,32 @@ class AsyncTrajectoryCollector:
         master_config: MasterConfig,
         replay_buffer: Any,
         start_step: int = 0,
+        teacher_worker_groups: Optional[dict[str, Any]] = None,
+        alias_to_group_alias: Optional[dict[str, str]] = None,
+        on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
         self.master_config = master_config
         self.replay_buffer = replay_buffer
+        self.teacher_worker_groups = teacher_worker_groups or {}
+        self.alias_to_group_alias = alias_to_group_alias or {}
+        self.on_policy_distillation_cfg = on_policy_distillation_cfg or {}
+        self._has_distillation_teachers = bool(self.teacher_worker_groups)
+        self._teacher_seq_pad_multiple = teacher_seq_pad_multiple(
+            self.teacher_worker_groups,
+            self.master_config.policy["make_sequence_length_divisible_by"],
+        )
+        # Per-teacher locks to serialize get_logprobs calls. Concurrent calls
+        # to the same teacher cause NCCL collective desync across workers
+        # (different workers may receive requests in different order → SeqNum
+        # mismatch → 600s timeout → crash). Different teachers can still run
+        # in parallel since they use separate NCCL groups on separate nodes.
+        self._teacher_locks: dict[str, _threading.Lock] = {
+            k: _threading.Lock() for k in self.teacher_worker_groups
+        }
         self.running = False
-
         self._pg_lock: _threading.Lock = _threading.Lock()
 
         # Event for manual pause/resume control
@@ -93,6 +118,9 @@ class AsyncTrajectoryCollector:
         self._completed_per_target: dict[int, int] = {}
         self._spawning_targets: set[int] = set()
         self._counter_lock: _threading.Lock = _threading.Lock()
+
+        # Timer for efficiency metrics
+        self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -235,7 +263,8 @@ class AsyncTrajectoryCollector:
                 # Check if refit is in progress and wait
                 if not self._refit_pause_cleared.is_set() and self.running:
                     print("⏸️ Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
+                    with self._efficiency_timer.time("idle/refit_event_wait"):
+                        self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
                 # Check if generation limits require pausing collection
@@ -258,7 +287,8 @@ class AsyncTrajectoryCollector:
                         self._generation_limit_cleared.clear()  # Clear the event to pause
 
                     # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
+                    with self._efficiency_timer.time("idle/generation_limit_pause"):
+                        self._generation_limit_cleared.wait()
 
                     # Double-check we're still running after being woken up
                     if not self.running:
@@ -268,7 +298,6 @@ class AsyncTrajectoryCollector:
                     break
 
                 self._process_batch(batch)
-
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
             import traceback
@@ -344,7 +373,8 @@ class AsyncTrajectoryCollector:
                         print(
                             "   Note: With vLLM V1 async engine, active threads can complete during weight update"
                         )
-                        self._refit_pause_cleared.wait()
+                        with self._efficiency_timer.time("idle/refit_event_wait"):
+                            self._refit_pause_cleared.wait()
 
                         # After refit finishes if weight version has updated, reflect that in the new trajectories
                         generation_weight_version = self.current_weight_version
@@ -437,9 +467,9 @@ class AsyncTrajectoryCollector:
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
-        For vLLM V1 async engine, leverages in-flight weight updates via collective_rpc,
-        allowing ongoing generations to continue with their current KV caches while
-        weights are updated. This significantly improves async performance.
+        For backends with an async engine in-flight weight updates allows ongoing generations
+        to continue with their current KV caches while weights are updated.
+        This significantly improves async performance.
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
@@ -450,19 +480,29 @@ class AsyncTrajectoryCollector:
         self._refit_pause_cleared.clear()
         print("⏸️ New generation starts paused")
 
-        # Check if we're using vLLM async engine
-        vllm_cfg = self.master_config.policy.get("generation", {}).get("vllm_cfg", {})
-        is_async_engine = vllm_cfg.get("async_engine", False)
+        # Check if we're using async engine
+        generation_cfg = self.master_config.policy.get("generation", {})
+        backend = generation_cfg.get("backend", "")
+        if backend == "vllm":
+            is_async_engine = generation_cfg.get("vllm_cfg", {}).get(
+                "async_engine", False
+            )
+        elif backend == "megatron":
+            is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
+                "async_engine", False
+            )
+        else:
+            is_async_engine = False
         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
             "in_flight_weight_updates", False
         )
 
         if is_async_engine and in_flight_weight_updates:
-            # vLLM V1 async engine supports in-flight weight updates
+            # async engines support in-flight weight updates
             # Ongoing generations will continue with their current KV caches
             # New generations (after weight update) will use the updated weights
             print(
-                "🚀 Using vLLM V1 in-flight weight update - skipping wait for pending generations"
+                f"🚀 Using {backend} in-flight weight update - skipping wait for pending generations"
             )
             print(
                 f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
@@ -530,6 +570,13 @@ class AsyncTrajectoryCollector:
             return self.dataloader.state_dict()
         return {}
 
+    def get_efficiency_metrics(self) -> dict[str, float]:
+        """Return accumulated efficiency metrics (sum of durations per category).
+
+        Called by the driver process each step to merge collector-side metrics.
+        """
+        return self._efficiency_timer.get_timing_metrics(reduction_op="sum")
+
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
             finished = {t for t in self._inflight_threads if not t.is_alive()}
@@ -569,6 +616,117 @@ class AsyncTrajectoryCollector:
                     f"{buffered} buffered)"
                 )
 
+    def _compute_teacher_logprobs(
+        self,
+        input_ids: torch.Tensor,
+        agent_refs: list[dict[str, Any]],
+        input_lengths: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, float]:
+        """Compute teacher logprobs for non-colocated teachers.
+
+        Groups samples by teacher, fans out in parallel, stitches results.
+
+        Args:
+            input_ids: [B, S] tokenized input tensor
+            agent_refs: list of B agent reference dicts
+            input_lengths: [B] per-sample lengths (required for sequence packing)
+
+        Returns:
+            ([B, S] teacher logprobs tensor, total_time_seconds)
+        """
+        opd_cfg = self.on_policy_distillation_cfg
+        teacher_model_by_agent_name = opd_cfg.get("teacher_model_by_agent_name", {})
+        default_teacher_alias = opd_cfg.get("default_teacher_alias")
+        strict = opd_cfg.get("strict_agent_name_match", False)
+
+        # Resolve each sample's agent -> the teacher alias it should be distilled
+        # from: the agent name is looked up in teacher_model_by_agent_name; unmapped
+        # agents fall back to default_teacher_alias (or raise if strict_agent_name_match).
+        # Returns one alias per sample, index-aligned with agent_refs.
+        reference_aliases = resolve_reference_aliases(
+            agent_refs,
+            teacher_model_by_agent_name,
+            default_teacher_alias=default_teacher_alias,
+            strict_agent_name_match=strict,
+        )
+
+        # Map aliases to actual group keys via deduplication mapping
+        group_keys = [self.alias_to_group_alias.get(a, a) for a in reference_aliases]
+
+        # Group sample indices by teacher group
+        group_to_indices: dict[str, list[int]] = defaultdict(list)
+        for i, gk in enumerate(group_keys):
+            group_to_indices[gk].append(i)
+
+        B, S = input_ids.shape
+        result = torch.zeros(B, S, dtype=torch.float32)
+        if (
+            not group_to_indices
+        ):  # 0-sample batch: nothing to route (avoid max_workers=0)
+            return result, 0.0
+
+        def _get_logprobs_for_group(group_key, indices):
+            twg = self.teacher_worker_groups[group_key]
+            sub_input_ids = input_ids[indices]
+            sub_lengths = input_lengths[indices] if input_lengths is not None else None
+
+            # Pad batch to multiple of dp_size (required for DP sharding)
+            dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
+            actual_batch_size = sub_input_ids.shape[0]
+            remainder = actual_batch_size % dp_size
+            if remainder != 0:
+                pad_count = dp_size - remainder
+                # Repeat last row to fill — can't slice [:pad_count] when
+                # actual_batch_size < pad_count (e.g., 1 sample, dp_size=4)
+                pad_rows = sub_input_ids[-1:].expand(pad_count, -1)
+                sub_input_ids = torch.cat([sub_input_ids, pad_rows], dim=0)
+                if sub_lengths is not None:
+                    sub_lengths = torch.cat(
+                        [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
+                    )
+
+            sub_data = BatchedDataDict({"input_ids": sub_input_ids})
+            if sub_lengths is not None:
+                sub_data["input_lengths"] = sub_lengths
+
+            # Serialize calls per teacher to prevent NCCL collective desync
+            t_lock_start = time.time()
+            with self._teacher_locks[group_key]:
+                t_inference_start = time.time()
+                logprobs_result = twg.get_logprobs(sub_data)
+            t_done = time.time()
+            lock_wait = t_inference_start - t_lock_start
+            inference_time = t_done - t_inference_start
+            print(
+                f"[teacher_logprob] group={group_key} samples={actual_batch_size} "
+                f"lock_wait={lock_wait:.2f}s inference={inference_time:.2f}s"
+            )
+            logprobs = logprobs_result["reference_logprobs"]
+
+            # Trim DP padding
+            logprobs = logprobs[:actual_batch_size]
+
+            return indices, logprobs
+
+        # Fan out to teachers in parallel
+        t_total_start = time.time()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(group_to_indices)
+        ) as executor:
+            futures = {
+                executor.submit(_get_logprobs_for_group, gk, idxs): gk
+                for gk, idxs in group_to_indices.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                indices, logprobs = future.result()
+                result[indices] = logprobs
+        total_time = time.time() - t_total_start
+        print(
+            f"[teacher_logprob] total={total_time:.2f}s for {B} samples across {len(group_to_indices)} teacher(s)"
+        )
+
+        return result, total_time
+
     def _run_prompt_group_worker(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
@@ -576,10 +734,14 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         prompt_idx: int,
     ) -> None:
+        worker_start = time.perf_counter()
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-            from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
+            from nemo_rl.experience.rollouts import (
+                get_nemo_gym_thinking_tags,
+                run_async_nemo_gym_rollout,
+            )
 
             # Run rollout for this prompt group
             # Async engine supports concurrent generation; avoid locking
@@ -595,6 +757,8 @@ class AsyncTrajectoryCollector:
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    reward_penalty_config=self.master_config.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 )
                 final_batch = nemo_gym_rollout_result.final_batch
                 rollout_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -613,6 +777,34 @@ class AsyncTrajectoryCollector:
             final_batch_cpu = final_batch.to("cpu")
             del final_batch
 
+            # Compute teacher logprobs at collection time (overlapped with async rollouts)
+            if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
+                agent_refs = final_batch_cpu["agent_ref"]
+                if isinstance(agent_refs, list):
+                    from nemo_rl.data.llm_message_utils import (
+                        batched_message_log_to_flat_message,
+                    )
+
+                    flat_for_teacher, teacher_input_lengths = (
+                        batched_message_log_to_flat_message(
+                            final_batch_cpu["message_log"],
+                            pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
+                            make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
+                        )
+                    )
+                    teacher_logprobs, teacher_logprob_time = (
+                        self._compute_teacher_logprobs(
+                            flat_for_teacher["token_ids"],
+                            agent_refs,
+                            input_lengths=teacher_input_lengths,
+                        )
+                    )
+                    # Store inside batch dict so from_batches handles
+                    # variable-length padding across prompt groups
+                    final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs
+                    rollout_metrics = dict(rollout_metrics)
+                    rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
+
             trajectory_group = {
                 "batch": final_batch_cpu,
                 "rollout_metrics": rollout_metrics,
@@ -622,6 +814,7 @@ class AsyncTrajectoryCollector:
             # Use exponential backoff when buffer is full
             try:
                 backoff_delay = 0.01
+                backoff_start = None
                 while self.running:
                     status = ray.get(
                         self.replay_buffer.add.remote(
@@ -642,6 +835,11 @@ class AsyncTrajectoryCollector:
                             spawned_count = self._spawned_per_target.get(
                                 target_weight_version, 0
                             )
+                        if backoff_start is not None:
+                            self._efficiency_timer.record(
+                                "idle/buffer_full_backoff",
+                                time.perf_counter() - backoff_start,
+                            )
                         print(
                             f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
                             f"target_weight {target_weight_version}) "
@@ -649,6 +847,8 @@ class AsyncTrajectoryCollector:
                         )
                         break
                     elif status == "full":
+                        if backoff_start is None:
+                            backoff_start = time.perf_counter()
                         # Exponential backoff up to 0.5 second
                         time.sleep(min(backoff_delay, 0.5))
                         backoff_delay *= 1.5
@@ -657,11 +857,19 @@ class AsyncTrajectoryCollector:
                         time.sleep(0.01)
             except Exception as e:
                 print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
+                if backoff_start is not None:
+                    self._efficiency_timer.record(
+                        "idle/buffer_full_backoff",
+                        time.perf_counter() - backoff_start,
+                    )
                 import traceback
 
                 traceback.print_exc()
         except Exception as e:
             print(f"❌ Error in prompt group worker: {e}")
+            self._efficiency_timer.record(
+                "wasted/failed_trajectory", time.perf_counter() - worker_start
+            )
             import traceback
 
             traceback.print_exc()

@@ -62,7 +62,7 @@ Learn about DTensor and Megatron Core training backends, their capabilities, and
 :link: about/algorithms/index
 :link-type: doc
 
-Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, and on-policy distillation with detailed guides and examples.
+Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy distillation, and multi-teacher on-policy distillation (MOPD) with detailed guides and examples.
 :::
 
 :::{grid-item-card} {octicon}`graph` Evaluation
@@ -119,6 +119,20 @@ Configure offline and online Eagle3 draft-model workflows to accelerate rollout 
 :link-type: doc
 
 Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
+:::
+
+:::{grid-item-card} {octicon}`device-camera-video` Audio-Visual Intent GRPO
+:link: guides/grpo-audio-visual
+:link-type: doc
+
+Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and evaluate on Daily-Omni, following HumanOmniV2's joint audio-visual setup.
+:::
+
+:::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
+:link: guides/swe-rl-qwen3
+:link-type: doc
+
+Train Qwen3-30B-A3B-Thinking into a SWE agent with a pivot stage plus end-to-end agentic RL on SWE-bench.
 :::
 
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
@@ -181,7 +195,8 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link: guides/quantization-aware-rl
 :link-type: doc
 
-Run quantization aware GRPO and distillation using NVIDIA ModelOpt (NVFP4, FP8).
+Run quantization-aware GRPO and distillation using NVIDIA ModelOpt.
+Includes NVFP4 W4A16 real rollout.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
@@ -247,6 +262,8 @@ guides/sft-openmathinstruct2.md
 :hidden:
 
 guides/nemotron-3-nano.md
+guides/nemotron-3-nano-omni.md
+guides/nemotron-3-super.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
@@ -254,11 +271,13 @@ guides/dapo.md
 guides/lora.md
 guides/cispo.md
 guides/prorlv2.md
+guides/swe-rl-qwen3.md
 guides/grpo.md
 guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
+guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
 guides/eval.md

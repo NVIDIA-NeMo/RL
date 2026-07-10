@@ -72,6 +72,7 @@ policy: &POLICY_BASE
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
+        use_gloo_process_groups: false
         peft:
             enabled: false
             target_modules: []
@@ -188,3 +189,4 @@ logger:
 cluster:
     gpus_per_node: 8
     num_nodes: 1
+    segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

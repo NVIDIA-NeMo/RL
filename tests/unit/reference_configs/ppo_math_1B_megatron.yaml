@@ -144,9 +144,11 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
     apply_rope_fusion: True
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
     moe_per_layer_logging: False
 
@@ -256,7 +258,6 @@ value:
     name: ${value.model_name}
     chat_template_kwargs: null
   hf_config_overrides: {}
-  load_value_head_from_model: false
 
   train_global_batch_size: ${policy.train_global_batch_size}
   train_micro_batch_size: ${policy.train_micro_batch_size}
@@ -310,9 +311,11 @@ value:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "allgather"
     moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
     apply_rope_fusion: True
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
     moe_per_layer_logging: False
 

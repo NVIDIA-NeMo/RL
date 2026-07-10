@@ -59,7 +59,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     cluster.gpus_per_node=2 \
     policy.dtensor_cfg.tensor_parallel_size=1 \
     policy.dtensor_cfg.context_parallel_size=2 \
-    policy.make_sequence_length_divisible_by=2 \
+    policy.make_sequence_length_divisible_by=4 \
     teacher.dtensor_cfg.tensor_parallel_size=2 \
     teacher.dtensor_cfg.context_parallel_size=1 \
     data.train.data_path=$TRAIN_PATH \
