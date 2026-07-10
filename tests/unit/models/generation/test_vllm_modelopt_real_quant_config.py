@@ -903,14 +903,18 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
     assert captured["config_file"] == "examples/modelopt/quant_configs/nvfp4_a16.yaml"
 
 
+def _canonicalize_float_format(num_bits):
+    if isinstance(num_bits, str):
+        return num_bits.lower()
+    exponent_bits, mantissa_bits = num_bits
+    return f"e{exponent_bits}m{mantissa_bits}"
+
+
 @pytest.mark.parametrize(
-    ("recipe", "accepted_num_bits"),
-    [
-        ("kv_cache_fp8.yaml", ((4, 3), "e4m3")),
-        ("kv_cache_nvfp4.yaml", ((2, 1), "e2m1")),
-    ],
+    ("recipe", "expected_num_bits"),
+    [("kv_cache_fp8.yaml", "e4m3"), ("kv_cache_nvfp4.yaml", "e2m1")],
 )
-def test_resolve_kv_cache_quant_recipe(recipe, accepted_num_bits):
+def test_resolve_kv_cache_quant_recipe(recipe, expected_num_bits):
     repo_root = Path(__file__).resolve().parents[4]
 
     config = resolve_quant_cfg(
@@ -922,13 +926,14 @@ def test_resolve_kv_cache_quant_recipe(recipe, accepted_num_bits):
     assert config["quant_cfg"][0] == {"quantizer_name": "*", "enable": False}
     assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
     assert kv_config["enable"] is True
-    # ModelOpt loaders may preserve ExMy strings or normalize them to tuples.
-    assert kv_config["cfg"]["num_bits"] in accepted_num_bits
+    assert _canonicalize_float_format(kv_config["cfg"]["num_bits"]) == (
+        expected_num_bits
+    )
     if recipe == "kv_cache_nvfp4.yaml":
         block_sizes = kv_config["cfg"]["block_sizes"]
         assert block_sizes[-1] == 16
         assert block_sizes["type"] == "dynamic"
-        assert block_sizes["scale_bits"] in ((4, 3), "e4m3")
+        assert _canonicalize_float_format(block_sizes["scale_bits"]) == "e4m3"
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
