@@ -328,6 +328,11 @@ fi
 if [[ -n "${SBATCH_SEGMENT_VALUE}" ]]; then
     SBATCH_EXTRA_ARGS+=("--segment=${SBATCH_SEGMENT_VALUE}")
 fi
+# Optional job dependency (e.g. afterany:<jobid>) so checkpoint-chained
+# windows can be queued ahead of time without EXP_NAME concurrency risk.
+if [[ -n "${SBATCH_DEPENDENCY:-}" ]]; then
+    SBATCH_EXTRA_ARGS+=("--dependency=${SBATCH_DEPENDENCY}")
+fi
 
 MOUNTS=$MOUNTS \
 COMMAND=$COMMAND \
