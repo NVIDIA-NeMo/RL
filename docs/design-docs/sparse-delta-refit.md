@@ -6,6 +6,12 @@ encoding, compression, backpressure, receiver apply, and transactional baseline
 commit logic.
 Payload checksums and transfer-scoped IDs make HTTP retries idempotent. Policy
 workers commit their baselines only after every receiver flush succeeds.
+
+The implementation is opt-in. Core policy and vLLM workers contain only lazy
+delegates; export/encoding, transport, receiver queuing, and sparse placement
+live in dedicated modules and are not initialized by existing IPC, HTTP, or
+NCCL refit paths.
+
 On a fresh run, generation starts from the shared checkpoint while policy
 workers build the CPU baseline asynchronously; the first transfer follows the
 first optimizer step. Resumed runs synchronize before generation.

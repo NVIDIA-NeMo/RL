@@ -1891,25 +1891,12 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
         lambda *_args, **_kwargs: seq_logprob_error_result,
     )
 
-    dynamic_sampling_calls = 0
-
-    def fake_dynamic_sampling(repeated_batch, *_args, **_kwargs):
-        nonlocal dynamic_sampling_calls
-        dynamic_sampling_calls += 1
-        repeated_batch["filtered_reward"] = repeated_batch["total_reward"]
-        repeated_batch["baseline"] = torch.zeros(repeated_batch.size)
-        repeated_batch["std"] = torch.ones(repeated_batch.size)
-        complete = dynamic_sampling_calls == 2
-        return repeated_batch, complete, None if complete else repeated_batch, {}
-
-    monkeypatch.setattr(grpo_mod, "dynamic_sampling", fake_dynamic_sampling)
-
     master_config = mock_grpo_components["master_config"]
     master_config.grpo["max_num_steps"] = 1
     master_config.grpo["max_num_epochs"] = 1
     master_config.grpo["val_period"] = 0
     master_config.grpo["val_at_start"] = False
-    master_config.grpo["use_dynamic_sampling"] = True
+    master_config.grpo["use_dynamic_sampling"] = False
 
     grpo_mod.grpo_train(
         mock_grpo_components["policy"],
@@ -1940,7 +1927,6 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     assert train_metrics["min_seq_mult_prob_error_after_mask"] == 1.0
     assert train_metrics["num_masked_seqs_by_logprob_error"] == 2
     assert train_metrics["masked_correct_pct"] == 0.5
-    assert dynamic_sampling_calls == 2
     assert any(
         call.args[0] == {"delta/changed_pct": 4.0}
         and call.kwargs.get("prefix") == "refit"

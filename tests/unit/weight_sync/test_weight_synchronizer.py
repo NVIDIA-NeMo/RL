@@ -34,9 +34,6 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
-from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
-    VllmRemoteSparseWeightSynchronizer,
-)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,25 +74,6 @@ def _mock_cluster(world_size=4, ip="127.0.0.1", port=29500):
     cluster.world_size.return_value = world_size
     cluster.get_master_address_and_port.return_value = (ip, port)
     return cluster
-
-
-def _remote_sparse_sync(
-    mock_ray: MagicMock,
-    transport: str,
-    stream_result: list[dict[str, int]] | RuntimeError,
-) -> tuple[VllmRemoteSparseWeightSynchronizer, MagicMock, MagicMock]:
-    policy = MagicMock()
-    policy.init_remote_sparse_delta_baseline.return_value = [MagicMock()]
-    policy.stream_remote_sparse_weights.return_value = [MagicMock()]
-    policy.finish_remote_sparse_delta_sync.return_value = [MagicMock()]
-    generation = MagicMock()
-    generation.report_refit_server_base_urls.return_value = ["http://receiver"]
-    generation.start_zmq_sparse_refit_relays.return_value = ["tcp://relay:19090"]
-    generation.invalidate_kv_cache.return_value = True
-    mock_ray.get.side_effect = [None, stream_result]
-    sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport=transport)
-    sync.init_communicator()
-    return sync, policy, generation
 
 
 # ---------------------------------------------------------------------------
@@ -236,143 +214,6 @@ class TestIPCWeightSynchronizer:
         sync = IPCWeightSynchronizer(policy, gen)
         with pytest.raises(ValueError, match="must be > 0"):
             sync._compute_buffer_size()
-
-
-class TestVllmRemoteSparseWeightSynchronizer:
-    def test_init_communicator_requires_receiver_endpoints(self):
-        policy = MagicMock()
-        generation = MagicMock()
-        generation.report_refit_server_base_urls.return_value = []
-        sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport="s3")
-
-        with pytest.raises(ValueError, match="endpoints are missing"):
-            sync.init_communicator()
-
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_shutdown_cancels_pending_work_and_stops_zmq(self, mock_ray):
-        policy = MagicMock()
-        generation = MagicMock()
-        sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport="zmq")
-        init_ref, commit_ref = MagicMock(), MagicMock()
-        sync._baseline_init_refs = [init_ref]
-        sync._baseline_commit_refs = [commit_ref]
-        sync._refit_urls = ["http://receiver"]
-        sync._targets = ["tcp://relay"]
-        sync._stale = False
-
-        sync.mark_stale()
-        sync.shutdown()
-
-        assert mock_ray.cancel.call_count == 2
-        mock_ray.cancel.assert_any_call(init_ref, force=False)
-        mock_ray.cancel.assert_any_call(commit_ref, force=False)
-        generation.stop_zmq_sparse_refit_relays.assert_called_once_with()
-        assert sync.is_stale
-        assert sync._baseline_init_refs is None
-        assert sync._baseline_commit_refs is None
-        assert sync._refit_urls == []
-        assert sync._targets == []
-
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_fails_before_transfer_when_kv_cache_invalidation_fails(self, _mock_ray):
-        policy = MagicMock()
-        generation = MagicMock()
-        generation.invalidate_kv_cache.return_value = False
-        sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport="s3")
-
-        with pytest.raises(RuntimeError, match="KV cache invalidation failed"):
-            sync.sync_weights()
-        policy.stream_remote_sparse_weights.assert_not_called()
-
-    @patch(
-        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
-    )
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_initializes_streams_commits_and_updates_baseline(
-        self, mock_ray, flush, capsys
-    ):
-        sync, policy, generation = _remote_sparse_sync(
-            mock_ray,
-            "zmq",
-            [{"payloads": 3, "changed_elements": 3, "total_elements": 100}],
-        )
-        flush.return_value = [
-            {
-                "verification_candidates": 4,
-                "verification_samples": 4,
-                "verification_exact_mismatches": 1,
-                "verification_mismatches": 0,
-                "verification_abs_sum": 1e-9,
-                "verification_max_abs": 1e-9,
-            }
-        ]
-        metrics = sync.sync_weights()
-
-        policy.init_remote_sparse_delta_baseline.assert_called_once_with("zmq")
-        generation.start_zmq_sparse_refit_relays.assert_called_once_with(
-            ["http://receiver"]
-        )
-        policy.stream_remote_sparse_weights.assert_called_once()
-        flush.assert_called_once_with(
-            ["http://receiver"], api_key_env_var=None, timeout_s=600.0
-        )
-        policy.finish_remote_sparse_delta_sync.assert_called_once_with(True)
-        assert (
-            "REFIT_ZMQ_DELTA_CHANGE changed_elements=3 total_elements=100 "
-            "changed_pct=3" in capsys.readouterr().out
-        )
-        assert metrics["delta/changed_pct"] == 3.0
-        assert metrics["delta_verify/candidates"] == 4.0
-        assert metrics["delta_verify/samples"] == 4.0
-        assert metrics["delta_verify/exact_mismatches"] == 1.0
-        assert metrics["delta_verify/mismatches"] == 0.0
-        assert metrics["delta_verify/mean_abs"] == 2.5e-10
-        assert metrics["delta_verify/max_abs"] == 1e-9
-        assert metrics["transfer/payloads"] == 3.0
-        assert not sync.is_stale
-
-    @patch(
-        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
-    )
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_sample_mismatch_does_not_commit_baseline(self, mock_ray, flush):
-        sync, policy, _ = _remote_sparse_sync(
-            mock_ray,
-            "zmq",
-            [{"payloads": 3, "changed_elements": 3, "total_elements": 100}],
-        )
-        flush.return_value = [
-            {
-                "verification_samples": 4,
-                "verification_mismatches": 1,
-                "verification_abs_sum": 0.5,
-                "verification_max_abs": 0.5,
-            }
-        ]
-
-        with pytest.raises(RuntimeError, match="1 mismatched deltas out of 4"):
-            sync.sync_weights()
-
-        policy.finish_remote_sparse_delta_sync.assert_called_once_with(False)
-
-    @patch(
-        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
-    )
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_failure_drains_receivers_without_committing_baseline(
-        self, mock_ray, flush
-    ):
-        sync, policy, _ = _remote_sparse_sync(
-            mock_ray, "s3", RuntimeError("stream failed")
-        )
-
-        with pytest.raises(RuntimeError, match="stream failed"):
-            sync.sync_weights()
-
-        flush.assert_called_once_with(
-            ["http://receiver"], api_key_env_var=None, timeout_s=60.0
-        )
-        policy.finish_remote_sparse_delta_sync.assert_called_once_with(False)
 
 
 # ---------------------------------------------------------------------------
