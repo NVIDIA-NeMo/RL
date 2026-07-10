@@ -1,4 +1,4 @@
-defaults: ./grpo-glm5.1-64n4g-megatron-8K-full-onpolicy-gb200.yaml
+defaults: ./grpo-glm5.1-64n4g-megatron-131k-full-onpolicy-gb200.yaml
 
 grpo:
   val_period: -1

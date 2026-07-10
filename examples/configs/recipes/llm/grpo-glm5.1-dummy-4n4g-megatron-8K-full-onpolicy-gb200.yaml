@@ -1,12 +1,16 @@
-defaults: ./grpo-glm5.1-64n4g-megatron-8K-full-onpolicy-gb200.yaml
+defaults: ./grpo-glm5.1-64n4g-megatron-131k-full-onpolicy-gb200.yaml
+
+data:
+  max_input_seq_length: 7680
 
 checkpointing:
-  checkpoint_dir: results/grpo-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-full-onpolicy-gb200
+  checkpoint_dir: results/grpo-glm51-dummy-8k-4n4g
 
 policy:
   model_name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/songlinj/glm5.1-dummy-model
   tokenizer:
     name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/songlinj/glm5.1-dummy-model
+  max_total_sequence_length: 8192
   megatron_cfg:
     force_reconvert_from_hf: false
     tensor_model_parallel_size: 4
@@ -15,12 +19,18 @@ policy:
     num_layers_in_last_pipeline_stage: null
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
+    context_parallel_size: 2
+    dsa_kernel_backend: ${oc.env:GLM51_DSA_KERNEL_BACKEND,cudnn}
+    activation_checkpointing: false
+    clear_memory_caches_before_refit: true
+    empty_unused_memory_level: 2
     env_vars:
       CUDA_DEVICE_MAX_CONNECTIONS: "1"
   generation:
     vllm_cfg:
       tensor_parallel_size: 4
       expert_parallel_size: 8
+      max_model_len: ${policy.max_total_sequence_length}
     vllm_kwargs:
       enable_chunked_prefill: true
       attention_config:
@@ -29,9 +39,9 @@ policy:
         moe_backend: flashinfer_cutlass
 
 logger:
-  log_dir: logs/grpo-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-full-onpolicy-gb200
+  log_dir: logs/grpo-glm51-dummy-8k-4n4g
   wandb:
-    name: grpo-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-full-onpolicy-gb200
+    name: grpo-glm51-dummy-8k-4n4g
 
 cluster:
   gpus_per_node: 4
