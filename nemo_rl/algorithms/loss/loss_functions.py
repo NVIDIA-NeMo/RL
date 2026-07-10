@@ -1618,6 +1618,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         student_logits_contig: torch.Tensor,
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
         aligns_by_idx: dict[int, LocalizedAlignment],
+        transport_stats: Optional[dict[str, float]] = None,
         *,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -1711,6 +1712,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             "num_valid_samples": data["input_ids"].shape[0],
         }
         metrics.update(per_teacher_metrics)
+        if transport_stats is not None:
+            metrics.update(transport_stats)
         return loss, metrics
 
     # ------------------------------------------------------------------ #
