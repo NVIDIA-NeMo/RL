@@ -72,8 +72,10 @@ versions:
 
 environment:
   shared:
-    UCX_TLS: rc,cuda_copy,tcp
-    NIXL_UCX_TLS: rc,cuda_copy,tcp
+    # Required on both sides before NIXL agent creation. Allowing TCP caused
+    # silent 3.5-3.8 Gbps data fallback despite valid rc_mlx5 paths.
+    UCX_TLS: "^tcp"
+    NIXL_UCX_TLS: "^tcp"
     UCX_NET_DEVICES: mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0
     UCX_IB_GID_INDEX: "3"
     UCX_CUDA_COPY_DMABUF: "yes"
@@ -92,7 +94,8 @@ environment:
     UCX_MAX_RMA_RAILS: "4"
     MX_POOL_REG: "1"
     NCCL_NET_PLUGIN: none
-    # Keep these enabled only while capturing the lane-selection trace.
+  optional_debug_trace:
+    # Do not set these for the clean performance measurement.
     NIXL_LOG_LEVEL: DEBUG
     UCX_LOG_LEVEL: DEBUG
     UCX_PROTO_INFO: "y"
@@ -108,26 +111,46 @@ vllm:
   moe_backend: triton
 
 validated_behavior:
-  # Repeats on every GRPO refit despite stable publisher metadata, persistent
-  # receiver buffers, and cached remote agents.
-  first_two_full_reads:
-    selected_lane: tcp/eth0
-    effective_rate_gbps: 3.5-3.8
-    seconds_per_17_58GB_source: 36-40
-  following_two_full_reads:
-    selected_lane: rc_mlx5
-    effective_rate_gbps: 580-669
-    seconds_per_17_58GB_source: 0.21-0.25
-  ucx_reachable_mds:
-    slow: "0x3d"
-    fast: "0x3f"
-  end_to_end_refit_seconds: 83-91
-  concurrent_warmup:
-    sources: 4
-    probe_bytes_per_source: 64MiB
-    timeout_seconds: 80
-    rounds: 63
-    rdma_ready_sources: 0
-    maximum_probe_rate_gbps: 2.0
-    outcome: rejected
+  baseline_with_tcp:
+    NIXL_UCX_TLS: rc,cuda_copy,tcp
+    first_two_full_reads:
+      selected_lane: tcp/eth0
+      effective_rate_gbps: 3.5-3.8
+      seconds_per_17_58GB_source: 36-40
+    following_two_full_reads:
+      selected_lane: rc_mlx5
+      effective_rate_gbps: 580-669
+      seconds_per_17_58GB_source: 0.21-0.25
+    ucx_reachable_mds:
+      slow: "0x3d"
+      fast: "0x3f"
+    refit_seconds: 83-91
+    concurrent_warmup:
+      probe_bytes_per_source: 64MiB
+      timeout_seconds: 80
+      rounds: 63
+      rdma_ready_sources: 0
+      outcome: rejected
+
+  fixed_without_tcp:
+    NIXL_UCX_TLS: "^tcp"
+    full_reads_on_rdma: 12/12
+    clean_debug_off_steps:
+      - step: 1
+        source_rates_gbps: [251.2, 570.8, 629.3, 637.6]
+        refit_seconds: 25.17
+        total_step_seconds: 71.06
+        generation_kl_error: 0.0529
+      - step: 2
+        source_rates_gbps: [574.7, 617.5, 628.4, 652.5]
+        refit_seconds: 12.23
+        total_step_seconds: 37.08
+        generation_kl_error: 0.0375
+      - step: 3
+        source_rates_gbps: [572.8, 629.0, 627.6, 655.4]
+        refit_seconds: 11.52
+        total_step_seconds: 37.21
+        generation_kl_error: 0.0684
+    steady_state_refit_speedup: approximately_7x
+    control_plane_status: healthy
 

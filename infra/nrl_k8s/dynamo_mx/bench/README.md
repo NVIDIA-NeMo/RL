@@ -14,7 +14,7 @@ refit), plus apples-to-apples transport and per-phase refit timing.
 | `mx_vs_nccl_refit_bench.py` | Deployment-agnostic driver: runs N refit cycles per backend (`mx` vs `nccl`) over the native weight-transfer API, times register/wire/translate/load/e2e, and `--compare`s the JSON. |
 | `ep_gt1_byte_pruning.py` | Synthetic-but-real-planner proof that EP>1 pulls only 1/EP of expert bytes (EP=8 → 8.0×). Runnable now, no cluster. |
 | `mdl_partial_smoke.py` | Runtime smoke for MDL incremental/partial-update (cold/warm/subset/incremental, byte-identical). No transport. |
-| `configs/nixl_ep4_tp1_gb200_rc_debug.yaml` | Sanitized snapshot of the live EP4→TP1 GB200 topology, RDMA pod attachments/resources, UCX/NIXL settings, and the repeatable TCP→`rc_mlx5` lane-selection behavior. |
+| `configs/nixl_ep4_tp1_gb200_rc_debug.yaml` | Sanitized EP4→TP1 GB200 topology and UCX/NIXL config, including the TCP-fallback baseline and validated `^tcp` fix (12/12 pulls on RDMA, ~7× steady-state refit speedup). |
 
 ## Run
 
