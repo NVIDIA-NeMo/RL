@@ -9,6 +9,10 @@ source /lustre/fsw/portfolios/coreai/users/erinh/env.sh
 cd /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/erinh/RL
 
 REPO_ROOT="$(pwd)"
+# WAR: Force this repo to win `import nemo_rl` over the container's baked /opt/nemo-rl copy
+# (entrypoint lives in examples/nemo_gym so sys.path[0] != REPO_ROOT; without this the
+# baked code shadows the mounted rebased tree). Propagates to Ray actors via env copy.
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 CONFIG_FILE="${REPO_ROOT}/examples/swe_bench/grpo_qwen3_30b_async_swe.yaml"
 CHECKPOINT_ROOT="${REPO_ROOT}/results"
 TRAIN_DATA_PATH="/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
@@ -38,7 +42,7 @@ INFLIGHT_WEIGHT_UPDATE=True
 RECOMPUTE_KV_CACHE_AFTER_WEIGHT_UPDATES=False
 SEQ_LOGPROB_ERROR_THRESHOLD=null
 COLOCATED_ENABLED=False
-TRTLLM_GPU_UTIL=0.8
+TRTLLM_GPU_UTIL="${TRTLLM_GPU_UTIL:-0.6}"   # was 0.8; lowered for refit NCCL-comm VRAM headroom. TODO: investigate TRTLLM mem regression.
 OVERLAP_GRAD_REDUCE=False
 ADVANTAGE_CLIP_LOW=-100
 ADVANTAGE_CLIP_HIGH=100
@@ -65,10 +69,7 @@ WANDB_PROJ="swe-benchmark-30b-erinh"
 WANDB_GROUP="${WANDB_GROUP:-swe-repro-trtllm}"
 
 SYNC_MODE="async-age${MAX_TRAJECTORY_AGE_STEPS}"
-# EXP_SUFFIX="${EXP_SUFFIX:-repro-baseline-swe2-trtllm-${SYNC_MODE}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}-tp${TP}}"
-# EXP_SUFFIX="${EXP_SUFFIX:-repro-baseline-swe2-trtllm-${SYNC_MODE}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}-tp${TP}-v2}"
-# EXP_SUFFIX="${EXP_SUFFIX:-repro-baseline-swe2-trtllm-${SYNC_MODE}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}-tp${TP}-v3}"
-EXP_SUFFIX="${EXP_SUFFIX:-repro-baseline-swe2-trtllm-${SYNC_MODE}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}-tp${TP}-v4}"
+EXP_SUFFIX="${EXP_SUFFIX:-repro-baseline-swe2-trtllm-${SYNC_MODE}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}-tp${TP}-eos-fix}"
 WANDB_NAME="${EXP_SUFFIX}"
 CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${EXP_SUFFIX}"
 mkdir -p "${CHECKPOINT_DIR}"
@@ -97,6 +98,7 @@ NRL_WG_USE_RAY_REF=1 \
   UV_LOCK_TIMEOUT=900 \
   TORCH_CUDA_ARCH_LIST='9.0 10.0' \
   NEMO_GYM_SKIP_VENV_IF_PRESENT=1 \
+  NEMO_GYM_VENV_DIR="${REPO_ROOT}/gym_venvs" \
   OMPI_MCA_plm=^slurm \
   OMPI_MCA_btl=^openib \
   uv run --frozen --no-sync --extra mcore ./examples/nemo_gym/run_grpo_nemo_gym.py \
@@ -131,6 +133,7 @@ NRL_WG_USE_RAY_REF=1 \
   policy.megatron_cfg.pipeline_model_parallel_size=${PP} \
   policy.megatron_cfg.sequence_parallel=True \
   policy.megatron_cfg.bias_activation_fusion=False \
+  ++policy.megatron_cfg.use_fused_weighted_squared_relu=False \
   policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce=${OVERLAP_GRAD_REDUCE} \
   policy.megatron_cfg.moe_permute_fusion=${MOE_PERMUTE_FUSION} \
   policy.megatron_cfg.moe_enable_deepep=${MOE_ENABLE_DEEPEP} \
