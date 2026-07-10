@@ -98,6 +98,51 @@ def test_dtensor_v2_update_moe_gate_bias_noop_when_unsupported():
     DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
 
 
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_logit_transfer_reuses_default_process_group():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker._xtoken_received_logits = {}
+    received_tensor = MagicMock()
+    request = MagicMock()
+    stream = MagicMock()
+    receive = {
+        "transfer_key": "sample0",
+        "source_rank": 1,
+        "actual_shape": (2, 3),
+        "dtype": torch.float16,
+    }
+
+    with (
+        patch.object(torch.distributed, "get_rank", return_value=3),
+        patch.object(torch, "empty", return_value=received_tensor) as empty,
+        patch.object(torch.distributed, "P2POp", return_value="recv_op") as p2p_op,
+        patch.object(
+            torch.distributed,
+            "batch_isend_irecv",
+            return_value=[request],
+        ) as batch_isend_irecv,
+        patch.object(torch.cuda, "current_device", return_value=0),
+        patch.object(torch.cuda, "current_stream", return_value=stream),
+    ):
+        result = DTensorPolicyWorkerV2Impl.transfer_ipc_logits_nccl(
+            worker,
+            {3: {"sends": [], "receives": [receive]}},
+        )
+
+    empty.assert_called_once_with(
+        (2, 3),
+        dtype=torch.float16,
+        device=0,
+    )
+    p2p_op.assert_called_once_with(torch.distributed.irecv, received_tensor, 1)
+    batch_isend_irecv.assert_called_once_with(["recv_op"])
+    request.wait.assert_called_once_with()
+    stream.synchronize.assert_called_once_with()
+    assert worker._xtoken_received_logits == {"sample0": received_tensor}
+    assert result is None
+
+
 def create_test_config(
     model_name: str,
     tp: int = 1,

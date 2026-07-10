@@ -57,6 +57,7 @@ from nemo_rl.models.automodel.data import (
     filter_multimodal_kwargs_for_model,
 )
 from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.utils import XTokenTransportContext
 
 # Union type for any post-processing function
 PostProcessingFunction = Union[
@@ -566,6 +567,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        xtoken_transport: Optional[XTokenTransportContext] = None,
     ):
         """Initialize LossPostProcessor.
 
@@ -579,6 +581,7 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
+            xtoken_transport: NCCL receive buffers and the local collective rank
         """
         self.loss_fn: LossFunction = loss_fn
         self.cfg: PolicyConfig = cfg
@@ -589,6 +592,7 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
+        self.xtoken_transport = xtoken_transport
 
     def __call__(
         self,
@@ -623,7 +627,9 @@ class LossPostProcessor:
 
         # Wrap prepare_loss_input with sampling_params
         prepare_loss_input_wrapped = partial(
-            prepare_loss_input, sampling_params=self.sampling_params
+            prepare_loss_input,
+            sampling_params=self.sampling_params,
+            xtoken_transport=self.xtoken_transport,
         )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
