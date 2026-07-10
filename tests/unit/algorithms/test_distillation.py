@@ -81,6 +81,7 @@ def mock_components():
             "loss_multiplier": torch.tensor(
                 [1.0]
             ),  # Make it 1D tensor for batch dimension
+            "total_reward": torch.tensor([1.0]),
             "task_name": ["math"],
             "extra_env_info": [{}],
             "length": torch.tensor([6]),  # Make it 1D tensor for batch dimension
@@ -207,22 +208,35 @@ def test_distillation_train_max_steps(mock_components):
 
     distillation_save_state = _default_distillation_save_state()
 
+    def _mock_rollout(policy_generation, input_batch, **kwargs):
+        return input_batch, {"mean_gen_tokens_per_sample": 5.0}
+
     # Run training
-    distillation_train(
-        mock_components["student_policy"],
-        mock_components["teacher_policy"],
-        mock_components["student_generation"],
-        mock_components["train_dataloader"],
-        mock_components["val_dataloader"],
-        mock_components["tokenizer"],
-        mock_components["loss_fn"],
-        mock_components["task_to_env"],
-        mock_components["val_task_to_env"],
-        mock_components["logger"],
-        mock_components["checkpointer"],
-        distillation_save_state,
-        mock_components["master_config"],
-    )
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            distillation_save_state,
+            mock_components["master_config"],
+        )
 
     assert mock_components["student_policy"].train.call_count == 5
 
@@ -290,7 +304,20 @@ def test_exit_on_timeout(mock_components, capsys):
     distillation_save_state = _default_distillation_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class:
+    def _mock_rollout(policy_generation, input_batch, **kwargs):
+        return input_batch, {"mean_gen_tokens_per_sample": 5.0}
+
+    with (
+        patch("nemo_rl.algorithms.distillation.TimeoutChecker") as mock_timeout_class,
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]
@@ -364,21 +391,34 @@ def test_non_colocated_offloads_student_optimizer_before_teacher_inference(
         mock_components["teacher_policy"].prepare_for_lp_inference, "teacher_prep"
     )
 
-    distillation_train(
-        mock_components["student_policy"],
-        mock_components["teacher_policy"],
-        mock_components["student_generation"],
-        mock_components["train_dataloader"],
-        mock_components["val_dataloader"],
-        mock_components["tokenizer"],
-        mock_components["loss_fn"],
-        mock_components["task_to_env"],
-        mock_components["val_task_to_env"],
-        mock_components["logger"],
-        mock_components["checkpointer"],
-        _default_distillation_save_state(),
-        mock_components["master_config"],
-    )
+    def _mock_rollout(policy_generation, input_batch, **kwargs):
+        return input_batch, {"mean_gen_tokens_per_sample": 5.0}
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
 
     # student_generation is None so refit never runs; every offload_before_refit
     # call comes from the teacher-inference prep path, once per step, and must
@@ -399,21 +439,34 @@ def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
     mock_components["master_config"].distillation["max_num_steps"] = 2
     mock_components["master_config"].policy["generation"]["colocated"]["enabled"] = True
 
-    distillation_train(
-        mock_components["student_policy"],
-        mock_components["teacher_policy"],
-        mock_components["student_generation"],
-        mock_components["train_dataloader"],
-        mock_components["val_dataloader"],
-        mock_components["tokenizer"],
-        mock_components["loss_fn"],
-        mock_components["task_to_env"],
-        mock_components["val_task_to_env"],
-        mock_components["logger"],
-        mock_components["checkpointer"],
-        _default_distillation_save_state(),
-        mock_components["master_config"],
-    )
+    def _mock_rollout(policy_generation, input_batch, **kwargs):
+        return input_batch, {"mean_gen_tokens_per_sample": 5.0}
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            mock_components["master_config"],
+        )
 
     assert mock_components["teacher_policy"].prepare_for_lp_inference.call_count == 2
     mock_components["student_policy"].offload_before_refit.assert_not_called()
@@ -421,15 +474,28 @@ def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
 
 def test_validate_function(mock_components):
     """Test independent validation function to ensure validation logic correctness."""
-    # Run validation
-    val_metrics, validation_timings = validate(
-        mock_components["student_generation"],
-        mock_components["val_dataloader"],
-        mock_components["tokenizer"],
-        mock_components["val_task_to_env"],
-        step=0,
-        master_config=mock_components["master_config"],
-    )
+
+    def _mock_rollout(policy_generation, input_batch, **kwargs):
+        return input_batch, {"mean_gen_tokens_per_sample": 5.0}
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout",
+            side_effect=_mock_rollout,
+        ),
+    ):
+        val_metrics, validation_timings = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=mock_components["master_config"],
+        )
 
     # Verify validation results
     assert isinstance(val_metrics, dict)
