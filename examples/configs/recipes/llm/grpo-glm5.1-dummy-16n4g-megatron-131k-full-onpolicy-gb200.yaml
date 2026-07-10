@@ -1,0 +1,36 @@
+defaults: ./grpo-glm5.1-dummy-4n4g-megatron-8K-full-onpolicy-gb200.yaml
+
+grpo:
+  val_period: 100
+  reward_shaping:
+    max_response_length: 2048
+
+data:
+  max_input_seq_length: 129024
+
+checkpointing:
+  checkpoint_dir: results/grpo-glm51-dummy-131k-16n4g
+
+policy:
+  max_total_sequence_length: 131072
+  megatron_cfg:
+    context_parallel_size: 16
+    moe_permute_fusion: true
+  generation:
+    max_new_tokens: 2048
+    vllm_cfg:
+      max_model_len: ${policy.max_total_sequence_length}
+      env_vars:
+        RAY_CGRAPH_get_timeout: 1800
+    vllm_kwargs:
+      max_num_batched_tokens: 8192
+      max_num_seqs: null
+
+logger:
+  log_dir: logs/grpo-glm51-dummy-131k-16n4g
+  wandb:
+    name: grpo-glm51-dummy-131k-16n4g
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 16

@@ -1,10 +1,24 @@
-defaults: ./grpo-glm5.1-64n4g-megatron-8K-full-onpolicy-gb200.yaml
+defaults: ./grpo-glm5.1-64n4g-megatron-131k-full-onpolicy-gb200.yaml
+
+grpo:
+  val_period: -1
+
+data:
+  shuffle: false
+  train:
+    dataset_name: ResponseDataset
+    data_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/slikhite/NeMo-RL/logs/dummy_model_long_context_data/grpo_nemotron_math_30k_160_20steps.jsonl
+    input_key: input
+    output_key: output
+    split_validation_size: 0
 
 checkpointing:
   checkpoint_dir: results/grpo-glm51-full-64n4g-cudnn-gen512-mbt4k-nomaxseq-vllmtp4ep64-mgtp1pp8cp32ep32-trainmb131k-recompute
   save_period: 12
 
 policy:
+  sequence_packing:
+    train_mb_tokens: 131072
   megatron_cfg:
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 8
@@ -13,8 +27,6 @@ policy:
     context_parallel_size: 32
     expert_model_parallel_size: 32
     activation_checkpointing: true
-    recompute_granularity: full
-    moe_permute_fusion: false
     dsa_kernel_backend: cudnn
   generation:
     vllm_cfg:
@@ -22,6 +34,7 @@ policy:
       expert_parallel_size: 64
     vllm_kwargs:
       max_num_batched_tokens: 4096
+      max_num_seqs: null
 
 logger:
   log_dir: logs/grpo-glm51-full-64n4g-cudnn-gen512-mbt4k-nomaxseq-vllmtp4ep64-mgtp1pp8cp32ep32-trainmb131k-recompute
