@@ -126,6 +126,73 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_dtype_fp32_for_plain_adamw(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Optimizers without an internal master (e.g. AdamW) load weights in fp32."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        assert call_kwargs["torch_dtype"] == torch.float32
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_dtype_compute_when_optimizer_holds_master(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """TE FusedAdam with master_weights holds its own fp32 master, so weights
+        load in the compute dtype to avoid ~2x memory (issue #2865)."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["optimizer"] = {
+            "name": "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam",
+            "kwargs": {"lr": 1e-4, "master_weights": True},
+        }
+
+        validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        # mock_config precision is "bfloat16"
+        assert call_kwargs["torch_dtype"] == torch.bfloat16
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_dtype_fp32_when_optimizer_absent(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """A missing optimizer config falls back to the fp32 load (no master)."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config.pop("optimizer", None)
+
+        validate_and_prepare_config(config=mock_config, processor=None, rank=0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        assert call_kwargs["torch_dtype"] == torch.float32
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
     def test_precision_validation_invalid(
         self,
         mock_dynamo,
