@@ -116,6 +116,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
         post_unpack_func([("model.weight", "weight-value")])
 
     ext._load_weights = load_weights
+    ext._reset_moe_weights_for_refit = lambda model: None
     ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
     monkeypatch.setattr(
         vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
