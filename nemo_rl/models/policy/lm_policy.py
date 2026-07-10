@@ -47,6 +47,10 @@ from nemo_rl.models.policy.interfaces import (
     TopkLogitsOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
+    XTokenSampleHandles,
+    XTokenTransferPlan,
+    XTokenWorkerHandles,
+    XTokenWorkerRoute,
     aggregate_per_sample_handles,
     resolve_policy_worker_cls,
 )
@@ -668,7 +672,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         data: BatchedDataDict[GenerationDatumSpec],
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[XTokenSampleHandles]:
         """Ship the teacher's full-vocab logits to the student via CUDA IPC.
 
         Used by cross-tokenizer distillation; supports heterogeneous teacher
@@ -713,8 +717,35 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 output_is_replicated=["pipeline_parallel"],
                 common_kwargs={"micro_batch_size": micro_batch_size},
             )
-        worker_results = self.worker_group.get_all_worker_results(futures)
+        worker_results: list[XTokenWorkerHandles] = (
+            self.worker_group.get_all_worker_results(futures)
+        )
         return aggregate_per_sample_handles(worker_results)
+
+    def get_xtoken_worker_routes(self) -> list[XTokenWorkerRoute]:
+        """Return worker host/parallel coordinates for hybrid routing."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_xtoken_worker_route"
+        )
+        return ray.get(futures)
+
+    def transfer_ipc_logits_nccl(
+        self,
+        plan_by_world_rank: dict[int, XTokenTransferPlan],
+    ) -> None:
+        """Run the student-relay NCCL exchange on every student worker."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "transfer_ipc_logits_nccl",
+            plan_by_world_rank=plan_by_world_rank,
+        )
+        ray.get(futures)
+
+    def clear_xtoken_received_logits(self) -> None:
+        """Release student-relay receive buffers after a train/eval call."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_xtoken_received_logits"
+        )
+        ray.get(futures)
 
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""

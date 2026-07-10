@@ -16,7 +16,16 @@ import gc
 import os
 import traceback
 from enum import Enum
-from typing import Any, Dict, Iterable, Optional
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    Literal,
+    Mapping,
+    NotRequired,
+    Optional,
+    TypedDict,
+)
 
 import requests
 import torch
@@ -267,6 +276,88 @@ def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
     return reduce_tensor(tensor.detach())[1:]
 
 
+class XTokenLogitShard(TypedDict):
+    """Descriptor for one teacher TP/CP logit shard.
+
+    The CUDA IPC handle is the node-local payload. Cross-node routing annotates
+    the descriptor with ``transport`` and per-destination ``nccl_keys`` while
+    the actual NCCL tensors stay resident on the receiving policy worker.
+    """
+
+    payload_ipc: tuple[Any, ...]
+    buf_idx: int
+    sample_index_in_buf: int
+    storage_shape: tuple[int, ...]
+    actual_shape: tuple[int, int]
+    dtype: torch.dtype
+    tp_rank: int
+    cp_rank: int
+    tp_size: int
+    cp_size: int
+    world_rank: int
+    hostname: str
+    device_uuid: str
+    vocab_start_index: int
+    vocab_end_index: int
+    global_seq_start: int
+    full_vocab_size: int
+    full_seq_len: int
+    vocab_sharded: bool
+    sequence_sharded: bool
+    transport: NotRequired[Literal["ipc", "nccl", "hybrid"]]
+    nccl_keys: NotRequired[dict[int, str]]
+
+
+class XTokenSampleHandles(TypedDict):
+    """All teacher shards needed to rebuild one global-batch sample."""
+
+    teacher_shards: list[XTokenLogitShard]
+
+
+class XTokenWorkerHandles(TypedDict):
+    """Per-worker IPC descriptors before DP-order aggregation."""
+
+    per_sample_handles: list[XTokenLogitShard]
+    dp_rank: int
+
+
+class XTokenWorkerRoute(TypedDict):
+    """Physical placement and parallel coordinates for one student worker."""
+
+    world_rank: int
+    hostname: str
+    device_uuid: str
+    dp_rank: int
+    tp_rank: int
+    cp_rank: int
+    cp_size: int
+
+
+class XTokenSend(XTokenLogitShard):
+    """One NCCL send sourced from a node-local teacher IPC shard."""
+
+    destination_rank: int
+
+
+class XTokenReceive(TypedDict):
+    """Allocation metadata for one NCCL receive."""
+
+    transfer_key: str
+    source_rank: int
+    actual_shape: tuple[int, int]
+    dtype: torch.dtype
+
+
+class XTokenTransferPlan(TypedDict):
+    """Grouped P2P operations executed by one student worker."""
+
+    sends: list[XTokenSend]
+    receives: list[XTokenReceive]
+
+
+XTokenTransportContext = tuple[Mapping[str, torch.Tensor], int]
+
+
 def ensure_teacher_ipc_buffer(
     storage: Optional[torch.Tensor],
     handle: Optional[tuple[Any, ...]],
@@ -305,8 +396,8 @@ def ensure_teacher_ipc_buffer(
 
 
 def aggregate_per_sample_handles(
-    worker_results: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    worker_results: list[XTokenWorkerHandles],
+) -> list[XTokenSampleHandles]:
     """Flatten teacher per-sample IPC handles into a global-batch-ordered list.
 
     Each worker returns ``{"dp_rank": int, "per_sample_handles": list}`` where
@@ -318,13 +409,13 @@ def aggregate_per_sample_handles(
     teacher's DP degree. Element ``i`` is ``{"teacher_shards": [shard, ...]}``
     holding all TP×CP shards of global sample ``i``.
     """
-    handles_by_dp_rank: dict[int, list[list[dict[str, Any]]]] = {}
+    handles_by_dp_rank: dict[int, list[list[XTokenLogitShard]]] = {}
     for worker_result in worker_results:
         dp_rank = worker_result["dp_rank"]
         handles_by_dp_rank.setdefault(dp_rank, []).append(
             worker_result["per_sample_handles"]
         )
-    aggregated: list[dict[str, Any]] = []
+    aggregated: list[XTokenSampleHandles] = []
     for dp_rank in sorted(handles_by_dp_rank.keys()):
         worker_handles_in_dp = handles_by_dp_rank[dp_rank]
         num_samples = len(worker_handles_in_dp[0])
