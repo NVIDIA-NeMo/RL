@@ -1,0 +1,53 @@
+defaults: grpo_super3_9nodes.yaml
+
+# On-policy distillation from the same 120B Super checkpoint acting as the
+# teacher. Uses non-colocated teachers on an additional 2 nodes (16 GPUs)
+# so training keeps its full 4-node compute footprint.
+#
+# Layout (7 nodes total):
+#   - 4 nodes: student training (megatron: tp=4, pp=1, cp=8, ep=16)
+#   - 1 node : student generation (vllm: tp=8)
+#   - 2 nodes: teacher forward pass (megatron: tp=4, pp=1, cp=1, ep=16)
+
+grpo:
+  adv_estimator:
+    name: opd
+
+policy:
+  model_name: "/data/flextron-nano-models/12b-hf"
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 4
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 4
+
+on_policy_distillation:
+  enabled: true
+  # Self-distillation: teacher checkpoint is the same as the student's.
+  teacher_model_by_agent_name:
+    default_teacher: "/data/models/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+  default_teacher_alias: default_teacher
+  strict_agent_name_match: false
+  deduplicate_shared_teacher_checkpoints: true
+  non_colocated_teachers:
+    enabled: true
+    default_teacher_cfg:
+      # Teacher runs Megatron inference-only. cp is dropped (short seqs, no
+      # optimizer/backward pressure) to fit the teacher on 2 nodes while
+      # keeping ep=16 to match the student's MoE sharding.
+      pipeline_model_parallel_size: 1
+      tensor_model_parallel_size: 8
+      context_parallel_size: 2
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 2
+      num_nodes: 2
+      gpus_per_node: 8
+      precision: bf16
+      micro_batch_size: 1
+
+cluster:
+  num_nodes: 7
