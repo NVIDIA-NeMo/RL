@@ -271,9 +271,7 @@ def _lm_head_weight_for_fused_linear_logprobs(
             "does not expose a weight tensor."
         )
     if isinstance(output_weight, DTensor):
-        local_vocab_is_tp_partition = _dtensor_weight_is_tp_vocab_sharded(
-            output_weight
-        )
+        local_vocab_is_tp_partition = _dtensor_weight_is_tp_vocab_sharded(output_weight)
         output_weight = (
             output_weight.to_local()
             if local_vocab_is_tp_partition
@@ -348,9 +346,7 @@ def _compute_fused_linear_logprobs(
 
     tp_rank = _tp_rank_for_fused_linear_logprobs(tp_group)
     local_vocab_size = int(output_weight.shape[0])
-    vocab_start_index = (
-        tp_rank * local_vocab_size if local_vocab_is_tp_partition else 0
-    )
+    vocab_start_index = tp_rank * local_vocab_size if local_vocab_is_tp_partition else 0
     tensor_parallel_hidden_states = hidden_states.transpose(0, 1).contiguous()
     return from_parallel_hidden_states_to_logprobs(
         tensor_parallel_hidden_states=tensor_parallel_hidden_states,

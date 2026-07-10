@@ -25,7 +25,6 @@ except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
 import nemo_rl.models.automodel.train as automodel_train
-
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -674,9 +673,7 @@ class TestLogprobsPostProcessor:
         assert result.shape == (batch_size, seq_len)
         assert result.dtype == torch.float32
         torch.testing.assert_close(result[:, 0], torch.zeros(batch_size))
-        torch.testing.assert_close(
-            result[:, 1:], selected_logprobs.to(torch.float32)
-        )
+        torch.testing.assert_close(result[:, 1:], selected_logprobs.to(torch.float32))
 
     def test_precomputed_selected_logprobs_rejects_context_parallel(
         self, base_cfg, mock_device_mesh, mock_cp_mesh, mock_tp_mesh
