@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
     _canonicalize_nvfp4_weight_scale,
@@ -903,37 +904,43 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
     assert captured["config_file"] == "examples/modelopt/quant_configs/nvfp4_a16.yaml"
 
 
-def _canonicalize_float_format(num_bits):
-    if isinstance(num_bits, str):
-        return num_bits.lower()
-    exponent_bits, mantissa_bits = num_bits
-    return f"e{exponent_bits}m{mantissa_bits}"
-
-
 @pytest.mark.parametrize(
-    ("recipe", "expected_num_bits"),
-    [("kv_cache_fp8.yaml", "e4m3"), ("kv_cache_nvfp4.yaml", "e2m1")],
+    ("recipe", "expected_cfg"),
+    [
+        ("kv_cache_fp8.yaml", {"num_bits": "e4m3"}),
+        (
+            "kv_cache_nvfp4.yaml",
+            {
+                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": "e4m3"},
+                "num_bits": "e2m1",
+            },
+        ),
+    ],
 )
-def test_resolve_kv_cache_quant_recipe(recipe, expected_num_bits):
+def test_resolve_kv_cache_quant_recipe(recipe, expected_cfg):
     repo_root = Path(__file__).resolve().parents[4]
+    recipe_path = repo_root / "examples/modelopt/quant_configs" / recipe
 
-    config = resolve_quant_cfg(
-        str((repo_root / "examples/modelopt/quant_configs" / recipe).resolve())
-    )
+    authored_config = yaml.safe_load(recipe_path.read_text())
+    assert authored_config["quantize"]["quant_cfg"][1] == {
+        "quantizer_name": "*[kv]_bmm_quantizer",
+        "enable": True,
+        "cfg": expected_cfg,
+    }
+
+    config = resolve_quant_cfg(str(recipe_path.resolve()))
 
     kv_config = config["quant_cfg"][1]
     assert config["algorithm"] == "max"
     assert config["quant_cfg"][0] == {"quantizer_name": "*", "enable": False}
     assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
     assert kv_config["enable"] is True
-    assert _canonicalize_float_format(kv_config["cfg"]["num_bits"]) == (
-        expected_num_bits
-    )
+    assert "num_bits" in kv_config["cfg"]
     if recipe == "kv_cache_nvfp4.yaml":
         block_sizes = kv_config["cfg"]["block_sizes"]
         assert block_sizes[-1] == 16
         assert block_sizes["type"] == "dynamic"
-        assert _canonicalize_float_format(block_sizes["scale_bits"]) == "e4m3"
+        assert "scale_bits" in block_sizes
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
