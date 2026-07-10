@@ -1,0 +1,263 @@
+# GCP GB200 infrastructure for:
+#   Megatron EP8 (2 nodes x 4 GPUs) -> vLLM TP2 (1 node x 2 GPUs)
+#
+# Required:
+# - shared-model-cache PVC
+# - ${user:}-secrets (optional HF token)
+# - Modelexpress service in ${user:}
+# - four GKE RDMA networks named rdma-0..rdma-3
+
+defaults: grpo_math_1b_dynamo_mx.gb300.infra.yaml
+
+namespace: ${user:}
+image: jwillthomson/nemo-rl-mx:06-12
+imagePullSecrets: [nvcr-imagepullsecret]
+serviceAccount: default
+
+_shared:
+  headNodeSelector: &head_node_selector
+    cloud.google.com/gke-nodepool: customer-gpu-o7v
+    kubernetes.io/arch: arm64
+    nodeGroup: customer-gpu
+    nvidia.com/gpu.present: "true"
+  workerNodeSelector: &worker_node_selector
+    cloud.google.com/gke-nodepool: customer-gpu-o7v
+    kubernetes.io/arch: arm64
+    nvidia.com/gpu.present: "true"
+    nvidia.com/gpu.product: NVIDIA-GB200
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME, value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG, value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME, value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG, value: INFO}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    - {name: UCX_TLS, value: "^tcp"}
+    - {name: NIXL_UCX_TLS, value: "^tcp"}
+    - {name: UCX_NET_DEVICES, value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0"}
+    - {name: UCX_IB_GID_INDEX, value: "3"}
+    - {name: UCX_CUDA_COPY_DMABUF, value: "yes"}
+    - {name: UCX_CUDA_COPY_REG_WHOLE_ALLOC, value: "off"}
+    - {name: MX_RDMA_NIC_PIN, value: "off"}
+    # Avoid loading an HPC-X UCX NCCL plugin beside NIXL's bundled UCX.
+    # NCCL's built-in IB transport remains enabled for the two-node trainer.
+    - {name: NCCL_NET_PLUGIN, value: "none"}
+    - {name: NCCL_IB_HCA, value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3"}
+  headResources: &head_resources
+    limits: {cpu: "8", memory: "32Gi"}
+    requests: {cpu: "4", memory: "16Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "48"
+      memory: "460Gi"
+      nvidia.com/gpu: "4"
+      networking.gke.io.networks/rdma-0: "1"
+      networking.gke.io.networks/rdma-0.IP: "1"
+      networking.gke.io.networks/rdma-1: "1"
+      networking.gke.io.networks/rdma-1.IP: "1"
+      networking.gke.io.networks/rdma-2: "1"
+      networking.gke.io.networks/rdma-2.IP: "1"
+      networking.gke.io.networks/rdma-3: "1"
+      networking.gke.io.networks/rdma-3.IP: "1"
+    requests:
+      cpu: "32"
+      memory: "320Gi"
+      nvidia.com/gpu: "4"
+      networking.gke.io.networks/rdma-0: "1"
+      networking.gke.io.networks/rdma-0.IP: "1"
+      networking.gke.io.networks/rdma-1: "1"
+      networking.gke.io.networks/rdma-1.IP: "1"
+      networking.gke.io.networks/rdma-2: "1"
+      networking.gke.io.networks/rdma-2.IP: "1"
+      networking.gke.io.networks/rdma-3: "1"
+      networking.gke.io.networks/rdma-3.IP: "1"
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379, name: gcs-server}
+    - {containerPort: 8265, name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm, name: dshm}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+    - {mountPath: /dev/infiniband, name: infiniband}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: shared-model-cache}
+    - name: infiniband
+      hostPath: {path: /dev/infiniband}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: shared-model-cache}
+    - name: infiniband
+      hostPath: {path: /dev/infiniband}
+
+launch:
+  attach:
+    training: ${user:}-rc-moe-q3-30b-ep8
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    export UCX_TLS='^tcp'
+    export NIXL_UCX_TLS='^tcp'
+    python -u examples/run_grpo.py \
+      --config infra/nrl_k8s/examples/k8s_exemplars/V1/grpo_moe_qwen3_30b_ep8_tp2_dynamo_mx.yaml \
+      +policy.generation.dynamo_cfg.dgd_name=${user:}-dyn-moe-q3-30b-ep8-tp2
+
+kuberay:
+  training:
+    name: ${user:}-rc-moe-q3-30b-ep8
+    labels:
+      kai.scheduler/queue: default
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "100000000"
+        template:
+          spec:
+            schedulerName: default-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            tolerations:
+              - operator: Exists
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 2
+          minReplicas: 2
+          maxReplicas: 2
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "100000000"
+          template:
+            metadata:
+              annotations:
+                networking.gke.io/default-interface: eth0
+                networking.gke.io/interfaces: >-
+                  [{"interfaceName":"eth0","network":"default"},
+                   {"interfaceName":"rdma0","network":"rdma-0"},
+                   {"interfaceName":"rdma1","network":"rdma-1"},
+                   {"interfaceName":"rdma2","network":"rdma-2"},
+                   {"interfaceName":"rdma3","network":"rdma-3"}]
+            spec:
+              schedulerName: default-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+dynamo:
+  serving:
+    manifest: ../../../examples_dgd/k8s_exemplars/V1/qwen2_5_1_5b_gb300_mx.yaml
+    name: ${user:}-dyn-moe-q3-30b-ep8-tp2
+    readyTimeoutS: 1800
+    overrides:
+      services:
+        Frontend:
+          extraPodSpec:
+            nodeSelector: *head_node_selector
+        VllmDecodeWorker:
+          envFromSecret: ${user:}-secrets
+          image: nvcr.io/nvidian/dynamo-dev/model-express-dev:native-ep8tp2-0f53b7e-3300035
+          resources:
+            requests:
+              gpu: "2"
+            limits:
+              gpu: "2"
+          extraPodSpec:
+            metadata:
+              annotations:
+                networking.gke.io/default-interface: eth0
+                networking.gke.io/interfaces: >-
+                  [{"interfaceName":"eth0","network":"default"},
+                   {"interfaceName":"rdma0","network":"rdma-0"},
+                   {"interfaceName":"rdma1","network":"rdma-1"},
+                   {"interfaceName":"rdma2","network":"rdma-2"},
+                   {"interfaceName":"rdma3","network":"rdma-3"}]
+            nodeSelector: *worker_node_selector
+            securityContext:
+              runAsUser: 0
+            mainContainer:
+              args:
+                - --model
+                - Qwen/Qwen3-30B-A3B
+                - --served-model-name
+                - Qwen/Qwen3-30B-A3B
+                - --load-format
+                - mx-target
+                - --model-express-url
+                - modelexpress-server.${user:}.svc.cluster.local:8001
+                - --tensor-parallel-size
+                - "2"
+                - --dtype
+                - bfloat16
+                - --gpu-memory-utilization
+                - "0.6"
+                - --max-model-len
+                - "1024"
+                - --enforce-eager
+                - --moe-backend
+                - triton
+              env:
+                - {name: DYN_MX_REFIT_ENABLED, value: "1"}
+                - {name: DYN_MX_NATIVE_WEIGHT_TRANSFER, value: "1"}
+                - {name: MODEL_EXPRESS_URL, value: "modelexpress-server.${user:}.svc.cluster.local:8001"}
+                - {name: UCX_TLS, value: "^tcp"}
+                - {name: NIXL_UCX_TLS, value: "^tcp"}
+                - {name: UCX_NET_DEVICES, value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0"}
+                - {name: UCX_IB_GID_INDEX, value: "3"}
+                - {name: UCX_CUDA_COPY_DMABUF, value: "yes"}
+                - {name: UCX_CUDA_COPY_REG_WHOLE_ALLOC, value: "off"}
+                - {name: UCX_MAX_RMA_RAILS, value: "4"}
+                - {name: MX_RDMA_NIC_PIN, value: "off"}
+                - {name: MX_POOL_REG, value: "1"}
+                - {name: MX_LOAD_MODE, value: "stock"}
+                - {name: NCCL_NET_PLUGIN, value: "none"}
+              resources:
+                claims: []
+                requests:
+                  networking.gke.io.networks/rdma-0: "1"
+                  networking.gke.io.networks/rdma-0.IP: "1"
+                  networking.gke.io.networks/rdma-1: "1"
+                  networking.gke.io.networks/rdma-1.IP: "1"
+                  networking.gke.io.networks/rdma-2: "1"
+                  networking.gke.io.networks/rdma-2.IP: "1"
+                  networking.gke.io.networks/rdma-3: "1"
+                  networking.gke.io.networks/rdma-3.IP: "1"
+                limits:
+                  networking.gke.io.networks/rdma-0: "1"
+                  networking.gke.io.networks/rdma-0.IP: "1"
+                  networking.gke.io.networks/rdma-1: "1"
+                  networking.gke.io.networks/rdma-1.IP: "1"
+                  networking.gke.io.networks/rdma-2: "1"
+                  networking.gke.io.networks/rdma-2.IP: "1"
+                  networking.gke.io.networks/rdma-3: "1"
+                  networking.gke.io.networks/rdma-3.IP: "1"
