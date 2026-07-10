@@ -921,40 +921,32 @@ def _create_checkpoint_config(
         optimizer_path: Path to the optimizer state (None if not resuming optimizer).
         load_main_params_from_ckpt: Load optimizer main params from the checkpoint.
         ckpt_cfg: MegatronCheckpointConfig dict from YAML (``megatron_cfg.checkpoint``).
-            ``async_save`` is required (the exemplar configs own its value — no
-            call-site default); nemo-rl branches on it for the save-path logic and
-            forwards it to Megatron Bridge. ``ckpt_assume_constant_structure`` and
-            the parallel-IO fields are optional and forwarded only when explicitly
-            set in YAML; when absent, Megatron Bridge's own ``CheckpointConfig``
-            default applies.
+            Every knob (``async_save``, ``ckpt_assume_constant_structure``, and the
+            parallel-IO fields) is forwarded only when explicitly set in YAML — no
+            call-site default. When a field (or the whole block) is absent, Megatron
+            Bridge's own ``CheckpointConfig`` default applies, so ``async_save``
+            falls back to synchronous save for configs that don't set it.
     """
     cfg = ckpt_cfg or {}
-    # async_save is required: the exemplar configs own its value, so there is no
-    # call-site default. nemo-rl branches on it (save-path logic) and forwards it.
-    async_save = cfg["async_save"]
-
-    # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
-    # On a fresh run (no prior checkpoint), weights_path is None, so fall back to
-    # pretrained_path as a placeholder — save_checkpoint() overwrites it with the
-    # real path before each write.
-    save_path = weights_path
-    if async_save and save_path is None:
-        save_path = pretrained_path
 
     kwargs: dict[str, Any] = dict(
         save_interval=100,
-        save=save_path,
+        save=weights_path,
         load=weights_path,
         load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
-        async_save=async_save,
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
-    # Only forward Bridge-only knobs when explicitly set in YAML.
+    # Forward checkpoint knobs only when explicitly set in YAML; otherwise Megatron
+    # Bridge's own CheckpointConfig defaults apply (the exemplar configs own the
+    # values). async_save is presence-checked exactly like the sibling Bridge knobs
+    # — no call-site default — so a config that omits the block keeps Bridge's
+    # default (synchronous save).
     _optional_ckpt_fields = (
+        "async_save",
         "ckpt_assume_constant_structure",
         "ckpt_fully_parallel_save_process_group",
         "ckpt_fully_parallel_load_process_group",
@@ -963,6 +955,14 @@ def _create_checkpoint_config(
     for field in _optional_ckpt_fields:
         if field in cfg:
             kwargs[field] = cfg[field]
+
+    # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
+    # On a fresh run (no prior checkpoint), weights_path is None, so fall back to
+    # pretrained_path as a placeholder — save_checkpoint() overwrites it with the
+    # real path before each write.
+    if kwargs.get("async_save") and kwargs["save"] is None:
+        kwargs["save"] = pretrained_path
+
     return CheckpointConfig(**kwargs)
 
 
