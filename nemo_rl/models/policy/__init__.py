@@ -286,6 +286,21 @@ class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
+class MegatronCheckpointConfig(TypedDict, total=False):
+    """Checkpoint knobs passed through to Megatron Bridge CheckpointConfig."""
+
+    # Offload disk writes to a persistent background worker so save_checkpoint
+    # returns after D2H staging.
+    async_save: bool
+    # Skip metadata recomputation after the first two saves when the sharded
+    # state structure is constant across steps.
+    ckpt_assume_constant_structure: bool
+    # Field names match megatron.bridge CheckpointConfig (ckpt_ prefix).
+    ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
+    ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
+    ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+
+
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -374,6 +389,8 @@ class MegatronConfig(TypedDict):
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+    # Megatron-specific checkpointing knobs (async save, parallel I/O, etc.)
+    checkpoint: NotRequired[MegatronCheckpointConfig]
     gradient_accumulation_fusion: NotRequired[bool]
     # Enable fused weighted squared ReLU when the architecture supports it.
     use_fused_weighted_squared_relu: NotRequired[bool]

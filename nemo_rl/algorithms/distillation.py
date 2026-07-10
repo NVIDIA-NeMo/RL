@@ -1026,7 +1026,10 @@ def distillation_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=student_policy.finalize_async_save,
+                        )
 
             # Logging
             # Log training data

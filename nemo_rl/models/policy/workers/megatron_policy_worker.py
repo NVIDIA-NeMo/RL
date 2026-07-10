@@ -2145,6 +2145,13 @@ class MegatronPolicyWorkerImpl(
     ):
         """Save a training checkpoint.
 
+        With async_save=True, this method returns after D2H staging. The actual
+        disk write continues in a background persistent worker process. Callers
+        must call finalize_async_save() before renaming the directory or starting
+        another save.
+
+        With async_save=False (default), this blocks until the write is complete.
+
         Args:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
@@ -2217,6 +2224,18 @@ class MegatronPolicyWorkerImpl(
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def finalize_async_save(self):
+        """Block until the in-flight async write completes and run finalize_fns.
+
+        Safe to call when async_save is disabled (no-op).
+        Does NOT terminate the persistent worker — it stays alive for the next save.
+        """
+        maybe_finalize_async_save(
+            self.mcore_state,
+            ckpt_cfg=self.mcore_state.cfg.checkpoint,
+            blocking=True,
+        )
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.

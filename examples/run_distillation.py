@@ -100,21 +100,24 @@ def main() -> None:
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    distillation_train(
-        student_policy,
-        teacher_policy,
-        student_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,  # pass tokenizer parameter
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        distillation_state,
-        master_config,
-    )
+    # The checkpointer owns background async-checkpoint finalization threads;
+    # the context manager guarantees they are flushed (rename + delete) on exit.
+    with checkpointer:
+        distillation_train(
+            student_policy,
+            teacher_policy,
+            student_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,  # pass tokenizer parameter
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            distillation_state,
+            master_config,
+        )
 
 
 if __name__ == "__main__":
