@@ -1,0 +1,133 @@
+# Sanitized snapshot of the live NeMo-RL / ModelExpress transport experiment.
+# This is a diagnostic reference for reproducing UCX lane selection; it contains
+# no cluster namespace, image, secret, PVC, user path, or private endpoint.
+
+schema_version: 1
+
+experiment:
+  model: Qwen/Qwen3-30B-A3B
+  hardware: NVIDIA GB200
+  placement: cross-node
+  workflow: NeMo-RL GRPO
+  weight_sync: ModelExpress / NIXL remote READ
+  source_pull_order: sequential
+
+topology:
+  trainer:
+    nodes: 1
+    node_gpu_capacity: 4
+    allocated_gpus: 4
+    parallelism:
+      tensor_parallel: 1
+      pipeline_parallel: 1
+      context_parallel: 1
+      expert_parallel: 4
+    ranks: 4
+    published_bytes_per_rank: 17.58GB
+  rollout:
+    nodes: 1
+    node_gpu_capacity: 4
+    allocated_gpus: 1
+    parallelism:
+      tensor_parallel: 1
+      expert_parallel: 1
+    total_bytes_pulled: 70.32GB
+
+rdma:
+  transport: RoCE
+  interfaces:
+    - {name: rdma0, network: rdma-0, device: mlx5_0, address_family: 10.0.32.x}
+    - {name: rdma1, network: rdma-1, device: mlx5_1, address_family: 10.0.48.x}
+    - {name: rdma2, network: rdma-2, device: mlx5_2, address_family: 10.0.64.x}
+    - {name: rdma3, network: rdma-3, device: mlx5_3, address_family: 10.0.80.x}
+  pod_annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: >-
+      [{"interfaceName":"eth0","network":"default"},
+       {"interfaceName":"rdma0","network":"rdma-0"},
+       {"interfaceName":"rdma1","network":"rdma-1"},
+       {"interfaceName":"rdma2","network":"rdma-2"},
+       {"interfaceName":"rdma3","network":"rdma-3"}]
+  pod_resource_requests:
+    networking.gke.io.networks/rdma-0: "1"
+    networking.gke.io.networks/rdma-0.IP: "1"
+    networking.gke.io.networks/rdma-1: "1"
+    networking.gke.io.networks/rdma-1.IP: "1"
+    networking.gke.io.networks/rdma-2: "1"
+    networking.gke.io.networks/rdma-2.IP: "1"
+    networking.gke.io.networks/rdma-3: "1"
+    networking.gke.io.networks/rdma-3.IP: "1"
+  device_mount:
+    host_path: /dev/infiniband
+    container_path: /dev/infiniband
+  security_context:
+    capabilities:
+      add: [IPC_LOCK]
+
+versions:
+  # Trainer and rollout must use the same NIXL wire/API version.
+  nixl_cu13: 1.2.0
+  ray: 2.52.0
+  cuda_major: 13
+
+environment:
+  shared:
+    UCX_TLS: rc,cuda_copy,tcp
+    NIXL_UCX_TLS: rc,cuda_copy,tcp
+    UCX_NET_DEVICES: mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0
+    UCX_IB_GID_INDEX: "3"
+    UCX_CUDA_COPY_DMABUF: "yes"
+    UCX_CUDA_COPY_REG_WHOLE_ALLOC: "off"
+    MX_RDMA_NIC_PIN: "off"
+  trainer:
+    # Prevent the HPC-X NCCL plugin from loading a conflicting UCX build.
+    NCCL_NET_PLUGIN: none
+    # Safe for this single-node EP4 trainer; do not copy to a multi-node trainer.
+    NCCL_IB_DISABLE: "1"
+    # These paths must point at the selected Megatron worker venv.
+    UCX_MODULE_DIR: ${MEGATRON_WORKER_VENV}/lib/python3.13/site-packages/nixl_cu13.libs/ucx
+    NIXL_PLUGIN_DIR: ${MEGATRON_WORKER_VENV}/lib/python3.13/site-packages/nixl_cu13.libs/nixl
+    PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  rollout:
+    UCX_MAX_RMA_RAILS: "4"
+    MX_POOL_REG: "1"
+    NCCL_NET_PLUGIN: none
+    # Keep these enabled only while capturing the lane-selection trace.
+    NIXL_LOG_LEVEL: DEBUG
+    UCX_LOG_LEVEL: DEBUG
+    UCX_PROTO_INFO: "y"
+
+vllm:
+  model: Qwen/Qwen3-30B-A3B
+  load_format: mx-target
+  tensor_parallel_size: 1
+  dtype: bfloat16
+  gpu_memory_utilization: 0.6
+  max_model_len: 1024
+  enforce_eager: true
+  moe_backend: triton
+
+validated_behavior:
+  # Repeats on every GRPO refit despite stable publisher metadata, persistent
+  # receiver buffers, and cached remote agents.
+  first_two_full_reads:
+    selected_lane: tcp/eth0
+    effective_rate_gbps: 3.5-3.8
+    seconds_per_17_58GB_source: 36-40
+  following_two_full_reads:
+    selected_lane: rc_mlx5
+    effective_rate_gbps: 580-669
+    seconds_per_17_58GB_source: 0.21-0.25
+  ucx_reachable_mds:
+    slow: "0x3d"
+    fast: "0x3f"
+  end_to_end_refit_seconds: 83-91
+  concurrent_warmup:
+    sources: 4
+    probe_bytes_per_source: 64MiB
+    timeout_seconds: 80
+    rounds: 63
+    rdma_ready_sources: 0
+    maximum_probe_rate_gbps: 2.0
+    outcome: rejected
+
