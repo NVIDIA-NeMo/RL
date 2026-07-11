@@ -15,6 +15,11 @@
 
 set -euo pipefail
 
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "--test-only" ) ]]; then
+    echo "Usage: $0 [--test-only]" >&2
+    exit 2
+fi
+
 REPLICATES="${CUTEDSL_BENCHMARK_REPLICATES:-3}"
 WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-3}"
 MEASURED_UPDATES="${CUTEDSL_BENCHMARK_MEASURED_UPDATES:-20}"
@@ -28,7 +33,17 @@ fi
 REPO_ROOT=$(git rev-parse --show-toplevel)
 readonly REPO_ROOT
 readonly EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
-readonly BENCHMARK_SCRIPT="${EXPERIMENT_DIR}/benchmark_cutedsl_ab_oci_hsg.sh"
+readonly BENCHMARK_SCRIPT="${EXPERIMENT_DIR}/run_cutedsl_matrix.sbatch"
+source "${EXPERIMENT_DIR}/lib/cluster_profile.sh"
+load_cutedsl_cluster_profile
+sbatch_args=()
+while IFS= read -r argument; do
+    sbatch_args+=("${argument}")
+done <<< "${CUTEDSL_SBATCH_ARGS}"
+sbatch_args+=("--time=${CUTEDSL_BENCHMARK_TIME}")
+if [[ ${1-} == "--test-only" ]]; then
+    sbatch_args+=("--test-only")
+fi
 SUBMISSION_GROUP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 readonly SUBMISSION_GROUP
 readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/benchmark_submissions"
@@ -64,7 +79,7 @@ for ((replicate_index = 0; replicate_index < REPLICATES; replicate_index++)); do
         "SLURM_EXPORT_ENV=ALL" \
         > "${EXPORT_PAYLOAD}"
 
-    job_id=$(sbatch --parsable \
+    job_id=$(sbatch --parsable "${sbatch_args[@]}" \
         --export-file="${EXPORT_PAYLOAD}" \
         "${BENCHMARK_SCRIPT}")
     printf '{"replicate_index":%d,"timing_order":"%s","job_id":"%s","submission_group":"%s"}\n' \

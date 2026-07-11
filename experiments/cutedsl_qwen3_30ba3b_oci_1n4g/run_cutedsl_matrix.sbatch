@@ -14,21 +14,16 @@
 # limitations under the License.
 
 #SBATCH --job-name=cutedsl-ab-qwen3-30ba3b-1n4g
-#SBATCH --account=nemotron_n3_post
-#SBATCH --partition=batch
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=08:00:00
 #SBATCH --exclusive
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 
 set -euo pipefail
 
-readonly IMAGE="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly_20260711_4677250.sqsh"
 readonly RECIPE="examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl.yaml"
 readonly CONTAINER_REPO_ROOT="/workspace/nemo-rl"
 readonly CONTAINER_RESULT_DIR="/results"
@@ -43,6 +38,9 @@ readonly SLURM_SUBMIT_DIR="${SLURM_SUBMIT_DIR:?submit this benchmark with sbatch
 REPO_ROOT=$(git -C "${SLURM_SUBMIT_DIR}" rev-parse --show-toplevel)
 readonly REPO_ROOT
 readonly EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
+source "${EXPERIMENT_DIR}/lib/cluster_profile.sh"
+load_cutedsl_cluster_profile
+readonly IMAGE="${CUTEDSL_IMAGE}"
 readonly RUN_ID="${SLURM_JOB_ID:?submit this benchmark with sbatch}${SLURM_RESTART_COUNT:+-r${SLURM_RESTART_COUNT}}"
 readonly RESULT_DIR="${EXPERIMENT_DIR}/benchmark_results/${RUN_ID}"
 readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl-benchmark/${RUN_ID}"
@@ -165,6 +163,10 @@ UPSTREAM_REF=$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref --symbolic-full-name
 UPSTREAM_SHA=$(git -C "${REPO_ROOT}" rev-parse '@{upstream}')
 IMAGE_SHA256=$(sha256sum "${IMAGE}" | awk '{print $1}')
 readonly GIT_SHA UPSTREAM_REF UPSTREAM_SHA IMAGE_SHA256
+if [[ "${IMAGE_SHA256}" != "${CUTEDSL_IMAGE_SHA256}" ]]; then
+    echo "[ERROR] Image SHA256 ${IMAGE_SHA256} does not match profile SHA256 ${CUTEDSL_IMAGE_SHA256}." >&2
+    exit 1
+fi
 if [[ "${GIT_SHA}" != "${UPSTREAM_SHA}" ]]; then
     echo "[ERROR] HEAD ${GIT_SHA} does not match ${UPSTREAM_REF} at ${UPSTREAM_SHA}." >&2
     exit 1
@@ -206,11 +208,10 @@ export UV_INSTALL_DIR="${CONTAINER_RUNTIME_DIR}/uv-bin"
 export UV_PYTHON_INSTALL_DIR="${CONTAINER_RUNTIME_DIR}/uv-python"
 export UV_BIN="${UV_INSTALL_DIR}/uv"
 
-readonly -a SRUN=(
+SRUN=(
     srun
     --nodes=1
     --ntasks=1
-    --gres=gpu:4
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
@@ -218,6 +219,10 @@ readonly -a SRUN=(
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
+if [[ -n "${CUTEDSL_GRES}" ]]; then
+    SRUN+=("--gres=${CUTEDSL_GRES}")
+fi
+readonly -a SRUN
 
 echo "[INFO] Benchmark run ID: ${RUN_ID}"
 echo "[INFO] Timing order: ${TIMING_ORDER}"
@@ -318,6 +323,7 @@ OmegaConf.save(OmegaConf.create(off_config), result_dir / "effective_config_off.
 timing_order = os.environ["TIMING_ORDER"].split(",")
 manifest = {
     "run_id": os.environ["RUN_ID"],
+    "cluster_profile": os.environ["CUTEDSL_PROFILE_NAME"],
     "replicate_index": int(os.environ["REPLICATE_INDEX"]),
     "submission_group": os.environ["SUBMISSION_GROUP"],
     "timing_order": timing_order,

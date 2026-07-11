@@ -13,22 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#SBATCH --job-name=cutedsl-qwen3-30ba3b-oci-1n4g
-#SBATCH --account=nemotron_n3_post
-#SBATCH --partition=batch
+#SBATCH --job-name=cutedsl-qwen3-30ba3b-1n4g
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=0
-#SBATCH --time=02:00:00
 #SBATCH --exclusive
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 
 set -euo pipefail
 
-readonly IMAGE="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly_20260711_4677250.sqsh"
 readonly RECIPE="examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl.yaml"
 readonly CONTAINER_REPO_ROOT="/workspace/nemo-rl"
 readonly CONTAINER_RESULT_DIR="/results"
@@ -40,6 +35,9 @@ readonly SLURM_SUBMIT_DIR="${SLURM_SUBMIT_DIR:?submit this wrapper with sbatch f
 REPO_ROOT=$(git -C "${SLURM_SUBMIT_DIR}" rev-parse --show-toplevel)
 readonly REPO_ROOT
 readonly EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
+source "${EXPERIMENT_DIR}/lib/cluster_profile.sh"
+load_cutedsl_cluster_profile
+readonly IMAGE="${CUTEDSL_IMAGE}"
 readonly RUN_ID="${SLURM_JOB_ID:?submit this wrapper with sbatch}${SLURM_RESTART_COUNT:+-r${SLURM_RESTART_COUNT}}"
 readonly RESULT_DIR="${EXPERIMENT_DIR}/results/${RUN_ID}"
 readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl/${RUN_ID}"
@@ -106,6 +104,10 @@ done <<< "${SUBMODULE_STATUS}"
 
 IMAGE_SHA256=$(sha256sum "${IMAGE}" | awk '{print $1}')
 readonly IMAGE_SHA256
+if [[ "${IMAGE_SHA256}" != "${CUTEDSL_IMAGE_SHA256}" ]]; then
+    echo "[ERROR] Image SHA256 ${IMAGE_SHA256} does not match profile SHA256 ${CUTEDSL_IMAGE_SHA256}." >&2
+    exit 1
+fi
 GIT_SHA=$(git -C "${REPO_ROOT}" rev-parse HEAD)
 readonly GIT_SHA
 GIT_BRANCH=$(git -C "${REPO_ROOT}" branch --show-current)
@@ -157,22 +159,21 @@ export UV_INSTALL_DIR="${CONTAINER_RUNTIME_DIR}/uv-bin"
 export UV_PYTHON_INSTALL_DIR="${CONTAINER_RUNTIME_DIR}/uv-python"
 export UV_BIN="${UV_INSTALL_DIR}/uv"
 
-export OCI_GATE_GIT_BRANCH="${GIT_BRANCH}"
-export OCI_GATE_GIT_REMOTE="${GIT_REMOTE}"
-export OCI_GATE_GIT_SHA="${GIT_SHA}"
-export OCI_GATE_IMAGE="${IMAGE}"
-export OCI_GATE_IMAGE_SHA256="${IMAGE_SHA256}"
-export OCI_GATE_RECIPE="${RECIPE}"
-export OCI_GATE_RUN_ID="${RUN_ID}"
-export OCI_GATE_UPSTREAM_REF="${UPSTREAM_REF}"
-export OCI_GATE_UPSTREAM_SHA="${UPSTREAM_SHA}"
+export CUTEDSL_GATE_GIT_BRANCH="${GIT_BRANCH}"
+export CUTEDSL_GATE_GIT_REMOTE="${GIT_REMOTE}"
+export CUTEDSL_GATE_GIT_SHA="${GIT_SHA}"
+export CUTEDSL_GATE_IMAGE="${IMAGE}"
+export CUTEDSL_GATE_IMAGE_SHA256="${IMAGE_SHA256}"
+export CUTEDSL_GATE_RECIPE="${RECIPE}"
+export CUTEDSL_GATE_RUN_ID="${RUN_ID}"
+export CUTEDSL_GATE_UPSTREAM_REF="${UPSTREAM_REF}"
+export CUTEDSL_GATE_UPSTREAM_SHA="${UPSTREAM_SHA}"
 export PARENT_BASE_SHA
 
-readonly -a SRUN=(
+SRUN=(
     srun
     --nodes=1
     --ntasks=1
-    --gres=gpu:4
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
@@ -180,6 +181,10 @@ readonly -a SRUN=(
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
+if [[ -n "${CUTEDSL_GRES}" ]]; then
+    SRUN+=("--gres=${CUTEDSL_GRES}")
+fi
+readonly -a SRUN
 
 echo "[INFO] Run ID: ${RUN_ID}"
 echo "[INFO] NeMo-RL: ${GIT_SHA} (${GIT_BRANCH})"
@@ -237,7 +242,7 @@ def package_version(*names: str) -> str | None:
 
 
 result_dir = Path(os.environ["CONTAINER_RESULT_DIR"])
-recipe = os.environ["OCI_GATE_RECIPE"]
+recipe = os.environ["CUTEDSL_GATE_RECIPE"]
 overrides = sys.argv[1:]
 
 register_omegaconf_resolvers()
@@ -261,24 +266,25 @@ for line in submodule_lines:
 
 metadata = {
     "run": {
-        "run_id": os.environ["OCI_GATE_RUN_ID"],
+        "run_id": os.environ["CUTEDSL_GATE_RUN_ID"],
+        "cluster_profile": os.environ["CUTEDSL_PROFILE_NAME"],
         "created_at_utc": command_output(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]),
         "recipe": recipe,
         "overrides": overrides,
         "effective_config": effective_config,
     },
     "source": {
-        "remote": os.environ["OCI_GATE_GIT_REMOTE"],
-        "branch": os.environ["OCI_GATE_GIT_BRANCH"],
-        "sha": os.environ["OCI_GATE_GIT_SHA"],
-        "upstream_ref": os.environ["OCI_GATE_UPSTREAM_REF"],
-        "upstream_sha": os.environ["OCI_GATE_UPSTREAM_SHA"],
+        "remote": os.environ["CUTEDSL_GATE_GIT_REMOTE"],
+        "branch": os.environ["CUTEDSL_GATE_GIT_BRANCH"],
+        "sha": os.environ["CUTEDSL_GATE_GIT_SHA"],
+        "upstream_ref": os.environ["CUTEDSL_GATE_UPSTREAM_REF"],
+        "upstream_sha": os.environ["CUTEDSL_GATE_UPSTREAM_SHA"],
         "status_before": (result_dir / "git_status_before.txt").read_text().splitlines(),
         "submodules": submodules,
     },
     "image": {
-        "path": os.environ["OCI_GATE_IMAGE"],
-        "sha256": os.environ["OCI_GATE_IMAGE_SHA256"],
+        "path": os.environ["CUTEDSL_GATE_IMAGE"],
+        "sha256": os.environ["CUTEDSL_GATE_IMAGE_SHA256"],
     },
     "runtime": {
         "platform": platform.platform(),
@@ -453,7 +459,7 @@ mkdir -p "${RAY_TMPDIR}" "${TMPDIR}" "${RAY_LOG_DIR}"
 mapfile -t grpo_overrides < "${CONTAINER_RESULT_DIR}/grpo_overrides.txt"
 set +e
 "${UV_BIN}" run --active --no-sync examples/run_grpo.py \
-    --config "${OCI_GATE_RECIPE}" \
+    --config "${CUTEDSL_GATE_RECIPE}" \
     "${grpo_overrides[@]}" \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/grpo.log"
 grpo_exit_code=${PIPESTATUS[0]}
@@ -556,4 +562,4 @@ assert peak_memory_metrics, summary
 PY
 '
 
-echo "[PASS] OCI-HSG wrapper completed. Review metrics_summary.json and kernel_evidence.txt before classifying the GPU gate."
+echo "[PASS] CuTeDSL functional payload completed. Review metrics_summary.json and kernel_evidence.txt before classifying the GPU gate."

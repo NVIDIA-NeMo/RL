@@ -19,13 +19,13 @@ import subprocess
 from pathlib import Path
 
 EXPERIMENT_DIR = Path(__file__).parents[1] / "experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
-SCRIPT = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
+SCRIPT = (EXPERIMENT_DIR / "run_cutedsl_functional.sbatch").read_text()
 README = (EXPERIMENT_DIR / "README.md").read_text()
 RECIPE = (
     Path(__file__).parents[1]
     / "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl.yaml"
 ).read_text()
-BENCHMARK_PATH = EXPERIMENT_DIR / "benchmark_cutedsl_ab_oci_hsg.sh"
+BENCHMARK_PATH = EXPERIMENT_DIR / "run_cutedsl_matrix.sbatch"
 BENCHMARK_SCRIPT = BENCHMARK_PATH.read_text() if BENCHMARK_PATH.exists() else ""
 BENCHMARK_SUBMIT_PATH = EXPERIMENT_DIR / "submit_cutedsl_ab_replicates.sh"
 BENCHMARK_SUBMIT_SCRIPT = (
@@ -82,6 +82,27 @@ def test_wrapper_discovers_repository_from_slurm_submit_directory() -> None:
         'EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"'
     ) in SCRIPT
     assert "BASH_SOURCE" not in SCRIPT
+
+
+def test_payloads_require_and_record_effective_cluster_profile() -> None:
+    for script in (SCRIPT, BENCHMARK_SCRIPT):
+        assert "CUTEDSL_PROFILE_NAME" in script
+        assert "CUTEDSL_IMAGE_SHA256" in script
+        assert '"cluster_profile"' in script
+
+
+def test_payloads_have_no_static_cluster_or_image_directives() -> None:
+    for script in (SCRIPT, BENCHMARK_SCRIPT):
+        forbidden_fragments = (
+            "#SBATCH --account=",
+            "#SBATCH --partition=",
+            "#SBATCH --gres=",
+            "#SBATCH --time=",
+            "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl",
+        )
+        for fragment in forbidden_fragments:
+            assert fragment not in script
+        assert not re.search(r'^readonly IMAGE="/', script, re.MULTILINE)
 
 
 def test_wrapper_bootstraps_pinned_run_local_uv_and_python() -> None:
@@ -334,16 +355,6 @@ def test_readme_matches_enforced_gate_and_requeue_paths() -> None:
     assert "direct tensor equality" not in README.lower()
 
 
-def test_wrapper_and_readme_pin_refreshed_immutable_nightly() -> None:
-    image = (
-        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/"
-        "containers/nemo_rl_nightly_20260711_4677250.sqsh"
-    )
-    assert f'readonly IMAGE="{image}"' in SCRIPT
-    assert f"`{image}`" in README
-    assert "af1d2ca2a7b169aa13be4b129a0fad8e206c63576d4941b00ae312bd65d0f3e1" in README
-
-
 def test_benchmark_uses_recipe_default_on_and_one_off_override() -> None:
     selector = "policy.megatron_cfg.env_vars.NVTE_CUTEDSL_FUSED_GROUPED_MLP"
     assert 'NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"' in RECIPE
@@ -413,7 +424,7 @@ def test_benchmark_separates_profiling_and_collects_raw_timing() -> None:
 
 def test_benchmark_reuses_pinned_image_and_node_local_bootstrap() -> None:
     required_fragments = (
-        "nemo_rl_nightly_20260711_4677250.sqsh",
+        'IMAGE="${CUTEDSL_IMAGE}"',
         'readonly CONTAINER_RUNTIME_DIR="/runtime"',
         'readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl-benchmark/${RUN_ID}"',
         "${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}",
@@ -545,6 +556,9 @@ required = {
     "CUTEDSL_BENCHMARK_REPLICATE",
     "CUTEDSL_BENCHMARK_ORDER",
     "CUTEDSL_BENCHMARK_SUBMISSION_GROUP",
+    "CUTEDSL_PROFILE_NAME",
+    "CUTEDSL_IMAGE",
+    "CUTEDSL_IMAGE_SHA256",
 }
 if not required <= exported.keys():
     print("missing benchmark export", file=sys.stderr)
@@ -568,6 +582,7 @@ print(f"mock-{record['replicate']}")
         {
             "PATH": f"{mock_bin}:{env['PATH']}",
             "MOCK_SBATCH_CALLS": str(calls_path),
+            "CUTEDSL_CLUSTER_PROFILE": "pre_tyche",
             "CUTEDSL_BENCHMARK_REPLICATES": "3",
             "CUTEDSL_BENCHMARK_REPLICATE": "999",
             "CUTEDSL_BENCHMARK_ORDER": "stale,order",
