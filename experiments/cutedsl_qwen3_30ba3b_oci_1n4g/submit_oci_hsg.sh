@@ -32,8 +32,9 @@ readonly IMAGE="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/user
 readonly RECIPE="examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl.yaml"
 readonly CONTAINER_REPO_ROOT="/workspace/nemo-rl"
 readonly CONTAINER_RESULT_DIR="/results"
+readonly CONTAINER_RUNTIME_DIR="/runtime"
 readonly PARENT_BASE_SHA="c1868b139819e6364d65f862a843eb39489072a1"
-export CONTAINER_REPO_ROOT CONTAINER_RESULT_DIR
+export CONTAINER_REPO_ROOT CONTAINER_RESULT_DIR CONTAINER_RUNTIME_DIR
 
 readonly SLURM_SUBMIT_DIR="${SLURM_SUBMIT_DIR:?submit this wrapper with sbatch from the repository checkout}"
 REPO_ROOT=$(git -C "${SLURM_SUBMIT_DIR}" rev-parse --show-toplevel)
@@ -41,8 +42,9 @@ readonly REPO_ROOT
 readonly EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
 readonly RUN_ID="${SLURM_JOB_ID:?submit this wrapper with sbatch}${SLURM_RESTART_COUNT:+-r${SLURM_RESTART_COUNT}}"
 readonly RESULT_DIR="${EXPERIMENT_DIR}/results/${RUN_ID}"
+readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl/${RUN_ID}"
 
-mkdir -p "${RESULT_DIR}"
+mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}"
 exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
 
 on_exit() {
@@ -51,6 +53,7 @@ on_exit() {
     printf '{\n  "run_id": "%s",\n  "job_id": "%s",\n  "exit_code": %d,\n  "finished_at_utc": "%s"\n}\n' \
         "${RUN_ID}" "${SLURM_JOB_ID}" "${exit_code}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         > "${RESULT_DIR}/status.json"
+    rm -rf --one-file-system -- "${HOST_RUNTIME_DIR}"
     return "${exit_code}"
 }
 trap on_exit EXIT
@@ -118,14 +121,20 @@ readonly -a GRPO_OVERRIDES=(
 printf '%s\n' "${GRPO_OVERRIDES[@]}" > "${RESULT_DIR}/grpo_overrides.txt"
 
 export CUDA_HOME="/usr/local/cuda"
-export NEMO_RL_VENV_DIR="${CONTAINER_RESULT_DIR}/worker_venvs"
+export NEMO_RL_VENV_DIR="${CONTAINER_RUNTIME_DIR}/worker_venvs"
 export NRL_FORCE_REBUILD_VENVS="true"
 export NRL_IGNORE_VERSION_MISMATCH="1"
 export PYTHONPATH="${CONTAINER_REPO_ROOT}:${PYTHONPATH:-}"
-export TORCH_EXTENSIONS_DIR="${CONTAINER_RESULT_DIR}/torch_extensions"
-export TRITON_CACHE_DIR="${CONTAINER_RESULT_DIR}/triton_cache"
-export UV_PROJECT_ENVIRONMENT="${CONTAINER_RESULT_DIR}/venv"
-export UV_CACHE_DIR="${CONTAINER_RESULT_DIR}/uv_cache"
+export TORCH_EXTENSIONS_DIR="${CONTAINER_RUNTIME_DIR}/torch_extensions"
+export TRITON_CACHE_DIR="${CONTAINER_RUNTIME_DIR}/triton_cache"
+export UV_PROJECT_ENVIRONMENT="${CONTAINER_RUNTIME_DIR}/venv"
+export UV_CACHE_DIR="${CONTAINER_RUNTIME_DIR}/uv-cache"
+export UV_VERSION="0.11.6"
+export UV_PYTHON_VERSION="3.13.13"
+export UV_NO_MODIFY_PATH=1
+export UV_INSTALL_DIR="${CONTAINER_RUNTIME_DIR}/uv-bin"
+export UV_PYTHON_INSTALL_DIR="${CONTAINER_RUNTIME_DIR}/uv-python"
+export UV_BIN="${UV_INSTALL_DIR}/uv"
 
 export OCI_GATE_GIT_BRANCH="${GIT_BRANCH}"
 export OCI_GATE_GIT_REMOTE="${GIT_REMOTE}"
@@ -146,7 +155,7 @@ readonly -a SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
-    --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR}"
+    --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
 
@@ -160,10 +169,14 @@ echo "[INFO] Creating the run-local Linux environment and recording provenance."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
-uv sync --locked --extra mcore --group test --group dev
-uv lock --check 2>&1 | tee "${CONTAINER_RESULT_DIR}/uv_lock_check.log"
+curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+[[ "$("${UV_BIN}" --version)" == "uv ${UV_VERSION} "* ]]
+"${UV_BIN}" python install "${UV_PYTHON_VERSION}"
+"${UV_BIN}" python find "${UV_PYTHON_VERSION}"
+"${UV_BIN}" sync --locked --extra mcore --group test --group dev --python "${UV_PYTHON_VERSION}"
+"${UV_BIN}" lock --check 2>&1 | tee "${CONTAINER_RESULT_DIR}/uv_lock_check.log"
 mapfile -t grpo_overrides < "${CONTAINER_RESULT_DIR}/grpo_overrides.txt"
-uv run --no-sync python - "${grpo_overrides[@]}" <<'"'"'PY'"'"'
+"${UV_BIN}" run --no-sync python - "${grpo_overrides[@]}" <<'"'"'PY'"'"'
 import importlib.metadata
 import json
 import os
@@ -282,7 +295,7 @@ echo "[INFO] Running focused Linux tests before the GPU smoke and GRPO launch."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
-uv run --no-sync pytest \
+"${UV_BIN}" run --no-sync pytest \
     3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/models/test_param_mapping.py \
     3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/training/test_checkpointing.py \
     tests/unit/models/megatron/test_megatron_setup.py \
@@ -290,7 +303,7 @@ uv run --no-sync pytest \
     tests/test_cutedsl_policy_recipe.py \
     -q 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"
 
-uv run --no-sync pyrefly check 2>&1 | tee "${CONTAINER_RESULT_DIR}/pyrefly.log"
+"${UV_BIN}" run --no-sync pyrefly check 2>&1 | tee "${CONTAINER_RESULT_DIR}/pyrefly.log"
 
 git diff --name-only --diff-filter=ACMR "${PARENT_BASE_SHA}..HEAD" -- \
     . ":(exclude)3rdparty/Megatron-Bridge-workspace/Megatron-Bridge" \
@@ -300,7 +313,7 @@ if [[ ${#parent_changed_files[@]} -eq 0 ]]; then
     echo "[ERROR] No changed parent files found for pre-commit validation." >&2
     exit 1
 fi
-"${UV_PROJECT_ENVIRONMENT}/bin/pre-commit" run --files "${parent_changed_files[@]}" \
+"${UV_BIN}" run --no-sync pre-commit run --files "${parent_changed_files[@]}" \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/parent_precommit.log"
 
 bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
@@ -313,7 +326,7 @@ if [[ ${#bridge_changed_files[@]} -eq 0 ]]; then
 fi
 (
     cd "${bridge_root}"
-    "${UV_PROJECT_ENVIRONMENT}/bin/pre-commit" run --files "${bridge_changed_files[@]}"
+    "${UV_BIN}" run --no-sync pre-commit run --files "${bridge_changed_files[@]}"
 ) 2>&1 | tee "${CONTAINER_RESULT_DIR}/bridge_precommit.log"
 '
 
@@ -321,7 +334,7 @@ echo "[INFO] Running the required Cutlass DSL import smoke."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
-uv run --no-sync python -c '"'"'import cutlass; from cutlass import cute; print(cutlass.__file__)'"'"' \
+"${UV_BIN}" run --no-sync python -c '"'"'import cutlass; from cutlass import cute; print(cutlass.__file__)'"'"' \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/cutlass_import.log"
 '
 
@@ -329,7 +342,7 @@ echo "[INFO] Running the four-GPU PyTorch and Transformer Engine device smoke."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
-uv run --no-sync python - <<'"'"'PY'"'"' 2>&1 | tee "${CONTAINER_RESULT_DIR}/gpu_smoke.log"
+"${UV_BIN}" run --no-sync python - <<'"'"'PY'"'"' 2>&1 | tee "${CONTAINER_RESULT_DIR}/gpu_smoke.log"
 import torch
 import transformer_engine.pytorch as te
 
@@ -371,12 +384,13 @@ cd "${CONTAINER_REPO_ROOT}"
 export NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker"
 export NRL_NSYS_PROFILE_STEP_RANGE="2:3"
 export NRL_NSYS_EXTRA_OPTIONS='"'"'{"cuda-memory-usage":"true","cpuctxsw":"none"}'"'"'
-export RAY_TMPDIR="${CONTAINER_RESULT_DIR}/ray_tmp"
-export TMPDIR="${RAY_TMPDIR}"
-mkdir -p "${RAY_TMPDIR}"
+export RAY_TMPDIR="${CONTAINER_RUNTIME_DIR}/ray_tmp"
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
+readonly RAY_LOG_DIR="${CONTAINER_RESULT_DIR}/ray_logs"
+mkdir -p "${RAY_TMPDIR}" "${TMPDIR}" "${RAY_LOG_DIR}"
 mapfile -t grpo_overrides < "${CONTAINER_RESULT_DIR}/grpo_overrides.txt"
 set +e
-uv run --no-sync examples/run_grpo.py \
+"${UV_BIN}" run --no-sync examples/run_grpo.py \
     --config "${OCI_GATE_RECIPE}" \
     "${grpo_overrides[@]}" \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/grpo.log"
@@ -390,18 +404,28 @@ while IFS= read -r -d "" report; do
     nsys stats --report cuda_gpu_kern_sum "${report}" \
         >> "${CONTAINER_RESULT_DIR}/kernel_evidence.txt" 2>&1 || true
 done < <(find "${RAY_TMPDIR}" -type f -path '"'"'*/logs/nsight/*.nsys-rep'"'"' -print0 2>/dev/null)
-find "${RAY_TMPDIR}" -type f -print > "${CONTAINER_RESULT_DIR}/ray_artifacts.txt" 2>/dev/null
+while IFS= read -r -d "" artifact; do
+    relative_path=${artifact#"${RAY_TMPDIR}/"}
+    destination="${RAY_LOG_DIR}/${relative_path}"
+    mkdir -p "$(dirname "${destination}")"
+    cp -a "${artifact}" "${destination}"
+done < <(
+    find "${RAY_TMPDIR}" -type f \
+        \( -name "*.log" -o -name "*.out" -o -name "*.err" -o -name "*.json" \) \
+        -size -50M -print0 2>/dev/null
+)
+find "${RAY_LOG_DIR}" -type f -print > "${CONTAINER_RESULT_DIR}/ray_artifacts.txt" 2>/dev/null
 set -e
 if [[ ${grpo_exit_code} -ne 0 ]]; then
     echo "[ERROR] GRPO exited with status ${grpo_exit_code}; preserved Ray/Nsight artifacts." >&2
     exit "${grpo_exit_code}"
 fi
 
-uv run --no-sync tests/json_dump_tb_logs.py \
+"${UV_BIN}" run --no-sync tests/json_dump_tb_logs.py \
     "${CONTAINER_RESULT_DIR}/tensorboard" \
     --output_path "${CONTAINER_RESULT_DIR}/metrics.json"
 
-uv run --no-sync python - <<'"'"'PY'"'"'
+"${UV_BIN}" run --no-sync python - <<'"'"'PY'"'"'
 import json
 import math
 import statistics
