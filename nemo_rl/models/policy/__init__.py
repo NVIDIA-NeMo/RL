@@ -55,13 +55,34 @@ def _patch_transformers_tokenizer_class_set():
         "Check if the upstream fix now applies and remove this patch if so."
     )
 
+    from transformers import AutoTokenizer
     from transformers.models.auto.tokenization_auto import (
         MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
         TOKENIZER_MAPPING_NAMES,
     )
 
-    MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
-    TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
+    _original_from_pretrained = AutoTokenizer.from_pretrained
+
+    def _patched_from_pretrained(pretrained_model_name_or_path, *args, **kwargs):
+        try:
+            # DSV3 goes here: the transformers blocklist routes its
+            # tokenizer.json around LlamaTokenizerFast.__init__'s Llama-specific
+            # post-processing, which would corrupt DSV3 special tokens.
+            return _original_from_pretrained(
+                pretrained_model_name_or_path, *args, **kwargs
+            )
+        except Exception:
+            # Moonlight goes here: it ships no tokenizer.json (only
+            # tiktoken.model + remote-code TikTokenTokenizer), so the blocklist
+            # prevents loading. Strip deepseek_v3 from the registries so
+            # trust_remote_code / auto_map takes over.
+            MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
+            TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
+            return _original_from_pretrained(
+                pretrained_model_name_or_path, *args, **kwargs
+            )
+
+    AutoTokenizer.from_pretrained = _patched_from_pretrained
 
 
 _patch_transformers_tokenizer_class_set()
