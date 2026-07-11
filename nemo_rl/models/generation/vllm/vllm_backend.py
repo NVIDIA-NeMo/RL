@@ -465,9 +465,12 @@ class VllmInternalWorkerExtension:
                 process_weights_after_loading,
             )
 
-            process_weights_after_loading(
-                self.model_runner.model, self.model_config, self.device
-            )
+            from vllm.config import set_current_vllm_config
+
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                process_weights_after_loading(
+                    self.model_runner.model, self.model_config, self.device
+                )
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
