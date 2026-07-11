@@ -24,6 +24,7 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 readonly REPO_ROOT
 readonly EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
 source "${EXPERIMENT_DIR}/lib/cluster_profile.sh"
+capture_cutedsl_submission_source "${REPO_ROOT}"
 load_cutedsl_cluster_profile
 sbatch_args=()
 while IFS= read -r argument; do

@@ -91,6 +91,19 @@ def test_payloads_require_and_record_effective_cluster_profile() -> None:
         assert '"cluster_profile"' in script
 
 
+def test_submitters_capture_source_and_payloads_reject_checkout_drift() -> None:
+    required_branch = "sna/nemo-2606-cutedsl-20260710"
+    for submitter in (
+        (EXPERIMENT_DIR / "submit_cutedsl_functional.sh").read_text(),
+        BENCHMARK_SUBMIT_SCRIPT,
+    ):
+        assert 'capture_cutedsl_submission_source "${REPO_ROOT}"' in submitter
+    for payload in (SCRIPT, BENCHMARK_SCRIPT):
+        assert 'source "${EXPERIMENT_DIR}/lib/cluster_profile.sh"' in payload
+        assert "validate_cutedsl_runtime_source" in payload
+    assert required_branch in (EXPERIMENT_DIR / "lib/cluster_profile.sh").read_text()
+
+
 def test_payloads_have_no_static_cluster_or_image_directives() -> None:
     for script in (SCRIPT, BENCHMARK_SCRIPT):
         forbidden_fragments = (
@@ -559,6 +572,8 @@ required = {
     "CUTEDSL_PROFILE_NAME",
     "CUTEDSL_IMAGE",
     "CUTEDSL_IMAGE_SHA256",
+    "CUTEDSL_SUBMISSION_GIT_BRANCH",
+    "CUTEDSL_SUBMISSION_GIT_SHA",
 }
 if not required <= exported.keys():
     print("missing benchmark export", file=sys.stderr)
@@ -569,6 +584,8 @@ record = {
     "replicate": exported["CUTEDSL_BENCHMARK_REPLICATE"],
     "order": exported["CUTEDSL_BENCHMARK_ORDER"],
     "submission_group": exported["CUTEDSL_BENCHMARK_SUBMISSION_GROUP"],
+    "submission_branch": exported["CUTEDSL_SUBMISSION_GIT_BRANCH"],
+    "submission_sha": exported["CUTEDSL_SUBMISSION_GIT_SHA"],
 }
 with Path(os.environ["MOCK_SBATCH_CALLS"]).open("a") as output:
     output.write(json.dumps(record) + "\\n")
@@ -608,3 +625,14 @@ print(f"mock-{record['replicate']}")
     ]
     assert len({call["submission_group"] for call in calls}) == 1
     assert calls[0]["submission_group"] != "stale-group"
+    assert [call["submission_branch"] for call in calls] == [
+        "sna/nemo-2606-cutedsl-20260710"
+    ] * 3
+    expected_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert [call["submission_sha"] for call in calls] == [expected_sha] * 3

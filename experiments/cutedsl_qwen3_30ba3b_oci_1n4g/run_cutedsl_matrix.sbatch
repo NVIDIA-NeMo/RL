@@ -159,10 +159,12 @@ while IFS= read -r line; do
 done <<< "${SUBMODULE_STATUS}"
 
 GIT_SHA=$(git -C "${REPO_ROOT}" rev-parse HEAD)
+GIT_BRANCH=$(git -C "${REPO_ROOT}" branch --show-current)
 UPSTREAM_REF=$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')
 UPSTREAM_SHA=$(git -C "${REPO_ROOT}" rev-parse '@{upstream}')
 IMAGE_SHA256=$(sha256sum "${IMAGE}" | awk '{print $1}')
-readonly GIT_SHA UPSTREAM_REF UPSTREAM_SHA IMAGE_SHA256
+readonly GIT_SHA GIT_BRANCH UPSTREAM_REF UPSTREAM_SHA IMAGE_SHA256
+validate_cutedsl_runtime_source "${GIT_BRANCH}" "${GIT_SHA}"
 if [[ "${IMAGE_SHA256}" != "${CUTEDSL_IMAGE_SHA256}" ]]; then
     echo "[ERROR] Image SHA256 ${IMAGE_SHA256} does not match profile SHA256 ${CUTEDSL_IMAGE_SHA256}." >&2
     exit 1
@@ -171,7 +173,7 @@ if [[ "${GIT_SHA}" != "${UPSTREAM_SHA}" ]]; then
     echo "[ERROR] HEAD ${GIT_SHA} does not match ${UPSTREAM_REF} at ${UPSTREAM_SHA}." >&2
     exit 1
 fi
-export GIT_SHA UPSTREAM_REF UPSTREAM_SHA IMAGE IMAGE_SHA256
+export GIT_SHA GIT_BRANCH UPSTREAM_REF UPSTREAM_SHA IMAGE IMAGE_SHA256
 
 printf '%s\n' "${SUBMODULE_STATUS}" > "${RESULT_DIR}/submodule_status.txt"
 printf '%s  %s\n' "${IMAGE_SHA256}" "${IMAGE}" > "${RESULT_DIR}/image.sha256"

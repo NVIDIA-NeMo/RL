@@ -112,6 +112,7 @@ GIT_SHA=$(git -C "${REPO_ROOT}" rev-parse HEAD)
 readonly GIT_SHA
 GIT_BRANCH=$(git -C "${REPO_ROOT}" branch --show-current)
 readonly GIT_BRANCH
+validate_cutedsl_runtime_source "${GIT_BRANCH}" "${GIT_SHA}"
 GIT_REMOTE=$(git -C "${REPO_ROOT}" remote get-url origin)
 readonly GIT_REMOTE
 UPSTREAM_REF=$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')

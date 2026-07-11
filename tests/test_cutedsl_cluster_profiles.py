@@ -14,6 +14,7 @@
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -73,6 +74,19 @@ EXPECTED_PROFILES = {
         "benchmark_time": "05:00:00",
     },
 }
+PROFILE_EXPORT_KEYS = {
+    "CUTEDSL_PROFILE_NAME",
+    "CUTEDSL_ACCOUNT",
+    "CUTEDSL_PARTITION",
+    "CUTEDSL_GRES",
+    "CUTEDSL_SEGMENT",
+    "CUTEDSL_COMMENT",
+    "CUTEDSL_IMAGE",
+    "CUTEDSL_IMAGE_SHA256",
+    "CUTEDSL_FUNCTIONAL_TIME",
+    "CUTEDSL_BENCHMARK_TIME",
+}
+REQUIRED_GIT_BRANCH = "sna/nemo-2606-cutedsl-20260710"
 
 
 def load_profile(profile_name: str) -> dict[str, object]:
@@ -120,6 +134,18 @@ def test_profiles_match_immutable_cluster_contracts(profile_name: str) -> None:
         **EXPECTED_PROFILES[profile_name],
         "sbatch_args": profile["sbatch_args"],
     }
+
+
+@pytest.mark.parametrize("profile_name", EXPECTED_PROFILES)
+def test_profile_scripts_export_exactly_required_keys(profile_name: str) -> None:
+    profile_text = (
+        EXPERIMENT_DIR / f"cluster_profiles/{profile_name}.sh"
+    ).read_text()
+    exported_keys = re.findall(
+        r"^export (CUTEDSL_[A-Z0-9_]+)(?:=|$)", profile_text, re.MULTILINE
+    )
+    assert len(exported_keys) == 10
+    assert set(exported_keys) == PROFILE_EXPORT_KEYS
 
 
 def test_pre_tyche_profile_uses_segment_without_gres() -> None:
@@ -174,7 +200,13 @@ def test_loader_builds_exact_cluster_sbatch_args(
         ("pre_tyche", "CUTEDSL_IMAGE=relative.sqsh", "absolute"),
         ("pre_tyche", "CUTEDSL_IMAGE_SHA256=bad", "SHA256"),
         ("pre_tyche", "CUTEDSL_SEGMENT=2", "segment"),
+        ("pre_tyche", "CUTEDSL_GRES=gpu:8", "Unsupported CUTEDSL GRES"),
         ("pre_tyche", "CUTEDSL_GRES=gpu:4", "both GRES and segment"),
+        (
+            "pre_tyche",
+            "CUTEDSL_SEGMENT=\nexport CUTEDSL_GRES=",
+            "either GRES or segment",
+        ),
     ],
 )
 def test_loader_rejects_invalid_profiles(
@@ -220,7 +252,11 @@ import sys
 from pathlib import Path
 
 with Path(os.environ["MOCK_SBATCH_CALLS"]).open("a") as output:
-    output.write(json.dumps(sys.argv[1:]) + "\\n")
+    output.write(json.dumps({
+        "argv": sys.argv[1:],
+        "submission_branch": os.environ.get("CUTEDSL_SUBMISSION_GIT_BRANCH"),
+        "submission_sha": os.environ.get("CUTEDSL_SUBMISSION_GIT_SHA"),
+    }) + "\\n")
 print("mock-job")
 """
     )
@@ -275,7 +311,15 @@ def test_functional_submitter_passes_exact_profile_argv(
         expected_args.append("--test-only")
     expected_args.append(str(EXPERIMENT_DIR / "run_cutedsl_functional.sbatch"))
     calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
-    assert calls == [expected_args]
+    assert [call["argv"] for call in calls] == [expected_args]
+    assert calls[0]["submission_branch"] == REQUIRED_GIT_BRANCH
+    assert calls[0]["submission_sha"] == subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 @pytest.mark.parametrize("profile_name", EXPECTED_PROFILES)
@@ -337,10 +381,68 @@ def test_benchmark_submitter_passes_exact_profile_argv(
     calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
     assert len(calls) == 3
     for call in calls:
-        export_args = [argument for argument in call if argument.startswith("--export-file=")]
+        argv = call["argv"]
+        export_args = [
+            argument for argument in argv if argument.startswith("--export-file=")
+        ]
         assert len(export_args) == 1
-        assert call == [
+        assert argv == [
             *common_args,
             export_args[0],
             str(EXPERIMENT_DIR / "run_cutedsl_matrix.sbatch"),
         ]
+        assert call["submission_branch"] == REQUIRED_GIT_BRANCH
+        assert call["submission_sha"] == subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+
+def test_runtime_source_validation_accepts_exact_submission() -> None:
+    sha = "a" * 40
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"source {LOADER!s}; "
+            f"CUTEDSL_SUBMISSION_GIT_BRANCH={REQUIRED_GIT_BRANCH}; "
+            f"CUTEDSL_SUBMISSION_GIT_SHA={sha}; "
+            f"validate_cutedsl_runtime_source {REQUIRED_GIT_BRANCH} {sha}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("submission_branch", "submission_sha", "runtime_branch", "runtime_sha"),
+    [
+        ("other", "a" * 40, REQUIRED_GIT_BRANCH, "a" * 40),
+        (REQUIRED_GIT_BRANCH, "a" * 40, "other", "a" * 40),
+        (REQUIRED_GIT_BRANCH, "a" * 40, REQUIRED_GIT_BRANCH, "b" * 40),
+    ],
+)
+def test_runtime_source_validation_rejects_branch_or_sha_drift(
+    submission_branch: str,
+    submission_sha: str,
+    runtime_branch: str,
+    runtime_sha: str,
+) -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"source {LOADER!s}; "
+            f"CUTEDSL_SUBMISSION_GIT_BRANCH={submission_branch}; "
+            f"CUTEDSL_SUBMISSION_GIT_SHA={submission_sha}; "
+            f"validate_cutedsl_runtime_source {runtime_branch} {runtime_sha}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "source" in result.stderr.lower()
