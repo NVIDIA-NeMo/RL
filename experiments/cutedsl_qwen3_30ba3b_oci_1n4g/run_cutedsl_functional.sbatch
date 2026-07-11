@@ -419,8 +419,49 @@ if [[ ${#parent_changed_files[@]} -eq 0 ]]; then
     echo "[ERROR] No changed parent files found for pre-commit validation." >&2
     exit 1
 fi
-"${UV_BIN}" run --active --no-sync pre-commit run --files "${parent_changed_files[@]}" \
-    2>&1 | tee "${CONTAINER_RESULT_DIR}/parent_precommit.log"
+parent_toml_files=()
+for changed_file in "${parent_changed_files[@]}"; do
+    if [[ "${changed_file}" == *.toml ]]; then
+        parent_toml_files+=("${changed_file}")
+    fi
+done
+{
+    printf '%s\n' \
+        "[INFO] Parent pre-commit skips only taplo-format: mirrors-taplo v0.9.3 sdist is missing crates/taplo-lsp/Cargo.toml for CPython 3.13/aarch64; validating every changed parent TOML with locked runtime tomllib."
+    if [[ ${#parent_toml_files[@]} -gt 0 ]]; then
+        "${RUNTIME_PYTHON}" - "${parent_toml_files[@]}" <<'"'"'PY'"'"'
+# CUTEDSL_PARENT_TOML_VALIDATOR_START
+import pathlib
+import sys
+import tomllib
+
+for raw_path in sys.argv[1:]:
+    path = pathlib.Path(raw_path)
+    try:
+        with path.open("rb") as stream:
+            tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        print(f"[ERROR] Invalid changed parent TOML {path}: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    print(f"[PASS] Valid changed parent TOML: {path}")
+# CUTEDSL_PARENT_TOML_VALIDATOR_END
+PY
+    else
+        printf '%s\n' "[INFO] No changed parent .toml files require direct validation."
+    fi
+} 2>&1 | tee "${CONTAINER_RESULT_DIR}/parent_precommit.log"
+
+parent_precommit_skip="${SKIP:-}"
+if [[ -n "${parent_precommit_skip}" ]]; then
+    parent_precommit_skip+=",taplo-format"
+else
+    parent_precommit_skip="taplo-format"
+fi
+(
+    export SKIP="${parent_precommit_skip}"
+    "${UV_BIN}" run --active --no-sync pre-commit run --files \
+        "${parent_changed_files[@]}"
+) 2>&1 | tee -a "${CONTAINER_RESULT_DIR}/parent_precommit.log"
 
 git -C "${bridge_root}" diff --name-only --diff-filter=ACMR HEAD^..HEAD \
     > "${CONTAINER_RESULT_DIR}/bridge_changed_files.txt"

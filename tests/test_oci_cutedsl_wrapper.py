@@ -193,6 +193,77 @@ def test_wrapper_validates_bridge_summary_before_nemo_rl_tests() -> None:
     assert SCRIPT.index(validator_call) < SCRIPT.index(nemo_rl_tests)
 
 
+def _parent_toml_validator_source() -> str:
+    start = "# CUTEDSL_PARENT_TOML_VALIDATOR_START\n"
+    end = "# CUTEDSL_PARENT_TOML_VALIDATOR_END\n"
+    assert start in SCRIPT
+    assert end in SCRIPT
+    return SCRIPT.split(start, 1)[1].split(end, 1)[0]
+
+
+def test_parent_toml_validator_fails_on_invalid_changed_file(tmp_path: Path) -> None:
+    valid_paths = (tmp_path / "pyproject.toml", tmp_path / "uv.lock")
+    for path in valid_paths:
+        path.write_text('[project]\nname = "valid"\n')
+    valid_result = subprocess.run(
+        [sys.executable, "-c", _parent_toml_validator_source(), *valid_paths],
+        capture_output=True,
+        text=True,
+    )
+    assert valid_result.returncode == 0, valid_result.stderr
+    for path in valid_paths:
+        assert f"Valid changed parent TOML: {path}" in valid_result.stdout
+
+    invalid_path = tmp_path / "broken.toml"
+    invalid_path.write_text('[project\nname = "broken"\n')
+    invalid_result = subprocess.run(
+        [sys.executable, "-c", _parent_toml_validator_source(), invalid_path],
+        capture_output=True,
+        text=True,
+    )
+    assert invalid_result.returncode != 0
+    assert f"Invalid changed parent TOML {invalid_path}" in invalid_result.stderr
+
+
+def test_wrapper_scopes_taplo_skip_to_parent_precommit() -> None:
+    parent_gate = SCRIPT[
+        SCRIPT.index("mapfile -t parent_changed_files") : SCRIPT.index(
+            'git -C "${bridge_root}" diff'
+        )
+    ]
+    bridge_gate = SCRIPT[
+        SCRIPT.index('git -C "${bridge_root}" diff') : SCRIPT.index(
+            "cutedsl_write_event focused_tests pass"
+        )
+    ]
+    rationale = (
+        "[INFO] Parent pre-commit skips only taplo-format: mirrors-taplo v0.9.3 "
+        "sdist is missing crates/taplo-lsp/Cargo.toml for CPython 3.13/aarch64; "
+        "validating every changed parent TOML with locked runtime tomllib."
+    )
+
+    assert 'for changed_file in "${parent_changed_files[@]}"' in parent_gate
+    assert '[[ "${changed_file}" == *.toml ]]' in parent_gate
+    assert 'parent_toml_files+=("${changed_file}")' in parent_gate
+    assert '"${RUNTIME_PYTHON}" - "${parent_toml_files[@]}"' in parent_gate
+    assert rationale in parent_gate
+    assert SCRIPT.index('"${UV_BIN}" lock --check') < SCRIPT.index(rationale)
+    assert 'parent_precommit_skip="${SKIP:-}"' in parent_gate
+    assert 'parent_precommit_skip+=",taplo-format"' in parent_gate
+    assert 'parent_precommit_skip="taplo-format"' in parent_gate
+    parent_precommit = """(
+    export SKIP="${parent_precommit_skip}"
+    "${UV_BIN}" run --active --no-sync pre-commit run --files \\
+        "${parent_changed_files[@]}"
+) 2>&1 | tee -a "${CONTAINER_RESULT_DIR}/parent_precommit.log"""
+    assert parent_precommit in parent_gate
+    assert parent_gate.count("taplo-format") == 3
+    assert '| tee "${CONTAINER_RESULT_DIR}/parent_precommit.log"' in parent_gate
+    assert "SKIP=" not in bridge_gate
+    for broad_skip in ("SKIP=all", "SKIP=ruff", "SKIP=pyrefly", "SKIP=configs"):
+        assert broad_skip not in SCRIPT
+
+
 def test_wrapper_runs_transformer_engine_forward_backward_on_each_gpu() -> None:
     assert "te.Linear" in SCRIPT
     assert ".backward()" in SCRIPT
