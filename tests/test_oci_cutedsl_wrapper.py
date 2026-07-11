@@ -70,6 +70,7 @@ def test_wrapper_isolates_bridge_and_nemo_rl_pytest_roots() -> None:
     {"""  # noqa: E501
     nemo_rl_pytest = """(
     cd "${CONTAINER_REPO_ROOT}"
+    trap preserve_nemo_unit_results EXIT
     "${UV_BIN}" run --active --no-sync pytest \\
         tests/unit/models/megatron/test_megatron_setup.py \\
         tests/unit/models/megatron/test_community_import.py \\
@@ -262,6 +263,108 @@ def test_wrapper_scopes_taplo_skip_to_parent_precommit() -> None:
     assert "SKIP=" not in bridge_gate
     for broad_skip in ("SKIP=all", "SKIP=ruff", "SKIP=pyrefly", "SKIP=configs"):
         assert broad_skip not in SCRIPT
+
+
+def _nemo_unit_results_preserver_source() -> str:
+    start = "# CUTEDSL_NEMO_UNIT_RESULTS_PRESERVER_START\n"
+    end = "# CUTEDSL_NEMO_UNIT_RESULTS_PRESERVER_END\n"
+    assert start in SCRIPT
+    assert end in SCRIPT
+    return SCRIPT.split(start, 1)[1].split(end, 1)[0]
+
+
+def _run_nemo_unit_results_preserver(
+    tmp_path: Path,
+    name: str,
+    pytest_exit: int,
+    *,
+    fail_moves: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    repo_root = tmp_path / name / "repo"
+    result_dir = tmp_path / name / "result"
+    (repo_root / "tests/unit/unit_results").mkdir(parents=True)
+    result_dir.mkdir(parents=True)
+    (repo_root / "tests/unit/unit_results.json").write_text('{"latest": true}\n')
+    (repo_root / "tests/unit/unit_results/20260711_120000.json").write_text(
+        '{"dated": true}\n'
+    )
+    command = f"""
+set -uo pipefail
+CONTAINER_REPO_ROOT=$1
+CONTAINER_RESULT_DIR=$2
+{_nemo_unit_results_preserver_source()}
+if [[ $4 == 1 ]]; then
+    mv() {{ return 9; }}
+fi
+(
+    trap preserve_nemo_unit_results EXIT
+    exit "$3"
+)
+"""
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            command,
+            "nemo-unit-results-preserver",
+            str(repo_root),
+            str(result_dir),
+            str(pytest_exit),
+            "1" if fail_moves else "0",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result, repo_root, result_dir
+
+
+def test_nemo_unit_results_preserver_cleans_success_and_failure(
+    tmp_path: Path,
+) -> None:
+    for name, pytest_exit in (("success", 0), ("failure", 17)):
+        result, repo_root, result_dir = _run_nemo_unit_results_preserver(
+            tmp_path, name, pytest_exit
+        )
+        assert result.returncode == pytest_exit, result.stderr
+        assert not (repo_root / "tests/unit/unit_results.json").exists()
+        assert not (repo_root / "tests/unit/unit_results").exists()
+        assert (result_dir / "nemo_unit_results.json").read_text() == (
+            '{"latest": true}\n'
+        )
+        assert (
+            result_dir / "nemo_unit_results/20260711_120000.json"
+        ).read_text() == '{"dated": true}\n'
+
+
+def test_nemo_unit_results_preserver_keeps_pytest_error_precedence(
+    tmp_path: Path,
+) -> None:
+    successful_pytest, _, _ = _run_nemo_unit_results_preserver(
+        tmp_path, "cleanup-failure", 0, fail_moves=True
+    )
+    failing_pytest, _, _ = _run_nemo_unit_results_preserver(
+        tmp_path, "pytest-and-cleanup-failure", 17, fail_moves=True
+    )
+
+    assert successful_pytest.returncode == 9
+    assert failing_pytest.returncode == 17
+
+
+def test_wrapper_installs_nemo_unit_results_exit_trap_before_pytest() -> None:
+    focused_gate = SCRIPT[
+        SCRIPT.index("validate_bridge_pytest_summary") : SCRIPT.index(
+            '"${UV_BIN}" run --active --no-sync pyrefly check'
+        )
+    ]
+    nemo_gate = focused_gate[focused_gate.index('(\n    cd "${CONTAINER_REPO_ROOT}"') :]
+    preserver_source = _nemo_unit_results_preserver_source()
+
+    assert "nemo_unit_results.json" in preserver_source
+    assert "nemo_unit_results" in preserver_source
+    assert "mv --" in preserver_source
+    assert nemo_gate.index("trap preserve_nemo_unit_results EXIT") < nemo_gate.index(
+        '"${UV_BIN}" run --active --no-sync pytest'
+    )
 
 
 def test_wrapper_runs_transformer_engine_forward_backward_on_each_gpu() -> None:

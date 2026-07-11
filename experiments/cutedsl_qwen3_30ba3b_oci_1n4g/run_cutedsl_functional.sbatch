@@ -400,8 +400,55 @@ bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-
     } 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"
 )
 validate_bridge_pytest_summary "${CONTAINER_RESULT_DIR}/focused_tests.log"
+# CUTEDSL_NEMO_UNIT_RESULTS_PRESERVER_START
+preserve_nemo_unit_results() {
+    local pytest_exit=$?
+    local cleanup_exit=0
+    local move_exit
+    local source_path
+    local destination_path
+    local index
+    local -a source_paths=(
+        "${CONTAINER_REPO_ROOT}/tests/unit/unit_results.json"
+        "${CONTAINER_REPO_ROOT}/tests/unit/unit_results"
+    )
+    local -a destination_paths=(
+        "${CONTAINER_RESULT_DIR}/nemo_unit_results.json"
+        "${CONTAINER_RESULT_DIR}/nemo_unit_results"
+    )
+
+    trap - EXIT
+    for index in "${!source_paths[@]}"; do
+        source_path=${source_paths[${index}]}
+        destination_path=${destination_paths[${index}]}
+        if [[ ! -e "${source_path}" && ! -L "${source_path}" ]]; then
+            continue
+        fi
+        if mv -- "${source_path}" "${destination_path}"; then
+            printf '[INFO] Preserved NeMo unit result artifact: %s\n' \
+                "$(basename "${destination_path}")"
+        else
+            move_exit=$?
+            printf '[ERROR] Failed to preserve NeMo unit result artifact: %s\n' \
+                "${source_path}" >&2
+            if [[ ${cleanup_exit} -eq 0 ]]; then
+                cleanup_exit=${move_exit}
+            fi
+        fi
+    done
+
+    if [[ ${pytest_exit} -ne 0 ]]; then
+        exit "${pytest_exit}"
+    fi
+    if [[ ${cleanup_exit} -ne 0 ]]; then
+        exit "${cleanup_exit}"
+    fi
+    exit 0
+}
+# CUTEDSL_NEMO_UNIT_RESULTS_PRESERVER_END
 (
     cd "${CONTAINER_REPO_ROOT}"
+    trap preserve_nemo_unit_results EXIT
     "${UV_BIN}" run --active --no-sync pytest \
         tests/unit/models/megatron/test_megatron_setup.py \
         tests/unit/models/megatron/test_community_import.py \

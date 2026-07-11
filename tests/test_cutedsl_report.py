@@ -831,6 +831,14 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
             "slurm": {"account": "account", "partition": "batch"},
         },
     )
+    write_json(
+        run_dir / "nemo_unit_results.json",
+        {
+            "exit_status": 0,
+            "metrics": {"focused_test": {"_elapsed": 1.0}},
+            "BUILD_TOKEN": "SENTINEL_UNIT_RESULTS_TOKEN_115",
+        },
+    )
     events = failure_events()
     events[2]["hypothesis"] = "BUILD_TOKEN=SENTINEL_COLLECTOR_TOKEN_104"
     events.append(
@@ -947,6 +955,7 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
         b"SYMLINKED_CREDENTIAL_SENTINEL_112",
         b"EXTERNAL_PROFILE_JSON_SENTINEL_113",
         b"EXTERNAL_PROFILE_EVIDENCE_SENTINEL_114",
+        b"SENTINEL_UNIT_RESULTS_TOKEN_115",
     ):
         assert sentinel not in public_bytes
     staged_run = public_dir / "runs/results/123"
@@ -954,6 +963,7 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
     assert (staged_run / "events.jsonl").is_file()
     assert (staged_run / "metrics_summary.json").is_file()
     assert (staged_run / "kernel_attribution.json").is_file()
+    assert (staged_run / "nemo_unit_results.json").is_file()
     assert (staged_run / "slurm.out").stat().st_size <= renderer.MAX_EXCERPT_BYTES
     assert not (staged_run / "credentials.txt").exists()
     assert not list(staged_run.rglob("*.nsys-rep"))
