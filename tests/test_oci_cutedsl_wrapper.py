@@ -97,11 +97,11 @@ def test_wrapper_bootstraps_pinned_run_local_uv_and_python() -> None:
         '"${UV_BIN}" python install "${UV_PYTHON_VERSION}"',
         '"${UV_BIN}" sync --locked --extra mcore --group test --group dev',
         '"${UV_BIN}" lock --check',
-        '"${UV_BIN}" run --no-sync pytest',
-        '"${UV_BIN}" run --no-sync pyrefly check',
-        '"${UV_BIN}" run --no-sync pre-commit run --files',
-        '"${UV_BIN}" run --no-sync examples/run_grpo.py',
-        '"${UV_BIN}" run --no-sync tests/json_dump_tb_logs.py',
+        '"${UV_BIN}" run --active --no-sync pytest',
+        '"${UV_BIN}" run --active --no-sync pyrefly check',
+        '"${UV_BIN}" run --active --no-sync pre-commit run --files',
+        '"${UV_BIN}" run --active --no-sync examples/run_grpo.py',
+        '"${UV_BIN}" run --active --no-sync tests/json_dump_tb_logs.py',
     )
     for fragment in required_fragments:
         assert fragment in SCRIPT, fragment
@@ -111,6 +111,58 @@ def test_wrapper_bootstraps_pinned_run_local_uv_and_python() -> None:
     assert SCRIPT.index("export UV_NO_MODIFY_PATH=1") < SCRIPT.index(
         'curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh'
     )
+
+
+def test_functional_and_benchmark_force_runtime_interpreter_across_srun() -> None:
+    for script in (SCRIPT, BENCHMARK_SCRIPT):
+        required_fragments = (
+            'export VIRTUAL_ENV="${UV_PROJECT_ENVIRONMENT}"',
+            'export RUNTIME_PYTHON="${UV_PROJECT_ENVIRONMENT}/bin/python"',
+            '[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]',
+            'expected_runtime_python=$("${RUNTIME_PYTHON}" -c',
+            'runtime_python=$("${UV_BIN}" run --active --no-sync python -c',
+            'runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c',
+            '[[ "${runtime_python}" == "${expected_runtime_python}" ]]',
+            '[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]',
+        )
+        for fragment in required_fragments:
+            assert fragment in script, fragment
+
+        uv_run_lines = [
+            line.strip() for line in script.splitlines() if '"${UV_BIN}" run ' in line
+        ]
+        assert uv_run_lines
+        assert all(
+            line.startswith('"${UV_BIN}" run --active --no-sync ')
+            or '$("${UV_BIN}" run --active --no-sync ' in line
+            for line in uv_run_lines
+        ), uv_run_lines
+        assert '"${UV_BIN}" run --no-sync ' not in script
+        assert "/opt/nemo_rl_venv" not in script
+
+        srun_count = script.count('"${SRUN[@]}"')
+        version_assertion_count = script.count(
+            '[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]'
+        )
+        assert version_assertion_count == srun_count
+
+
+def test_pyxis_explicitly_overrides_image_virtual_env() -> None:
+    image_env = {"VIRTUAL_ENV": "/opt/nemo_rl_venv"}
+    host_env = {"VIRTUAL_ENV": "/runtime/venv"}
+
+    def pyxis_container_env(script: str) -> dict[str, str]:
+        resolved = image_env.copy()
+        match = re.search(r"^\s*--container-env=([^\s]+)$", script, re.MULTILINE)
+        if match is not None:
+            for name in match.group(1).split(","):
+                resolved[name] = host_env[name]
+        return resolved
+
+    assert image_env["VIRTUAL_ENV"] == "/opt/nemo_rl_venv"
+    for script in (SCRIPT, BENCHMARK_SCRIPT):
+        assert script.count("--container-env=VIRTUAL_ENV") == 1
+        assert pyxis_container_env(script)["VIRTUAL_ENV"] == "/runtime/venv"
 
 
 def test_wrapper_keeps_high_churn_runtime_off_lustre_across_srun_steps() -> None:

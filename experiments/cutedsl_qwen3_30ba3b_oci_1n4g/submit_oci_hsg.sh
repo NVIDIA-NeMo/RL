@@ -128,6 +128,8 @@ export PYTHONPATH="${CONTAINER_REPO_ROOT}:${PYTHONPATH:-}"
 export TORCH_EXTENSIONS_DIR="${CONTAINER_RUNTIME_DIR}/torch_extensions"
 export TRITON_CACHE_DIR="${CONTAINER_RUNTIME_DIR}/triton_cache"
 export UV_PROJECT_ENVIRONMENT="${CONTAINER_RUNTIME_DIR}/venv"
+export VIRTUAL_ENV="${UV_PROJECT_ENVIRONMENT}"
+export RUNTIME_PYTHON="${UV_PROJECT_ENVIRONMENT}/bin/python"
 export UV_CACHE_DIR="${CONTAINER_RUNTIME_DIR}/uv-cache"
 export UV_VERSION="0.11.6"
 export UV_PYTHON_VERSION="3.13.13"
@@ -155,6 +157,7 @@ readonly -a SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
+    --container-env=VIRTUAL_ENV
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -174,9 +177,16 @@ curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
 "${UV_BIN}" python find "${UV_PYTHON_VERSION}"
 "${UV_BIN}" sync --locked --extra mcore --group test --group dev --python "${UV_PYTHON_VERSION}"
+[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
+[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; print(sys.prefix)'"'"')
+[[ "${runtime_python}" == "${expected_runtime_python}" ]]
+[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
 "${UV_BIN}" lock --check 2>&1 | tee "${CONTAINER_RESULT_DIR}/uv_lock_check.log"
 mapfile -t grpo_overrides < "${CONTAINER_RESULT_DIR}/grpo_overrides.txt"
-"${UV_BIN}" run --no-sync python - "${grpo_overrides[@]}" <<'"'"'PY'"'"'
+"${UV_BIN}" run --active --no-sync python - "${grpo_overrides[@]}" <<'"'"'PY'"'"'
 import importlib.metadata
 import json
 import os
@@ -295,7 +305,14 @@ echo "[INFO] Running focused Linux tests before the GPU smoke and GRPO launch."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
-"${UV_BIN}" run --no-sync pytest \
+[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
+[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; print(sys.prefix)'"'"')
+[[ "${runtime_python}" == "${expected_runtime_python}" ]]
+[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
+"${UV_BIN}" run --active --no-sync pytest \
     3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/models/test_param_mapping.py \
     3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/training/test_checkpointing.py \
     tests/unit/models/megatron/test_megatron_setup.py \
@@ -303,7 +320,7 @@ cd "${CONTAINER_REPO_ROOT}"
     tests/test_cutedsl_policy_recipe.py \
     -q 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"
 
-"${UV_BIN}" run --no-sync pyrefly check 2>&1 | tee "${CONTAINER_RESULT_DIR}/pyrefly.log"
+"${UV_BIN}" run --active --no-sync pyrefly check 2>&1 | tee "${CONTAINER_RESULT_DIR}/pyrefly.log"
 
 git diff --name-only --diff-filter=ACMR "${PARENT_BASE_SHA}..HEAD" -- \
     . ":(exclude)3rdparty/Megatron-Bridge-workspace/Megatron-Bridge" \
@@ -313,7 +330,7 @@ if [[ ${#parent_changed_files[@]} -eq 0 ]]; then
     echo "[ERROR] No changed parent files found for pre-commit validation." >&2
     exit 1
 fi
-"${UV_BIN}" run --no-sync pre-commit run --files "${parent_changed_files[@]}" \
+"${UV_BIN}" run --active --no-sync pre-commit run --files "${parent_changed_files[@]}" \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/parent_precommit.log"
 
 bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
@@ -326,7 +343,7 @@ if [[ ${#bridge_changed_files[@]} -eq 0 ]]; then
 fi
 (
     cd "${bridge_root}"
-    "${UV_BIN}" run --no-sync pre-commit run --files "${bridge_changed_files[@]}"
+    "${UV_BIN}" run --active --no-sync pre-commit run --files "${bridge_changed_files[@]}"
 ) 2>&1 | tee "${CONTAINER_RESULT_DIR}/bridge_precommit.log"
 '
 
@@ -334,7 +351,14 @@ echo "[INFO] Running the required Cutlass DSL import smoke."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
-"${UV_BIN}" run --no-sync python -c '"'"'import cutlass; from cutlass import cute; print(cutlass.__file__)'"'"' \
+[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
+[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; print(sys.prefix)'"'"')
+[[ "${runtime_python}" == "${expected_runtime_python}" ]]
+[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
+"${UV_BIN}" run --active --no-sync python -c '"'"'import cutlass; from cutlass import cute; print(cutlass.__file__)'"'"' \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/cutlass_import.log"
 '
 
@@ -342,7 +366,14 @@ echo "[INFO] Running the four-GPU PyTorch and Transformer Engine device smoke."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
-"${UV_BIN}" run --no-sync python - <<'"'"'PY'"'"' 2>&1 | tee "${CONTAINER_RESULT_DIR}/gpu_smoke.log"
+[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
+[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; print(sys.prefix)'"'"')
+[[ "${runtime_python}" == "${expected_runtime_python}" ]]
+[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
+"${UV_BIN}" run --active --no-sync python - <<'"'"'PY'"'"' 2>&1 | tee "${CONTAINER_RESULT_DIR}/gpu_smoke.log"
 import torch
 import transformer_engine.pytorch as te
 
@@ -381,6 +412,13 @@ echo "[INFO] Launching the three-update GRPO gate with a step-2 policy-worker Ns
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
+[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; print(sys.prefix)'"'"')
+[[ "${runtime_python}" == "${expected_runtime_python}" ]]
+[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
 export NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker"
 export NRL_NSYS_PROFILE_STEP_RANGE="2:3"
 export NRL_NSYS_EXTRA_OPTIONS='"'"'{"cuda-memory-usage":"true","cpuctxsw":"none"}'"'"'
@@ -390,7 +428,7 @@ readonly RAY_LOG_DIR="${CONTAINER_RESULT_DIR}/ray_logs"
 mkdir -p "${RAY_TMPDIR}" "${TMPDIR}" "${RAY_LOG_DIR}"
 mapfile -t grpo_overrides < "${CONTAINER_RESULT_DIR}/grpo_overrides.txt"
 set +e
-"${UV_BIN}" run --no-sync examples/run_grpo.py \
+"${UV_BIN}" run --active --no-sync examples/run_grpo.py \
     --config "${OCI_GATE_RECIPE}" \
     "${grpo_overrides[@]}" \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/grpo.log"
@@ -421,11 +459,11 @@ if [[ ${grpo_exit_code} -ne 0 ]]; then
     exit "${grpo_exit_code}"
 fi
 
-"${UV_BIN}" run --no-sync tests/json_dump_tb_logs.py \
+"${UV_BIN}" run --active --no-sync tests/json_dump_tb_logs.py \
     "${CONTAINER_RESULT_DIR}/tensorboard" \
     --output_path "${CONTAINER_RESULT_DIR}/metrics.json"
 
-"${UV_BIN}" run --no-sync python - <<'"'"'PY'"'"'
+"${UV_BIN}" run --active --no-sync python - <<'"'"'PY'"'"'
 import json
 import math
 import statistics

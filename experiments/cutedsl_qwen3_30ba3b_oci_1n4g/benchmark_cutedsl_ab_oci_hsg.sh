@@ -177,6 +177,8 @@ export PYTHONPATH="${CONTAINER_REPO_ROOT}:${PYTHONPATH:-}"
 export TORCH_EXTENSIONS_DIR="${CONTAINER_RUNTIME_DIR}/torch_extensions"
 export TRITON_CACHE_DIR="${CONTAINER_RUNTIME_DIR}/triton_cache"
 export UV_PROJECT_ENVIRONMENT="${CONTAINER_RUNTIME_DIR}/venv"
+export VIRTUAL_ENV="${UV_PROJECT_ENVIRONMENT}"
+export RUNTIME_PYTHON="${UV_PROJECT_ENVIRONMENT}/bin/python"
 export UV_CACHE_DIR="${CONTAINER_RUNTIME_DIR}/uv-cache"
 export UV_VERSION="0.11.6"
 export UV_PYTHON_VERSION="3.13.13"
@@ -193,6 +195,7 @@ readonly -a SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
+    --container-env=VIRTUAL_ENV
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -211,9 +214,16 @@ curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
 "${UV_BIN}" python find "${UV_PYTHON_VERSION}"
 "${UV_BIN}" sync --locked --extra mcore --group test --group dev --python "${UV_PYTHON_VERSION}"
+[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
+[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c 'import os, sys; print(os.path.realpath(sys.executable))')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c 'import os, sys; print(os.path.realpath(sys.executable))')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c 'import sys; print(sys.prefix)')
+[[ "${runtime_python}" == "${expected_runtime_python}" ]]
+[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
 "${UV_BIN}" lock --check 2>&1 | tee "${CONTAINER_RESULT_DIR}/uv_lock_check.log"
 
-"${UV_BIN}" run --no-sync python - <<'PY'
+"${UV_BIN}" run --active --no-sync python - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -316,6 +326,13 @@ echo "[INFO] Running timing-only arms without profiling instrumentation."
 "${SRUN[@]}" bash -s <<'BASH'
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
+[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c 'import os, sys; print(os.path.realpath(sys.executable))')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c 'import os, sys; print(os.path.realpath(sys.executable))')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c 'import sys; print(sys.prefix)')
+[[ "${runtime_python}" == "${expected_runtime_python}" ]]
+[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
 mapfile -t COMMON_OVERRIDES < "${CONTAINER_RESULT_DIR}/common_overrides.txt"
 IFS=',' read -r -a timing_arms <<< "${TIMING_ORDER}"
 
@@ -345,7 +362,7 @@ run_timing_arm() {
     unset NRL_NSYS_EXTRA_OPTIONS
 
     set +e
-    "${UV_BIN}" run --no-sync examples/run_grpo.py \
+    "${UV_BIN}" run --active --no-sync examples/run_grpo.py \
         --config "${RECIPE}" \
         "${COMMON_OVERRIDES[@]}" "${arm_overrides[@]}" \
         2>&1 | tee "${arm_dir}/grpo.log"
@@ -356,11 +373,11 @@ run_timing_arm() {
         return "${grpo_exit_code}"
     fi
 
-    "${UV_BIN}" run --no-sync tests/json_dump_tb_logs.py \
+    "${UV_BIN}" run --active --no-sync tests/json_dump_tb_logs.py \
         "${CONTAINER_RUNTIME_DIR}/benchmark_logs" \
         --output_path "${arm_dir}/metrics.json"
 
-    "${UV_BIN}" run --no-sync python - "${arm_dir}" <<'PY'
+    "${UV_BIN}" run --active --no-sync python - "${arm_dir}" <<'PY'
 import csv
 import json
 import os
@@ -473,7 +490,7 @@ for order_index in "${!timing_arms[@]}"; do
     run_timing_arm "${timing_arms[order_index]}" "${order_index}"
 done
 
-"${UV_BIN}" run --no-sync python - <<'PY'
+"${UV_BIN}" run --active --no-sync python - <<'PY'
 import json
 import os
 import statistics
@@ -545,6 +562,13 @@ if [[ "${PROFILE_ENABLED}" == "1" ]]; then
     "${SRUN[@]}" bash -s <<'BASH'
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
+[[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c 'import os, sys; print(os.path.realpath(sys.executable))')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c 'import os, sys; print(os.path.realpath(sys.executable))')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c 'import sys; print(sys.prefix)')
+[[ "${runtime_python}" == "${expected_runtime_python}" ]]
+[[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
 mapfile -t common_timing_overrides < "${CONTAINER_RESULT_DIR}/common_overrides.txt"
 profile_overrides=()
 for override in "${common_timing_overrides[@]}"; do
@@ -576,7 +600,7 @@ run_profile_arm() {
     export NRL_NSYS_EXTRA_OPTIONS='{"cuda-memory-usage":"true","cpuctxsw":"none"}'
 
     set +e
-    "${UV_BIN}" run --no-sync examples/run_grpo.py \
+    "${UV_BIN}" run --active --no-sync examples/run_grpo.py \
         --config "${RECIPE}" \
         "${profile_overrides[@]}" "${arm_overrides[@]}" \
         2>&1 | tee "${arm_dir}/grpo_profile.log"
