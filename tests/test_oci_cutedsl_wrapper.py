@@ -64,14 +64,10 @@ def test_wrapper_isolates_bridge_and_nemo_rl_pytest_roots() -> None:
             '"${UV_BIN}" run --active --no-sync pyrefly check'
         )
     ]
-    bridge_pytest = """bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+    bridge_subshell = """bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 (
     cd "${bridge_root}"
-    "${UV_BIN}" run --active --no-sync pytest \\
-        tests/unit_tests/models/test_param_mapping.py \\
-        tests/unit_tests/training/test_checkpointing.py \\
-        -q
-) 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"""  # noqa: E501
+    {"""  # noqa: E501
     nemo_rl_pytest = """(
     cd "${CONTAINER_REPO_ROOT}"
     "${UV_BIN}" run --active --no-sync pytest \\
@@ -82,14 +78,41 @@ def test_wrapper_isolates_bridge_and_nemo_rl_pytest_roots() -> None:
 ) 2>&1 | tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"""
 
     assert "set -euo pipefail" in focused_gate
-    assert focused_gate.count('"${UV_BIN}" run --active --no-sync pytest') == 2
-    assert bridge_pytest in focused_gate
+    assert bridge_subshell in focused_gate
     assert nemo_rl_pytest in focused_gate
-    assert focused_gate.index(bridge_pytest) < focused_gate.index(nemo_rl_pytest)
+    assert focused_gate.index(bridge_subshell) < focused_gate.index(nemo_rl_pytest)
     assert focused_gate.count('| tee "${CONTAINER_RESULT_DIR}/focused_tests.log"') == 1
     assert (
         focused_gate.count('| tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"') == 1
     )
+
+
+def test_wrapper_bounds_bridge_msc_deselections_to_locked_runtime() -> None:
+    focused_gate = SCRIPT[
+        SCRIPT.index("cutedsl_write_event focused_tests start") : SCRIPT.index(
+            '"${UV_BIN}" run --active --no-sync pyrefly check'
+        )
+    ]
+    bridge_gate = focused_gate[
+        focused_gate.index('bridge_root="${CONTAINER_REPO_ROOT}') : focused_gate.index(
+            '(\n    cd "${CONTAINER_REPO_ROOT}"'
+        )
+    ]
+    deselected_nodes = (
+        "tests/unit_tests/training/test_checkpointing.py::TestCheckpointUtilities::test_ensure_directory_exists_with_msc_url",
+        "tests/unit_tests/training/test_checkpointing.py::TestLoadCheckpointFromPathDirectIterDir::test_fsdp_dtensor_skips_tracker_resolution_with_msc",
+    )
+
+    assert '"${RUNTIME_PYTHON}" -m pytest' in bridge_gate
+    assert '"${UV_BIN}" run --active --no-sync pytest' not in bridge_gate
+    assert bridge_gate.count("--deselect=") == len(deselected_nodes)
+    for node_id in deselected_nodes:
+        assert f"--deselect={node_id}" in bridge_gate
+    assert "Bridge MSC exclusions: exactly 2 tests" in bridge_gate
+    assert "multi-storage-client~=0.50 provides only CPython 3.12 wheels" in bridge_gate
+    assert "Expected Bridge pytest summary: 203 passed, 2 deselected" in bridge_gate
+    for broad_filter in (" -k ", "--ignore", "--ignore-glob", "pytest.skip"):
+        assert broad_filter not in bridge_gate
 
 
 def test_wrapper_runs_transformer_engine_forward_backward_on_each_gpu() -> None:
