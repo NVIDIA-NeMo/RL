@@ -145,6 +145,19 @@ class AsyncPPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recompute the KV cache after in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # How to treat the INCOMPLETE (partially-generated) frontier target step found
+    # in a restored replay-buffer checkpoint on resume:
+    #   * false (default): keep the partial survivors and let the collector gap-fill
+    #     only the missing groups. Fast resume, but the partial batch is
+    #     SURVIVORSHIP-BIASED toward SHORT rollouts (only the fast-completing ones
+    #     were saved), so the first step after each resume trains on a shorter +
+    #     higher-reward batch — visible as a dip in mean_gen_tokens_per_sample and a
+    #     reward spike right after every resume.
+    #   * true: drop the incomplete target and regenerate it fresh (unbiased batch),
+    #     at the cost of a one-target generation bubble at resume. Recommended when
+    #     resuming frequently. Complete banked targets are unbiased and always kept.
+    # Absent/null => false. Read with a None-safe default, so allow null.
+    drop_incomplete_targets_on_restore: NotRequired[bool | None]
     # Heartbeat frequency for the collector/replay-buffer per-rollout progress
     # prints: log every Nth event (plus the final one per target). These fire once
     # per prompt group and flood the log at large num_prompts_per_step, so throttle
@@ -2328,6 +2341,13 @@ def async_ppo_train(
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
         log_every=async_cfg.get("log_every"),
+        # Default False => historical gap-fill behavior; True drops the
+        # survivorship-biased incomplete frontier target on resume (regenerate
+        # fresh). None (absent) is coerced to False by the buffer constructor.
+        drop_incomplete_targets_on_restore=async_cfg.get(
+            "drop_incomplete_targets_on_restore"
+        )
+        or False,
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()

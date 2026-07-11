@@ -62,6 +62,9 @@ ppo:
     warmup_max_trajectory_age_steps: null
     in_flight_weight_updates: false  # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false
+    # false (default) keeps the partial frontier target on resume and gap-fills it
+    # (survivorship-biased toward short rollouts); true drops + regenerates it fresh.
+    drop_incomplete_targets_on_restore: false
     log_every: 500  # heartbeat frequency for collector progress prints (0 silences)
 
 loss_fn:

@@ -62,6 +62,13 @@ ppo:
     warmup_max_trajectory_age_steps: null
     in_flight_weight_updates: true  # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false
+    # On resume, how to treat the INCOMPLETE (partially-generated) frontier target
+    # in the restored replay buffer. false (default) keeps the partial batch and
+    # gap-fills the missing groups (fast resume, but survivorship-biased toward
+    # short rollouts => a dip in mean_gen_tokens_per_sample + reward spike after
+    # each resume). true drops it and regenerates fresh (unbiased, one-target
+    # bubble at resume). See AsyncPPOConfig in nemo_rl/algorithms/ppo.py.
+    drop_incomplete_targets_on_restore: false
     # Heartbeat frequency for the collector/replay-buffer per-rollout progress
     # prints (they flood the log at large num_prompts_per_step). Log every Nth
     # event (plus the final one per target); 0 silences them; unset => every event.

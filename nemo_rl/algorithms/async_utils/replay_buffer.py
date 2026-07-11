@@ -41,7 +41,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int, log_every: Optional[int] = None):
+    def __init__(
+        self,
+        max_size: int,
+        log_every: Optional[int] = None,
+        drop_incomplete_targets_on_restore: bool = False,
+    ):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
@@ -49,6 +54,18 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         # (ppo.async_ppo.log_every). N>0 => every Nth event; 0 => silence; unset
         # (None) => every event (log_every_n == 1, no throttling).
         self._log_every_n = 1 if log_every is None else int(log_every)
+        # How to treat an INCOMPLETE (partially-generated) restored target step on
+        # resume — see _prepare_for_training_step for the full rationale.
+        #   False (default): keep the partial survivors and let the collector
+        #     gap-fill only the missing groups. This is the historical behavior.
+        #   True: drop the incomplete target(s) and regenerate them fresh. Fixes a
+        #     survivorship bias (the partial batch holds only the fast/short
+        #     rollouts that finished before the checkpoint) at the cost of a
+        #     one-target generation bubble per resume.
+        # Configured via YAML (ppo.async_ppo.drop_incomplete_targets_on_restore).
+        self._drop_incomplete_targets_on_restore = bool(
+            drop_incomplete_targets_on_restore
+        )
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -432,15 +449,57 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             "   Complete targets: "
             f"{sorted(complete_targets) if complete_targets else 'none'}"
         )
-        for target in sorted(incomplete_targets):
+
+        # How to handle an INCOMPLETE (partially-generated) restored target. This
+        # matters because a partial (frontier) target in the checkpoint is
+        # SURVIVORSHIP-BIASED toward SHORT responses: the buffer was saved while the
+        # collector was mid-generation, so only the fast-completing (shorter)
+        # rollouts made it in — the slow/long ones were still generating. The first
+        # step trained after each resume then sees a systematically shorter +
+        # higher-reward batch (short math answers score higher), biasing the
+        # critic/policy toward short generations. Complete banked targets are
+        # unbiased either way and are always kept/replayed exactly.
+        #
+        # Two behaviors, selected by drop_incomplete_targets_on_restore (default
+        # False, i.e. the historical behavior):
+        #   * False -> KEEP the partial survivors; the collector gap-fills only the
+        #     missing groups (fast resume, but reintroduces the bias above).
+        #   * True  -> DROP the incomplete target(s) so the collector regenerates
+        #     them from scratch (unbiased batch, at the cost of a one-target
+        #     generation bubble at resume).
+        if incomplete_targets and self._drop_incomplete_targets_on_restore:
             print(
-                f"   Incomplete target {target}: "
-                f"{target_counts[target]}/{num_prompts_per_step}"
+                "   Dropping survivorship-biased incomplete restored target(s) "
+                "(will regenerate fresh): "
+                + ", ".join(
+                    f"{t}={target_counts[t]}/{num_prompts_per_step}"
+                    for t in sorted(incomplete_targets)
+                )
+            )
+            keep = [
+                i
+                for i, t in enumerate(self.target_weight_versions)
+                if t not in incomplete_targets
+            ]
+            self.trajectories = [self.trajectories[i] for i in keep]
+            self.trajectory_versions = [self.trajectory_versions[i] for i in keep]
+            self.target_weight_versions = [
+                self.target_weight_versions[i] for i in keep
+            ]
+        elif incomplete_targets:
+            print(
+                "   Keeping incomplete restored target(s) for gap-fill "
+                "(set ppo.async_ppo.drop_incomplete_targets_on_restore=true to "
+                "regenerate fresh instead): "
+                + ", ".join(
+                    f"{t}={target_counts[t]}/{num_prompts_per_step}"
+                    for t in sorted(incomplete_targets)
+                )
             )
 
-        # Let the collector ask each target from current_step onward how many
-        # trajectories are still needed, so incomplete restored batches can be
-        # gap-filled and complete batches can be skipped.
+        # Collector gap-fills each target from current_step onward: complete
+        # restored batches (and kept incomplete ones) are topped up only by their
+        # missing groups; dropped (incomplete) ones regenerate fully.
         self.last_target_weight_already_generated = current_step - 1
 
     @staticmethod

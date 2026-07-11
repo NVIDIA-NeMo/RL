@@ -125,7 +125,13 @@ class TestReplayBufferImplCheckpointing:
             "max_size": max_size,
         }
 
-    def test_local_restore_prepares_current_step_for_gap_fill(self):
+    def test_local_restore_default_keeps_incomplete_targets_for_gap_fill(self):
+        # DEFAULT behavior (drop_incomplete_targets_on_restore=False): the restored
+        # buffer holds past target 1 (dropped), COMPLETE target 2 (count 2 ==
+        # num_prompts_per_step), and an INCOMPLETE frontier target 3 (count 1 < 2) —
+        # the target the collector was mid-generating when the checkpoint was
+        # written. By default that partial target is KEPT and the collector gap-fills
+        # only the missing group (historical behavior).
         buffer = ReplayBufferImpl(max_size=10)
         state = self._state(
             trajectory_versions=[0, 1, 1, 2],
@@ -139,13 +145,47 @@ class TestReplayBufferImplCheckpointing:
             current_training_step=2,
         )
 
-        assert buffer.get_debug_info()["trajectory_versions"] == [1, 1, 2]
+        # target 1 dropped (past); complete target 2 and the partial target 3 kept.
         assert buffer.get_debug_info()["target_weight_versions"] == [2, 2, 3]
+        assert buffer.get_debug_info()["trajectory_versions"] == [1, 1, 2]
         assert buffer.get_last_target_weight_already_generated() == 1
         assert buffer.has_complete_batch(2, 2)
         assert not buffer.has_complete_batch(3, 2)
         assert buffer.get_trajectories_needed(2, 2) == 0
+        # kept -> only the missing group is gap-filled, not the whole batch.
         assert buffer.get_trajectories_needed(3, 2) == 1
+
+    def test_local_restore_drops_incomplete_targets_for_fresh_regen(self):
+        # With drop_incomplete_targets_on_restore=True: the INCOMPLETE frontier
+        # target 3 (count 1 < 2) is survivorship-biased toward SHORT rollouts (short
+        # responses finish first), so on resume it must be DROPPED and regenerated
+        # fresh, NOT gap-filled from the biased subset (which would train the first
+        # post-resume step on a systematically shorter + higher-reward batch).
+        buffer = ReplayBufferImpl(
+            max_size=10, drop_incomplete_targets_on_restore=True
+        )
+        state = self._state(
+            trajectory_versions=[0, 1, 1, 2],
+            target_weight_versions=[1, 2, 2, 3],
+            last_target_weight_already_generated=3,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=2,
+        )
+
+        # target 1 dropped (past); incomplete target 3 dropped (regenerate fresh);
+        # complete target 2 kept and replayed exactly.
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 2]
+        assert buffer.get_debug_info()["trajectory_versions"] == [1, 1]
+        assert buffer.get_last_target_weight_already_generated() == 1
+        assert buffer.has_complete_batch(2, 2)
+        assert not buffer.has_complete_batch(3, 2)
+        assert buffer.get_trajectories_needed(2, 2) == 0
+        # dropped -> fully regenerated (needs the whole batch), NOT gap-filled (1)
+        assert buffer.get_trajectories_needed(3, 2) == 2
 
     def test_local_restore_empty_state_resets_generation_watermark(self):
         buffer = ReplayBufferImpl(max_size=10)
@@ -820,8 +860,12 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
-    def test_replay_buffer_restore_for_training_step_gap_fill_accounting(self):
-        """Test resume cleanup keeps incomplete future targets for gap filling."""
+    def test_replay_buffer_restore_default_keeps_incomplete_targets(self):
+        """DEFAULT resume cleanup keeps incomplete future targets for gap filling.
+
+        With drop_incomplete_targets_on_restore unset (False), the partial frontier
+        target is kept and the collector gap-fills only the missing group.
+        """
         buffer = ReplayBuffer.remote(max_size=10)
 
         state = {
@@ -846,12 +890,59 @@ class TestReplayBuffer:
         )
 
         debug_info = ray.get(buffer.get_debug_info.remote())
+        # complete target 2 and partial target 3 kept; past target 1 dropped.
         assert debug_info["trajectory_versions"] == [1, 1, 2]
         assert debug_info["target_weight_versions"] == [2, 2, 3]
         assert ray.get(buffer.has_complete_batch.remote(2, 2))
         assert not ray.get(buffer.has_complete_batch.remote(3, 2))
         assert ray.get(buffer.get_trajectories_needed.remote(2, 2)) == 0
+        # kept -> only the missing group is gap-filled.
         assert ray.get(buffer.get_trajectories_needed.remote(3, 2)) == 1
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 1
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_restore_drops_incomplete_targets_when_enabled(self):
+        """With drop_incomplete_targets_on_restore=True, incomplete targets drop.
+
+        The incomplete frontier target the collector was mid-generating at save
+        time is survivorship-biased toward short rollouts, so it is dropped and
+        regenerated rather than gap-filled from the biased subset.
+        """
+        buffer = ReplayBuffer.remote(
+            max_size=10, drop_incomplete_targets_on_restore=True
+        )
+
+        state = {
+            "trajectories": [
+                {"batch": {"data": "past"}},
+                {"batch": {"data": "step2_a"}},
+                {"batch": {"data": "step2_b"}},
+                {"batch": {"data": "step3_a"}},
+            ],
+            "trajectory_versions": [0, 1, 1, 2],
+            "target_weight_versions": [1, 2, 2, 3],
+            "last_target_weight_already_generated": 3,
+            "max_size": 10,
+        }
+
+        ray.get(
+            buffer.load_state_dict.remote(
+                state,
+                num_prompts_per_step=2,
+                current_training_step=2,
+            )
+        )
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        # complete target 2 kept; past target 1 and incomplete target 3 dropped.
+        assert debug_info["trajectory_versions"] == [1, 1]
+        assert debug_info["target_weight_versions"] == [2, 2]
+        assert ray.get(buffer.has_complete_batch.remote(2, 2))
+        assert not ray.get(buffer.has_complete_batch.remote(3, 2))
+        assert ray.get(buffer.get_trajectories_needed.remote(2, 2)) == 0
+        # dropped -> fully regenerated, not gap-filled (would be 1)
+        assert ray.get(buffer.get_trajectories_needed.remote(3, 2)) == 2
         assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 1
 
         ray.kill(buffer)
