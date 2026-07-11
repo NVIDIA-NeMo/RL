@@ -1,0 +1,11 @@
+# Apples-to-apples collective baseline for the EP8 -> TP2 MX target.
+# Uses the same model, trainer/rollout parallelism, batch sizes, and step count;
+# only the weight-sync backend changes.
+
+defaults: grpo_moe_qwen3_30b_ep8_tp2_dynamo_mx.yaml
+
+cluster:
+  weight_sync:
+    method: nccl
+    mx_config:
+      enabled: false
