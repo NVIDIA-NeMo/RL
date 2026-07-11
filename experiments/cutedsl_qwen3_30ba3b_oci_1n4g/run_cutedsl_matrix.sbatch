@@ -64,24 +64,11 @@ exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
 on_exit() {
     local exit_code=$?
     set +e
-    local completion_status=pass
-    if [[ ${exit_code} -ne 0 ]]; then
-        completion_status=fail
-        if ! grep -q '"phase":"root_cause"' "${RESULT_DIR}/events.jsonl"; then
-            cutedsl_write_root_cause \
-                "Run exited with code ${exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}" \
-                "${CUTEDSL_CURRENT_ARTIFACT:-slurm.out}" \
-                "Pending investigation" "pending" "pending"
-        fi
-    fi
-    cutedsl_write_event complete "${completion_status}" "${exit_code}" \
-        "Benchmark payload finished" report.html
-    cutedsl_write_status "${exit_code}"
-    if ! python3 "${EXPERIMENT_DIR}/render_cutedsl_report.py" --run-dir "${RESULT_DIR}"; then
-        echo "[WARN] Failed to render ${RESULT_DIR}/report.html; preserving exit ${exit_code}." >&2
-    fi
+    cutedsl_finalize_run "${exit_code}" "Benchmark payload finished" \
+        "${EXPERIMENT_DIR}/render_cutedsl_report.py"
+    local final_exit_code=$?
     rm -rf --one-file-system -- "${HOST_RUNTIME_DIR}"
-    return "${exit_code}"
+    return "${final_exit_code}"
 }
 trap on_exit EXIT
 
@@ -350,6 +337,26 @@ OmegaConf.save(OmegaConf.create(off_config), result_dir / "effective_config_off.
 )
 
 timing_order = os.environ["TIMING_ORDER"].split(",")
+cluster_config = on_config["cluster"]
+megatron_config = on_config["policy"]["megatron_cfg"]
+topology = {
+    "num_nodes": cluster_config["num_nodes"],
+    "gpus_per_node": cluster_config["gpus_per_node"],
+    "tensor_model_parallel_size": megatron_config["tensor_model_parallel_size"],
+    "pipeline_model_parallel_size": megatron_config["pipeline_model_parallel_size"],
+    "context_parallel_size": megatron_config["context_parallel_size"],
+    "expert_tensor_parallel_size": megatron_config["expert_tensor_parallel_size"],
+    "expert_model_parallel_size": megatron_config["expert_model_parallel_size"],
+}
+assert topology == {
+    "num_nodes": 1,
+    "gpus_per_node": 4,
+    "tensor_model_parallel_size": 1,
+    "pipeline_model_parallel_size": 1,
+    "context_parallel_size": 1,
+    "expert_tensor_parallel_size": 1,
+    "expert_model_parallel_size": 4,
+}, topology
 manifest = {
     "run_id": os.environ["RUN_ID"],
     "cluster_profile": os.environ["CUTEDSL_PROFILE_NAME"],
@@ -366,6 +373,13 @@ manifest = {
     "image": os.environ["IMAGE"],
     "image_sha256": os.environ["IMAGE_SHA256"],
     "recipe": recipe,
+    "scheduler": {
+        "account": os.environ["CUTEDSL_ACCOUNT"],
+        "partition": os.environ["CUTEDSL_PARTITION"],
+        "gres": os.environ["CUTEDSL_GRES"],
+        "segment": os.environ["CUTEDSL_SEGMENT"],
+    },
+    "topology": topology,
     "arms": [
         {"arm": arm, "order_index": order_index}
         for order_index, arm in enumerate(timing_order)

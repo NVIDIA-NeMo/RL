@@ -17,7 +17,7 @@ readonly -a CUTEDSL_REQUIRED_EVENT_PHASES=(
 
 _cutedsl_json_escape() {
     local value=${1-}
-    value=${value//\/\\}
+    value=${value//\\/\\\\}
     value=${value//\"/\\\"}
     value=${value//$'\n'/\\n}
     value=${value//$'\r'/\\r}
@@ -39,6 +39,7 @@ cutedsl_events_init() {
     mkdir -p "${result_dir}"
     CUTEDSL_EVENTS_FILE="${result_dir}/events.jsonl"
     export CUTEDSL_EVENTS_FILE
+    rm -f "${result_dir}/status.json" "${result_dir}/report.html"
     : > "${CUTEDSL_EVENTS_FILE}"
 }
 
@@ -86,12 +87,16 @@ cutedsl_write_root_cause() {
     local root_cause="${3:?cutedsl_write_root_cause requires a root cause}"
     local fix_commit="${4:?cutedsl_write_root_cause requires a fix commit}"
     local verification_job="${5:?cutedsl_write_root_cause requires a verification job}"
+    local reproduction="${6:?cutedsl_write_root_cause requires reproduction evidence}"
+    local hypothesis="${7:?cutedsl_write_root_cause requires a hypothesis}"
+    local tested_change="${8:?cutedsl_write_root_cause requires one tested change}"
+    local verification_evidence="${9:?cutedsl_write_root_cause requires verification evidence}"
     local root_status=resolved
 
     if [[ "${root_cause}" == "Pending investigation" ]]; then
         root_status=pending
     fi
-    printf '{"timestamp_utc":"%s","cluster":"%s","job_id":"%s","phase":"root_cause","status":"%s","exit_code":null,"message":"Root-cause record","artifact":"%s","symptom":"%s","evidence":"%s","root_cause":"%s","fix_commit":"%s","verification_job":"%s"}\n' \
+    printf '{"timestamp_utc":"%s","cluster":"%s","job_id":"%s","phase":"root_cause","status":"%s","exit_code":null,"message":"Root-cause record","artifact":"%s","symptom":"%s","evidence":"%s","root_cause":"%s","fix_commit":"%s","verification_job":"%s","reproduction":"%s","hypothesis":"%s","tested_change":"%s","verification_evidence":"%s"}\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "$(_cutedsl_json_escape "${CUTEDSL_EVENT_CLUSTER:-unknown}")" \
         "$(_cutedsl_json_escape "${CUTEDSL_EVENT_JOB_ID:-unknown}")" \
@@ -102,6 +107,10 @@ cutedsl_write_root_cause() {
         "$(_cutedsl_json_escape "${root_cause}")" \
         "$(_cutedsl_json_escape "${fix_commit}")" \
         "$(_cutedsl_json_escape "${verification_job}")" \
+        "$(_cutedsl_json_escape "${reproduction}")" \
+        "$(_cutedsl_json_escape "${hypothesis}")" \
+        "$(_cutedsl_json_escape "${tested_change}")" \
+        "$(_cutedsl_json_escape "${verification_evidence}")" \
         >> "${CUTEDSL_EVENTS_FILE}"
 }
 
@@ -116,4 +125,71 @@ cutedsl_write_status() {
         "$(_cutedsl_json_escape "${SLURM_JOB_ID:-unknown}")" \
         "${exit_code}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         > "${RESULT_DIR:?RESULT_DIR must be set}/status.json"
+}
+
+_cutedsl_phase_has_terminal_event() {
+    local phase="${1:?phase is required}"
+    grep -Eq \
+        "\"phase\":\"${phase}\".*\"status\":\"(pass|fail|skip)\"" \
+        "${CUTEDSL_EVENTS_FILE}"
+}
+
+cutedsl_finalize_events() {
+    local exit_code="${1:?cutedsl_finalize_events requires an exit code}"
+    local completion_message="${2:?cutedsl_finalize_events requires a message}"
+    local phase
+    local completion_status=pass
+
+    if [[ ${exit_code} -ne 0 ]]; then
+        completion_status=fail
+        if [[ -n "${CUTEDSL_CURRENT_PHASE:-}" ]] && \
+            ! _cutedsl_phase_has_terminal_event "${CUTEDSL_CURRENT_PHASE}"; then
+            cutedsl_write_event "${CUTEDSL_CURRENT_PHASE}" fail "${exit_code}" \
+                "Phase failed before completion" "${CUTEDSL_CURRENT_ARTIFACT:-slurm.out}"
+        fi
+    fi
+
+    for phase in "${CUTEDSL_REQUIRED_EVENT_PHASES[@]}"; do
+        if [[ "${phase}" == "complete" ]]; then
+            continue
+        fi
+        if ! grep -Fq "\"phase\":\"${phase}\"" "${CUTEDSL_EVENTS_FILE}"; then
+            cutedsl_write_event "${phase}" skip 0 "Phase not reached" ''
+        fi
+    done
+    cutedsl_write_event complete "${completion_status}" "${exit_code}" \
+        "${completion_message}" report.html
+}
+
+cutedsl_finalize_run() {
+    local original_exit_code="${1:?cutedsl_finalize_run requires an exit code}"
+    local completion_message="${2:?cutedsl_finalize_run requires a message}"
+    local renderer="${3:?cutedsl_finalize_run requires the renderer path}"
+    local renderer_exit_code=0
+    local final_exit_code=${original_exit_code}
+
+    if [[ ${original_exit_code} -ne 0 ]] && \
+        ! grep -Fq '"phase":"root_cause"' "${CUTEDSL_EVENTS_FILE}"; then
+        cutedsl_write_root_cause \
+            "Run exited with code ${original_exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}" \
+            "${CUTEDSL_CURRENT_ARTIFACT:-slurm.out}" \
+            "Pending investigation" "pending" "pending" \
+            "Pending reproduction" "Pending hypothesis" "Pending tested change" \
+            "Pending verification evidence"
+    fi
+
+    cutedsl_finalize_events "${original_exit_code}" "${completion_message}"
+    cutedsl_write_status "${original_exit_code}"
+    "${CUTEDSL_REPORT_PYTHON:-python3}" "${renderer}" --run-dir "${RESULT_DIR}"
+    renderer_exit_code=$?
+    if [[ ${renderer_exit_code} -ne 0 ]]; then
+        if [[ ${original_exit_code} -eq 0 ]]; then
+            final_exit_code=${renderer_exit_code}
+        fi
+        cutedsl_write_event complete fail "${final_exit_code}" \
+            "Report rendering failed with code ${renderer_exit_code}" \
+            "$(basename "${renderer}")"
+        cutedsl_write_status "${final_exit_code}"
+    fi
+    return "${final_exit_code}"
 }

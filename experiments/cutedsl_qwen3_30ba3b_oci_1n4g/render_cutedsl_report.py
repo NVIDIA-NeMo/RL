@@ -9,7 +9,9 @@ import argparse
 import csv
 import html
 import json
+import posixpath
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +31,21 @@ REQUIRED_PHASES = {
 }
 MAX_EXCERPT_BYTES = 16_384
 MAX_EXCERPT_LINES = 120
-SECRET_PATTERN = re.compile(
-    r"(?i)(authorization|api[_-]?key|password|secret|token)(\s*[:=]\s*).*$"
+SENSITIVE_NAME_PATTERN = re.compile(
+    r"(?i)(?:secret|token|password|passwd|private[_-]?key|api[_-]?key|"
+    r"access[_-]?key|cookie|session|authorization|auth)"
+)
+SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?im)\b([a-z0-9_.-]*(?:secret|token|password|passwd|private[_-]?key|"
+    r"api[_-]?key|access[_-]?key|cookie|session|authorization|auth)"
+    r"[a-z0-9_.-]*)([\"']?\s*[:=]\s*).*$"
+)
+AUTH_VALUE_PATTERN = re.compile(r"(?i)\b(Bearer|Basic)\s+\S+")
+URL_USERINFO_PATTERN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+REFRESH_COMMAND = (
+    "uv run --no-project python "
+    "experiments/cutedsl_qwen3_30ba3b_oci_1n4g/render_cutedsl_report.py "
+    "--refresh-experiment-dir experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
 )
 STYLE = """
 :root { color-scheme: light; --ink:#182433; --muted:#607184; --line:#d9e1e8;
@@ -57,8 +72,36 @@ a { color:var(--accent); } .timeline { border-left:3px solid var(--line); margin
 """
 
 
+def redact_text(value: str) -> str:
+    """Redact concrete common credential forms from display text."""
+    redacted = URL_USERINFO_PATTERN.sub(r"\1[REDACTED]@", value)
+    redacted = AUTH_VALUE_PATTERN.sub(r"\1 [REDACTED]", redacted)
+    return SECRET_ASSIGNMENT_PATTERN.sub(r"\1\2[REDACTED]", redacted)
+
+
+def redact_value(value: Any) -> Any:
+    """Recursively redact sensitive mapping keys and credential-bearing text."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[REDACTED]"
+                if SENSITIVE_NAME_PATTERN.search(str(key))
+                else redact_value(child)
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_value(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(redact_value(child) for child in value)
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
 def escape(value: Any) -> str:
-    """Return an HTML-safe string for an artifact value."""
+    """Redact and return an HTML-safe string for an artifact value."""
+    value = redact_value(value)
     if value is None:
         return "—"
     if isinstance(value, (dict, list)):
@@ -117,7 +160,19 @@ def artifact_link(path: str | None, label: str | None = None) -> str:
     """Render a safe local artifact link, or an em dash when absent."""
     if not path:
         return "—"
-    if Path(path).is_absolute() or ":" in path.partition("/")[0]:
+    redacted_path = redact_text(path)
+    normalized = posixpath.normpath(path)
+    is_descendant = (
+        redacted_path == path
+        and "\\" not in path
+        and not any(character in path for character in ("%", "?", "#"))
+        and not Path(path).is_absolute()
+        and ":" not in path.partition("/")[0]
+        and normalized == path
+        and normalized not in {"", "."}
+        and ".." not in Path(path).parts
+    )
+    if not is_descendant:
         return f"<code>{escape(path)}</code>"
     return f'<a href="{escape(path)}">{escape(label or path)}</a>'
 
@@ -136,7 +191,7 @@ def read_bounded_excerpt(path: Path) -> str:
     if size > MAX_EXCERPT_BYTES and "\n" in text:
         text = text.split("\n", 1)[1]
     lines = text.splitlines()[-MAX_EXCERPT_LINES:]
-    redacted = [SECRET_PATTERN.sub(r"\1\2[REDACTED]", line) for line in lines]
+    redacted = [redact_text(line) for line in lines]
     return "\n".join(redacted)
 
 
@@ -153,6 +208,9 @@ def summary_cards(
     )
     image = metadata.get("image", {}) if isinstance(metadata.get("image"), dict) else {}
     slurm = metadata.get("slurm", {}) if isinstance(metadata.get("slurm"), dict) else {}
+    scheduler = slurm
+    if not scheduler and isinstance(manifest.get("scheduler"), dict):
+        scheduler = manifest["scheduler"]
     config = (
         run.get("effective_config", {})
         if isinstance(run.get("effective_config"), dict)
@@ -160,6 +218,34 @@ def summary_cards(
     )
     nodes = nested(config, "cluster", "num_nodes", default=1)
     gpus = nested(config, "cluster", "gpus_per_node", default=4)
+    manifest_topology = (
+        manifest.get("topology", {})
+        if isinstance(manifest.get("topology"), dict)
+        else {}
+    )
+    nodes = manifest_topology.get("num_nodes", nodes)
+    gpus = manifest_topology.get("gpus_per_node", gpus)
+    megatron_config = nested(config, "policy", "megatron_cfg", default={})
+    topology = manifest_topology or (
+        megatron_config if isinstance(megatron_config, dict) else {}
+    )
+    topology_label = " / ".join(
+        [
+            f"TP{topology.get('tensor_model_parallel_size', '?')}",
+            f"PP{topology.get('pipeline_model_parallel_size', '?')}",
+            f"CP{topology.get('context_parallel_size', '?')}",
+            f"ETP{topology.get('expert_tensor_parallel_size', '?')}",
+            f"EP{topology.get('expert_model_parallel_size', '?')}",
+        ]
+    )
+    scheduler_parts = [
+        str(scheduler.get("account", "unknown")),
+        str(scheduler.get("partition", "unknown")),
+    ]
+    if scheduler.get("gres"):
+        scheduler_parts.append(f"gres={scheduler['gres']}")
+    if scheduler.get("segment"):
+        scheduler_parts.append(f"segment={scheduler['segment']}")
     feature_cell = nested(
         config,
         "policy",
@@ -181,7 +267,7 @@ def summary_cards(
         ),
         (
             "Scheduler",
-            f"{escape(slurm.get('account', 'unknown'))} / {escape(slurm.get('partition', 'unknown'))}",
+            escape(" / ".join(scheduler_parts)),
         ),
         (
             "Job",
@@ -197,7 +283,7 @@ def summary_cards(
         ),
         (
             "Model / topology",
-            f"Qwen3 30B-A3B · {escape(nodes)} node · {escape(gpus)} GPUs",
+            f"Qwen3 30B-A3B · {escape(nodes)} node · {escape(gpus)} GPUs · {escape(topology_label)}",
         ),
         ("Feature cell", escape(feature_cell)),
     ]
@@ -282,12 +368,33 @@ def root_cause_section(events: list[dict[str, Any]], failed: bool) -> str:
             f"<td>{escape(record.get('root_cause'))}</td>"
             f"<td>{escape(record.get('fix_commit'))}</td>"
             f"<td>{escape(record.get('verification_job'))}</td>"
+            f"<td>{escape(record.get('reproduction'))}</td>"
+            f"<td>{escape(record.get('hypothesis'))}</td>"
+            f"<td>{escape(record.get('tested_change'))}</td>"
+            f"<td>{escape(record.get('verification_evidence'))}</td>"
             "</tr>"
         )
     return (
         "<h2>Root cause</h2><table><thead><tr><th>Symptom</th><th>Boundary evidence</th>"
-        "<th>Root cause / one fix</th><th>Fix commit</th><th>Verification job</th></tr></thead>"
+        "<th>Root cause / one fix</th><th>Fix commit</th><th>Verification job</th>"
+        "<th>Reproduction</th><th>Hypothesis</th><th>Tested change</th>"
+        "<th>Verification evidence</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def completeness_section(events: list[dict[str, Any]]) -> str:
+    """Render whether every required phase has at least one event record."""
+    observed = {str(event.get("phase")) for event in events}
+    missing = sorted(REQUIRED_PHASES - observed)
+    if missing:
+        return (
+            '<h2>Evidence completeness</h2><p><span class="badge fail">INCOMPLETE</span> '
+            f"Missing phases: {escape(', '.join(missing))}</p>"
+        )
+    return (
+        '<h2>Evidence completeness</h2><p><span class="badge pass">COMPLETE</span> '
+        "Every required phase is recorded.</p>"
     )
 
 
@@ -373,6 +480,7 @@ def render_run(run_dir: Path) -> Path:
             timing_section(timing, metrics),
             profile_section(run_dir, metrics),
             root_cause_section(events, failed),
+            completeness_section(events),
             timeline_section(events),
             excerpt_section,
             reproducibility_section(run_dir, metadata, manifest, events),
@@ -410,6 +518,131 @@ def read_run_index(path: Path) -> list[dict[str, str]]:
         return []
 
 
+def feature_cell(metadata: dict[str, Any], manifest: dict[str, Any]) -> str:
+    """Return a compact feature-cell label for the aggregate run index."""
+    config = nested(metadata, "run", "effective_config", default={})
+    value = nested(
+        config if isinstance(config, dict) else {},
+        "policy",
+        "megatron_cfg",
+        "env_vars",
+        "NVTE_CUTEDSL_FUSED_GROUPED_MLP",
+        default=manifest.get("timing_order", "unknown"),
+    )
+    if isinstance(value, list):
+        return ",".join(str(item) for item in value)
+    return str(value)
+
+
+def refresh_aggregate(experiment_dir: Path) -> Path:
+    """Discover completed runs and deterministically rebuild aggregate evidence."""
+    report_dir = experiment_dir / "report"
+    public_runs_dir = report_dir / "public/runs"
+    if public_runs_dir.exists():
+        shutil.rmtree(public_runs_dir)
+    rows: list[dict[str, str]] = []
+    incidents: list[dict[str, Any]] = []
+    incident_fields = [
+        "timestamp_utc",
+        "symptom",
+        "evidence",
+        "root_cause",
+        "fix_commit",
+        "verification_job",
+        "reproduction",
+        "hypothesis",
+        "tested_change",
+        "verification_evidence",
+    ]
+
+    for category in ("results", "benchmark_results"):
+        category_dir = experiment_dir / category
+        if not category_dir.is_dir():
+            continue
+        for run_dir in sorted(path for path in category_dir.iterdir() if path.is_dir()):
+            if not (run_dir / "status.json").is_file():
+                continue
+            status = read_json(run_dir / "status.json")
+            metadata = read_json(run_dir / "metadata.json")
+            manifest = read_json(run_dir / "benchmark_manifest.json")
+            events = read_events(run_dir / "events.jsonl")
+            rendered = render_run(run_dir)
+            public_relative = Path("runs") / category / run_dir.name / "report.html"
+            public_copy = report_dir / "public" / public_relative
+            public_copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(rendered, public_copy)
+
+            run_id = str(
+                status.get(
+                    "run_id",
+                    nested(
+                        metadata,
+                        "run",
+                        "run_id",
+                        default=manifest.get("run_id", run_dir.name),
+                    ),
+                )
+            )
+            cluster = str(
+                nested(
+                    metadata,
+                    "run",
+                    "cluster_profile",
+                    default=manifest.get("cluster_profile", "unknown"),
+                )
+            )
+            row = {
+                "run_id": redact_text(run_id),
+                "report_path": public_relative.as_posix(),
+                "status": "PASS" if status.get("exit_code") == 0 else "FAIL",
+                "cluster": redact_text(cluster),
+                "feature_cell": redact_text(feature_cell(metadata, manifest)),
+            }
+            rows.append(row)
+            for event in events:
+                if event.get("phase") != "root_cause":
+                    continue
+                incident = {
+                    field: redact_value(event.get(field)) for field in incident_fields
+                }
+                incident.update(
+                    {
+                        "run_id": row["run_id"],
+                        "report_path": row["report_path"],
+                        "cluster": row["cluster"],
+                    }
+                )
+                incidents.append(incident)
+
+    rows.sort(key=lambda row: (row["run_id"], row["report_path"]))
+    report_dir.mkdir(parents=True, exist_ok=True)
+    with (report_dir / "run_index.tsv").open("w", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=[
+                "run_id",
+                "report_path",
+                "status",
+                "cluster",
+                "feature_cell",
+            ],
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    incidents.sort(
+        key=lambda incident: (
+            str(incident.get("timestamp_utc", "")),
+            str(incident.get("run_id", "")),
+        )
+    )
+    (report_dir / "incidents.json").write_text(
+        json.dumps(incidents, indent=2, sort_keys=True) + "\n"
+    )
+    return render_aggregate(report_dir)
+
+
 def render_aggregate(report_dir: Path) -> Path:
     """Render the committed aggregate index from incidents and run-index data."""
     incidents = sorted(
@@ -432,10 +665,13 @@ def render_aggregate(report_dir: Path) -> Path:
             "<tr>"
             f"<td>{escape(item.get('timestamp_utc'))}</td><td>{escape(item.get('symptom'))}</td>"
             f"<td>{escape(item.get('evidence'))}</td><td>{escape(item.get('root_cause'))}</td>"
-            f"<td>{escape(item.get('fix_commit'))}</td><td>{escape(item.get('verification_job'))}</td></tr>"
+            f"<td>{escape(item.get('fix_commit'))}</td><td>{escape(item.get('verification_job'))}</td>"
+            f"<td>{escape(item.get('reproduction'))}</td><td>{escape(item.get('hypothesis'))}</td>"
+            f"<td>{escape(item.get('tested_change'))}</td>"
+            f"<td>{escape(item.get('verification_evidence'))}</td></tr>"
             for item in incidents
         )
-        or '<tr><td colspan="6" class="muted">No incidents recorded yet.</td></tr>'
+        or '<tr><td colspan="10" class="muted">No incidents recorded yet.</td></tr>'
     )
     body = (
         "<h1>CuTeDSL experiment report</h1>"
@@ -444,7 +680,12 @@ def render_aggregate(report_dir: Path) -> Path:
         f"<th>Cluster</th><th>Feature cell</th><th>Reproducibility</th></tr></thead><tbody>{run_rows}</tbody></table>"
         "<h2>Root-cause timeline</h2><table><thead><tr><th>Time</th><th>Symptom</th>"
         "<th>Boundary evidence</th><th>Root cause / one fix</th><th>Fix commit</th>"
-        f"<th>Verification job</th></tr></thead><tbody>{incident_rows}</tbody></table>"
+        "<th>Verification job</th><th>Reproduction</th><th>Hypothesis</th>"
+        "<th>Tested change</th><th>Verification evidence</th></tr></thead>"
+        f"<tbody>{incident_rows}</tbody></table>"
+        "<h2>Refresh aggregate</h2><p>After completed result directories are collected, "
+        "run this explicit deterministic refresh. Scheduled payloads do not mutate tracked "
+        f"aggregate files.</p><pre>{escape(REFRESH_COMMAND)}</pre>"
     )
     output = report_dir / "public/index.html"
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -463,6 +704,11 @@ def parse_args() -> argparse.Namespace:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--run-dir", type=Path)
     group.add_argument("--report-dir", type=Path)
+    group.add_argument(
+        "--refresh-experiment-dir",
+        type=Path,
+        help="discover completed runs and rebuild TSV, incidents JSON, and aggregate HTML",
+    )
     return parser.parse_args()
 
 
@@ -471,8 +717,10 @@ def main() -> int:
     args = parse_args()
     if args.run_dir is not None:
         render_run(args.run_dir)
-    else:
+    elif args.report_dir is not None:
         render_aggregate(args.report_dir)
+    else:
+        refresh_aggregate(args.refresh_experiment_dir)
     return 0
 
 

@@ -71,24 +71,11 @@ exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
 on_exit() {
     local exit_code=$?
     set +e
-    local completion_status=pass
-    if [[ ${exit_code} -ne 0 ]]; then
-        completion_status=fail
-        if ! grep -q '"phase":"root_cause"' "${RESULT_DIR}/events.jsonl"; then
-            cutedsl_write_root_cause \
-                "Run exited with code ${exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}" \
-                "${CUTEDSL_CURRENT_ARTIFACT:-slurm.out}" \
-                "Pending investigation" "pending" "pending"
-        fi
-    fi
-    cutedsl_write_event complete "${completion_status}" "${exit_code}" \
-        "Functional payload finished" report.html
-    cutedsl_write_status "${exit_code}"
-    if ! python3 "${EXPERIMENT_DIR}/render_cutedsl_report.py" --run-dir "${RESULT_DIR}"; then
-        echo "[WARN] Failed to render ${RESULT_DIR}/report.html; preserving exit ${exit_code}." >&2
-    fi
+    cutedsl_finalize_run "${exit_code}" "Functional payload finished" \
+        "${EXPERIMENT_DIR}/render_cutedsl_report.py"
+    local final_exit_code=$?
     rm -rf --one-file-system -- "${HOST_RUNTIME_DIR}"
-    return "${exit_code}"
+    return "${final_exit_code}"
 }
 trap on_exit EXIT
 
