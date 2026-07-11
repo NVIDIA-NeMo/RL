@@ -758,8 +758,9 @@ class StubReplayBuffer:
         """Return a mock that reports whether the current step can train."""
         mock = MagicMock()
         mock.remote = MagicMock(
-            side_effect=lambda _target_step, num_prompts_per_step, *_args: self._size
-            >= num_prompts_per_step
+            side_effect=lambda _target_step, num_prompts_per_step, *_args: (
+                self._size >= num_prompts_per_step
+            )
         )
         return mock
 
@@ -1884,12 +1885,12 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
     checkpointer = mock_grpo_components["checkpointer"]
 
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_epochs"] = 1
-    master_config.grpo["max_num_steps"] = 100
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["val_at_start"] = False
-    master_config.grpo["val_at_end"] = False
-    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.max_num_steps = 100
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
     master_config.checkpointing["enabled"] = True
     master_config.checkpointing["save_period"] = 1000
     master_config.checkpointing["metric_name"] = None

@@ -15,7 +15,7 @@
 import asyncio
 import copy
 import json
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -38,6 +38,14 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+def _percentile(values: Sequence[float | int], percentile: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    index = min(int(len(sorted_values) * percentile / 100), len(sorted_values) - 1)
+    return float(sorted_values[index])
 
 
 class AsyncRolloutImpl:
@@ -257,6 +265,7 @@ class AsyncRolloutImpl:
             "turn_gen_tokens": turn_gen_tokens,
             "turn_input_tokens": turn_input_tokens,
             "turn_total_tokens": turn_total_tokens,
+            "max_gen_tokens_per_turn": max(turn_gen_tokens, default=0),
             "per_worker_token_counts": per_worker_token_counts,
         }
         return completion, sample_metrics
@@ -332,6 +341,9 @@ class AsyncRolloutImpl:
         total_tokens = [m["total_tokens"] for m in all_sample_metrics]
         assistant_tokens = [m["assistant_tokens"] for m in all_sample_metrics]
         env_tokens = [m["env_tokens"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
         # truncated metrics
         truncated = [c.truncated for c in completions]
         terminated = [m["terminated"] for m in all_sample_metrics]
@@ -344,9 +356,17 @@ class AsyncRolloutImpl:
             # turn metrics
             "total_turns": sum(turn_count),
             **_calculate_single_metric(turn_count, n, "turns_per_sample"),
+            "turns_per_sample/p95": _percentile(turn_count, 95),
+            "turns_per_sample/p99": _percentile(turn_count, 99),
             # token metrics
             **_calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
             **_calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            **_calculate_single_metric(
+                max_gen_tokens_per_turn_values, n, "max_gen_tokens_per_turn"
+            ),
+            "max_gen_tokens_per_turn/p95": _percentile(
+                max_gen_tokens_per_turn_values, 95
+            ),
             **_calculate_single_metric(env_tokens, n, "env_tokens_per_sample"),
             # truncated metrics
             "truncation_rate": sum(truncated) / n,
@@ -542,6 +562,17 @@ class AsyncNemoGymRolloutImpl:
             sum(len(m["token_ids"]) for m in c.message_log if m["role"] == "assistant")
             for c in completions
         ]
+        max_gen_tokens_per_turn_values = [
+            max(
+                (
+                    len(message["token_ids"])
+                    for message in completion.message_log
+                    if message["role"] == "assistant"
+                ),
+                default=0,
+            )
+            for completion in completions
+        ]
         # truncated metrics
         truncated = [c.truncated for c in completions]
 
@@ -551,9 +582,17 @@ class AsyncNemoGymRolloutImpl:
             **_calculate_single_metric(total_reward, n, "total_reward"),
             # turn metrics
             **_calculate_single_metric(turn_count, n, "turns_per_sample"),
+            "turns_per_sample/p95": _percentile(turn_count, 95),
+            "turns_per_sample/p99": _percentile(turn_count, 99),
             # token metrics
             **_calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
             **_calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            **_calculate_single_metric(
+                max_gen_tokens_per_turn_values, n, "max_gen_tokens_per_turn"
+            ),
+            "max_gen_tokens_per_turn/p95": _percentile(
+                max_gen_tokens_per_turn_values, 95
+            ),
             # truncated metrics
             "natural_termination_rate": sum(not t for t in truncated) / n,
             "truncation_rate": sum(truncated) / n,
