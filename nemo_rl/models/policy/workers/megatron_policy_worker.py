@@ -366,7 +366,7 @@ class MegatronPolicyWorkerImpl(
         self.sampling_params = runtime_config.sampling_params
         generation_config = self.cfg.get("generation")
         delta_config = None
-        if generation_config is not None and generation_config["backend"] == "vllm":
+        if generation_config and generation_config.get("refit_transport") is not None:
             delta_config = cast(VllmConfig, generation_config).get("delta_compression")
         self._remote_sparse_refit = None
         if delta_config:

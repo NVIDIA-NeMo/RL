@@ -39,11 +39,33 @@ from nemo_rl.utils.weight_transfer_zmq import (
 )
 
 
+class _SparsePipelineTracker:
+    sparse_bucket_size_bytes = 1
+
+    @staticmethod
+    def prepare_sparse_delta_payload(chunk):
+        return (chunk, torch.ones(1), [1]), 1, 1
+
+
+def _stream_sparse_test_payloads(tensors, send_payload):
+    return weight_transfer_remote_sparse.stream_sparse_delta_payloads(
+        tensors,
+        delta_tracker=_SparsePipelineTracker(),
+        transport="zmq",
+        send_payload=send_payload,
+        transfer_workers=1,
+        shard_rank=0,
+        shard_count=1,
+    )
+
+
+def _delta_tracker() -> DeltaCompressionTracker:
+    return DeltaCompressionTracker({"dtype": "bf16", "sparse_bucket_size_bytes": 1024})
+
+
 def test_delta_tracker_commits_only_successful_syncs(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
-    tracker = DeltaCompressionTracker(
-        {"dtype": "bf16", "sparse_bucket_size_bytes": 1024}
-    )
+    tracker = _delta_tracker()
     tensor = torch.tensor([1.0, 2.0, 3.0])
     tracker.snapshot_baseline([("weight", tensor)])
     tensor[1] += 4
@@ -58,9 +80,7 @@ def test_delta_tracker_commits_only_successful_syncs(monkeypatch) -> None:
 def test_delta_tracker_emits_bounded_delta_samples(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
     monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
-    tracker = DeltaCompressionTracker(
-        {"dtype": "bf16", "sparse_bucket_size_bytes": 1024}
-    )
+    tracker = _delta_tracker()
     tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
     tracker.snapshot_baseline([("weight", tensor)])
     tensor[[1, 3]] += 1
@@ -76,9 +96,7 @@ def test_delta_tracker_emits_bounded_delta_samples(monkeypatch) -> None:
 
 def test_delta_tracker_commits_quantized_receiver_baseline(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
-    tracker = DeltaCompressionTracker(
-        {"dtype": "bf16", "sparse_bucket_size_bytes": 1024}
-    )
+    tracker = _delta_tracker()
     tensor = torch.tensor([1.0])
     tracker.snapshot_baseline([("weight", tensor)])
     tensor.add_(0.001)
@@ -141,13 +159,6 @@ def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
     release_transfers = threading.Event()
     result = []
 
-    class Tracker:
-        sparse_bucket_size_bytes = 1
-
-        @staticmethod
-        def prepare_sparse_delta_payload(chunk):
-            return (chunk, torch.ones(1), [1]), 1, 1
-
     def tensors():
         for index in range(4):
             yield f"weight-{index}", torch.ones(1)
@@ -158,17 +169,7 @@ def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
         return {"receiver": {}}
 
     def run():
-        result.append(
-            weight_transfer_remote_sparse.stream_sparse_delta_payloads(
-                tensors(),
-                delta_tracker=Tracker(),
-                transport="zmq",
-                send_payload=send_payload,
-                transfer_workers=1,
-                shard_rank=0,
-                shard_count=1,
-            )
-        )
+        result.append(_stream_sparse_test_payloads(tensors(), send_payload))
 
     thread = threading.Thread(target=run)
     thread.start()
@@ -187,13 +188,6 @@ def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
     exported = []
 
-    class Tracker:
-        sparse_bucket_size_bytes = 1
-
-        @staticmethod
-        def prepare_sparse_delta_payload(chunk):
-            return (chunk, torch.ones(1), [1]), 1, 1
-
     def tensors():
         for index in range(4):
             exported.append(index)
@@ -203,15 +197,7 @@ def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
         raise RuntimeError("transfer failed")
 
     with pytest.raises(RuntimeError, match="transfer failed"):
-        weight_transfer_remote_sparse.stream_sparse_delta_payloads(
-            tensors(),
-            delta_tracker=Tracker(),
-            transport="zmq",
-            send_payload=fail_transfer,
-            transfer_workers=1,
-            shard_rank=0,
-            shard_count=1,
-        )
+        _stream_sparse_test_payloads(tensors(), fail_transfer)
 
     assert exported == list(range(4))
 
@@ -483,47 +469,21 @@ def test_zmq_server_rejects_malformed_messages() -> None:
         "checksum": sparse_payload_checksum(body),
     }
 
-    with pytest.raises(ValueError, match="Expected 4"):
-        server._parse_data_message([])
-    with pytest.raises(ValueError, match="Unsupported ZeroMQ sparse refit message"):
-        server._parse_data_message(
-            [b"id", b"OTHER", json.dumps(metadata).encode(), body]
-        )
-    with pytest.raises(ValueError, match="protocol"):
-        server._parse_data_message(
-            [
-                b"id",
-                b"DATA",
-                json.dumps({**metadata, "protocol": "other"}).encode(),
-                body,
-            ]
-        )
-    with pytest.raises(PermissionError, match="authentication"):
-        server._parse_data_message(
-            [
-                b"id",
-                b"DATA",
-                json.dumps({**metadata, "api_key": "wrong"}).encode(),
-                body,
-            ]
-        )
-    with pytest.raises(ValueError, match="identity"):
-        server._parse_data_message(
-            [b"id", b"DATA", json.dumps({**metadata, "transfer_id": ""}).encode(), body]
-        )
-    with pytest.raises(ValueError, match="checksum mismatch"):
-        server._parse_data_message(
-            [
-                b"id",
-                b"DATA",
-                json.dumps({**metadata, "checksum": "wrong"}).encode(),
-                body,
-            ]
-        )
+    def frames(kind: bytes = b"DATA", **updates: object) -> list[bytes]:
+        return [b"id", kind, json.dumps({**metadata, **updates}).encode(), body]
 
-    assert server._parse_data_message(
-        [b"id", b"DATA", json.dumps(metadata).encode(), body]
-    )[1] == ("transfer", 0, 1)
+    for message, error, match in (
+        ([], ValueError, "Expected 4"),
+        (frames(b"OTHER"), ValueError, "Unsupported ZeroMQ sparse refit message"),
+        (frames(protocol="other"), ValueError, "protocol"),
+        (frames(api_key="wrong"), PermissionError, "authentication"),
+        (frames(transfer_id=""), ValueError, "identity"),
+        (frames(checksum="wrong"), ValueError, "checksum mismatch"),
+    ):
+        with pytest.raises(error, match=match):
+            server._parse_data_message(message)
+
+    assert server._parse_data_message(frames())[1] == ("transfer", 0, 1)
 
 
 def _receiver_server(received):

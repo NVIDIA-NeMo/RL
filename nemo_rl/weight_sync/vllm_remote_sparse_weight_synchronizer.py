@@ -16,13 +16,17 @@
 
 import time
 import uuid
+from collections import defaultdict
 from contextlib import nullcontext, suppress
 from typing import Any
 
 import ray
 
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.weight_transfer_remote_sparse import flush_vllm_refit_urls
+from nemo_rl.utils.weight_transfer_remote_sparse import (
+    flush_vllm_refit_urls,
+    merge_vllm_refit_metrics,
+)
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
@@ -66,13 +70,13 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         self._policy = policy
         self._generation = generation
         self._transport = transport
-        self._refit_urls: list[str] = []
-        self._targets: list[str] = []
         self._api_key_env_var = api_key_env_var
         self._request_timeout_s = request_timeout_s
+        self._refit_urls: list[str] = []
+        self._targets: list[str] = []
+        self._baseline_init_refs: list[Any] = []
+        self._baseline_commit_refs: list[Any] = []
         self._stale = True
-        self._baseline_init_refs: list[Any] | None = None
-        self._baseline_commit_refs: list[Any] | None = None
 
     def sync_weights(
         self,
@@ -80,94 +84,75 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         timer: Timer | None = None,
         kv_scales: dict[str, float] | None = None,
     ) -> dict[str, float]:
-        timer_context = (
+        context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
-            if timer is not None
+            if timer
             else nullcontext()
         )
-        with timer_context:
-            if self._baseline_commit_refs is not None:
+        with context:
+            if self._baseline_commit_refs:
                 ray.get(self._baseline_commit_refs)
-                self._baseline_commit_refs = None
+                self._baseline_commit_refs.clear()
             if not self._generation.invalidate_kv_cache():
                 raise RuntimeError(
                     f"vLLM KV cache invalidation failed before {self._transport} "
                     "weight update."
                 )
-
-            if self._baseline_init_refs is not None:
+            if self._baseline_init_refs:
                 ray.get(self._baseline_init_refs)
-                self._baseline_init_refs = None
+                self._baseline_init_refs.clear()
+
             succeeded = False
             try:
                 transfer_id = uuid.uuid4().hex
-                refs = self._run_policy_workers(
-                    "stream_remote_sparse_weights",
-                    transport=self._transport,
-                    targets=self._targets,
-                    transfer_id=transfer_id,
-                    api_key_env_var=self._api_key_env_var,
-                    timeout_s=self._request_timeout_s,
-                )
-                results = ray.get(refs)
-                payloads = sum(result["payloads"] for result in results)
-                changed_elements = sum(result["changed_elements"] for result in results)
-                total_elements = sum(result["total_elements"] for result in results)
-                changed_pct = 100.0 * changed_elements / max(total_elements, 1)
-                print(
-                    f"REFIT_{self._transport.upper()}_DELTA_CHANGE "
-                    f"changed_elements={changed_elements} "
-                    f"total_elements={total_elements} "
-                    f"changed_pct={changed_pct:.8g}",
-                    flush=True,
-                )
-                candidates = 0
-                samples = 0
-                exact_mismatches = 0
-                mismatches = 0
-                abs_sum = 0.0
-                max_abs = 0.0
-                commit_s = 0.0
-                if payloads:
-                    started = time.perf_counter()
-                    receiver_results = flush_vllm_refit_urls(
-                        self._refit_urls,
+                results = ray.get(
+                    self._run_policy_workers(
+                        "stream_remote_sparse_weights",
+                        transport=self._transport,
+                        targets=self._targets,
+                        transfer_id=transfer_id,
                         api_key_env_var=self._api_key_env_var,
                         timeout_s=self._request_timeout_s,
                     )
-                    candidates = sum(
-                        int(result.get("verification_candidates", 0))
-                        for result in receiver_results
+                )
+                payloads = sum(result["payloads"] for result in results)
+                changed = sum(result["changed_elements"] for result in results)
+                total = sum(result["total_elements"] for result in results)
+                changed_pct = 100.0 * changed / max(total, 1)
+                print(
+                    f"REFIT_{self._transport.upper()}_DELTA_CHANGE "
+                    f"changed_elements={changed} total_elements={total} "
+                    f"changed_pct={changed_pct:.8g}",
+                    flush=True,
+                )
+
+                verification: defaultdict[str, float] = defaultdict(float)
+                commit_s = 0.0
+                if payloads:
+                    started = time.perf_counter()
+                    verification.update(
+                        merge_vllm_refit_metrics(
+                            {},
+                            flush_vllm_refit_urls(
+                                self._refit_urls,
+                                api_key_env_var=self._api_key_env_var,
+                                timeout_s=self._request_timeout_s,
+                            ),
+                            maximum=True,
+                            candidate_maximum=False,
+                        )
                     )
-                    samples = sum(
-                        int(result.get("verification_samples", 0))
-                        for result in receiver_results
-                    )
-                    exact_mismatches = sum(
-                        int(result.get("verification_exact_mismatches", 0))
-                        for result in receiver_results
-                    )
-                    mismatches = sum(
-                        int(result.get("verification_mismatches", 0))
-                        for result in receiver_results
-                    )
-                    abs_sum = sum(
-                        float(result.get("verification_abs_sum", 0.0))
-                        for result in receiver_results
-                    )
-                    max_abs = max(
-                        (
-                            float(result.get("verification_max_abs", 0.0))
-                            for result in receiver_results
-                        ),
-                        default=0.0,
-                    )
+                    candidates = int(verification["verification_candidates"])
+                    samples = int(verification["verification_samples"])
+                    exact = int(verification["verification_exact_mismatches"])
+                    mismatches = int(verification["verification_mismatches"])
+                    abs_sum = float(verification["verification_abs_sum"])
+                    max_abs = float(verification["verification_max_abs"])
                     if candidates or samples:
                         print(
                             f"REFIT_{self._transport.upper()}_DELTA_VERIFY "
                             f"candidates={candidates} samples={samples} "
-                            f"exact_mismatches={exact_mismatches} "
-                            f"mismatches={mismatches} "
+                            f"exact_mismatches={exact} mismatches={mismatches} "
                             f"mean_abs={abs_sum / max(samples, 1):.8g} "
                             f"max_abs={max_abs:.8g}",
                             flush=True,
@@ -195,25 +180,36 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                         )
                 self._baseline_commit_refs = (
                     self._policy.worker_group.run_all_workers_single_data(
-                        "finish_remote_sparse_delta_sync",
-                        succeeded=succeeded,
+                        "finish_remote_sparse_delta_sync", succeeded=succeeded
                     )
                 )
+
         self._stale = False
-        return {
-            "delta/changed_elements": float(changed_elements),
-            "delta/total_elements": float(total_elements),
+        samples = int(verification["verification_samples"])
+        mismatches = int(verification["verification_mismatches"])
+        metrics = {
+            "delta/changed_elements": float(changed),
+            "delta/total_elements": float(total),
             "delta/changed_pct": changed_pct,
-            "delta_verify/candidates": float(candidates),
-            "delta_verify/samples": float(samples),
-            "delta_verify/exact_mismatches": float(exact_mismatches),
-            "delta_verify/mismatches": float(mismatches),
             "delta_verify/mismatch_pct": 100.0 * mismatches / max(samples, 1),
-            "delta_verify/mean_abs": abs_sum / max(samples, 1),
-            "delta_verify/max_abs": max_abs,
+            "delta_verify/mean_abs": float(verification["verification_abs_sum"])
+            / max(samples, 1),
             "transfer/payloads": float(payloads),
             "transfer/global_commit_s": commit_s,
         }
+        metrics.update(
+            {
+                f"delta_verify/{key}": float(verification[f"verification_{key}"])
+                for key in (
+                    "candidates",
+                    "samples",
+                    "exact_mismatches",
+                    "mismatches",
+                    "max_abs",
+                )
+            }
+        )
+        return metrics
 
     @property
     def is_stale(self) -> bool:
@@ -223,20 +219,18 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         self._stale = True
 
     def _run_policy_workers(self, method_name: str, **kwargs: Any) -> list[Any]:
-        worker_group = self._policy.worker_group
-        worker_count = len(worker_group.workers)
-        return worker_group.run_all_workers_multiple_data(
+        workers = self._policy.worker_group
+        count = len(workers.workers)
+        return workers.run_all_workers_multiple_data(
             method_name,
-            common_kwargs={**kwargs, "shard_count": worker_count},
-            shard_rank=list(range(worker_count)),
+            common_kwargs={**kwargs, "shard_count": count},
+            shard_rank=list(range(count)),
         )
 
     def _run_generation_workers(self, method_name: str, **kwargs: Any) -> list[Any]:
-        worker_group = self._generation.worker_group
-        if not worker_group or not worker_group.workers:
-            raise RuntimeError("vLLM worker group is not initialized.")
+        workers = self._generation.worker_group
         return ray.get(
-            worker_group.run_all_workers_single_data(
+            workers.run_all_workers_single_data(
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
                 **kwargs,
@@ -245,8 +239,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
 
     def init_communicator(self) -> None:
         self._baseline_init_refs = self._run_policy_workers(
-            "init_remote_sparse_delta_baseline",
-            transport=self._transport,
+            "init_remote_sparse_delta_baseline", transport=self._transport
         )
         self._refit_urls = [
             url
@@ -269,14 +262,12 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         self._stale = False
 
     def shutdown(self) -> None:
-        for ref in (self._baseline_init_refs or []) + (
-            self._baseline_commit_refs or []
-        ):
+        for ref in self._baseline_init_refs + self._baseline_commit_refs:
             ray.cancel(ref, force=False)
         if self._transport == "zmq":
             self._run_generation_workers("stop_zmq_sparse_refit_relay")
-        self._baseline_init_refs = None
-        self._baseline_commit_refs = None
-        self._refit_urls = []
-        self._targets = []
+        self._baseline_init_refs.clear()
+        self._baseline_commit_refs.clear()
+        self._refit_urls.clear()
+        self._targets.clear()
         self._stale = True

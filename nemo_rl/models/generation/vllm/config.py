@@ -16,8 +16,6 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
-DeltaCompressionDType = Literal["fp16", "float16", "bf16", "bfloat16", "fp32", "float32"]  # fmt: skip
-
 
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
@@ -61,7 +59,7 @@ class VllmSpecificArgs(TypedDict):
 
 
 class VllmDeltaCompressionConfig(TypedDict):
-    dtype: DeltaCompressionDType
+    dtype: Literal["fp16", "float16", "bf16", "bfloat16", "fp32", "float32"]  # fmt: skip
     sparse_bucket_size_bytes: int
 
 

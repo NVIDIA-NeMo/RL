@@ -107,10 +107,12 @@ def _encode_explicit_locations(
     indices = locations.detach().cpu().numpy().astype(np.int64, copy=False)
     deltas = np.diff(indices, prepend=-1) - 1
     max_delta = int(deltas.max())
-    dtype = next(
-        dtype
-        for dtype in (np.uint16, np.uint32, np.uint64)
-        if max_delta <= np.iinfo(dtype).max
+    dtype = (
+        np.uint16
+        if max_delta <= 0xFFFF
+        else np.uint32
+        if max_delta <= 0xFFFFFFFF
+        else np.uint64
     )
     raw = deltas.astype(dtype, copy=False).tobytes()
     return torch.from_numpy(np.frombuffer(raw, dtype=np.uint8).copy())
@@ -193,9 +195,6 @@ class DeltaCompressionTracker:
     ) -> None:
         total = sum(int(locations.numel()) for locations, _ in sources)
         count = min(self.verification_samples, total)
-        if not count:
-            return
-
         sample_ranks = [
             ((2 * index + 1) * total) // (2 * count) for index in range(count)
         ]

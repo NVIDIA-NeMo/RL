@@ -61,11 +61,7 @@ class MegatronRemoteSparseRefit:
         streamer = {
             "s3": stream_sparse_delta_payloads_via_s3_manifest,
             "zmq": stream_sparse_delta_payloads_via_zmq,
-        }.get(transport)
-        if streamer is None:
-            raise ValueError(
-                f"Unsupported remote sparse refit transport {transport!r}."
-            )
+        }[transport]
         result = streamer(
             self._worker._iter_params_with_optional_kv_scales(),
             delta_tracker=self._tracker,

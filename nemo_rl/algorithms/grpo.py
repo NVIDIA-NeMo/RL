@@ -2079,13 +2079,7 @@ def refit_policy_generation(
     """
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
-        return (
-            synchronizer.sync_weights(
-                timer=timer,
-                kv_scales=kv_scales,
-            )
-            or {}
-        )
+        return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
@@ -2465,10 +2459,10 @@ def grpo_train(
         batch_cache: BatchedDataDict[DatumSpec] = None
         # This is the number of batches we processed so far at each step to generate responses whose std is non-zero. Maximum threshold is set by dynamic_sampling_max_gen_batches. Used in the case of dynamic sampling.
         dynamic_sampling_num_gen_batches = 0
-        refit_metrics: dict[str, float] = {}
 
         # Run grpo/dapo training loop (single-turn)
         for batch in wrapped_dataloader:
+            refit_metrics: dict[str, float] = {}
             # A central place to store logging data that won't be deleted until the loop ends
             metrics_logging_data = dict()
             metrics = dict()
@@ -3369,7 +3363,6 @@ def grpo_train(
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
             dynamic_sampling_num_gen_batches = 0
-            refit_metrics = {}
 
             # Clear mem
             memory_tracker.snapshot_start_of_stage("After CPU memory clear", dir())

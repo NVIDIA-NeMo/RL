@@ -26,7 +26,7 @@ import zmq
 
 from nemo_rl.utils.weight_transfer_remote_sparse import (
     SparseDeltaStreamResult,
-    merge_vllm_refit_receiver_timing,
+    merge_vllm_refit_metrics,
     post_vllm_refit_endpoints,
     refit_env_int,
     sparse_payload_checksum,
@@ -231,7 +231,7 @@ class ZmqSparseRefitServer:
             headers=headers,
             executor=http_executor,
         )
-        merged = merge_vllm_refit_receiver_timing({}, results, maximum=True)
+        merged = merge_vllm_refit_metrics({}, results, maximum=True)
         merged["receiver_relay_fanout_s"] = time.perf_counter() - started
         return merged
 
@@ -246,7 +246,7 @@ class ZmqSparseRefitServer:
             socket.send_multipart(
                 [identity, kind, _json_bytes(reply)], flags=zmq.NOBLOCK
             )
-        except (zmq.Again, zmq.ZMQError):
+        except zmq.ZMQError:
             pass
 
     def _parse_data_message(

@@ -79,8 +79,9 @@ workers. It uses file-backed `torch.from_file` tensors by default;
 
 On a fresh run, vLLM already holds the shared checkpoint. Baseline construction
 starts early and can overlap initial generation, so the redundant initial full
-sync is skipped. A resumed run performs a refit before generation because the
-training checkpoint may be newer than the rollout checkpoint.
+sync is skipped. On resume, both clusters must still start from the same HF
+weight version; sparse refit does not reconstruct a rollout baseline from an
+arbitrary training checkpoint.
 
 ### Export and encode deltas
 
@@ -98,7 +99,7 @@ expected = previous_baseline + delta.to(baseline_dtype)
 ```
 
 The producer overlaps export, encoding, `torch.save` serialization, zstd level
-1 compression, and transfer with bounded executors. Source baselines do not
+1 compression, and transfer with fixed-size executors. Source baselines do not
 commit until the entire transfer succeeds.
 
 ### Transfer and apply
@@ -118,7 +119,7 @@ the same receiver endpoints and checksum validation.
 The receiver deduplicates payload identities, batches them in a bounded FIFO
 queue, and applies batches on one worker thread. When all vLLM ranks share a
 node, payloads are staged under `/dev/shm` and passed to collective RPC by file
-path. Otherwise, each serialized payload is sent through collective RPC.
+path. Otherwise, the serialized batch is sent through one collective RPC.
 
 The final `/nemo-rl/refit/flush` drains the queue, synchronizes CUDA, and checks
 optional delta samples. Only then does the source commit pending baseline
@@ -144,15 +145,16 @@ and optional verification samples.
 
 HF coordinates are the canonical wire format because Megatron Bridge already
 defines the training-to-HF mapping while vLLM owns a different packed and
-sharded layout. `_SparseDeltaTargetPlan` converts source coordinates to local
-vLLM indices without materializing a dense HF tensor. Plans cover identity and
-single-dimension shards, packed QKV, merged gate/up projections, fused MoE
-experts, and Mamba2 layouts.
+sharded layout. On first use, the receiver runs vLLM's native `load_weights()`
+against metadata-only tensors while a PyTorch dispatch mode records the source
+and destination views of each `copy_`. It caches those mappings and applies
+later sparse deltas directly with `index_add_`, without materializing a dense HF
+tensor or duplicating QKV, MoE, Mamba, or TP placement rules.
 
-`_SparseDeltaTargetPlan(target=None)` means a valid tensor is absent from the
-current rank. A `None` plan means the layout is unsupported; the receiver fails
-the payload before applying it. There is no dense fallback for an unknown
-layout.
+The tracer accepts affine tensor views and the Mamba `A_log` transform. An
+element-expanding copy, unknown transform, or unplaced
+non-expert tensor fails before any payload update. There is no dense fallback
+for an unknown layout.
 
 ## Configuration
 
@@ -233,12 +235,13 @@ not duplicate the baseline tracker, codec, receiver queue, or placement logic.
 Retries must preserve payload identity and bytes, fan out to every required
 replica, and require a successful global flush before baseline commit.
 
-For a new vLLM layout, derive shard ownership and offsets from vLLM module
-attributes or its loader contract. Validate every source shape and target
-capacity. Unit tests must exercise nonzero TP ranks, replicated KV heads, local
-and remote experts, uneven shapes, contiguous ranges, and explicit locations.
-In-range but incorrect `index_add_` locations silently corrupt weights, so test
-the exact mapped indices and values.
+Do not add model-specific placement math. New layouts should work through their
+native vLLM weight loader; extend the tracer only for a general loader operation
+and fail closed for transformed or broadcasting copies. Tests must invoke the
+real vLLM loader at nonzero TP ranks and cover replicated KV heads, packed
+columns, local and remote experts, segmented views, contiguous ranges, and
+explicit locations. Incorrect in-range `index_add_` locations silently corrupt
+weights, so assert exact mapped indices and values.
 
 Codec changes must update encoder and decoder together, preserve 64-bit-safe
 locations, and retain wire-dtype rounding in pending baseline updates. Receiver
@@ -248,13 +251,14 @@ propagation, flush, CUDA synchronization, and clean shutdown.
 Run the focused suite:
 
 ```bash
-uv run pytest -q \
+uv run --extra vllm pytest -q \
   tests/unit/utils/test_weight_transfer_remote_sparse.py \
   tests/unit/models/policy/test_megatron_remote_sparse_refit.py \
   tests/unit/models/generation/test_vllm_sparse_refit.py \
-  tests/unit/models/generation/test_vllm_sparse_delta.py \
-  tests/unit/weight_sync/test_vllm_remote_sparse_weight_synchronizer.py \
-  tests/unit/tools/test_refit_bandwidth_calculator.py
+  tests/unit/weight_sync/test_vllm_remote_sparse_weight_synchronizer.py
+
+uv run --extra vllm pytest -q -m vllm \
+  tests/unit/models/generation/test_vllm_sparse_delta.py
 
 uv run ruff check \
   nemo_rl/utils/weight_transfer_{remote_sparse,sparse_codec,zmq}.py \
@@ -264,7 +268,7 @@ uv run ruff check \
 ```
 
 On the target topology, verify the exact commit, image digest, and checkpoint
-revision; run fresh and resumed starts; compare at least two balanced
+revision; validate fresh starts and same-version resumes; compare two balanced
 repetitions with an equivalent NCCL or full control; and require the requested
 changed density, one global commit, no traceback, and zero sampled mismatches.
 After failure injection, confirm the source baseline does not commit and reload
@@ -276,23 +280,15 @@ the receiver before retrying.
 benchmark-specific estimator for the current S3 and ZeroMQ implementation. It
 is not a general fabric or topology model.
 
-The sparse side embeds July 2026 end-to-end fits from 32 GB300 sender GPUs in
-`us-east-2` to 64 H100 receiver GPUs in `us-east-1`. The measured checkpoints
-span 63.2-1121.0 GB of indexed BF16 weights. With `S` as decimal TB, the
-embedded latency fits are:
-
-| Transport | Payload | 3% changed | 5% changed |
-|---|---|---:|---:|
-| S3 | raw | `2.370 + 116.138S` | `2.646 + 183.431S` |
-| S3 | zstd | `84.746S` | `134.041S` |
-| ZeroMQ | raw | `264.753S` | `428.008S` |
-| ZeroMQ | zstd | `6.517 + 73.621S` | `8.165 + 157.339S` |
-
-For an arbitrary positive changed density `d`, the calculator evaluates `T3`
-and `T5` from this table, computes `p = log(T5 / T3) / log(5 / 3)`, and returns
-`T3 * (d / 3)^p`. Inputs outside 3-5% are accepted but are extrapolations. The
-wire estimate is `model_size_gb * d / 100 * multiplier`, where the raw and zstd
-multipliers are 2.0 and 0.74.
+The sparse side embeds July 2026 end-to-end latency fits from 32 GB300 sender
+GPUs in `us-east-2` to 64 H100 receiver GPUs in `us-east-1`. Measurements cover
+63.2-1121.0 GB of indexed BF16 weights, S3 and ZeroMQ, raw and zstd payloads,
+and 3% and 5% changed density. Any positive `--changed-pct` is accepted; values
+outside 3-5% use an extrapolated power curve through the two measured-density
+fits. Estimated wire bytes use the measured raw or zstd payload ratio.
+The coefficients in `_SPARSE_LATENCY_FITS` implement
+`fixed_seconds + seconds_per_1000_GB * model_size_GB / 1000`; they are latency
+regressions, not bandwidth measurements.
 
 The NCCL side uses these measured generation-EP H100 refit envelopes on 400
 Gbps/rank InfiniBand:

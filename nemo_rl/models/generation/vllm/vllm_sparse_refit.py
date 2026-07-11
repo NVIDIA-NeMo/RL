@@ -38,7 +38,7 @@ from nemo_rl.utils.weight_transfer_remote_sparse import (
     G_VLLM_REFIT_S3_MANIFEST_PATH,
     decode_sparse_payload,
     download_s3_refit_payload,
-    merge_vllm_refit_receiver_timing,
+    merge_vllm_refit_metrics,
     refit_env_int,
     vllm_refit_api_key,
 )
@@ -79,19 +79,11 @@ class VllmSparseRefitReceiver:
         self._zmq_refit_server: tuple[ZmqSparseRefitServer, str] | None = None
         self._refit_async_loop: asyncio.AbstractEventLoop | None = None
 
-    @property
-    def cfg(self) -> Any:
-        return self._worker.cfg
-
-    @property
-    def llm(self) -> Any:
-        return self._worker.llm
-
     def set_worker_hostnames(self, hostnames: list[str]) -> None:
         self._refit_workers_share_node = len(set(hostnames)) == 1
 
     def start_sync_server(self) -> None:
-        llm = self.llm
+        llm = self._worker.llm
         if llm is None:
             raise RuntimeError("vLLM is not initialized on this worker.")
         self.set_worker_hostnames(llm.collective_rpc("report_node_hostname", args=()))
@@ -161,7 +153,7 @@ class VllmSparseRefitReceiver:
     ) -> dict[str, Any]:
         results = [future.result() for future in futures]
         timing: dict[str, float] = {}
-        merge_vllm_refit_receiver_timing(timing, results, maximum=False)
+        merge_vllm_refit_metrics(timing, results, maximum=False)
         return {
             "ok": True,
             "payloads": sum(int(result.get("payloads", 0)) for result in results),
@@ -171,37 +163,22 @@ class VllmSparseRefitReceiver:
     @staticmethod
     def _refit_collective_response(worker_results: Any) -> dict[str, Any]:
         results = cast(list[dict[str, Any]], worker_results)
-        response = {
+        return {
             "ok": True,
-            **merge_vllm_refit_receiver_timing({}, results, maximum=True),
+            **merge_vllm_refit_metrics(
+                {}, results, maximum=True, candidate_maximum=True
+            ),
         }
-        if any("verification_candidates" in result for result in results):
-            response["verification_candidates"] = max(
-                (int(result["verification_candidates"]) for result in results),
-                default=0,
-            )
-            for key in (
-                "verification_samples",
-                "verification_exact_mismatches",
-                "verification_mismatches",
-                "verification_abs_sum",
-            ):
-                response[key] = sum(result[key] for result in results)
-            response["verification_max_abs"] = max(
-                (float(result["verification_max_abs"]) for result in results),
-                default=0.0,
-            )
-        return response
 
     def _refit_collective_rpc(
         self,
         method: str,
         args: tuple[Any, ...],
     ) -> Any:
-        llm = self.llm
+        llm = self._worker.llm
         if llm is None:
             raise RuntimeError("vLLM is not initialized on this worker.")
-        if not self.cfg["vllm_cfg"]["async_engine"]:
+        if not self._worker.cfg["vllm_cfg"]["async_engine"]:
             return llm.collective_rpc(method, args=args)
         if self._refit_async_loop is None:
             raise RuntimeError("The async vLLM refit server loop is not initialized.")
@@ -215,21 +192,15 @@ class VllmSparseRefitReceiver:
         serialized_payloads: tuple[bytes, ...],
     ) -> dict[str, Any]:
         """Apply a FIFO batch of sparse deltas through one collective RPC."""
-        if self.llm is None:
-            raise RuntimeError("vLLM is not initialized on this worker.")
         if not self._refit_workers_share_node:
-            results = [
-                self._refit_collective_response(
-                    self._refit_collective_rpc(
-                        "update_weights_from_serialized_sparse_payload",
-                        (payload,),
-                    )
+            response = self._refit_collective_response(
+                self._refit_collective_rpc(
+                    "update_weights_from_serialized_sparse_payload",
+                    serialized_payloads,
                 )
-                for payload in serialized_payloads
-            ]
-            timing: dict[str, float] = {}
-            merge_vllm_refit_receiver_timing(timing, results, maximum=False)
-            return {"ok": True, "payloads": len(serialized_payloads), **timing}
+            )
+            response["payloads"] = len(serialized_payloads)
+            return response
 
         with tempfile.TemporaryDirectory(
             prefix="nemo_rl_refit_", dir=self._refit_batch_staging_dir
@@ -271,7 +242,6 @@ class VllmSparseRefitReceiver:
             submitted.add_done_callback(self._notify_refit_apply_waiters)
         response = self._collect_refit_apply_results(futures)
         if futures:
-            assert self.llm is not None
             response.update(
                 self._refit_collective_response(
                     self._refit_collective_rpc("finish_sparse_delta_refit", ())
@@ -347,15 +317,14 @@ class VllmSparseRefitReceiver:
         return result
 
     def setup_api_server(self, app: Any) -> None:
-        token = vllm_refit_api_key(
-            self.cfg["vllm_cfg"].get("http_refit_api_key_env_var")
-        )
+        cfg = self._worker.cfg
+        token = vllm_refit_api_key(cfg["vllm_cfg"].get("http_refit_api_key_env_var"))
 
         async def respond(
             raw_request: Request,
             action: Literal["s3", "flush", "zmq"],
         ) -> JSONResponse:
-            if self.cfg["vllm_cfg"]["async_engine"]:
+            if cfg["vllm_cfg"]["async_engine"]:
                 self._refit_async_loop = asyncio.get_running_loop()
             if (
                 token is not None
@@ -398,16 +367,15 @@ class VllmSparseRefitReceiver:
     def start_zmq_sparse_refit_relay(self, refit_urls: list[str]) -> str:
         if self._zmq_refit_server is not None:
             return self._zmq_refit_server[1]
-        port = self.cfg["vllm_cfg"].get(
-            "zmq_refit_server_port"
-        ) or _get_free_port_local(
-            self.cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
-            self.cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
+        cfg = self._worker.cfg
+        port = cfg["vllm_cfg"].get("zmq_refit_server_port") or _get_free_port_local(
+            cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
+            cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
         )
         server = ZmqSparseRefitServer(
             refit_urls,
             bind_address=f"tcp://0.0.0.0:{port}",
-            api_key_env_var=self.cfg["vllm_cfg"].get("http_refit_api_key_env_var"),
+            api_key_env_var=cfg["vllm_cfg"].get("http_refit_api_key_env_var"),
             timeout_s=float(os.getenv("NRL_REFIT_ZMQ_TIMEOUT_S") or 600.0),
         )
         server.start()
@@ -424,11 +392,10 @@ class VllmSparseRefitReceiver:
     def _setup_vllm_refit_server(self) -> None:
         app = FastAPI()
         self.setup_api_server(app)
-        port = self.cfg["vllm_cfg"].get(
-            "http_refit_server_port"
-        ) or _get_free_port_local(
-            self.cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
-            self.cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
+        cfg = self._worker.cfg
+        port = cfg["vllm_cfg"].get("http_refit_server_port") or _get_free_port_local(
+            cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
+            cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
         )
         server = uvicorn.Server(
             uvicorn.Config(

@@ -95,7 +95,7 @@ def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
     assert response["payloads"] == 5
     assert response["batches"] == 2
     assert sum(result.get("receiver_total_s", 0.0) for result in responses) == 5.0
-    receiver.llm.collective_rpc.assert_called_once_with(
+    receiver._worker.llm.collective_rpc.assert_called_once_with(
         "finish_sparse_delta_refit", args=()
     )
 
@@ -209,7 +209,7 @@ def test_sparse_refit_batch_uses_one_collective_rpc(tmp_path: Path) -> None:
 
         assert staged_payloads == [b"0", b"1", b"2"]
         assert not list(tmp_path.iterdir())
-        receiver.llm.collective_rpc.assert_called_once()
+        receiver._worker.llm.collective_rpc.assert_called_once()
         assert response == {"ok": True, "receiver_total_s": 1.0, "payloads": 3}
 
 
@@ -236,7 +236,8 @@ def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) 
             receiver.update_weights_from_serialized_sparse_payloads((b"0", b"1"))
 
         assert [
-            entry.args[0] for entry in receiver.llm.collective_rpc.call_args_list
+            entry.args[0]
+            for entry in receiver._worker.llm.collective_rpc.call_args_list
         ] == [
             "update_weights_from_sparse_payload_files",
             "synchronize_device",
@@ -244,7 +245,7 @@ def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) 
         assert not list(tmp_path.iterdir())
 
 
-def test_sparse_refit_batch_falls_back_across_nodes() -> None:
+def test_sparse_refit_batch_uses_one_collective_rpc_across_nodes() -> None:
     with _sparse_refit_receiver() as receiver:
         receiver._refit_workers_share_node = False
         receiver._worker.llm = MagicMock(
@@ -257,11 +258,11 @@ def test_sparse_refit_batch_falls_back_across_nodes() -> None:
             (b"0", b"1", b"2")
         )
 
-        assert receiver.llm.collective_rpc.call_args_list == [
-            call("update_weights_from_serialized_sparse_payload", args=(payload,))
-            for payload in (b"0", b"1", b"2")
-        ]
-        assert response == {"ok": True, "receiver_total_s": 3.0, "payloads": 3}
+        receiver._worker.llm.collective_rpc.assert_called_once_with(
+            "update_weights_from_serialized_sparse_payload",
+            args=(b"0", b"1", b"2"),
+        )
+        assert response == {"ok": True, "receiver_total_s": 1.0, "payloads": 3}
 
 
 @pytest.mark.asyncio

@@ -94,8 +94,8 @@ class TestVllmRemoteSparseWeightSynchronizer:
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         assert sync.is_stale
-        assert sync._baseline_init_refs is None
-        assert sync._baseline_commit_refs is None
+        assert sync._baseline_init_refs == []
+        assert sync._baseline_commit_refs == []
         assert sync._refit_urls == []
         assert sync._targets == []
 

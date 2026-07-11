@@ -372,7 +372,6 @@ class VllmInternalWorkerExtension:
             self._sparse_delta_applier = VllmSparseDeltaApplier(
                 self.model_runner,
                 self.device,
-                rank=int(getattr(self, "rank", 0)),
             )
         return self._sparse_delta_applier
 
@@ -507,10 +506,10 @@ class VllmInternalWorkerExtension:
 
     def update_weights_from_serialized_sparse_payload(
         self,
-        serialized_payload: bytes,
+        *serialized_payloads: bytes,
     ) -> dict[str, Any]:
         return self._get_sparse_delta_applier().update_weights_from_serialized_sparse_payload(
-            serialized_payload
+            *serialized_payloads
         )
 
     def update_weights_from_sparse_payload_files(

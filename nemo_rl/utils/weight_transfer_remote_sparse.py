@@ -80,7 +80,6 @@ def _s3_client(region: str) -> Any:
 
 class _S3ObjectStore:
     def __init__(self, *, bucket: str, region: str) -> None:
-        # Keep the AWS runtime unloaded for ZeroMQ-only jobs.
         from awscrt.s3 import S3RequestType
 
         self.bucket = bucket
@@ -95,7 +94,6 @@ class _S3ObjectStore:
         ).finished_future.result()
 
     def get(self, key: str) -> bytes:
-        # Keep the AWS runtime unloaded for ZeroMQ-only jobs.
         from awscrt.http import HttpHeaders
 
         body = bytearray()
@@ -132,7 +130,6 @@ class _S3ObjectStore:
         ).finished_future.result()
 
     def _request(self, method: str, key: str, body: bytes | None = None) -> Any:
-        # Keep the AWS runtime unloaded for ZeroMQ-only jobs.
         from awscrt.http import HttpHeaders, HttpRequest
 
         headers = HttpHeaders(
@@ -303,7 +300,6 @@ def stream_sparse_delta_payloads(
         f"NRL_REFIT_{prefix}_ENCODE_WORKERS",
         default=max(2, min(8, os.cpu_count() or 8)),
     )
-    pipeline_workers = max(encode_workers, transfer_workers)
     encode_executor = _executor(f"refit-{transport}-encode", encode_workers)
     transfer_executor = _executor(f"refit-{transport}-transfer", transfer_workers)
     export_chunk_size = sparse_export_chunk_size(delta_tracker, transport)
@@ -382,7 +378,7 @@ def stream_sparse_delta_payloads(
             for key, value in result.items():
                 if key.endswith("_s"):
                     timing[key] = timing.get(key, 0.0) + float(value)
-            merge_vllm_refit_receiver_timing(
+            merge_vllm_refit_metrics(
                 receiver_timing, [result["receiver"]], maximum=False
             )
 
@@ -445,7 +441,6 @@ def stream_sparse_delta_payloads(
         "payloads": counts["payloads"],
         "chunks": chunk_count,
         "wire_mb": counts["wire_bytes"] / 1e6,
-        "pipeline_workers": pipeline_workers,
         "encode_workers": encode_workers,
         "export_chunk_mb": export_chunk_size / 1e6,
         "shard_rank": shard_rank,
@@ -524,7 +519,7 @@ def stream_sparse_delta_payloads_via_s3_manifest(
         return {
             "s3_put_s": s3_put_s,
             "manifest_post_s": manifest_post_s,
-            "receiver": merge_vllm_refit_receiver_timing({}, responses, maximum=True),
+            "receiver": merge_vllm_refit_metrics({}, responses, maximum=True),
         }
 
     return stream_sparse_delta_payloads(
@@ -603,23 +598,29 @@ def download_s3_refit_payload(
     return decode_sparse_payload(body, checksum)
 
 
-def merge_vllm_refit_receiver_timing(
+def merge_vllm_refit_metrics(
     result: dict[str, Any],
-    timings: Iterable[Mapping[str, Any]],
+    metrics: Iterable[Mapping[str, Any]],
     *,
     maximum: bool,
+    candidate_maximum: bool | None = None,
 ) -> dict[str, Any]:
-    for timing in timings:
-        for key, value in timing.items():
+    for metric in metrics:
+        for key, value in metric.items():
             if key.startswith("receiver_") and key.endswith("_s"):
-                number = float(value)
-                if key in result:
-                    number = (
-                        max(float(result[key]), number)
-                        if maximum
-                        else float(result[key]) + number
-                    )
-                result[key] = number
+                number, use_maximum = float(value), maximum
+            elif candidate_maximum is not None and key.startswith("verification_"):
+                number = value
+                use_maximum = key == "verification_max_abs" or (
+                    key == "verification_candidates" and candidate_maximum
+                )
+            else:
+                continue
+            if key in result:
+                number = (
+                    max(result[key], number) if use_maximum else result[key] + number
+                )
+            result[key] = number
     return result
 
 
