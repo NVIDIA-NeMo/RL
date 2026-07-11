@@ -26,6 +26,7 @@ not enter an all-stage collective from ``next()``.
 
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -53,8 +54,7 @@ from nemo_rl.utils.r3_trace import trace_tq_prefetch_payload
 TQ_SAMPLE_IDS_FIELD = "__tq_sample_ids"
 
 _QUEUE_POLL_SECONDS = 0.1
-_COLLECTIVE_TIMEOUT_SECONDS = 120.0
-_CLOSE_TIMEOUT_SECONDS = _COLLECTIVE_TIMEOUT_SECONDS + 10.0
+_CLOSE_TIMEOUT_SECONDS = 10.0
 _MAX_ERROR_LENGTH = 4096
 
 
@@ -122,6 +122,13 @@ class _PrefetchFailure:
     global_batch_index: int
     microbatch_index: int
     message: str
+
+
+def _validate_timeout_seconds(value: float, *, name: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{name} must be finite and greater than zero, got {value!r}")
+    return seconds
 
 
 def _as_nonempty_sequence(value: Any, *, name: str) -> Sequence[Any]:
@@ -291,8 +298,15 @@ def build_replica_topology(
     return replicas
 
 
-def initialize_train_microbatch_prefetch_group() -> TrainMicrobatchPrefetchGroup:
+def initialize_train_microbatch_prefetch_group(
+    *, collective_timeout_s: float | None
+) -> TrainMicrobatchPrefetchGroup:
     """Create one dedicated Gloo group per DP replica on every world rank."""
+    if collective_timeout_s is not None:
+        collective_timeout_s = _validate_timeout_seconds(
+            collective_timeout_s,
+            name="policy.train_microbatch_prefetch.collective_timeout_s",
+        )
     if not torch.distributed.is_initialized():
         raise RuntimeError("train microbatch prefetch requires torch.distributed")
 
@@ -323,11 +337,13 @@ def initialize_train_microbatch_prefetch_group() -> TrainMicrobatchPrefetchGroup
 
     groups: dict[int, Any] = {}
     for dp_rank, members in replicas.items():
-        groups[dp_rank] = torch.distributed.new_group(
-            ranks=[coord.global_rank for coord in members],
-            backend="gloo",
-            timeout=timedelta(seconds=_COLLECTIVE_TIMEOUT_SECONDS),
-        )
+        group_kwargs: dict[str, Any] = {
+            "ranks": [coord.global_rank for coord in members],
+            "backend": "gloo",
+        }
+        if collective_timeout_s is not None:
+            group_kwargs["timeout"] = timedelta(seconds=collective_timeout_s)
+        groups[dp_rank] = torch.distributed.new_group(**group_kwargs)
 
     my_dp_rank = parallel_state.get_data_parallel_rank()
     my_members = replicas[my_dp_rank]
@@ -364,6 +380,7 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         group: TrainMicrobatchPrefetchGroup,
         pad_value_dict: dict[str, Any],
         depth: int,
+        item_ready_timeout_s: float,
     ) -> None:
         if depth not in (0, 1):
             raise ValueError(
@@ -374,6 +391,10 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         self._group = group
         self._pad_value_dict = pad_value_dict
         self._depth = depth
+        self._item_ready_timeout_s = _validate_timeout_seconds(
+            item_ready_timeout_s,
+            name="policy.train_microbatch_prefetch.item_ready_timeout_s",
+        )
         self.plan = build_train_microbatch_plan(meta)
         self._items = tuple(
             (batch.global_batch_index, mb_idx, sample_ids)
@@ -386,8 +407,10 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         # One initial permit prepares MB0. Depth one releases after consuming
         # MB N; depth zero releases on the source only when MB N+1 is requested.
         self._producer_permit = threading.Semaphore(1)
+        self._stop_event = threading.Event()
         self._consumed = 0
         self._closed = False
+        self._terminal_failure: _PrefetchFailure | None = None
         self._started_at = time.perf_counter()
         self._metrics_lock = threading.Lock()
         self._metrics: dict[str, float] = {
@@ -422,6 +445,8 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
             self._metrics[key] = max(self._metrics[key], value)
 
     def _publish(self, item: PrefetchedMicrobatch | _PrefetchFailure) -> None:
+        if self._stop_event.is_set():
+            return
         if self._consumed == 0:
             with self._metrics_lock:
                 if self._metrics["first_microbatch_ready_s"] == 0.0:
@@ -432,7 +457,12 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
             self._record_max(
                 "queued_payload_peak_bytes", float(_tensor_bytes(item.data))
             )
-        self._queue.put(item)
+        while not self._stop_event.is_set():
+            try:
+                self._queue.put(item, timeout=_QUEUE_POLL_SECONDS)
+                return
+            except queue.Full:
+                continue
 
     def _broadcast_envelope(self, envelope: list[Any]) -> tuple[Any, ...]:
         if len(self._group.replica_ranks) > 1:
@@ -451,6 +481,8 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
     def _source_loop(self) -> None:
         for gb_idx, mb_idx, sample_ids in self._items:
             self._producer_permit.acquire()
+            if self._stop_event.is_set():
+                return
             data: BatchedDataDict[Any] | None = None
             try:
                 start = time.perf_counter()
@@ -523,6 +555,8 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
     def _receiver_loop(self) -> None:
         for expected_gb, expected_mb, sample_ids in self._items:
             self._producer_permit.acquire()
+            if self._stop_event.is_set():
+                return
             try:
                 start = time.perf_counter()
                 status = self._broadcast_envelope([None])
@@ -563,9 +597,23 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
             item = self._queue.get_nowait()
             self._record("ready_count", 1.0)
         except queue.Empty:
+            deadline = time.monotonic() + self._item_ready_timeout_s
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    expected_gb, expected_mb, _ = self._items[self._consumed]
+                    item = _PrefetchFailure(
+                        expected_gb,
+                        expected_mb,
+                        "microbatch did not become ready within "
+                        f"{self._item_ready_timeout_s:g}s; background data-plane "
+                        "or collective work may still be running",
+                    )
+                    self._terminal_failure = item
+                    self._stop_event.set()
+                    break
                 try:
-                    item = self._queue.get(timeout=_QUEUE_POLL_SECONDS)
+                    item = self._queue.get(timeout=min(_QUEUE_POLL_SECONDS, remaining))
                     break
                 except queue.Empty:
                     if not self._producer_thread.is_alive():
@@ -579,6 +627,11 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         return item
 
     def __next__(self) -> PrefetchedMicrobatch:
+        if self._terminal_failure is not None:
+            raise TrainMicrobatchPrefetchError(
+                "train microbatch prefetch is terminal after failure: "
+                f"{self._terminal_failure.message}"
+            )
         if self._consumed >= len(self._items):
             raise StopIteration
 
@@ -587,9 +640,9 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
             self._producer_permit.release()
 
         item = self._take()
-        if self._depth == 1 or not self._group.is_source:
-            self._producer_permit.release()
         if isinstance(item, _PrefetchFailure):
+            self._terminal_failure = item
+            self._stop_event.set()
             raise TrainMicrobatchPrefetchError(
                 "train microbatch prefetch failed for global batch "
                 f"{item.global_batch_index}, microbatch {item.microbatch_index}: "
@@ -616,6 +669,8 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         trace_tq_prefetch_payload(keys=item.sample_ids, data=item.data)
         self._consumed += 1
         self._record("consume_count", 1.0)
+        if self._depth == 1 or not self._group.is_source:
+            self._producer_permit.release()
         return item
 
     def iter_global_batch(
@@ -648,20 +703,25 @@ class TrainMicrobatchPrefetcher(Iterator[PrefetchedMicrobatch]):
         return result
 
     def close(self) -> None:
-        """Drain the local queue and let the fixed producer sequence finish."""
+        """Finish the producer or bound cleanup after a terminal timeout."""
         if self._closed:
             return
         self._closed = True
         deadline = time.monotonic() + _CLOSE_TIMEOUT_SECONDS
-        while self._producer_thread.is_alive() and time.monotonic() < deadline:
+        while self._producer_thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                self._queue.get(timeout=_QUEUE_POLL_SECONDS)
+                self._queue.get(timeout=min(_QUEUE_POLL_SECONDS, remaining))
             except queue.Empty:
                 pass
             self._producer_permit.release()
         remaining = max(0.0, deadline - time.monotonic())
         self._producer_thread.join(timeout=remaining)
         if self._producer_thread.is_alive():
+            self._stop_event.set()
+            self._producer_permit.release()
             raise TrainMicrobatchPrefetchError(
                 "train microbatch prefetch producer did not stop within "
                 f"{_CLOSE_TIMEOUT_SECONDS:.0f}s"

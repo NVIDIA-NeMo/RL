@@ -277,6 +277,7 @@ class MegatronPolicyWorkerImpl(
             group=self._train_microbatch_prefetch_group,
             pad_value_dict=self._pad_value_dict(),
             depth=self._train_microbatch_prefetch_depth,
+            item_ready_timeout_s=(self._train_microbatch_prefetch_item_ready_timeout_s),
         )
         try:
             result = self.train(
@@ -369,11 +370,27 @@ class MegatronPolicyWorkerImpl(
         self._router_replay_enabled = router_replay_enabled(config)
         prefetch_cfg = config.get("train_microbatch_prefetch") or {}
         self._train_microbatch_prefetch_enabled = bool(prefetch_cfg.get("enabled"))
-        self._train_microbatch_prefetch_depth = int(prefetch_cfg.get("depth", 1))
+        self._train_microbatch_prefetch_depth = 0
+        self._train_microbatch_prefetch_item_ready_timeout_s = 0.0
+        self._train_microbatch_prefetch_collective_timeout_s: float | None = None
         self._train_microbatch_prefetch_group: Optional[
             TrainMicrobatchPrefetchGroup
         ] = None
         if self._train_microbatch_prefetch_enabled:
+            if "item_ready_timeout_s" not in prefetch_cfg:
+                raise ValueError(
+                    "policy.train_microbatch_prefetch.item_ready_timeout_s is "
+                    "required when prefetch is enabled"
+                )
+            self._train_microbatch_prefetch_depth = int(prefetch_cfg.get("depth", 1))
+            self._train_microbatch_prefetch_item_ready_timeout_s = float(
+                prefetch_cfg["item_ready_timeout_s"]
+            )
+            collective_timeout_s = prefetch_cfg.get("collective_timeout_s")
+            if collective_timeout_s is not None:
+                self._train_microbatch_prefetch_collective_timeout_s = float(
+                    collective_timeout_s
+                )
             if self._train_microbatch_prefetch_depth not in (0, 1):
                 raise ValueError(
                     "policy.train_microbatch_prefetch.depth must be 0 or 1"
@@ -532,7 +549,11 @@ class MegatronPolicyWorkerImpl(
             # setup. Create every prefetch group here so a later per-rank TQ
             # connection failure cannot strand healthy ranks in new_group().
             self._train_microbatch_prefetch_group = (
-                initialize_train_microbatch_prefetch_group()
+                initialize_train_microbatch_prefetch_group(
+                    collective_timeout_s=(
+                        self._train_microbatch_prefetch_collective_timeout_s
+                    )
+                )
             )
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None

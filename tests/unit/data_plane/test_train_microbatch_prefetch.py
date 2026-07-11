@@ -173,6 +173,96 @@ def test_build_replica_topology_is_independent_of_global_rank_layout(
     assert tuple(x.global_rank for x in topology[1]) == (0, 2)
 
 
+@pytest.mark.parametrize(
+    ("timeout_s", "expected_timeout_s"),
+    [(None, None), (321.5, 321.5)],
+)
+def test_prefetch_group_uses_configured_collective_timeout(
+    monkeypatch,
+    prefetch_module,
+    timeout_s: float | None,
+    expected_timeout_s: float | None,
+) -> None:
+    distributed = prefetch_module.torch.distributed
+    monkeypatch.setattr(distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(distributed, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        distributed,
+        "all_gather",
+        lambda gathered, local: gathered[0].copy_(local),
+    )
+    group_calls: list[dict[str, Any]] = []
+
+    def fake_new_group(**kwargs):
+        group_calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(distributed, "new_group", fake_new_group)
+    monkeypatch.setattr(
+        prefetch_module.parallel_state, "get_data_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        prefetch_module.parallel_state,
+        "get_pipeline_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        prefetch_module.parallel_state,
+        "get_tensor_model_parallel_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        prefetch_module.parallel_state,
+        "get_context_parallel_rank",
+        lambda: 0,
+    )
+
+    prefetch_module.initialize_train_microbatch_prefetch_group(
+        collective_timeout_s=timeout_s
+    )
+
+    assert len(group_calls) == 1
+    if expected_timeout_s is None:
+        assert "timeout" not in group_calls[0]
+    else:
+        assert group_calls[0]["timeout"].total_seconds() == expected_timeout_s
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, float("nan"), float("inf")])
+def test_prefetch_group_rejects_invalid_collective_timeout(
+    prefetch_module,
+    timeout_s: float,
+) -> None:
+    with pytest.raises(ValueError, match="collective_timeout_s"):
+        prefetch_module.initialize_train_microbatch_prefetch_group(
+            collective_timeout_s=timeout_s
+        )
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, float("nan"), float("inf")])
+def test_prefetcher_rejects_invalid_item_ready_timeout(
+    prefetch_module,
+    timeout_s: float,
+) -> None:
+    group = prefetch_module.TrainMicrobatchPrefetchGroup(
+        replica_group=object(),
+        replica_ranks=(0,),
+        source_rank=0,
+        is_source=True,
+    )
+    with pytest.raises(ValueError, match="item_ready_timeout_s"):
+        prefetch_module.TrainMicrobatchPrefetcher(
+            client=object(),
+            meta=_meta(["A"], indices=[[[0, 1]]], lengths=[[4]]),
+            group=group,
+            pad_value_dict={},
+            depth=1,
+            item_ready_timeout_s=timeout_s,
+        )
+
+
 def test_stamp_train_normalization_matches_current_formula() -> None:
     from nemo_rl.models.policy.tq_policy import _stamp_train_normalization
 
@@ -353,6 +443,7 @@ def test_enabled_prefetch_skips_complete_shard_fetch(monkeypatch) -> None:
     worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
     worker._train_microbatch_prefetch_enabled = True
     worker._train_microbatch_prefetch_depth = 1
+    worker._train_microbatch_prefetch_item_ready_timeout_s = 30.0
     worker._train_microbatch_prefetch_group = object()
     client = object()
     calls: dict[str, Any] = {}
@@ -400,6 +491,7 @@ def test_enabled_prefetch_skips_complete_shard_fetch(monkeypatch) -> None:
         "group": worker._train_microbatch_prefetch_group,
         "pad_value_dict": {"input_ids": 0},
         "depth": 1,
+        "item_ready_timeout_s": 30.0,
     }
     assert calls["train_data"]["__tq_sample_ids"] == ["A"]
     assert calls["train_kwargs"]["microbatch_prefetcher"].__class__ is FakePrefetcher
@@ -443,6 +535,27 @@ class _RecordingClient:
             return list(self._calls)
 
 
+class _BlockingClient:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def get_samples(
+        self,
+        *,
+        sample_ids: list[str],
+        partition_id: str,
+        select_fields: list[str],
+    ) -> BatchedDataDict:
+        assert partition_id == "train"
+        assert select_fields == FIELDS
+        self.calls += 1
+        self.started.set()
+        self.release.wait()
+        return _payload(sample_ids)
+
+
 def _single_rank_prefetcher(monkeypatch, prefetch_module, *, depth: int):
     client = _RecordingClient()
     meta = _meta(
@@ -477,7 +590,60 @@ def _single_rank_prefetcher(monkeypatch, prefetch_module, *, depth: int):
         group=group,
         pad_value_dict={"input_ids": 0},
         depth=depth,
+        item_ready_timeout_s=5,
     )
+
+
+def test_close_is_bounded_after_item_ready_timeout(
+    monkeypatch,
+    prefetch_module,
+) -> None:
+    client = _BlockingClient()
+    meta = _meta(["A"], indices=[[[0, 1]]], lengths=[[4]])
+    group = prefetch_module.TrainMicrobatchPrefetchGroup(
+        replica_group=object(),
+        replica_ranks=(0,),
+        source_rank=0,
+        is_source=True,
+    )
+    monkeypatch.setattr(prefetch_module, "materialize", lambda wire, **_: wire)
+    monkeypatch.setattr(prefetch_module.torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(prefetch_module, "_CLOSE_TIMEOUT_SECONDS", 0.05)
+    prefetcher = prefetch_module.TrainMicrobatchPrefetcher(
+        client=client,
+        meta=meta,
+        group=group,
+        pad_value_dict={},
+        depth=1,
+        item_ready_timeout_s=0.05,
+    )
+    assert client.started.wait(timeout=1)
+    try:
+        take_started = time.monotonic()
+        with pytest.raises(
+            prefetch_module.TrainMicrobatchPrefetchError,
+            match="did not become ready within 0.05s",
+        ):
+            next(prefetcher)
+        assert time.monotonic() - take_started < 0.5
+        with pytest.raises(
+            prefetch_module.TrainMicrobatchPrefetchError,
+            match="terminal after failure",
+        ):
+            next(prefetcher)
+
+        close_started = time.monotonic()
+        with pytest.raises(
+            prefetch_module.TrainMicrobatchPrefetchError,
+            match="producer did not stop within",
+        ):
+            prefetcher.close()
+        assert time.monotonic() - close_started < 0.5
+    finally:
+        client.release.set()
+        prefetcher._producer_thread.join(timeout=1)
+    assert not prefetcher._producer_thread.is_alive()
+    assert client.calls == 1
 
 
 def test_depth_one_stays_exactly_one_microbatch_ahead(
@@ -558,6 +724,7 @@ def test_multiple_global_batches_are_consumed_without_crossing_boundaries(
         group=group,
         pad_value_dict={},
         depth=1,
+        item_ready_timeout_s=5,
     )
     try:
         first = list(prefetcher.iter_global_batch(0))
@@ -629,6 +796,7 @@ def _distributed_worker(
                 group=prefetch_group,
                 pad_value_dict={},
                 depth=depth,
+                item_ready_timeout_s=5,
             )
             for step, expected_ids in enumerate((("A", "B"), ("C",), ("D",))):
                 if rank >= world_size // 2:
@@ -651,6 +819,7 @@ def _distributed_worker(
             group=prefetch_group,
             pad_value_dict={},
             depth=1,
+            item_ready_timeout_s=5,
         )
         assert next(failing).sample_ids == ("A", "B")
         with pytest.raises(module.TrainMicrobatchPrefetchError, match="injected"):
@@ -666,6 +835,7 @@ def _distributed_worker(
             group=prefetch_group,
             pad_value_dict={},
             depth=1,
+            item_ready_timeout_s=5,
         )
         assert next(early).sample_ids == ("A", "B")
         early.close()
