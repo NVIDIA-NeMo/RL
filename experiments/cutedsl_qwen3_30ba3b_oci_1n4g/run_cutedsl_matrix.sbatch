@@ -357,6 +357,19 @@ assert topology == {
     "expert_tensor_parallel_size": 1,
     "expert_model_parallel_size": 4,
 }, topology
+fixed_config_paths = (
+    "policy.megatron_cfg.moe_grouped_gemm",
+    "policy.megatron_cfg.use_transformer_engine_op_fuser",
+)
+fixed_config_evidence = {
+    "on": {path: value_at(on_config, path) for path in fixed_config_paths},
+    "off": {path: value_at(off_config, path) for path in fixed_config_paths},
+}
+assert all(
+    fixed_config_evidence[arm][path] is True
+    for arm in ("on", "off")
+    for path in fixed_config_paths
+), fixed_config_evidence
 manifest = {
     "run_id": os.environ["RUN_ID"],
     "cluster_profile": os.environ["CUTEDSL_PROFILE_NAME"],
@@ -380,6 +393,7 @@ manifest = {
         "segment": os.environ["CUTEDSL_SEGMENT"],
     },
     "topology": topology,
+    "fixed_config_evidence": fixed_config_evidence,
     "arms": [
         {"arm": arm, "order_index": order_index}
         for order_index, arm in enumerate(timing_order)
@@ -809,9 +823,139 @@ run_profile_arm() {
 for order_index in "${!timing_arms[@]}"; do
     run_profile_arm "${timing_arms[order_index]}" "${order_index}"
 done
+
+"${UV_BIN}" run --active --no-sync python - "${CONTAINER_RESULT_DIR}" <<'PY'
+# CUTEDSL_KERNEL_ATTRIBUTION_START
+import json
+import re
+import sys
+from pathlib import Path
+
+FUSED_GLU_SIGNATURES = {
+    "transformer_engine_forward_grouped_mlp": (
+        r"\bForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8\b"
+    ),
+    "cudnn_frontend_glu_bias_kernel": (
+        r"\bBlockScaledMoEGroupedGemmGluBiasKernel\b"
+    ),
+    "cudnn_frontend_glu_wrapper_sm100": r"\bgrouped_gemm_glu_wrapper_sm100\b",
+}
+FUSED_DGLU_SIGNATURES = {
+    "cudnn_frontend_dglu_dbias_kernel": (
+        r"\bBlockScaledMoEGroupedGemmDgluDbiasKernel\b"
+    ),
+    "cudnn_frontend_dglu_wrapper_sm100": (
+        r"\bgrouped_gemm_dglu(?:_dbias)?_wrapper_sm100\b"
+    ),
+}
+QUANT_SIGNATURES = {
+    "cudnn_frontend_quant_kernel": r"\bBlockScaledMoEGroupedGemmQuantKernel\b",
+    "cudnn_frontend_quant_wrapper_sm100": r"\bgrouped_gemm_quant_wrapper_sm100\b",
+}
+GROUPED_GEMM_SIGNATURES = {
+    "grouped_gemm_text": r"\bgrouped[_ ]?gemm\w*\b",
+    "cudnn_frontend_grouped_gemm_class": r"\bBlockScaledMoEGroupedGemm\w*Kernel\b",
+    "transformer_engine_grouped_mlp_cute_gemm": r"\bForwardGroupedMLP_CuTeGEMM\w*\b",
+    "moe_gemm_text": r"\b(?:moe\w*gemm|gemm\w*moe)\b",
+}
+SIGNATURE_REGEXES = {
+    "fused_glu": FUSED_GLU_SIGNATURES,
+    "fused_dglu": FUSED_DGLU_SIGNATURES,
+    "quant": QUANT_SIGNATURES,
+    "grouped_gemm": GROUPED_GEMM_SIGNATURES,
+}
+
+
+def signature_counts(text: str, signatures: dict[str, str]) -> dict[str, int]:
+    return {
+        name: len(re.findall(pattern, text, flags=re.IGNORECASE))
+        for name, pattern in signatures.items()
+    }
+
+
+def total_matches(counts: dict[str, int]) -> int:
+    return sum(counts.values())
+
+
+result_dir = Path(sys.argv[1])
+manifest_path = result_dir / "benchmark_manifest.json"
+manifest = json.loads(manifest_path.read_text())
+config_evidence = manifest.get("fixed_config_evidence", {})
+failures: list[str] = []
+arm_results: dict[str, dict[str, object]] = {}
+
+for arm in ("on", "off"):
+    evidence_paths = sorted((result_dir / "profiles").glob(f"*-{arm}/kernel_evidence.txt"))
+    if len(evidence_paths) != 1:
+        failures.append(
+            f"{arm.upper()} expected exactly one kernel evidence file, found {len(evidence_paths)}"
+        )
+        evidence = ""
+        evidence_file = None
+    else:
+        evidence_path = evidence_paths[0]
+        evidence = evidence_path.read_text()
+        evidence_file = str(evidence_path.relative_to(result_dir))
+
+    category_counts = {
+        category: signature_counts(evidence, signatures)
+        for category, signatures in SIGNATURE_REGEXES.items()
+    }
+    arm_results[arm] = {
+        "kernel_evidence": evidence_file,
+        "signature_match_counts": category_counts,
+        "fused_glu_match_count": total_matches(category_counts["fused_glu"]),
+        "fused_dglu_match_count": total_matches(category_counts["fused_dglu"]),
+        "quant_match_count": total_matches(category_counts["quant"]),
+        "grouped_gemm_match_count": total_matches(category_counts["grouped_gemm"]),
+    }
+
+on_result = arm_results["on"]
+off_result = arm_results["off"]
+if on_result["fused_glu_match_count"] == 0:
+    failures.append("ON fused GLU kernel signature was not found")
+if on_result["fused_dglu_match_count"] == 0:
+    failures.append("ON fused dGLU kernel signature was not found")
+if off_result["fused_glu_match_count"] != 0:
+    failures.append("OFF fused GLU kernel signature must be absent")
+if off_result["fused_dglu_match_count"] != 0:
+    failures.append("OFF fused dGLU kernel signature must be absent")
+for arm in ("on", "off"):
+    if arm_results[arm]["grouped_gemm_match_count"] == 0:
+        failures.append(f"{arm.upper()} grouped-GEMM path signature was not found")
+
+config_contracts = {
+    "policy.megatron_cfg.moe_grouped_gemm": "grouped GEMM",
+    "policy.megatron_cfg.use_transformer_engine_op_fuser": "op fuser",
+}
+for arm in ("on", "off"):
+    for path, label in config_contracts.items():
+        if config_evidence.get(arm, {}).get(path) is not True:
+            failures.append(f"{arm.upper()} {label} config evidence is not true")
+
+attribution = {
+    "passed": not failures,
+    "signature_regexes": SIGNATURE_REGEXES,
+    "config_evidence": config_evidence,
+    "arms": arm_results,
+    "failures": failures,
+}
+(result_dir / "kernel_attribution.json").write_text(
+    json.dumps(attribution, indent=2, sort_keys=True) + "\n"
+)
+manifest["kernel_attribution"] = {
+    **attribution,
+    "artifact": "kernel_attribution.json",
+}
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+if failures:
+    raise RuntimeError("kernel attribution failed: " + "; ".join(failures))
+# CUTEDSL_KERNEL_ATTRIBUTION_END
+PY
 BASH
     cutedsl_write_event profile pass 0 \
-        "Nsight reports and kernel evidence recorded for both arms" profiles
+        "Nsight reports and CuTeDSL kernel attribution passed for both arms" \
+        kernel_attribution.json
 else
     cutedsl_write_event profile skip 0 \
         "Profiling disabled by CUTEDSL_BENCHMARK_PROFILE=0" ''

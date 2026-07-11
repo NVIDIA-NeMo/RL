@@ -292,6 +292,10 @@ def test_renderer_outputs_metric_profile_and_reproducibility_sections(
             "kernel_evidence": "kernel_evidence.txt",
         },
     )
+    write_json(
+        run_dir / "kernel_attribution.json",
+        {"passed": True, "signature_regexes": {"fused_glu": {"te": "pattern"}}},
+    )
 
     renderer = load_renderer()
     renderer.render_run(run_dir)
@@ -302,6 +306,7 @@ def test_renderer_outputs_metric_profile_and_reproducibility_sections(
     assert "1.25" in html
     assert "Nsight evidence" in html
     assert "profiles/0-on/kernel_evidence.txt" in html
+    assert "kernel_attribution.json" in html
     assert "Reproducibility" in html
 
 
@@ -696,6 +701,14 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
             "BUILD_TOKEN": "SENTINEL_STRUCTURED_TOKEN_106",
         },
     )
+    write_json(
+        run_dir / "kernel_attribution.json",
+        {
+            "passed": False,
+            "signature_regexes": {"fused_glu": {"te": "safe-pattern"}},
+            "failures": ["name drift"],
+        },
+    )
     profile_dir = run_dir / "profiles/0-on"
     (profile_dir / "nsight").mkdir(parents=True)
     write_json(
@@ -786,6 +799,7 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
     assert (staged_run / "status.json").is_file()
     assert (staged_run / "events.jsonl").is_file()
     assert (staged_run / "metrics_summary.json").is_file()
+    assert (staged_run / "kernel_attribution.json").is_file()
     assert (staged_run / "slurm.out").stat().st_size <= renderer.MAX_EXCERPT_BYTES
     assert not (staged_run / "credentials.txt").exists()
     assert not list(staged_run.rglob("*.nsys-rep"))

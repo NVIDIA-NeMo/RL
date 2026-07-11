@@ -40,6 +40,7 @@ PUBLIC_JSON_ALLOWLIST = (
     "timing_summary.json",
     "metrics_summary.json",
     "matched_config_diff.json",
+    "kernel_attribution.json",
 )
 PUBLIC_TEXT_ALLOWLIST = (
     "image.sha256",
@@ -462,6 +463,7 @@ def reproducibility_section(
         "effective_config_off.yaml",
         "timing_summary.json",
         "metrics_summary.json",
+        "kernel_attribution.json",
         "slurm.out",
     ]
     linked = [candidate for candidate in candidates if (run_dir / candidate).exists()]

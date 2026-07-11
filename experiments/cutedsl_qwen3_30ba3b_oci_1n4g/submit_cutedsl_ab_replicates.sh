@@ -24,9 +24,19 @@ REPLICATES="${CUTEDSL_BENCHMARK_REPLICATES:-3}"
 WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-5}"
 MEASURED_UPDATES="${CUTEDSL_BENCHMARK_MEASURED_UPDATES:-20}"
 PROFILE_ENABLED="${CUTEDSL_BENCHMARK_PROFILE:-1}"
-readonly REPLICATES
+PROFILE_REPLICATE="${CUTEDSL_BENCHMARK_PROFILE_REPLICATE:-0}"
+readonly REPLICATES WARMUP_UPDATES MEASURED_UPDATES PROFILE_ENABLED PROFILE_REPLICATE
 if [[ ! "${REPLICATES}" =~ ^[0-9]+$ ]] || ((REPLICATES < 3)); then
     echo "[ERROR] CUTEDSL_BENCHMARK_REPLICATES must be an integer >= 3." >&2
+    exit 1
+fi
+if [[ "${PROFILE_ENABLED}" != "0" && "${PROFILE_ENABLED}" != "1" ]]; then
+    echo "[ERROR] CUTEDSL_BENCHMARK_PROFILE must be 0 or 1." >&2
+    exit 1
+fi
+if [[ ! "${PROFILE_REPLICATE}" =~ ^[0-9]+$ ]] || \
+    ((PROFILE_REPLICATE >= REPLICATES)); then
+    echo "[ERROR] CUTEDSL_BENCHMARK_PROFILE_REPLICATE must be an integer in [0, REPLICATES)." >&2
     exit 1
 fi
 
@@ -69,6 +79,11 @@ for ((replicate_index = 0; replicate_index < REPLICATES; replicate_index++)); do
     else
         timing_order="off,on"
     fi
+    replicate_profile_enabled=0
+    if [[ "${PROFILE_ENABLED}" == "1" ]] && \
+        ((replicate_index == PROFILE_REPLICATE)); then
+        replicate_profile_enabled=1
+    fi
 
     env -0 \
         -u CUTEDSL_BENCHMARK_REPLICATES \
@@ -78,13 +93,14 @@ for ((replicate_index = 0; replicate_index < REPLICATES; replicate_index++)); do
         -u CUTEDSL_BENCHMARK_WARMUP_UPDATES \
         -u CUTEDSL_BENCHMARK_MEASURED_UPDATES \
         -u CUTEDSL_BENCHMARK_PROFILE \
+        -u CUTEDSL_BENCHMARK_PROFILE_REPLICATE \
         -u SLURM_EXPORT_ENV \
         "CUTEDSL_BENCHMARK_REPLICATE=${replicate_index}" \
         "CUTEDSL_BENCHMARK_ORDER=${timing_order}" \
         "CUTEDSL_BENCHMARK_SUBMISSION_GROUP=${SUBMISSION_GROUP}" \
         "CUTEDSL_BENCHMARK_WARMUP_UPDATES=${WARMUP_UPDATES}" \
         "CUTEDSL_BENCHMARK_MEASURED_UPDATES=${MEASURED_UPDATES}" \
-        "CUTEDSL_BENCHMARK_PROFILE=${PROFILE_ENABLED}" \
+        "CUTEDSL_BENCHMARK_PROFILE=${replicate_profile_enabled}" \
         "SLURM_EXPORT_ENV=ALL" \
         > "${EXPORT_PAYLOAD}"
 
@@ -92,8 +108,9 @@ for ((replicate_index = 0; replicate_index < REPLICATES; replicate_index++)); do
         --export-file="${EXPORT_PAYLOAD}" \
         "${BENCHMARK_SCRIPT}")
     record=$(printf \
-        '{"replicate_index":%d,"timing_order":"%s","job_id":"%s","submission_group":"%s"}' \
-        "${replicate_index}" "${timing_order}" "${job_id}" "${SUBMISSION_GROUP}")
+        '{"replicate_index":%d,"timing_order":"%s","profile_enabled":%s,"job_id":"%s","submission_group":"%s"}' \
+        "${replicate_index}" "${timing_order}" "${replicate_profile_enabled}" \
+        "${job_id}" "${SUBMISSION_GROUP}")
     printf '%s\n' "${record}"
     if [[ "${TEST_ONLY}" == "0" ]]; then
         printf '%s\n' "${record}" >> "${SUBMISSION_RECORD}"

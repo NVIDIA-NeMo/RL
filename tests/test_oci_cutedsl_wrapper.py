@@ -464,9 +464,17 @@ def test_benchmark_requires_profile_artifacts_for_each_arm() -> None:
         '[[ ! -s "${arm_dir}/kernel_evidence.txt" ]]',
         '"nsight_report_count"',
         '"kernel_evidence"',
+        '"kernel_attribution.json"',
+        "FUSED_GLU_SIGNATURES",
+        "FUSED_DGLU_SIGNATURES",
+        "GROUPED_GEMM_SIGNATURES",
+        'manifest["kernel_attribution"]',
     )
     for fragment in required_fragments:
         assert fragment in BENCHMARK_SCRIPT, fragment
+    assert BENCHMARK_SCRIPT.index("# CUTEDSL_KERNEL_ATTRIBUTION_START") < (
+        BENCHMARK_SCRIPT.index("cutedsl_write_event profile pass")
+    )
 
 
 def test_benchmark_records_workload_and_normalized_throughput_as_primary() -> None:
@@ -582,6 +590,116 @@ def test_benchmark_metric_extractor_fails_loudly_when_required_metric_is_missing
     assert not (tmp_path / "arm/raw_timing.json").exists()
 
 
+def test_benchmark_metric_extractor_rejects_ambiguous_aliases(tmp_path: Path) -> None:
+    metrics = _required_fake_metrics()
+    metrics["timing/train/get_logprobs"] = metrics[
+        "timing/train/policy_and_reference_logprobs"
+    ].copy()
+    result = _run_metric_extractor(tmp_path, metrics)
+    assert result.returncode != 0
+    assert "timing/train/get_logprobs" in result.stderr
+    assert "ambiguous" in result.stderr
+    assert not (tmp_path / "arm/raw_timing.json").exists()
+
+
+def test_benchmark_metric_extractor_rejects_missing_measured_step(
+    tmp_path: Path,
+) -> None:
+    metrics = _required_fake_metrics()
+    metrics["timing/train/generation"].pop("12")
+    result = _run_metric_extractor(tmp_path, metrics)
+    assert result.returncode != 0
+    assert "timing/train/generation" in result.stderr
+    assert "missing measured steps: [12]" in result.stderr
+    assert not (tmp_path / "arm/raw_timing.json").exists()
+
+
+def _kernel_attribution_source() -> str:
+    start = "# CUTEDSL_KERNEL_ATTRIBUTION_START\n"
+    end = "# CUTEDSL_KERNEL_ATTRIBUTION_END\n"
+    assert start in BENCHMARK_SCRIPT
+    assert end in BENCHMARK_SCRIPT
+    return BENCHMARK_SCRIPT.split(start, 1)[1].split(end, 1)[0]
+
+
+def _run_kernel_attribution(
+    tmp_path: Path,
+    *,
+    on_evidence: str,
+    off_evidence: str,
+    grouped_gemm: bool = True,
+    op_fuser: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    result_dir = tmp_path / "result"
+    (result_dir / "profiles/0-on").mkdir(parents=True)
+    (result_dir / "profiles/1-off").mkdir(parents=True)
+    (result_dir / "profiles/0-on/kernel_evidence.txt").write_text(on_evidence)
+    (result_dir / "profiles/1-off/kernel_evidence.txt").write_text(off_evidence)
+    config_evidence = {
+        arm: {
+            "policy.megatron_cfg.moe_grouped_gemm": grouped_gemm,
+            "policy.megatron_cfg.use_transformer_engine_op_fuser": op_fuser,
+        }
+        for arm in ("on", "off")
+    }
+    (result_dir / "benchmark_manifest.json").write_text(
+        json.dumps({"fixed_config_evidence": config_evidence})
+    )
+    return subprocess.run(
+        [sys.executable, "-c", _kernel_attribution_source(), str(result_dir)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_benchmark_kernel_attribution_requires_fused_on_and_grouped_both(
+    tmp_path: Path,
+) -> None:
+    result = _run_kernel_attribution(
+        tmp_path,
+        on_evidence=(
+            "ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8\n"
+            "BlockScaledMoEGroupedGemmDgluDbiasKernel\n"
+            "BlockScaledMoEGroupedGemmQuantKernel\n"
+        ),
+        off_evidence="cutlass grouped_gemm universal kernel\n",
+    )
+    assert result.returncode == 0, result.stderr
+    attribution = json.loads((tmp_path / "result/kernel_attribution.json").read_text())
+    assert attribution["passed"] is True
+    assert attribution["arms"]["on"]["fused_glu_match_count"] > 0
+    assert attribution["arms"]["on"]["fused_dglu_match_count"] > 0
+    assert attribution["arms"]["off"]["fused_glu_match_count"] == 0
+    assert attribution["arms"]["off"]["fused_dglu_match_count"] == 0
+    assert attribution["arms"]["on"]["grouped_gemm_match_count"] > 0
+    assert attribution["arms"]["off"]["grouped_gemm_match_count"] > 0
+    assert "signature_regexes" in attribution
+    manifest = json.loads((tmp_path / "result/benchmark_manifest.json").read_text())
+    assert manifest["kernel_attribution"]["passed"] is True
+    assert (
+        manifest["kernel_attribution"]["signature_regexes"]
+        == attribution["signature_regexes"]
+    )
+
+
+def test_benchmark_kernel_attribution_writes_diagnostics_before_failure(
+    tmp_path: Path,
+) -> None:
+    result = _run_kernel_attribution(
+        tmp_path,
+        on_evidence="ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8\n",
+        off_evidence="BlockScaledMoEGroupedGemmGluBiasKernel\n",
+        op_fuser=False,
+    )
+    assert result.returncode != 0
+    assert "kernel attribution failed" in result.stderr
+    attribution = json.loads((tmp_path / "result/kernel_attribution.json").read_text())
+    assert attribution["passed"] is False
+    assert any("ON fused dGLU" in failure for failure in attribution["failures"])
+    assert any("OFF fused GLU" in failure for failure in attribution["failures"])
+    assert any("op fuser" in failure for failure in attribution["failures"])
+
+
 def test_benchmark_submit_driver_requires_three_alternating_replicates() -> None:
     wrapper_fragments = (
         'REPLICATE_INDEX="${CUTEDSL_BENCHMARK_REPLICATE:-0}"',
@@ -593,7 +711,9 @@ def test_benchmark_submit_driver_requires_three_alternating_replicates() -> None
     driver_fragments = (
         'REPLICATES="${CUTEDSL_BENCHMARK_REPLICATES:-3}"',
         'WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-5}"',
+        'PROFILE_REPLICATE="${CUTEDSL_BENCHMARK_PROFILE_REPLICATE:-0}"',
         "REPLICATES < 3",
+        "PROFILE_REPLICATE >= REPLICATES",
         "replicate_index % 2 == 0",
         'timing_order="on,off"',
         'timing_order="off,on"',
@@ -670,6 +790,7 @@ required = {
     "CUTEDSL_BENCHMARK_REPLICATE",
     "CUTEDSL_BENCHMARK_ORDER",
     "CUTEDSL_BENCHMARK_SUBMISSION_GROUP",
+    "CUTEDSL_BENCHMARK_PROFILE",
     "CUTEDSL_PROFILE_NAME",
     "CUTEDSL_IMAGE",
     "CUTEDSL_IMAGE_SHA256",
@@ -688,6 +809,7 @@ record = {
     "mode": mode,
     "replicate": exported["CUTEDSL_BENCHMARK_REPLICATE"],
     "order": exported["CUTEDSL_BENCHMARK_ORDER"],
+    "profile_enabled": exported["CUTEDSL_BENCHMARK_PROFILE"],
     "submission_group": exported["CUTEDSL_BENCHMARK_SUBMISSION_GROUP"],
     "submission_branch": exported["CUTEDSL_SUBMISSION_GIT_BRANCH"],
     "submission_sha": exported["CUTEDSL_SUBMISSION_GIT_SHA"],
@@ -706,6 +828,7 @@ print(f"mock-{record['replicate']}")
             "MOCK_SBATCH_CALLS": str(calls_path),
             "CUTEDSL_CLUSTER_PROFILE": "pre_tyche",
             "CUTEDSL_BENCHMARK_REPLICATES": "3",
+            "CUTEDSL_BENCHMARK_PROFILE_REPLICATE": "0",
             "CUTEDSL_BENCHMARK_REPLICATE": "999",
             "CUTEDSL_BENCHMARK_ORDER": "stale,order",
             "CUTEDSL_BENCHMARK_SUBMISSION_GROUP": "stale-group",
@@ -740,6 +863,7 @@ print(f"mock-{record['replicate']}")
         "off,on",
         "on,off",
     ]
+    assert [call["profile_enabled"] for call in calls] == ["1", "0", "0"]
     assert len({call["submission_group"] for call in calls}) == 1
     assert calls[0]["submission_group"] != "stale-group"
     assert [call["submission_branch"] for call in calls] == [
@@ -753,3 +877,47 @@ print(f"mock-{record['replicate']}")
         text=True,
     ).stdout.strip()
     assert [call["submission_sha"] for call in calls] == [expected_sha] * 3
+
+    calls_path.write_text("")
+    env["CUTEDSL_BENCHMARK_PROFILE"] = "0"
+    disabled_result = subprocess.run(
+        ["bash", str(driver)],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert disabled_result.returncode == 0, disabled_result.stderr
+    disabled_calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+    assert [call["profile_enabled"] for call in disabled_calls] == ["0", "0", "0"]
+
+
+def test_benchmark_submit_driver_rejects_invalid_profile_replicate(
+    tmp_path: Path,
+) -> None:
+    mock_bin = tmp_path / "bin"
+    mock_bin.mkdir()
+    calls_path = tmp_path / "calls.jsonl"
+    mock_sbatch = mock_bin / "sbatch"
+    mock_sbatch.write_text("#!/bin/bash\nexit 99\n")
+    mock_sbatch.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{mock_bin}:{env['PATH']}",
+            "CUTEDSL_CLUSTER_PROFILE": "pre_tyche",
+            "CUTEDSL_BENCHMARK_REPLICATES": "3",
+            "CUTEDSL_BENCHMARK_PROFILE_REPLICATE": "3",
+            "MOCK_SBATCH_CALLS": str(calls_path),
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(BENCHMARK_SUBMIT_PATH), "--test-only"],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "CUTEDSL_BENCHMARK_PROFILE_REPLICATE" in result.stderr
+    assert not calls_path.exists()
