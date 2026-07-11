@@ -42,8 +42,8 @@ def test_wrapper_runs_complete_locked_linux_validation_gate() -> None:
         "Copyright (c) 2026, NVIDIA CORPORATION.",
         '"${UV_BIN}" sync --locked --extra mcore --group test --group dev',
         '"${UV_BIN}" lock --check',
-        "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/models/test_param_mapping.py",
-        "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/training/test_checkpointing.py",
+        "tests/unit_tests/models/test_param_mapping.py",
+        "tests/unit_tests/training/test_checkpointing.py",
         "tests/unit/models/megatron/test_megatron_setup.py",
         "tests/unit/models/megatron/test_community_import.py",
         "tests/test_cutedsl_policy_recipe.py",
@@ -55,6 +55,40 @@ def test_wrapper_runs_complete_locked_linux_validation_gate() -> None:
         assert fragment in SCRIPT, fragment
     assert SCRIPT.index('"${UV_BIN}" lock --check') < SCRIPT.index(
         "Running the four-GPU"
+    )
+
+
+def test_wrapper_isolates_bridge_and_nemo_rl_pytest_roots() -> None:
+    focused_gate = SCRIPT[
+        SCRIPT.index("cutedsl_write_event focused_tests start") : SCRIPT.index(
+            '"${UV_BIN}" run --active --no-sync pyrefly check'
+        )
+    ]
+    bridge_pytest = """bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+(
+    cd "${bridge_root}"
+    "${UV_BIN}" run --active --no-sync pytest \\
+        tests/unit_tests/models/test_param_mapping.py \\
+        tests/unit_tests/training/test_checkpointing.py \\
+        -q
+) 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"""  # noqa: E501
+    nemo_rl_pytest = """(
+    cd "${CONTAINER_REPO_ROOT}"
+    "${UV_BIN}" run --active --no-sync pytest \\
+        tests/unit/models/megatron/test_megatron_setup.py \\
+        tests/unit/models/megatron/test_community_import.py \\
+        tests/test_cutedsl_policy_recipe.py \\
+        -q
+) 2>&1 | tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"""
+
+    assert "set -euo pipefail" in focused_gate
+    assert focused_gate.count('"${UV_BIN}" run --active --no-sync pytest') == 2
+    assert bridge_pytest in focused_gate
+    assert nemo_rl_pytest in focused_gate
+    assert focused_gate.index(bridge_pytest) < focused_gate.index(nemo_rl_pytest)
+    assert focused_gate.count('| tee "${CONTAINER_RESULT_DIR}/focused_tests.log"') == 1
+    assert (
+        focused_gate.count('| tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"') == 1
     )
 
 

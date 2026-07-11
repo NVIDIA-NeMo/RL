@@ -370,13 +370,22 @@ runtime_python=$("${UV_BIN}" run --active --no-sync python -c '"'"'import os, sy
 runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; print(sys.prefix)'"'"')
 [[ "${runtime_python}" == "${expected_runtime_python}" ]]
 [[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
-"${UV_BIN}" run --active --no-sync pytest \
-    3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/models/test_param_mapping.py \
-    3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/training/test_checkpointing.py \
-    tests/unit/models/megatron/test_megatron_setup.py \
-    tests/unit/models/megatron/test_community_import.py \
-    tests/test_cutedsl_policy_recipe.py \
-    -q 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"
+bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+(
+    cd "${bridge_root}"
+    "${UV_BIN}" run --active --no-sync pytest \
+        tests/unit_tests/models/test_param_mapping.py \
+        tests/unit_tests/training/test_checkpointing.py \
+        -q
+) 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"
+(
+    cd "${CONTAINER_REPO_ROOT}"
+    "${UV_BIN}" run --active --no-sync pytest \
+        tests/unit/models/megatron/test_megatron_setup.py \
+        tests/unit/models/megatron/test_community_import.py \
+        tests/test_cutedsl_policy_recipe.py \
+        -q
+) 2>&1 | tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"
 
 "${UV_BIN}" run --active --no-sync pyrefly check 2>&1 | tee "${CONTAINER_RESULT_DIR}/pyrefly.log"
 
@@ -391,7 +400,6 @@ fi
 "${UV_BIN}" run --active --no-sync pre-commit run --files "${parent_changed_files[@]}" \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/parent_precommit.log"
 
-bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 git -C "${bridge_root}" diff --name-only --diff-filter=ACMR HEAD^..HEAD \
     > "${CONTAINER_RESULT_DIR}/bridge_changed_files.txt"
 mapfile -t bridge_changed_files < "${CONTAINER_RESULT_DIR}/bridge_changed_files.txt"
