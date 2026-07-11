@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import threading as _threading
 from collections import Counter
 from typing import Any, Iterable, Optional
@@ -19,6 +20,17 @@ from typing import Any, Iterable, Optional
 import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+
+# Per-add / per-sample debug prints fire once per prompt group, so they flood the
+# log at large ppo.num_prompts_per_step (e.g. 8192 => tens of thousands of lines
+# per step). Throttle to a periodic heartbeat: print every Nth event. N is
+# configured in YAML (ppo.async_ppo.log_every / grpo.async_grpo.log_every) and
+# passed to the buffer constructor:
+#   N > 0  -> print every Nth event
+#   N == 0 -> silence the throttled lines
+#   unset  -> print every event (no throttling)
+# NRL_ASYNC_VERBOSE=1 additionally enables the O(n) full-list dumps.
+_ASYNC_VERBOSE = os.environ.get("NRL_ASYNC_VERBOSE", "0").lower() in ("1", "true")
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -29,10 +41,14 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, log_every: Optional[int] = None):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
+        # Heartbeat frequency for the throttled progress prints, from YAML
+        # (ppo.async_ppo.log_every). N>0 => every Nth event; 0 => silence; unset
+        # (None) => every event (log_every_n == 1, no throttling).
+        self._log_every_n = 1 if log_every is None else int(log_every)
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -40,6 +56,10 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+
+    def _should_log(self, n: int) -> bool:
+        """True on every ``log_every``-th event (always if ``NRL_ASYNC_VERBOSE``)."""
+        return _ASYNC_VERBOSE or (self._log_every_n > 0 and n % self._log_every_n == 0)
 
     def add(
         self,
@@ -58,15 +78,24 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             if len(self.trajectories) >= self.max_size:
                 return "full"
 
-            print("🔍 ReplayBuffer.add: Adding trajectory")
             self.trajectories.append(trajectory)
             self.trajectory_versions.append(weight_version)
             self.target_weight_versions.append(target_weight_version)
             # Do not advance last_target_weight_already_generated here. A target
             # is only safe to skip once training consumes a complete batch for it.
-            print(
-                f"ReplayBuffer state: {len(self.trajectories)} groups, versions={self.trajectory_versions}, targets={self.target_weight_versions}, last_target_weight_already_generated={self.last_target_weight_already_generated}"
-            )
+            n = len(self.trajectories)
+            if _ASYNC_VERBOSE:
+                print(
+                    f"🔍 ReplayBuffer.add: {n} groups, "
+                    f"versions={self.trajectory_versions}, "
+                    f"targets={self.target_weight_versions}, "
+                    f"last_target_weight_already_generated={self.last_target_weight_already_generated}"
+                )
+            elif self._should_log(n):
+                print(
+                    f"🔍 ReplayBuffer: {n} groups buffered "
+                    f"(last_target_already_generated={self.last_target_weight_already_generated})"
+                )
             return "success"
 
     def get_debug_info(self) -> dict:
@@ -115,13 +144,15 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 return None
 
             total_trajectories = len(self.trajectories)
-            print("🔍 ReplayBuffer sampling debug:")
-            print(f"   {current_weight_version=}, {max_age_steps=}")
-            print(f"   {self.trajectory_versions=}")
-
-            # For debugging: check for unexpected old trajectories
+            # Counter is a compact summary; the raw per-group version list is O(n)
+            # and floods at large buffers, so only dump it under NRL_ASYNC_VERBOSE.
             version_counts = Counter(self.trajectory_versions)
-            print(f"   {version_counts=}")
+            print(
+                f"🔍 ReplayBuffer sampling: {current_weight_version=}, "
+                f"{max_age_steps=}, {total_trajectories=}, {version_counts=}"
+            )
+            if _ASYNC_VERBOSE:
+                print(f"   {self.trajectory_versions=}")
 
             # Compute minimum valid version based on age window
             # max_age_steps=1 means trajectories from the last 1 step are valid
@@ -220,13 +251,24 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     f"(consumed batch for step {current_weight_version})"
                 )
 
+            _new_targets = (
+                self.target_weight_versions
+                if _ASYNC_VERBOSE
+                else f"<{len(self.target_weight_versions)} groups>"
+            )
             print(
-                f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
+                f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {_new_targets}"
             )
 
             return {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
+                # Per-group generation weight-versions of the sampled trajectories.
+                # avg_trajectory_age above is the GEN-version age; a consumer that
+                # knows the freeze boundary (e.g. async PPO's critic warmup) can use
+                # these to compute the true POLICY-age instead. Extra key — ignored
+                # by callers that don't need it (e.g. async GRPO).
+                "generation_weight_versions": sampled_weights,
             }
 
     def size(self) -> int:
@@ -640,4 +682,7 @@ class ReplayBufferNew(ReplayBufferImpl):
             return {
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
+                # Keep the return schema identical to ReplayBufferImpl.sample so
+                # consumers can compute freeze-aware policy-age uniformly.
+                "generation_weight_versions": sampled_weights,
             }

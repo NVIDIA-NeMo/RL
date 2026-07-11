@@ -1184,6 +1184,38 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    def test_async_trajectory_collector_max_trajectory_age_override(self):
+        """Collector max trajectory age defaults to config and is settable.
+
+        Async PPO raises this during critic warmup (frozen actor => any-age
+        trajectories are on-policy) and lowers it at the warmup->training
+        boundary. The mock config has async_grpo.max_trajectory_age_steps=2 and
+        no warmup key, so the default is 2.
+        """
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        assert ray.get(collector.get_max_trajectory_age.remote()) == 2
+        ray.get(collector.set_max_trajectory_age.remote(8))
+        assert ray.get(collector.get_max_trajectory_age.remote()) == 8
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
     def test_async_trajectory_collector_pause_resume(self):
         """Test pause and resume functionality."""
         buffer = ReplayBuffer.remote(max_size=10)

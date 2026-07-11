@@ -117,13 +117,24 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
-# It's session based and won't affect the system outside the script
-# Ensure that the soft limit isn't above the hard limit
-if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
-  ulimit -Sn 65535
-elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
-  echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
+# It's session based and won't affect the system outside the script.
+# 65535 is Ray's *minimum* recommendation. Async RL opens one asyncio/uvloop event
+# loop (several file descriptors) per in-flight generation rollout, so with a large
+# ppo.num_prompts_per_step the collector can need far more than 65535 and hit
+# "OSError: [Errno 24] Too many open files". Raise the soft limit as high as the
+# hard limit permits (capped at 1048576, which covers e.g. 8192 prompts * age 10).
+_NRL_TARGET_NOFILE=1048576
+_NRL_HARD_NOFILE=$(ulimit -Hn)
+if [[ "$_NRL_HARD_NOFILE" == "unlimited" ]] || [[ "$_NRL_HARD_NOFILE" -ge "$_NRL_TARGET_NOFILE" ]]; then
+  ulimit -Sn "$_NRL_TARGET_NOFILE"
+elif [[ "$_NRL_HARD_NOFILE" -ge 65535 ]]; then
+  # Hard limit below our target but still >= Ray's minimum: raise soft to the hard cap.
+  ulimit -Sn "$_NRL_HARD_NOFILE"
+else
+  echo "[WARNING]: hard FD limit ($_NRL_HARD_NOFILE) is below Ray's recommended 65535. Async RL with a large ppo.num_prompts_per_step may crash with 'Too many open files' (Errno 24). Ask cluster admins to raise the nofile hard limit."
+  ulimit -Sn "$_NRL_HARD_NOFILE"
 fi
+echo "[INFO] FD limit (ulimit -n): soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
 
 # Worker port range must NOT overlap with the OS ephemeral range (32768-60999)
 # to prevent TOCTOU collisions.  Ray's Raylet uses a probe-and-release pattern

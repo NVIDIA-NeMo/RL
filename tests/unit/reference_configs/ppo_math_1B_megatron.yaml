@@ -49,6 +49,21 @@ ppo:
     target_max: 1.0
   seq_logprob_error_threshold: null
 
+  async_ppo:
+    enabled: false  # Set to true for async PPO (requires non-colocated vLLM generation)
+    # Max age (in training steps) for trajectories drawn from the replay buffer.
+    # Recommended/validated value is 1; higher values increase critic-staleness
+    # bias (warned, not forbidden). See AsyncPPOConfig in nemo_rl/algorithms/ppo.py.
+    max_trajectory_age_steps: 1
+    # Max age used ONLY during critic warmup (step < policy_training_start_step),
+    # where the frozen actor makes any-age trajectories on-policy for free. null
+    # => same as max_trajectory_age_steps. Only helps throughput when warmup is
+    # generation-bound. See AsyncPPOConfig.
+    warmup_max_trajectory_age_steps: null
+    in_flight_weight_updates: false  # Set to true to enable in-flight weight updates
+    recompute_kv_cache_after_weight_updates: false
+    log_every: 500  # heartbeat frequency for collector progress prints (0 silences)
+
 loss_fn:
   disable_ppo_ratio: false
   reference_policy_kl_penalty: 0.0  # DAPO: no KL penalty

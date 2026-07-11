@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import threading as _threading
 import time
 from collections import defaultdict
@@ -38,6 +39,17 @@ from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
 
+# Per-worker / per-group progress prints fire once per prompt group, so they flood
+# the log at large ppo.num_prompts_per_step (e.g. 8192 => tens of thousands of lines
+# per step). Throttle to a periodic heartbeat: print every Nth event, plus the final
+# one per target. N is configured in YAML (ppo.async_ppo.log_every /
+# grpo.async_grpo.log_every):
+#   N > 0  -> print every Nth event
+#   N == 0 -> silence the throttled lines
+#   unset  -> print every event (no throttling)
+# NRL_ASYNC_VERBOSE=1 additionally enables the O(n) full-list dumps.
+_ASYNC_VERBOSE = os.environ.get("NRL_ASYNC_VERBOSE", "0").lower() in ("1", "true")
+
 
 @ray.remote  # pragma: no cover
 class AsyncTrajectoryCollector:
@@ -59,6 +71,43 @@ class AsyncTrajectoryCollector:
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
         self.master_config = master_config
+        # Resolve the algorithm config block generically so this collector works
+        # for both GRPO (master_config.grpo / "async_grpo") and PPO
+        # (master_config.ppo / "async_ppo"). The shared trajectory-collection
+        # logic (num_prompts_per_step, num_generations_per_prompt,
+        # max_rollout_turns, and the async sub-block) is identical between them;
+        # only the config key differs. `_algo_cfg`/`_async_cfg` are read below in
+        # place of the former `master_config.grpo[...]` / `["async_grpo"]` reads.
+        self._algo_cfg = getattr(master_config, "grpo", None)
+        if self._algo_cfg is None:
+            self._algo_cfg = master_config.ppo
+        self._async_cfg = (
+            self._algo_cfg.get("async_grpo")
+            or self._algo_cfg.get("async_ppo")
+            or {}
+        )
+        # Effective max trajectory age used for the generation-lead decisions
+        # below. The driver may override it per phase via set_max_trajectory_age()
+        # — e.g. a larger value during critic warmup, where the frozen actor makes
+        # arbitrarily-old trajectories on-policy (importance ratio == 1). Defaults
+        # to the configured value, so callers that never call the setter (e.g.
+        # async GRPO) behave exactly as before.
+        self._current_max_age = int(self._async_cfg["max_trajectory_age_steps"])
+        # Highest age the collector may be switched to (warmup age if larger),
+        # used to size the fixed in-flight semaphore up front. Absent for GRPO
+        # (async_grpo has no warmup key) → falls back to the train age.
+        self._max_age_ceiling = max(
+            self._current_max_age,
+            int(
+                self._async_cfg.get("warmup_max_trajectory_age_steps")
+                or self._current_max_age
+            ),
+        )
+        # Heartbeat frequency for throttled progress prints, from YAML
+        # (ppo.async_ppo.log_every / grpo.async_grpo.log_every). N>0 => every Nth
+        # event; 0 => silence; unset (None) => every event (no throttling).
+        _log_every_cfg = self._async_cfg.get("log_every")
+        self._log_every_n = 1 if _log_every_cfg is None else int(_log_every_cfg)
         self.replay_buffer = replay_buffer
         self.teacher_worker_groups = teacher_worker_groups or {}
         self.alias_to_group_alias = alias_to_group_alias or {}
@@ -100,11 +149,19 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
-        # This value limits the parallelism of the generation requests.
+        # Limit in-flight generator requests to num_prompts_per_step * max age,
+        # sized for the ceiling (warmup age if larger) so deep warmup generation
+        # isn't throttled. The semaphore size is fixed for the collector's life.
+        #
+        # CAUTION: this bounds CONCURRENT in-flight rollouts, and each rollout runs
+        # its own asyncio/uvloop event loop (several file descriptors). So the peak
+        # concurrency is num_prompts_per_step * _max_age_ceiling — keep the product
+        # under the process FD limit (`ulimit -n`). E.g. num_prompts_per_step=8192
+        # with warmup age 10 => 81920 concurrent event loops => ~300k FDs, which
+        # overruns a default limit (OSError: [Errno 24] Too many open files). Either
+        # keep warmup_max_trajectory_age_steps modest or raise `ulimit -n`.
         max_inflight = (
-            int(self.master_config.grpo["num_prompts_per_step"])
-            * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
+            int(self._algo_cfg["num_prompts_per_step"]) * self._max_age_ceiling
         ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
@@ -122,6 +179,10 @@ class AsyncTrajectoryCollector:
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
 
+    def _should_log(self, n: int) -> bool:
+        """True on every ``log_every``-th event (always if ``NRL_ASYNC_VERBOSE``)."""
+        return _ASYNC_VERBOSE or (self._log_every_n > 0 and n % self._log_every_n == 0)
+
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
 
@@ -137,9 +198,8 @@ class AsyncTrajectoryCollector:
         Returns:
             [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
         """
-        # Read async config strictly from grpo.async_grpo
-        async_cfg = self.master_config.grpo.get("async_grpo", {})
-        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+        # Effective (possibly warmup-elevated) max age, see set_max_trajectory_age.
+        max_trajectory_age = self._current_max_age
         if generation_weight_version == self.initial_weight_version:
             return [
                 i
@@ -156,10 +216,8 @@ class AsyncTrajectoryCollector:
     ) -> Optional[int]:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
-        num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
-        max_age_steps = int(
-            self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
-        )
+        num_prompts = int(self._algo_cfg["num_prompts_per_step"])
+        max_age_steps = int(self._current_max_age)
         last_consumed_target = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
@@ -202,14 +260,26 @@ class AsyncTrajectoryCollector:
         else:
             print(f"🔄 Updated weight version to {version}")
 
+    def set_max_trajectory_age(self, age: int) -> None:
+        """Override the effective max trajectory age for generation-lead decisions.
+
+        Used by async PPO to run a larger age during critic warmup (where the
+        frozen actor makes old trajectories on-policy) and snap back to the
+        configured training age once the actor starts training. The replay
+        buffer's own eviction (driven by the age the *driver* passes to
+        ``sample``) is what actually clamps staleness, so lowering this at the
+        warmup→training transition simply stops the collector from generating
+        further ahead than the training age allows.
+        """
+        self._current_max_age = int(age)
+        print(f"🔧 Collector max trajectory age set to {self._current_max_age}")
+
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
-            num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
-            max_age_steps = int(
-                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
-            )
+            num_prompts = int(self._algo_cfg["num_prompts_per_step"])
+            max_age_steps = int(self._current_max_age)
             last_consumed_target = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
@@ -271,8 +341,7 @@ class AsyncTrajectoryCollector:
                 if self._should_pause_for_generation_limits() and self.running:
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                        max_trajectory_age = self._current_max_age
                         target_weights = [
                             self.current_weight_version + i
                             for i in range(max_trajectory_age)
@@ -312,12 +381,10 @@ class AsyncTrajectoryCollector:
         target_weight: Optional[int] = None
         try:
             generation_weight_version = self.current_weight_version
-            num_generations = self.master_config.grpo["num_generations_per_prompt"]
+            num_generations = self._algo_cfg["num_generations_per_prompt"]
             num_prompts_in_batch = batch.size
-            num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
-            max_age_steps = int(
-                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
-            )
+            num_prompts_per_step = int(self._algo_cfg["num_prompts_per_step"])
+            max_age_steps = int(self._current_max_age)
 
             # Get the next target weight that needs generation
             target_weight = self._get_next_target_for_generation(
@@ -425,10 +492,11 @@ class AsyncTrajectoryCollector:
                         self._inflight_sema.release()
                         raise
                     started += 1
-                    print(
-                        f"📊 Started worker {started}/{num_prompts_to_generate} for "
-                        f"target_weight={target_weight} ({spawned_count} total)"
-                    )
+                    if self._should_log(started) or started == num_prompts_to_generate:
+                        print(
+                            f"📊 Started worker {started}/{num_prompts_to_generate} "
+                            f"for target_weight={target_weight} ({spawned_count} total)"
+                        )
             finally:
                 if started < num_prompts_to_generate:
                     print(
@@ -453,6 +521,9 @@ class AsyncTrajectoryCollector:
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
+
+    def get_max_trajectory_age(self) -> int:
+        return self._current_max_age
 
     def pause(self) -> None:
         """Pause trajectory collection."""
@@ -493,7 +564,7 @@ class AsyncTrajectoryCollector:
             )
         else:
             is_async_engine = False
-        in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
+        in_flight_weight_updates = self._async_cfg.get(
             "in_flight_weight_updates", False
         )
 
@@ -524,7 +595,7 @@ class AsyncTrajectoryCollector:
         # Invalidate&recompute vLLM caches after the in-flight weight updates if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
-        async_cfg = self.master_config.grpo.get("async_grpo", {})
+        async_cfg = self._async_cfg
         if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
             "recompute_kv_cache_after_weight_updates", False
         ):
@@ -769,7 +840,7 @@ class AsyncTrajectoryCollector:
                     tokenizer=self.tokenizer,
                     task_to_env=self.task_to_env,
                     max_seq_len=self.master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=self.master_config.grpo["max_rollout_turns"],
+                    max_rollout_turns=self._algo_cfg["max_rollout_turns"],
                     greedy=False,
                 )
 
@@ -840,11 +911,15 @@ class AsyncTrajectoryCollector:
                                 "idle/buffer_full_backoff",
                                 time.perf_counter() - backoff_start,
                             )
-                        print(
-                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
-                            f"target_weight {target_weight_version}) "
-                            f"[{buffered_count}/{spawned_count} buffered]"
-                        )
+                        if (
+                            self._should_log(buffered_count)
+                            or buffered_count == spawned_count
+                        ):
+                            print(
+                                f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
+                                f"target_weight {target_weight_version}) "
+                                f"[{buffered_count}/{spawned_count} buffered]"
+                            )
                         break
                     elif status == "full":
                         if backoff_start is None:

@@ -965,3 +965,328 @@ def test_ppo_setup_cluster_split_matches_colocation_mode(monkeypatch, colocated)
         assert train_cluster is not inference_cluster
         assert train_cluster.max_colocated_worker_groups == 2
         assert inference_cluster.max_colocated_worker_groups == 1
+
+
+# ===============================================================================
+# Async PPO entry guards (async_ppo_train)
+# ===============================================================================
+
+
+def _build_async_ppo_master_config():
+    """PPO MasterConfig pre-configured for a valid async run.
+
+    Individual guard tests mutate one field to trip a specific assertion. All
+    guards fire before any Ray actor is created, so the other async_ppo_train
+    arguments can be plain mocks.
+    """
+    master_config = _build_ppo_master_config()
+    master_config.policy["generation"]["backend"] = "vllm"
+    master_config.policy["generation"]["colocated"] = {
+        "enabled": False,
+        "resources": {"gpus_per_node": 1, "num_nodes": 1},
+    }
+    master_config.policy["generation"]["vllm_cfg"]["async_engine"] = True
+    master_config.loss_fn = ClippedPGLossConfig(use_importance_sampling_correction=True)
+    master_config.ppo["policy_training_start_step"] = 0
+    master_config.ppo["num_generations_per_prompt"] = 1
+    master_config.ppo["overlong_filtering"] = False
+    master_config.ppo["async_ppo"] = {
+        "enabled": True,
+        "max_trajectory_age_steps": 1,
+        "in_flight_weight_updates": False,
+    }
+    return master_config
+
+
+def _call_async_ppo_train(master_config):
+    from unittest.mock import MagicMock
+
+    from nemo_rl.algorithms.ppo import async_ppo_train
+
+    async_ppo_train(
+        policy=MagicMock(),
+        policy_generation=MagicMock(),
+        value_model=MagicMock(),
+        dataloader=MagicMock(),
+        val_dataloader=None,
+        tokenizer=MagicMock(),
+        loss_fn=MagicMock(),
+        value_loss_fn=MagicMock(),
+        task_to_env={},
+        val_task_to_env=None,
+        logger=MagicMock(),
+        checkpointer=MagicMock(),
+        ppo_save_state=MagicMock(),
+        master_config=master_config,
+        max_trajectory_age_steps=master_config.ppo["async_ppo"][
+            "max_trajectory_age_steps"
+        ],
+    )
+
+
+def test_async_ppo_rejects_non_vllm_backend():
+    master_config = _build_async_ppo_master_config()
+    master_config.policy["generation"]["backend"] = "sglang"
+    with pytest.raises(AssertionError, match="async vLLM generation engine"):
+        _call_async_ppo_train(master_config)
+
+
+def test_async_ppo_requires_async_engine():
+    master_config = _build_async_ppo_master_config()
+    master_config.policy["generation"]["vllm_cfg"]["async_engine"] = False
+    with pytest.raises(AssertionError, match="async vLLM generation engine"):
+        _call_async_ppo_train(master_config)
+
+
+def test_async_ppo_requires_importance_sampling_correction():
+    master_config = _build_async_ppo_master_config()
+    master_config.loss_fn = ClippedPGLossConfig(
+        use_importance_sampling_correction=False
+    )
+    with pytest.raises(AssertionError, match="Importance sampling correction"):
+        _call_async_ppo_train(master_config)
+
+
+def test_async_ppo_rejects_colocated_inference():
+    master_config = _build_async_ppo_master_config()
+    master_config.policy["generation"]["colocated"]["enabled"] = True
+    with pytest.raises(AssertionError, match="Colocated inference is not supported"):
+        _call_async_ppo_train(master_config)
+
+
+def test_async_ppo_requires_positive_ppo_epochs():
+    """ppo_epochs == 0 would leave train_results unset; guard rejects it."""
+    master_config = _build_async_ppo_master_config()
+    master_config.ppo["ppo_epochs"] = 0
+    with pytest.raises(AssertionError, match="ppo_epochs must be >= 1"):
+        _call_async_ppo_train(master_config)
+
+
+def test_async_ppo_rejects_nemo_gym():
+    """NeMo-Gym rollout is not wired for async PPO; guard fails loud at startup."""
+    master_config = _build_async_ppo_master_config()
+    master_config.env["should_use_nemo_gym"] = True
+    # _should_use_nemo_gym also requires the http server to be exposed.
+    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    with pytest.raises(AssertionError, match="NeMo-Gym rollout is not yet supported"):
+        _call_async_ppo_train(master_config)
+
+
+# ---------------------------------------------------------------------------
+# Warmup trajectory-age boundaries (the two-boundary fix for the frozen-actor
+# critic-warmup phase). See async_ppo_train's _collector_lead_age /
+# _sample_max_age and the pi_0 policy-version analysis.
+# ---------------------------------------------------------------------------
+def test_async_warmup_age_boundaries_no_elevation():
+    """warmup_age == train_age (the default) => constant age at every step, so
+    behaviour is identical to plain async PPO regardless of the boundary math."""
+    from nemo_rl.algorithms.ppo import (
+        _async_warmup_collector_lead_age,
+        _async_warmup_sample_max_age,
+    )
+
+    W, train_age = 20, 1
+    for s in range(0, W + 10):
+        assert _async_warmup_collector_lead_age(s, W, train_age, train_age) == train_age
+        assert _async_warmup_sample_max_age(s, W, train_age, train_age) == train_age
+
+
+def test_async_warmup_collector_lead_age_boundary_at_W():
+    """Collector generation-lead is elevated through step W (frozen actor), then
+    drops to the training age from W+1 so it regenerates against the trained policy."""
+    from nemo_rl.algorithms.ppo import _async_warmup_collector_lead_age
+
+    W, train_age, warmup_age = 20, 1, 8
+    assert _async_warmup_collector_lead_age(W - 1, W, train_age, warmup_age) == warmup_age
+    assert _async_warmup_collector_lead_age(W, W, train_age, warmup_age) == warmup_age
+    assert _async_warmup_collector_lead_age(W + 1, W, train_age, warmup_age) == train_age
+
+
+def test_async_warmup_sample_max_age_boundary_at_W_plus_train_age():
+    """Driver eviction age stays elevated through W + train_age: a frozen (pi_0)
+    rollout is within train_age POLICY-steps of the actor there, so it is admitted
+    as valid lag-<=train_age data instead of being wrongly evicted (which would
+    deadlock, since the collector never regenerates that target)."""
+    from nemo_rl.algorithms.ppo import _async_warmup_sample_max_age
+
+    W, warmup_age = 20, 8
+    # train_age = 1: elevated through W+1 (policy-age 1), drops at W+2.
+    assert _async_warmup_sample_max_age(W, W, 1, warmup_age) == warmup_age
+    assert _async_warmup_sample_max_age(W + 1, W, 1, warmup_age) == warmup_age
+    assert _async_warmup_sample_max_age(W + 2, W, 1, warmup_age) == 1
+    # train_age = 2: pi_0 stays within 2 policy-steps through W+2, drops at W+3.
+    assert _async_warmup_sample_max_age(W + 2, W, 2, warmup_age) == warmup_age
+    assert _async_warmup_sample_max_age(W + 3, W, 2, warmup_age) == 2
+
+
+def test_async_trajectory_policy_age_is_freeze_aware():
+    """The gen-version age overcounts staleness during warmup; policy-age is the
+    true off-policy distance and must stay <= max_trajectory_age_steps.
+
+    Reproduces the smoke-test boundary (W=3, A_w=5, A_t=1): the frozen pi_0 banked
+    at gen-version 0 is consumed at steps 0..4, then a fresh pi_1 (gen-version 4) at
+    step 5. Its gen-version age spikes to 4 at step 4, but its POLICY-age is only 1.
+    """
+    from nemo_rl.algorithms.ppo import _async_trajectory_policy_age
+
+    W, train_age = 3, 1
+    # (weight_version s, gen_version g) actually consumed each step of the smoke run.
+    consumed = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 4)]
+    expected_gen_age = [0, 1, 2, 3, 4, 1]
+    expected_policy_age = [0, 0, 0, 0, 1, 1]
+    for (s, g), gen_age, pol_age in zip(
+        consumed, expected_gen_age, expected_policy_age
+    ):
+        assert (s - g) == gen_age  # what avg_trajectory_age reports
+        got = _async_trajectory_policy_age(g, s, W)
+        assert got == pol_age, (s, g, got, pol_age)
+        assert got <= train_age  # the invariant that actually matters
+
+    # No warmup (W == 0): policy-age reduces to the plain gen-version age.
+    for s in range(6):
+        for g in range(s + 1):
+            assert _async_trajectory_policy_age(g, s, 0) == s - g
+
+
+def test_replay_buffer_admits_banked_frozen_rollout_at_boundary():
+    """End-to-end buffer check of the boundary: a frozen rollout banked deep during
+    warmup (low gen-version) targeting step W+1 must be ADMITTED when sampled with
+    the elevated (warmup) age at step W+1, and EVICTED once the age snaps back.
+
+    This is the exact scenario that deadlocked with a single W boundary: the
+    collector had already advanced its lead past target W+1, so an eviction there
+    is unrecoverable.
+    """
+    from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
+
+    W, train_age, warmup_age = 20, 1, 8
+    num_prompts = 2
+
+    def _fresh_buffer():
+        buf = ReplayBufferImpl(max_size=64)
+        # Two groups for target W+1, generated during warmup at gen-version W+1-A_w
+        # (the frozen actor pi_0). gen-version age is warmup_age, policy-age is 1.
+        for _ in range(num_prompts):
+            buf.add({"batch": None}, W + 1 - warmup_age, W + 1)
+        return buf
+
+    # At step W+1 with the elevated (warmup) age -> admitted (valid lag-1 pi_0).
+    buf = _fresh_buffer()
+    result = buf.sample(
+        num_prompt_groups=num_prompts,
+        current_weight_version=W + 1,
+        max_age_steps=warmup_age,
+    )
+    assert result is not None
+    assert len(result["trajectories"]) == num_prompts
+
+    # Same rollout at step W+2 with the training age -> gen-version W+1-A_w is now
+    # older than (W+2 - train_age), so it is correctly evicted (pi_0 genuinely stale).
+    buf = _fresh_buffer()
+    # relabel the (identical) banked groups to target W+2 to model the surplus that
+    # the driver would try to consume one step later.
+    buf.target_weight_versions = [W + 2, W + 2]
+    result = buf.sample(
+        num_prompt_groups=num_prompts,
+        current_weight_version=W + 2,
+        max_age_steps=train_age,
+    )
+    assert result is None  # evicted as stale; collector must regenerate fresh
+
+
+# ---------------------------------------------------------------------------
+# validate() rollout dispatch. Async PPO runs the vLLM async engine, whose
+# generation worker has no sync `generate` method — validate() must take the
+# async rollout path or it raises AttributeError ('ActorHandle' has no
+# attribute 'generate') at the first validation step.
+# ---------------------------------------------------------------------------
+def _run_validate_with_mocked_rollouts(master_config):
+    """Drive validate() through one batch with both rollout fns mocked.
+
+    Returns (async_rollout_mock, sync_rollout_mock) for call assertions.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from nemo_rl.algorithms.ppo import validate
+
+    # Fields validate() reads to run one batch and summarize.
+    master_config.ppo["max_val_samples"] = 1
+    master_config.ppo["val_batch_size"] = 1
+    master_config.ppo["max_rollout_turns"] = 1
+    master_config.logger = {"num_val_samples_to_print": 0}
+
+    rollout_return = (
+        {"total_reward": torch.tensor([1.0]), "message_log": []},
+        {"mean_gen_tokens_per_sample": 5.0},
+    )
+    with (
+        patch(
+            "nemo_rl.algorithms.ppo.run_async_multi_turn_rollout",
+            return_value=rollout_return,
+        ) as async_mock,
+        patch(
+            "nemo_rl.algorithms.ppo.run_multi_turn_rollout",
+            return_value=rollout_return,
+        ) as sync_mock,
+    ):
+        validate(
+            policy_generation=MagicMock(),
+            val_dataloader=[MagicMock()],  # one validation batch
+            tokenizer=MagicMock(),
+            val_task_to_env={},
+            step=5,
+            master_config=master_config,
+            logger=MagicMock(),
+        )
+    return async_mock, sync_mock
+
+
+def test_validate_dispatches_to_async_rollout_for_async_engine():
+    """Regression: async PPO (vLLM async_engine) validation must use the ASYNC
+    rollout path. The sync path calls policy_generation.generate(), which the
+    async worker lacks -> AttributeError at the first validation step."""
+    master_config = _build_async_ppo_master_config()  # vllm async_engine=True
+    async_mock, sync_mock = _run_validate_with_mocked_rollouts(master_config)
+    async_mock.assert_called_once()
+    sync_mock.assert_not_called()
+
+
+def test_validate_dispatches_to_sync_rollout_when_not_async():
+    """Non-async (colocated/sync) PPO validation uses the synchronous rollout."""
+    master_config = _build_async_ppo_master_config()
+    master_config.policy["generation"]["vllm_cfg"]["async_engine"] = False
+    async_mock, sync_mock = _run_validate_with_mocked_rollouts(master_config)
+    sync_mock.assert_called_once()
+    async_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Resume optimizer-path resolution. Megatron bundles the optimizer + LR
+# scheduler inside weights/iter_*/*.distcp (no separate optimizer/ dir), so a
+# resume must point optimizer_path at the weights or load_optim stays False and
+# the LR-warmup scheduler restarts on every resume (V-shaped critic/lr).
+# ---------------------------------------------------------------------------
+def test_resolve_resume_optimizer_path(tmp_path):
+    from nemo_rl.algorithms.ppo import _resolve_resume_optimizer_path
+
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    optim = tmp_path / "optimizer"
+    missing_optim = tmp_path / "optimizer_absent"
+    megatron = {"megatron_cfg": {"enabled": True}}
+    dtensor = {"megatron_cfg": {"enabled": False}}
+
+    # DTensor writes a separate optimizer/ dir -> use it when present.
+    optim.mkdir()
+    assert _resolve_resume_optimizer_path(optim, weights, dtensor) == optim
+    # A present separate dir wins even on megatron.
+    assert _resolve_resume_optimizer_path(optim, weights, megatron) == optim
+
+    # Megatron: no separate optimizer/ dir (bundled in weights) -> weights path,
+    # so load_optim=True and the optimizer + scheduler actually resume.
+    assert _resolve_resume_optimizer_path(missing_optim, weights, megatron) == weights
+    # Megatron during warmup: policy weights not saved -> nothing to resume.
+    assert _resolve_resume_optimizer_path(missing_optim, None, megatron) is None
+    # DTensor without a separate optimizer/ dir -> None (don't misread weights as
+    # an optimizer path for a backend that stores it separately).
+    assert _resolve_resume_optimizer_path(missing_optim, weights, dtensor) is None
