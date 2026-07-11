@@ -45,9 +45,9 @@ def calculate_single_metric(
 
 
 def pct(values: Sequence[float | int], p: float) -> float:
-    """Percentile helper for buffer starvation diagnostics."""
+    """Return the nearest-rank percentile for buffer starvation diagnostics."""
     if not values:
         return 0.0
     sorted_v = sorted(values)
-    idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
+    idx = min(max(math.ceil(len(sorted_v) * p / 100) - 1, 0), len(sorted_v) - 1)
     return float(sorted_v[idx])

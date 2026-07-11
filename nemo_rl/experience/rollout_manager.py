@@ -265,6 +265,7 @@ class AsyncRolloutImpl:
             "turn_gen_tokens": turn_gen_tokens,
             "turn_input_tokens": turn_input_tokens,
             "turn_total_tokens": turn_total_tokens,
+            "max_gen_tokens_per_turn": max(turn_gen_tokens, default=0),
             "per_worker_token_counts": per_worker_token_counts,
         }
         return completion, sample_metrics

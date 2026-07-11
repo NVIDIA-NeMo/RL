@@ -133,9 +133,13 @@ class TestPct:
         """Test that a single-element input returns that element."""
         assert pct([42], 95) == 42.0
 
-    def test_median_like_p50(self):
-        """Test that p50 lands on the upper-mid element (int truncation, no interpolation)."""
-        assert pct([10, 20, 30, 40], 50) == 30.0
+    def test_nearest_rank_p50(self):
+        """Test that p50 uses the nearest-rank element without upward bias."""
+        assert pct([10, 20, 30, 40], 50) == 20.0
+
+    def test_nearest_rank_exact_boundary(self):
+        """An exact rank boundary selects that rank, not the following value."""
+        assert pct(list(range(1, 21)), 95) == 19.0
 
 
 class _DummyTokenizer:
