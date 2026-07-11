@@ -1931,7 +1931,7 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
             mock_grpo_components["val_task_to_env"],
             mock_grpo_components["logger"],
             checkpointer,
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )
 
