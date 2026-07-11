@@ -12,17 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lightweight quantization config resolver usable by both Megatron and vLLM workers."""
+"""Lightweight ModelOpt helpers shared by Megatron and vLLM workers."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from fnmatch import fnmatchcase
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
+
+MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS = 600_000
 
 _QUANT_IGNORE_NAME_SUFFIXES = (
     ".weight",
     ".weight_scale",
     ".weight_scale_2",
+    ".input_scale",
 )
 
 # Layers kept in native dtype by the real-quant vLLM rollout. Shared between the
@@ -36,6 +40,9 @@ DEFAULT_NVFP4_IGNORE = [
     "*self_attention*",
     "*self_attn*",
 ]
+
+NVFP4RealQuantMode = Literal["w4a4", "w4a16"]
+_NVFP4_REAL_QUANT_MODES = frozenset({"w4a4", "w4a16"})
 
 
 def _iter_quant_ignore_suffix_variants(name: str) -> Iterator[str]:
@@ -71,6 +78,7 @@ def matches_quant_ignore_pattern(name: str, patterns: list[str]) -> bool:
 
 def build_vllm_modelopt_nvfp4_config(
     *,
+    mode: NVFP4RealQuantMode,
     ignore: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the HuggingFace quantization_config consumed by vLLM ModelOpt NVFP4.
@@ -79,11 +87,25 @@ def build_vllm_modelopt_nvfp4_config(
     ``mtq.quantize``. vLLM expects the deployment/export-side
     ``quantization_config`` shape instead.
     """
+    if mode not in _NVFP4_REAL_QUANT_MODES:
+        raise ValueError(
+            f"Unsupported NVFP4 real-quant mode {mode!r}; expected 'w4a4' or 'w4a16'."
+        )
+
+    input_activations = None
+    if mode == "w4a4":
+        input_activations = {
+            "dynamic": False,
+            "num_bits": 4,
+            "type": "float",
+            "group_size": 16,
+        }
+
     return {
         "quant_method": "modelopt",
         "config_groups": {
             "group_0": {
-                "input_activations": None,
+                "input_activations": input_activations,
                 "weights": {
                     "dynamic": False,
                     "num_bits": 4,
@@ -95,11 +117,214 @@ def build_vllm_modelopt_nvfp4_config(
         },
         "ignore": ignore if ignore is not None else list(DEFAULT_NVFP4_IGNORE),
         "quant_algo": "NVFP4",
-        "quant_mode": "w4a16_nvfp4",
-        "weight_only": True,
+        "quant_mode": f"{mode}_nvfp4",
+        "weight_only": mode == "w4a16",
         "group_size": 16,
         "producer": {"name": "modelopt"},
     }
+
+
+def _resolve_effective_quantizer_formats(
+    quant_cfg: object,
+    *,
+    source: str,
+) -> tuple[list[object], list[object]]:
+    """Resolve enabled weight and input formats from ordered ModelOpt entries."""
+    if not isinstance(quant_cfg, Sequence) or isinstance(quant_cfg, (str, bytes)):
+        raise ValueError(
+            f"Quantization config {source!r} must contain a list-valued 'quant_cfg'."
+        )
+
+    states: dict[str, dict[str, tuple[bool, object | None]]] = {
+        "weight_quantizer": {},
+        "input_quantizer": {},
+    }
+
+    def _updated_state(
+        current: tuple[bool, object | None],
+        entry: Mapping,
+        *,
+        pattern: str,
+    ) -> tuple[bool, object | None]:
+        enabled, format_cfg = current
+        has_format = entry.get("cfg") is not None
+        has_enable = "enable" in entry
+        if not has_format and not has_enable:
+            raise ValueError(
+                f"Quantization config {source!r} has an ineffective entry for "
+                f"{pattern!r}; expected 'cfg', 'enable', or both."
+            )
+
+        if has_format:
+            format_cfg = entry["cfg"]
+        if has_enable:
+            enable = entry["enable"]
+            if not isinstance(enable, bool):
+                raise ValueError(
+                    f"Quantization config {source!r} has non-boolean 'enable' for "
+                    f"{pattern!r}."
+                )
+            enabled = enable
+        else:
+            enabled = True
+        return enabled, format_cfg
+
+    for index, entry in enumerate(quant_cfg):
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                f"Quantization config {source!r} has a non-mapping quant_cfg entry "
+                f"at index {index}."
+            )
+
+        pattern = entry.get("quantizer_name")
+        if not isinstance(pattern, str):
+            raise ValueError(
+                f"Quantization config {source!r} has a quant_cfg entry without a "
+                f"string 'quantizer_name' at index {index}."
+            )
+
+        # Parent-scoped overrides describe exclusions, not a model-wide format.
+        if entry.get("parent_class") is not None:
+            continue
+
+        if pattern == "*":
+            if entry.get("cfg") is not None:
+                raise ValueError(
+                    f"Real quantization for {source!r} cannot infer weight and "
+                    "activation formats from an enabled catch-all quantizer entry."
+                )
+            for kind_states in states.values():
+                for existing_pattern, current in tuple(kind_states.items()):
+                    kind_states[existing_pattern] = _updated_state(
+                        current,
+                        entry,
+                        pattern=pattern,
+                    )
+            continue
+
+        matching_kinds = [kind for kind in states if kind in pattern]
+        if not matching_kinds:
+            continue
+        if len(matching_kinds) != 1:
+            raise ValueError(
+                f"Quantization config {source!r} has ambiguous quantizer pattern "
+                f"{pattern!r}."
+            )
+
+        kind = matching_kinds[0]
+        kind_states = states[kind]
+        if pattern == f"*{kind}":
+            # A generic selector overrides every previously described subset.
+            for existing_pattern, current in tuple(kind_states.items()):
+                kind_states[existing_pattern] = _updated_state(
+                    current,
+                    entry,
+                    pattern=pattern,
+                )
+        kind_states[pattern] = _updated_state(
+            kind_states.get(pattern, (False, None)),
+            entry,
+            pattern=pattern,
+        )
+
+    weight_formats = [
+        format_cfg
+        for enabled, format_cfg in states["weight_quantizer"].values()
+        if enabled
+    ]
+    input_formats = [
+        format_cfg
+        for enabled, format_cfg in states["input_quantizer"].values()
+        if enabled
+    ]
+    return weight_formats, input_formats
+
+
+def _is_float_format(value: object, exponent_bits: int, mantissa_bits: int) -> bool:
+    """Return whether a ModelOpt numeric-format value names the requested float."""
+    if isinstance(value, str):
+        return value.lower() == f"e{exponent_bits}m{mantissa_bits}"
+    return value == (exponent_bits, mantissa_bits) or value == [
+        exponent_bits,
+        mantissa_bits,
+    ]
+
+
+def _validate_nvfp4_quantizer_format(
+    format_cfg: object,
+    *,
+    quantizer_name: str,
+    source: str,
+) -> None:
+    """Validate the block-16 E2M1 format supported by vLLM ModelOpt NVFP4."""
+    if not isinstance(format_cfg, Mapping):
+        raise ValueError(
+            f"Real quantization for {source!r} requires a single NVFP4 "
+            f"{quantizer_name} format; got {format_cfg!r}."
+        )
+
+    block_sizes = format_cfg.get("block_sizes")
+    block_size = None
+    block_type = None
+    scale_bits = None
+    if isinstance(block_sizes, Mapping):
+        block_size = block_sizes.get(-1, block_sizes.get("-1"))
+        block_type = block_sizes.get("type")
+        scale_bits = block_sizes.get("scale_bits")
+
+    if not (
+        _is_float_format(format_cfg.get("num_bits"), 2, 1)
+        and block_size == 16
+        and block_type == "dynamic"
+        and _is_float_format(scale_bits, 4, 3)
+    ):
+        raise ValueError(
+            f"Real quantization for {source!r} supports only block-16 NVFP4 "
+            f"(E2M1 with E4M3 dynamic scales) {quantizer_name}; got "
+            f"{dict(format_cfg)!r}."
+        )
+
+
+def resolve_nvfp4_real_quant_mode(quant_cfg: str) -> NVFP4RealQuantMode:
+    """Resolve a ModelOpt training config to its supported real-quant mode.
+
+    The mode is derived from all effective weight and input quantizer entries,
+    including model-specific selectors, rather than from a config name. NVFP4
+    weights with no enabled input quantizer resolve to W4A16; block-16 NVFP4
+    input quantization resolves to W4A4. FP8, W4A8, sequential, mixed, and other
+    activation formats fail loudly because vLLM would otherwise run a kernel
+    with incompatible semantics.
+    """
+    if not isinstance(quant_cfg, str) or not quant_cfg:
+        raise ValueError("NVFP4 real quantization requires a non-empty quant_cfg.")
+
+    resolved = resolve_quant_cfg(quant_cfg)
+    entries = resolved["quant_cfg"]
+
+    weight_formats, input_formats = _resolve_effective_quantizer_formats(
+        entries, source=quant_cfg
+    )
+    if not weight_formats:
+        raise ValueError(
+            f"Real quantization for {quant_cfg!r} requires enabled NVFP4 weights."
+        )
+    for weight_format in weight_formats:
+        _validate_nvfp4_quantizer_format(
+            weight_format,
+            quantizer_name="weights",
+            source=quant_cfg,
+        )
+
+    if not input_formats:
+        return "w4a16"
+
+    for input_format in input_formats:
+        _validate_nvfp4_quantizer_format(
+            input_format,
+            quantizer_name="input activations",
+            source=quant_cfg,
+        )
+    return "w4a4"
 
 
 def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:

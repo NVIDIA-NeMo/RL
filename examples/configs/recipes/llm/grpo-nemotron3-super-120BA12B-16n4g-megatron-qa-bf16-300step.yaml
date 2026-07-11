@@ -1,0 +1,75 @@
+defaults: grpo-nemotron3-super-120BA12B-16n8g-megatron.yaml
+cluster:
+  segment_size: 16
+  gpus_per_node: 4
+grpo:
+  max_num_steps: 300
+  max_num_epochs: 1000000
+  use_leave_one_out_baseline: false
+  use_dynamic_sampling: true
+  batch_multiplier: 2
+  val_at_start: true
+  val_at_end: true
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+checkpointing:
+  checkpoint_dir: results/super120b-bf16-300step
+policy:
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: false
+  logprob_chunk_size: 1024
+  max_total_sequence_length: 65536
+  refit_buffer_size_gb: 8
+  sequence_packing:
+    train_mb_tokens: 49152
+  quant_cfg: null
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+    mtp_num_layers: 2
+    mtp_detach_heads: false
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      adam_beta2: 0.95
+      clip_grad: 1.0
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: 1.0e-06
+      start_weight_decay: 0.1
+      end_weight_decay: 0.1
+  generation:
+    top_p: 0.95
+    max_new_tokens: 32768
+    quant_cfg: null
+    real_quant: false
+    vllm_cfg:
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enable_vllm_metrics_logger: false
+      env_vars:
+        VLLM_USE_RAY_V2_EXECUTOR_BACKEND: 1
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      max_num_seqs: 2
+      max_num_batched_tokens: 131072
+      moe_backend: triton
+data:
+  max_input_seq_length: 1024
+  default:
+    prompt_file: null
+logger:
+  log_dir: logs/super120b-bf16-300step
+  wandb_enabled: false
+  wandb:
+    name: super120b-bf16-300step
+  tensorboard:
+    log_dir: tb_logs/super120b-bf16-300step

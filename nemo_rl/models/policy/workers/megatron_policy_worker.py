@@ -26,8 +26,6 @@ log = logging.getLogger(__name__)
 
 import ray
 import torch
-from transformers import PreTrainedTokenizerBase
-
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
@@ -46,6 +44,8 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config
+from transformers import PreTrainedTokenizerBase
+
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -2227,14 +2227,7 @@ class MegatronPolicyWorkerImpl(
         else:
             # Ordinary offload case
             if move_params:
-                new_state_dict = {}
-                for name, item in model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device=device, non_blocking=True, copy=True
-                        )
-                    new_state_dict[name] = item
-                model.load_state_dict(new_state_dict)
+                model.to(device=device, non_blocking=True)
         return model
 
     def move_optimizer(self, device: str):

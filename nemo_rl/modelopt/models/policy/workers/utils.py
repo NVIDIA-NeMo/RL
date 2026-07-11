@@ -20,6 +20,12 @@ from pathlib import Path
 import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
+from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
+from megatron.bridge.models.mamba.mamba_provider import (
+    modelopt_mamba_stack_spec,
+    transformer_engine_mamba_stack_spec,
+)
+from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.utils.dataset_utils import (
     create_forward_loop,
@@ -31,12 +37,6 @@ from modelopt.torch.utils.plugins import (
 )
 from torch.utils.data import DataLoader, Dataset
 
-from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
-from megatron.bridge.models.mamba.mamba_provider import (
-    modelopt_mamba_stack_spec,
-    transformer_engine_mamba_stack_spec,
-)
-from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from nemo_rl.algorithms.utils import get_tokenizer as _base_get_tokenizer
 from nemo_rl.modelopt.utils import resolve_quant_cfg
 
@@ -148,12 +148,18 @@ def quantize_model(
             else DEFAULT_CALIB_SAMPLE_LENGTH
         )
         if data == "random":
-            calib_size = 1
             calib_dataloader = DataLoader(
                 _DictDataset(
-                    {"input_ids": torch.randint(0, 100, (1, 5), device=device)}
+                    {
+                        "input_ids": torch.randint(
+                            0,
+                            100,
+                            (calib_size, calib_sample_length),
+                            device=device,
+                        )
+                    }
                 ),
-                batch_size=1,
+                batch_size=calib_batch_size,
             )
             forward_loop = get_forward_loop_func(is_megatron, calib_dataloader)
         elif is_megatron:

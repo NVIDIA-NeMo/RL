@@ -158,10 +158,9 @@ def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
     monkeypatch.setattr(
         worker_utils.mtq,
         "quantize",
-        lambda model_arg, cfg, forward_loop: calls.append(
-            (model_arg, cfg, forward_loop)
-        )
-        or model_arg,
+        lambda model_arg, cfg, forward_loop: (
+            calls.append((model_arg, cfg, forward_loop)) or model_arg
+        ),
     )
     monkeypatch.setattr(
         worker_utils.mtq,
@@ -209,6 +208,8 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
             "loop",
             is_megatron,
             len(dataloader.dataset),
+            dataloader.batch_size,
+            tuple(dataloader.dataset.data["input_ids"].shape),
         ),
     )
     monkeypatch.setattr(
@@ -227,11 +228,13 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
         "activation-cfg",
         tokenizer=None,
         calib_size=8,
+        batch_size=2,
+        max_sample_length=16,
         is_megatron=True,
         data="random",
     )
 
-    assert calls == [("loop", True, 1)]
+    assert calls == [("loop", True, 8, 2, (8, 16))]
 
 
 def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
@@ -261,10 +264,9 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
     monkeypatch.setattr(
         worker_utils.mtq,
         "quantize",
-        lambda model_arg, cfg, forward_loop: calls.append(
-            ("quantize", model_arg, cfg, forward_loop)
-        )
-        or model_arg,
+        lambda model_arg, cfg, forward_loop: (
+            calls.append(("quantize", model_arg, cfg, forward_loop)) or model_arg
+        ),
     )
     monkeypatch.setattr(
         worker_utils.mtq,
@@ -306,8 +308,9 @@ def test_quantize_model_uses_modelopt_megatron_calibration_loop(monkeypatch):
     monkeypatch.setattr(
         worker_utils,
         "get_megatron_calibration_forward_loop",
-        lambda tokenizer, **kwargs: calls.append(("calibration", tokenizer, kwargs))
-        or "megatron-loop",
+        lambda tokenizer, **kwargs: (
+            calls.append(("calibration", tokenizer, kwargs)) or "megatron-loop"
+        ),
     )
     monkeypatch.setattr(
         worker_utils,
@@ -319,10 +322,9 @@ def test_quantize_model_uses_modelopt_megatron_calibration_loop(monkeypatch):
     monkeypatch.setattr(
         worker_utils.mtq,
         "quantize",
-        lambda model_arg, cfg, forward_loop: calls.append(
-            ("quantize", model_arg, cfg, forward_loop)
-        )
-        or model_arg,
+        lambda model_arg, cfg, forward_loop: (
+            calls.append(("quantize", model_arg, cfg, forward_loop)) or model_arg
+        ),
     )
     monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
 

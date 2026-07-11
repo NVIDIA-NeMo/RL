@@ -19,12 +19,22 @@ These patches target vLLM 0.20.0 internals. Revalidate the imported APIs,
 method signatures, and tensor layouts whenever vLLM is upgraded.
 """
 
+import inspect
 from typing import Any
 
 import torch
 from torch.nn import Parameter
 
-_DENSE_HF_PARAMS = ("weight", "weight_scale", "weight_scale_2")
+_DENSE_W4A16_HF_PARAMS = ("weight", "weight_scale", "weight_scale_2")
+_DENSE_W4A4_HF_PARAMS = (*_DENSE_W4A16_HF_PARAMS, "input_scale")
+_DENSE_KERNEL_PARAMS = (
+    "weight",
+    "weight_scale",
+    "weight_global_scale",
+    "input_global_scale",
+    "alpha",
+    "input_global_scale_inv",
+)
 _MOE_HF_PARAMS = (
     "w13_weight",
     "w13_weight_scale",
@@ -53,6 +63,14 @@ _ORIGINAL_KV_CACHE_PROCESS_WEIGHTS_ATTR = (
 )
 _MODELOPT_PROCESS_WEIGHTS_CALL_COUNT_ATTR = "_nrl_process_weights_call_count"
 _MODELOPT_PROCESSED_TENSOR_REFS_ATTR = "_nrl_modelopt_processed_tensor_refs"
+_MODELOPT_MOE_QUANT_CONFIG_SCALE_ATTRS = (
+    "g1_alphas",
+    "g2_alphas",
+    "a1_gscale",
+    "a2_gscale",
+    "w1_scale",
+    "w2_scale",
+)
 
 
 def _unwrap_vllm_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -93,6 +111,52 @@ def _requests_w4a16_modelopt_config(config: dict[str, Any]) -> bool:
 
 def _is_w4a16_modelopt_quant_config(quant_config: object) -> bool:
     return bool(getattr(quant_config, _MODELOPT_W4A16_ATTR, False))
+
+
+def _is_marlin_backend(quant_method: object) -> bool:
+    for candidate in (
+        getattr(quant_method, "nvfp4_backend", None),
+        getattr(quant_method, "backend", None),
+        getattr(quant_method, "kernel", None),
+    ):
+        if isinstance(candidate, str) and candidate.upper() == "MARLIN":
+            return True
+        name = getattr(candidate, "value", None) or getattr(candidate, "name", None)
+        if isinstance(name, str) and name.upper() == "MARLIN":
+            return True
+        if candidate is not None and "marlin" in candidate.__class__.__name__.lower():
+            return True
+    return False
+
+
+def _require_valid_scale(
+    value: torch.Tensor,
+    *,
+    name: str,
+    strictly_positive: bool,
+) -> None:
+    value = value.detach().float()
+    if not torch.isfinite(value).all():
+        raise RuntimeError(f"ModelOpt NVFP4 {name} must contain only finite values")
+    if strictly_positive and not torch.all(value > 0):
+        raise RuntimeError(f"ModelOpt NVFP4 {name} must be strictly positive")
+    if not strictly_positive and not torch.all(value >= 0):
+        raise RuntimeError(f"ModelOpt NVFP4 {name} must be non-negative")
+
+
+def _sanitize_dummy_scale(
+    value: torch.Tensor,
+    *,
+    strictly_positive: bool,
+) -> None:
+    """Make vLLM dummy-loader scale placeholders safe for initial kernel setup."""
+    with torch.no_grad():
+        sanitized = value.detach().float().abs()
+        invalid = ~torch.isfinite(sanitized)
+        if strictly_positive:
+            invalid |= sanitized == 0
+        sanitized.masked_fill_(invalid, 1.0)
+        value.data.copy_(sanitized.to(dtype=value.dtype, device=value.device))
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -210,7 +274,23 @@ def _set_or_update_processed_tensor_ref(
         setattr(layer, _MODELOPT_PROCESSED_TENSOR_REFS_ATTR, refs)
 
     ref = refs.get(param_name)
-    if is_first_call or ref is None:
+    if (
+        is_first_call
+        or ref is None
+        or ref.shape != data.shape
+        or ref.dtype != data.dtype
+        or ref.device != data.device
+    ):
+        # vLLM may represent repeated per-expert scales with expand(), which
+        # produces a zero-stride view. Such a view is valid for kernel reads,
+        # but cannot be the destination of the in-place copy used by the next
+        # refit. Materialize only those expanded dimensions; cloning all
+        # processed tensors here would transiently duplicate the FP4 weights.
+        if any(
+            size > 1 and stride == 0
+            for size, stride in zip(data.shape, data.stride(), strict=True)
+        ):
+            data = data.clone(memory_format=torch.preserve_format)
         setattr(layer, param_name, Parameter(data, requires_grad=False))
         refs[param_name] = getattr(layer, param_name).data
         return
@@ -222,8 +302,20 @@ def _set_or_update_processed_tensor_ref(
 def _modelopt_dense_process_w4a16_weights(self, layer: torch.nn.Module) -> None:
     """Convert dense ModelOpt NVFP4 W4A16 weights for Marlin weight-only GEMM."""
     _require_fp4_marlin_supported()
-    _capture_modelopt_param_reload_meta(layer, _DENSE_HF_PARAMS)
+    _capture_modelopt_param_reload_meta(layer, _DENSE_W4A16_HF_PARAMS)
     is_first_call = _is_first_modelopt_process_weights_call(layer)
+
+    if not is_first_call:
+        weight_scale_2 = getattr(layer, "weight_scale_2", None)
+        if not isinstance(weight_scale_2, torch.Tensor):
+            raise RuntimeError(
+                "ModelOpt NVFP4 W4A16 dense refit requires weight_scale_2"
+            )
+        _require_valid_scale(
+            weight_scale_2,
+            name="dense weight_scale_2",
+            strictly_positive=True,
+        )
 
     weight_global_scale = layer.weight_scale_2.max().to(torch.float32)
     layer.weight_global_scale = Parameter(weight_global_scale, requires_grad=False)
@@ -259,17 +351,43 @@ def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
         _modelopt_dense_process_w4a16_weights(self, layer)
         return
 
-    _capture_modelopt_param_reload_meta(layer, _DENSE_HF_PARAMS)
+    if _is_marlin_backend(self):
+        raise RuntimeError(
+            "ModelOpt NVFP4 W4A4 requires an activation-quantizing vLLM backend; "
+            "Marlin is weight-only"
+        )
 
-    input_global_scale = torch.ones(
-        (),
-        dtype=torch.float32,
-        device=layer.weight.device,
+    if not isinstance(getattr(layer, "input_scale", None), torch.Tensor):
+        raise RuntimeError(
+            "ModelOpt NVFP4 W4A4 dense refit requires input_scale; check the "
+            "training quantizer and refit export"
+        )
+
+    _capture_modelopt_param_reload_meta(layer, _DENSE_W4A4_HF_PARAMS)
+    is_first_call = _is_first_modelopt_process_weights_call(layer)
+
+    scale_specs = (
+        ("input_scale", True),
+        ("weight_scale", True),
+        ("weight_scale_2", True),
     )
+    for param_name, strictly_positive in scale_specs:
+        scale = getattr(layer, param_name)
+        if is_first_call:
+            _sanitize_dummy_scale(scale, strictly_positive=strictly_positive)
+        else:
+            _require_valid_scale(
+                scale,
+                name=f"dense {param_name}",
+                strictly_positive=strictly_positive,
+            )
+
+    input_global_scale = layer.input_scale.max().to(torch.float32)
     layer.input_global_scale = Parameter(input_global_scale, requires_grad=False)
 
     weight_global_scale = layer.weight_scale_2.max().to(torch.float32)
     layer.weight_global_scale = Parameter(weight_global_scale, requires_grad=False)
+    delattr(layer, "input_scale")
     delattr(layer, "weight_scale_2")
 
     layer.alpha = Parameter(
@@ -282,6 +400,14 @@ def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
     )
 
     _convert_nvfp4_linear_kernel_format(self, layer)
+    for param_name in _DENSE_KERNEL_PARAMS:
+        if hasattr(layer, param_name):
+            _set_or_update_processed_tensor_ref(
+                layer,
+                param_name,
+                getattr(layer, param_name).data,
+                is_first_call=is_first_call,
+            )
 
 
 def _modelopt_dense_apply(
@@ -317,6 +443,11 @@ def _modelopt_moe_init(self, quant_config: object, moe_config: object) -> None:
     if not _is_w4a16_modelopt_quant_config(quant_config):
         original_init = getattr(type(self), _ORIGINAL_FUSED_MOE_INIT_ATTR)
         original_init(self, quant_config, moe_config)
+        if _is_marlin_backend(self):
+            raise RuntimeError(
+                "ModelOpt NVFP4 W4A4 MoE requires an activation-quantizing "
+                "vLLM backend; Marlin is weight-only"
+            )
         return
 
     try:
@@ -433,6 +564,124 @@ def _zero_modelopt_moe_padding(layer: torch.nn.Module) -> None:
                 tensor.narrow(2, start, min(end, tensor.shape[2]) - start).zero_()
 
 
+def _modelopt_moe_quant_config_inplace_update(
+    self,
+    layer: torch.nn.Module,
+) -> bool:
+    """Refresh scale values without changing CUDA-graph-visible addresses."""
+    old_config = getattr(self, "moe_quant_config", None)
+    old_kernel = getattr(self, "moe_kernel", None) or getattr(self, "kernel", None)
+    if old_config is None or old_kernel is None:
+        return False
+
+    new_config = self.get_fused_moe_quant_config(layer)
+    if new_config is None:
+        return False
+
+    updates: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for attr in _MODELOPT_MOE_QUANT_CONFIG_SCALE_ATTRS:
+        old_value = getattr(old_config, attr, None)
+        new_value = getattr(new_config, attr, None)
+        if old_value is new_value or (old_value is None and new_value is None):
+            continue
+        if not isinstance(old_value, torch.Tensor) or not isinstance(
+            new_value, torch.Tensor
+        ):
+            return False
+        if (
+            old_value.shape != new_value.shape
+            or old_value.dtype != new_value.dtype
+            or old_value.device != new_value.device
+        ):
+            return False
+        updates.append((old_value, new_value))
+
+    with torch.no_grad():
+        for old_value, new_value in updates:
+            old_value.copy_(new_value)
+
+    self.moe_kernel = old_kernel
+    self.kernel = old_kernel
+    fused_experts = getattr(old_kernel, "fused_experts", None)
+    if fused_experts is not None and hasattr(fused_experts, "quant_config"):
+        fused_experts.quant_config = old_config
+    return True
+
+
+def _init_modelopt_moe_kernel(self, layer: torch.nn.Module) -> None:
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        make_nvfp4_moe_kernel,
+    )
+
+    moe_quant_config = self.get_fused_moe_quant_config(layer)
+    if moe_quant_config is None:
+        raise RuntimeError("ModelOpt NVFP4 MoE quant config is missing")
+    if self.experts_cls is None:
+        raise RuntimeError("ModelOpt NVFP4 MoE experts class is missing")
+
+    kwargs: dict[str, object] = {
+        "moe_quant_config": moe_quant_config,
+        "moe_config": self.moe,
+        "experts_cls": self.experts_cls,
+    }
+    parameters = inspect.signature(make_nvfp4_moe_kernel).parameters
+    if "nvfp4_backend" in parameters:
+        kwargs["nvfp4_backend"] = self.nvfp4_backend
+    if "shared_experts" in parameters:
+        kwargs["shared_experts"] = getattr(layer, "shared_experts", None)
+    if "routing_tables" in parameters:
+        kwargs["routing_tables"] = (
+            layer._maybe_init_expert_routing_tables()
+            if hasattr(layer, "_maybe_init_expert_routing_tables")
+            else None
+        )
+
+    result = make_nvfp4_moe_kernel(**kwargs)
+    if isinstance(result, tuple):
+        kernel = result[0]
+        if len(result) > 1:
+            self.use_inplace = result[1]
+    else:
+        kernel = result
+    self.moe_quant_config = moe_quant_config
+    self.moe_kernel = kernel
+    self.kernel = kernel
+
+
+def _run_modelopt_moe_kernel_postprocess(
+    self,
+    layer: torch.nn.Module,
+    *,
+    is_first_call: bool,
+) -> None:
+    fused_experts = getattr(
+        getattr(self, "moe_kernel", None),
+        "fused_experts",
+        None,
+    )
+    process_weights = getattr(fused_experts, "process_weights_after_loading", None)
+    if process_weights is None:
+        raise RuntimeError("ModelOpt NVFP4 MoE kernel post-load hook is missing")
+    process_weights(layer)
+
+    # vLLM's TRTLLM NVFP4 expert hook derives ``g1_scale_c`` from the freshly
+    # loaded global scales and registers a new Parameter on every call. CUDA
+    # graphs captured after the dummy load retain the original address, so a
+    # later real-weight refit must update that storage in place just like the
+    # other processed ModelOpt tensors. Other backends do not expose this
+    # derived tensor and need no special handling.
+    g1_scale_c = getattr(layer, "g1_scale_c", None)
+    if isinstance(g1_scale_c, torch.Tensor):
+        _set_or_update_processed_tensor_ref(
+            layer,
+            "g1_scale_c",
+            g1_scale_c.data,
+            is_first_call=is_first_call,
+        )
+        if hasattr(fused_experts, "g1_scale_c"):
+            fused_experts.g1_scale_c = layer.g1_scale_c
+
+
 def _modelopt_moe_process_w4a16_marlin_weights(
     self,
     layer: torch.nn.Module,
@@ -440,8 +689,24 @@ def _modelopt_moe_process_w4a16_marlin_weights(
 ) -> None:
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
         convert_to_nvfp4_moe_kernel_format,
-        make_nvfp4_moe_kernel,
     )
+
+    if not is_first_call:
+        for param_name in (
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+        ):
+            value = getattr(layer, param_name, None)
+            if not isinstance(value, torch.Tensor):
+                raise RuntimeError(
+                    f"ModelOpt NVFP4 W4A16 MoE requires {param_name}; "
+                    "check the training quantizer and refit export"
+                )
+            _require_valid_scale(
+                value,
+                name=f"MoE {param_name}",
+                strictly_positive=True,
+            )
 
     w13_weight_scale_2 = layer.w13_weight_scale_2.data
     if w13_weight_scale_2.dim() == 2:
@@ -487,26 +752,138 @@ def _modelopt_moe_process_w4a16_marlin_weights(
 
     layer.w13_input_scale = None
     layer.w2_input_scale = None
+    _init_modelopt_moe_kernel(self, layer)
+    _run_modelopt_moe_kernel_postprocess(
+        self,
+        layer,
+        is_first_call=is_first_call,
+    )
 
-    moe_quant_config = self.get_fused_moe_quant_config(layer)
-    if moe_quant_config is None:
-        raise RuntimeError("ModelOpt NVFP4 MoE quant config is missing")
-    self.moe_quant_config = moe_quant_config
-    if self.experts_cls is None:
-        raise RuntimeError("ModelOpt NVFP4 MoE experts class is missing")
-    routing_tables = (
-        layer._maybe_init_expert_routing_tables()
-        if hasattr(layer, "_maybe_init_expert_routing_tables")
-        else None
+
+def _modelopt_moe_process_w4a4_weights(
+    self,
+    layer: torch.nn.Module,
+    is_first_call: bool,
+) -> None:
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+        convert_to_nvfp4_moe_kernel_format,
     )
-    self.moe_kernel = make_nvfp4_moe_kernel(
-        moe_quant_config=moe_quant_config,
-        moe_config=self.moe,
-        experts_cls=self.experts_cls,
-        shared_experts=getattr(layer, "shared_experts", None),
-        routing_tables=routing_tables,
+
+    if _is_marlin_backend(self):
+        raise RuntimeError(
+            "ModelOpt NVFP4 W4A4 MoE requires an activation-quantizing "
+            "vLLM backend; Marlin is weight-only"
+        )
+
+    for param_name in (
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ):
+        value = getattr(layer, param_name)
+        if is_first_call:
+            _sanitize_dummy_scale(value, strictly_positive=True)
+        else:
+            _require_valid_scale(
+                value,
+                name=f"MoE {param_name}",
+                strictly_positive=True,
+            )
+    for param_name in (
+        "w13_weight_scale_2",
+        "w2_weight_scale_2",
+        "w13_input_scale",
+        "w2_input_scale",
+    ):
+        value = getattr(layer, param_name, None)
+        if not isinstance(value, torch.Tensor):
+            raise RuntimeError(
+                f"ModelOpt NVFP4 W4A4 MoE requires {param_name}; "
+                "check the training quantizer and refit export"
+            )
+        if is_first_call:
+            _sanitize_dummy_scale(value, strictly_positive=True)
+        else:
+            _require_valid_scale(
+                value,
+                name=f"MoE {param_name}",
+                strictly_positive=True,
+            )
+
+    local_num_experts = getattr(layer, "local_num_experts", layer.w13_weight.shape[0])
+    global_num_experts = getattr(layer, "global_num_experts", local_num_experts)
+    expert_map = getattr(layer, "expert_map", getattr(layer, "_expert_map", None))
+    if local_num_experts != global_num_experts or expert_map is not None:
+        raise RuntimeError(
+            "ModelOpt NVFP4 W4A4 MoE refits require every vLLM rank to own "
+            "the full expert set"
+        )
+    num_experts = global_num_experts
+    w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+    if tuple(layer.w13_input_scale.shape) != (num_experts, w13_num_shards):
+        raise RuntimeError(
+            "ModelOpt NVFP4 W4A4 w13_input_scale must have shape "
+            f"({num_experts}, {w13_num_shards}), got "
+            f"{tuple(layer.w13_input_scale.shape)}"
+        )
+    if tuple(layer.w2_input_scale.shape) not in {
+        (num_experts,),
+        (num_experts, 1),
+    }:
+        raise RuntimeError(
+            "ModelOpt NVFP4 W4A4 w2_input_scale must provide one scale per "
+            f"expert, got {tuple(layer.w2_input_scale.shape)}"
+        )
+
+    w13_weight_scale_2 = layer.w13_weight_scale_2.data
+    if w13_weight_scale_2.ndim == 2:
+        if w13_weight_scale_2.shape[1] != w13_num_shards:
+            raise RuntimeError(
+                "ModelOpt NVFP4 W4A4 w13_weight_scale_2 must have "
+                f"{w13_num_shards} projection column(s)"
+            )
+        if (
+            w13_num_shards == 2
+            and not is_first_call
+            and not torch.allclose(
+                w13_weight_scale_2[:, 0],
+                w13_weight_scale_2[:, 1],
+            )
+        ):
+            raise RuntimeError(
+                "vLLM's fused W4A4 MoE kernel requires gate and up projections "
+                "to share weight_scale_2"
+            )
+        w13_weight_scale_2 = w13_weight_scale_2[:, 0].contiguous()
+
+    _canonicalize_moe_nvfp4_weight_scales(layer)
+    converted = convert_to_nvfp4_moe_kernel_format(
+        nvfp4_backend=self.nvfp4_backend,
+        layer=layer,
+        w13=layer.w13_weight.data,
+        w13_scale=layer.w13_weight_scale.data,
+        w13_scale_2=w13_weight_scale_2,
+        a13_scale=layer.w13_input_scale.data,
+        w2=layer.w2_weight.data,
+        w2_scale=layer.w2_weight_scale.data,
+        w2_scale_2=layer.w2_weight_scale_2.data,
+        a2_scale=layer.w2_input_scale.data,
+        is_act_and_mul=self.moe.is_act_and_mul,
     )
-    self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+    for param_name, data in zip(_MOE_HF_PARAMS, converted, strict=True):
+        _set_or_update_processed_tensor_ref(
+            layer,
+            param_name,
+            data.data if isinstance(data, Parameter) else data,
+            is_first_call=is_first_call,
+        )
+
+    if is_first_call or not _modelopt_moe_quant_config_inplace_update(self, layer):
+        _init_modelopt_moe_kernel(self, layer)
+    _run_modelopt_moe_kernel_postprocess(
+        self,
+        layer,
+        is_first_call=is_first_call,
+    )
 
 
 def _modelopt_kv_cache_process_weights(self, layer: torch.nn.Module) -> None:
@@ -583,17 +960,28 @@ def _modelopt_kv_cache_process_weights(self, layer: torch.nn.Module) -> None:
 def _modelopt_moe_process_weights(self, layer: torch.nn.Module) -> None:
     """Convert MoE ModelOpt NVFP4 weights after initial load or refit."""
     if not _is_w4a16_marlin_moe_quant_method(self):
-        original_process_weights = getattr(
-            type(self),
-            _ORIGINAL_FUSED_MOE_PROCESS_WEIGHTS_ATTR,
-        )
-        original_process_weights(self, layer)
-        return
-
+        missing = [
+            name
+            for name in _MOE_INPUT_SCALE_PARAMS
+            if not isinstance(getattr(layer, name, None), torch.Tensor)
+        ]
+        if missing:
+            raise RuntimeError(
+                "ModelOpt NVFP4 W4A4 MoE refit requires activation scales: "
+                + ", ".join(missing)
+            )
     _capture_modelopt_param_reload_meta(layer, _MOE_HF_PARAMS)
     is_first_call = _is_first_modelopt_process_weights_call(layer)
-    _zero_modelopt_moe_padding(layer)
-    _modelopt_moe_process_w4a16_marlin_weights(
+    if _is_w4a16_marlin_moe_quant_method(self):
+        _zero_modelopt_moe_padding(layer)
+        _modelopt_moe_process_w4a16_marlin_weights(
+            self,
+            layer,
+            is_first_call=is_first_call,
+        )
+        return
+
+    _modelopt_moe_process_w4a4_weights(
         self,
         layer,
         is_first_call=is_first_call,
@@ -615,7 +1003,10 @@ def prepare_modelopt_for_weight_reload(
             param = getattr(module, param_name, None)
             weight_loader = weight_loaders.get(param_name)
             param_class = meta["param_class"]
-            default_to_one = param_name in _MOE_INPUT_SCALE_PARAMS
+            is_sentinel_scale = param_name.endswith("scale_2") or param_name in (
+                "input_scale",
+                *_MOE_INPUT_SCALE_PARAMS,
+            )
             if (
                 param is None
                 or tuple(param.shape) != tuple(meta["shape"])
@@ -633,8 +1024,9 @@ def prepare_modelopt_for_weight_reload(
                     dtype=meta["dtype"],
                     device=device or meta["device"],
                 )
-                if default_to_one:
-                    data.fill_(1.0)
+                if is_sentinel_scale:
+                    # Missing small scales must fail post-load validation.
+                    data.fill_(torch.nan)
                 if param_class is not Parameter and weight_loader is not None:
                     kwargs = {"data": data, "weight_loader": weight_loader}
                     if "input_dim" in meta:
@@ -649,10 +1041,11 @@ def prepare_modelopt_for_weight_reload(
                 for attr, value in meta.get("attrs", {}).items():
                     setattr(replacement, attr, value)
                 setattr(module, param_name, replacement)
-            elif default_to_one:
-                # W4A16 exports do not stream MoE activation scales. Reset to
-                # the neutral scale before loading; W4A8 streams overwrite it.
-                param.data.fill_(1.0)
+            elif is_sentinel_scale:
+                # Poison only small global/input scales. Exact key accounting
+                # proves the large block scales arrived without adding a
+                # multi-gigabyte sentinel write to every refit.
+                param.data.fill_(torch.nan)
 
 
 def modelopt_process_weights_after_loading(model: torch.nn.Module) -> None:
@@ -669,11 +1062,22 @@ def modelopt_process_weights_after_loading(model: torch.nn.Module) -> None:
             scheme.process_weights_after_loading(module)
 
         quant_method = getattr(module, "quant_method", None)
-        if quant_method.__class__.__name__ in (
+        actual_quant_method = getattr(quant_method, "old_quant_method", quant_method)
+        if actual_quant_method.__class__.__name__ in (
             "ModelOptNvFp4LinearMethod",
             "ModelOptNvFp4FusedMoE",
         ):
-            quant_method.process_weights_after_loading(module)
+            actual_quant_method.process_weights_after_loading(module)
+            if actual_quant_method is not quant_method and hasattr(
+                actual_quant_method, "moe_quant_config"
+            ):
+                quant_method.moe_quant_config = actual_quant_method.moe_quant_config
+                fused_experts = getattr(quant_method, "fused_experts", None)
+                nested_experts = getattr(fused_experts, "fused_experts", None)
+                if nested_experts is not None and hasattr(
+                    nested_experts, "quant_config"
+                ):
+                    nested_experts.quant_config = actual_quant_method.moe_quant_config
 
 
 _patched = False

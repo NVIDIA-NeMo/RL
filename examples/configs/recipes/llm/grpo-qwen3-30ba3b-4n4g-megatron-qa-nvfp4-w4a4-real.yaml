@@ -1,0 +1,33 @@
+defaults: ../../../../examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
+cluster:
+  segment_size: null
+grpo:
+  max_num_steps: 300
+  val_at_end: true
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real
+  save_period: 30
+  keep_top_k: 1
+  checkpoint_must_save_by: 00:03:45:00
+policy:
+  quant_cfg: examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml
+  generation:
+    quant_cfg: examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml
+    real_quant: true
+    real_quant_ignore:
+    - lm_head
+    - '*output_layer*'
+    - '*mlp.gate*'
+    - '*router*'
+    - '*self_attention*'
+    - '*self_attn*'
+    vllm_kwargs:
+      moe_backend: auto
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real
+  wandb:
+    project: nemo-rl-qarl
+    name: grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real
+  tensorboard:
+    log_dir: tb_logs-grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real

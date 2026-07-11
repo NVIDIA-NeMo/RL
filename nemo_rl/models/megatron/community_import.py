@@ -17,9 +17,9 @@ from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 import torch
-
 from megatron.bridge import AutoBridge
 from megatron.core.transformer import ModuleSpec
+
 from nemo_rl.models.policy import MegatronConfig
 
 

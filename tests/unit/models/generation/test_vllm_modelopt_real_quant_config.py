@@ -21,11 +21,15 @@ import weakref
 import pytest
 import torch
 
+import nemo_rl.modelopt.utils as modelopt_utils
 from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
     _convert_nvfp4_linear_kernel_format,
     _modelopt_dense_apply,
     _modelopt_dense_process_weights,
     _modelopt_kv_cache_process_weights,
+    _modelopt_moe_maybe_roundup_sizes,
+    _modelopt_moe_process_weights,
+    _run_modelopt_moe_kernel_postprocess,
     _zero_modelopt_moe_padding,
     apply_modelopt_nvfp4_patches,
     modelopt_process_weights_after_loading,
@@ -35,6 +39,7 @@ from nemo_rl.modelopt.utils import (
     build_vllm_modelopt_nvfp4_config,
     iter_quant_ignore_name_candidates,
     matches_quant_ignore_pattern,
+    resolve_nvfp4_real_quant_mode,
     resolve_quant_cfg,
 )
 
@@ -98,6 +103,7 @@ def _install_fake_modelopt_tensor_quantizer(monkeypatch):
 
 def _make_real_quant_extension(backend, model, ignore):
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._nrl_w13_num_shards_by_prefix = {}
     extension.model_runner = types.SimpleNamespace(
         model=model,
         vllm_config=types.SimpleNamespace(
@@ -123,8 +129,8 @@ def _patch_real_quant_load(monkeypatch, backend, forwarded=None):
         )
 
 
-def test_w4a16_real_quant_config_keeps_weight_only_default():
-    cfg = build_vllm_modelopt_nvfp4_config()
+def test_w4a16_real_quant_config_is_weight_only():
+    cfg = build_vllm_modelopt_nvfp4_config(mode="w4a16")
 
     group = cfg["config_groups"]["group_0"]
     assert cfg["quant_method"] == "modelopt"
@@ -150,9 +156,31 @@ def test_w4a16_real_quant_config_keeps_weight_only_default():
     ]
 
 
+def test_w4a4_real_quant_config_has_static_input_activations():
+    cfg = build_vllm_modelopt_nvfp4_config(mode="w4a4")
+
+    group = cfg["config_groups"]["group_0"]
+    assert cfg["quant_method"] == "modelopt"
+    assert cfg["quant_algo"] == "NVFP4"
+    assert cfg["quant_mode"] == "w4a4_nvfp4"
+    assert cfg["weight_only"] is False
+    assert cfg["group_size"] == 16
+    assert group["input_activations"] == {
+        "dynamic": False,
+        "num_bits": 4,
+        "type": "float",
+        "group_size": 16,
+    }
+
+
+def test_real_quant_config_rejects_unsupported_mode():
+    with pytest.raises(ValueError, match="expected 'w4a4' or 'w4a16'"):
+        build_vllm_modelopt_nvfp4_config(mode="w4a8")  # type: ignore[arg-type]
+
+
 def test_real_quant_config_allows_explicit_ignore_override():
     ignore = ["lm_head", "*.mixer.in_proj*"]
-    cfg = build_vllm_modelopt_nvfp4_config(ignore=ignore)
+    cfg = build_vllm_modelopt_nvfp4_config(mode="w4a16", ignore=ignore)
 
     assert cfg["ignore"] == ignore
     assert matches_quant_ignore_pattern(
@@ -162,7 +190,7 @@ def test_real_quant_config_allows_explicit_ignore_override():
 
 
 def test_default_ignore_patterns_match_expected_layers():
-    ignore_patterns = build_vllm_modelopt_nvfp4_config()["ignore"]
+    ignore_patterns = build_vllm_modelopt_nvfp4_config(mode="w4a16")["ignore"]
 
     assert matches_quant_ignore_pattern(
         "model.layers.0.self_attn.o_proj.weight", ignore_patterns
@@ -177,6 +205,9 @@ def test_default_ignore_patterns_match_expected_layers():
     assert matches_quant_ignore_pattern("lm_head.weight", ignore_patterns)
     assert matches_quant_ignore_pattern(
         "model.layers.0.mlp.gate.weight_scale", ignore_patterns
+    )
+    assert matches_quant_ignore_pattern(
+        "model.layers.0.mlp.gate.input_scale", ignore_patterns
     )
     assert not matches_quant_ignore_pattern(
         "model.layers.0.mlp.experts.0.w1.weight", ignore_patterns
@@ -196,6 +227,12 @@ def test_quant_ignore_name_candidates_include_model_prefix_and_base_names():
         "model.lm_head.weight_scale",
         "model.lm_head",
         "lm_head.weight_scale",
+        "lm_head",
+    ]
+    assert list(iter_quant_ignore_name_candidates("model.lm_head.input_scale")) == [
+        "model.lm_head.input_scale",
+        "model.lm_head",
+        "lm_head.input_scale",
         "lm_head",
     ]
 
@@ -219,7 +256,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
     assert llm_kwargs["worker_extension_cls"] == (
         "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
     )
-    assert os.environ["VLLM_QUANT_CFG"] == (
+    assert os.environ["VLLM_QUANT_CFG"] == os.path.abspath(
         "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml"
     )
     assert "quantization" not in llm_kwargs
@@ -255,7 +292,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     assert "worker_cls" not in llm_kwargs
     assert llm_kwargs["quantization"] == "modelopt"
     assert llm_kwargs["hf_overrides"]["quantization_config"] == (
-        build_vllm_modelopt_nvfp4_config(ignore=["lm_head"])
+        build_vllm_modelopt_nvfp4_config(mode="w4a16", ignore=["lm_head"])
     )
 
 
@@ -394,6 +431,50 @@ def test_vllm_modelopt_backend_imports_without_gpt_oss_helper(monkeypatch):
     _import_vllm_quant_backend(monkeypatch)
 
 
+def test_real_quant_backend_uses_modelopt_refit_timeout(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    events = []
+
+    class FakeSocket:
+        def setsockopt(self, option, value):
+            events.append(("setsockopt", option, value))
+
+        def connect(self, address):
+            events.append(("connect", address))
+
+    class FakeContext:
+        def socket(self, socket_type):
+            events.append(("socket", socket_type))
+            return FakeSocket()
+
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension.get_zmq_address = lambda: "ipc:///tmp/modelopt-test.sock"
+    monkeypatch.setattr(backend.zmq, "Context", FakeContext)
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda _self: True,
+    )
+
+    extension.maybe_init_zmq()
+
+    assert events == [
+        ("socket", backend.zmq.REP),
+        (
+            "setsockopt",
+            backend.zmq.SNDTIMEO,
+            modelopt_utils.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
+        ),
+        (
+            "setsockopt",
+            backend.zmq.RCVTIMEO,
+            modelopt_utils.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
+        ),
+        ("setsockopt", backend.zmq.LINGER, 0),
+        ("connect", "ipc:///tmp/modelopt-test.sock"),
+    ]
+
+
 def test_vllm_modelopt_backend_applies_real_quant_patch_on_import(monkeypatch):
     patch_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_modelopt_patch"
@@ -434,7 +515,8 @@ def test_batch_fused_modelopt_moe_weights_keeps_non_gated_expert_dimension(
             ("model.layers.0.mlp.experts.w2_weight", down),
             ("model.layers.0.mlp.experts.w2_weight_scale", down_scale),
             ("model.layers.0.mlp.experts.w2_weight_scale_2", down_scale_2),
-        ]
+        ],
+        w13_num_shards_by_prefix={},
     )
 
     assert [name for name, _ in batched] == [
@@ -457,6 +539,54 @@ def test_batch_fused_modelopt_moe_weights_keeps_non_gated_expert_dimension(
     torch.testing.assert_close(batched[3][1], up_scale_2[1])
     torch.testing.assert_close(batched[6][1], down_scale_2[0, 0])
     torch.testing.assert_close(batched[7][1], down_scale_2[1, 0])
+
+
+def test_modelopt_moe_manifest_requires_complete_w4a4_family(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    prefix = "model.layers.0.mixer"
+    state_dict_info = {
+        f"{prefix}.experts.w13_weight": ((2, 4, 3), torch.uint8),
+        f"{prefix}.experts.w13_weight_scale": ((2, 4, 1), torch.uint8),
+        f"{prefix}.experts.w13_weight_scale_2": ((2, 2), torch.float32),
+        f"{prefix}.experts.w13_input_scale": ((2, 2), torch.float32),
+        f"{prefix}.experts.w2_weight": ((2, 3, 4), torch.uint8),
+        f"{prefix}.experts.w2_weight_scale": ((2, 1, 4), torch.uint8),
+        f"{prefix}.experts.w2_weight_scale_2": ((2,), torch.float32),
+        f"{prefix}.experts.w2_input_scale": ((2,), torch.float32),
+    }
+
+    assert backend._w13_num_shards_from_state_dict_info(
+        state_dict_info, require_input_scales=True
+    ) == {prefix: 2}
+
+    legacy_state_dict_info = dict(state_dict_info)
+    legacy_state_dict_info[f"{prefix}.experts.w13_weight_scale_2"] = (
+        (2,),
+        torch.float32,
+    )
+    legacy_state_dict_info[f"{prefix}.experts.w13_input_scale"] = (
+        (2,),
+        torch.float32,
+    )
+    assert backend._w13_num_shards_from_state_dict_info(
+        legacy_state_dict_info, require_input_scales=True
+    ) == {prefix: 1}
+
+    mismatched_state_dict_info = dict(state_dict_info)
+    mismatched_state_dict_info[f"{prefix}.experts.w13_input_scale"] = (
+        (2, 1),
+        torch.float32,
+    )
+    with pytest.raises(RuntimeError, match="input/global scale layouts disagree"):
+        backend._w13_num_shards_from_state_dict_info(
+            mismatched_state_dict_info, require_input_scales=True
+        )
+
+    del state_dict_info[f"{prefix}.experts.w2_input_scale"]
+    with pytest.raises(RuntimeError, match="missing.*w2_input_scale"):
+        backend._w13_num_shards_from_state_dict_info(
+            state_dict_info, require_input_scales=True
+        )
 
 
 def test_supports_batched_modelopt_moe_load_requires_all_experts_local(monkeypatch):
@@ -682,7 +812,7 @@ def test_real_quant_collective_reload_runs_modelopt_hooks(monkeypatch):
     ]
 
 
-def test_real_quant_collective_reload_skips_processing_when_base_fails(monkeypatch):
+def test_real_quant_collective_reload_raises_when_base_fails(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     patch_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_modelopt_patch"
@@ -715,7 +845,8 @@ def test_real_quant_collective_reload_skips_processing_when_base_fails(monkeypat
         lambda self: False,
     )
 
-    assert extension.update_weights_from_collective() is False
+    with pytest.raises(RuntimeError, match="collective refit failed"):
+        extension.update_weights_from_collective()
     assert calls == [("prepare", model, torch.device("cpu"))]
 
 
@@ -760,6 +891,7 @@ def test_real_quant_ipc_complete_processes_modelopt_and_acks(monkeypatch):
     extension.model_runner = types.SimpleNamespace(model=model)
     extension.device = torch.device("cpu")
     extension.zmq_socket = socket
+    extension.state_dict_info = {}
     extension.maybe_init_zmq = lambda: None
     extension._maybe_process_fp8_kv_cache = lambda: None
     calls = []
@@ -794,6 +926,139 @@ def test_real_quant_ipc_complete_processes_modelopt_and_acks(monkeypatch):
     assert socket.sent == [IPCProtocol.ACK.value.encode()]
 
 
+def test_real_quant_ipc_postprocess_failure_acks_complete(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    patch_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_modelopt_patch"
+    )
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    socket = types.SimpleNamespace(
+        recv_pyobj=lambda: IPCProtocol.COMPLETE,
+        sent=[],
+    )
+    socket.send = socket.sent.append
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension.model_runner = types.SimpleNamespace(model=torch.nn.Linear(1, 1))
+    extension.device = torch.device("cpu")
+    extension.zmq_socket = socket
+    extension.state_dict_info = {}
+    extension.maybe_init_zmq = lambda: None
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda _self: True,
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "prepare_modelopt_for_weight_reload",
+        lambda _model, device: None,
+    )
+
+    def fail_postprocess(_model):
+        raise RuntimeError("bad scales")
+
+    monkeypatch.setattr(
+        patch_mod,
+        "modelopt_process_weights_after_loading",
+        fail_postprocess,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="ModelOpt real-quant refit post-processing failed"
+    ):
+        extension.update_weights_via_ipc_zmq()
+    assert socket.sent == [IPCProtocol.ACK.value.encode()]
+
+
+@pytest.mark.parametrize(
+    ("payload_groups", "state_dict_info", "error"),
+    [
+        (
+            [["decoder.weight"]],
+            {
+                "decoder.weight": ([1], torch.float32),
+                "decoder.bias": ([1], torch.float32),
+            },
+            "missing keys",
+        ),
+        (
+            [["decoder.weight"], ["decoder.weight"]],
+            {"decoder.weight": ([1], torch.float32)},
+            "duplicate keys",
+        ),
+        (
+            [["decoder.weight", "decoder.weight"]],
+            {"decoder.weight": ([1], torch.float32)},
+            "duplicate keys",
+        ),
+        (
+            [["unexpected.weight"]],
+            {"decoder.weight": ([1], torch.float32)},
+            "unexpected keys",
+        ),
+    ],
+)
+def test_real_quant_ipc_rejects_invalid_key_manifest(
+    monkeypatch, payload_groups, state_dict_info, error
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    patch_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_modelopt_patch"
+    )
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    payload_buffer = torch.tensor([1.0], dtype=torch.float32).view(torch.uint8)
+    used_bytes = backend.calculate_aligned_size(payload_buffer.numel())
+    payloads = [
+        ("ipc-handle", keys, used_bytes * len(keys)) for keys in payload_groups
+    ] + [IPCProtocol.COMPLETE]
+
+    class FakeSocket:
+        def __init__(self):
+            self.payloads = iter(payloads)
+            self.sent = []
+
+        def recv_pyobj(self):
+            return next(self.payloads)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension.model_runner = types.SimpleNamespace(model=torch.nn.Linear(1, 1))
+    extension.device = torch.device("cuda:0")
+    extension.zmq_socket = FakeSocket()
+    extension.state_dict_info = state_dict_info
+    extension.maybe_init_zmq = lambda: None
+    extension._load_weights = lambda _weights: None
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda _self: True,
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "prepare_modelopt_for_weight_reload",
+        lambda _model, device: None,
+    )
+    monkeypatch.setattr(
+        patch_mod,
+        "modelopt_process_weights_after_loading",
+        lambda _model: pytest.fail("invalid refit must not be post-processed"),
+    )
+    monkeypatch.setattr(
+        backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda _ipc_handle, _device_index: payload_buffer,
+    )
+    monkeypatch.setattr(backend.torch.cuda, "synchronize", lambda: None)
+
+    with pytest.raises(RuntimeError, match=error):
+        extension.update_weights_via_ipc_zmq()
+    assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * len(payloads)
+
+
 def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     patch_mod = pytest.importorskip(
@@ -813,6 +1078,7 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
             self.payloads = iter(
                 [
                     ("ipc-handle", ["decoder.weight"], used_bytes),
+                    ("ipc-handle", ["decoder.bias"], used_bytes),
                     IPCProtocol.COMPLETE,
                 ]
             )
@@ -822,7 +1088,7 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
             return next(self.payloads)
 
         def send(self, payload):
-            if not self.sent:
+            if len(self.sent) < 2:
                 assert view_refs
                 assert all(view_ref() is None for view_ref in view_refs)
                 calls.append("views_released")
@@ -838,7 +1104,10 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     )
     extension.device = torch.device("cuda:0")
     extension.zmq_socket = FakeSocket()
-    extension.state_dict_info = {"decoder.weight": ([2], torch.float32)}
+    extension.state_dict_info = {
+        "decoder.weight": ([2], torch.float32),
+        "decoder.bias": ([2], torch.float32),
+    }
     extension.maybe_init_zmq = lambda: None
     extension._maybe_process_fp8_kv_cache = lambda: calls.append("kv")
 
@@ -880,11 +1149,15 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     assert extension.zmq_socket.sent == [
         IPCProtocol.ACK.value.encode(),
         IPCProtocol.ACK.value.encode(),
+        IPCProtocol.ACK.value.encode(),
     ]
-    assert loaded[0][0] == "decoder.weight"
-    torch.testing.assert_close(loaded[0][1], payload_weight)
+    assert [name for name, _ in loaded] == ["decoder.weight", "decoder.bias"]
+    for _, loaded_weight in loaded:
+        torch.testing.assert_close(loaded_weight, payload_weight)
     assert calls == [
         ("prepare", model, torch.device("cuda:0")),
+        "sync",
+        "views_released",
         "sync",
         "views_released",
         ("process", model),
@@ -953,6 +1226,167 @@ def test_get_quantizer_stats_counts_enabled_positive_amax(monkeypatch):
         "with_amax": 2,
         "positive_amax": 1,
     }
+
+
+def _nvfp4_source_format() -> dict:
+    return {
+        "num_bits": "e2m1",
+        "block_sizes": {
+            -1: 16,
+            "type": "dynamic",
+            "scale_bits": "e4m3",
+        },
+    }
+
+
+def test_resolve_nvfp4_real_quant_mode_detects_model_specific_w4a16(monkeypatch):
+    resolved = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {
+                "quantizer_name": "*mixer.experts.*weight_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+            {
+                "quantizer_name": "*mlp.experts*weight_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+        ],
+        "algorithm": "max",
+    }
+    monkeypatch.setattr(modelopt_utils, "resolve_quant_cfg", lambda _: resolved)
+
+    assert resolve_nvfp4_real_quant_mode("custom-nvfp4-config") == "w4a16"
+
+
+def test_resolve_nvfp4_real_quant_mode_detects_w4a4(monkeypatch):
+    resolved = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {
+                "quantizer_name": "*mlp.experts*weight_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+            {
+                "quantizer_name": "*mlp.experts*input_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+            {
+                "quantizer_name": "*mlp.experts*input_quantizer",
+                "parent_class": "nn.LeakyReLU",
+                "enable": False,
+            },
+        ],
+        "algorithm": "max",
+    }
+    monkeypatch.setattr(modelopt_utils, "resolve_quant_cfg", lambda _: resolved)
+
+    assert resolve_nvfp4_real_quant_mode("not-named-after-the-format") == "w4a4"
+
+
+def test_resolve_nvfp4_real_quant_mode_honors_late_generic_disable(monkeypatch):
+    resolved = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {
+                "quantizer_name": "*weight_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+            {
+                "quantizer_name": "*mlp.experts*input_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+            {"quantizer_name": "*input_quantizer", "enable": False},
+        ],
+        "algorithm": "max",
+    }
+    monkeypatch.setattr(modelopt_utils, "resolve_quant_cfg", lambda _: resolved)
+
+    assert resolve_nvfp4_real_quant_mode("disabled-input") == "w4a16"
+
+
+@pytest.mark.parametrize(
+    ("weight_format", "input_format", "error_match"),
+    [
+        (
+            {"num_bits": "e4m3", "axis": None},
+            {"num_bits": "e4m3", "axis": None},
+            "only block-16 NVFP4.*weights",
+        ),
+        (
+            _nvfp4_source_format(),
+            {"num_bits": "e4m3", "axis": None},
+            "only block-16 NVFP4.*input activations",
+        ),
+        (
+            _nvfp4_source_format(),
+            [_nvfp4_source_format()],
+            "single NVFP4 input activations format",
+        ),
+        (
+            _nvfp4_source_format(),
+            {
+                "num_bits": "e2m1",
+                "block_sizes": {
+                    -1: 32,
+                    "type": "dynamic",
+                    "scale_bits": "e4m3",
+                },
+            },
+            "only block-16 NVFP4.*input activations",
+        ),
+    ],
+    ids=["fp8", "w4a8", "sequential-activation", "unsupported-nvfp4-block"],
+)
+def test_resolve_nvfp4_real_quant_mode_rejects_unsupported_formats(
+    monkeypatch,
+    weight_format,
+    input_format,
+    error_match,
+):
+    resolved = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {"quantizer_name": "*weight_quantizer", "cfg": weight_format},
+            {"quantizer_name": "*input_quantizer", "cfg": input_format},
+        ],
+        "algorithm": "max",
+    }
+    monkeypatch.setattr(modelopt_utils, "resolve_quant_cfg", lambda _: resolved)
+
+    with pytest.raises(ValueError, match=error_match):
+        resolve_nvfp4_real_quant_mode("unsupported-real-quant-config")
+
+
+def test_resolve_nvfp4_real_quant_mode_rejects_mixed_activation_formats(
+    monkeypatch,
+):
+    resolved = {
+        "quant_cfg": [
+            {"quantizer_name": "*", "enable": False},
+            {
+                "quantizer_name": "*mixer.experts.*weight_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+            {
+                "quantizer_name": "*mlp.experts*weight_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+            {
+                "quantizer_name": "*mixer.experts.*input_quantizer",
+                "cfg": _nvfp4_source_format(),
+            },
+            {
+                "quantizer_name": "*mlp.experts*input_quantizer",
+                "cfg": {"num_bits": "e4m3", "axis": None},
+            },
+        ],
+        "algorithm": "max",
+    }
+    monkeypatch.setattr(modelopt_utils, "resolve_quant_cfg", lambda _: resolved)
+
+    with pytest.raises(ValueError, match="only block-16 NVFP4.*input activations"):
+        resolve_nvfp4_real_quant_mode("mixed-input-formats")
 
 
 def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
@@ -1233,7 +1667,7 @@ def test_apply_modelopt_nvfp4_patches_updates_vllm_method(monkeypatch):
         quant_method="NVFP4",
         kv_cache_quant_method=None,
         exclude_modules=[],
-        original_config=build_vllm_modelopt_nvfp4_config(),
+        original_config=build_vllm_modelopt_nvfp4_config(mode="w4a16"),
         group_size=16,
     )
 
@@ -1290,6 +1724,7 @@ def test_modelopt_dense_process_uses_vllm_kernel_api():
         requires_grad=False,
     )
     layer.weight_scale_2 = torch.nn.Parameter(torch.tensor([2.0]), requires_grad=False)
+    layer.input_scale = torch.nn.Parameter(torch.tensor([3.0]), requires_grad=False)
 
     calls = []
 
@@ -1306,15 +1741,28 @@ def test_modelopt_dense_process_uses_vllm_kernel_api():
     _modelopt_dense_process_weights(quant_method, layer)
 
     assert calls == [layer]
+    assert not hasattr(layer, "input_scale")
     assert not hasattr(layer, "weight_scale_2")
-    torch.testing.assert_close(layer.input_global_scale, torch.tensor(1.0))
+    torch.testing.assert_close(layer.input_global_scale, torch.tensor(3.0))
     torch.testing.assert_close(layer.weight_global_scale, torch.tensor(2.0))
-    torch.testing.assert_close(layer.alpha, torch.tensor(2.0))
-    torch.testing.assert_close(layer.input_global_scale_inv, torch.tensor(1.0))
+    torch.testing.assert_close(layer.alpha, torch.tensor(6.0))
+    torch.testing.assert_close(
+        layer.input_global_scale_inv,
+        torch.tensor(1.0 / 3.0),
+    )
     assert set(layer._nrl_modelopt_param_meta) == {
         "weight",
         "weight_scale",
         "weight_scale_2",
+        "input_scale",
+    }
+    assert set(layer._nrl_modelopt_processed_tensor_refs) == {
+        "weight",
+        "weight_scale",
+        "weight_global_scale",
+        "input_global_scale",
+        "alpha",
+        "input_global_scale_inv",
     }
     assert layer._nrl_modelopt_param_meta["weight"]["input_dim"] == 1
     assert layer._nrl_modelopt_param_meta["weight"]["output_dim"] == 0
@@ -1396,6 +1844,167 @@ def test_modelopt_dense_process_w4a16_uses_marlin_weight_only(monkeypatch):
         "weight_global_scale",
     }
 
+    prepare_modelopt_for_weight_reload(layer, device=torch.device("cpu"))
+    assert torch.isnan(layer.weight_scale_2).all()
+    with pytest.raises(RuntimeError, match="dense weight_scale_2 must contain"):
+        _modelopt_dense_process_weights(quant_method, layer)
+
+
+def test_modelopt_moe_w4a16_marlin_postprocesses_super_relu2_tp4_padding(
+    monkeypatch,
+):
+    module_names = [
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.layers",
+        "vllm.model_executor.layers.fused_moe",
+        "vllm.model_executor.layers.fused_moe.oracle",
+    ]
+    for module_name in module_names:
+        module = types.ModuleType(module_name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, module_name, module)
+
+    conversion_calls = []
+    postprocess_calls = []
+    oracle = types.ModuleType("vllm.model_executor.layers.fused_moe.oracle.nvfp4")
+
+    def convert_to_nvfp4_moe_kernel_format(**kwargs):
+        conversion_calls.append(kwargs)
+        return (
+            kwargs["w13"].detach().clone(),
+            kwargs["w13_scale"].detach().clone(),
+            kwargs["w13_scale_2"].detach().clone(),
+            kwargs["a13_scale"],
+            kwargs["w2"].detach().clone(),
+            kwargs["w2_scale"].detach().clone(),
+            kwargs["w2_scale_2"].detach().clone(),
+            kwargs["a2_scale"],
+        )
+
+    class FakeMarlinExperts:
+        def __init__(self, quant_config):
+            self.quant_config = quant_config
+
+        def process_weights_after_loading(self, target_layer):
+            postprocess_calls.append(
+                (
+                    target_layer,
+                    target_layer.w13_weight.detach().clone(),
+                    target_layer.w2_weight.detach().clone(),
+                )
+            )
+
+    def make_nvfp4_moe_kernel(
+        *,
+        moe_quant_config,
+        moe_config,
+        experts_cls,
+        nvfp4_backend,
+    ):
+        assert moe_config.activation == "relu2"
+        assert moe_config.is_act_and_mul is False
+        assert experts_cls is FakeMarlinExperts
+        assert nvfp4_backend.value == "MARLIN"
+        return types.SimpleNamespace(fused_experts=FakeMarlinExperts(moe_quant_config))
+
+    oracle.convert_to_nvfp4_moe_kernel_format = convert_to_nvfp4_moe_kernel_format
+    oracle.make_nvfp4_moe_kernel = make_nvfp4_moe_kernel
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.fused_moe.oracle.nvfp4",
+        oracle,
+    )
+
+    class ModelOptNvFp4FusedMoE:
+        def __init__(self):
+            self.quant_config = types.SimpleNamespace(
+                _nrl_weight_only_w4a16=True,
+                group_size=16,
+            )
+            self.nvfp4_backend = types.SimpleNamespace(value="MARLIN")
+            self.moe = types.SimpleNamespace(
+                activation="relu2",
+                is_act_and_mul=False,
+            )
+            self.experts_cls = FakeMarlinExperts
+
+        def get_fused_moe_quant_config(self, layer):
+            del layer
+            return types.SimpleNamespace()
+
+        def _nrl_original_maybe_roundup_sizes(
+            self,
+            hidden_size,
+            intermediate_size_per_partition,
+            act_dtype,
+            moe_parallel_config,
+        ):
+            del self, act_dtype
+            assert moe_parallel_config.tp_size == 4
+            return hidden_size, intermediate_size_per_partition
+
+    quant_method = ModelOptNvFp4FusedMoE()
+    unpadded_intermediate_size = 2688 // 4
+    assert unpadded_intermediate_size == 672
+    hidden_size, padded_intermediate_size = _modelopt_moe_maybe_roundup_sizes(
+        quant_method,
+        hidden_size=4096,
+        intermediate_size_per_partition=unpadded_intermediate_size,
+        act_dtype=torch.bfloat16,
+        moe_parallel_config=types.SimpleNamespace(tp_size=4),
+    )
+    assert hidden_size == 4096
+    assert padded_intermediate_size == 704
+
+    layer = torch.nn.Module()
+    layer.moe_config = types.SimpleNamespace(
+        intermediate_size_per_partition=padded_intermediate_size,
+        intermediate_size_per_partition_unpadded=unpadded_intermediate_size,
+    )
+    layer.quant_config = quant_method.quant_config
+    layer.tp_rank = 0
+    layer.tp_size = 4
+    tensors = {
+        "w13_weight": torch.ones(2, padded_intermediate_size, 2),
+        "w13_weight_scale": torch.ones(2, padded_intermediate_size, 1),
+        "w13_weight_scale_2": torch.ones(2, 1),
+        "w13_input_scale": torch.ones(2, 1),
+        "w2_weight": torch.ones(2, 2, padded_intermediate_size // 2),
+        "w2_weight_scale": torch.ones(
+            2,
+            1,
+            padded_intermediate_size // quant_method.quant_config.group_size,
+        ),
+        "w2_weight_scale_2": torch.ones(2),
+        "w2_input_scale": torch.ones(2),
+    }
+    for name, tensor in tensors.items():
+        setattr(layer, name, torch.nn.Parameter(tensor, requires_grad=False))
+
+    _modelopt_moe_process_weights(quant_method, layer)
+
+    assert len(conversion_calls) == 1
+    conversion = conversion_calls[0]
+    assert conversion["is_act_and_mul"] is False
+    assert conversion["a13_scale"] is None
+    assert conversion["a2_scale"] is None
+    assert conversion["w13"].shape == (2, 704, 2)
+    assert conversion["w13_scale_2"].shape == (2,)
+    assert conversion["w2"].shape == (2, 2, 352)
+    assert len(postprocess_calls) == 1
+    processed_layer, processed_w13, processed_w2 = postprocess_calls[0]
+    assert processed_layer is layer
+    assert processed_w13.shape == (2, 704, 2)
+    assert processed_w2.shape == (2, 2, 352)
+    assert layer.w13_input_scale is None
+    assert layer.w2_input_scale is None
+
+    prepare_modelopt_for_weight_reload(layer, device=torch.device("cpu"))
+    assert torch.isnan(layer.w13_weight_scale_2).all()
+    with pytest.raises(RuntimeError, match="w13_weight_scale_2 must contain"):
+        _modelopt_moe_process_weights(quant_method, layer)
+
 
 def test_zero_modelopt_moe_padding_uses_tp_rank_valid_size():
     def make_layer(tp_rank: int):
@@ -1432,3 +2041,45 @@ def test_zero_modelopt_moe_padding_uses_tp_rank_valid_size():
     assert torch.all(rank3.w2_weight[:, :, 160:] == 0)
     assert torch.all(rank3.w2_weight_scale[:, :, :20] == 1)
     assert torch.all(rank3.w2_weight_scale[:, :, 20:] == 0)
+
+
+def test_modelopt_moe_postprocess_preserves_trtllm_g1_scale_c_address():
+    layer = torch.nn.Module()
+
+    class FakeTrtLlmExperts:
+        def __init__(self):
+            self.call_count = 0
+            self.g1_scale_c = None
+
+        def process_weights_after_loading(self, target_layer):
+            self.call_count += 1
+            value = torch.tensor([float(self.call_count), float(self.call_count + 1)])
+            target_layer.register_parameter(
+                "g1_scale_c",
+                torch.nn.Parameter(value, requires_grad=False),
+            )
+            self.g1_scale_c = target_layer.g1_scale_c
+
+    experts = FakeTrtLlmExperts()
+    quant_method = types.SimpleNamespace(
+        moe_kernel=types.SimpleNamespace(fused_experts=experts)
+    )
+
+    _run_modelopt_moe_kernel_postprocess(
+        quant_method,
+        layer,
+        is_first_call=True,
+    )
+    first_storage = layer.g1_scale_c.untyped_storage().data_ptr()
+    first_ref = layer._nrl_modelopt_processed_tensor_refs["g1_scale_c"]
+
+    _run_modelopt_moe_kernel_postprocess(
+        quant_method,
+        layer,
+        is_first_call=False,
+    )
+
+    assert layer.g1_scale_c.untyped_storage().data_ptr() == first_storage
+    assert experts.g1_scale_c is layer.g1_scale_c
+    assert layer._nrl_modelopt_processed_tensor_refs["g1_scale_c"] is first_ref
+    torch.testing.assert_close(layer.g1_scale_c, torch.tensor([2.0, 3.0]))

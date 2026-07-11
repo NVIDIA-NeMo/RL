@@ -53,14 +53,22 @@ def _configure_quant_engine_kwargs(
         from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
             apply_modelopt_nvfp4_patches,
         )
-        from nemo_rl.modelopt.utils import build_vllm_modelopt_nvfp4_config
+        from nemo_rl.modelopt.utils import (
+            build_vllm_modelopt_nvfp4_config,
+            resolve_nvfp4_real_quant_mode,
+        )
 
+        quant_cfg = cfg.get("quant_cfg")
+        if not quant_cfg:
+            raise ValueError("NVFP4 real quantization requires a non-empty quant_cfg.")
+        mode = resolve_nvfp4_real_quant_mode(quant_cfg)
         apply_modelopt_nvfp4_patches()
         os.environ.pop("VLLM_QUANT_CFG", None)
         os.environ["VLLM_MODELOPT_REAL_QUANT"] = "1"
 
         hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
         hf_overrides["quantization_config"] = build_vllm_modelopt_nvfp4_config(
+            mode=mode,
             ignore=cfg.get("real_quant_ignore"),
         )
         llm_kwargs["quantization"] = "modelopt"

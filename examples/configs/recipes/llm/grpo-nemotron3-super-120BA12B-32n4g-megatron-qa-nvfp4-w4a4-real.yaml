@@ -1,0 +1,66 @@
+defaults: grpo-nemotron3-super-120BA12B-16n8g-megatron.yaml
+cluster:
+  segment_size: 16
+  gpus_per_node: 4
+  num_nodes: 32
+grpo:
+  num_prompts_per_step: 4
+  val_period: 0
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-32n4g-megatron-qa-nvfp4-w4a4-real
+policy:
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 32
+  max_total_sequence_length: 2048
+  logprob_chunk_size: 1024
+  disable_modelopt_layer_spec: true
+  quant_cfg: ${oc.env:PROJECT_ROOT}/examples/modelopt/quant_configs/super120b_nvfp4_w4a4.yaml
+  quant_calib_data: random
+  quant_calib_size: 16
+  quant_batch_size: 1
+  quant_sequence_length: 1024
+  generation:
+    quant_cfg: ${oc.env:PROJECT_ROOT}/examples/modelopt/quant_configs/super120b_nvfp4_w4a4.yaml
+    real_quant: true
+    real_quant_ignore:
+    - lm_head
+    - '*output_layer*'
+    - '*mtp*'
+    - '*router*'
+    - '*mixer.gate*'
+    - '*self_attention*'
+    - '*self_attn*'
+    - '*.q_proj*'
+    - '*.k_proj*'
+    - '*.v_proj*'
+    - '*.o_proj*'
+    - '*.qkv_proj*'
+    - '*.linear_qkv*'
+    - '*.linear_proj*'
+    - '*.mixer.in_proj*'
+    - '*.mixer.out_proj*'
+    - '*fc1_latent_proj*'
+    - '*fc2_latent_proj*'
+    - '*.shared_expert.*'
+    - '*.shared_experts.*'
+    vllm_cfg:
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      moe_backend: auto
+      kernel_config:
+        enable_flashinfer_autotune: false
+      compilation_config:
+        backend: eager
+data:
+  max_input_seq_length: 1024
+logger:
+  log_dir: logs/grpo-nemotron3-super-120BA12B-32n4g-megatron-qa-nvfp4-w4a4-real
+  wandb:
+    project: nemo-rl-qarl
+    name: grpo-nemotron3-super-120BA12B-32n4g-megatron-qa-nvfp4-w4a4-real
+  tensorboard:
+    log_dir: tb_logs-grpo-nemotron3-super-120BA12B-32n4g-megatron-qa-nvfp4-w4a4-real

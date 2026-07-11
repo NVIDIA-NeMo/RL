@@ -1,0 +1,32 @@
+# Qwen3 MoE routed-expert NVFP4 W4A4 real-quant recipe for QARL.
+#
+# Both weights and inputs use block-16 E2M1 NVFP4. Attention, routers, shared
+# experts, and other non-routed-MLP paths remain in their native dtype.
+metadata:
+  recipe_type: ptq
+  description: Qwen3 MoE routed-expert NVFP4 W4A4.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*mlp.experts*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*mlp.experts*input_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*router*'
+      enable: false
+    - quantizer_name: '*mlp.gate*'
+      enable: false

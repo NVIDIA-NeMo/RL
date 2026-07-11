@@ -23,15 +23,16 @@ from pathlib import Path
 
 import ray
 import torch
-from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
-from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
-
-import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
+import zmq
 from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
     load_modelopt_state,
 )
 from megatron.core.utils import unwrap_model
+from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
+from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+
+import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
     get_quantization_layer_spec,
     get_quantization_mamba_stack_spec,
@@ -39,6 +40,7 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
     quantize_model,
     symlink_pre_quantized_model,
 )
+from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -142,6 +144,19 @@ def _set_quantization_model_specs(model_config, disable_modelopt_layer_spec: boo
     runtime_env=get_runtime_env_for_policy_worker("megatron_quant_policy_worker")
 )  # pragma: no cover
 class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
+    def maybe_init_zmq(self) -> None:
+        """Use a longer timeout only for ModelOpt real-quant refits."""
+        if not self._use_real_quant_refit():
+            super().maybe_init_zmq()
+            return
+        if not hasattr(self, "zmq_socket"):
+            self.zmq_context = zmq.Context()
+            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
+            self.zmq_socket.setsockopt(zmq.LINGER, 0)
+            self.zmq_socket.bind(self.get_zmq_address())
+
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
         megatron_cfg = config.get("megatron_cfg", {}) or {}
@@ -443,6 +458,27 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             and bool(generation_cfg.get("real_quant"))
         )
 
+    def _get_real_quant_mode(self) -> str:
+        """Resolve and cross-check the training and rollout quantization modes."""
+        from nemo_rl.modelopt.utils import resolve_nvfp4_real_quant_mode
+
+        cached_mode = getattr(self, "_real_quant_mode", None)
+        if cached_mode is not None:
+            return cached_mode
+
+        policy_quant_cfg = self.cfg.get("quant_cfg")
+        generation_quant_cfg = self.cfg["generation"].get("quant_cfg")
+        policy_mode = resolve_nvfp4_real_quant_mode(policy_quant_cfg)
+        generation_mode = resolve_nvfp4_real_quant_mode(generation_quant_cfg)
+        if policy_mode != generation_mode:
+            raise ValueError(
+                "Real-quant refit requires matching policy and generation "
+                f"quantization modes, got {policy_mode} from {policy_quant_cfg!r} "
+                f"and {generation_mode} from {generation_quant_cfg!r}."
+            )
+        self._real_quant_mode = policy_mode
+        return policy_mode
+
     def _iter_real_quant_refit_params(
         self,
         kv_scales: dict[str, float] | None = None,
@@ -455,9 +491,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         ignore = generation_cfg.get("real_quant_ignore")
         if ignore is None:
             ignore = DEFAULT_NVFP4_IGNORE
+        mode = self._get_real_quant_mode()
         yield from self.megatron_bridge.export_hf_weights_modelopt(
             [self.model],
-            quant_mode="w4a16_nvfp4",
+            quant_mode="nvfp4" if mode == "w4a4" else "w4a16_nvfp4",
             cpu=True,
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,

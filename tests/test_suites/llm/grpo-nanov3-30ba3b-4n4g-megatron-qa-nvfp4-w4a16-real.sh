@@ -12,12 +12,20 @@ STEPS_PER_RUN=1
 MAX_STEPS=1
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=180
+SNAPSHOT_MEGATRON_BRIDGE=1
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
 
 cd "$PROJECT_ROOT"
-export PYTHONPATH="$PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${PYTHONPATH:-}"
+MEGATRON_BRIDGE_ROOT=${MEGATRON_BRIDGE_ROOT:-$HOME/modelopt/Megatron-Bridge}
+MEGATRON_LM_ROOT=${MEGATRON_LM_ROOT:-$PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM}
+if ! grep -q '"w4a16_nvfp4"' \
+    "$MEGATRON_BRIDGE_ROOT/src/megatron/bridge/models/conversion/modelopt_utils.py"; then
+    echo "[ERROR] Megatron-Bridge lacks W4A16 ModelOpt export support: $MEGATRON_BRIDGE_ROOT"
+    exit 1
+fi
+export PYTHONPATH="$MEGATRON_BRIDGE_ROOT/src:$MEGATRON_LM_ROOT:$PROJECT_ROOT:${PYTHONPATH:-}"
 
 uv run --no-sync examples/run_grpo.py \
     --config "$CONFIG_PATH" \
@@ -43,10 +51,14 @@ grep -q "quantization=modelopt" "$RUN_LOG"
 ! grep -q "FakeQuantWorker" "$RUN_LOG"
 ! grep -q "VLLM_QUANT_CFG" "$RUN_LOG"
 
-if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' "$JSON_METRICS") -ge $MAX_STEPS ]]; then
-    uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
-        'data["train/gen_kl_error"]["1"] < 0.003' \
-        'max(data["train/token_mult_prob_error"]) < 1.05' \
-        'data["train/loss"]["1"] > 0.0' \
-        'data["train/num_valid_samples"]["1"] > 0'
+MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' "$JSON_METRICS")
+if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then
+    echo "[ERROR] Expected train/loss through step $MAX_STEPS, found step $MAX_RECORDED_STEP"
+    exit 1
 fi
+
+uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
+    'data["train/gen_kl_error"]["1"] < 0.003' \
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'data["train/loss"]["1"] > 0.0' \
+    'data["train/num_valid_samples"]["1"] > 0'

@@ -85,13 +85,14 @@ def _make_real_quant_worker():
     worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
     worker.cfg = {
+        "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
         "generation": {
             "backend": "vllm",
             "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
             "real_quant": True,
             "real_quant_ignore": ["lm_head"],
             "vllm_cfg": {"kv_cache_dtype": "auto"},
-        }
+        },
     }
     worker.model = object()
     worker.draft_model = None
@@ -99,6 +100,42 @@ def _make_real_quant_worker():
     worker.megatron_bridge = _FakeModelOptBridge()
     worker.rank = 0
     return worker
+
+
+@requires_weight_folding
+def test_modelopt_policy_worker_uses_real_quant_refit_timeout(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    events = []
+
+    class FakeSocket:
+        def setsockopt(self, option, value):
+            events.append(("setsockopt", option, value))
+
+        def bind(self, address):
+            events.append(("bind", address))
+
+    class FakeContext:
+        def socket(self, socket_type):
+            events.append(("socket", socket_type))
+            return FakeSocket()
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker._use_real_quant_refit = lambda: True
+    worker.get_zmq_address = lambda: "ipc:///tmp/modelopt-test.sock"
+    monkeypatch.setattr(megatron_quant_policy_worker.zmq, "Context", FakeContext)
+
+    worker.maybe_init_zmq()
+
+    timeout = megatron_quant_policy_worker.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+    assert events == [
+        ("socket", megatron_quant_policy_worker.zmq.REQ),
+        ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, timeout),
+        ("setsockopt", megatron_quant_policy_worker.zmq.RCVTIMEO, timeout),
+        ("setsockopt", megatron_quant_policy_worker.zmq.LINGER, 0),
+        ("bind", "ipc:///tmp/modelopt-test.sock"),
+    ]
 
 
 def create_quant_megatron_test_config(model_name, tp=1, pp=1, precision="float32"):
@@ -126,6 +163,7 @@ def test_modelopt_layer_spec_config_selects_layer_specs():
     from megatron.core.post_training.modelopt.gpt.model_specs import (
         get_gpt_modelopt_spec,
     )
+
     from nemo_rl.modelopt.models.policy.workers.utils import (
         get_quantization_layer_spec,
         get_quantization_mamba_stack_spec,
@@ -231,6 +269,30 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
     assert kwargs["show_progress"] is False
     assert kwargs["conversion_tasks"] == worker.refit_conversion_tasks
     assert kwargs["ignore_patterns"] == ["lm_head"]
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_exports_w4a4_mode():
+    worker = _make_real_quant_worker()
+    quant_cfg = "examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml"
+    worker.cfg["quant_cfg"] = quant_cfg
+    worker.cfg["generation"]["quant_cfg"] = quant_cfg
+
+    list(worker._iter_real_quant_refit_params())
+
+    _, kwargs = worker.megatron_bridge.calls[0]
+    assert kwargs["quant_mode"] == "nvfp4"
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_rejects_policy_generation_mode_mismatch():
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["quant_cfg"] = (
+        "examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml"
+    )
+
+    with pytest.raises(ValueError, match="matching policy and generation"):
+        list(worker._iter_real_quant_refit_params())
 
 
 @requires_weight_folding
