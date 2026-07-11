@@ -43,7 +43,10 @@ readonly RUN_ID="${SLURM_JOB_ID:?submit this wrapper with sbatch}${SLURM_RESTART
 readonly RESULT_DIR="${EXPERIMENT_DIR}/results/${RUN_ID}"
 readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl/${RUN_ID}"
 
-mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}"
+# CUTEDSL_RUNTIME_TMPDIR_START
+mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}/tmp"
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
+# CUTEDSL_RUNTIME_TMPDIR_END
 export CUTEDSL_EVENT_CLUSTER="${CUTEDSL_PROFILE_NAME}"
 export CUTEDSL_EVENT_JOB_ID="${SLURM_JOB_ID}"
 cutedsl_events_init "${RESULT_DIR}"
@@ -66,6 +69,7 @@ printf '[INFO] Runtime versions: uv=%s python=%s\n' "${runtime_uv_version}" "${r
 printf '[INFO] Runtime Python: realpath=%s prefix=%s\n' "${runtime_python_realpath}" "${runtime_python_prefix}"
 printf '[INFO] Runtime build environment: NVTE_CUDA_ARCHS=%s\n' \
     "${NVTE_CUDA_ARCHS-<unset>}"
+printf '[INFO] Runtime temporary directory: TMPDIR=%s\n' "${TMPDIR-<unset>}"
 unset runtime_uv_version runtime_python_version runtime_python_realpath runtime_python_prefix
 BASH
 exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
@@ -195,7 +199,7 @@ SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
-    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS
+    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -217,6 +221,8 @@ cutedsl_write_event runtime_bootstrap start '' \
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
+[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
+[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
 curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 [[ "$("${UV_BIN}" --version)" == "uv ${UV_VERSION} "* ]]
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
@@ -309,6 +315,7 @@ metadata = {
     },
     "runtime": {
         "nvte_cuda_archs": os.environ["NVTE_CUDA_ARCHS"],
+        "tmpdir": os.environ["TMPDIR"],
         "platform": platform.platform(),
         "machine": platform.machine(),
         "python": sys.version,
@@ -361,6 +368,8 @@ cutedsl_write_event focused_tests start '' \
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
+[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
@@ -531,6 +540,8 @@ cutedsl_write_event gpu_smoke start '' \
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
+[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
@@ -548,6 +559,8 @@ echo "[INFO] Running the four-GPU PyTorch and Transformer Engine device smoke."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
+[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
@@ -600,6 +613,8 @@ cutedsl_write_event functional_grpo start '' \
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
+[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]

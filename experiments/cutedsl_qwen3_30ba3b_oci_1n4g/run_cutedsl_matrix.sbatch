@@ -55,7 +55,10 @@ SUBMISSION_GROUP="${CUTEDSL_BENCHMARK_SUBMISSION_GROUP:-direct}"
 readonly WARMUP_UPDATES MEASURED_UPDATES TIMING_ORDER PROFILE_ENABLED
 readonly REPLICATE_INDEX SUBMISSION_GROUP
 
-mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}"
+# CUTEDSL_RUNTIME_TMPDIR_START
+mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}/tmp"
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
+# CUTEDSL_RUNTIME_TMPDIR_END
 export CUTEDSL_EVENT_CLUSTER="${CUTEDSL_PROFILE_NAME}"
 export CUTEDSL_EVENT_JOB_ID="${SLURM_JOB_ID}"
 cutedsl_events_init "${RESULT_DIR}"
@@ -141,6 +144,7 @@ printf '[INFO] Runtime versions: uv=%s python=%s\n' "${runtime_uv_version}" "${r
 printf '[INFO] Runtime Python: realpath=%s prefix=%s\n' "${runtime_python_realpath}" "${runtime_python_prefix}"
 printf '[INFO] Runtime build environment: NVTE_CUDA_ARCHS=%s\n' \
     "${NVTE_CUDA_ARCHS-<unset>}"
+printf '[INFO] Runtime temporary directory: TMPDIR=%s\n' "${TMPDIR-<unset>}"
 unset runtime_uv_version runtime_python_version runtime_python_realpath runtime_python_prefix
 BASH
 
@@ -236,7 +240,7 @@ SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
-    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS
+    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -257,6 +261,8 @@ cutedsl_write_event runtime_bootstrap start '' \
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
+[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
+[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
 curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 [[ "$("${UV_BIN}" --version)" == "uv ${UV_VERSION} "* ]]
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
@@ -390,6 +396,7 @@ manifest = {
     "profile_enabled": os.environ["PROFILE_ENABLED"] == "1",
     "build_environment": {
         "NVTE_CUDA_ARCHS": os.environ["NVTE_CUDA_ARCHS"],
+        "TMPDIR": os.environ["TMPDIR"],
     },
     "source_sha": os.environ["GIT_SHA"],
     "upstream_ref": os.environ["UPSTREAM_REF"],
@@ -434,6 +441,8 @@ cutedsl_write_event timing start '' \
 "${SRUN[@]}" bash -s <<'BASH'
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
+[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
@@ -758,6 +767,8 @@ if [[ "${PROFILE_ENABLED}" == "1" ]]; then
     "${SRUN[@]}" bash -s <<'BASH'
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
+[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]

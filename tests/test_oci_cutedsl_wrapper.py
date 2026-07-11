@@ -496,11 +496,13 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
         "VIRTUAL_ENV": "/opt/nemo_rl_venv",
         "UV_PROJECT_ENVIRONMENT": "/opt/nemo_rl_venv",
         "NVTE_CUDA_ARCHS": "75;80;89;90;100;103;120",
+        "TMPDIR": "/lustre/fsw/portfolios/stale-login/tmp",
     }
     host_env = {
         "VIRTUAL_ENV": "/runtime/venv",
         "UV_PROJECT_ENVIRONMENT": "/runtime/venv",
         "NVTE_CUDA_ARCHS": "100",
+        "TMPDIR": "/runtime/tmp",
     }
 
     def pyxis_container_env(script: str) -> dict[str, str]:
@@ -513,7 +515,7 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
 
     for script in (SCRIPT, BENCHMARK_SCRIPT):
         expected_option = (
-            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS"
+            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR"
         )
         assert script.count(expected_option) == 1
         assert not re.search(
@@ -523,6 +525,87 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
         assert resolved["VIRTUAL_ENV"] == "/runtime/venv"
         assert resolved["UV_PROJECT_ENVIRONMENT"] == "/runtime/venv"
         assert resolved["NVTE_CUDA_ARCHS"] == "100"
+        assert resolved["TMPDIR"] == "/runtime/tmp"
+
+
+def _runtime_tmpdir_init_source(script: str) -> str:
+    start = "# CUTEDSL_RUNTIME_TMPDIR_START\n"
+    end = "# CUTEDSL_RUNTIME_TMPDIR_END\n"
+    assert script.count(start) == 1
+    assert script.count(end) == 1
+    return script.split(start, 1)[1].split(end, 1)[0]
+
+
+def test_payloads_override_stale_tmpdir_for_every_profile(tmp_path: Path) -> None:
+    stale_tmpdir = "/lustre/fsw/portfolios/coreai/projects/stale-login/tmp"
+    expected_container_tmpdir = "/runtime/tmp"
+    tmpdir_assertion = '[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]'
+    writable_assertion = '[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]'
+
+    for payload_name, script in (("functional", SCRIPT), ("matrix", BENCHMARK_SCRIPT)):
+        for profile_name in ("pre_tyche", "aws_dfw", "lyris"):
+            case_dir = tmp_path / f"{payload_name}-{profile_name}"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CONTAINER_RUNTIME_DIR": "/runtime",
+                    "CUTEDSL_PROFILE_NAME": profile_name,
+                    "HOST_RUNTIME_DIR": str(case_dir / "host-runtime"),
+                    "RESULT_DIR": str(case_dir / "result"),
+                    "TMPDIR": stale_tmpdir,
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "set -euo pipefail\n"
+                    + _runtime_tmpdir_init_source(script)
+                    + '\nprintf "%s\\n" "${TMPDIR}"\n',
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, (payload_name, profile_name, result.stderr)
+            assert result.stdout.strip() == expected_container_tmpdir
+            assert (case_dir / "host-runtime/tmp").is_dir()
+
+        srun_count = script.count('"${SRUN[@]}"')
+        assert script.count(tmpdir_assertion) == srun_count
+        assert script.count(writable_assertion) == srun_count
+        assert (
+            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR"
+            in script
+        )
+        bootstrap_start = script.index("cutedsl_write_event runtime_bootstrap start")
+        assert script.index(tmpdir_assertion, bootstrap_start) < script.index(
+            'curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh"',
+            bootstrap_start,
+        )
+        srun_positions = [
+            match.start() for match in re.finditer(re.escape('"${SRUN[@]}"'), script)
+        ]
+        for index, srun_position in enumerate(srun_positions):
+            block_end = (
+                srun_positions[index + 1]
+                if index + 1 < len(srun_positions)
+                else len(script)
+            )
+            srun_block = script[srun_position:block_end]
+            first_runtime_tool = min(
+                srun_block.index(marker)
+                for marker in (
+                    'curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh"',
+                    'source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"',
+                )
+                if marker in srun_block
+            )
+            assert srun_block.index(tmpdir_assertion) < first_runtime_tool
+            assert srun_block.index(writable_assertion) < first_runtime_tool
+
+    assert '"tmpdir": os.environ["TMPDIR"]' in SCRIPT
+    assert '"TMPDIR": os.environ["TMPDIR"]' in BENCHMARK_SCRIPT
 
 
 def test_runtime_diagnostics_precede_each_srun_environment_assertion() -> None:
@@ -580,7 +663,7 @@ def test_payloads_pin_sm100_transformer_engine_build_architecture() -> None:
             '"${UV_BIN}" sync --locked --extra mcore --group test --group dev'
         )
         assert (
-            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS"
+            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR"
             in script
         )
         assert script.count(assertion) == script.count('"${SRUN[@]}"')
