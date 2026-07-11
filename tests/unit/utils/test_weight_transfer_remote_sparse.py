@@ -25,6 +25,7 @@ from nemo_rl.utils import weight_transfer_remote_sparse, weight_transfer_zmq
 from nemo_rl.utils.weight_transfer_remote_sparse import download_s3_refit_payload
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     DeltaCompressionTracker,
+    _bytewise_diff_mask,
     encode_sparse_infos,
     sparse_locations_for_item,
 )
@@ -59,8 +60,10 @@ def _stream_sparse_test_payloads(tensors, send_payload):
     )
 
 
-def _delta_tracker() -> DeltaCompressionTracker:
-    return DeltaCompressionTracker({"dtype": "bf16", "sparse_bucket_size_bytes": 1024})
+def _delta_tracker(encoding: str = "overwrite") -> DeltaCompressionTracker:
+    return DeltaCompressionTracker(
+        {"encoding": encoding, "sparse_bucket_size_bytes": 1024}
+    )
 
 
 def test_delta_tracker_commits_only_successful_syncs(monkeypatch) -> None:
@@ -90,35 +93,136 @@ def test_delta_tracker_emits_bounded_delta_samples(monkeypatch) -> None:
     )
 
     assert metadata[0]["verification_locations"] == [1, 3]
-    assert metadata[0]["verification_deltas"] == [1.0, 1.0]
+    assert metadata[0]["verification_values"] == [
+        int(tensor.view(torch.int32)[1]),
+        int(tensor.view(torch.int32)[3]),
+    ]
+    assert metadata[0]["operation"] == "overwrite"
     assert (changed, total) == (2, 4)
 
 
-def test_delta_tracker_commits_quantized_receiver_baseline(monkeypatch) -> None:
+def test_delta_tracker_commits_exact_source_baseline(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
     tracker = _delta_tracker()
     tensor = torch.tensor([1.0])
     tracker.snapshot_baseline([("weight", tensor)])
     tensor.add_(0.001)
 
-    (_, deltas, _), _, _ = tracker.prepare_sparse_delta_payload([("weight", tensor)])
-    expected = torch.tensor([1.0]) + deltas.float()
+    (_, value_groups, _), _, _ = tracker.prepare_sparse_delta_payload(
+        [("weight", tensor)]
+    )
+    assert torch.equal(value_groups[0], tensor.view(torch.int32))
     tracker.on_sync_succeeded()
     tracker.prepare_sparse_delta_payload([("weight", tensor)])
 
-    assert torch.equal(tracker.baseline["weight"], expected)
-    assert not torch.equal(expected, tensor)
+    assert torch.equal(tracker.baseline["weight"], tensor)
+
+
+def test_delta_tracker_xor_encodes_against_baseline(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+    tracker = _delta_tracker("xor")
+    tensor = torch.tensor([1.0, 2.0, 3.0])
+    baseline = tensor.clone()
+    tracker.snapshot_baseline([("weight", tensor)])
+    tensor[[0, 2]] = torch.tensor([4.0, 5.0])
+
+    (_, value_groups, metadata), changed, total = tracker.prepare_sparse_delta_payload(
+        [("weight", tensor)]
+    )
+    locations = torch.tensor([0, 2])
+    expected = tensor.view(torch.int32)[locations].bitwise_xor(
+        baseline.view(torch.int32)[locations]
+    )
+
+    assert torch.equal(value_groups[0], expected)
+    assert metadata[0]["operation"] == "xor"
+    assert (changed, total) == (2, 3)
+    tracker.on_sync_succeeded()
+    tracker.prepare_sparse_delta_payload([("weight", tensor)])
+    assert torch.equal(tracker.baseline["weight"], tensor)
 
 
 def test_sparse_index_encoding_preserves_uint64_locations() -> None:
     locations = torch.tensor([0, 2**32 + 5])
     packed, _, metadata = encode_sparse_infos(
-        [("weight", torch.empty(2), locations, torch.ones(2))],
-        empty_dtype=torch.float32,
+        [
+            (
+                "weight",
+                torch.empty(2),
+                locations,
+                torch.ones(2, dtype=torch.int32),
+                "overwrite",
+            )
+        ],
     )
 
     decoded = sparse_locations_for_item(metadata[0], packed, device="cpu")
     assert torch.equal(decoded, locations)
+
+
+def test_bytewise_diff_mask_supports_float8() -> None:
+    baseline = torch.tensor([0x38, 0x7F, 0x00], dtype=torch.uint8).view(
+        torch.float8_e4m3fn
+    )
+    current = baseline.clone()
+    current.view(torch.uint8)[1] = 0x7E
+
+    assert _bytewise_diff_mask(current, baseline).tolist() == [False, True, False]
+
+
+@pytest.mark.parametrize("encoding", ["xor", "overwrite"])
+def test_delta_tracker_encodes_fp8_weight_and_scale_bits(
+    monkeypatch, encoding: str
+) -> None:
+    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+    monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
+    tracker = _delta_tracker(encoding)
+    weight = torch.tensor([0x38, 0x40, 0x48], dtype=torch.uint8).view(
+        torch.float8_e4m3fn
+    )
+    scale = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    baseline_weight = weight.clone()
+    baseline_scale = scale.clone()
+    tracker.snapshot_baseline([("weight", weight), ("weight_scale_inv", scale)])
+    weight.view(torch.uint8)[1] = 0x41
+    scale[0] = 1.5
+
+    (locations, value_groups, metadata), changed, total = (
+        tracker.prepare_sparse_delta_payload(
+            [("weight", weight), ("weight_scale_inv", scale)]
+        )
+    )
+
+    assert (changed, total) == (2, 5)
+    assert len(value_groups) == 2
+    assert [item["operation"] for item in metadata] == [encoding, encoding]
+    assert [item["dtype"] for item in metadata] == ["float8_e4m3fn", "float32"]
+    expected_weight = int(weight.view(torch.uint8)[1])
+    expected_scale = int(scale.view(torch.int32)[0])
+    if encoding == "xor":
+        expected_weight ^= int(baseline_weight.view(torch.uint8)[1])
+        expected_scale ^= int(baseline_scale.view(torch.int32)[0])
+    assert [item["verification_values"] for item in metadata] == [
+        [expected_weight],
+        [expected_scale],
+    ]
+    assert [
+        sparse_locations_for_item(item, locations, device="cpu").tolist()
+        for item in metadata
+    ] == [
+        [1],
+        [0],
+    ]
+
+    tracker.on_sync_succeeded()
+    assert not tracker.prepare_sparse_delta_payload(
+        [("weight", weight), ("weight_scale_inv", scale)]
+    )[0][2]
+
+
+def test_delta_tracker_rejects_arithmetic_encoding() -> None:
+    with pytest.raises(ValueError, match="Unsupported sparse-refit operation"):
+        _delta_tracker("add")
 
 
 def test_s3_download_verifies_checksum(monkeypatch) -> None:

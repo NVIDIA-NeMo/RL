@@ -3,8 +3,8 @@
 Remote sparse-delta refit updates non-colocated vLLM workers without sending a
 full checkpoint after every optimizer step. Megatron workers export Hugging
 Face (HF) weights, compare them with a sharded CPU baseline, and send changed
-locations and deltas through S3 or ZeroMQ. vLLM maps those HF coordinates into
-its local TP and EP layouts and applies the updates in place.
+locations and byte-encoded values through S3 or ZeroMQ. vLLM maps those HF
+coordinates into its local TP and EP layouts and applies the updates in place.
 
 The feature is opt-in. Its synchronizer, codec, transports, receiver queue, and
 placement engine are separate from existing NCCL, CUDA IPC, and packed refit
@@ -91,12 +91,12 @@ not remove Bridge export or the full CPU comparison. Low changed density mainly
 reduces encoded and transferred bytes.
 
 For each assigned chunk, `DeltaCompressionTracker` finds changed flat
-locations and encodes deltas in the configured dtype. The pending baseline is
-updated to the value the receiver will hold after wire-dtype rounding:
-
-```text
-expected = previous_baseline + delta.to(baseline_dtype)
-```
+locations through an integer view with the same element width. It encodes
+either the absolute new bits (`overwrite`) or new bits XOR baseline bits
+(`xor`). Both encodings are dtype-blind and preserve FP8 bit patterns.
+`overwrite` is idempotent and recommended. `xor` can compress better, but it
+requires an exact same-dtype receiver baseline and exactly-once application.
+The pending source baseline always records the exact new source bits.
 
 The producer overlaps export, encoding, `torch.save` serialization, zstd level
 1 compression, and transfer with fixed-size executors. Source baselines do not
@@ -128,33 +128,37 @@ updates in background CPU threads.
 > **Failure boundary:** source baseline commit is transactional, but receiver
 > updates are in place and are not rolled back. If a transfer fails after a
 > receiver accepts any payload, reload that receiver from a known-good weight
-> version before retrying.
+> version before retrying. This is mandatory for `xor`, because replaying an
+> already-applied XOR reverts those bits. Replaying `overwrite` is safe.
 
 ## Payload and placement
 
 Each serialized payload is:
 
 ```text
-(packed_location_bytes, packed_delta_values, tensor_metadata)
+(packed_location_bytes, packed_value_groups, tensor_metadata)
 ```
 
 Contiguous locations use a range encoding. Other sorted locations are
 delta-encoded into the smallest lossless unsigned width among 16, 32, and 64
 bits. Metadata carries the HF name and shape, value offsets, location encoding,
-and optional verification samples.
+the `xor` or `overwrite` operation, and optional verification samples.
 
 HF coordinates are the canonical wire format because Megatron Bridge already
 defines the training-to-HF mapping while vLLM owns a different packed and
 sharded layout. On first use, the receiver runs vLLM's native `load_weights()`
 against metadata-only tensors while a PyTorch dispatch mode records the source
 and destination views of each `copy_`. It caches those mappings and applies
-later sparse deltas directly with `index_add_`, without materializing a dense HF
-tensor or duplicating QKV, MoE, Mamba, or TP placement rules.
+later sparse values directly with bitwise XOR or `index_copy_`, without
+materializing a dense HF tensor or duplicating QKV, MoE, Mamba, or TP placement
+rules.
 
-The tracer accepts affine tensor views and the Mamba `A_log` transform. An
-element-expanding copy, unknown transform, or unplaced
-non-expert tensor fails before any payload update. There is no dense fallback
-for an unknown layout.
+The tracer accepts affine tensor views. Absolute overwrite also supports the
+Mamba `A_log` transform and source-to-target dtype casts. XOR rejects either
+case because target bits no longer match the source representation. XOR also
+rejects overlapping target mappings. An element-expanding copy, unknown
+transform, or unplaced non-expert tensor fails before any payload update. There
+is no dense fallback for an unknown layout.
 
 ## Configuration
 
@@ -166,7 +170,7 @@ policy:
     backend: vllm
     refit_transport: vllm_s3_sparse  # or vllm_zmq_sparse
     delta_compression:
-      dtype: bf16
+      encoding: overwrite  # xor requires an exact baseline and exactly-once apply
       sparse_bucket_size_bytes: 268435456
     colocated:
       enabled: false
@@ -233,18 +237,19 @@ Keep transport changes behind the shared `stream_sparse_delta_payloads()`
 pipeline. A transport should provide payload delivery and timing only; it must
 not duplicate the baseline tracker, codec, receiver queue, or placement logic.
 Retries must preserve payload identity and bytes, fan out to every required
-replica, and require a successful global flush before baseline commit.
+replica, and require a successful global flush before baseline commit. Never
+retry XOR after an uncertain or partial receiver apply.
 
 Do not add model-specific placement math. New layouts should work through their
 native vLLM weight loader; extend the tracer only for a general loader operation
 and fail closed for transformed or broadcasting copies. Tests must invoke the
 real vLLM loader at nonzero TP ranks and cover replicated KV heads, packed
 columns, local and remote experts, segmented views, contiguous ranges, and
-explicit locations. Incorrect in-range `index_add_` locations silently corrupt
-weights, so assert exact mapped indices and values.
+explicit locations. Incorrect in-range XOR or overwrite locations silently
+corrupt weights, so assert exact mapped indices and values.
 
 Codec changes must update encoder and decoder together, preserve 64-bit-safe
-locations, and retain wire-dtype rounding in pending baseline updates. Receiver
+locations, and commit exact source bits only after global success. Receiver
 changes must preserve FIFO application, bounded memory, deferred-error
 propagation, flush, CUDA synchronization, and clean shutdown.
 

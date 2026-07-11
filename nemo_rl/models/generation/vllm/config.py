@@ -59,7 +59,7 @@ class VllmSpecificArgs(TypedDict):
 
 
 class VllmDeltaCompressionConfig(TypedDict):
-    dtype: Literal["fp16", "float16", "bf16", "bfloat16", "fp32", "float32"]  # fmt: skip
+    encoding: Literal["xor", "overwrite"]
     sparse_bucket_size_bytes: int
 
 

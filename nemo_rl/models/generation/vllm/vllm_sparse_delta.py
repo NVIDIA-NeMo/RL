@@ -138,9 +138,7 @@ class VllmSparseDeltaApplier:
         self.model_runner = model_runner
         self._cuda_device_index = device.index
         self._plan_cache: dict[str, _SparseDeltaTargetPlan] = {}
-        self._verification: list[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = []
+        self._verification: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self._verification_candidates = 0
 
     def _compile_plans(self, metadata: list[dict[str, Any]]) -> None:
@@ -155,7 +153,11 @@ class VllmSparseDeltaApplier:
         model = self.model_runner.model
         targets = list(model.parameters()) + list(model.buffers())
         sources = {
-            name: torch.empty(tuple(item["shape"]), device="meta")
+            name: torch.empty(
+                tuple(item["shape"]),
+                dtype=sparse_codec.dtype_from_name(str(item["dtype"])),
+                device="meta",
+            )
             for name, item in missing.items()
         }
         tracer = _SparseLoadTracer(targets, sources)
@@ -227,96 +229,178 @@ class VllmSparseDeltaApplier:
         self,
         item: dict[str, Any],
         plan: _SparseDeltaTargetPlan,
+        operation: sparse_codec.SparseOperation,
+        source_dtype: torch.dtype,
     ) -> None:
         sample_locations = item.get("verification_locations", [])
         self._verification_candidates += len(sample_locations)
-        if not sample_locations or plan.log_delta_transform or not plan.copies:
+        if not sample_locations or not plan.copies:
             return
         target = plan.copies[0].target
         locations = torch.tensor(sample_locations, device=target.device)
+        value_dtype = sparse_codec.integer_dtype_for_element_size(source_dtype.itemsize)
         values = torch.tensor(
-            item["verification_deltas"], device=target.device, dtype=target.dtype
+            item["verification_values"], device=target.device, dtype=value_dtype
         )
         for copy in plan.copies:
             mapped, selected = self._map_copy(locations, values, copy)
             if not mapped.numel():
                 continue
-            before = copy.target.data.view(-1).index_select(0, mapped)
-            expected = (before + selected).float() - before.float()
-            self._verification.append((copy.target, mapped, before.float(), expected))
+            if operation == "xor":
+                target_bits = self._integer_flat(copy.target)
+                expected = target_bits.index_select(0, mapped).bitwise_xor(selected)
+            else:
+                _, replacement = self._overwrite_target_values(
+                    copy.target,
+                    selected,
+                    source_dtype,
+                    log_transform=plan.log_delta_transform,
+                )
+                expected = replacement.contiguous().view(
+                    sparse_codec.integer_dtype_for_element_size(
+                        copy.target.element_size()
+                    )
+                )
+            self._verification.append((copy.target, mapped, expected))
+
+    @staticmethod
+    def _integer_flat(target: torch.Tensor) -> torch.Tensor:
+        dtype = sparse_codec.integer_dtype_for_element_size(target.element_size())
+        return target.data.view(dtype).view(-1)
+
+    @staticmethod
+    def _xor_target_mappings_overlap(plan: _SparseDeltaTargetPlan) -> bool:
+        spans: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        for copy in plan.copies:
+            origin = int(copy.target.storage_offset()) + copy.target_offset
+            extents = [
+                (size - 1) * stride
+                for size, stride in zip(copy.shape, copy.target_strides, strict=True)
+            ]
+            start = origin + sum(min(0, extent) for extent in extents)
+            end = origin + sum(max(0, extent) for extent in extents)
+            target_spans = spans[_storage_key(copy.target)]
+            if any(
+                start <= other_end and other_start <= end
+                for other_start, other_end in target_spans
+            ):
+                return True
+            target_spans.append((start, end))
+        return False
+
+    @classmethod
+    def _overwrite_target_values(
+        cls,
+        target: torch.Tensor,
+        values: torch.Tensor,
+        source_dtype: torch.dtype,
+        *,
+        log_transform: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not log_transform and target.dtype == source_dtype:
+            return cls._integer_flat(target), values
+        source_values = values.contiguous().view(source_dtype)
+        replacement = (
+            -source_values.float().exp().to(target.dtype)
+            if log_transform
+            else source_values.to(target.dtype)
+        )
+        return target.data.view(-1), replacement
 
     def _apply_item(
         self,
         item: dict[str, Any],
         plan: _SparseDeltaTargetPlan,
         raw_locations: torch.Tensor,
-        raw_values: torch.Tensor,
+        raw_value_groups: tuple[torch.Tensor, ...],
     ) -> None:
-        self._record_verification(item, plan)
+        operation = sparse_codec.sparse_operation(item["operation"])
+        source_dtype = sparse_codec.dtype_from_name(str(item["dtype"]))
         if not plan.copies:
+            self._record_verification(item, plan, operation, source_dtype)
             return
         first_target = plan.copies[0].target
+        if operation == "xor" and plan.log_delta_transform:
+            raise RuntimeError(f"XOR cannot apply transformed weight {item['name']!r}.")
+        if operation == "xor" and any(
+            copy.target.dtype != source_dtype for copy in plan.copies
+        ):
+            raise RuntimeError(
+                f"XOR source and target dtypes differ for {item['name']!r}."
+            )
+        if operation == "xor" and self._xor_target_mappings_overlap(plan):
+            raise RuntimeError(f"XOR target mappings overlap for {item['name']!r}.")
         value_start, value_end = int(item["value_start"]), int(item["value_end"])
-        values = raw_values[value_start:value_end].to(
-            device=first_target.device, dtype=first_target.dtype, non_blocking=True
+        values = raw_value_groups[int(item["value_group"])][value_start:value_end]
+        expected_dtype = sparse_codec.integer_dtype_for_element_size(
+            source_dtype.itemsize
         )
+        if values.dtype != expected_dtype:
+            raise RuntimeError(
+                f"Sparse values have the wrong dtype for {item['name']!r}."
+            )
+        values = values.to(device=first_target.device, non_blocking=True)
+        self._record_verification(item, plan, operation, source_dtype)
         if plan.identity and item["index_encoding"] == "range":
-            first_target.data.view(-1).narrow(
-                0, int(item["range_start"]), value_end - value_start
-            ).add_(values)
+            if operation == "xor":
+                target = self._integer_flat(first_target)
+                target.narrow(
+                    0, int(item["range_start"]), value_end - value_start
+                ).bitwise_xor_(values)
+            else:
+                target, replacement = self._overwrite_target_values(
+                    first_target, values, source_dtype, log_transform=False
+                )
+                target.narrow(
+                    0, int(item["range_start"]), value_end - value_start
+                ).copy_(replacement)
             return
 
         locations = sparse_codec.sparse_locations_for_item(
             item, raw_locations, device=first_target.device
         )
         if plan.identity:
-            first_target.data.view(-1).index_add_(0, locations, values)
+            if operation == "xor":
+                target = self._integer_flat(first_target)
+                current = target.index_select(0, locations)
+                target.index_copy_(0, locations, current.bitwise_xor(values))
+            else:
+                target, replacement = self._overwrite_target_values(
+                    first_target, values, source_dtype, log_transform=False
+                )
+                target.index_copy_(0, locations, replacement)
             return
-        grouped: dict[
-            int, tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]
-        ] = {}
         for copy in plan.copies:
             mapped, selected = self._map_copy(locations, values, copy)
-            if mapped.numel():
-                _, mapped_parts, value_parts = grouped.setdefault(
-                    id(copy.target), (copy.target, [], [])
-                )
-                mapped_parts.append(mapped)
-                value_parts.append(selected)
-        for target, mapped_parts, value_parts in grouped.values():
-            mapped = (
-                torch.cat(mapped_parts) if len(mapped_parts) > 1 else mapped_parts[0]
-            )
-            selected = (
-                torch.cat(value_parts) if len(value_parts) > 1 else value_parts[0]
-            )
-            target_flat = target.data.view(-1)
-            if plan.log_delta_transform:
-                current = target_flat.index_select(0, mapped)
-                target_flat.index_copy_(
-                    0, mapped, current * selected.float().exp().to(current.dtype)
-                )
+            if not mapped.numel():
+                continue
+            if operation == "xor":
+                target = self._integer_flat(copy.target)
+                current = target.index_select(0, mapped)
+                target.index_copy_(0, mapped, current.bitwise_xor(selected))
             else:
-                target_flat.index_add_(0, mapped, selected)
+                target, replacement = self._overwrite_target_values(
+                    copy.target,
+                    selected,
+                    source_dtype,
+                    log_transform=plan.log_delta_transform,
+                )
+                target.index_copy_(0, mapped, replacement)
 
     def _apply_sparse_weight_deltas(
         self,
-        payload_tensors: tuple[torch.Tensor, torch.Tensor],
+        payload_tensors: tuple[torch.Tensor, tuple[torch.Tensor, ...]],
         metadata: list[dict[str, Any]],
     ) -> None:
-        from nemo_rl.models.generation.vllm.quantization import fp8
-
-        if fp8.is_fp8_model(self.model_runner.vllm_config):
-            raise RuntimeError(
-                "Direct sparse delta refit does not support FP8 weights."
-            )
-
         self._compile_plans(metadata)
-        raw_locations, raw_values = payload_tensors
+        raw_locations, raw_value_groups = payload_tensors
         with torch.no_grad():
             for item in metadata:
                 self._apply_item(
-                    item, self._plan_cache[str(item["name"])], raw_locations, raw_values
+                    item,
+                    self._plan_cache[str(item["name"])],
+                    raw_locations,
+                    raw_value_groups,
                 )
 
     @wrap_with_nvtx_name(
@@ -389,28 +473,43 @@ class VllmSparseDeltaApplier:
             }
 
         with torch.no_grad():
-            actual = torch.cat(
-                [
-                    target.data.view(-1).index_select(0, locations).float() - before
-                    for target, locations, before, _ in verification
-                ]
-            )
-            expected = torch.cat([item[3] for item in verification])
-            difference = (actual - expected).abs()
+            differences = []
+            exact_mismatches = []
+            mismatches = []
+            samples = 0
+            for target, locations, expected_bits in verification:
+                integer_dtype = sparse_codec.integer_dtype_for_element_size(
+                    target.element_size()
+                )
+                actual_bits = (
+                    target.data.view(integer_dtype).view(-1).index_select(0, locations)
+                )
+                bit_mismatches = actual_bits.ne(expected_bits)
+                actual = target.data.view(-1).index_select(0, locations).float()
+                expected = expected_bits.view(target.dtype).float()
+                difference = torch.where(
+                    bit_mismatches, (actual - expected).abs(), torch.zeros_like(actual)
+                )
+                differences.append(torch.nan_to_num(difference, nan=float("inf")))
+                exact_mismatches.append(bit_mismatches)
+                mismatches.append(
+                    bit_mismatches
+                    & ~torch.isclose(actual, expected, rtol=1e-6, atol=1e-8)
+                )
+                samples += actual.numel()
+            difference = torch.cat(differences)
             stats = torch.stack(
                 (
                     difference.sum(),
                     difference.max(),
-                    actual.ne(expected).sum().float(),
-                    (~torch.isclose(actual, expected, rtol=1e-6, atol=1e-8))
-                    .sum()
-                    .float(),
+                    torch.cat(exact_mismatches).sum().float(),
+                    torch.cat(mismatches).sum().float(),
                 )
             ).cpu()
         return {
             "ok": True,
             "verification_candidates": candidates,
-            "verification_samples": actual.numel(),
+            "verification_samples": samples,
             "verification_exact_mismatches": int(stats[2]),
             "verification_mismatches": int(stats[3]),
             "verification_abs_sum": float(stats[0]),
