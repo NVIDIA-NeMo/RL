@@ -21,8 +21,14 @@ import pytest
 import ray
 
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    DEFAULT_GYM_PORT_RANGE_HIGH,
+    DEFAULT_GYM_PORT_RANGE_LOW,
     DEFAULT_MASTER_PORT_RANGE_HIGH,
     DEFAULT_MASTER_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORTS_PER_ENGINE,
     PY_EXECUTABLES,
     RayVirtualCluster,
     ResourceInsufficientError,
@@ -341,20 +347,20 @@ class TestVllmPortAssignment:
         "bundle_indices,expected_port",
         [
             # TP=1: single-bundle engines, engine_index = bundle index
-            ((0, [0]), 20001),
-            ((0, [1]), 20101),
-            ((0, [7]), 20701),
-            ((1, [0]), 20001),
-            ((1, [3]), 20301),
+            ((0, [0]), 7000),
+            ((0, [1]), 7100),
+            ((0, [7]), 7700),
+            ((1, [0]), 7000),
+            ((1, [3]), 7300),
             # TP=4: multi-bundle engine, engine_index = first_bundle // tp_size
-            ((0, [0, 1, 2, 3]), 20001),  # 0 // 4 = 0
-            ((0, [4, 5, 6, 7]), 20101),  # 4 // 4 = 1
+            ((0, [0, 1, 2, 3]), 7000),  # 0 // 4 = 0
+            ((0, [4, 5, 6, 7]), 7100),  # 4 // 4 = 1
             # TP=2: multi-bundle engine
-            ((0, [0, 1]), 20001),  # 0 // 2 = 0
-            ((0, [2, 3]), 20101),  # 2 // 2 = 1
-            ((0, [6, 7]), 20301),  # 6 // 2 = 3
+            ((0, [0, 1]), 7000),  # 0 // 2 = 0
+            ((0, [2, 3]), 7100),  # 2 // 2 = 1
+            ((0, [6, 7]), 7300),  # 6 // 2 = 3
             # TP=8: entire node is one engine
-            ((0, [0, 1, 2, 3, 4, 5, 6, 7]), 20001),  # 0 // 8 = 0
+            ((0, [0, 1, 2, 3, 4, 5, 6, 7]), 7000),  # 0 // 8 = 0
         ],
     )
     def test_vllm_port_assignment(self, bundle_indices, expected_port):
@@ -374,3 +380,22 @@ class TestVllmPortAssignment:
 
         _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(num_gpus=1)
         assert "VLLM_PORT" not in env_vars
+
+
+def test_default_port_ranges_ordered_and_below_ephemeral_floor():
+    # Lowest observed ephemeral floor on some GB200 nodes; stock Linux is 32768.
+    EPHEMERAL_FLOOR = 9000
+    assert DEFAULT_MASTER_PORT_RANGE_LOW < DEFAULT_MASTER_PORT_RANGE_HIGH
+    assert DEFAULT_GENERATION_PORT_RANGE_LOW < DEFAULT_GENERATION_PORT_RANGE_HIGH
+    assert DEFAULT_GYM_PORT_RANGE_LOW < DEFAULT_GYM_PORT_RANGE_HIGH
+    # Ordered, non-overlapping bands: master < generation < gym < vllm.
+    assert DEFAULT_MASTER_PORT_RANGE_HIGH < DEFAULT_GENERATION_PORT_RANGE_LOW
+    assert DEFAULT_GENERATION_PORT_RANGE_HIGH < DEFAULT_GYM_PORT_RANGE_LOW
+    assert DEFAULT_GYM_PORT_RANGE_HIGH < DEFAULT_VLLM_PORT_RANGE_LOW
+    # Top vLLM engine (8 GPUs, TP=1) stays below the ephemeral floor.
+    assert (
+        DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
+        < EPHEMERAL_FLOOR
+    )
+    # Avoid privileged ports (<1024).
+    assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
