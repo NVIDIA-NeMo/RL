@@ -1,144 +1,117 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Push-button MX-vs-NCCL differentiator benchmark for the 30B MoE refit path.
-# Runs the scenarios where MX/NIXL is expected to win (elasticity, stragglers,
-# partial/EP refit) plus the apples-to-apples transport + refit-phase numbers.
-#
-# Prereqs (set via env; the script preflight-checks and skips gracefully):
-#   NS            k8s namespace (default: kavin)
-#   MX_URL        modelexpress-server URL (default: modelexpress-server.$NS.svc.cluster.local:8001)
-#   MODEL         served model id (default: Qwen/Qwen3-30B-A3B-Instruct-2507)
-#   WORKER_LABEL  label selector for decode workers
-#   FRONTEND      http://<frontend>:<port> for the DGD (for HTTP-mode refit)
-#   OUT           results dir (default: ./diff_bench_results)
-#
-# Scenarios (each writes JSON to $OUT and prints a summary line):
-#   S1 transport baseline    — NCCL broadcast vs MX pull (single + multi-rail)
-#   S2 refit-phase breakdown — register/wire/translate/load/e2e, backend swap
-#   S3 elastic-join latency  — scale in a fresh worker, time to current version
-#   S4 straggler isolation   — one slow worker; fleet completion vs a barrier
-#   S5 partial/EP refit       — bytes-on-wire per worker at EP>1 (+ synthetic proof)
-#
-# S1/S2/S3/S4-live need a trainer actively PUBLISHING versions and (for the NCCL
-# arm) an NCCL weight-transfer path deployed for the same model. Where a prereq
-# is missing the scenario is SKIPPED with a clear reason, so this is safe to run
-# incrementally as the deployment comes up.
+# Unified runner for the seven MX differentiator scenarios.
+# Every executed scenario writes one schema-versioned JSON result.
 
 set -uo pipefail
 
-NS="${NS:-kavin}"
-MX_URL="${MX_URL:-modelexpress-server.${NS}.svc.cluster.local:8001}"
-MODEL="${MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
-WORKER_LABEL="${WORKER_LABEL:-nvidia.com/dynamo-component-type=worker}"
-FRONTEND="${FRONTEND:-}"
-OUT="${OUT:-./diff_bench_results}"
-HARNESS_DIR="${HARNESS_DIR:-$(cd "$(dirname "$0")" && pwd)}"
-CYCLES="${CYCLES:-10}"
-mkdir -p "$OUT"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+OUT="${OUT:-./differentiator_results}"
+PYTHON="${PYTHON:-python3}"
+FULL_BYTES="${FULL_BYTES:-61064245248}"
+FULL_EXPERT_BYTES="${FULL_EXPERT_BYTES:-58000000000}"
+EXPERTS="${EXPERTS:-128}"
+ROLLOUT_EP="${ROLLOUT_EP:-2}"
+TP="${TP:-2}"
+mkdir -p "${OUT}"
 
-log() { printf '\n=== %s ===\n' "$*"; }
-skip() { printf '  [SKIP] %s\n' "$*"; }
-have_pod() { kubectl -n "$NS" get pods --no-headers 2>/dev/null | grep -q '1/1'; }
-
-first_worker() {
-  kubectl -n "$NS" get pods -l "$WORKER_LABEL" --no-headers 2>/dev/null \
-    | grep '1/1' | grep -i vllmdecodeworker | head -1 | awk '{print $1}'
-}
-
-trainer_publishing() {
-  # true if the catalog has >=1 READY source for $MODEL (a live publisher)
-  local pod; pod=$(first_worker); [ -z "$pod" ] && return 1
-  kubectl -n "$NS" exec "$pod" -- python3 - "$MX_URL" "$MODEL" <<'PY' 2>/dev/null | grep -q 'sources=[1-9]'
-import sys
-from modelexpress.engines.vllm.weight_update import MxVllmWeightUpdater, MxInitInfo
-u = MxVllmWeightUpdater()
-u.initialize_weight_update_setup(MxInitInfo(mx_server_url=sys.argv[1], model_name=sys.argv[2]))
-try:
-    c = u._receiver.discover_v2_sources(model_name=sys.argv[2], min_version=1, same_rank_only=False, include_replicas=True)
-    print(f"sources={len(c)}")
-except Exception as e:
-    print(f"sources=0 ({e})")
-PY
-}
-
-# ---------------------------------------------------------------------------
-preflight() {
-  log "preflight"
-  have_pod || { echo "  no ready worker pod in ns=$NS — aborting"; exit 1; }
-  echo "  ns=$NS  model=$MODEL  mx=$MX_URL  out=$OUT"
-  echo "  worker: $(first_worker)"
-  if trainer_publishing; then echo "  trainer: PUBLISHING (live source present)"; PUBLISHING=1
-  else echo "  trainer: not publishing (S2/S3/S4-live will skip)"; PUBLISHING=0; fi
-}
-
-# S1 — transport baseline (raw GPU->GPU BW; no publisher needed, uses 2 bench pods)
-s1_transport() {
-  log "S1 transport baseline (NCCL vs MX)"
-  echo "  NCCL: kubectl apply the 2-pod nccl-bench, run nccl_bcast_bench.py (1-rail baseline: NCCL_IB_HCA=mlx5_0, NCCL_MNNVL_ENABLE=0)"
-  echo "  MX:   smoke_fanout_receiver.py FANOUT_SEED_RANDOM_GB=8 FANOUT_NO_VERIFY=1 (single + MX_RDMA_NIC_PIN=stripe)"
-  echo "  -> record Gbps single-rail + 4-rail; reference: NCCL ~375, MX ~316/~529"
-  skip "wire-up left to the 2-pod bench (nccl-bench-{0,1}); harnesses: nccl_bcast_bench.py / smoke_fanout_receiver.py"
-}
-
-# S2 — refit-phase breakdown via the native backend swap
-s2_refit_phases() {
-  log "S2 refit-phase breakdown (backend swap mx vs nccl)"
-  [ "$PUBLISHING" = 1 ] || { skip "no publishing trainer"; return; }
-  [ -n "$FRONTEND" ] || { skip "set FRONTEND=http://<host>:<port> for HTTP-mode driver"; return; }
-  for be in mx nccl; do
-    echo "  driving $CYCLES cycles, backend=$be"
-    python3 "$HARNESS_DIR/mx_vs_nccl_refit_bench.py" --mode http --worker-url "$FRONTEND" \
-      --backend "$be" --model "$MODEL" --cycles "$CYCLES" --out "$OUT/refit_$be.json" \
-      || skip "backend=$be run failed (path may not be wired)"
-  done
-  python3 "$HARNESS_DIR/mx_vs_nccl_refit_bench.py" --compare "$OUT/refit_mx.json" "$OUT/refit_nccl.json" 2>/dev/null \
-    | tee "$OUT/refit_compare.txt" || skip "compare skipped (missing runs)"
-}
-
-# S3 — elastic-join latency (MX's home turf; NCCL can't do this without rebuild)
-s3_elastic_join() {
-  log "S3 elastic-join latency"
-  [ "$PUBLISHING" = 1 ] || { skip "no publishing trainer to join to"; return; }
-  local before after new t0
-  before=$(kubectl -n "$NS" get pods -l "$WORKER_LABEL" --no-headers | grep -c vllmdecodeworker)
-  echo "  scaling decode workers $before -> $((before+1)) and timing the new pod to current version"
-  # Scale via the DGD (adjust the resource/name for your deployment):
-  echo "  kubectl -n $NS patch dgd <dgd-name> -p '{\"spec\":{\"services\":{\"VllmDecodeWorker\":{\"replicas\":$((before+1))}}}}'"
-  echo "  then: watch the new pod log for '[mx-wt] ... update ... version=' and record wall time from Ready->synced"
-  skip "scale command left parameterized on <dgd-name>; measurement = new-pod Ready -> first successful update_weights"
-}
-
-# S4 — straggler isolation
-s4_straggler() {
-  log "S4 straggler isolation"
-  [ "$PUBLISHING" = 1 ] || { skip "no publishing trainer"; return; }
-  echo "  inject a slow reader on one worker (e.g. cgroup cpu throttle or a sleep in the load hook),"
-  echo "  publish a version, and record fleet-completion time + whether healthy workers proceed."
-  echo "  MX expectation: healthy workers complete independently (pull is per-worker);"
-  echo "  a collective barrier would stall all workers on the straggler."
-  skip "fault-injection hook is deployment-specific; harness: smoke_fanout_receiver.py with one throttled follower"
-}
-
-# S5 — partial / EP byte-pruning
-s5_partial_ep() {
-  log "S5 partial / EP refit byte-pruning"
-  echo "  synthetic proof (always runnable):"
-  ( cd "$HARNESS_DIR" && PYTHONPATH="${MX_PY:-}" python3 ep_gt1_byte_pruning.py 2>/dev/null | tail -3 ) \
-    || skip "set MX_PY=<modelexpress_client/python> to run the synthetic proof"
-  if [ "$PUBLISHING" = 1 ]; then
-    echo "  live: on an --enable-expert-parallel EP>1 deploy, per-worker pulled bytes should be ~1/EP;"
-    echo "  read each worker's [mx-wt] arena/register + wire log and sum byte_count per worker."
+run() {
+  local name="$1"
+  shift
+  printf '\n=== %s ===\n' "${name}"
+  if "$@"; then
+    printf '[PASS] %s\n' "${name}"
   else
-    skip "live EP>1 measurement needs the EP>1 DGD (ep8_rollout_dgd.example.yaml) + publisher"
+    printf '[FAIL] %s\n' "${name}"
+    return 1
   fi
 }
 
-# ---------------------------------------------------------------------------
-preflight
-s1_transport
-s2_refit_phases
-s3_elastic_join
-s4_straggler
-s5_partial_ep
-log "done — results in $OUT"
+skip() {
+  printf '[SKIP] %s\n' "$1"
+}
+
+# D1 — full EP filtering. Set EP_ACTUAL_BYTES from the live receiver log;
+# otherwise this is the planner/expected-byte assertion.
+ep_args=(
+  "${PYTHON}" "${DIR}/differentiator_suite.py"
+  --out "${OUT}/01_ep_filter.json"
+  ep-filter
+  --experts "${EXPERTS}"
+  --rollout-ep "${ROLLOUT_EP}"
+  --full-expert-bytes "${FULL_EXPERT_BYTES}"
+)
+if [[ -n "${EP_ACTUAL_BYTES:-}" ]]; then
+  ep_args+=(--actual-bytes "${EP_ACTUAL_BYTES}")
+fi
+run "D1 expert filtering" "${ep_args[@]}"
+
+# D2 — TP-local bytes. Set TP_ACTUAL_BYTES after a live sliced-pull run.
+tp_args=(
+  "${PYTHON}" "${DIR}/differentiator_suite.py"
+  --out "${OUT}/02_tp_slice.json"
+  tp-slice
+  --tp "${TP}"
+  --full-bytes "${FULL_BYTES}"
+)
+if [[ -n "${TP_ACTUAL_BYTES:-}" ]]; then
+  tp_args+=(--actual-bytes "${TP_ACTUAL_BYTES}")
+fi
+run "D2 TP-local slicing" "${tp_args[@]}"
+
+# D3 — partial refit. Manifest entries are {name, bytes}; selectors repeat.
+if [[ -n "${PARTIAL_MANIFEST:-}" && -n "${PARTIAL_SELECTOR:-}" ]]; then
+  partial_args=(
+    "${PYTHON}" "${DIR}/differentiator_suite.py"
+    --out "${OUT}/03_partial.json"
+    partial
+    --manifest "${PARTIAL_MANIFEST}"
+  )
+  IFS=',' read -ra selectors <<< "${PARTIAL_SELECTOR}"
+  for selector in "${selectors[@]}"; do
+    partial_args+=(--selector "${selector}")
+  done
+  run "D3 partial refit" "${partial_args[@]}"
+else
+  skip "D3 partial refit: set PARTIAL_MANIFEST and PARTIAL_SELECTOR"
+fi
+
+# D4/D5 — use result_*.json produced by elastic_bench.py.
+if [[ -n "${ELASTIC_RESULTS:-}" ]]; then
+  run "D4 elastic join" \
+    "${PYTHON}" "${DIR}/differentiator_suite.py" \
+    --out "${OUT}/04_elastic.json" elastic --results "${ELASTIC_RESULTS}"
+else
+  skip "D4 elastic join: set ELASTIC_RESULTS"
+fi
+
+if [[ -n "${STRAGGLER_RESULTS:-${ELASTIC_RESULTS:-}}" ]]; then
+  run "D5 straggler isolation" \
+    "${PYTHON}" "${DIR}/differentiator_suite.py" \
+    --out "${OUT}/05_straggler.json" straggler \
+    --results "${STRAGGLER_RESULTS:-${ELASTIC_RESULTS}}"
+else
+  skip "D5 straggler isolation: set STRAGGLER_RESULTS"
+fi
+
+# D6 — direct/tree result directories produced by fanout_bench.py.
+if [[ -n "${FANOUT_DIRECT:-}" && -n "${FANOUT_TREE:-}" ]]; then
+  run "D6 tree fan-out" \
+    "${PYTHON}" "${DIR}/differentiator_suite.py" \
+    --out "${OUT}/06_fanout.json" fanout \
+    --direct "${FANOUT_DIRECT}" --tree "${FANOUT_TREE}"
+else
+  skip "D6 tree fan-out: set FANOUT_DIRECT and FANOUT_TREE"
+fi
+
+# D7 — parse source-ranked RDMA lines from the production rollout log.
+if [[ -n "${MX_LOG:-}" ]]; then
+  run "D7 trainer egress balance" \
+    "${PYTHON}" "${DIR}/differentiator_suite.py" \
+    --out "${OUT}/07_egress.json" egress --log "${MX_LOG}"
+else
+  skip "D7 trainer egress balance: set MX_LOG"
+fi
+
+printf '\nResults: %s\n' "${OUT}"
