@@ -60,6 +60,7 @@ SECRET_ASSIGNMENT_PATTERN = re.compile(
 )
 AUTH_VALUE_PATTERN = re.compile(r"(?i)\b(Bearer|Basic)\s+\S+")
 URL_USERINFO_PATTERN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/@\s]+@")
+INCIDENT_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 REFRESH_COMMAND = (
     "uv run --no-project python "
     "experiments/cutedsl_qwen3_30ba3b_oci_1n4g/render_cutedsl_report.py "
@@ -787,12 +788,54 @@ def aggregate_incident_evidence(report_dir: Path, incident: dict[str, Any]) -> s
     report_path = incident.get("report_path")
     if not isinstance(report_path, str) or not report_path:
         return evidence
-    if "<a href=" not in artifact_link(report_path, "evidence snapshot"):
-        return f"{evidence}<br><code>{escape(report_path)}</code>"
+    unavailable = f"{evidence}<br><code>{escape(report_path)}</code>"
+    run_id = incident.get("run_id")
+    if not isinstance(run_id, str) or INCIDENT_RUN_ID_PATTERN.fullmatch(run_id) is None:
+        return unavailable
+    expected_path = f"evidence/job-{run_id}.txt"
+    if report_path != expected_path:
+        return unavailable
     public_dir = report_dir / "public"
+    public_evidence_dir = public_dir / "evidence"
     source = report_dir / report_path
     destination = public_dir / report_path
-    copy_public_text(report_dir, source, destination)
+    if public_dir.is_symlink() or public_evidence_dir.is_symlink():
+        return unavailable
+    try:
+        public_evidence_dir.mkdir(parents=True, exist_ok=True)
+        public_root = public_dir.resolve(strict=True)
+        public_evidence_root = public_evidence_dir.resolve(strict=True)
+    except OSError:
+        return unavailable
+    if (
+        public_dir.is_symlink()
+        or public_evidence_dir.is_symlink()
+        or public_evidence_root.parent != public_root
+    ):
+        return unavailable
+    try:
+        if destination.is_symlink():
+            destination.unlink()
+            return unavailable
+        if destination.exists():
+            if not destination.is_file():
+                return unavailable
+            destination.unlink()
+    except OSError:
+        return unavailable
+    try:
+        copied = copy_public_text(report_dir, source, destination)
+    except OSError:
+        return unavailable
+    if not copied:
+        return unavailable
+    if not is_contained_regular_file(public_evidence_dir, destination):
+        try:
+            if destination.is_symlink() or destination.is_file():
+                destination.unlink()
+        except OSError:
+            pass
+        return unavailable
     link = existing_artifact_link(public_dir, report_path, "evidence snapshot")
     return f"{evidence}<br>{link}"
 

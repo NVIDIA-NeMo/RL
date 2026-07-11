@@ -519,6 +519,195 @@ def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
                 assert secret_fragment not in text
 
 
+@pytest.mark.parametrize(
+    ("run_id", "report_path"),
+    [
+        ("123", "evidence/arbitrary.txt"),
+        ("123", "../job-123.txt"),
+        ("bad/run", "evidence/job-bad/run.txt"),
+        ("", "evidence/job-.txt"),
+    ],
+)
+def test_aggregate_incident_evidence_rejects_unmatched_or_unsafe_paths(
+    tmp_path: Path, run_id: str, report_path: str
+) -> None:
+    """Only the exact sanitized run-ID evidence filename is eligible."""
+    renderer = load_renderer()
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    relative_path = Path(report_path)
+    if not relative_path.is_absolute() and ".." not in relative_path.parts:
+        source = report_dir / relative_path
+        destination = report_dir / "public" / relative_path
+        source.parent.mkdir(parents=True, exist_ok=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("arbitrary source")
+        destination.write_text("stale arbitrary evidence")
+
+    rendered = renderer.aggregate_incident_evidence(
+        report_dir,
+        {"run_id": run_id, "report_path": report_path, "evidence": "boundary"},
+    )
+
+    assert "<a href=" not in rendered
+    assert "<code>" in rendered
+    assert not (report_dir / "public/evidence/job-123.txt").exists()
+
+
+@pytest.mark.parametrize("source_kind", ["missing", "oversized", "symlink"])
+def test_aggregate_incident_evidence_rejects_invalid_source_and_removes_stale(
+    tmp_path: Path, source_kind: str
+) -> None:
+    """Missing, oversized, or symlink sources cannot retain a stale public link."""
+    renderer = load_renderer()
+    report_dir = tmp_path / "report"
+    source = report_dir / "evidence/job-123.txt"
+    destination = report_dir / "public/evidence/job-123.txt"
+    source.parent.mkdir(parents=True)
+    destination.parent.mkdir(parents=True)
+    destination.write_text("stale public evidence")
+    if source_kind == "oversized":
+        source.write_bytes(b"x" * (renderer.MAX_PUBLIC_TEXT_BYTES + 1))
+    elif source_kind == "symlink":
+        target = report_dir / "evidence/source.txt"
+        target.write_text("real source")
+        source.symlink_to(target)
+
+    rendered = renderer.aggregate_incident_evidence(
+        report_dir,
+        {
+            "run_id": "123",
+            "report_path": "evidence/job-123.txt",
+            "evidence": "boundary",
+        },
+    )
+
+    assert "<a href=" not in rendered
+    assert "<code>evidence/job-123.txt</code>" in rendered
+    assert not destination.exists()
+
+
+def test_aggregate_incident_evidence_rejects_destination_directory_symlink(
+    tmp_path: Path,
+) -> None:
+    """A symlinked public evidence directory cannot redirect publication."""
+    renderer = load_renderer()
+    report_dir = tmp_path / "report"
+    source = report_dir / "evidence/job-123.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("bounded source")
+    public_dir = report_dir / "public"
+    public_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (public_dir / "evidence").symlink_to(outside, target_is_directory=True)
+
+    rendered = renderer.aggregate_incident_evidence(
+        report_dir,
+        {
+            "run_id": "123",
+            "report_path": "evidence/job-123.txt",
+            "evidence": "boundary",
+        },
+    )
+
+    assert "<a href=" not in rendered
+    assert "<code>evidence/job-123.txt</code>" in rendered
+    assert not (outside / "job-123.txt").exists()
+
+
+def test_aggregate_incident_evidence_rejects_destination_file_symlink(
+    tmp_path: Path,
+) -> None:
+    """A destination symlink is removed without writing through its target."""
+    renderer = load_renderer()
+    report_dir = tmp_path / "report"
+    source = report_dir / "evidence/job-123.txt"
+    destination = report_dir / "public/evidence/job-123.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("bounded source")
+    destination.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside sentinel")
+    destination.symlink_to(outside)
+
+    rendered = renderer.aggregate_incident_evidence(
+        report_dir,
+        {
+            "run_id": "123",
+            "report_path": "evidence/job-123.txt",
+            "evidence": "boundary",
+        },
+    )
+
+    assert "<a href=" not in rendered
+    assert "<code>evidence/job-123.txt</code>" in rendered
+    assert not destination.exists()
+    assert not destination.is_symlink()
+    assert outside.read_text() == "outside sentinel"
+
+
+@pytest.mark.parametrize("copy_failure", ["false", "error"])
+def test_aggregate_incident_evidence_links_only_after_successful_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, copy_failure: str
+) -> None:
+    """A false or failed copy cannot leave or link stale public evidence."""
+    renderer = load_renderer()
+    report_dir = tmp_path / "report"
+    source = report_dir / "evidence/job-123.txt"
+    destination = report_dir / "public/evidence/job-123.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("bounded source")
+    destination.parent.mkdir(parents=True)
+    destination.write_text("stale public evidence")
+    if copy_failure == "false":
+        monkeypatch.setattr(renderer, "copy_public_text", lambda *_args: False)
+    else:
+
+        def fail_copy(*_args: object) -> bool:
+            raise OSError("simulated copy failure")
+
+        monkeypatch.setattr(renderer, "copy_public_text", fail_copy)
+
+    rendered = renderer.aggregate_incident_evidence(
+        report_dir,
+        {
+            "run_id": "123",
+            "report_path": "evidence/job-123.txt",
+            "evidence": "boundary",
+        },
+    )
+
+    assert "<a href=" not in rendered
+    assert "<code>evidence/job-123.txt</code>" in rendered
+    assert not destination.exists()
+
+
+def test_aggregate_incident_evidence_publishes_exact_valid_path(
+    tmp_path: Path,
+) -> None:
+    """An exact run-ID evidence file is copied and linked inside public/evidence."""
+    renderer = load_renderer()
+    report_dir = tmp_path / "report"
+    source = report_dir / "evidence/job-123.txt"
+    destination = report_dir / "public/evidence/job-123.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("bounded source")
+
+    rendered = renderer.aggregate_incident_evidence(
+        report_dir,
+        {
+            "run_id": "123",
+            "report_path": "evidence/job-123.txt",
+            "evidence": "boundary",
+        },
+    )
+
+    assert '<a href="evidence/job-123.txt">evidence snapshot</a>' in rendered
+    assert destination.read_text() == "bounded source"
+    assert not destination.is_symlink()
+
+
 def test_report_redacts_known_credentials_from_all_displayed_inputs(
     tmp_path: Path,
 ) -> None:
