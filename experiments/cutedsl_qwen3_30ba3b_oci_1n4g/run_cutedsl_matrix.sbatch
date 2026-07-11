@@ -39,6 +39,7 @@ REPO_ROOT=$(git -C "${SLURM_SUBMIT_DIR}" rev-parse --show-toplevel)
 readonly REPO_ROOT
 readonly EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
 source "${EXPERIMENT_DIR}/lib/cluster_profile.sh"
+source "${EXPERIMENT_DIR}/lib/events.sh"
 load_cutedsl_cluster_profile
 readonly IMAGE="${CUTEDSL_IMAGE}"
 readonly RUN_ID="${SLURM_JOB_ID:?submit this benchmark with sbatch}${SLURM_RESTART_COUNT:+-r${SLURM_RESTART_COUNT}}"
@@ -53,6 +54,38 @@ REPLICATE_INDEX="${CUTEDSL_BENCHMARK_REPLICATE:-0}"
 SUBMISSION_GROUP="${CUTEDSL_BENCHMARK_SUBMISSION_GROUP:-direct}"
 readonly WARMUP_UPDATES MEASURED_UPDATES TIMING_ORDER PROFILE_ENABLED
 readonly REPLICATE_INDEX SUBMISSION_GROUP
+
+mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}"
+export CUTEDSL_EVENT_CLUSTER="${CUTEDSL_PROFILE_NAME}"
+export CUTEDSL_EVENT_JOB_ID="${SLURM_JOB_ID}"
+cutedsl_events_init "${RESULT_DIR}"
+exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
+
+on_exit() {
+    local exit_code=$?
+    set +e
+    local completion_status=pass
+    if [[ ${exit_code} -ne 0 ]]; then
+        completion_status=fail
+        if ! grep -q '"phase":"root_cause"' "${RESULT_DIR}/events.jsonl"; then
+            cutedsl_write_root_cause \
+                "Run exited with code ${exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}" \
+                "${CUTEDSL_CURRENT_ARTIFACT:-slurm.out}" \
+                "Pending investigation" "pending" "pending"
+        fi
+    fi
+    cutedsl_write_event complete "${completion_status}" "${exit_code}" \
+        "Benchmark payload finished" report.html
+    cutedsl_write_status "${exit_code}"
+    if ! python3 "${EXPERIMENT_DIR}/render_cutedsl_report.py" --run-dir "${RESULT_DIR}"; then
+        echo "[WARN] Failed to render ${RESULT_DIR}/report.html; preserving exit ${exit_code}." >&2
+    fi
+    rm -rf --one-file-system -- "${HOST_RUNTIME_DIR}"
+    return "${exit_code}"
+}
+trap on_exit EXIT
+
+cutedsl_write_event preflight start '' "Validate benchmark controls, source, and image" slurm.out
 
 if [[ ! "${WARMUP_UPDATES}" =~ ^[0-9]+$ ]] || ((WARMUP_UPDATES < 3)); then
     echo "[ERROR] CUTEDSL_BENCHMARK_WARMUP_UPDATES must be an integer >= 3." >&2
@@ -98,7 +131,6 @@ readonly TOTAL_UPDATES
 export RUN_ID WARMUP_UPDATES MEASURED_UPDATES TIMING_ORDER TOTAL_UPDATES PROFILE_ENABLED
 export REPLICATE_INDEX SUBMISSION_GROUP
 
-mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}"
 cat > "${HOST_RUNTIME_DIR}/log_runtime_environment.sh" <<'BASH'
 printf '[INFO] Runtime environment: VIRTUAL_ENV=%s UV_PROJECT_ENVIRONMENT=%s RUNTIME_PYTHON=%s\n' \
     "${VIRTUAL_ENV-<unset>}" "${UV_PROJECT_ENVIRONMENT-<unset>}" "${RUNTIME_PYTHON-<unset>}"
@@ -118,19 +150,8 @@ printf '[INFO] Runtime versions: uv=%s python=%s\n' "${runtime_uv_version}" "${r
 printf '[INFO] Runtime Python: realpath=%s prefix=%s\n' "${runtime_python_realpath}" "${runtime_python_prefix}"
 unset runtime_uv_version runtime_python_version runtime_python_realpath runtime_python_prefix
 BASH
-exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
 
-on_exit() {
-    local exit_code=$?
-    set +e
-    printf '{\n  "run_id": "%s",\n  "job_id": "%s",\n  "exit_code": %d,\n  "finished_at_utc": "%s"\n}\n' \
-        "${RUN_ID}" "${SLURM_JOB_ID}" "${exit_code}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        > "${RESULT_DIR}/status.json"
-    rm -rf --one-file-system -- "${HOST_RUNTIME_DIR}"
-    return "${exit_code}"
-}
-trap on_exit EXIT
-
+cutedsl_write_event image_hash start '' "Verify immutable container SHA256" image.sha256
 if [[ ! -r "${IMAGE}" ]]; then
     echo "[ERROR] Required immutable image is not readable: ${IMAGE}" >&2
     exit 1
@@ -169,6 +190,7 @@ if [[ "${IMAGE_SHA256}" != "${CUTEDSL_IMAGE_SHA256}" ]]; then
     echo "[ERROR] Image SHA256 ${IMAGE_SHA256} does not match profile SHA256 ${CUTEDSL_IMAGE_SHA256}." >&2
     exit 1
 fi
+cutedsl_write_event image_hash pass 0 "Container SHA256 matches cluster profile" image.sha256
 if [[ "${GIT_SHA}" != "${UPSTREAM_SHA}" ]]; then
     echo "[ERROR] HEAD ${GIT_SHA} does not match ${UPSTREAM_REF} at ${UPSTREAM_SHA}." >&2
     exit 1
@@ -177,6 +199,9 @@ export GIT_SHA GIT_BRANCH UPSTREAM_REF UPSTREAM_SHA IMAGE IMAGE_SHA256
 
 printf '%s\n' "${SUBMODULE_STATUS}" > "${RESULT_DIR}/submodule_status.txt"
 printf '%s  %s\n' "${IMAGE_SHA256}" "${IMAGE}" > "${RESULT_DIR}/image.sha256"
+cutedsl_write_event preflight pass 0 \
+    "Benchmark controls, source, submodules, upstream, and image are immutable" \
+    benchmark_manifest.json
 
 readonly -a COMMON_OVERRIDES=(
     "grpo.max_num_steps=${TOTAL_UPDATES}"
@@ -232,6 +257,8 @@ echo "[INFO] Updates per timing arm: ${WARMUP_UPDATES} warmup + ${MEASURED_UPDAT
 echo "[INFO] Source: ${GIT_SHA}; image SHA256: ${IMAGE_SHA256}"
 
 echo "[INFO] Bootstrapping the locked node-local environment and validating matched configs."
+cutedsl_write_event runtime_bootstrap start '' \
+    "Create locked run-local Python environment" uv_lock_check.log
 "${SRUN[@]}" bash -s <<'BASH'
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
@@ -349,8 +376,22 @@ manifest = {
 )
 PY
 BASH
+cutedsl_write_event runtime_bootstrap pass 0 \
+    "Locked runtime environment is active" uv_lock_check.log
+cutedsl_write_event config_validation start '' \
+    "Verify matched ON/OFF configs differ only by the selector" matched_config_diff.json
+cutedsl_write_event config_validation pass 0 \
+    "Matched config and benchmark manifest recorded" benchmark_manifest.json
+cutedsl_write_event focused_tests skip 0 \
+    "Focused tests are enforced by run_cutedsl_functional.sbatch" ''
+cutedsl_write_event gpu_smoke skip 0 \
+    "GPU smoke is enforced by run_cutedsl_functional.sbatch" ''
+cutedsl_write_event functional_grpo skip 0 \
+    "Functional GRPO is enforced by run_cutedsl_functional.sbatch" ''
 
 echo "[INFO] Running timing-only arms without profiling instrumentation."
+cutedsl_write_event timing start '' \
+    "Run matched CuTeDSL ON/OFF timing arms" timing_summary.json
 "${SRUN[@]}" bash -s <<'BASH'
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
@@ -585,8 +626,12 @@ summary = {
 (result_dir / "timing_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 PY
 BASH
+cutedsl_write_event timing pass 0 \
+    "Matched timing and normalized throughput summary recorded" timing_summary.json
 
 if [[ "${PROFILE_ENABLED}" == "1" ]]; then
+    cutedsl_write_event profile start '' \
+        "Run separate profiling-only ON/OFF arms" profiles
     echo "[INFO] Timing is complete; running separate profiling-only arms."
     "${SRUN[@]}" bash -s <<'BASH'
 set -euo pipefail
@@ -669,6 +714,16 @@ for order_index in "${!timing_arms[@]}"; do
     run_profile_arm "${timing_arms[order_index]}" "${order_index}"
 done
 BASH
+    cutedsl_write_event profile pass 0 \
+        "Nsight reports and kernel evidence recorded for both arms" profiles
+else
+    cutedsl_write_event profile skip 0 \
+        "Profiling disabled by CUTEDSL_BENCHMARK_PROFILE=0" ''
 fi
+
+cutedsl_write_event metrics_export start '' \
+    "Publish benchmark timing and profile summaries" timing_summary.json
+cutedsl_write_event metrics_export pass 0 \
+    "Benchmark evidence is ready for report rendering" timing_summary.json
 
 echo "[PASS] Matched CuTeDSL ON/OFF benchmark completed: ${RESULT_DIR}"

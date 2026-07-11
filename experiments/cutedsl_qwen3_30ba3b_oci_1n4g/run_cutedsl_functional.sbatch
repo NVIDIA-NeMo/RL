@@ -36,6 +36,7 @@ REPO_ROOT=$(git -C "${SLURM_SUBMIT_DIR}" rev-parse --show-toplevel)
 readonly REPO_ROOT
 readonly EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
 source "${EXPERIMENT_DIR}/lib/cluster_profile.sh"
+source "${EXPERIMENT_DIR}/lib/events.sh"
 load_cutedsl_cluster_profile
 readonly IMAGE="${CUTEDSL_IMAGE}"
 readonly RUN_ID="${SLURM_JOB_ID:?submit this wrapper with sbatch}${SLURM_RESTART_COUNT:+-r${SLURM_RESTART_COUNT}}"
@@ -43,6 +44,9 @@ readonly RESULT_DIR="${EXPERIMENT_DIR}/results/${RUN_ID}"
 readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl/${RUN_ID}"
 
 mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}"
+export CUTEDSL_EVENT_CLUSTER="${CUTEDSL_PROFILE_NAME}"
+export CUTEDSL_EVENT_JOB_ID="${SLURM_JOB_ID}"
+cutedsl_events_init "${RESULT_DIR}"
 cat > "${HOST_RUNTIME_DIR}/log_runtime_environment.sh" <<'BASH'
 printf '[INFO] Runtime environment: VIRTUAL_ENV=%s UV_PROJECT_ENVIRONMENT=%s RUNTIME_PYTHON=%s\n' \
     "${VIRTUAL_ENV-<unset>}" "${UV_PROJECT_ENVIRONMENT-<unset>}" "${RUNTIME_PYTHON-<unset>}"
@@ -67,13 +71,29 @@ exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
 on_exit() {
     local exit_code=$?
     set +e
-    printf '{\n  "run_id": "%s",\n  "job_id": "%s",\n  "exit_code": %d,\n  "finished_at_utc": "%s"\n}\n' \
-        "${RUN_ID}" "${SLURM_JOB_ID}" "${exit_code}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        > "${RESULT_DIR}/status.json"
+    local completion_status=pass
+    if [[ ${exit_code} -ne 0 ]]; then
+        completion_status=fail
+        if ! grep -q '"phase":"root_cause"' "${RESULT_DIR}/events.jsonl"; then
+            cutedsl_write_root_cause \
+                "Run exited with code ${exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}" \
+                "${CUTEDSL_CURRENT_ARTIFACT:-slurm.out}" \
+                "Pending investigation" "pending" "pending"
+        fi
+    fi
+    cutedsl_write_event complete "${completion_status}" "${exit_code}" \
+        "Functional payload finished" report.html
+    cutedsl_write_status "${exit_code}"
+    if ! python3 "${EXPERIMENT_DIR}/render_cutedsl_report.py" --run-dir "${RESULT_DIR}"; then
+        echo "[WARN] Failed to render ${RESULT_DIR}/report.html; preserving exit ${exit_code}." >&2
+    fi
     rm -rf --one-file-system -- "${HOST_RUNTIME_DIR}"
     return "${exit_code}"
 }
 trap on_exit EXIT
+
+cutedsl_write_event preflight start '' "Validate immutable source and image" slurm.out
+cutedsl_write_event image_hash start '' "Verify immutable container SHA256" image.sha256
 
 if [[ ! -r "${IMAGE}" ]]; then
     echo "[ERROR] Required first-choice image is not readable: ${IMAGE}" >&2
@@ -108,6 +128,7 @@ if [[ "${IMAGE_SHA256}" != "${CUTEDSL_IMAGE_SHA256}" ]]; then
     echo "[ERROR] Image SHA256 ${IMAGE_SHA256} does not match profile SHA256 ${CUTEDSL_IMAGE_SHA256}." >&2
     exit 1
 fi
+cutedsl_write_event image_hash pass 0 "Container SHA256 matches cluster profile" image.sha256
 GIT_SHA=$(git -C "${REPO_ROOT}" rev-parse HEAD)
 readonly GIT_SHA
 GIT_BRANCH=$(git -C "${REPO_ROOT}" branch --show-current)
@@ -128,6 +149,8 @@ git -C "${REPO_ROOT}" status --porcelain=v1 --branch --untracked-files=normal --
     > "${RESULT_DIR}/git_status_before.txt"
 printf '%s\n' "${SUBMODULE_STATUS}" > "${RESULT_DIR}/submodule_status.txt"
 printf '%s  %s\n' "${IMAGE_SHA256}" "${IMAGE}" > "${RESULT_DIR}/image.sha256"
+cutedsl_write_event preflight pass 0 \
+    "Source, submodules, upstream, and image are immutable" git_status_before.txt
 
 readonly -a GRPO_OVERRIDES=(
     "grpo.max_num_steps=3"
@@ -194,6 +217,8 @@ echo "[INFO] Image SHA256: ${IMAGE_SHA256}"
 echo "[INFO] Result directory: ${RESULT_DIR}"
 
 echo "[INFO] Creating the run-local Linux environment and recording provenance."
+cutedsl_write_event runtime_bootstrap start '' \
+    "Create locked run-local Python environment" uv_lock_check.log
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
@@ -327,8 +352,16 @@ metadata = {
 (result_dir / "topology.txt").write_text("\n".join(metadata["hardware"]["nvidia_smi_topology"]) + "\n")
 PY
 '
+cutedsl_write_event runtime_bootstrap pass 0 \
+    "Locked runtime environment is active" uv_lock_check.log
+cutedsl_write_event config_validation start '' \
+    "Resolve and validate the functional GRPO config" effective_config.yaml
+cutedsl_write_event config_validation pass 0 \
+    "Functional config and provenance recorded" metadata.json
 
 echo "[INFO] Running focused Linux tests before the GPU smoke and GRPO launch."
+cutedsl_write_event focused_tests start '' \
+    "Run focused tests, type checks, and pre-commit" focused_tests.log
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
@@ -374,8 +407,12 @@ fi
     "${UV_BIN}" run --active --no-sync pre-commit run --files "${bridge_changed_files[@]}"
 ) 2>&1 | tee "${CONTAINER_RESULT_DIR}/bridge_precommit.log"
 '
+cutedsl_write_event focused_tests pass 0 \
+    "Focused validation gate passed" focused_tests.log
 
 echo "[INFO] Running the required Cutlass DSL import smoke."
+cutedsl_write_event gpu_smoke start '' \
+    "Run Cutlass import and four-GPU Transformer Engine smoke" gpu_smoke.log
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
@@ -437,8 +474,12 @@ for device_index in range(actual_devices):
         )
 PY
 '
+cutedsl_write_event gpu_smoke pass 0 \
+    "Cutlass import and four-GPU Transformer Engine smoke passed" gpu_smoke.log
 
 echo "[INFO] Launching the three-update GRPO gate with a step-2 policy-worker Nsight capture."
+cutedsl_write_event functional_grpo start '' \
+    "Run three-update functional GRPO gate" grpo.log
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
@@ -562,5 +603,16 @@ assert tokens_per_second, summary
 assert peak_memory_metrics, summary
 PY
 '
+
+cutedsl_write_event functional_grpo pass 0 \
+    "Functional GRPO gate passed" grpo.log
+cutedsl_write_event timing skip 0 \
+    "Timing matrix is handled by run_cutedsl_matrix.sbatch" ''
+cutedsl_write_event profile pass 0 \
+    "Functional Nsight evidence collected" kernel_evidence.txt
+cutedsl_write_event metrics_export start '' \
+    "Validate and summarize functional metrics" metrics_summary.json
+cutedsl_write_event metrics_export pass 0 \
+    "Functional metrics summary recorded" metrics_summary.json
 
 echo "[PASS] CuTeDSL functional payload completed. Review metrics_summary.json and kernel_evidence.txt before classifying the GPU gate."
