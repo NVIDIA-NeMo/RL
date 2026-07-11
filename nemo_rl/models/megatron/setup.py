@@ -471,6 +471,7 @@ def setup_model_config(
     optimizer_path: Optional[str] = None,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic."""
+    _validate_cutedsl_config(config)
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
     validate_router_replay_config(config)
@@ -744,7 +745,47 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+    if "use_transformer_engine_op_fuser" in config["megatron_cfg"]:
+        model_cfg.use_transformer_engine_op_fuser = config["megatron_cfg"][
+            "use_transformer_engine_op_fuser"
+        ]
+    if "moe_mlp_glu_interleave_size" in config["megatron_cfg"]:
+        model_cfg.moe_mlp_glu_interleave_size = config["megatron_cfg"][
+            "moe_mlp_glu_interleave_size"
+        ]
     model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
+
+
+def _validate_cutedsl_config(config: PolicyConfig) -> None:
+    """Validate config-visible requirements when CuTeDSL is explicitly requested."""
+    megatron_cfg = config["megatron_cfg"]
+    env_vars = megatron_cfg.get("env_vars")
+    configured_request = bool(
+        env_vars and env_vars.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP") == "1"
+    )
+    runtime_request = os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP") == "1"
+    if not configured_request and not runtime_request:
+        return
+
+    errors: list[str] = []
+    if megatron_cfg.get("moe_grouped_gemm") is not True:
+        errors.append("megatron_cfg.moe_grouped_gemm must be true")
+    if megatron_cfg.get("use_transformer_engine_op_fuser") is not True:
+        errors.append("megatron_cfg.use_transformer_engine_op_fuser must be true")
+    if megatron_cfg.get("moe_mlp_glu_interleave_size") != 32:
+        errors.append("megatron_cfg.moe_mlp_glu_interleave_size must be 32")
+    if megatron_cfg.get("expert_tensor_parallel_size") != 1:
+        errors.append("megatron_cfg.expert_tensor_parallel_size must be 1")
+
+    fp8_cfg = megatron_cfg.get("fp8_cfg")
+    if not fp8_cfg or fp8_cfg.get("enabled") is not True:
+        errors.append("megatron_cfg.fp8_cfg.enabled must be true")
+    if not fp8_cfg or fp8_cfg.get("fp8_recipe") != "mxfp8":
+        errors.append('megatron_cfg.fp8_cfg.fp8_recipe must be "mxfp8"')
+
+    if errors:
+        details = "\n  - ".join(errors)
+        raise ValueError("NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 requires:\n  - " + details)
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:

@@ -1,0 +1,39 @@
+defaults: ./grpo-qwen3-30ba3b-4n4g-mxfp8-rollout.yaml
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_num_steps: 3
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  max_total_sequence_length: 1024
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 4
+    moe_grouped_gemm: true
+    use_transformer_engine_op_fuser: true
+    moe_mlp_glu_interleave_size: 32
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: false
+    env_vars:
+      NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl
+  wandb:
+    name: grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl
+cluster:
+  num_nodes: 1
+  gpus_per_node: 4

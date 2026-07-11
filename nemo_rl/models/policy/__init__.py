@@ -377,6 +377,12 @@ class MegatronConfig(TypedDict):
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
     moe_grouped_gemm: NotRequired[bool]
+    # Enable Transformer Engine's operation fuser. Required by the CuTeDSL fused
+    # grouped MLP path; omitted configs preserve the model provider's default.
+    use_transformer_engine_op_fuser: NotRequired[bool]
+    # Interleave size for gated MoE MLP FC1 weights. CuTeDSL requires 32; None
+    # preserves the legacy non-interleaved layout.
+    moe_mlp_glu_interleave_size: NotRequired[int | None]
     # HybridEP settings for MoE expert parallelism (requires moe_token_dispatcher_type='flex')
     # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
     moe_flex_dispatcher_backend: NotRequired[str]

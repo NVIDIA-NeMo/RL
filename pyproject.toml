@@ -165,7 +165,6 @@ mcore = [
   # sudo dpkg -i cuda-keyring_1.1-1_all.deb
   # sudo apt-get update
   # sudo apt-get install cudnn-cuda-13
-
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
@@ -196,6 +195,7 @@ mcore = [
   "flashinfer-jit-cache==0.6.8.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
+  "nvidia-cutlass-dsl[cu13]>=4.5.2",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [

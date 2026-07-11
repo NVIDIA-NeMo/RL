@@ -1,7 +1,7 @@
 # NeMo 26.06 Policy Training Performance Integration Design
 
-**Source baseline:** NeMo-RL `main` at `c1868b139819e6364d65f862a843eb39489072a1`  
-**Primary model:** `Qwen/Qwen3-30B-A3B`  
+**Source baseline:** NeMo-RL `main` at `c1868b139819e6364d65f862a843eb39489072a1`
+**Primary model:** `Qwen/Qwen3-30B-A3B`
 **Target hardware:** GB200 on OCI-HSG, Lyris, Pre-Tyche, and AWS-DFW
 
 ## Goal

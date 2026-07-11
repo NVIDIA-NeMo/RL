@@ -689,6 +689,50 @@ class TestApplyMoeConfig:
 
         assert not hasattr(model_cfg, "moe_grouped_gemm")
 
+    @pytest.mark.parametrize("use_transformer_engine_op_fuser", [True, False])
+    def test_transformer_engine_op_fuser_explicit(
+        self, use_transformer_engine_op_fuser: bool
+    ) -> None:
+        """use_transformer_engine_op_fuser is applied exactly when present."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["use_transformer_engine_op_fuser"] = (
+            use_transformer_engine_op_fuser
+        )
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert (
+            model_cfg.use_transformer_engine_op_fuser is use_transformer_engine_op_fuser
+        )
+
+    def test_moe_mlp_glu_interleave_size_explicit(self) -> None:
+        """moe_mlp_glu_interleave_size is applied exactly when present."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_mlp_glu_interleave_size"] = 32
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert model_cfg.moe_mlp_glu_interleave_size == 32
+
+    def test_optional_cutedsl_fields_absent_keep_upstream_defaults(self) -> None:
+        """Absent CuTeDSL keys do not overwrite model-provider defaults."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        model_cfg.use_transformer_engine_op_fuser = "upstream-op-fuser-default"
+        model_cfg.moe_mlp_glu_interleave_size = "upstream-interleave-default"
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": self._base_moe_megatron_cfg()})
+
+        assert model_cfg.use_transformer_engine_op_fuser == "upstream-op-fuser-default"
+        assert model_cfg.moe_mlp_glu_interleave_size == "upstream-interleave-default"
+
     def test_hybridep_env_vars_auto_set_with_warning(self, monkeypatch):
         """HybridEP backend with no env config: auto-set env vars and emit warnings."""
         from nemo_rl.models.megatron.setup import _apply_moe_config
@@ -829,6 +873,89 @@ class TestApplyMoeConfig:
         assert not hasattr(model_cfg, "moe_hybridep_num_sms")
         assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ
         assert "USE_MNNVL" not in os.environ
+
+
+@pytest.mark.mcore
+class TestValidateCutedslConfig:
+    """Tests for requested CuTeDSL grouped-MLP validation."""
+
+    @staticmethod
+    def _config(env_value: str | None = "1", **overrides: object) -> dict[str, object]:
+        megatron_cfg: dict[str, object] = {
+            "moe_grouped_gemm": True,
+            "use_transformer_engine_op_fuser": True,
+            "moe_mlp_glu_interleave_size": 32,
+            "expert_tensor_parallel_size": 1,
+            "fp8_cfg": {
+                "enabled": True,
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "fp8_param": False,
+            },
+        }
+        if env_value is not None:
+            megatron_cfg["env_vars"] = {"NVTE_CUTEDSL_FUSED_GROUPED_MLP": env_value}
+        megatron_cfg.update(overrides)
+        return {"megatron_cfg": megatron_cfg}
+
+    def test_cutedsl_valid_config_is_accepted(self, monkeypatch) -> None:
+        from nemo_rl.models.megatron.setup import _validate_cutedsl_config
+
+        monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+        _validate_cutedsl_config(self._config())
+
+    def test_cutedsl_reports_all_invalid_requested_preconditions(
+        self, monkeypatch
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _validate_cutedsl_config
+
+        monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+        config = self._config(
+            moe_grouped_gemm=False,
+            use_transformer_engine_op_fuser=False,
+            moe_mlp_glu_interleave_size=None,
+            expert_tensor_parallel_size=2,
+            fp8_cfg={"enabled": False, "fp8_recipe": "blockwise"},
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            _validate_cutedsl_config(config)
+
+        message = str(exc_info.value)
+        assert "megatron_cfg.moe_grouped_gemm" in message
+        assert "megatron_cfg.use_transformer_engine_op_fuser" in message
+        assert "megatron_cfg.moe_mlp_glu_interleave_size" in message
+        assert "megatron_cfg.expert_tensor_parallel_size" in message
+        assert "megatron_cfg.fp8_cfg.enabled" in message
+        assert "megatron_cfg.fp8_cfg.fp8_recipe" in message
+
+    @pytest.mark.parametrize("env_value", [None, "0"])
+    def test_cutedsl_validation_is_disabled_unless_env_is_exactly_one(
+        self, env_value: str | None, monkeypatch
+    ) -> None:
+        from nemo_rl.models.megatron.setup import _validate_cutedsl_config
+
+        monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+        _validate_cutedsl_config(
+            self._config(
+                env_value,
+                moe_grouped_gemm=False,
+                use_transformer_engine_op_fuser=False,
+                moe_mlp_glu_interleave_size=None,
+                expert_tensor_parallel_size=2,
+                fp8_cfg={"enabled": False, "fp8_recipe": "blockwise"},
+            )
+        )
+
+    def test_cutedsl_process_environment_requests_validation(self, monkeypatch) -> None:
+        from nemo_rl.models.megatron.setup import _validate_cutedsl_config
+
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+
+        with pytest.raises(ValueError, match="megatron_cfg.moe_grouped_gemm"):
+            _validate_cutedsl_config(
+                self._config(env_value=None, moe_grouped_gemm=False)
+            )
 
 
 @pytest.mark.mcore
@@ -1903,6 +2030,29 @@ class TestSetupModelConfig:
         model_cfg = MagicMock()
         model_cfg.__post_init__ = MagicMock()
         return model_cfg
+
+    def test_cutedsl_validation_precedes_model_config_construction(self) -> None:
+        """Invalid requested CuTeDSL config fails before loading model metadata."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        config = {
+            "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
+            "megatron_cfg": {
+                "env_vars": {"NVTE_CUTEDSL_FUSED_GROUPED_MLP": "1"},
+            },
+        }
+
+        with patch("transformers.AutoConfig.from_pretrained") as mock_auto_config:
+            with pytest.raises(ValueError, match="megatron_cfg.moe_grouped_gemm"):
+                setup_model_config(
+                    config,
+                    rank=0,
+                    dtype=torch.bfloat16,
+                    hf_model_name="test-model",
+                    pretrained_path="/ckpt/iter_0005000",
+                )
+
+        mock_auto_config.assert_not_called()
 
     def test_megatron_lm_passes_hf_config_overrides_to_autoconfig(self, request):
         """hf_config_overrides must be forwarded to AutoConfig.from_pretrained for megatron_lm."""
