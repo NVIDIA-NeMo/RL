@@ -12,12 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 EXPERIMENT_DIR = Path(__file__).parents[1] / "experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
 SCRIPT = (EXPERIMENT_DIR / "submit_oci_hsg.sh").read_text()
 README = (EXPERIMENT_DIR / "README.md").read_text()
+RECIPE = (
+    Path(__file__).parents[1]
+    / "examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl.yaml"
+).read_text()
+BENCHMARK_PATH = EXPERIMENT_DIR / "benchmark_cutedsl_ab_oci_hsg.sh"
+BENCHMARK_SCRIPT = BENCHMARK_PATH.read_text() if BENCHMARK_PATH.exists() else ""
+BENCHMARK_SUBMIT_PATH = EXPERIMENT_DIR / "submit_cutedsl_ab_replicates.sh"
+BENCHMARK_SUBMIT_SCRIPT = (
+    BENCHMARK_SUBMIT_PATH.read_text() if BENCHMARK_SUBMIT_PATH.exists() else ""
+)
 SMOKE_SCRIPT = (
     Path(__file__).parents[1] / "scripts/smoke_nemo_rl_container.sbatch"
 ).read_text()
@@ -104,7 +117,7 @@ def test_wrapper_keeps_high_churn_runtime_off_lustre_across_srun_steps() -> None
     required_fragments = (
         'readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl/${RUN_ID}"',
         'readonly CONTAINER_RUNTIME_DIR="/runtime"',
-        '${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}',
+        "${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}",
         'export UV_INSTALL_DIR="${CONTAINER_RUNTIME_DIR}/uv-bin"',
         'export UV_PYTHON_INSTALL_DIR="${CONTAINER_RUNTIME_DIR}/uv-python"',
         'export UV_PROJECT_ENVIRONMENT="${CONTAINER_RUNTIME_DIR}/venv"',
@@ -131,7 +144,7 @@ def test_smoke_uses_result_mount_for_logs_and_image_prebuilt_environment() -> No
         "${CONTAINER_SMOKE_DIR}:/results",
         'readonly python_bin="/opt/nemo_rl_venv/bin/python"',
         '[[ "$("${python_bin}" --version)" == "Python 3.13.13" ]]',
-        '"${python_bin}" - <<\'PY\'',
+        "\"${python_bin}\" - <<'PY'",
         "import cutlass",
         "from cutlass import cute",
         "import nemo_rl",
@@ -148,7 +161,7 @@ def test_smoke_uses_result_mount_for_logs_and_image_prebuilt_environment() -> No
 def test_smoke_has_bounded_runtime_and_proves_gb200_allocation() -> None:
     required_fragments = (
         "#SBATCH --time=00:10:00",
-        'device_names = [torch.cuda.get_device_name(index) for index in range(actual_devices)]',
+        "device_names = [torch.cuda.get_device_name(index) for index in range(actual_devices)]",
         'assert all("GB200" in device_name for device_name in device_names)',
         'tee "${CONTAINER_SMOKE_DIR}/smoke.log"',
     )
@@ -166,7 +179,7 @@ def test_smoke_uses_image_prebuilt_environment_without_sync() -> None:
     required_fragments = (
         'readonly python_bin="/opt/nemo_rl_venv/bin/python"',
         '[[ "$("${python_bin}" --version)" == "Python 3.13.13" ]]',
-        '"${python_bin}" - <<\'PY\'',
+        "\"${python_bin}\" - <<'PY'",
     )
     for fragment in required_fragments:
         assert fragment in SMOKE_SCRIPT, fragment
@@ -220,3 +233,254 @@ def test_wrapper_and_readme_pin_refreshed_immutable_nightly() -> None:
     assert f'readonly IMAGE="{image}"' in SCRIPT
     assert f"`{image}`" in README
     assert "af1d2ca2a7b169aa13be4b129a0fad8e206c63576d4941b00ae312bd65d0f3e1" in README
+
+
+def test_benchmark_uses_recipe_default_on_and_one_off_override() -> None:
+    selector = "policy.megatron_cfg.env_vars.NVTE_CUTEDSL_FUSED_GROUPED_MLP"
+    assert 'NVTE_CUTEDSL_FUSED_GROUPED_MLP: "1"' in RECIPE
+    required_fragments = (
+        f'readonly CUTEDSL_SELECTOR_PATH="{selector}"',
+        'readonly EXPECTED_ON_SELECTOR="1"',
+        'readonly OFF_OVERRIDE="${CUTEDSL_SELECTOR_PATH}=\\"0\\""',
+        "arm_overrides=()",
+        'arm_overrides=("${OFF_OVERRIDE}")',
+        '"${COMMON_OVERRIDES[@]}" "${arm_overrides[@]}"',
+    )
+    for fragment in required_fragments:
+        assert fragment in BENCHMARK_SCRIPT, fragment
+    assert f'{selector}="1"' not in BENCHMARK_SCRIPT
+
+
+def test_benchmark_verifies_exact_matched_config_diff() -> None:
+    required_fragments = (
+        'on_selector == "1"',
+        'off_selector == "0"',
+        'differences == {selector_path: {"on": "1", "off": "0"}}',
+        '"matched_config_diff.json"',
+        '"effective_config_on.yaml"',
+        '"effective_config_off.yaml"',
+    )
+    for fragment in required_fragments:
+        assert fragment in BENCHMARK_SCRIPT, fragment
+
+
+def test_benchmark_has_recorded_order_and_sufficient_timing_samples() -> None:
+    required_fragments = (
+        'WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-3}"',
+        'MEASURED_UPDATES="${CUTEDSL_BENCHMARK_MEASURED_UPDATES:-20}"',
+        "WARMUP_UPDATES < 3",
+        "MEASURED_UPDATES < 10",
+        "TOTAL_UPDATES=$((WARMUP_UPDATES + MEASURED_UPDATES))",
+        'TIMING_ORDER="${CUTEDSL_BENCHMARK_ORDER:-on,off}"',
+        '"run_id"',
+        '"timing_order"',
+        '"warmup_updates"',
+        '"measured_updates"',
+        '"arm"',
+        '"order_index"',
+    )
+    for fragment in required_fragments:
+        assert fragment in BENCHMARK_SCRIPT, fragment
+
+
+def test_benchmark_separates_profiling_and_collects_raw_timing() -> None:
+    required_fragments = (
+        "run_timing_arm()",
+        "run_profile_arm()",
+        "unset NRL_NSYS_WORKER_PATTERNS",
+        'export NRL_NSYS_PROFILE_STEP_RANGE="1:2"',
+        '"raw_timing.json"',
+        '"raw_timing.csv"',
+        '"timing/train/policy_training"',
+        "ordered_values(name)[WARMUP_UPDATES:]",
+        "len(points) == MEASURED_UPDATES",
+    )
+    for fragment in required_fragments:
+        assert fragment in BENCHMARK_SCRIPT, fragment
+    assert BENCHMARK_SCRIPT.index("run_timing_arm()") < BENCHMARK_SCRIPT.index(
+        "run_profile_arm()"
+    )
+
+
+def test_benchmark_reuses_pinned_image_and_node_local_bootstrap() -> None:
+    required_fragments = (
+        "nemo_rl_nightly_20260711_4677250.sqsh",
+        'readonly CONTAINER_RUNTIME_DIR="/runtime"',
+        'readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl-benchmark/${RUN_ID}"',
+        "${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}",
+        'export UV_VERSION="0.11.6"',
+        'export UV_PYTHON_VERSION="3.13.13"',
+        "export UV_NO_MODIFY_PATH=1",
+        '"${UV_BIN}" sync --locked --extra mcore --group test --group dev',
+        '"${UV_BIN}" lock --check',
+    )
+    for fragment in required_fragments:
+        assert fragment in BENCHMARK_SCRIPT, fragment
+
+
+def test_benchmark_requires_profile_artifacts_for_each_arm() -> None:
+    required_fragments = (
+        'report_count=$(find "${arm_dir}/nsight" -type f -name "*.nsys-rep"',
+        "((report_count < 1))",
+        '[[ ! -s "${arm_dir}/kernel_evidence.txt" ]]',
+        '"nsight_report_count"',
+        '"kernel_evidence"',
+    )
+    for fragment in required_fragments:
+        assert fragment in BENCHMARK_SCRIPT, fragment
+
+
+def test_benchmark_records_workload_and_normalized_throughput_as_primary() -> None:
+    required_fragments = (
+        'TOKEN_COUNT_METRIC = "train/total_num_tokens"',
+        'VALID_TOKEN_COUNT_METRIC = "train/global_valid_toks"',
+        'NORMALIZED_THROUGHPUT_METRIC = "performance/policy_training_tokens_per_sec_per_gpu"',
+        '"measured_step_workload"',
+        '"total_num_tokens"',
+        '"global_valid_toks"',
+        '"normalized_policy_training_tokens_per_sec_per_gpu"',
+        '"workload_equality_required": False',
+        '"workload_equality_observed"',
+        '"primary_metric": NORMALIZED_THROUGHPUT_METRIC',
+        '"secondary_metric": POLICY_TIME_METRIC',
+        '"secondary_metric_confounded_by_live_workload": True',
+    )
+    for fragment in required_fragments:
+        assert fragment in BENCHMARK_SCRIPT, fragment
+
+
+def test_benchmark_submit_driver_requires_three_alternating_replicates() -> None:
+    wrapper_fragments = (
+        'REPLICATE_INDEX="${CUTEDSL_BENCHMARK_REPLICATE:-0}"',
+        '"replicate_index"',
+    )
+    for fragment in wrapper_fragments:
+        assert fragment in BENCHMARK_SCRIPT, fragment
+
+    driver_fragments = (
+        'REPLICATES="${CUTEDSL_BENCHMARK_REPLICATES:-3}"',
+        "REPLICATES < 3",
+        "replicate_index % 2 == 0",
+        'timing_order="on,off"',
+        'timing_order="off,on"',
+        "CUTEDSL_BENCHMARK_REPLICATE=${replicate_index}",
+        "CUTEDSL_BENCHMARK_ORDER=${timing_order}",
+        "env -0",
+        "-u CUTEDSL_BENCHMARK_ORDER",
+        '--export-file="${EXPORT_PAYLOAD}"',
+        '"replicate_index"',
+        '"timing_order"',
+        '"job_id"',
+    )
+    for fragment in driver_fragments:
+        assert fragment in BENCHMARK_SUBMIT_SCRIPT, fragment
+    assert "--export=" not in BENCHMARK_SUBMIT_SCRIPT
+
+
+def test_benchmark_submit_driver_uses_exact_nul_export_payload(
+    tmp_path: Path,
+) -> None:
+    driver = tmp_path / "submit_cutedsl_ab_replicates.sh"
+    driver_text = BENCHMARK_SUBMIT_SCRIPT.replace(
+        'readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/benchmark_submissions"',
+        f'readonly SUBMISSION_DIR="{tmp_path}/records"',
+    )
+    assert driver_text != BENCHMARK_SUBMIT_SCRIPT
+    driver.write_text(driver_text)
+
+    mock_bin = tmp_path / "bin"
+    mock_bin.mkdir()
+    calls_path = tmp_path / "sbatch_calls.jsonl"
+    mock_sbatch = mock_bin / "sbatch"
+    mock_sbatch.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+exported = None
+mode = None
+for argument in sys.argv[1:]:
+    if argument.startswith("--export="):
+        mode = "comma"
+        tokens = argument.removeprefix("--export=").split(",")
+        exported = dict(os.environ) if "ALL" in tokens else {}
+        for token in tokens:
+            if token == "ALL":
+                continue
+            if "=" not in token:
+                if token not in os.environ:
+                    print(f"invalid --export token: {token}", file=sys.stderr)
+                    raise SystemExit(64)
+                exported[token] = os.environ[token]
+                continue
+            name, value = token.split("=", 1)
+            if name not in exported:
+                exported[name] = value
+    elif argument.startswith("--export-file="):
+        mode = "nul_file"
+        payload_path = Path(argument.removeprefix("--export-file="))
+        exported = {}
+        for entry in payload_path.read_bytes().split(b"\\0"):
+            if not entry:
+                continue
+            name, value = entry.decode().split("=", 1)
+            exported[name] = value
+
+if exported is None:
+    print("missing export option", file=sys.stderr)
+    raise SystemExit(64)
+
+required = {
+    "CUTEDSL_BENCHMARK_REPLICATE",
+    "CUTEDSL_BENCHMARK_ORDER",
+    "CUTEDSL_BENCHMARK_SUBMISSION_GROUP",
+}
+if not required <= exported.keys():
+    print("missing benchmark export", file=sys.stderr)
+    raise SystemExit(64)
+
+record = {
+    "mode": mode,
+    "replicate": exported["CUTEDSL_BENCHMARK_REPLICATE"],
+    "order": exported["CUTEDSL_BENCHMARK_ORDER"],
+    "submission_group": exported["CUTEDSL_BENCHMARK_SUBMISSION_GROUP"],
+}
+with Path(os.environ["MOCK_SBATCH_CALLS"]).open("a") as output:
+    output.write(json.dumps(record) + "\\n")
+print(f"mock-{record['replicate']}")
+"""
+    )
+    mock_sbatch.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{mock_bin}:{env['PATH']}",
+            "MOCK_SBATCH_CALLS": str(calls_path),
+            "CUTEDSL_BENCHMARK_REPLICATES": "3",
+            "CUTEDSL_BENCHMARK_REPLICATE": "999",
+            "CUTEDSL_BENCHMARK_ORDER": "stale,order",
+            "CUTEDSL_BENCHMARK_SUBMISSION_GROUP": "stale-group",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(driver)],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+    assert [call["mode"] for call in calls] == ["nul_file"] * 3
+    assert [call["replicate"] for call in calls] == ["0", "1", "2"]
+    assert [call["order"] for call in calls] == [
+        "on,off",
+        "off,on",
+        "on,off",
+    ]
+    assert len({call["submission_group"] for call in calls}) == 1
+    assert calls[0]["submission_group"] != "stale-group"
