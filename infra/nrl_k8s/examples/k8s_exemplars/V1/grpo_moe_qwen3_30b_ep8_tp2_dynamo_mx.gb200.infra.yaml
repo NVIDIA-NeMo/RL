@@ -10,7 +10,7 @@
 defaults: grpo_math_1b_dynamo_mx.gb300.infra.yaml
 
 namespace: ${user:}
-image: jwillthomson/nemo-rl-mx:06-12
+image: nvcr.io/nvidian/dynamo-dev/model-express-dev:nemorl-ep8tp2-073d1cb2e-f63d53b
 imagePullSecrets: [nvcr-imagepullsecret]
 serviceAccount: default
 
@@ -36,6 +36,8 @@ _shared:
   workerEnv: &shared_worker_env
     - {name: HF_HOME, value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: NCCL_DEBUG, value: INFO}
+    # Cross-node GB200 pods do not share a configured IMEX channel.
+    - {name: NCCL_MNNVL_ENABLE, value: "0"}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
     - {name: UCX_TLS, value: "^tcp"}
     - {name: NIXL_UCX_TLS, value: "^tcp"}
@@ -186,7 +188,7 @@ dynamo:
             nodeSelector: *head_node_selector
         VllmDecodeWorker:
           envFromSecret: ${user:}-secrets
-          image: nvcr.io/nvidian/dynamo-dev/model-express-dev:native-ep8tp2-0f53b7e-3300035
+          image: nvcr.io/nvidian/dynamo-dev/model-express-dev:native-ep8tp2-30175fa-3300035
           resources:
             requests:
               gpu: "2"

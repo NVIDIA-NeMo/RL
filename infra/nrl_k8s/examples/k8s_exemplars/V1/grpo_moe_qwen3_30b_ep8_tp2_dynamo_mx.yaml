@@ -7,7 +7,8 @@ defaults: ../../../../../examples/configs/grpo_math_qwen30ba3b_megatron.yaml
 
 grpo:
   max_num_steps: 3
-  num_prompts_per_step: 2
+  # Eight policy workers require a generation batch divisible by eight.
+  num_prompts_per_step: 4
   num_generations_per_prompt: 2
   max_rollout_turns: 1
   val_period: 0
