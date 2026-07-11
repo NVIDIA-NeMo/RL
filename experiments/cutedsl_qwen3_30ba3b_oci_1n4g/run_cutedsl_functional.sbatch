@@ -45,7 +45,7 @@ readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl/${RUN_ID}"
 
 # CUTEDSL_RUNTIME_TMPDIR_START
 mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}/tmp"
-export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
+export TMPDIR="${HOST_RUNTIME_DIR}/tmp"
 # CUTEDSL_RUNTIME_TMPDIR_END
 export CUTEDSL_EVENT_CLUSTER="${CUTEDSL_PROFILE_NAME}"
 export CUTEDSL_EVENT_JOB_ID="${SLURM_JOB_ID}"
@@ -199,7 +199,7 @@ SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
-    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR
+    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -218,11 +218,14 @@ echo "[INFO] Creating the run-local Linux environment and recording provenance."
 cutedsl_write_event runtime_bootstrap start '' \
     "Create locked run-local Python environment" uv_lock_check.log
 "${SRUN[@]}" bash -lc '
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-cd "${CONTAINER_REPO_ROOT}"
-[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
+printf '"'"'[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n'"'"' \
+    "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
+cd "${CONTAINER_REPO_ROOT}"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 [[ "$("${UV_BIN}" --version)" == "uv ${UV_VERSION} "* ]]
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
@@ -366,10 +369,13 @@ echo "[INFO] Running focused Linux tests before the GPU smoke and GRPO launch."
 cutedsl_write_event focused_tests start '' \
     "Run focused tests, type checks, and pre-commit" focused_tests.log
 "${SRUN[@]}" bash -lc '
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-cd "${CONTAINER_REPO_ROOT}"
+printf '"'"'[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n'"'"' \
+    "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
+cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
@@ -538,10 +544,13 @@ echo "[INFO] Running the required Cutlass DSL import smoke."
 cutedsl_write_event gpu_smoke start '' \
     "Run Cutlass import and four-GPU Transformer Engine smoke" gpu_smoke.log
 "${SRUN[@]}" bash -lc '
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-cd "${CONTAINER_REPO_ROOT}"
+printf '"'"'[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n'"'"' \
+    "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
+cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
@@ -557,10 +566,13 @@ runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; p
 
 echo "[INFO] Running the four-GPU PyTorch and Transformer Engine device smoke."
 "${SRUN[@]}" bash -lc '
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-cd "${CONTAINER_REPO_ROOT}"
+printf '"'"'[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n'"'"' \
+    "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
+cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
@@ -611,10 +623,13 @@ echo "[INFO] Launching the three-update GRPO gate with a step-2 policy-worker Ns
 cutedsl_write_event functional_grpo start '' \
     "Run three-update functional GRPO gate" grpo.log
 "${SRUN[@]}" bash -lc '
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-cd "${CONTAINER_REPO_ROOT}"
+printf '"'"'[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n'"'"' \
+    "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
+cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]

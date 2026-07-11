@@ -502,7 +502,6 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
         "VIRTUAL_ENV": "/runtime/venv",
         "UV_PROJECT_ENVIRONMENT": "/runtime/venv",
         "NVTE_CUDA_ARCHS": "100",
-        "TMPDIR": "/runtime/tmp",
     }
 
     def pyxis_container_env(script: str) -> dict[str, str]:
@@ -515,9 +514,10 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
 
     for script in (SCRIPT, BENCHMARK_SCRIPT):
         expected_option = (
-            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR"
+            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS"
         )
         assert script.count(expected_option) == 1
+        assert not re.search(r"^\s*--container-env=.*TMPDIR", script, re.MULTILINE)
         assert not re.search(
             r"^\s*--container-env=VIRTUAL_ENV\s*$", script, re.MULTILINE
         )
@@ -525,7 +525,7 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
         assert resolved["VIRTUAL_ENV"] == "/runtime/venv"
         assert resolved["UV_PROJECT_ENVIRONMENT"] == "/runtime/venv"
         assert resolved["NVTE_CUDA_ARCHS"] == "100"
-        assert resolved["TMPDIR"] == "/runtime/tmp"
+        assert resolved["TMPDIR"] == image_env["TMPDIR"]
 
 
 def _runtime_tmpdir_init_source(script: str) -> str:
@@ -536,11 +536,20 @@ def _runtime_tmpdir_init_source(script: str) -> str:
     return script.split(start, 1)[1].split(end, 1)[0]
 
 
+def _container_tmpdir_preambles(script: str) -> list[list[str]]:
+    lines = script.splitlines()
+    return [
+        lines[index + 1 : index + 7]
+        for index, line in enumerate(lines)
+        if '"${SRUN[@]}" bash' in line
+    ]
+
+
 def test_payloads_override_stale_tmpdir_for_every_profile(tmp_path: Path) -> None:
     stale_tmpdir = "/lustre/fsw/portfolios/coreai/projects/stale-login/tmp"
-    expected_container_tmpdir = "/runtime/tmp"
     tmpdir_assertion = '[[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]'
     writable_assertion = '[[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]'
+    container_diagnostic = "[INFO] Container temporary directory:"
 
     for payload_name, script in (("functional", SCRIPT), ("matrix", BENCHMARK_SCRIPT)):
         for profile_name in ("pre_tyche", "aws_dfw", "lyris"):
@@ -568,14 +577,43 @@ def test_payloads_override_stale_tmpdir_for_every_profile(tmp_path: Path) -> Non
                 text=True,
             )
             assert result.returncode == 0, (payload_name, profile_name, result.stderr)
-            assert result.stdout.strip() == expected_container_tmpdir
-            assert (case_dir / "host-runtime/tmp").is_dir()
+            expected_host_tmpdir = case_dir / "host-runtime/tmp"
+            assert result.stdout.strip() == str(expected_host_tmpdir)
+            assert expected_host_tmpdir.is_dir()
+
+        preambles = _container_tmpdir_preambles(script)
+        assert len(preambles) == script.count('"${SRUN[@]}"')
+        for index, preamble in enumerate(preambles):
+            assert preamble[0] == 'export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"'
+            container_runtime_dir = tmp_path / payload_name / str(index) / "runtime"
+            (container_runtime_dir / "tmp").mkdir(parents=True)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CONTAINER_RUNTIME_DIR": str(container_runtime_dir),
+                    "TMPDIR": stale_tmpdir,
+                }
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    "\n".join((preamble[0], preamble[1], preamble[4], preamble[5]))
+                    + '\nprintf "%s\\n" "${TMPDIR}"\n',
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, (payload_name, index, result.stderr)
+            assert result.stdout.splitlines()[-1] == str(container_runtime_dir / "tmp")
 
         srun_count = script.count('"${SRUN[@]}"')
         assert script.count(tmpdir_assertion) == srun_count
         assert script.count(writable_assertion) == srun_count
+        assert script.count(container_diagnostic) == srun_count
         assert (
-            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR"
+            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS\n"
             in script
         )
         bootstrap_start = script.index("cutedsl_write_event runtime_bootstrap start")
@@ -663,7 +701,7 @@ def test_payloads_pin_sm100_transformer_engine_build_architecture() -> None:
             '"${UV_BIN}" sync --locked --extra mcore --group test --group dev'
         )
         assert (
-            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR"
+            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS"
             in script
         )
         assert script.count(assertion) == script.count('"${SRUN[@]}"')

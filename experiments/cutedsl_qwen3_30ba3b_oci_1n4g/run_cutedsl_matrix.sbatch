@@ -57,7 +57,7 @@ readonly REPLICATE_INDEX SUBMISSION_GROUP
 
 # CUTEDSL_RUNTIME_TMPDIR_START
 mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}/tmp"
-export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
+export TMPDIR="${HOST_RUNTIME_DIR}/tmp"
 # CUTEDSL_RUNTIME_TMPDIR_END
 export CUTEDSL_EVENT_CLUSTER="${CUTEDSL_PROFILE_NAME}"
 export CUTEDSL_EVENT_JOB_ID="${SLURM_JOB_ID}"
@@ -240,7 +240,7 @@ SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
-    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS,TMPDIR
+    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -258,11 +258,14 @@ echo "[INFO] Bootstrapping the locked node-local environment and validating matc
 cutedsl_write_event runtime_bootstrap start '' \
     "Create locked run-local Python environment" uv_lock_check.log
 "${SRUN[@]}" bash -s <<'BASH'
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-cd "${CONTAINER_REPO_ROOT}"
-[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
+printf '[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n' \
+    "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
+cd "${CONTAINER_REPO_ROOT}"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 [[ "$("${UV_BIN}" --version)" == "uv ${UV_VERSION} "* ]]
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
@@ -439,10 +442,13 @@ echo "[INFO] Running timing-only arms without profiling instrumentation."
 cutedsl_write_event timing start '' \
     "Run matched CuTeDSL ON/OFF timing arms" timing_summary.json
 "${SRUN[@]}" bash -s <<'BASH'
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-cd "${CONTAINER_REPO_ROOT}"
+printf '[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n' \
+    "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
+cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
@@ -765,10 +771,13 @@ if [[ "${PROFILE_ENABLED}" == "1" ]]; then
         "Run separate profiling-only ON/OFF arms" profiles
     echo "[INFO] Timing is complete; running separate profiling-only arms."
     "${SRUN[@]}" bash -s <<'BASH'
+export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-cd "${CONTAINER_REPO_ROOT}"
+printf '[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n' \
+    "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
+cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]

@@ -14,7 +14,6 @@ from typing import Any
 
 import pytest
 
-
 EXPERIMENT_DIR = Path(__file__).parents[1] / "experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
 RENDERER_PATH = EXPERIMENT_DIR / "render_cutedsl_report.py"
 EVENTS_PATH = EXPERIMENT_DIR / "lib/events.sh"
@@ -477,6 +476,12 @@ def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:
     assert "<script src=" not in index
     assert isinstance(incidents, list)
     assert run_index.startswith("run_id\treport_path\tstatus\tcluster\tfeature_cell\n")
+    incident_text = json.dumps(incidents, sort_keys=True)
+    for job_id in ("1910599", "1911208"):
+        assert job_id in incident_text
+        assert job_id in index
+    assert "stale login-image TMPDIR" in incident_text
+    assert "/runtime/tmp" in incident_text
 
 
 def test_report_redacts_known_credentials_from_all_displayed_inputs(

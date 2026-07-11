@@ -1,1 +1,32 @@
-[]
+[
+  {
+    "cluster": "aws_dfw",
+    "evidence": "Job 1910599 on nvl72d022-T13 reached the runtime-bootstrap announcement, then task 0 exited 1 before any curl or uv output; elapsed time was 00:02:23.",
+    "fix_commit": "post-login TMPDIR namespace-split commit",
+    "hypothesis": "The container runtime did not receive a valid writable temporary directory.",
+    "report_path": "",
+    "reproduction": "Submit the functional wrapper on aws_dfw with the login image's stale TMPDIR environment.",
+    "root_cause": "Diagnostic job 1911208 showed that bash -lc restored a stale login-image TMPDIR after the /runtime mount was established.",
+    "run_id": "1910599",
+    "symptom": "Functional job failed silently at runtime_bootstrap before curl.",
+    "tested_change": "Instrument the host/Pyxis/login-shell boundary and verify the /runtime mount independently of TMPDIR.",
+    "timestamp_utc": "2026-07-11T23:01:05Z",
+    "verification_evidence": "Job 1911208 isolated the post-login environment overwrite; the production fix still requires a new remote verification job.",
+    "verification_job": "1911208 (diagnostic)"
+  },
+  {
+    "cluster": "aws_dfw",
+    "evidence": "Job 1911208 on nvl72d042-T04 found /runtime/tmp mounted from local NVMe, root:root mode 755 and writable as uid 0, while bash -lc observed TMPDIR=/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_post/users/sna/tmp; equality with /runtime/tmp failed and touching the stale path returned ENOENT.",
+    "fix_commit": "post-login TMPDIR namespace-split commit",
+    "hypothesis": "Pyxis propagation alone could override the image's stale temporary-directory value.",
+    "report_path": "",
+    "reproduction": "Start the aws_dfw Pyxis image with host TMPDIR=/runtime/tmp and inspect TMPDIR inside bash -lc.",
+    "root_cause": "Login-image initialization overwrote TMPDIR after Pyxis environment setup; the mount and permissions were not the failure.",
+    "run_id": "1911208",
+    "symptom": "A valid /runtime/tmp mount existed, but the login shell selected a nonexistent Lustre TMPDIR.",
+    "tested_change": "Keep host TMPDIR at the host runtime path, stop propagating TMPDIR through Pyxis, and export /runtime/tmp as the first command inside every container shell.",
+    "timestamp_utc": "2026-07-11T23:05:41Z",
+    "verification_evidence": "Job 1911208 proved the boundary diagnosis; host regression tests simulate the stale post-login value, while remote verification remains pending.",
+    "verification_job": "pending"
+  }
+]
