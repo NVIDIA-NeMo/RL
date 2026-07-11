@@ -24,6 +24,9 @@
 
 set -eoux pipefail
 
+# Record job-start epoch so Python can measure pre-Python overhead
+export NRL_JOB_START_EPOCH=$(date +%s.%N)
+
 ########################################################
 # Function to detect if SLURM cluster uses GRES
 ########################################################
@@ -49,33 +52,34 @@ maybe_gres_arg() {
 # Function to detect the number of CPUs per node from SLURM
 ########################################################
 detect_cpus_per_node() {
-  # Query SLURM for the total number of CPUs (CPUTot) on every allocated node.
-  # With --exclusive whole-node allocations (the default for this script) this
-  # is the full CPU count of the node, which is what we want to claim per worker
-  # so Ray sees every CPU. We assert that all allocated nodes report the same
-  # CPUTot: a heterogeneous allocation breaks the single CPUS_PER_WORKER
-  # assumption and is treated as a user error. On any failure we exit (no
-  # heuristic fallback); set CPUS_PER_WORKER explicitly to override.
-  local node raw cpus expected_cpus=""
-  for node in $(scontrol show hostnames "$SLURM_JOB_NODELIST"); do
-    # Parse "CPUTot=<n>" out of the single-line (`-o`) node description using
-    # pure bash parameter expansion (no grep/awk pipeline) so we don't trip
-    # `set -e`/`pipefail` on a non-matching or short-circuited pipe.
-    raw=$(scontrol show node "$node" -o 2>/dev/null || true)
-    cpus=${raw#*CPUTot=}
-    cpus=${cpus%% *}
-    if ! [[ "$cpus" =~ ^[0-9]+$ ]] || [[ "$cpus" -le 0 ]]; then
-      echo "Error: Could not determine CPUTot for node '$node' from SLURM. Set CPUS_PER_WORKER explicitly to override." >&2
-      exit 1
-    fi
-    if [[ -z "$expected_cpus" ]]; then
-      expected_cpus=$cpus
-    elif [[ "$cpus" -ne "$expected_cpus" ]]; then
-      echo "Error: Heterogeneous CPU counts across allocated nodes (node '$node' reports CPUTot=$cpus but expected $expected_cpus). NeMo-RL assumes a homogeneous allocation; set CPUS_PER_WORKER explicitly to override." >&2
-      exit 1
-    fi
-  done
-  echo "$expected_cpus"
+  # Query SLURM for the total number of CPUs (CPUTot) on the first allocated
+  # node. With --exclusive whole-node allocations (the default for this script)
+  # this is the full CPU count of the node, which is what we want to claim per
+  # worker so Ray sees every CPU.
+  #
+  # ASSUMPTION: all allocated nodes have the same CPU count (homogeneous
+  # allocation), so reading a single node is sufficient. We deliberately do
+  # NOT query every node: each `scontrol show node` is an RPC to the SLURM
+  # controller, and issuing one per node across many jobs launched in a burst
+  # (e.g. CI) can overwhelm the controller. If your allocation is
+  # heterogeneous, set CPUS_PER_WORKER explicitly instead. On any failure we
+  # exit (no heuristic fallback); set CPUS_PER_WORKER explicitly to override.
+  local nodelist first_node raw cpus
+  # `scontrol show hostnames` expands the compressed nodelist string locally
+  # (no controller RPC). Take the first line with parameter expansion (no
+  # head/grep pipeline, to avoid `set -e`/`pipefail` foot-guns).
+  nodelist=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+  first_node=${nodelist%%$'\n'*}
+  # Parse "CPUTot=<n>" out of the single-line (`-o`) node description using
+  # pure bash parameter expansion.
+  raw=$(scontrol show node "$first_node" -o 2>/dev/null || true)
+  cpus=${raw#*CPUTot=}
+  cpus=${cpus%% *}
+  if ! [[ "$cpus" =~ ^[0-9]+$ ]] || [[ "$cpus" -le 0 ]]; then
+    echo "Error: Could not determine CPUTot for node '$first_node' from SLURM. Set CPUS_PER_WORKER explicitly to override." >&2
+    exit 1
+  fi
+  echo "$cpus"
 }
 
 ########################################################
@@ -88,19 +92,18 @@ COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If le
 SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
-NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
-OBJECT_MANAGER_PORT=${OBJECT_MANAGER_PORT:-53003}
-RUNTIME_ENV_AGENT_PORT=${RUNTIME_ENV_AGENT_PORT:-53005}
-DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
-METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
+NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
+OBJECT_MANAGER_PORT=${OBJECT_MANAGER_PORT:-1303}
+RUNTIME_ENV_AGENT_PORT=${RUNTIME_ENV_AGENT_PORT:-1305}
+DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-1307}
+METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-1309}
 
-# Ports for the head node
-# GCS head port and client server port -- kept below ephemeral range (32768-60999).
-PORT=${PORT:-9900}
-RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-9901}
+# Ports for the head node -- all below ephemeral floor (9000 on some GB200 nodes).
+PORT=${PORT:-1200}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-1201}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
-DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
+DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-1311}
 RAY_DEBUGGER_ARGS=
 if [ "${RAY_DEBUG:-}" = "legacy" ]; then
   RAY_DEBUGGER_ARGS="--ray-debugger-external"
@@ -121,22 +124,30 @@ elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
   echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
 fi
 
-# Worker port range must NOT overlap with the OS ephemeral range (32768-60999)
-# to prevent TOCTOU collisions.  Ray's Raylet uses a probe-and-release pattern
+# Worker port range must NOT overlap with the OS ephemeral range to prevent
+# TOCTOU collisions.  Ray's Raylet uses a probe-and-release pattern
 # (CheckPortFree) that can leave a window where the port is unguarded.
 # If the range overlaps with the ephemeral range, the kernel can assign the same
 # port as an ephemeral source port for outgoing TCP traffic during that window,
 # causing EADDRINUSE when the worker tries to bind.
 #
-# Port layout (all below ephemeral range):
-#   9900-9901    Ray GCS / client server (PORT, RAY_CLIENT_SERVER_PORT above)
-#   10002-11000  Ray worker gRPC (this setting)
-#   11001-15000  vLLM HTTP servers (policy.generation.port_range_low/high)
-#   15001-20000  NeMo Gym HTTP servers (env.nemo_gym.port_range_low/high)
-#   20001+       vLLM TP/DP rendezvous (VLLM_PORT env var, 100-port spacing per engine)
-#   25000-28000  Master address / TCPStore (cluster.master_port_range_low/high)
-MIN_WORKER_PORT=${MIN_WORKER_PORT:-10002}
-MAX_WORKER_PORT=${MAX_WORKER_PORT:-11000}
+# The ephemeral range is 9000-65000 on some DGX/GB200 nodes (32768-60999 on
+# stock Linux).  All service ports are pinned below 9000 to stay clear of even
+# the lowest observed ephemeral floor.
+#
+# Port layout (all below ephemeral floor at 9000):
+#   1200-1201    Ray GCS + client server (head only)
+#   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
+#   1400-1999    Master address / TCPStore (cluster.master_port_range_low/high)
+#   2000-2999    Ray worker gRPC (min/max-worker-port)
+#   3000-4999    NeMo RL generation HTTP servers (policy.generation.port_range_low/high)
+#   5000-5999    NeMo Gym HTTP servers (Gym global config port_range_low/high)
+#   6000         Sandbox Nginx (NEMO_SKILLS_SANDBOX_PORT)
+#   6001-6999    Sandbox uWSGI workers (SANDBOX_BASE_PORT)
+#   7000-8999    vLLM / SGLang engine rendezvous (VLLM_PORT in vllm_worker.py / SGLang base_port)
+#   8265         Ray Dashboard (DASHBOARD_PORT; reserved carve-out inside the 7000-8999 band)
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-2000}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
@@ -214,13 +225,13 @@ COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
 # explicitly, auto-detect it from SLURM so we claim every CPU the node actually
 # has (instead of the old GPUS_PER_NODE * 16 heuristic, which under-claims on
-# nodes with more cores). Detection exits with an error if it cannot determine a
-# single consistent CPU count; set CPUS_PER_WORKER explicitly to override.
+# nodes with more cores). Detection queries a single node and assumes a
+# homogeneous allocation; set CPUS_PER_WORKER explicitly to override.
 if [[ -n "${CPUS_PER_WORKER:-}" ]]; then
   echo "[INFO] Using user-provided CPUS_PER_WORKER=$CPUS_PER_WORKER."
 else
   CPUS_PER_WORKER=$(detect_cpus_per_node)
-  echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of allocated nodes)."
+  echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of first allocated node)."
 fi
 
 # ---------------------------------------------------------------------------
@@ -423,6 +434,34 @@ else
   fi
 fi
 
+# Write GPU→cpulist mapping for NUMA binding.
+# IMPORTANT: The env var name NRL_GPU_CPU_AFFINITY_FILE and default path must stay
+# in sync with GPU_CPU_AFFINITY_PATH in nemo_rl/distributed/numa_utils.py.
+export NRL_GPU_CPU_AFFINITY_FILE="/tmp/nrl_gpu_cpu_affinity"
+# nvidia-smi topo -m's CPU Affinity column is unreliable on GB200 (empty for
+# GPUs not directly attached to the socket). Use NUMA Affinity (always
+# populated, at field NF-1 since GPU NUMA ID is last) and look up the
+# node-local CPU list from sysfs. On GB200 the NUMA Affinity column can be a
+# list like "0,2-17" (the GPU-local CPU NUMA node plus the GPU's HBM NUMA
+# nodes); take the first entry, which is the local CPU NUMA node.
+nvidia-smi topo -m 2>/dev/null | awk '/^GPU[0-9]/ {
+  gpu = \$1; sub(/GPU/, "", gpu)
+  numa = \$(NF-1)
+  sub(/[,-].*/, "", numa)
+  if (numa ~ /^[0-9]+\$/) print gpu, numa
+}' | while read -r _gpu _numa; do
+  _cpulist=\$(cat "/sys/devices/system/node/node\${_numa}/cpulist" 2>/dev/null)
+  if [[ -n "\$_cpulist" ]]; then
+    echo "\${_gpu}:\${_cpulist}"
+  fi
+done > "\$NRL_GPU_CPU_AFFINITY_FILE" || true
+if [[ -s "\$NRL_GPU_CPU_AFFINITY_FILE" ]]; then
+  echo "NUMA affinity map written to \$NRL_GPU_CPU_AFFINITY_FILE:"
+  cat "\$NRL_GPU_CPU_AFFINITY_FILE"
+else
+  echo "WARNING: Could not generate NUMA affinity map (nvidia-smi topo unavailable)"
+fi
+
 # Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
 # IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
 # with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in
@@ -572,6 +611,8 @@ ray start --head \
     --dashboard-port=${DASHBOARD_PORT} \
     --dashboard-host="$head_node_ip" \
     --include-dashboard=True \
+    --min-worker-port=${MIN_WORKER_PORT} \
+    --max-worker-port=${MAX_WORKER_PORT} \
     \
     --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
     --object-manager-port=$((${OBJECT_MANAGER_PORT} + 1)) \
@@ -640,6 +681,10 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
     fi
     sleep 5
   done
+
+  # Record the wall-clock epoch when the Ray cluster became ready so the driver
+  # and training process can measure post-ready initialization timing.
+  export NRL_RAY_READY_EPOCH=\$(date +%s.%N)
 
   set +e
   bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
@@ -796,18 +841,19 @@ bash -n <(printf '%s' "$worker_cmd") || { echo "[FATAL] Worker script has syntax
 export SLURM_MASTER_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
 SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 
+SANDBOX_BASE_PORT="${SANDBOX_BASE_PORT:-6001}"
 if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
   SANDBOX_MOUNTS="$SANDBOX_PORTS_DIR:$SANDBOX_PORTS_DIR"
   if [[ -n "${SANDBOX_EXTRA_MOUNTS:-}" ]]; then
     SANDBOX_MOUNTS="${SANDBOX_EXTRA_MOUNTS},${SANDBOX_MOUNTS}"
   fi
 
-  SANDBOX_EXPORTS="ALL,SANDBOX_PORTS_DIR=$SANDBOX_PORTS_DIR"
+  SANDBOX_EXPORTS="ALL,SANDBOX_PORTS_DIR=$SANDBOX_PORTS_DIR,SANDBOX_WORKER_BASE_PORT=$SANDBOX_BASE_PORT,NGINX_PORT=$SANDBOX_PORT"
   if [[ -n "${SANDBOX_ENV_VARS:-}" ]]; then
     SANDBOX_EXPORTS="${SANDBOX_EXPORTS},${SANDBOX_ENV_VARS}"
   fi
 
-  echo "[INFO] Starting sandbox sidecars on all allocated nodes (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT)..."
+  echo "[INFO] Starting sandbox sidecars on all allocated nodes (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT, base_port=$SANDBOX_BASE_PORT)..."
   srun --output "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
     --error "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
     --container-image="$SANDBOX_CONTAINER" \

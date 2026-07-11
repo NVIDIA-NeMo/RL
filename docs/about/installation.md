@@ -8,7 +8,7 @@ Clone **NeMo RL** with submodules:
 git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
 
-# If you are already cloned without the recursive option, you can initialize the submodules recursively
+# If you have already cloned without the recursive option, you can initialize the submodules recursively
 git submodule update --init --recursive
 
 # Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
@@ -34,7 +34,7 @@ dpkg -l | grep cudnn.*cuda
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
-sudo apt install cudnn  # Will install cuDNN meta packages which points to the latest versions
+sudo apt install cudnn  # Will install cuDNN meta packages that point to the latest versions
 # sudo apt install cudnn9-cuda-13  # Will install cuDNN version 9.x.x compiled for cuda 13.x (CUDA 13 — current primary)
 # sudo apt install cudnn9-cuda-13-2  # Will install cuDNN version 9.x.x compiled for cuda 13.2 specifically
 ```

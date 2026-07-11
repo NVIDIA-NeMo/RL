@@ -91,17 +91,20 @@ def main():
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    rm_train(
-        policy,
-        train_dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        master_config,
-        logger,
-        checkpointer,
-        rm_save_state,
-    )
+    # The checkpointer owns background async-checkpoint finalization threads;
+    # the context manager guarantees they are flushed (rename + delete) on exit.
+    with checkpointer:
+        rm_train(
+            policy,
+            train_dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            master_config,
+            logger,
+            checkpointer,
+            rm_save_state,
+        )
 
 
 if __name__ == "__main__":

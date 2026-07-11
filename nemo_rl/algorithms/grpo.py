@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import json
 import os
 import time
 import warnings
@@ -54,6 +55,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
+    print_efficiency_summary,
     print_performance_metrics,
     set_seed,
 )
@@ -1841,12 +1843,49 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
+    """Whether NeMo Gym is responsible for full response logging (wandb/metrics paths).
+
+    When **True**, we **skip** the expensive per-step ``train_data_step*.jsonl`` dump and
+    **keep** ``full_result``-style keys in rollout metrics (large payloads).
+
+    When **False** (default if unset), we **strip** ``full_result`` from rollout metrics and
+    **write** the ``train_data_step*.jsonl`` file (can be very large for Gym).
+
+    Set via ``env.should_log_nemo_gym_responses`` in the master config.
+    """
     env_config = master_config.env
     should_log_nemo_gym_responses = bool(
         env_config.get("should_log_nemo_gym_responses")
     )
 
     return should_log_nemo_gym_responses
+
+
+def _write_latest_checkpoint_status(
+    checkpointer: CheckpointManager, last_checkpoint_step: int
+) -> None:
+    """Write a lightweight, top-level ``latest_checkpoint_status.json`` for monitoring.
+
+    Records the wall-clock time and step of the most recent successful checkpoint
+    save so an out-of-band watchdog can poll checkpoint progress on long runs.
+
+    Intentionally distinct from ``CheckpointManager``'s per-step
+    ``step_{N}/training_info.json`` (the resume state): different schema, written
+    at the checkpoint-dir root. There is no in-repo consumer yet. The read is
+    deliberately unguarded so a corrupt file surfaces loudly (signalling
+    corruption) instead of being silently masked.
+    """
+    status_path = os.path.join(
+        str(checkpointer.checkpoint_dir), "latest_checkpoint_status.json"
+    )
+    status: dict[str, Any] = {}
+    if os.path.exists(status_path):
+        with open(status_path) as f:
+            status = json.load(f)
+    status["last_successful_ckpt_save_completion"] = time.time()
+    status["last_checkpoint_step"] = last_checkpoint_step
+    with open(status_path, "w") as f:
+        json.dump(status, f)
 
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
@@ -2254,7 +2293,7 @@ def grpo_train(
     master_config: MasterConfig,
 ) -> None:
     """Run GRPO training algorithm."""
-    timer = Timer()
+    timer = Timer(context={"worker": "driver"})
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -3039,6 +3078,10 @@ def grpo_train(
                             ]
 
                     with timer.time("checkpointing"):
+                        # Finalize the previous (possibly async) checkpoint before
+                        # starting a new one. No-op with sync save / nothing pending.
+                        checkpointer.finalize_pending()
+
                         print(
                             f"Saving checkpoint for step {total_steps + 1}...",
                             flush=True,
@@ -3077,7 +3120,22 @@ def grpo_train(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # Finalize in the background. The directory rename is
+                        # deferred until any async write completes (via wait_fn);
+                        # with sync save it renames immediately. Finalization is
+                        # flushed at the next save (finalize_pending) or on exit
+                        # (shutdown).
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
+
+                        # Record last-successful-checkpoint time/step for external
+                        # monitoring (parity with async_grpo_train; see
+                        # _write_latest_checkpoint_status).
+                        _write_latest_checkpoint_status(
+                            checkpointer, last_checkpoint_step=total_steps + 1
+                        )
 
             # Logging
             # Log training data
@@ -3234,10 +3292,12 @@ def grpo_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -3247,6 +3307,13 @@ def grpo_train(
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread would be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
 
 
 def validate(
@@ -3266,7 +3333,7 @@ def validate(
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
-    timer = Timer()
+    timer = Timer(context={"worker": "validator"})
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
@@ -3432,6 +3499,14 @@ def aggregate_rollout_metrics(
             aggregated[k] = max(v)
         elif k == "total_turns":
             aggregated[k] = sum(v)
+        elif k == "trajectory_duration_s":
+            sorted_v = sorted(v)
+            p95_idx = min(int(len(sorted_v) * 0.95), len(sorted_v) - 1)
+            aggregated[k] = sum(v) / len(v)
+            aggregated["trajectory_duration_s/max"] = max(v)
+            aggregated["trajectory_duration_s/p95"] = (
+                sorted_v[p95_idx] if sorted_v else 0
+            )
         else:
             aggregated[k] = sum(v) / len(v)
     return aggregated
@@ -3505,7 +3580,8 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
-    timer = Timer()
+    timer = Timer(context={"worker": "driver"})
+    training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -3727,6 +3803,7 @@ def async_grpo_train(
     print(
         f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
+    timer.start("init/total")
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -3755,9 +3832,26 @@ def async_grpo_train(
                 f"trajectories for step {step}"
             )
 
+        collector_status = ray.get(trajectory_collector.get_status.remote())
+        if (
+            (
+                collector_status["data_exhausted"]
+                or collector_status.get("errored", False)
+            )
+            and not collector_status["running"]
+            and collector_status["inflight_workers"] == 0
+        ):
+            raise RuntimeError(
+                f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
+                f"The dataset ran out of data before training could start. "
+                f"Collector status: {collector_status}. "
+                f"Increase data.train.max_num_epochs or use a larger dataset."
+            )
+
         wait_iterations += 1
         time.sleep(1.0)
 
+    timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     # Main training loop
@@ -3813,8 +3907,52 @@ def async_grpo_train(
                             print(
                                 f"   Trajectory versions in buffer: {buffer_debug['trajectory_versions']}"
                             )
+                            diag = buffer_debug.get("starvation_diagnostics")
+                            if diag:
+                                print(
+                                    "   📊 Buffer starvation diagnostics (long-tail root cause):"
+                                )
+                                print(
+                                    f"      trajectory_duration_s: mean={diag['trajectory_duration_s']['mean']:.1f}s, "
+                                    f"median={diag['trajectory_duration_s']['median']:.1f}s, "
+                                    f"max={diag['trajectory_duration_s']['max']:.1f}s, "
+                                    f"p95={diag['trajectory_duration_s']['p95']:.1f}s"
+                                )
+                                print(
+                                    f"      max_gen_tokens_per_turn: mean={diag['max_gen_tokens_per_turn_in_buffer']['mean']:.0f}, "
+                                    f"median={diag['max_gen_tokens_per_turn_in_buffer']['median']:.0f}, "
+                                    f"max={diag['max_gen_tokens_per_turn_in_buffer']['max']:.0f}, "
+                                    f"p95={diag['max_gen_tokens_per_turn_in_buffer']['p95']:.0f} "
+                                    "(high = long single generations per turn)"
+                                )
+                                print(
+                                    f"      turns_per_sample: mean={diag['turns_per_sample_in_buffer']['mean']:.1f}, "
+                                    f"median={diag['turns_per_sample_in_buffer']['median']:.1f}, "
+                                    f"max={diag['turns_per_sample_in_buffer']['max']:.0f}, "
+                                    f"p95={diag['turns_per_sample_in_buffer']['p95']:.1f} "
+                                    "(high = many turns per trajectory)"
+                                )
 
-                        time.sleep(0.5)
+                        collector_status = ray.get(
+                            trajectory_collector.get_status.remote()
+                        )
+                        if (
+                            (
+                                collector_status["data_exhausted"]
+                                or collector_status.get("errored", False)
+                            )
+                            and not collector_status["running"]
+                            and collector_status["inflight_workers"] == 0
+                        ):
+                            raise RuntimeError(
+                                f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
+                                f"The dataset ran out of data before training could complete. "
+                                f"Collector status: {collector_status}. "
+                                f"Increase data.train.max_num_epochs or use a larger dataset."
+                            )
+
+                        with timer.time("idle/buffer_starvation"):
+                            time.sleep(0.5)
                         continue
 
                     # Extract trajectories and metadata from sample result
@@ -4087,6 +4225,8 @@ def async_grpo_train(
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
                 if NEED_REFIT:
+                    timer.start("idle/refit_bubble")
+
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
@@ -4114,6 +4254,8 @@ def async_grpo_train(
                         trajectory_collector.set_weight_version.remote(weight_version)
                         trajectory_collector.resume_after_refit.remote()
 
+                    timer.stop("idle/refit_bubble")
+
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
                     policy_generation.clear_logger_metrics()
@@ -4126,39 +4268,40 @@ def async_grpo_train(
                 if (val_period > 0 and (step + 1) % val_period == 0) or (
                     val_at_end and is_last_step
                 ):
-                    # Pause trajectory collection during validation to reduce memory pressure
-                    trajectory_collector.pause.remote()
+                    with timer.time("idle/validation"):
+                        # Pause trajectory collection during validation to reduce memory pressure
+                        trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                policy, policy_generation, colocated_inference
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            policy_generation.prepare_for_generation()
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=step + 1,
+                            master_config=master_config,
+                            logger=logger,
                         )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=step + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
-                    policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, step + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        policy_generation.finish_generation()
+                        logger.log_metrics(
+                            validation_timings, step + 1, prefix="timing/validation"
+                        )
+                        logger.log_metrics(val_metrics, step + 1, prefix="validation")
 
-                    # Explicit GPU memory cleanup after validation in async mode
-                    import gc
+                        # Explicit GPU memory cleanup after validation in async mode
+                        import gc
 
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
-                    # Resume trajectory collection after validation
-                    trajectory_collector.resume.remote()
+                        # Resume trajectory collection after validation
+                        trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -4281,6 +4424,10 @@ def async_grpo_train(
                             ]
 
                     with timer.time("checkpointing"):
+                        # Finalize the previous (possibly async) checkpoint before
+                        # starting a new one. No-op with sync save / nothing pending.
+                        checkpointer.finalize_pending()
+
                         print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             step + 1, grpo_save_state, master_config
@@ -4317,29 +4464,47 @@ def async_grpo_train(
                             "✅ Saved replay buffer with "
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # Defer the directory rename until any async write
+                        # completes; flushed at the next save or on training exit.
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
+
+                        # Record last-successful-checkpoint time/step for external
+                        # monitoring (see _write_latest_checkpoint_status).
+                        _write_latest_checkpoint_status(
+                            checkpointer, last_checkpoint_step=step + 1
+                        )
 
             # Logging
-            # Log training data (match sync GRPO logging payload for parity)
-            log_data = {}
-            if "agent_ref" in repeated_batch:
-                log_data["agent_ref"] = repeated_batch["agent_ref"]
-            log_data["content"] = flat_messages_content
-            log_data["rewards"] = rewards.tolist()
-            if master_config.grpo["use_dynamic_sampling"]:
-                # In dynamic sampling, `rewards` corresponds to filtered rewards
-                log_data["filtered_rewards"] = rewards.tolist()
-                log_data["rewards"] = repeated_batch["total_reward"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
-            log_data["token_ids"] = train_data["input_ids"].tolist()
-            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-            log_data["advantages"] = train_data["advantages"].tolist()
-            log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
-            log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
+            # Log training data (match sync GRPO logging payload for parity).
+            # NeMo Gym responses can be very large and expensive to log; when
+            # env.should_log_nemo_gym_responses is true, skip this jsonl (see
+            # _should_log_nemo_gym_responses).
+            if not _should_log_nemo_gym_responses(master_config):
+                log_data = {}
+                if "agent_ref" in repeated_batch:
+                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = flat_messages_content
+                log_data["rewards"] = rewards.tolist()
+                if master_config.grpo["use_dynamic_sampling"]:
+                    # In dynamic sampling, `rewards` corresponds to filtered rewards
+                    log_data["filtered_rewards"] = rewards.tolist()
+                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
+                log_data["input_lengths"] = input_lengths.tolist()
+                log_data["token_ids"] = train_data["input_ids"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["advantages"] = train_data["advantages"].tolist()
+                log_data["generation_logprobs"] = train_data[
+                    "generation_logprobs"
+                ].tolist()
+                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
+                del log_data
             del train_data
             del flat_messages_content
 
@@ -4411,8 +4576,31 @@ def async_grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
+            collector_efficiency = ray.get(
+                trajectory_collector.get_efficiency_metrics.remote()
+            )
+            driver_efficiency = {
+                cat: timer.reduce(cat, "sum")
+                for cat in [
+                    "init/total",
+                    "idle/buffer_starvation",
+                    "idle/refit_bubble",
+                    "idle/validation",
+                ]
+                if cat in timer._timers
+            }
+            merged_efficiency = {**driver_efficiency}
+            for cat, dur in collector_efficiency.items():
+                merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur
+
+            total_wall_time = time.perf_counter() - training_wall_start
+            efficiency_loggable = print_efficiency_summary(
+                merged_efficiency, total_wall_time, step + 1
+            )
+
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
+            logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(
                 timing_metrics,
@@ -4424,9 +4612,11 @@ def async_grpo_train(
             timer.reset()
             step += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if step >= master_config.grpo["max_num_steps"]:
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -4440,6 +4630,12 @@ def async_grpo_train(
         traceback.print_exc()
 
     finally:
+        # Finalize any pending async checkpoint before tearing down workers.
+        try:
+            checkpointer.shutdown()
+        except Exception as e:
+            print(f"Error finalizing pending checkpoint: {e}")
+
         # Clean up
         print("🛑 Stopping trajectory collection...")
         try:
