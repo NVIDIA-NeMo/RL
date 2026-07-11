@@ -210,3 +210,13 @@ def test_readme_matches_enforced_gate_and_requeue_paths() -> None:
     for fragment in required_fragments:
         assert fragment in README, fragment
     assert "direct tensor equality" not in README.lower()
+
+
+def test_wrapper_and_readme_pin_refreshed_immutable_nightly() -> None:
+    image = (
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/"
+        "containers/nemo_rl_nightly_20260711_4677250.sqsh"
+    )
+    assert f'readonly IMAGE="{image}"' in SCRIPT
+    assert f"`{image}`" in README
+    assert "af1d2ca2a7b169aa13be4b129a0fad8e206c63576d4941b00ae312bd65d0f3e1" in README

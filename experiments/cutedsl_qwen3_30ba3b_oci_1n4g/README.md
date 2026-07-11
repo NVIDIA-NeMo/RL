@@ -10,13 +10,14 @@ This experiment is the first Linux/GB200 gate for the CuTeDSL fused grouped-MLP 
 | Partition | `batch` |
 | Allocation | 1 node, `--gres=gpu:4` |
 | Expected GPU | 4x GB200 |
-| Image used first | `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly_20260707.sqsh` |
+| Image | `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly_20260711_4677250.sqsh` |
+| Image SHA256 | `af1d2ca2a7b169aa13be4b129a0fad8e206c63576d4941b00ae312bd65d0f3e1` |
 | Recipe | `examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl.yaml` |
 | GRPO steps | 3 |
 | Profiler | Megatron policy worker, step range `2:3` |
 | MXFP8 rollout/refit parity | `max(train/gen_kl_error) < 0.05`; `max(train/token_mult_prob_error) < 2.0` |
 
-The wrapper does not accept a container override. If the pinned image has a confirmed runtime failure, stage a new immutable nightly through the container-staging workflow, commit the new provenance, and only then change the wrapper. Do not overwrite the dated image.
+The wrapper does not accept a container override. The pinned nightly was staged by job `4677250`. Its baked environment is older than this branch, so the wrapper creates a locked Python 3.13.13 MCore environment in node-local storage before validation. If that compatibility build fails, classify it separately from policy-training failures. Do not overwrite the dated image.
 
 ## Preflight and scheduling check
 

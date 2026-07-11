@@ -28,7 +28,7 @@
 
 set -euo pipefail
 
-readonly IMAGE="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly_20260707.sqsh"
+readonly IMAGE="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/nemo_rl_nightly_20260711_4677250.sqsh"
 readonly RECIPE="examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl.yaml"
 readonly CONTAINER_REPO_ROOT="/workspace/nemo-rl"
 readonly CONTAINER_RESULT_DIR="/results"
