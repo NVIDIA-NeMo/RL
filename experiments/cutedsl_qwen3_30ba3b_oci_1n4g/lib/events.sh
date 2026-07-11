@@ -62,8 +62,34 @@ cutedsl_events_init() {
     mkdir -p "${result_dir}"
     CUTEDSL_EVENTS_FILE="${result_dir}/events.jsonl"
     export CUTEDSL_EVENTS_FILE
+    unset CUTEDSL_FINALIZATION_STARTED CUTEDSL_TERMINATING_SIGNAL
     rm -f "${result_dir}/status.json" "${result_dir}/report.html"
     : > "${CUTEDSL_EVENTS_FILE}"
+}
+
+_cutedsl_exit_for_signal() {
+    local exit_code="${1:?signal exit code is required}"
+    local signal_name="${2:?signal name is required}"
+    CUTEDSL_TERMINATING_SIGNAL="${signal_name}"
+    export CUTEDSL_TERMINATING_SIGNAL
+    trap '' TERM INT
+    exit "${exit_code}"
+}
+
+cutedsl_install_signal_traps() {
+    trap '_cutedsl_exit_for_signal 143 TERM' TERM
+    trap '_cutedsl_exit_for_signal 130 INT' INT
+}
+
+cutedsl_begin_finalization() {
+    if [[ "${CUTEDSL_FINALIZATION_STARTED:-0}" == "1" ]]; then
+        return 1
+    fi
+    CUTEDSL_FINALIZATION_STARTED=1
+    export CUTEDSL_FINALIZATION_STARTED
+    trap - EXIT
+    trap '' TERM INT
+    return 0
 }
 
 cutedsl_write_event() {
@@ -190,11 +216,16 @@ cutedsl_finalize_run() {
     local renderer="${3:?cutedsl_finalize_run requires the renderer path}"
     local renderer_exit_code=0
     local final_exit_code=${original_exit_code}
+    local failure_symptom="Run exited with code ${original_exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}"
+
+    if [[ -n "${CUTEDSL_TERMINATING_SIGNAL:-}" ]]; then
+        failure_symptom="Run received SIG${CUTEDSL_TERMINATING_SIGNAL} and exited with code ${original_exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}"
+    fi
 
     if [[ ${original_exit_code} -ne 0 ]] && \
         ! grep -Fq '"phase":"root_cause"' "${CUTEDSL_EVENTS_FILE}"; then
         cutedsl_write_root_cause \
-            "Run exited with code ${original_exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}" \
+            "${failure_symptom}" \
             "${CUTEDSL_CURRENT_ARTIFACT:-slurm.out}" \
             "Pending investigation" "pending" "pending" \
             "Pending reproduction" "Pending hypothesis" "Pending tested change" \

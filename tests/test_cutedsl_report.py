@@ -3,8 +3,10 @@
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from html.parser import HTMLParser
 from pathlib import Path
 from types import ModuleType
@@ -350,10 +352,73 @@ def test_payload_exit_handlers_always_render_without_masking_exit_code() -> None
         assert "cutedsl_events_init" in script
         assert 'cutedsl_finalize_run "${exit_code}"' in script
         assert '"${EXPERIMENT_DIR}/render_cutedsl_report.py"' in script
-        assert 'return "${final_exit_code}"' in script
+        assert "cutedsl_begin_finalization" in script
+        assert 'exit "${final_exit_code}"' in script
+        assert "cutedsl_install_signal_traps" in script
         assert script.index("trap on_exit EXIT") < script.index(
             'if [[ ! -r "${IMAGE}" ]]'
         )
+
+
+@pytest.mark.parametrize(
+    ("signal_name", "signal_number", "expected_exit"),
+    [("TERM", signal.SIGTERM, 143), ("INT", signal.SIGINT, 130)],
+)
+def test_signal_finalization_records_nonzero_failure_once(
+    tmp_path: Path,
+    signal_name: str,
+    signal_number: signal.Signals,
+    expected_exit: int,
+) -> None:
+    result_dir = tmp_path / signal_name.lower()
+    ready_file = tmp_path / f"{signal_name.lower()}.ready"
+    command = f"""
+set -euo pipefail
+RESULT_DIR={result_dir!s}
+RUN_ID=signal-{signal_name.lower()}
+SLURM_JOB_ID=2361608
+EXPERIMENT_DIR={EXPERIMENT_DIR!s}
+export RESULT_DIR RUN_ID SLURM_JOB_ID
+source {EVENTS_PATH!s}
+export CUTEDSL_EVENT_CLUSTER=pre_tyche CUTEDSL_EVENT_JOB_ID="$SLURM_JOB_ID"
+cutedsl_events_init "$RESULT_DIR"
+on_exit() {{
+    local exit_code=$?
+    if ! cutedsl_begin_finalization; then
+        return "$exit_code"
+    fi
+    set +e
+    cutedsl_finalize_run "$exit_code" "signal harness finished" \
+        "$EXPERIMENT_DIR/render_cutedsl_report.py"
+    local final_exit_code=$?
+    exit "$final_exit_code"
+}}
+trap on_exit EXIT
+cutedsl_install_signal_traps
+cutedsl_write_event runtime_bootstrap start '' 'signal boundary' slurm.out
+printf ready > {ready_file!s}
+while :; do sleep 0.1; done
+"""
+    process = subprocess.Popen(["bash", "-c", command])
+    deadline = time.monotonic() + 5
+    while not ready_file.exists() and process.poll() is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert process.poll() is None
+    os.kill(process.pid, signal_number)
+    assert process.wait(timeout=10) == expected_exit
+
+    status = json.loads((result_dir / "status.json").read_text())
+    events = [
+        json.loads(line)
+        for line in (result_dir / "events.jsonl").read_text().splitlines()
+    ]
+    assert status["exit_code"] == expected_exit
+    complete_events = [event for event in events if event["phase"] == "complete"]
+    assert len(complete_events) == 1
+    assert complete_events[0]["status"] == "fail"
+    assert complete_events[0]["exit_code"] == expected_exit
+    assert len([event for event in events if event["phase"] == "root_cause"]) == 1
 
 
 def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:

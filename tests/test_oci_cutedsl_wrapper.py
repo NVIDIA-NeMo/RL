@@ -186,10 +186,12 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
     image_env = {
         "VIRTUAL_ENV": "/opt/nemo_rl_venv",
         "UV_PROJECT_ENVIRONMENT": "/opt/nemo_rl_venv",
+        "NVTE_CUDA_ARCHS": "75;80;89;90;100;103;120",
     }
     host_env = {
         "VIRTUAL_ENV": "/runtime/venv",
         "UV_PROJECT_ENVIRONMENT": "/runtime/venv",
+        "NVTE_CUDA_ARCHS": "100",
     }
 
     def pyxis_container_env(script: str) -> dict[str, str]:
@@ -201,7 +203,9 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
         return resolved
 
     for script in (SCRIPT, BENCHMARK_SCRIPT):
-        expected_option = "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT"
+        expected_option = (
+            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS"
+        )
         assert script.count(expected_option) == 1
         assert not re.search(
             r"^\s*--container-env=VIRTUAL_ENV\s*$", script, re.MULTILINE
@@ -209,6 +213,7 @@ def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
         resolved = pyxis_container_env(script)
         assert resolved["VIRTUAL_ENV"] == "/runtime/venv"
         assert resolved["UV_PROJECT_ENVIRONMENT"] == "/runtime/venv"
+        assert resolved["NVTE_CUDA_ARCHS"] == "100"
 
 
 def test_runtime_diagnostics_precede_each_srun_environment_assertion() -> None:
@@ -255,6 +260,27 @@ def test_runtime_diagnostics_precede_each_srun_environment_assertion() -> None:
                 strict=True,
             )
         )
+
+
+def test_payloads_pin_sm100_transformer_engine_build_architecture() -> None:
+    for script in (SCRIPT, BENCHMARK_SCRIPT):
+        export = 'export NVTE_CUDA_ARCHS="100"'
+        assertion = '[[ "${NVTE_CUDA_ARCHS}" == "100" ]]'
+        assert script.count(export) == 1
+        assert script.index(export) < script.index(
+            '"${UV_BIN}" sync --locked --extra mcore --group test --group dev'
+        )
+        assert (
+            "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS"
+            in script
+        )
+        assert script.count(assertion) == script.count('"${SRUN[@]}"')
+        assert "Runtime build environment: NVTE_CUDA_ARCHS=%s" in script
+        assert "TORCH_CUDA_ARCH_LIST" not in script
+        assert "CMAKE_CUDA_ARCHITECTURES" not in script
+
+    assert '"nvte_cuda_archs": os.environ["NVTE_CUDA_ARCHS"]' in SCRIPT
+    assert '"NVTE_CUDA_ARCHS": os.environ["NVTE_CUDA_ARCHS"]' in BENCHMARK_SCRIPT
 
 
 def test_wrapper_keeps_high_churn_runtime_off_lustre_across_srun_steps() -> None:

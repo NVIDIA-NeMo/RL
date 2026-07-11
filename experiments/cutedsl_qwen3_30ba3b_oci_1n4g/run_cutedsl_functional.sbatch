@@ -64,20 +64,26 @@ if [[ -x "${RUNTIME_PYTHON-}" ]]; then
 fi
 printf '[INFO] Runtime versions: uv=%s python=%s\n' "${runtime_uv_version}" "${runtime_python_version}"
 printf '[INFO] Runtime Python: realpath=%s prefix=%s\n' "${runtime_python_realpath}" "${runtime_python_prefix}"
+printf '[INFO] Runtime build environment: NVTE_CUDA_ARCHS=%s\n' \
+    "${NVTE_CUDA_ARCHS-<unset>}"
 unset runtime_uv_version runtime_python_version runtime_python_realpath runtime_python_prefix
 BASH
 exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
 
 on_exit() {
     local exit_code=$?
+    if ! cutedsl_begin_finalization; then
+        return "${exit_code}"
+    fi
     set +e
     cutedsl_finalize_run "${exit_code}" "Functional payload finished" \
         "${EXPERIMENT_DIR}/render_cutedsl_report.py"
     local final_exit_code=$?
     rm -rf --one-file-system -- "${HOST_RUNTIME_DIR}"
-    return "${final_exit_code}"
+    exit "${final_exit_code}"
 }
 trap on_exit EXIT
+cutedsl_install_signal_traps
 
 cutedsl_write_event preflight start '' "Validate immutable source and image" slurm.out
 cutedsl_write_event image_hash start '' "Verify immutable container SHA256" image.sha256
@@ -153,6 +159,7 @@ readonly -a GRPO_OVERRIDES=(
 printf '%s\n' "${GRPO_OVERRIDES[@]}" > "${RESULT_DIR}/grpo_overrides.txt"
 
 export CUDA_HOME="/usr/local/cuda"
+export NVTE_CUDA_ARCHS="100"
 export NEMO_RL_VENV_DIR="${CONTAINER_RUNTIME_DIR}/worker_venvs"
 export NRL_FORCE_REBUILD_VENVS="true"
 export NRL_IGNORE_VERSION_MISMATCH="1"
@@ -188,7 +195,7 @@ SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
-    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT
+    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -209,6 +216,7 @@ cutedsl_write_event runtime_bootstrap start '' \
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 [[ "$("${UV_BIN}" --version)" == "uv ${UV_VERSION} "* ]]
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
@@ -300,6 +308,7 @@ metadata = {
         "sha256": os.environ["CUTEDSL_GATE_IMAGE_SHA256"],
     },
     "runtime": {
+        "nvte_cuda_archs": os.environ["NVTE_CUDA_ARCHS"],
         "platform": platform.platform(),
         "machine": platform.machine(),
         "python": sys.version,
@@ -353,6 +362,7 @@ cutedsl_write_event focused_tests start '' \
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
@@ -404,6 +414,7 @@ cutedsl_write_event gpu_smoke start '' \
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
@@ -420,6 +431,7 @@ echo "[INFO] Running the four-GPU PyTorch and Transformer Engine device smoke."
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
@@ -471,6 +483,7 @@ cutedsl_write_event functional_grpo start '' \
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')

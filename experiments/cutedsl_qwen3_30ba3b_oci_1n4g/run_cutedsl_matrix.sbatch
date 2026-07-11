@@ -63,14 +63,18 @@ exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
 
 on_exit() {
     local exit_code=$?
+    if ! cutedsl_begin_finalization; then
+        return "${exit_code}"
+    fi
     set +e
     cutedsl_finalize_run "${exit_code}" "Benchmark payload finished" \
         "${EXPERIMENT_DIR}/render_cutedsl_report.py"
     local final_exit_code=$?
     rm -rf --one-file-system -- "${HOST_RUNTIME_DIR}"
-    return "${final_exit_code}"
+    exit "${final_exit_code}"
 }
 trap on_exit EXIT
+cutedsl_install_signal_traps
 
 cutedsl_write_event preflight start '' "Validate benchmark controls, source, and image" slurm.out
 
@@ -135,6 +139,8 @@ if [[ -x "${RUNTIME_PYTHON-}" ]]; then
 fi
 printf '[INFO] Runtime versions: uv=%s python=%s\n' "${runtime_uv_version}" "${runtime_python_version}"
 printf '[INFO] Runtime Python: realpath=%s prefix=%s\n' "${runtime_python_realpath}" "${runtime_python_prefix}"
+printf '[INFO] Runtime build environment: NVTE_CUDA_ARCHS=%s\n' \
+    "${NVTE_CUDA_ARCHS-<unset>}"
 unset runtime_uv_version runtime_python_version runtime_python_realpath runtime_python_prefix
 BASH
 
@@ -205,6 +211,7 @@ printf '%s\n' "${COMMON_OVERRIDES[@]}" > "${RESULT_DIR}/common_overrides.txt"
 printf '%s\n' "${timing_arms[@]}" > "${RESULT_DIR}/timing_order.txt"
 
 export CUDA_HOME="/usr/local/cuda"
+export NVTE_CUDA_ARCHS="100"
 export NEMO_RL_VENV_DIR="${CONTAINER_RUNTIME_DIR}/worker_venvs"
 export NRL_FORCE_REBUILD_VENVS="true"
 export NRL_IGNORE_VERSION_MISMATCH="1"
@@ -229,7 +236,7 @@ SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
-    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT
+    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT,NVTE_CUDA_ARCHS
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -249,6 +256,7 @@ cutedsl_write_event runtime_bootstrap start '' \
 "${SRUN[@]}" bash -s <<'BASH'
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 [[ "$("${UV_BIN}" --version)" == "uv ${UV_VERSION} "* ]]
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
@@ -380,6 +388,9 @@ manifest = {
     "measured_updates": int(os.environ["MEASURED_UPDATES"]),
     "total_updates": int(os.environ["TOTAL_UPDATES"]),
     "profile_enabled": os.environ["PROFILE_ENABLED"] == "1",
+    "build_environment": {
+        "NVTE_CUDA_ARCHS": os.environ["NVTE_CUDA_ARCHS"],
+    },
     "source_sha": os.environ["GIT_SHA"],
     "upstream_ref": os.environ["UPSTREAM_REF"],
     "upstream_sha": os.environ["UPSTREAM_SHA"],
@@ -424,6 +435,7 @@ cutedsl_write_event timing start '' \
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c 'import os, sys; print(os.path.realpath(sys.executable))')
@@ -747,6 +759,7 @@ if [[ "${PROFILE_ENABLED}" == "1" ]]; then
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
+[[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c 'import os, sys; print(os.path.realpath(sys.executable))')
