@@ -2375,6 +2375,8 @@ def grpo_train(
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -3023,7 +3025,6 @@ def grpo_train(
                 timeout.mark_iteration()
 
                 # +1 because step is 0-indexed
-                ft_save_period = master_config.checkpointing.get("ft_save_period")
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
@@ -3859,6 +3860,8 @@ def async_grpo_train(
     timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     # Main training loop
     try:
         while step < master_config.grpo["max_num_steps"]:
@@ -4381,7 +4384,6 @@ def async_grpo_train(
                 timeout.mark_iteration()
 
                 # +1 because step is 0-indexed
-                ft_save_period = master_config.checkpointing.get("ft_save_period")
                 should_save_by_step = (
                     is_last_step
                     or (step + 1) % master_config.checkpointing["save_period"] == 0
