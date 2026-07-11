@@ -81,7 +81,7 @@ cluster:
     method: mx
     mx_config:
       enabled: true
-      mx_server_url: modelexpress-server.${user:}.svc.cluster.local:8001
+      mx_server_url: modelexpress-server:8001
       timeout_seconds: 600.0
       same_rank_only: false
       tree_scale_out: false

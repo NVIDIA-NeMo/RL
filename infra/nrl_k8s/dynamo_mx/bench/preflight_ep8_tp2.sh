@@ -45,6 +45,8 @@ check_pod() {
 
 for pod in "${TRAIN_PODS[@]}"; do
   check_pod "${pod}" 4
+  kubectl exec -n "${NS}" "${pod}" -- /opt/nemo_rl_venv/bin/python -c \
+    'import nemo_rl.algorithms.grpo; print("nemo_rl_grpo_import=ok")'
 done
 check_pod "${ROLLOUT_PODS[0]}" 2
 

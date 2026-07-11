@@ -10,7 +10,7 @@
 defaults: grpo_math_1b_dynamo_mx.gb300.infra.yaml
 
 namespace: ${user:}
-image: nvcr.io/nvidian/dynamo-dev/model-express-dev:nemorl-ep8tp2-073d1cb2e-f63d53b
+image: nvcr.io/nvidian/dynamo-dev/model-express-dev:nemorl-ep8tp2-9124f4c0b-f63d53b-full
 imagePullSecrets: [nvcr-imagepullsecret]
 serviceAccount: default
 
@@ -208,6 +208,7 @@ dynamo:
             securityContext:
               runAsUser: 0
             mainContainer:
+              command: [python3, -m, dynamo.vllm]
               args:
                 - --model
                 - Qwen/Qwen3-30B-A3B
@@ -241,7 +242,7 @@ dynamo:
                 - {name: UCX_MAX_RMA_RAILS, value: "4"}
                 - {name: MX_RDMA_NIC_PIN, value: "off"}
                 - {name: MX_POOL_REG, value: "1"}
-                - {name: MX_LOAD_MODE, value: "stock"}
+                - {name: MX_LOAD_MODE, value: "direct"}
                 - {name: NCCL_NET_PLUGIN, value: "none"}
               resources:
                 claims: []
