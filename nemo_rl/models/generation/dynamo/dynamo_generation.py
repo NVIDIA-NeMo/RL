@@ -427,20 +427,15 @@ def _derive_frontend_url_from_dgd(dynamo_cfg: DynamoCfg) -> str:
     )
 
 
-def _resolve_frontend_url(dynamo_cfg: DynamoCfg) -> tuple[str, bool]:
-    """Resolve the frontend URL from a DynamoCfg.
-
-    Returns ``(url, requires_k8s)``. ``requires_k8s`` is True only on the
-    ``dgd_name`` path; an explicit ``frontend_url`` opts out of the
-    in-pod check so the backend works against any reachable endpoint.
-    """
+def _resolve_frontend_url(dynamo_cfg: DynamoCfg) -> str:
+    """Resolve the frontend URL from a DynamoCfg."""
     if dynamo_cfg.frontend_url is not None:
         url = dynamo_cfg.frontend_url
         if not url:
             raise RuntimeError(
                 "policy.generation.dynamo_cfg.frontend_url is set but empty."
             )
-        return url, False
+        return url
 
     if dynamo_cfg.dgd_name is None:
         raise RuntimeError(
@@ -448,7 +443,14 @@ def _resolve_frontend_url(dynamo_cfg: DynamoCfg) -> tuple[str, bool]:
             "(the metadata.name of the DynamoGraphDeployment) or "
             "policy.generation.dynamo_cfg.frontend_url (an explicit reachable URL)."
         )
-    return _derive_frontend_url_from_dgd(dynamo_cfg), True
+    if not is_in_kubernetes():
+        raise RuntimeError(
+            "DynamoGeneration with dgd_name requires running inside a "
+            "Kubernetes pod (KUBERNETES_SERVICE_HOST is not set). "
+            "Either run inside a pod, or set "
+            "policy.generation.dynamo_cfg.frontend_url to a reachable URL."
+        )
+    return _derive_frontend_url_from_dgd(dynamo_cfg)
 
 
 class DynamoGeneration(GenerationInterface):
@@ -469,14 +471,7 @@ class DynamoGeneration(GenerationInterface):
         self.cfg = config
         self._dynamo_cfg = DynamoCfg.model_validate(config["dynamo_cfg"])
         dynamo_cfg = self._dynamo_cfg
-        url, requires_k8s = _resolve_frontend_url(dynamo_cfg)
-        if requires_k8s and not is_in_kubernetes():
-            raise RuntimeError(
-                "DynamoGeneration with dgd_name requires running inside a "
-                "Kubernetes pod (KUBERNETES_SERVICE_HOST is not set). "
-                "Either run inside a pod, or set "
-                "policy.generation.dynamo_cfg.frontend_url to a reachable URL."
-            )
+        url = _resolve_frontend_url(dynamo_cfg)
         self._dynamo_frontend_base_url = url
         self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
 

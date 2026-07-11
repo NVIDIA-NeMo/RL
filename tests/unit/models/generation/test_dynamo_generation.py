@@ -137,7 +137,8 @@ def test_explicit_frontend_url_skips_k8s_check(monkeypatch):
     assert g.dp_openai_server_base_urls == ["http://my-dgd.example.com:8000/v1"]
 
 
-def test_explicit_frontend_url_overrides_dgd_name(in_k8s):
+def test_explicit_frontend_url_overrides_dgd_name(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
     cfg = _base_config(frontend_url="http://override.example.com:9000/v1")
     g = DynamoGeneration(cluster=None, config=cfg)
     assert g.dp_openai_server_base_urls == ["http://override.example.com:9000/v1"]
