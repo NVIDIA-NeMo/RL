@@ -370,6 +370,20 @@ runtime_python=$("${UV_BIN}" run --active --no-sync python -c '"'"'import os, sy
 runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; print(sys.prefix)'"'"')
 [[ "${runtime_python}" == "${expected_runtime_python}" ]]
 [[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
+# CUTEDSL_BRIDGE_SUMMARY_VALIDATOR_START
+validate_bridge_pytest_summary() {
+    local log_file="${1:?Bridge pytest log path is required}"
+    local summary_line
+    local expected_pattern="^=+[[:space:]]+203[[:space:]]+passed,[[:space:]]+2[[:space:]]+deselected(,[[:space:]]+[0-9]+[[:space:]]+warnings?)?[[:space:]]+in[[:space:]]+[0-9]+([.][0-9]+)?s[[:space:]]+=+$"
+
+    summary_line=$(grep -E "^=+[[:space:]].*[[:space:]]=+$" "${log_file}" | tail -n 1 || true)
+    if [[ ! "${summary_line}" =~ ${expected_pattern} ]]; then
+        printf "[ERROR] Bridge pytest terminal summary mismatch: expected 203 passed and 2 deselected; observed: %.240s\n" \
+            "${summary_line:-<missing>}" >&2
+        return 1
+    fi
+}
+# CUTEDSL_BRIDGE_SUMMARY_VALIDATOR_END
 bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 (
     cd "${bridge_root}"
@@ -385,6 +399,7 @@ bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-
             -q
     } 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"
 )
+validate_bridge_pytest_summary "${CONTAINER_RESULT_DIR}/focused_tests.log"
 (
     cd "${CONTAINER_REPO_ROOT}"
     "${UV_BIN}" run --active --no-sync pytest \

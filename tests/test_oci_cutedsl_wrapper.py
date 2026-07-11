@@ -115,6 +115,84 @@ def test_wrapper_bounds_bridge_msc_deselections_to_locked_runtime() -> None:
         assert broad_filter not in bridge_gate
 
 
+def _bridge_summary_validator_source() -> str:
+    start = "# CUTEDSL_BRIDGE_SUMMARY_VALIDATOR_START\n"
+    end = "# CUTEDSL_BRIDGE_SUMMARY_VALIDATOR_END\n"
+    assert start in SCRIPT
+    assert end in SCRIPT
+    return SCRIPT.split(start, 1)[1].split(end, 1)[0]
+
+
+def _run_bridge_summary_validator(
+    tmp_path: Path,
+    name: str,
+    log_text: str,
+) -> subprocess.CompletedProcess[str]:
+    log_path = tmp_path / f"{name}.log"
+    log_path.write_text(log_text)
+    command = (
+        "set -euo pipefail\n"
+        f"{_bridge_summary_validator_source()}\n"
+        'validate_bridge_pytest_summary "$1"\n'
+    )
+    return subprocess.run(
+        ["bash", "-c", command, "bridge-summary-validator", str(log_path)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_bridge_summary_validator_requires_actual_terminal_counts(
+    tmp_path: Path,
+) -> None:
+    diagnostic = "[INFO] Expected Bridge pytest summary: 203 passed, 2 deselected.\n"
+    cases = (
+        (
+            "correct-with-warnings",
+            diagnostic
+            + "================ 203 passed, 2 deselected, 7 warnings in 12.34s ================\n",
+            True,
+        ),
+        (
+            "correct-without-warnings",
+            diagnostic
+            + "==================== 203 passed, 2 deselected in 9.8s ====================\n",
+            True,
+        ),
+        (
+            "wrong-passed",
+            diagnostic
+            + "================ 202 passed, 2 deselected, 1 warning in 12.34s ================\n",
+            False,
+        ),
+        (
+            "wrong-deselected",
+            diagnostic
+            + "==================== 203 passed, 1 deselected in 12s ====================\n",
+            False,
+        ),
+        ("diagnostic-only-spoof", diagnostic, False),
+    )
+
+    for name, log_text, succeeds in cases:
+        result = _run_bridge_summary_validator(tmp_path, name, log_text)
+        assert (result.returncode == 0) is succeeds, (name, result.stderr)
+        if not succeeds:
+            assert "Bridge pytest terminal summary mismatch" in result.stderr
+            assert len(result.stderr.splitlines()) == 1
+
+
+def test_wrapper_validates_bridge_summary_before_nemo_rl_tests() -> None:
+    bridge_log = '} 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"'
+    validator_call = (
+        'validate_bridge_pytest_summary "${CONTAINER_RESULT_DIR}/focused_tests.log"'
+    )
+    nemo_rl_tests = '(\n    cd "${CONTAINER_REPO_ROOT}"'
+
+    assert SCRIPT.index(bridge_log) < SCRIPT.index(validator_call)
+    assert SCRIPT.index(validator_call) < SCRIPT.index(nemo_rl_tests)
+
+
 def test_wrapper_runs_transformer_engine_forward_backward_on_each_gpu() -> None:
     assert "te.Linear" in SCRIPT
     assert ".backward()" in SCRIPT
