@@ -9,9 +9,12 @@ import argparse
 import csv
 import html
 import json
+import os
 import posixpath
 import re
+import secrets
 import shutil
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -782,6 +785,137 @@ def refresh_aggregate(experiment_dir: Path) -> Path:
     return render_aggregate(report_dir)
 
 
+def _open_directory_at(parent_fd: int, name: str, *, create: bool = False) -> int:
+    """Open one direct directory child without following symbolic links."""
+    if create:
+        try:
+            os.mkdir(name, mode=0o755, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    return os.open(name, flags, dir_fd=parent_fd)
+
+
+def _directory_entry_matches(parent_fd: int, name: str, child_fd: int) -> bool:
+    """Return whether a direct non-symlink child still names the held directory."""
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        held = os.fstat(child_fd)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(entry.st_mode)
+        and entry.st_dev == held.st_dev
+        and entry.st_ino == held.st_ino
+    )
+
+
+def _unlink_at(directory_fd: int, name: str) -> bool:
+    """Unlink one direct non-directory child, treating absence as success."""
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_bounded_regular_text(directory_fd: int, name: str) -> str | None:
+    """Read one bounded UTF-8 regular file without following its leaf."""
+    file_descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        file_descriptor = os.open(name, flags, dir_fd=directory_fd)
+        file_status = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(file_status.st_mode)
+            or file_status.st_size > MAX_PUBLIC_TEXT_BYTES
+        ):
+            return None
+        content = bytearray()
+        while len(content) <= MAX_PUBLIC_TEXT_BYTES:
+            chunk = os.read(
+                file_descriptor,
+                min(65_536, MAX_PUBLIC_TEXT_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > MAX_PUBLIC_TEXT_BYTES:
+            return None
+        return content.decode()
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+
+
+def _write_all(file_descriptor: int, data: bytes) -> bool:
+    """Write every byte to an open file descriptor."""
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(file_descriptor, remaining)
+        if written <= 0:
+            return False
+        remaining = remaining[written:]
+    return True
+
+
+def _atomic_stage_incident_evidence(
+    source_directory_fd: int,
+    destination_directory_fd: int,
+    filename: str,
+) -> bool:
+    """Redact and atomically stage one bounded incident evidence file."""
+    content = _read_bounded_regular_text(source_directory_fd, filename)
+    if content is None:
+        return False
+    payload = redact_text(content).encode()
+    temporary_name = f".{filename}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    temporary_fd: int | None = None
+    temporary_exists = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        temporary_fd = os.open(
+            temporary_name,
+            flags,
+            0o644,
+            dir_fd=destination_directory_fd,
+        )
+        temporary_exists = True
+        if not _write_all(temporary_fd, payload):
+            return False
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=destination_directory_fd,
+            dst_dir_fd=destination_directory_fd,
+        )
+        temporary_exists = False
+        return True
+    except OSError:
+        return False
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if temporary_exists:
+            _unlink_at(destination_directory_fd, temporary_name)
+
+
+def _regular_entry_at(directory_fd: int, name: str) -> bool:
+    """Return whether one held-directory child is a regular non-symlink file."""
+    try:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(entry.st_mode)
+
+
 def aggregate_incident_evidence(report_dir: Path, incident: dict[str, Any]) -> str:
     """Stage and link one safe report-root incident artifact when it exists."""
     evidence = escape(incident.get("evidence"))
@@ -795,48 +929,51 @@ def aggregate_incident_evidence(report_dir: Path, incident: dict[str, Any]) -> s
     expected_path = f"evidence/job-{run_id}.txt"
     if report_path != expected_path:
         return unavailable
-    public_dir = report_dir / "public"
-    public_evidence_dir = public_dir / "evidence"
-    source = report_dir / report_path
-    destination = public_dir / report_path
-    if public_dir.is_symlink() or public_evidence_dir.is_symlink():
-        return unavailable
+    filename = f"job-{run_id}.txt"
+    report_fd: int | None = None
+    public_fd: int | None = None
+    source_evidence_fd: int | None = None
+    destination_evidence_fd: int | None = None
     try:
-        public_evidence_dir.mkdir(parents=True, exist_ok=True)
-        public_root = public_dir.resolve(strict=True)
-        public_evidence_root = public_evidence_dir.resolve(strict=True)
-    except OSError:
-        return unavailable
-    if (
-        public_dir.is_symlink()
-        or public_evidence_dir.is_symlink()
-        or public_evidence_root.parent != public_root
-    ):
-        return unavailable
-    try:
-        if destination.is_symlink():
-            destination.unlink()
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        report_fd = os.open(report_dir, flags)
+        public_fd = _open_directory_at(report_fd, "public", create=True)
+        destination_evidence_fd = _open_directory_at(public_fd, "evidence", create=True)
+        if not _unlink_at(destination_evidence_fd, filename):
             return unavailable
-        if destination.exists():
-            if not destination.is_file():
-                return unavailable
-            destination.unlink()
+        source_evidence_fd = _open_directory_at(report_fd, "evidence")
+        if not _directory_entry_matches(report_fd, "evidence", source_evidence_fd):
+            return unavailable
+        if not _atomic_stage_incident_evidence(
+            source_evidence_fd,
+            destination_evidence_fd,
+            filename,
+        ):
+            _unlink_at(destination_evidence_fd, filename)
+            return unavailable
+        if not (
+            _directory_entry_matches(report_fd, "public", public_fd)
+            and _directory_entry_matches(public_fd, "evidence", destination_evidence_fd)
+            and _regular_entry_at(destination_evidence_fd, filename)
+        ):
+            _unlink_at(destination_evidence_fd, filename)
+            return unavailable
     except OSError:
+        if destination_evidence_fd is not None:
+            _unlink_at(destination_evidence_fd, filename)
         return unavailable
-    try:
-        copied = copy_public_text(report_dir, source, destination)
-    except OSError:
-        return unavailable
-    if not copied:
-        return unavailable
-    if not is_contained_regular_file(public_evidence_dir, destination):
-        try:
-            if destination.is_symlink() or destination.is_file():
-                destination.unlink()
-        except OSError:
-            pass
-        return unavailable
-    link = existing_artifact_link(public_dir, report_path, "evidence snapshot")
+    finally:
+        for file_descriptor in (
+            source_evidence_fd,
+            destination_evidence_fd,
+            public_fd,
+            report_fd,
+        ):
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+    link = existing_artifact_link(
+        report_dir / "public", report_path, "evidence snapshot"
+    )
     return f"{evidence}<br>{link}"
 
 
