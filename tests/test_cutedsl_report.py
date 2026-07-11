@@ -710,6 +710,23 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
         "OVERSIZED_EVIDENCE_SENTINEL_107\n" + "x" * 100_000
     )
     (profile_dir / "nsight/worker.nsys-rep").write_bytes(b"NSYS_BINARY_SENTINEL_108")
+    external_profile_dir = tmp_path / "external-profile"
+    external_profile_dir.mkdir()
+    write_json(
+        external_profile_dir / "profile_summary.json",
+        {
+            "arm": "external",
+            "nsight_report_count": 0,
+            "kernel_evidence": "kernel_evidence.txt",
+            "note": "EXTERNAL_PROFILE_JSON_SENTINEL_113",
+        },
+    )
+    (external_profile_dir / "kernel_evidence.txt").write_text(
+        "EXTERNAL_PROFILE_EVIDENCE_SENTINEL_114\n"
+    )
+    (run_dir / "profiles/external").symlink_to(
+        external_profile_dir, target_is_directory=True
+    )
     (run_dir / "credentials.txt").write_text("SENTINEL_ARBITRARY_FILE_109\n")
     (run_dir / "symlinked_credentials.raw").write_text(
         "SYMLINKED_CREDENTIAL_SENTINEL_112\n"
@@ -761,6 +778,8 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
         b"RAW_SLURM_PREFIX_SENTINEL_110",
         b"SENTINEL_SLURM_SECRET_111",
         b"SYMLINKED_CREDENTIAL_SENTINEL_112",
+        b"EXTERNAL_PROFILE_JSON_SENTINEL_113",
+        b"EXTERNAL_PROFILE_EVIDENCE_SENTINEL_114",
     ):
         assert sentinel not in public_bytes
     staged_run = public_dir / "runs/results/123"
@@ -770,6 +789,7 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
     assert (staged_run / "slurm.out").stat().st_size <= renderer.MAX_EXCERPT_BYTES
     assert not (staged_run / "credentials.txt").exists()
     assert not list(staged_run.rglob("*.nsys-rep"))
+    assert not (staged_run / "profiles/external").exists()
 
 
 def test_matrix_report_renders_scheduler_and_complete_parallel_topology(

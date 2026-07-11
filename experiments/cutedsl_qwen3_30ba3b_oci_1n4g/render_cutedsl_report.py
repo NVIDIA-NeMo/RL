@@ -563,10 +563,25 @@ def feature_cell(metadata: dict[str, Any], manifest: dict[str, Any]) -> str:
     return str(value)
 
 
-def write_public_json(source: Path, destination: Path) -> None:
+def is_contained_regular_file(source_run: Path, candidate: Path) -> bool:
+    """Return whether a regular non-symlink file resolves beneath a run root."""
+    try:
+        source_root = source_run.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        return False
+    return (
+        candidate.is_file()
+        and not candidate.is_symlink()
+        and resolved.is_file()
+        and resolved.is_relative_to(source_root)
+    )
+
+
+def write_public_json(source_run: Path, source: Path, destination: Path) -> bool:
     """Write one size-bounded structured JSON artifact with values redacted."""
-    if source.is_symlink():
-        raise ValueError(f"Refusing symlinked structured public artifact: {source}")
+    if not is_contained_regular_file(source_run, source):
+        return False
     if source.stat().st_size > MAX_PUBLIC_STRUCTURED_BYTES:
         raise ValueError(f"Structured public artifact exceeds size bound: {source}")
     try:
@@ -577,12 +592,13 @@ def write_public_json(source: Path, destination: Path) -> None:
     destination.write_text(
         json.dumps(redact_value(value), indent=2, sort_keys=True) + "\n"
     )
+    return True
 
 
-def write_public_events(source: Path, destination: Path) -> None:
+def write_public_events(source_run: Path, source: Path, destination: Path) -> bool:
     """Write size-bounded JSONL events after recursive value redaction."""
-    if source.is_symlink():
-        raise ValueError(f"Refusing symlinked structured public artifact: {source}")
+    if not is_contained_regular_file(source_run, source):
+        return False
     if source.stat().st_size > MAX_PUBLIC_STRUCTURED_BYTES:
         raise ValueError(f"Structured public artifact exceeds size bound: {source}")
     events = read_events(source)
@@ -592,13 +608,13 @@ def write_public_events(source: Path, destination: Path) -> None:
             json.dumps(redact_value(event), sort_keys=True) + "\n" for event in events
         )
     )
+    return True
 
 
-def copy_public_text(source: Path, destination: Path) -> bool:
+def copy_public_text(source_run: Path, source: Path, destination: Path) -> bool:
     """Copy one allowlisted UTF-8 text artifact when it is within the size bound."""
     if (
-        not source.is_file()
-        or source.is_symlink()
+        not is_contained_regular_file(source_run, source)
         or source.stat().st_size > MAX_PUBLIC_TEXT_BYTES
     ):
         return False
@@ -627,26 +643,25 @@ def stage_public_run(source_run: Path, public_run: Path) -> Path:
 
     for name in PUBLIC_JSON_ALLOWLIST:
         source = source_run / name
-        if source.is_file():
-            write_public_json(source, public_run / name)
+        write_public_json(source_run, source, public_run / name)
     events_source = source_run / "events.jsonl"
-    if events_source.is_file():
-        write_public_events(events_source, public_run / "events.jsonl")
+    write_public_events(source_run, events_source, public_run / "events.jsonl")
     slurm_source = source_run / "slurm.out"
-    if slurm_source.is_file() and not slurm_source.is_symlink():
+    if is_contained_regular_file(source_run, slurm_source):
         excerpt = bounded_utf8_tail(
             read_bounded_excerpt(slurm_source), MAX_EXCERPT_BYTES
         )
         (public_run / "slurm.out").write_text(excerpt)
     for name in PUBLIC_TEXT_ALLOWLIST:
-        copy_public_text(source_run / name, public_run / name)
+        copy_public_text(source_run, source_run / name, public_run / name)
 
     for summary_source in sorted(source_run.glob("profiles/*/profile_summary.json")):
         relative = summary_source.relative_to(source_run)
-        write_public_json(summary_source, public_run / relative)
+        if not write_public_json(source_run, summary_source, public_run / relative):
+            continue
         evidence_source = summary_source.parent / "kernel_evidence.txt"
         evidence_destination = public_run / relative.parent / "kernel_evidence.txt"
-        copy_public_text(evidence_source, evidence_destination)
+        copy_public_text(source_run, evidence_source, evidence_destination)
 
     return render_run(public_run)
 
@@ -681,15 +696,15 @@ def refresh_aggregate(experiment_dir: Path) -> Path:
             for path in category_dir.iterdir()
             if path.is_dir() and not path.is_symlink()
         ):
-            if not (run_dir / "status.json").is_file():
+            if not is_contained_regular_file(run_dir, run_dir / "status.json"):
                 continue
-            status = read_json(run_dir / "status.json")
-            metadata = read_json(run_dir / "metadata.json")
-            manifest = read_json(run_dir / "benchmark_manifest.json")
-            events = read_events(run_dir / "events.jsonl")
             public_relative = Path("runs") / category / run_dir.name / "report.html"
             public_run = (report_dir / "public" / public_relative).parent
             stage_public_run(run_dir, public_run)
+            status = read_json(public_run / "status.json")
+            metadata = read_json(public_run / "metadata.json")
+            manifest = read_json(public_run / "benchmark_manifest.json")
+            events = read_events(public_run / "events.jsonl")
 
             run_id = str(
                 status.get(
