@@ -1152,7 +1152,10 @@ def grpo_train_sync(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             memory_tracker.snapshot_start_of_stage("Logging", dir())
             # Per-step log_data jsonl. The 1-hop driver holds per-token

@@ -1868,6 +1868,77 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     assert train_metrics["masked_correct_pct"] == 0.5
 
 
+def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):
+    """Regression test for epoch-bounded runs losing the final async checkpoint.
+
+    When training exits because max_num_epochs is reached (not max_num_steps or
+    timeout), the last step may start background checkpoint finalization via
+    begin_finalization() but never hit the inline shutdown() early returns.
+    grpo_train must flush pending finalization in a finally block.
+    """
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    checkpointer = mock_grpo_components["checkpointer"]
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["max_num_steps"] = 100
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["val_at_end"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 1000
+    master_config.checkpointing["metric_name"] = None
+
+    single_batch_dataloader = MagicMock(spec=StatefulDataLoader)
+    single_batch_dataloader.__iter__ = lambda self: iter([mock_batch])
+    single_batch_dataloader.__len__ = MagicMock(return_value=1)
+    single_batch_dataloader.state_dict = MagicMock(return_value={})
+
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
+    # grpo_train writes latest_checkpoint_status.json under checkpoint_dir; give
+    # the mocked checkpointer a real directory so that write succeeds.
+    checkpointer.checkpoint_dir = tmp_path
+
+    with (
+        _patched_logprob_phase(policy),
+        patch(
+            "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+            return_value=_mock_seq_logprob_error_result(),
+        ),
+        patch("nemo_rl.algorithms.grpo.torch.save"),
+    ):
+        grpo_mod.grpo_train(
+            policy,
+            _mock_policy_generation(),
+            single_batch_dataloader,
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            checkpointer,
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    checkpointer.begin_finalization.assert_called_once()
+    checkpointer.shutdown.assert_called_once()
+
+
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_train_skips_reference_policy_logprobs(mock_grpo_components, train_func):
     """Regression test for issue #1968 (Bug 1) and PRs #2174 / #2178.

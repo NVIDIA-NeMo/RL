@@ -591,7 +591,10 @@ def sft_train(
                             train_dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 

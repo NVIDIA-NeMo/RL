@@ -1602,7 +1602,13 @@ def ppo_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # The value worker finalizes its own write synchronously
+                        # (blocking=True) inside save_checkpoint, so only the
+                        # policy's async write needs to be awaited before rename.
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             # Logging
             memory_tracker.snapshot_start_of_stage("Logging", dir())

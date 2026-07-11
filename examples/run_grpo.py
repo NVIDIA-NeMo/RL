@@ -218,20 +218,24 @@ def main() -> None:
         # Two parallel synchronous trainers (verl-style — main_ppo.py vs
         # main_ppo_sync.py). data_plane.enabled selects which one runs.
         trainer = _select_trainer(master_config)
-        trainer(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-        )
+        # grpo_train_sync defers checkpoint finalization to the checkpointer's
+        # background threads; the context manager guarantees they are flushed on
+        # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
+        with checkpointer:
+            trainer(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+            )
 
 
 if __name__ == "__main__":
