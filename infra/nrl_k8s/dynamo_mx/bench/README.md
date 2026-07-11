@@ -15,6 +15,7 @@ refit), plus apples-to-apples transport and per-phase refit timing.
 | `ep_gt1_byte_pruning.py` | Synthetic-but-real-planner proof that EP>1 pulls only 1/EP of expert bytes (EP=8 → 8.0×). Runnable now, no cluster. |
 | `mdl_partial_smoke.py` | Runtime smoke for MDL incremental/partial-update (cold/warm/subset/incremental, byte-identical). No transport. |
 | `configs/nixl_ep4_tp1_gb200_rc_debug.yaml` | Sanitized EP4→TP1 GB200 topology and UCX/NIXL config, including the TCP-fallback baseline and validated `^tcp` fix (12/12 pulls on RDMA, ~7× steady-state refit speedup). |
+| `preflight_ep8_tp2.sh` | Fail-fast Kubernetes gate for the two 4-GPU EP8 trainer pods and 2-GPU TP2 rollout: GPU count, `rdma0..3`, `^tcp`, matching package versions, and native `mx` backend registration. |
 
 ## Run
 

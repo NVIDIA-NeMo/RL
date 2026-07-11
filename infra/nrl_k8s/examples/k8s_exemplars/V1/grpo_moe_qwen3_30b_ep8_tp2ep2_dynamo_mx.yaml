@@ -1,0 +1,16 @@
+# Expert-filter validation variant of the EP8 -> TP2 target.
+# The same two rollout GPUs form TP2 + EP2; each rank should request only its
+# locally-owned 64 experts while retaining the same dense TP layout.
+
+defaults: grpo_moe_qwen3_30b_ep8_tp2_dynamo_mx.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 2
+      expert_parallel_size: 2
+
+cluster:
+  weight_sync:
+    mx_config:
+      moe_expert_filter: true
