@@ -176,6 +176,34 @@ cutedsl_write_status() {
         > "${RESULT_DIR:?RESULT_DIR must be set}/status.json"
 }
 
+cutedsl_replace_completion_event() {
+    local status="${1:?cutedsl_replace_completion_event requires a status}"
+    local exit_code="${2:?cutedsl_replace_completion_event requires an exit code}"
+    local message="${3:?cutedsl_replace_completion_event requires a message}"
+    local artifact=${4-}
+    local events_file="${CUTEDSL_EVENTS_FILE:?cutedsl_events_init must run before replacing completion}"
+    local temporary_file
+    local filter_exit_code
+
+    temporary_file=$(mktemp "${events_file}.tmp.XXXXXX") || return 1
+    if grep -vF '"phase":"complete"' "${events_file}" > "${temporary_file}"; then
+        :
+    else
+        filter_exit_code=$?
+        if [[ ${filter_exit_code} -ne 1 ]]; then
+            rm -f "${temporary_file}"
+            return "${filter_exit_code}"
+        fi
+    fi
+
+    if ! CUTEDSL_EVENTS_FILE="${temporary_file}" \
+        cutedsl_write_event complete "${status}" "${exit_code}" "${message}" "${artifact}"; then
+        rm -f "${temporary_file}"
+        return 1
+    fi
+    mv -f "${temporary_file}" "${events_file}"
+}
+
 _cutedsl_phase_has_terminal_event() {
     local phase="${1:?phase is required}"
     grep -Eq \
@@ -210,6 +238,7 @@ cutedsl_finalize_run() {
     local completion_message="${2:?cutedsl_finalize_run requires a message}"
     local renderer="${3:?cutedsl_finalize_run requires the renderer path}"
     local renderer_exit_code=0
+    local final_renderer_exit_code=0
     local final_exit_code=${original_exit_code}
     local completion_artifact=report.html
     local completion_status=pass
@@ -250,6 +279,20 @@ cutedsl_finalize_run() {
 
     if [[ ${renderer_exit_code} -eq 0 ]]; then
         "${CUTEDSL_REPORT_PYTHON:-python3}" "${renderer}" --run-dir "${RESULT_DIR}"
+        final_renderer_exit_code=$?
+        if [[ ${final_renderer_exit_code} -ne 0 ]]; then
+            completion_status=fail
+            completion_message="Final report rendering failed with code ${final_renderer_exit_code}"
+            completion_artifact=$(basename "${renderer}")
+            if [[ ${original_exit_code} -eq 0 ]]; then
+                final_exit_code=${final_renderer_exit_code}
+            fi
+            cutedsl_replace_completion_event \
+                "${completion_status}" "${final_exit_code}" \
+                "${completion_message}" "${completion_artifact}"
+            cutedsl_write_status "${final_exit_code}"
+            rm -f "${RESULT_DIR}/report.html"
+        fi
     fi
     return "${final_exit_code}"
 }

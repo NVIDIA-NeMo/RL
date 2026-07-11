@@ -360,13 +360,35 @@ def test_payload_exit_handlers_always_render_without_masking_exit_code() -> None
         )
 
 
+def write_stateful_renderer(path: Path) -> None:
+    path.write_text(
+        """#!/bin/bash
+set -euo pipefail
+count=0
+if [[ -s "${STATEFUL_RENDER_COUNT_FILE}" ]]; then
+    count=$(<"${STATEFUL_RENDER_COUNT_FILE}")
+fi
+count=$((count + 1))
+printf '%d\n' "${count}" > "${STATEFUL_RENDER_COUNT_FILE}"
+if [[ ${count} -eq 1 ]]; then
+    printf 'stale probe report\n' > "$3/report.html"
+    exit 0
+fi
+exit 7
+"""
+    )
+    path.chmod(0o755)
+
+
 @pytest.mark.parametrize(
-    ("signal_name", "signal_number", "expected_exit", "renderer_fails"),
+    ("signal_name", "signal_number", "expected_exit", "renderer_mode"),
     [
-        ("TERM", signal.SIGTERM, 143, False),
-        ("INT", signal.SIGINT, 130, False),
-        ("TERM", signal.SIGTERM, 143, True),
-        ("INT", signal.SIGINT, 130, True),
+        ("TERM", signal.SIGTERM, 143, "success"),
+        ("INT", signal.SIGINT, 130, "success"),
+        ("TERM", signal.SIGTERM, 143, "always_fail"),
+        ("INT", signal.SIGINT, 130, "always_fail"),
+        ("TERM", signal.SIGTERM, 143, "final_fail"),
+        ("INT", signal.SIGINT, 130, "final_fail"),
     ],
 )
 def test_signal_finalization_records_nonzero_failure_once(
@@ -374,14 +396,22 @@ def test_signal_finalization_records_nonzero_failure_once(
     signal_name: str,
     signal_number: signal.Signals,
     expected_exit: int,
-    renderer_fails: bool,
+    renderer_mode: str,
 ) -> None:
-    case_name = f"{signal_name.lower()}-renderer-fail-{renderer_fails}"
+    case_name = f"{signal_name.lower()}-renderer-{renderer_mode}"
     result_dir = tmp_path / case_name
     ready_file = tmp_path / f"{case_name}.ready"
-    renderer_environment = (
-        "export CUTEDSL_REPORT_PYTHON=false" if renderer_fails else ""
-    )
+    renderer_environment = ""
+    if renderer_mode == "always_fail":
+        renderer_environment = "export CUTEDSL_REPORT_PYTHON=false"
+    elif renderer_mode == "final_fail":
+        renderer_path = tmp_path / f"{case_name}.sh"
+        count_path = tmp_path / f"{case_name}.count"
+        write_stateful_renderer(renderer_path)
+        renderer_environment = (
+            f"export CUTEDSL_REPORT_PYTHON={renderer_path!s} "
+            f"STATEFUL_RENDER_COUNT_FILE={count_path!s}"
+        )
     command = f"""
 set -euo pipefail
 RESULT_DIR={result_dir!s}
@@ -430,7 +460,7 @@ while :; do sleep 0.1; done
     assert complete_events[0]["status"] == "fail"
     assert complete_events[0]["exit_code"] == expected_exit
     assert len([event for event in events if event["phase"] == "root_cause"]) == 1
-    assert (result_dir / "report.html").exists() is not renderer_fails
+    assert (result_dir / "report.html").exists() is (renderer_mode == "success")
 
 
 def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:
@@ -733,6 +763,51 @@ exit $?
         and event["exit_code"] == expected_exit
         for event in complete_events
     )
+
+
+@pytest.mark.parametrize(
+    ("original_exit", "expected_exit"),
+    [(0, 7), (17, 17)],
+)
+def test_finalize_run_handles_completion_inclusive_renderer_failure(
+    tmp_path: Path,
+    original_exit: int,
+    expected_exit: int,
+) -> None:
+    result_dir = tmp_path / f"final-render-failure-{original_exit}"
+    renderer_path = tmp_path / f"stateful-renderer-{original_exit}.sh"
+    count_path = tmp_path / f"stateful-renderer-{original_exit}.count"
+    write_stateful_renderer(renderer_path)
+    command = f"""
+set -u
+RESULT_DIR={result_dir!s}
+RUN_ID=final-render-failure
+SLURM_JOB_ID=765
+export RESULT_DIR RUN_ID SLURM_JOB_ID
+source {EVENTS_PATH!s}
+export CUTEDSL_EVENT_CLUSTER=pre_tyche CUTEDSL_EVENT_JOB_ID="$SLURM_JOB_ID"
+export CUTEDSL_REPORT_PYTHON={renderer_path!s}
+export STATEFUL_RENDER_COUNT_FILE={count_path!s}
+cutedsl_events_init "$RESULT_DIR"
+cutedsl_write_event preflight start '' 'final renderer boundary' slurm.out
+cutedsl_finalize_run {original_exit} 'stateful renderer fixture' {RENDERER_PATH!s}
+exit $?
+"""
+    completed = subprocess.run(["bash", "-c", command], check=False)
+    status = json.loads((result_dir / "status.json").read_text())
+    events = [
+        json.loads(line)
+        for line in (result_dir / "events.jsonl").read_text().splitlines()
+    ]
+    complete_events = [event for event in events if event["phase"] == "complete"]
+
+    assert completed.returncode == expected_exit
+    assert status["exit_code"] == expected_exit
+    assert len(complete_events) == 1
+    assert complete_events[0]["status"] == "fail"
+    assert complete_events[0]["exit_code"] == expected_exit
+    assert "Final report rendering failed with code 7" in complete_events[0]["message"]
+    assert not (result_dir / "report.html").exists()
 
 
 def test_refresh_aggregate_discovers_completed_runs_and_incidents(
