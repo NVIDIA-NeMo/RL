@@ -606,6 +606,7 @@ class MegatronPolicyWorkerImpl(
             all_mb_metrics = []
             losses = []
             total_num_microbatches = 0
+            all_updates_successful = True
             for gb_idx in range(num_global_batches):
                 gb_result = process_global_batch(
                     data,
@@ -737,6 +738,9 @@ class MegatronPolicyWorkerImpl(
                 update_successful = logical_and_across_model_parallel_group(
                     update_successful, mp_group=pg_collection.mp
                 )
+                all_updates_successful = all_updates_successful and bool(
+                    update_successful
+                )
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks
                 grad_norm: float = reduce_max_stat_across_model_parallel_group(
@@ -832,6 +836,8 @@ class MegatronPolicyWorkerImpl(
             "grad_norm": torch.tensor([grad_norm]),
             "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
+        if not eval_mode:
+            metrics["update_successful"] = all_updates_successful
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
         # matches torch.distributed.config (a non-pickleable ConfigModuleInstance).
@@ -1369,6 +1375,7 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            "update_successful": bool(update_successful),
         }
 
         # MoE aux-loss metrics: same convention as sync train() — scale

@@ -2970,6 +2970,10 @@ def grpo_train(
                     else 0.0,
                     **ds_metrics,
                 }
+                if "update_successful" in train_results:
+                    metrics["optimizer_update_successful"] = train_results[
+                        "update_successful"
+                    ]
                 if "moe_metrics" in train_results:
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
@@ -4331,6 +4335,10 @@ def async_grpo_train(
                     if response_advantages.numel() > 0
                     else 0.0,
                 }
+                if "update_successful" in train_results:
+                    metrics["optimizer_update_successful"] = train_results[
+                        "update_successful"
+                    ]
                 if "moe_metrics" in train_results:
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}

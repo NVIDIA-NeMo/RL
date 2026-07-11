@@ -29,11 +29,13 @@ contracts cheaply:
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
-from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.tq_policy import TQPolicy, _aggregate_train_results
 
 
 class _SplitStubWorker(TQWorkerMixin):
@@ -193,3 +195,55 @@ class TestTQPolicySplitFanout:
             "abort_train_step_presharded"
         )
         mock_ray.get.assert_called_once_with(["f0", "f1"])
+
+
+def _train_result(update_successful: bool | None) -> dict[str, Any]:
+    result = {
+        "global_loss": 1.0,
+        "grad_norm": 0.5,
+        "all_mb_metrics": {"loss": [0.1]},
+        "gpu_name": "GB200",
+        "model_dtype": "bfloat16",
+    }
+    if update_successful is not None:
+        result["update_successful"] = update_successful
+    return result
+
+
+def test_policy_train_aggregates_failed_optimizer_update() -> None:
+    policy = object.__new__(Policy)
+    policy.cfg = {"train_global_batch_size": 2, "train_micro_batch_size": 1}
+    policy.flops_tracker = None
+    policy._shard_for_train = MagicMock(return_value=["shard-0", "shard-1"])
+    policy.worker_group = MagicMock()
+    policy.worker_group.run_all_workers_sharded_data.return_value = object()
+    policy.worker_group.get_all_worker_results.return_value = [
+        _train_result(True),
+        _train_result(False),
+    ]
+
+    result = policy.train(data=MagicMock(), loss_fn=MagicMock())
+
+    assert result["update_successful"] is False
+
+
+def test_split_aggregation_preserves_failed_optimizer_update() -> None:
+    result = _aggregate_train_results([_train_result(True), _train_result(False)])
+
+    assert result["update_successful"] is False
+
+
+def test_policy_train_omits_optimizer_update_for_legacy_worker_results() -> None:
+    policy = object.__new__(Policy)
+    policy.cfg = {"train_global_batch_size": 1, "train_micro_batch_size": 1}
+    policy.flops_tracker = None
+    policy._shard_for_train = MagicMock(return_value=["shard-0"])
+    policy.worker_group = MagicMock()
+    policy.worker_group.run_all_workers_sharded_data.return_value = object()
+    policy.worker_group.get_all_worker_results.return_value = [
+        _train_result(None),
+    ]
+
+    result = policy.train(data=MagicMock(), loss_fn=MagicMock())
+
+    assert "update_successful" not in result

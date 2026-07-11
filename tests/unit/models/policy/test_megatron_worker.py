@@ -154,6 +154,63 @@ def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
     assert torch.allclose(scale_fn(), torch.tensor(1.0))
 
 
+def test_megatron_eval_results_omit_optimizer_update_status():
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    train_method = next(
+        node
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        and class_node.name == "MegatronPolicyWorkerImpl"
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef) and node.name == "train"
+    )
+
+    metrics_dict = next(
+        node.value
+        for node in ast.walk(train_method)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "metrics"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Dict)
+    )
+    unconditional_keys = {
+        key.value
+        for key in metrics_dict.keys
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    assert "update_successful" not in unconditional_keys
+
+    guarded_update_status = any(
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.op, ast.Not)
+        and isinstance(node.test.operand, ast.Name)
+        and node.test.operand.id == "eval_mode"
+        and any(
+            isinstance(child, ast.Assign)
+            and isinstance(child.value, ast.Name)
+            and child.value.id == "all_updates_successful"
+            and any(
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "metrics"
+                and isinstance(target.slice, ast.Constant)
+                and target.slice.value == "update_successful"
+                for target in child.targets
+            )
+            for child in node.body
+        )
+        for node in ast.walk(train_method)
+    )
+    assert guarded_update_status
+
+
 def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
     source_path = (
         Path(__file__).parents[4]
@@ -599,6 +656,7 @@ def test_megatron_policy_training(training_setup):
 
         # Verify results
         assert "loss" in results, "Training results should contain 'loss'"
+        assert results["update_successful"] is True
         loss_tensor = results["loss"]
         verify_loss_tensor(loss_tensor)
         losses.append(loss_tensor[-1].item())

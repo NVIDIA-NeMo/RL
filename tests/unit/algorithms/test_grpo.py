@@ -1783,6 +1783,7 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     master_config.grpo["val_period"] = 0
     master_config.grpo["val_at_start"] = False
     master_config.grpo["use_dynamic_sampling"] = False
+    mock_grpo_components["policy"].train.return_value["update_successful"] = False
 
     grpo_mod.grpo_train(
         mock_grpo_components["policy"],
@@ -1813,6 +1814,7 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     assert train_metrics["min_seq_mult_prob_error_after_mask"] == 1.0
     assert train_metrics["num_masked_seqs_by_logprob_error"] == 2
     assert train_metrics["masked_correct_pct"] == 0.5
+    assert train_metrics["optimizer_update_successful"] is False
 
 
 def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):

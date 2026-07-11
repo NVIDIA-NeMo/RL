@@ -508,6 +508,16 @@ class TestFinish:
         ):
             assert key in metrics, f"missing {key!r}"
 
+    def test_returns_failed_optimizer_update(self, mock_module_symbols) -> None:
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        w.optimizer.step.return_value = (False, 0.5, 0)
+
+        metrics = w.finish_train_step()
+
+        assert metrics["update_successful"] is False
+
     def test_moe_branch_skipped_when_num_experts_is_none(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 

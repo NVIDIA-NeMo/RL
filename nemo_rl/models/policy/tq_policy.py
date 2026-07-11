@@ -65,6 +65,10 @@ def _aggregate_train_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "loss": results[0]["global_loss"],
         "grad_norm": results[0]["grad_norm"],
     }
+    if results and all("update_successful" in result for result in results):
+        out["update_successful"] = all(
+            result["update_successful"] for result in results
+        )
     if "moe_metrics" in results[0]:
         out["moe_metrics"] = results[0]["moe_metrics"]
     all_mb_metrics: dict[str, list[Any]] = defaultdict(list)

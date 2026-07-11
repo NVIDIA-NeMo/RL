@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #SBATCH --job-name=cutedsl-qwen3-30ba3b-oci-1n4g
 #SBATCH --account=nemotron_n3_post
 #SBATCH --partition=batch
@@ -18,11 +32,13 @@ readonly IMAGE="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/user
 readonly RECIPE="examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-1n4g-megatron-mxfp8-cutedsl.yaml"
 readonly CONTAINER_REPO_ROOT="/workspace/nemo-rl"
 readonly CONTAINER_RESULT_DIR="/results"
+readonly PARENT_BASE_SHA="c1868b139819e6364d65f862a843eb39489072a1"
 export CONTAINER_REPO_ROOT CONTAINER_RESULT_DIR
 
-readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly EXPERIMENT_DIR="${SCRIPT_DIR}"
-readonly REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+readonly SLURM_SUBMIT_DIR="${SLURM_SUBMIT_DIR:?submit this wrapper with sbatch from the repository checkout}"
+REPO_ROOT=$(git -C "${SLURM_SUBMIT_DIR}" rev-parse --show-toplevel)
+readonly REPO_ROOT
+readonly EXPERIMENT_DIR="${REPO_ROOT}/experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
 readonly RUN_ID="${SLURM_JOB_ID:?submit this wrapper with sbatch}${SLURM_RESTART_COUNT:+-r${SLURM_RESTART_COUNT}}"
 readonly RESULT_DIR="${EXPERIMENT_DIR}/results/${RUN_ID}"
 
@@ -44,23 +60,48 @@ if [[ ! -r "${IMAGE}" ]]; then
     exit 1
 fi
 
-if ! git -C "${REPO_ROOT}" diff --quiet || ! git -C "${REPO_ROOT}" diff --cached --quiet; then
-    echo "[ERROR] Refusing to run with tracked changes in the NeMo-RL checkout." >&2
+SOURCE_STATUS=$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal --ignore-submodules=none)
+readonly SOURCE_STATUS
+if [[ -n "${SOURCE_STATUS}" ]]; then
+    echo "[ERROR] Refusing to run with tracked changes or non-ignored untracked files:" >&2
+    printf '%s\n' "${SOURCE_STATUS}" >&2
     exit 1
 fi
 if ! git -C "${REPO_ROOT}" submodule foreach --quiet --recursive \
-    'git diff --quiet && git diff --cached --quiet'; then
-    echo "[ERROR] Refusing to run with tracked changes in a recursive submodule." >&2
+    'test -z "$(git status --porcelain --untracked-files=normal --ignore-submodules=none)"'; then
+    echo "[ERROR] Refusing to run with changes or non-ignored untracked files in a recursive submodule." >&2
     exit 1
 fi
 
-readonly IMAGE_SHA256="$(sha256sum "${IMAGE}" | awk '{print $1}')"
-readonly GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
-readonly GIT_BRANCH="$(git -C "${REPO_ROOT}" branch --show-current)"
-readonly GIT_REMOTE="$(git -C "${REPO_ROOT}" remote get-url origin)"
+SUBMODULE_STATUS=$(git -C "${REPO_ROOT}" submodule status --recursive)
+readonly SUBMODULE_STATUS
+while IFS= read -r line; do
+    if [[ -n "${line}" && "${line:0:1}" != " " ]]; then
+        echo "[ERROR] Recursive submodule is not clean and initialized: ${line}" >&2
+        exit 1
+    fi
+done <<< "${SUBMODULE_STATUS}"
 
-git -C "${REPO_ROOT}" status --short --branch > "${RESULT_DIR}/git_status_before.txt"
-git -C "${REPO_ROOT}" submodule status --recursive > "${RESULT_DIR}/submodule_status.txt"
+IMAGE_SHA256=$(sha256sum "${IMAGE}" | awk '{print $1}')
+readonly IMAGE_SHA256
+GIT_SHA=$(git -C "${REPO_ROOT}" rev-parse HEAD)
+readonly GIT_SHA
+GIT_BRANCH=$(git -C "${REPO_ROOT}" branch --show-current)
+readonly GIT_BRANCH
+GIT_REMOTE=$(git -C "${REPO_ROOT}" remote get-url origin)
+readonly GIT_REMOTE
+UPSTREAM_REF=$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')
+readonly UPSTREAM_REF
+UPSTREAM_SHA=$(git -C "${REPO_ROOT}" rev-parse '@{upstream}')
+readonly UPSTREAM_SHA
+if [[ "${GIT_SHA}" != "${UPSTREAM_SHA}" ]]; then
+    echo "[ERROR] HEAD ${GIT_SHA} does not match ${UPSTREAM_REF} at ${UPSTREAM_SHA}." >&2
+    exit 1
+fi
+
+git -C "${REPO_ROOT}" status --porcelain=v1 --branch --untracked-files=normal --ignore-submodules=none \
+    > "${RESULT_DIR}/git_status_before.txt"
+printf '%s\n' "${SUBMODULE_STATUS}" > "${RESULT_DIR}/submodule_status.txt"
 printf '%s  %s\n' "${IMAGE_SHA256}" "${IMAGE}" > "${RESULT_DIR}/image.sha256"
 
 readonly -a GRPO_OVERRIDES=(
@@ -93,6 +134,9 @@ export OCI_GATE_IMAGE="${IMAGE}"
 export OCI_GATE_IMAGE_SHA256="${IMAGE_SHA256}"
 export OCI_GATE_RECIPE="${RECIPE}"
 export OCI_GATE_RUN_ID="${RUN_ID}"
+export OCI_GATE_UPSTREAM_REF="${UPSTREAM_REF}"
+export OCI_GATE_UPSTREAM_SHA="${UPSTREAM_SHA}"
+export PARENT_BASE_SHA
 
 readonly -a SRUN=(
     srun
@@ -116,7 +160,8 @@ echo "[INFO] Creating the run-local Linux environment and recording provenance."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
-uv sync --frozen --extra mcore --group test
+uv sync --locked --extra mcore --group test --group dev
+uv lock --check 2>&1 | tee "${CONTAINER_RESULT_DIR}/uv_lock_check.log"
 mapfile -t grpo_overrides < "${CONTAINER_RESULT_DIR}/grpo_overrides.txt"
 uv run --no-sync python - "${grpo_overrides[@]}" <<'"'"'PY'"'"'
 import importlib.metadata
@@ -183,6 +228,8 @@ metadata = {
         "remote": os.environ["OCI_GATE_GIT_REMOTE"],
         "branch": os.environ["OCI_GATE_GIT_BRANCH"],
         "sha": os.environ["OCI_GATE_GIT_SHA"],
+        "upstream_ref": os.environ["OCI_GATE_UPSTREAM_REF"],
+        "upstream_sha": os.environ["OCI_GATE_UPSTREAM_SHA"],
         "status_before": (result_dir / "git_status_before.txt").read_text().splitlines(),
         "submodules": submodules,
     },
@@ -236,10 +283,38 @@ echo "[INFO] Running focused Linux tests before the GPU smoke and GRPO launch."
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
 uv run --no-sync pytest \
+    3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/models/test_param_mapping.py \
+    3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/tests/unit_tests/training/test_checkpointing.py \
     tests/unit/models/megatron/test_megatron_setup.py \
     tests/unit/models/megatron/test_community_import.py \
     tests/test_cutedsl_policy_recipe.py \
     -q 2>&1 | tee "${CONTAINER_RESULT_DIR}/focused_tests.log"
+
+uv run --no-sync pyrefly check 2>&1 | tee "${CONTAINER_RESULT_DIR}/pyrefly.log"
+
+git diff --name-only --diff-filter=ACMR "${PARENT_BASE_SHA}..HEAD" -- \
+    . ":(exclude)3rdparty/Megatron-Bridge-workspace/Megatron-Bridge" \
+    > "${CONTAINER_RESULT_DIR}/parent_changed_files.txt"
+mapfile -t parent_changed_files < "${CONTAINER_RESULT_DIR}/parent_changed_files.txt"
+if [[ ${#parent_changed_files[@]} -eq 0 ]]; then
+    echo "[ERROR] No changed parent files found for pre-commit validation." >&2
+    exit 1
+fi
+"${UV_PROJECT_ENVIRONMENT}/bin/pre-commit" run --files "${parent_changed_files[@]}" \
+    2>&1 | tee "${CONTAINER_RESULT_DIR}/parent_precommit.log"
+
+bridge_root="${CONTAINER_REPO_ROOT}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+git -C "${bridge_root}" diff --name-only --diff-filter=ACMR HEAD^..HEAD \
+    > "${CONTAINER_RESULT_DIR}/bridge_changed_files.txt"
+mapfile -t bridge_changed_files < "${CONTAINER_RESULT_DIR}/bridge_changed_files.txt"
+if [[ ${#bridge_changed_files[@]} -eq 0 ]]; then
+    echo "[ERROR] No changed Bridge files found for pre-commit validation." >&2
+    exit 1
+fi
+(
+    cd "${bridge_root}"
+    "${UV_PROJECT_ENVIRONMENT}/bin/pre-commit" run --files "${bridge_changed_files[@]}"
+) 2>&1 | tee "${CONTAINER_RESULT_DIR}/bridge_precommit.log"
 '
 
 echo "[INFO] Running the required Cutlass DSL import smoke."
@@ -264,14 +339,27 @@ assert actual_devices == expected_devices, f"expected {expected_devices} CUDA de
 print(f"PyTorch {torch.__version__}; CUDA {torch.version.cuda}; TE module {te.__file__}")
 for device_index in range(actual_devices):
     with torch.cuda.device(device_index):
-        lhs = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)
-        rhs = torch.randn((256, 256), device="cuda", dtype=torch.bfloat16)
-        output = lhs @ rhs
+        model = te.Linear(256, 512, bias=True).cuda(device_index)
+        model_input = torch.randn(
+            (32, 256), device=f"cuda:{device_index}", requires_grad=True
+        )
+        output = model(model_input)
+        loss = output.square().mean()
+        loss.backward()
         torch.cuda.synchronize()
-        assert torch.isfinite(output).all(), f"non-finite device-smoke output on CUDA device {device_index}"
+        assert torch.isfinite(output).all(), (
+            f"non-finite TE output on CUDA device {device_index}"
+        )
+        assert model_input.grad is not None and torch.isfinite(model_input.grad).all(), (
+            f"non-finite TE input gradient on CUDA device {device_index}"
+        )
+        for name, parameter in model.named_parameters():
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), (
+                f"missing or non-finite TE gradient {name} on CUDA device {device_index}"
+            )
         print(
             f"cuda:{device_index} {torch.cuda.get_device_name(device_index)} "
-            f"capability={torch.cuda.get_device_capability(device_index)} smoke=PASS"
+            f"capability={torch.cuda.get_device_capability(device_index)} TE forward/backward=PASS"
         )
 PY
 '
@@ -283,11 +371,16 @@ cd "${CONTAINER_REPO_ROOT}"
 export NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker"
 export NRL_NSYS_PROFILE_STEP_RANGE="2:3"
 export NRL_NSYS_EXTRA_OPTIONS='"'"'{"cuda-memory-usage":"true","cpuctxsw":"none"}'"'"'
+export RAY_TMPDIR="${CONTAINER_RESULT_DIR}/ray_tmp"
+export TMPDIR="${RAY_TMPDIR}"
+mkdir -p "${RAY_TMPDIR}"
 mapfile -t grpo_overrides < "${CONTAINER_RESULT_DIR}/grpo_overrides.txt"
+set +e
 uv run --no-sync examples/run_grpo.py \
     --config "${OCI_GATE_RECIPE}" \
     "${grpo_overrides[@]}" \
     2>&1 | tee "${CONTAINER_RESULT_DIR}/grpo.log"
+grpo_exit_code=${PIPESTATUS[0]}
 
 mkdir -p "${CONTAINER_RESULT_DIR}/nsight"
 : > "${CONTAINER_RESULT_DIR}/kernel_evidence.txt"
@@ -296,7 +389,13 @@ while IFS= read -r -d "" report; do
     printf "\n===== %s =====\n" "${report}" >> "${CONTAINER_RESULT_DIR}/kernel_evidence.txt"
     nsys stats --report cuda_gpu_kern_sum "${report}" \
         >> "${CONTAINER_RESULT_DIR}/kernel_evidence.txt" 2>&1 || true
-done < <(find /tmp/ray -type f -path '"'"'*/logs/nsight/*.nsys-rep'"'"' -print0 2>/dev/null)
+done < <(find "${RAY_TMPDIR}" -type f -path '"'"'*/logs/nsight/*.nsys-rep'"'"' -print0 2>/dev/null)
+find "${RAY_TMPDIR}" -type f -print > "${CONTAINER_RESULT_DIR}/ray_artifacts.txt" 2>/dev/null
+set -e
+if [[ ${grpo_exit_code} -ne 0 ]]; then
+    echo "[ERROR] GRPO exited with status ${grpo_exit_code}; preserved Ray/Nsight artifacts." >&2
+    exit "${grpo_exit_code}"
+fi
 
 uv run --no-sync tests/json_dump_tb_logs.py \
     "${CONTAINER_RESULT_DIR}/tensorboard" \
@@ -322,33 +421,52 @@ def values(name: str, *, post_warmup: bool = False) -> list[float]:
 
 losses = values("train/loss")
 grad_norms = values("train/grad_norm")
+optimizer_updates = values("train/optimizer_update_successful")
 policy_times = values("timing/train/policy_training", post_warmup=True)
 tokens_per_second = values("performance/policy_training_tokens_per_sec_per_gpu", post_warmup=True)
 memory_series = {
     name: [float(value) for value in series.values()]
     for name, series in metrics.items()
-    if "memory" in name.lower() and isinstance(series, dict)
+    if name.endswith(".mem_gb") and isinstance(series, dict)
 }
+peak_memory_metrics = {
+    name: max(series) for name, series in memory_series.items() if series
+}
+parity_thresholds = {
+    "gen_kl_error_max": 0.05,
+    "token_mult_prob_error_max": 2.0,
+}
+max_generation_kl_error = max(values("train/gen_kl_error"), default=None)
+max_token_mult_probability_error = max(
+    values("train/token_mult_prob_error"), default=None
+)
 
 summary = {
-    "completed_policy_updates": len(losses),
+    "successful_optimizer_updates": sum(value == 1.0 for value in optimizer_updates),
+    "optimizer_update_results": optimizer_updates,
     "losses_finite": bool(losses) and all(math.isfinite(value) for value in losses),
     "gradients_finite": bool(grad_norms) and all(math.isfinite(value) for value in grad_norms),
-    "max_generation_kl_error": max(values("train/gen_kl_error"), default=None),
-    "max_token_mult_probability_error": max(values("train/token_mult_prob_error"), default=None),
+    "parity_thresholds": parity_thresholds,
+    "max_generation_kl_error": max_generation_kl_error,
+    "max_token_mult_probability_error": max_token_mult_probability_error,
     "median_post_warmup_policy_training_time_s": statistics.median(policy_times) if policy_times else None,
     "median_post_warmup_policy_training_tokens_per_s_per_gpu": statistics.median(tokens_per_second) if tokens_per_second else None,
-    "peak_memory_metrics": {
-        name: max(series) for name, series in memory_series.items() if series
-    },
+    "peak_memory_metrics_gb": peak_memory_metrics,
     "nsight_reports": sorted(path.name for path in (result_dir / "nsight").glob("*.nsys-rep")),
     "kernel_evidence_file": "kernel_evidence.txt",
 }
 (result_dir / "metrics_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
-assert summary["completed_policy_updates"] >= 2, summary
+assert summary["successful_optimizer_updates"] >= 2, summary
 assert summary["losses_finite"], summary
 assert summary["gradients_finite"], summary
+assert max_generation_kl_error is not None, summary
+assert max_generation_kl_error < parity_thresholds["gen_kl_error_max"], summary
+assert max_token_mult_probability_error is not None, summary
+assert max_token_mult_probability_error < parity_thresholds["token_mult_prob_error_max"], summary
+assert policy_times, summary
+assert tokens_per_second, summary
+assert peak_memory_metrics, summary
 PY
 '
 
