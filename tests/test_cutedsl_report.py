@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -30,6 +31,37 @@ REQUIRED_PHASES = {
     "metrics_export",
     "complete",
 }
+
+
+class LinkCollector(HTMLParser):
+    """Collect href values from generated HTML for local-target verification."""
+
+    def __init__(self: "LinkCollector") -> None:
+        """Initialize an empty href collection."""
+        super().__init__()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(
+        self: "LinkCollector", tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        """Record each href on an anchor element."""
+        if tag != "a":
+            return
+        for name, value in attrs:
+            if name == "href" and value is not None:
+                self.hrefs.append(value)
+
+
+def assert_public_links_exist(public_dir: Path) -> None:
+    """Assert every generated public href resolves inside the public tree."""
+    public_root = public_dir.resolve()
+    for html_path in sorted(public_dir.rglob("*.html")):
+        collector = LinkCollector()
+        collector.feed(html_path.read_text())
+        for href in collector.hrefs:
+            target = (html_path.parent / href).resolve()
+            assert target.is_relative_to(public_root), (html_path, href)
+            assert target.exists(), (html_path, href)
 
 
 def load_renderer() -> ModuleType:
@@ -422,28 +454,36 @@ def test_aggregate_redacts_known_incident_credentials(tmp_path: Path) -> None:
 
 
 def test_event_writer_json_escapes_backslashes_exactly(tmp_path: Path) -> None:
-    """Literal, unknown-escape, and trailing backslashes remain valid JSON."""
+    """All Bash controls and literal backslashes round-trip through JSON."""
     result_dir = tmp_path / "run"
+    all_controls = "".join(chr(codepoint) for codepoint in range(1, 32))
     values = {
-        "CUTEDSL_TEST_MESSAGE": "windows=C:\\runtime\\unknown\\",
-        "CUTEDSL_TEST_ARTIFACT": "logs\\unknown\\",
-        "CUTEDSL_TEST_SYMPTOM": "symptom\\q\\",
-        "CUTEDSL_TEST_EVIDENCE": "evidence\\z\\",
-        "CUTEDSL_TEST_ROOT": "root\\cause\\",
-        "CUTEDSL_TEST_REPRODUCTION": "repro\\unknown\\",
-        "CUTEDSL_TEST_HYPOTHESIS": "hypothesis\\q\\",
-        "CUTEDSL_TEST_CHANGE": "change\\z\\",
-        "CUTEDSL_TEST_VERIFICATION": "verify\\end\\",
+        "CUTEDSL_TEST_MESSAGE": f"controls={all_controls}; path=C:\\runtime\\unknown\\",
+        "CUTEDSL_TEST_ARTIFACT": f"artifact={chr(1)}{chr(31)}\\unknown\\",
+        "CUTEDSL_TEST_SYMPTOM": f"symptom={chr(8)}{chr(12)}\\q\\",
+        "CUTEDSL_TEST_EVIDENCE": f"evidence={chr(27)}{chr(1)}\\z\\",
+        "CUTEDSL_TEST_ROOT": f"root={chr(31)}\\cause\\",
+        "CUTEDSL_TEST_REPRODUCTION": f"repro={chr(8)}\\unknown\\",
+        "CUTEDSL_TEST_HYPOTHESIS": f"hypothesis={chr(12)}\\q\\",
+        "CUTEDSL_TEST_CHANGE": f"change={chr(27)}\\z\\",
+        "CUTEDSL_TEST_VERIFICATION": f"verify={all_controls}\\end\\",
+        "CUTEDSL_TEST_RUN_ID": f"run={chr(1)}{chr(8)}{chr(12)}{chr(27)}{chr(31)}\\",
+        "CUTEDSL_TEST_JOB_ID": f"job={chr(31)}{chr(1)}\\",
     }
     command = f"""
 set -euo pipefail
 source {EVENTS_PATH!s}
-export CUTEDSL_EVENT_CLUSTER=pre_tyche CUTEDSL_EVENT_JOB_ID=123
+RUN_ID="$CUTEDSL_TEST_RUN_ID"
+SLURM_JOB_ID="$CUTEDSL_TEST_JOB_ID"
+RESULT_DIR={result_dir!s}
+export RUN_ID SLURM_JOB_ID RESULT_DIR
+export CUTEDSL_EVENT_CLUSTER=pre_tyche CUTEDSL_EVENT_JOB_ID="$SLURM_JOB_ID"
 cutedsl_events_init {result_dir!s}
 cutedsl_write_event gpu_smoke start '' "$CUTEDSL_TEST_MESSAGE" "$CUTEDSL_TEST_ARTIFACT"
 cutedsl_write_root_cause "$CUTEDSL_TEST_SYMPTOM" "$CUTEDSL_TEST_EVIDENCE" \
     "$CUTEDSL_TEST_ROOT" abc123 456 "$CUTEDSL_TEST_REPRODUCTION" \
     "$CUTEDSL_TEST_HYPOTHESIS" "$CUTEDSL_TEST_CHANGE" "$CUTEDSL_TEST_VERIFICATION"
+cutedsl_write_status 0
 """
     subprocess.run(["bash", "-c", command], check=True, env={**os.environ, **values})
     parsed = [
@@ -455,6 +495,9 @@ cutedsl_write_root_cause "$CUTEDSL_TEST_SYMPTOM" "$CUTEDSL_TEST_EVIDENCE" \
     assert parsed[0]["artifact"] == values["CUTEDSL_TEST_ARTIFACT"]
     assert parsed[1]["symptom"] == values["CUTEDSL_TEST_SYMPTOM"]
     assert parsed[1]["verification_evidence"] == values["CUTEDSL_TEST_VERIFICATION"]
+    status = json.loads((result_dir / "status.json").read_text())
+    assert status["run_id"] == values["CUTEDSL_TEST_RUN_ID"]
+    assert status["job_id"] == values["CUTEDSL_TEST_JOB_ID"]
 
 
 def test_early_failure_finalization_records_every_required_phase(
@@ -631,14 +674,63 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
     )
     events = failure_events()
     events[2]["hypothesis"] = "BUILD_TOKEN=SENTINEL_COLLECTOR_TOKEN_104"
+    events.append(
+        {
+            "timestamp_utc": "2026-07-11T18:12:00Z",
+            "cluster": "pre_tyche",
+            "job_id": "123",
+            "phase": "runtime_diagnostic",
+            "status": "fail",
+            "exit_code": 1,
+            "message": "COOKIE=SENTINEL_ARBITRARY_COOKIE_105",
+            "artifact": "credentials.txt",
+        }
+    )
     (run_dir / "events.jsonl").write_text(
         "".join(json.dumps(event) + "\n" for event in events)
+    )
+    write_json(
+        run_dir / "metrics_summary.json",
+        {
+            "median_post_warmup_policy_training_time_s": 1.25,
+            "BUILD_TOKEN": "SENTINEL_STRUCTURED_TOKEN_106",
+        },
+    )
+    profile_dir = run_dir / "profiles/0-on"
+    (profile_dir / "nsight").mkdir(parents=True)
+    write_json(
+        profile_dir / "profile_summary.json",
+        {
+            "arm": "on",
+            "nsight_report_count": 1,
+            "kernel_evidence": "kernel_evidence.txt",
+        },
+    )
+    (profile_dir / "kernel_evidence.txt").write_text(
+        "OVERSIZED_EVIDENCE_SENTINEL_107\n" + "x" * 100_000
+    )
+    (profile_dir / "nsight/worker.nsys-rep").write_bytes(b"NSYS_BINARY_SENTINEL_108")
+    (run_dir / "credentials.txt").write_text("SENTINEL_ARBITRARY_FILE_109\n")
+    (run_dir / "symlinked_credentials.raw").write_text(
+        "SYMLINKED_CREDENTIAL_SENTINEL_112\n"
+    )
+    (run_dir / "topology.txt").symlink_to("symlinked_credentials.raw")
+    (run_dir / "slurm.out").write_text(
+        "RAW_SLURM_PREFIX_SENTINEL_110\n"
+        + "y" * 40_000
+        + "\nAWS_SECRET_ACCESS_KEY=SENTINEL_SLURM_SECRET_111\n"
     )
 
     renderer = load_renderer()
     renderer.refresh_aggregate(experiment_dir)
     first_index = (experiment_dir / "report/run_index.tsv").read_text()
     first_incidents = (experiment_dir / "report/incidents.json").read_text()
+    public_dir = experiment_dir / "report/public"
+    first_public_tree = {
+        path.relative_to(public_dir).as_posix(): path.read_bytes()
+        for path in sorted(public_dir.rglob("*"))
+        if path.is_file()
+    }
     renderer.refresh_aggregate(experiment_dir)
 
     assert "123" in first_index
@@ -647,10 +739,37 @@ def test_refresh_aggregate_discovers_completed_runs_and_incidents(
     assert "SENTINEL_COLLECTOR_TOKEN_104" not in first_incidents
     assert first_index == (experiment_dir / "report/run_index.tsv").read_text()
     assert first_incidents == (experiment_dir / "report/incidents.json").read_text()
-    index = (experiment_dir / "report/public/index.html").read_text()
+    second_public_tree = {
+        path.relative_to(public_dir).as_posix(): path.read_bytes()
+        for path in sorted(public_dir.rglob("*"))
+        if path.is_file()
+    }
+    assert first_public_tree == second_public_tree
+    assert_public_links_exist(public_dir)
+    index = (public_dir / "index.html").read_text()
     assert "123" in index
     assert "UV_PROJECT_ENVIRONMENT mismatch" in index
     assert "--refresh-experiment-dir" in index
+    public_bytes = b"\n".join(second_public_tree.values())
+    for sentinel in (
+        b"SENTINEL_COLLECTOR_TOKEN_104",
+        b"SENTINEL_ARBITRARY_COOKIE_105",
+        b"SENTINEL_STRUCTURED_TOKEN_106",
+        b"OVERSIZED_EVIDENCE_SENTINEL_107",
+        b"NSYS_BINARY_SENTINEL_108",
+        b"SENTINEL_ARBITRARY_FILE_109",
+        b"RAW_SLURM_PREFIX_SENTINEL_110",
+        b"SENTINEL_SLURM_SECRET_111",
+        b"SYMLINKED_CREDENTIAL_SENTINEL_112",
+    ):
+        assert sentinel not in public_bytes
+    staged_run = public_dir / "runs/results/123"
+    assert (staged_run / "status.json").is_file()
+    assert (staged_run / "events.jsonl").is_file()
+    assert (staged_run / "metrics_summary.json").is_file()
+    assert (staged_run / "slurm.out").stat().st_size <= renderer.MAX_EXCERPT_BYTES
+    assert not (staged_run / "credentials.txt").exists()
+    assert not list(staged_run.rglob("*.nsys-rep"))
 
 
 def test_matrix_report_renders_scheduler_and_complete_parallel_topology(

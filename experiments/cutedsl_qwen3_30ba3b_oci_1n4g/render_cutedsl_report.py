@@ -31,6 +31,22 @@ REQUIRED_PHASES = {
 }
 MAX_EXCERPT_BYTES = 16_384
 MAX_EXCERPT_LINES = 120
+MAX_PUBLIC_TEXT_BYTES = 65_536
+MAX_PUBLIC_STRUCTURED_BYTES = 1_048_576
+PUBLIC_JSON_ALLOWLIST = (
+    "status.json",
+    "metadata.json",
+    "benchmark_manifest.json",
+    "timing_summary.json",
+    "metrics_summary.json",
+    "matched_config_diff.json",
+)
+PUBLIC_TEXT_ALLOWLIST = (
+    "image.sha256",
+    "kernel_evidence.txt",
+    "timing_order.txt",
+    "topology.txt",
+)
 SENSITIVE_NAME_PATTERN = re.compile(
     r"(?i)(?:secret|token|password|passwd|private[_-]?key|api[_-]?key|"
     r"access[_-]?key|cookie|session|authorization|auth)"
@@ -175,6 +191,18 @@ def artifact_link(path: str | None, label: str | None = None) -> str:
     if not is_descendant:
         return f"<code>{escape(path)}</code>"
     return f'<a href="{escape(path)}">{escape(label or path)}</a>'
+
+
+def existing_artifact_link(
+    run_dir: Path, path: str | None, label: str | None = None
+) -> str:
+    """Link only an existing normalized file contained by the run directory."""
+    if not path or "<a href=" not in artifact_link(path, label):
+        return f"<code>{escape(path)}</code>" if path else "—"
+    target = (run_dir / path).resolve()
+    if not target.is_relative_to(run_dir.resolve()) or not target.is_file():
+        return f"<code>{escape(path)}</code>"
+    return artifact_link(path, label)
 
 
 def read_bounded_excerpt(path: Path) -> str:
@@ -333,13 +361,14 @@ def profile_section(run_dir: Path, metrics: dict[str, Any]) -> str:
         evidence_path = str(relative_dir / str(evidence)) if evidence else None
         rows.append(
             f"<tr><td>{escape(summary.get('arm'))}</td><td>{escape(summary.get('nsight_report_count'))}</td>"
-            f"<td>{artifact_link(evidence_path)}</td></tr>"
+            f"<td>{existing_artifact_link(run_dir, evidence_path)}</td></tr>"
         )
     reports = metrics.get("nsight_reports", [])
     if isinstance(reports, list) and reports:
         evidence = metrics.get("kernel_evidence_file")
         rows.append(
-            f"<tr><td>functional</td><td>{len(reports)}</td><td>{artifact_link(str(evidence) if evidence else None)}</td></tr>"
+            f"<tr><td>functional</td><td>{len(reports)}</td>"
+            f"<td>{existing_artifact_link(run_dir, str(evidence) if evidence else None)}</td></tr>"
         )
     if not rows:
         return (
@@ -398,15 +427,15 @@ def completeness_section(events: list[dict[str, Any]]) -> str:
     )
 
 
-def timeline_section(events: list[dict[str, Any]]) -> str:
+def timeline_section(run_dir: Path, events: list[dict[str, Any]]) -> str:
     """Render the chronological incident and phase history."""
     if not events:
         return '<h2>Chronological incident history</h2><p class="muted">No events recorded.</p>'
     items = []
     for event in events:
         event_class = "event fail-event" if event.get("status") == "fail" else "event"
-        artifact = artifact_link(
-            str(event["artifact"]) if event.get("artifact") else None
+        artifact = existing_artifact_link(
+            run_dir, str(event["artifact"]) if event.get("artifact") else None
         )
         items.append(
             f'<div class="{event_class}"><time>{escape(event.get("timestamp_utc"))}</time> '
@@ -436,11 +465,11 @@ def reproducibility_section(
         "slurm.out",
     ]
     linked = [candidate for candidate in candidates if (run_dir / candidate).exists()]
-    event_artifacts = {
-        str(event["artifact"])
-        for event in events
-        if event.get("artifact") and not Path(str(event["artifact"])).is_absolute()
-    }
+    event_artifacts = set()
+    for event in events:
+        artifact = str(event["artifact"]) if event.get("artifact") else None
+        if artifact and "<a href=" in existing_artifact_link(run_dir, artifact):
+            event_artifacts.add(artifact)
     linked.extend(sorted(event_artifacts - set(linked)))
     links = (
         " · ".join(artifact_link(path) for path in linked)
@@ -481,7 +510,7 @@ def render_run(run_dir: Path) -> Path:
             profile_section(run_dir, metrics),
             root_cause_section(events, failed),
             completeness_section(events),
-            timeline_section(events),
+            timeline_section(run_dir, events),
             excerpt_section,
             reproducibility_section(run_dir, metadata, manifest, events),
         ]
@@ -534,6 +563,94 @@ def feature_cell(metadata: dict[str, Any], manifest: dict[str, Any]) -> str:
     return str(value)
 
 
+def write_public_json(source: Path, destination: Path) -> None:
+    """Write one size-bounded structured JSON artifact with values redacted."""
+    if source.is_symlink():
+        raise ValueError(f"Refusing symlinked structured public artifact: {source}")
+    if source.stat().st_size > MAX_PUBLIC_STRUCTURED_BYTES:
+        raise ValueError(f"Structured public artifact exceeds size bound: {source}")
+    try:
+        value = json.loads(source.read_text())
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Malformed JSON in {source}: {error}") from error
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(redact_value(value), indent=2, sort_keys=True) + "\n"
+    )
+
+
+def write_public_events(source: Path, destination: Path) -> None:
+    """Write size-bounded JSONL events after recursive value redaction."""
+    if source.is_symlink():
+        raise ValueError(f"Refusing symlinked structured public artifact: {source}")
+    if source.stat().st_size > MAX_PUBLIC_STRUCTURED_BYTES:
+        raise ValueError(f"Structured public artifact exceeds size bound: {source}")
+    events = read_events(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        "".join(
+            json.dumps(redact_value(event), sort_keys=True) + "\n" for event in events
+        )
+    )
+
+
+def copy_public_text(source: Path, destination: Path) -> bool:
+    """Copy one allowlisted UTF-8 text artifact when it is within the size bound."""
+    if (
+        not source.is_file()
+        or source.is_symlink()
+        or source.stat().st_size > MAX_PUBLIC_TEXT_BYTES
+    ):
+        return False
+    try:
+        content = source.read_text()
+    except UnicodeDecodeError:
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(redact_text(content))
+    return True
+
+
+def bounded_utf8_tail(value: str, maximum_bytes: int) -> str:
+    """Return a UTF-8-safe tail whose encoded size does not exceed a bound."""
+    encoded = value.encode()
+    if len(encoded) <= maximum_bytes:
+        return value
+    return encoded[-maximum_bytes:].decode(errors="ignore")
+
+
+def stage_public_run(source_run: Path, public_run: Path) -> Path:
+    """Build a redacted, allowlisted public run tree and render its report."""
+    if public_run.exists():
+        shutil.rmtree(public_run)
+    public_run.mkdir(parents=True)
+
+    for name in PUBLIC_JSON_ALLOWLIST:
+        source = source_run / name
+        if source.is_file():
+            write_public_json(source, public_run / name)
+    events_source = source_run / "events.jsonl"
+    if events_source.is_file():
+        write_public_events(events_source, public_run / "events.jsonl")
+    slurm_source = source_run / "slurm.out"
+    if slurm_source.is_file() and not slurm_source.is_symlink():
+        excerpt = bounded_utf8_tail(
+            read_bounded_excerpt(slurm_source), MAX_EXCERPT_BYTES
+        )
+        (public_run / "slurm.out").write_text(excerpt)
+    for name in PUBLIC_TEXT_ALLOWLIST:
+        copy_public_text(source_run / name, public_run / name)
+
+    for summary_source in sorted(source_run.glob("profiles/*/profile_summary.json")):
+        relative = summary_source.relative_to(source_run)
+        write_public_json(summary_source, public_run / relative)
+        evidence_source = summary_source.parent / "kernel_evidence.txt"
+        evidence_destination = public_run / relative.parent / "kernel_evidence.txt"
+        copy_public_text(evidence_source, evidence_destination)
+
+    return render_run(public_run)
+
+
 def refresh_aggregate(experiment_dir: Path) -> Path:
     """Discover completed runs and deterministically rebuild aggregate evidence."""
     report_dir = experiment_dir / "report"
@@ -559,18 +676,20 @@ def refresh_aggregate(experiment_dir: Path) -> Path:
         category_dir = experiment_dir / category
         if not category_dir.is_dir():
             continue
-        for run_dir in sorted(path for path in category_dir.iterdir() if path.is_dir()):
+        for run_dir in sorted(
+            path
+            for path in category_dir.iterdir()
+            if path.is_dir() and not path.is_symlink()
+        ):
             if not (run_dir / "status.json").is_file():
                 continue
             status = read_json(run_dir / "status.json")
             metadata = read_json(run_dir / "metadata.json")
             manifest = read_json(run_dir / "benchmark_manifest.json")
             events = read_events(run_dir / "events.jsonl")
-            rendered = render_run(run_dir)
             public_relative = Path("runs") / category / run_dir.name / "report.html"
-            public_copy = report_dir / "public" / public_relative
-            public_copy.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(rendered, public_copy)
+            public_run = (report_dir / "public" / public_relative).parent
+            stage_public_run(run_dir, public_run)
 
             run_id = str(
                 status.get(

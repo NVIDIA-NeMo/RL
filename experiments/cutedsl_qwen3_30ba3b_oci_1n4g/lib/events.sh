@@ -17,12 +17,35 @@ readonly -a CUTEDSL_REQUIRED_EVENT_PHASES=(
 
 _cutedsl_json_escape() {
     local value=${1-}
-    value=${value//\\/\\\\}
-    value=${value//\"/\\\"}
-    value=${value//$'\n'/\\n}
-    value=${value//$'\r'/\\r}
-    value=${value//$'\t'/\\t}
-    printf '%s' "${value}"
+    local output=
+    local character
+    local codepoint
+    local escaped
+    local LC_ALL=C
+
+    while [[ -n "${value}" ]]; do
+        character=${value:0:1}
+        value=${value:1}
+        case "${character}" in
+            $'\\') output+='\\' ;;
+            '"') output+='\"' ;;
+            $'\b') output+='\b' ;;
+            $'\f') output+='\f' ;;
+            $'\n') output+='\n' ;;
+            $'\r') output+='\r' ;;
+            $'\t') output+='\t' ;;
+            *)
+                printf -v codepoint '%d' "'${character}"
+                if ((codepoint >= 1 && codepoint <= 31)); then
+                    printf -v escaped '\\u%04x' "${codepoint}"
+                    output+="${escaped}"
+                else
+                    output+="${character}"
+                fi
+                ;;
+        esac
+    done
+    printf '%s' "${output}"
 }
 
 _cutedsl_json_string_or_null() {
