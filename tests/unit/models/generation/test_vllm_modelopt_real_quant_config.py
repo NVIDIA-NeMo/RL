@@ -20,7 +20,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import yaml
 
 from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
     _canonicalize_nvfp4_weight_scale,
@@ -905,38 +904,28 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("recipe", "expected_cfg"),
-    [
-        ("kv_cache_fp8.yaml", {"num_bits": "e4m3"}),
-        (
-            "kv_cache_nvfp4.yaml",
-            {
-                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": "e4m3"},
-                "num_bits": "e2m1",
-            },
-        ),
-    ],
+    ("recipe", "num_bits"),
+    [("kv_cache_fp8.yaml", (4, 3)), ("kv_cache_nvfp4.yaml", (2, 1))],
 )
-def test_resolve_kv_cache_quant_recipe(recipe, expected_cfg):
+def test_resolve_kv_cache_quant_recipe(recipe, num_bits):
     repo_root = Path(__file__).resolve().parents[4]
-    recipe_path = repo_root / "examples/modelopt/quant_configs" / recipe
 
-    authored_config = yaml.safe_load(recipe_path.read_text())
-    assert authored_config["quantize"] == {
-        "algorithm": "max",
-        "quant_cfg": [
-            {"quantizer_name": "*", "enable": False},
-            {
-                "quantizer_name": "*[kv]_bmm_quantizer",
-                "enable": True,
-                "cfg": expected_cfg,
-            },
-        ],
-    }
+    config = resolve_quant_cfg(
+        str((repo_root / "examples/modelopt/quant_configs" / recipe).resolve())
+    )
 
-    config = resolve_quant_cfg(str(recipe_path.resolve()))
+    kv_config = config["quant_cfg"][1]
     assert config["algorithm"] == "max"
-    assert config["quant_cfg"]
+    assert config["quant_cfg"][0] == {"quantizer_name": "*", "enable": False}
+    assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
+    assert kv_config["enable"] is True
+    assert kv_config["cfg"]["num_bits"] == num_bits
+    if recipe == "kv_cache_nvfp4.yaml":
+        assert kv_config["cfg"]["block_sizes"] == {
+            -1: 16,
+            "type": "dynamic",
+            "scale_bits": (4, 3),
+        }
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
