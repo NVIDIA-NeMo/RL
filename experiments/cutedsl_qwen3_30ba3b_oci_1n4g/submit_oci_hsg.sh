@@ -45,6 +45,25 @@ readonly RESULT_DIR="${EXPERIMENT_DIR}/results/${RUN_ID}"
 readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl/${RUN_ID}"
 
 mkdir -p "${RESULT_DIR}" "${HOST_RUNTIME_DIR}"
+cat > "${HOST_RUNTIME_DIR}/log_runtime_environment.sh" <<'BASH'
+printf '[INFO] Runtime environment: VIRTUAL_ENV=%s UV_PROJECT_ENVIRONMENT=%s RUNTIME_PYTHON=%s\n' \
+    "${VIRTUAL_ENV-<unset>}" "${UV_PROJECT_ENVIRONMENT-<unset>}" "${RUNTIME_PYTHON-<unset>}"
+runtime_uv_version='<unavailable>'
+runtime_python_version='<unavailable>'
+runtime_python_realpath='<unavailable>'
+runtime_python_prefix='<unavailable>'
+if [[ -x "${UV_BIN-}" ]]; then
+    runtime_uv_version=$("${UV_BIN}" --version 2>&1)
+fi
+if [[ -x "${RUNTIME_PYTHON-}" ]]; then
+    runtime_python_version=$("${RUNTIME_PYTHON}" --version 2>&1)
+    runtime_python_realpath=$("${RUNTIME_PYTHON}" -c "import os, sys; print(os.path.realpath(sys.executable))" 2>&1)
+    runtime_python_prefix=$("${RUNTIME_PYTHON}" -c "import sys; print(sys.prefix)" 2>&1)
+fi
+printf '[INFO] Runtime versions: uv=%s python=%s\n' "${runtime_uv_version}" "${runtime_python_version}"
+printf '[INFO] Runtime Python: realpath=%s prefix=%s\n' "${runtime_python_realpath}" "${runtime_python_prefix}"
+unset runtime_uv_version runtime_python_version runtime_python_realpath runtime_python_prefix
+BASH
 exec > >(tee "${RESULT_DIR}/slurm.out") 2>&1
 
 on_exit() {
@@ -157,7 +176,7 @@ readonly -a SRUN=(
     --cpus-per-task=72
     --mpi=pmix
     --container-image="${IMAGE}"
-    --container-env=VIRTUAL_ENV
+    --container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT
     --container-mounts="${REPO_ROOT}:${CONTAINER_REPO_ROOT},${RESULT_DIR}:${CONTAINER_RESULT_DIR},${HOST_RUNTIME_DIR}:${CONTAINER_RUNTIME_DIR}"
     --container-workdir="${CONTAINER_REPO_ROOT}"
 )
@@ -177,6 +196,7 @@ curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 "${UV_BIN}" python install "${UV_PYTHON_VERSION}"
 "${UV_BIN}" python find "${UV_PYTHON_VERSION}"
 "${UV_BIN}" sync --locked --extra mcore --group test --group dev --python "${UV_PYTHON_VERSION}"
+source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
@@ -305,6 +325,7 @@ echo "[INFO] Running focused Linux tests before the GPU smoke and GRPO launch."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
@@ -351,6 +372,7 @@ echo "[INFO] Running the required Cutlass DSL import smoke."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
@@ -366,6 +388,7 @@ echo "[INFO] Running the four-GPU PyTorch and Transformer Engine device smoke."
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
@@ -412,6 +435,7 @@ echo "[INFO] Launching the three-update GRPO gate with a step-2 policy-worker Ns
 "${SRUN[@]}" bash -lc '
 set -euo pipefail
 cd "${CONTAINER_REPO_ROOT}"
+source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
 expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')

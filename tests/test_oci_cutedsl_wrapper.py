@@ -147,9 +147,15 @@ def test_functional_and_benchmark_force_runtime_interpreter_across_srun() -> Non
         assert version_assertion_count == srun_count
 
 
-def test_pyxis_explicitly_overrides_image_virtual_env() -> None:
-    image_env = {"VIRTUAL_ENV": "/opt/nemo_rl_venv"}
-    host_env = {"VIRTUAL_ENV": "/runtime/venv"}
+def test_pyxis_explicitly_overrides_image_runtime_environment() -> None:
+    image_env = {
+        "VIRTUAL_ENV": "/opt/nemo_rl_venv",
+        "UV_PROJECT_ENVIRONMENT": "/opt/nemo_rl_venv",
+    }
+    host_env = {
+        "VIRTUAL_ENV": "/runtime/venv",
+        "UV_PROJECT_ENVIRONMENT": "/runtime/venv",
+    }
 
     def pyxis_container_env(script: str) -> dict[str, str]:
         resolved = image_env.copy()
@@ -159,10 +165,61 @@ def test_pyxis_explicitly_overrides_image_virtual_env() -> None:
                 resolved[name] = host_env[name]
         return resolved
 
-    assert image_env["VIRTUAL_ENV"] == "/opt/nemo_rl_venv"
     for script in (SCRIPT, BENCHMARK_SCRIPT):
-        assert script.count("--container-env=VIRTUAL_ENV") == 1
-        assert pyxis_container_env(script)["VIRTUAL_ENV"] == "/runtime/venv"
+        expected_option = "--container-env=VIRTUAL_ENV,UV_PROJECT_ENVIRONMENT"
+        assert script.count(expected_option) == 1
+        assert not re.search(
+            r"^\s*--container-env=VIRTUAL_ENV\s*$", script, re.MULTILINE
+        )
+        resolved = pyxis_container_env(script)
+        assert resolved["VIRTUAL_ENV"] == "/runtime/venv"
+        assert resolved["UV_PROJECT_ENVIRONMENT"] == "/runtime/venv"
+
+
+def test_runtime_diagnostics_precede_each_srun_environment_assertion() -> None:
+    for script in (SCRIPT, BENCHMARK_SCRIPT):
+        srun_count = script.count('"${SRUN[@]}"')
+        required_diagnostics = (
+            "[INFO] Runtime environment:",
+            "[INFO] Runtime versions:",
+            "[INFO] Runtime Python:",
+            '"${VIRTUAL_ENV-<unset>}"',
+            '"${UV_PROJECT_ENVIRONMENT-<unset>}"',
+            '"${RUNTIME_PYTHON-<unset>}"',
+            '"${UV_BIN}" --version',
+            'os.path.realpath(sys.executable)',
+            "print(sys.prefix)",
+        )
+        for fragment in required_diagnostics:
+            assert fragment in script, fragment
+
+        diagnostic_call_positions = [
+            match.start()
+            for match in re.finditer(
+                re.escape(
+                    'source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"'
+                ),
+                script,
+            )
+        ]
+        assertion_positions = [
+            match.start()
+            for match in re.finditer(
+                re.escape('[[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]'),
+                script,
+            )
+        ]
+
+        assert len(diagnostic_call_positions) == srun_count
+        assert len(assertion_positions) == srun_count
+        assert all(
+            diagnostic < assertion
+            for diagnostic, assertion in zip(
+                diagnostic_call_positions,
+                assertion_positions,
+                strict=True,
+            )
+        )
 
 
 def test_wrapper_keeps_high_churn_runtime_off_lustre_across_srun_steps() -> None:
