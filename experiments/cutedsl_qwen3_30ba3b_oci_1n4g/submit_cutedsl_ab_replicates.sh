@@ -21,7 +21,7 @@ if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "--test-only" ) ]]; then
 fi
 
 REPLICATES="${CUTEDSL_BENCHMARK_REPLICATES:-3}"
-WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-3}"
+WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-5}"
 MEASURED_UPDATES="${CUTEDSL_BENCHMARK_MEASURED_UPDATES:-20}"
 PROFILE_ENABLED="${CUTEDSL_BENCHMARK_PROFILE:-1}"
 readonly REPLICATES
@@ -41,19 +41,27 @@ sbatch_args=()
 while IFS= read -r argument; do
     sbatch_args+=("${argument}")
 done <<< "${CUTEDSL_SBATCH_ARGS}"
-sbatch_args+=("--time=${CUTEDSL_BENCHMARK_TIME}")
+sbatch_args+=(
+    "--job-name=${CUTEDSL_ACCOUNT}-cutedsl.ab"
+    "--time=${CUTEDSL_BENCHMARK_TIME}"
+)
+TEST_ONLY=0
 if [[ ${1-} == "--test-only" ]]; then
     sbatch_args+=("--test-only")
+    TEST_ONLY=1
 fi
+readonly TEST_ONLY
 SUBMISSION_GROUP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 readonly SUBMISSION_GROUP
-readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/benchmark_submissions"
+readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/results/benchmark/submissions"
 readonly SUBMISSION_RECORD="${SUBMISSION_DIR}/${SUBMISSION_GROUP}.jsonl"
 EXPORT_PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/cutedsl-benchmark-export.XXXXXX")
 readonly EXPORT_PAYLOAD
 trap 'rm -f "${EXPORT_PAYLOAD}"' EXIT
 chmod 600 "${EXPORT_PAYLOAD}"
-mkdir -p "${SUBMISSION_DIR}"
+if [[ "${TEST_ONLY}" == "0" ]]; then
+    mkdir -p "${SUBMISSION_DIR}"
+fi
 
 for ((replicate_index = 0; replicate_index < REPLICATES; replicate_index++)); do
     if ((replicate_index % 2 == 0)); then
@@ -83,9 +91,17 @@ for ((replicate_index = 0; replicate_index < REPLICATES; replicate_index++)); do
     job_id=$(sbatch --parsable "${sbatch_args[@]}" \
         --export-file="${EXPORT_PAYLOAD}" \
         "${BENCHMARK_SCRIPT}")
-    printf '{"replicate_index":%d,"timing_order":"%s","job_id":"%s","submission_group":"%s"}\n' \
-        "${replicate_index}" "${timing_order}" "${job_id}" "${SUBMISSION_GROUP}" \
-        | tee -a "${SUBMISSION_RECORD}"
+    record=$(printf \
+        '{"replicate_index":%d,"timing_order":"%s","job_id":"%s","submission_group":"%s"}' \
+        "${replicate_index}" "${timing_order}" "${job_id}" "${SUBMISSION_GROUP}")
+    printf '%s\n' "${record}"
+    if [[ "${TEST_ONLY}" == "0" ]]; then
+        printf '%s\n' "${record}" >> "${SUBMISSION_RECORD}"
+    fi
 done
 
-echo "[INFO] Submitted ${REPLICATES} matched paired jobs. Record: ${SUBMISSION_RECORD}"
+if [[ "${TEST_ONLY}" == "1" ]]; then
+    echo "[INFO] Validated ${REPLICATES} matched paired job requests; no submission record persisted."
+else
+    echo "[INFO] Submitted ${REPLICATES} matched paired jobs. Record: ${SUBMISSION_RECORD}"
+fi

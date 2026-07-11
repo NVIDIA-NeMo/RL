@@ -30,7 +30,11 @@ sbatch_args=()
 while IFS= read -r argument; do
     sbatch_args+=("${argument}")
 done <<< "${CUTEDSL_SBATCH_ARGS}"
-sbatch_args+=("--time=${CUTEDSL_FUNCTIONAL_TIME}" "--export=ALL")
+sbatch_args+=(
+    "--job-name=${CUTEDSL_ACCOUNT}-cutedsl.func"
+    "--time=${CUTEDSL_FUNCTIONAL_TIME}"
+    "--export=ALL"
+)
 if [[ ${1-} == "--test-only" ]]; then
     sbatch_args+=("--test-only")
 fi

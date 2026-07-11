@@ -43,10 +43,10 @@ source "${EXPERIMENT_DIR}/lib/events.sh"
 load_cutedsl_cluster_profile
 readonly IMAGE="${CUTEDSL_IMAGE}"
 readonly RUN_ID="${SLURM_JOB_ID:?submit this benchmark with sbatch}${SLURM_RESTART_COUNT:+-r${SLURM_RESTART_COUNT}}"
-readonly RESULT_DIR="${EXPERIMENT_DIR}/benchmark_results/${RUN_ID}"
+readonly RESULT_DIR="${EXPERIMENT_DIR}/results/${RUN_ID}"
 readonly HOST_RUNTIME_DIR="/tmp/${USER}/nemo-2606-cutedsl-benchmark/${RUN_ID}"
 
-WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-3}"
+WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-5}"
 MEASURED_UPDATES="${CUTEDSL_BENCHMARK_MEASURED_UPDATES:-20}"
 TIMING_ORDER="${CUTEDSL_BENCHMARK_ORDER:-on,off}"
 PROFILE_ENABLED="${CUTEDSL_BENCHMARK_PROFILE:-1}"
@@ -74,8 +74,8 @@ trap on_exit EXIT
 
 cutedsl_write_event preflight start '' "Validate benchmark controls, source, and image" slurm.out
 
-if [[ ! "${WARMUP_UPDATES}" =~ ^[0-9]+$ ]] || ((WARMUP_UPDATES < 3)); then
-    echo "[ERROR] CUTEDSL_BENCHMARK_WARMUP_UPDATES must be an integer >= 3." >&2
+if [[ ! "${WARMUP_UPDATES}" =~ ^[0-9]+$ ]] || ((WARMUP_UPDATES < 5)); then
+    echo "[ERROR] CUTEDSL_BENCHMARK_WARMUP_UPDATES must be an integer >= 5." >&2
     exit 1
 fi
 if [[ ! "${MEASURED_UPDATES}" =~ ^[0-9]+$ ]] || ((MEASURED_UPDATES < 10)); then
@@ -462,6 +462,7 @@ run_timing_arm() {
         --output_path "${arm_dir}/metrics.json"
 
     "${UV_BIN}" run --active --no-sync python - "${arm_dir}" <<'PY'
+# CUTEDSL_METRIC_EXTRACTOR_START
 import csv
 import json
 import os
@@ -473,42 +474,100 @@ arm_dir = Path(sys.argv[1])
 metrics = json.loads((arm_dir / "metrics.json").read_text())
 WARMUP_UPDATES = int(os.environ["WARMUP_UPDATES"])
 MEASURED_UPDATES = int(os.environ["MEASURED_UPDATES"])
+TOTAL_STEP_METRIC = "timing/train/total_step_time"
+GENERATION_METRIC = "timing/train/generation"
+LOGPROB_METRIC = "timing/train/get_logprobs"
 POLICY_TIME_METRIC = "timing/train/policy_training"
+REFIT_METRIC = "timing/train/prepare_for_generation/transfer_and_update_weights"
 TOKEN_COUNT_METRIC = "train/total_num_tokens"
 VALID_TOKEN_COUNT_METRIC = "train/global_valid_toks"
 NORMALIZED_THROUGHPUT_METRIC = "performance/policy_training_tokens_per_sec_per_gpu"
+METRIC_ALIASES = {
+    TOTAL_STEP_METRIC: (TOTAL_STEP_METRIC,),
+    GENERATION_METRIC: (GENERATION_METRIC,),
+    LOGPROB_METRIC: (
+        LOGPROB_METRIC,
+        "timing/train/policy_and_reference_logprobs",
+    ),
+    POLICY_TIME_METRIC: (POLICY_TIME_METRIC,),
+    REFIT_METRIC: (REFIT_METRIC,),
+    NORMALIZED_THROUGHPUT_METRIC: (NORMALIZED_THROUGHPUT_METRIC,),
+    TOKEN_COUNT_METRIC: (TOKEN_COUNT_METRIC,),
+    VALID_TOKEN_COUNT_METRIC: (VALID_TOKEN_COUNT_METRIC,),
+}
 
 
-def ordered_values(name: str) -> list[tuple[int, float]]:
-    series = metrics.get(name, {})
+def resolve_metric_name(canonical_name: str) -> str:
+    candidates = METRIC_ALIASES[canonical_name]
+    resolved = [name for name in candidates if name in metrics]
+    if not resolved:
+        raise KeyError(
+            f"required metric {canonical_name!r} not found; "
+            f"accepted source names: {candidates!r}; "
+            f"available metrics: {sorted(metrics)!r}"
+        )
+    if len(resolved) != 1:
+        raise ValueError(
+            f"required metric {canonical_name!r} is ambiguous; "
+            f"resolved source names: {resolved!r}"
+        )
+    return resolved[0]
+
+
+def ordered_values(source_name: str) -> list[tuple[int, float]]:
+    series = metrics[source_name]
     return sorted((int(step), float(value)) for step, value in series.items())
 
 
-def measured_points(name: str) -> list[tuple[int, float]]:
-    points = ordered_values(name)[WARMUP_UPDATES:]
-    assert len(points) == MEASURED_UPDATES, {
-        "metric": name,
-        "warmup_updates": WARMUP_UPDATES,
-        "measured_updates_expected": MEASURED_UPDATES,
-        "measured_values_found": len(points),
-    }
-    return points
+resolved_metric_names = {
+    canonical_name: resolve_metric_name(canonical_name)
+    for canonical_name in METRIC_ALIASES
+}
+total_step_points = ordered_values(resolved_metric_names[TOTAL_STEP_METRIC])
+expected_updates = WARMUP_UPDATES + MEASURED_UPDATES
+if len(total_step_points) != expected_updates:
+    raise ValueError(
+        f"required metric {TOTAL_STEP_METRIC!r} has {len(total_step_points)} "
+        f"updates; expected {expected_updates} ({WARMUP_UPDATES} warmup + "
+        f"{MEASURED_UPDATES} measured)"
+    )
+measured_steps = [step for step, _ in total_step_points[-MEASURED_UPDATES:]]
+measured_step_set = set(measured_steps)
 
 
-policy_points = measured_points(POLICY_TIME_METRIC)
-token_points = measured_points(TOKEN_COUNT_METRIC)
-valid_token_points = measured_points(VALID_TOKEN_COUNT_METRIC)
-throughput_points = measured_points(NORMALIZED_THROUGHPUT_METRIC)
-measured_steps = [step for step, _ in policy_points]
-assert [step for step, _ in token_points] == measured_steps
-assert [step for step, _ in valid_token_points] == measured_steps
-assert [step for step, _ in throughput_points] == measured_steps
+def measured_points(canonical_name: str) -> list[tuple[int, float]]:
+    source_name = resolved_metric_names[canonical_name]
+    values_by_step = dict(ordered_values(source_name))
+    missing_steps = sorted(measured_step_set - values_by_step.keys())
+    if missing_steps:
+        raise ValueError(
+            f"required metric {canonical_name!r}, resolved as {source_name!r}, "
+            f"is missing measured steps: {missing_steps!r}"
+        )
+    return [(step, values_by_step[step]) for step in measured_steps]
+
+
+measured_components = {
+    canonical_name: measured_points(canonical_name)
+    for canonical_name in METRIC_ALIASES
+}
+generation_points = measured_components[GENERATION_METRIC]
+logprob_points = measured_components[LOGPROB_METRIC]
+policy_points = measured_components[POLICY_TIME_METRIC]
+refit_points = measured_components[REFIT_METRIC]
+token_points = measured_components[TOKEN_COUNT_METRIC]
+valid_token_points = measured_components[VALID_TOKEN_COUNT_METRIC]
+throughput_points = measured_components[NORMALIZED_THROUGHPUT_METRIC]
 measured_values = [value for _, value in policy_points]
 
 measured_step_workload = [
     {
         "step": step,
+        "total_step_seconds": measured_components[TOTAL_STEP_METRIC][index][1],
+        "generation_seconds": generation_points[index][1],
+        "logprob_seconds": logprob_points[index][1],
         "policy_training_seconds": policy_points[index][1],
+        "refit_transfer_update_seconds": refit_points[index][1],
         "total_num_tokens": token_points[index][1],
         "global_valid_toks": valid_token_points[index][1],
         "normalized_policy_training_tokens_per_sec_per_gpu": throughput_points[index][1],
@@ -519,7 +578,8 @@ measured_step_workload = [
 timing_series = {
     name: [
         {"step": step, "seconds": value}
-        for step, value in ordered_values(name)[WARMUP_UPDATES:]
+        for step, value in ordered_values(name)
+        if step in measured_step_set
     ]
     for name in sorted(metrics)
     if name.startswith("timing/")
@@ -532,6 +592,13 @@ raw = {
     "measured_updates": MEASURED_UPDATES,
     "policy_training_seconds": measured_values,
     "policy_training_median_seconds": statistics.median(measured_values),
+    "resolved_metric_names": resolved_metric_names,
+    "measured_component_series": {
+        canonical_name: [
+            {"step": step, "value": value} for step, value in points
+        ]
+        for canonical_name, points in measured_components.items()
+    },
     "token_count_metric": TOKEN_COUNT_METRIC,
     "valid_token_count_metric": VALID_TOKEN_COUNT_METRIC,
     "normalized_throughput_metric": NORMALIZED_THROUGHPUT_METRIC,
@@ -548,7 +615,11 @@ with (arm_dir / "raw_timing.csv").open("w", newline="") as csv_file:
             "arm",
             "order_index",
             "step",
+            "total_step_seconds",
+            "generation_seconds",
+            "logprob_seconds",
             "policy_training_seconds",
+            "refit_transfer_update_seconds",
             "total_num_tokens",
             "global_valid_toks",
             "normalized_policy_training_tokens_per_sec_per_gpu",
@@ -561,12 +632,17 @@ with (arm_dir / "raw_timing.csv").open("w", newline="") as csv_file:
                 raw["arm"],
                 raw["order_index"],
                 item["step"],
+                item["total_step_seconds"],
+                item["generation_seconds"],
+                item["logprob_seconds"],
                 item["policy_training_seconds"],
+                item["refit_transfer_update_seconds"],
                 item["total_num_tokens"],
                 item["global_valid_toks"],
                 item["normalized_policy_training_tokens_per_sec_per_gpu"],
             ]
         )
+# CUTEDSL_METRIC_EXTRACTOR_END
 PY
 }
 
@@ -638,6 +714,12 @@ summary = {
     / statistics.median(on_values),
 }
 (result_dir / "timing_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+manifest_path = result_dir / "benchmark_manifest.json"
+manifest = json.loads(manifest_path.read_text())
+manifest["resolved_metric_names"] = {
+    arm: by_arm[arm]["resolved_metric_names"] for arm in ("on", "off")
+}
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 BASH
 cutedsl_write_event timing pass 0 \
@@ -665,7 +747,7 @@ for override in "${common_timing_overrides[@]}"; do
         profile_overrides+=("${override}")
     fi
 done
-profile_overrides+=("grpo.max_num_steps=2")
+profile_overrides+=("grpo.max_num_steps=7")
 IFS=',' read -r -a timing_arms <<< "${TIMING_ORDER}"
 
 run_profile_arm() {
@@ -685,7 +767,7 @@ run_profile_arm() {
     export RAY_TMPDIR="${CONTAINER_RUNTIME_DIR}/ray_profile"
     export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
     export NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker"
-    export NRL_NSYS_PROFILE_STEP_RANGE="1:2"
+    export NRL_NSYS_PROFILE_STEP_RANGE="6:7"
     export NRL_NSYS_EXTRA_OPTIONS='{"cuda-memory-usage":"true","cpuctxsw":"none"}'
 
     set +e

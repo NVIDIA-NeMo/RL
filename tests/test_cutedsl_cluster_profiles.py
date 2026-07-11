@@ -138,9 +138,7 @@ def test_profiles_match_immutable_cluster_contracts(profile_name: str) -> None:
 
 @pytest.mark.parametrize("profile_name", EXPECTED_PROFILES)
 def test_profile_scripts_export_exactly_required_keys(profile_name: str) -> None:
-    profile_text = (
-        EXPERIMENT_DIR / f"cluster_profiles/{profile_name}.sh"
-    ).read_text()
+    profile_text = (EXPERIMENT_DIR / f"cluster_profiles/{profile_name}.sh").read_text()
     exported_keys = re.findall(
         r"^export (CUTEDSL_[A-Z0-9_]+)(?:=|$)", profile_text, re.MULTILINE
     )
@@ -296,14 +294,13 @@ def test_functional_submitter_passes_exact_profile_argv(
     assert result.returncode == 0, result.stderr
 
     expected = EXPECTED_PROFILES[profile_name]
-    cluster_specific = (
-        ["--gres=gpu:4"] if expected["gres"] else ["--segment=1"]
-    )
+    cluster_specific = ["--gres=gpu:4"] if expected["gres"] else ["--segment=1"]
     expected_args = [
         f"--account={expected['account']}",
         f"--partition={expected['partition']}",
         f"--comment={expected['comment']}",
         *cluster_specific,
+        f"--job-name={expected['account']}-cutedsl.func",
         f"--time={expected['functional_time']}",
         "--export=ALL",
     ]
@@ -313,13 +310,16 @@ def test_functional_submitter_passes_exact_profile_argv(
     calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
     assert [call["argv"] for call in calls] == [expected_args]
     assert calls[0]["submission_branch"] == REQUIRED_GIT_BRANCH
-    assert calls[0]["submission_sha"] == subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=Path(__file__).parents[1],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    assert (
+        calls[0]["submission_sha"]
+        == subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
 
 
 @pytest.mark.parametrize("profile_name", EXPECTED_PROFILES)
@@ -347,7 +347,7 @@ def test_benchmark_submitter_passes_exact_profile_argv(
         (EXPERIMENT_DIR / "submit_cutedsl_ab_replicates.sh")
         .read_text()
         .replace(
-            'readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/benchmark_submissions"',
+            'readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/results/benchmark/submissions"',
             f'readonly SUBMISSION_DIR="{tmp_path}/records"',
         )
     )
@@ -364,15 +364,14 @@ def test_benchmark_submitter_passes_exact_profile_argv(
     assert result.returncode == 0, result.stderr
 
     expected = EXPECTED_PROFILES[profile_name]
-    cluster_specific = (
-        ["--gres=gpu:4"] if expected["gres"] else ["--segment=1"]
-    )
+    cluster_specific = ["--gres=gpu:4"] if expected["gres"] else ["--segment=1"]
     common_args = [
         "--parsable",
         f"--account={expected['account']}",
         f"--partition={expected['partition']}",
         f"--comment={expected['comment']}",
         *cluster_specific,
+        f"--job-name={expected['account']}-cutedsl.ab",
         f"--time={expected['benchmark_time']}",
     ]
     if test_only:
@@ -392,13 +391,48 @@ def test_benchmark_submitter_passes_exact_profile_argv(
             str(EXPERIMENT_DIR / "run_cutedsl_matrix.sbatch"),
         ]
         assert call["submission_branch"] == REQUIRED_GIT_BRANCH
-        assert call["submission_sha"] == subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).parents[1],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
+        assert (
+            call["submission_sha"]
+            == subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).parents[1],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+
+    records_dir = tmp_path / "records"
+    if test_only:
+        assert not records_dir.exists()
+    else:
+        records = list(records_dir.glob("*.jsonl"))
+        assert len(records) == 1
+        assert len(records[0].read_text().splitlines()) == 3
+
+
+def test_benchmark_submission_records_use_repo_ignored_results_tree() -> None:
+    submitter = (EXPERIMENT_DIR / "submit_cutedsl_ab_replicates.sh").read_text()
+    assert (
+        'readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/results/benchmark/submissions"'
+        in submitter
+    )
+    assert (
+        "results/"
+        in (Path(__file__).parents[1] / ".gitignore").read_text().splitlines()
+    )
+    tracked_probe = subprocess.run(
+        [
+            "git",
+            "ls-files",
+            "--error-unmatch",
+            str(EXPERIMENT_DIR / "results/benchmark/submissions/probe.jsonl"),
+        ],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert tracked_probe.returncode != 0
 
 
 def test_runtime_source_validation_accepts_exact_submission() -> None:

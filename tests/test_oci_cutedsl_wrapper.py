@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 EXPERIMENT_DIR = Path(__file__).parents[1] / "experiments/cutedsl_qwen3_30ba3b_oci_1n4g"
@@ -221,7 +222,7 @@ def test_runtime_diagnostics_precede_each_srun_environment_assertion() -> None:
             '"${UV_PROJECT_ENVIRONMENT-<unset>}"',
             '"${RUNTIME_PYTHON-<unset>}"',
             '"${UV_BIN}" --version',
-            'os.path.realpath(sys.executable)',
+            "os.path.realpath(sys.executable)",
             "print(sys.prefix)",
         )
         for fragment in required_diagnostics:
@@ -399,9 +400,9 @@ def test_benchmark_verifies_exact_matched_config_diff() -> None:
 
 def test_benchmark_has_recorded_order_and_sufficient_timing_samples() -> None:
     required_fragments = (
-        'WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-3}"',
+        'WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-5}"',
         'MEASURED_UPDATES="${CUTEDSL_BENCHMARK_MEASURED_UPDATES:-20}"',
-        "WARMUP_UPDATES < 3",
+        "WARMUP_UPDATES < 5",
         "MEASURED_UPDATES < 10",
         "TOTAL_UPDATES=$((WARMUP_UPDATES + MEASURED_UPDATES))",
         'TIMING_ORDER="${CUTEDSL_BENCHMARK_ORDER:-on,off}"',
@@ -421,15 +422,20 @@ def test_benchmark_separates_profiling_and_collects_raw_timing() -> None:
         "run_timing_arm()",
         "run_profile_arm()",
         "unset NRL_NSYS_WORKER_PATTERNS",
-        'export NRL_NSYS_PROFILE_STEP_RANGE="1:2"',
+        'profile_overrides+=("grpo.max_num_steps=7")',
+        'export NRL_NSYS_PROFILE_STEP_RANGE="6:7"',
         '"raw_timing.json"',
         '"raw_timing.csv"',
         '"timing/train/policy_training"',
-        "ordered_values(name)[WARMUP_UPDATES:]",
-        "len(points) == MEASURED_UPDATES",
+        '"resolved_metric_names"',
+        '"measured_component_series"',
+        "measured_step_set",
+        "missing measured steps",
     )
     for fragment in required_fragments:
         assert fragment in BENCHMARK_SCRIPT, fragment
+    assert 'manifest["resolved_metric_names"]' in BENCHMARK_SCRIPT
+    assert 'by_arm[arm]["resolved_metric_names"]' in BENCHMARK_SCRIPT
     assert BENCHMARK_SCRIPT.index("run_timing_arm()") < BENCHMARK_SCRIPT.index(
         "run_profile_arm()"
     )
@@ -482,6 +488,100 @@ def test_benchmark_records_workload_and_normalized_throughput_as_primary() -> No
         assert fragment in BENCHMARK_SCRIPT, fragment
 
 
+def _metric_extractor_source() -> str:
+    start = "# CUTEDSL_METRIC_EXTRACTOR_START\n"
+    end = "# CUTEDSL_METRIC_EXTRACTOR_END\n"
+    assert start in BENCHMARK_SCRIPT
+    assert end in BENCHMARK_SCRIPT
+    return BENCHMARK_SCRIPT.split(start, 1)[1].split(end, 1)[0]
+
+
+def _required_fake_metrics(*, omit: str | None = None) -> dict[str, dict[str, float]]:
+    source_names = (
+        "timing/train/total_step_time",
+        "timing/train/generation",
+        "timing/train/policy_and_reference_logprobs",
+        "timing/train/policy_training",
+        "timing/train/prepare_for_generation/transfer_and_update_weights",
+        "performance/policy_training_tokens_per_sec_per_gpu",
+        "train/total_num_tokens",
+        "train/global_valid_toks",
+    )
+    metrics = {
+        name: {str(step): float(step) for step in range(1, 26)}
+        for name in source_names
+        if name != omit
+    }
+    refit_name = "timing/train/prepare_for_generation/transfer_and_update_weights"
+    if refit_name in metrics:
+        metrics[refit_name].pop("1")
+    return metrics
+
+
+def _run_metric_extractor(
+    tmp_path: Path,
+    metrics: dict[str, dict[str, float]],
+) -> subprocess.CompletedProcess[str]:
+    arm_dir = tmp_path / "arm"
+    arm_dir.mkdir()
+    (arm_dir / "metrics.json").write_text(json.dumps(metrics))
+    env = os.environ.copy()
+    env.update(
+        {
+            "WARMUP_UPDATES": "5",
+            "MEASURED_UPDATES": "20",
+            "RUN_ID": "fake-run",
+            "BENCHMARK_ARM": "on",
+            "BENCHMARK_ORDER_INDEX": "0",
+        }
+    )
+    return subprocess.run(
+        [sys.executable, "-c", _metric_extractor_source(), str(arm_dir)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_benchmark_extracts_all_required_measured_component_series(
+    tmp_path: Path,
+) -> None:
+    result = _run_metric_extractor(tmp_path, _required_fake_metrics())
+    assert result.returncode == 0, result.stderr
+    raw = json.loads((tmp_path / "arm/raw_timing.json").read_text())
+    canonical_names = {
+        "timing/train/total_step_time",
+        "timing/train/generation",
+        "timing/train/get_logprobs",
+        "timing/train/policy_training",
+        "timing/train/prepare_for_generation/transfer_and_update_weights",
+        "performance/policy_training_tokens_per_sec_per_gpu",
+        "train/total_num_tokens",
+        "train/global_valid_toks",
+    }
+    assert set(raw["resolved_metric_names"]) == canonical_names
+    assert (
+        raw["resolved_metric_names"]["timing/train/get_logprobs"]
+        == "timing/train/policy_and_reference_logprobs"
+    )
+    assert set(raw["measured_component_series"]) == canonical_names
+    for series in raw["measured_component_series"].values():
+        assert [point["step"] for point in series] == list(range(6, 26))
+
+
+def test_benchmark_metric_extractor_fails_loudly_when_required_metric_is_missing(
+    tmp_path: Path,
+) -> None:
+    missing = "timing/train/generation"
+    result = _run_metric_extractor(
+        tmp_path,
+        _required_fake_metrics(omit=missing),
+    )
+    assert result.returncode != 0
+    assert f"required metric {missing!r}" in result.stderr
+    assert not (tmp_path / "arm/raw_timing.json").exists()
+
+
 def test_benchmark_submit_driver_requires_three_alternating_replicates() -> None:
     wrapper_fragments = (
         'REPLICATE_INDEX="${CUTEDSL_BENCHMARK_REPLICATE:-0}"',
@@ -492,6 +592,7 @@ def test_benchmark_submit_driver_requires_three_alternating_replicates() -> None
 
     driver_fragments = (
         'REPLICATES="${CUTEDSL_BENCHMARK_REPLICATES:-3}"',
+        'WARMUP_UPDATES="${CUTEDSL_BENCHMARK_WARMUP_UPDATES:-5}"',
         "REPLICATES < 3",
         "replicate_index % 2 == 0",
         'timing_order="on,off"',
@@ -515,7 +616,7 @@ def test_benchmark_submit_driver_uses_exact_nul_export_payload(
 ) -> None:
     driver = tmp_path / "submit_cutedsl_ab_replicates.sh"
     driver_text = BENCHMARK_SUBMIT_SCRIPT.replace(
-        'readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/benchmark_submissions"',
+        'readonly SUBMISSION_DIR="${EXPERIMENT_DIR}/results/benchmark/submissions"',
         f'readonly SUBMISSION_DIR="{tmp_path}/records"',
     )
     assert driver_text != BENCHMARK_SUBMIT_SCRIPT
@@ -580,6 +681,10 @@ if not required <= exported.keys():
     raise SystemExit(64)
 
 record = {
+    "argv": [
+        "--export-file=<payload>" if argument.startswith("--export-file=") else argument
+        for argument in sys.argv[1:]
+    ],
     "mode": mode,
     "replicate": exported["CUTEDSL_BENCHMARK_REPLICATE"],
     "order": exported["CUTEDSL_BENCHMARK_ORDER"],
@@ -617,6 +722,18 @@ print(f"mock-{record['replicate']}")
 
     calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
     assert [call["mode"] for call in calls] == ["nul_file"] * 3
+    expected_argv = [
+        "--parsable",
+        "--account=coreai_dlalgo_llm",
+        "--partition=batch",
+        "--comment=metrics",
+        "--segment=1",
+        "--job-name=coreai_dlalgo_llm-cutedsl.ab",
+        "--time=05:00:00",
+        "--export-file=<payload>",
+        str(BENCHMARK_PATH),
+    ]
+    assert [call["argv"] for call in calls] == [expected_argv] * 3
     assert [call["replicate"] for call in calls] == ["0", "1", "2"]
     assert [call["order"] for call in calls] == [
         "on,off",
