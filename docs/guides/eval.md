@@ -94,7 +94,7 @@ When you complete the evaluation, you will receive a summary similar to the foll
 
 ```
 ============================================================
-model_name='Qwen2.5-Math-1.5B-Instruct' dataset_name='aime2024'
+model_name='Qwen2.5-Math-1.5B-Instruct' dataset_name='AIME2024'
 max_new_tokens=2048 temperature=0.0 top_p=1.0 top_k=-1 seed=42
 
 metric=pass@1 num_tests_per_prompt=1
@@ -105,10 +105,10 @@ score=0.1000 (3.0/30)
 
 ## List of currently supported benchmarks
 
-- [AIME-2024, AIME-2025, and AIME-2026](../../nemo_rl/data/datasets/eval_datasets/aime.py): the corresponding `data.dataset_name` are `"aime2024"`, `"aime2025"`, and `"aime2026"`.
+- [AIME-2024, AIME-2025, and AIME-2026](../../nemo_rl/data/datasets/response_datasets/aime.py): the corresponding `data.dataset_name` values are `"AIME2024"`, `"AIME2025"`, and `"AIME2026"`.
 - [GPQA and GPQA-diamond](../../nemo_rl/data/datasets/eval_datasets/gpqa.py): the corresponding `data.dataset_name` are `"gpqa"` and `"gpqa_diamond"`.
 - [MATH and MATH-500](../../nemo_rl/data/datasets/eval_datasets/math.py): the corresponding `data.dataset_name` are `"math"` and `"math500"`.
 - [MMLU](../../nemo_rl/data/datasets/eval_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU), a total of 14 languages. When `data.dataset_name` is set to `mmlu`, the English version is used. If one wants to run evaluation on another language, `data.dataset_name` should be set to `mmlu_{language}` where `language` is one of following 14 values, `["AR-XY", "BN-BD", "DE-DE", "ES-LA", "FR-FR", "HI-IN", "ID-ID", "IT-IT", "JA-JP", "KO-KR", "PT-BR", "ZH-CN", "SW-KE", "YO-NG"]`.
 - [MMLU-Pro](../../nemo_rl/data/datasets/eval_datasets/mmlu_pro.py): the corresponding `data.dataset_name` is `"mmlu_pro"`.
 
-More details can be found in [load_eval_dataset](../../nemo_rl/data/datasets/eval_datasets/__init__.py).
+Response datasets such as AIME are listed in the [response dataset registry](../../nemo_rl/data/datasets/response_datasets/__init__.py). The remaining eval-only datasets are handled by [load_eval_dataset](../../nemo_rl/data/datasets/eval_datasets/__init__.py).
