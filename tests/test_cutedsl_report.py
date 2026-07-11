@@ -361,17 +361,27 @@ def test_payload_exit_handlers_always_render_without_masking_exit_code() -> None
 
 
 @pytest.mark.parametrize(
-    ("signal_name", "signal_number", "expected_exit"),
-    [("TERM", signal.SIGTERM, 143), ("INT", signal.SIGINT, 130)],
+    ("signal_name", "signal_number", "expected_exit", "renderer_fails"),
+    [
+        ("TERM", signal.SIGTERM, 143, False),
+        ("INT", signal.SIGINT, 130, False),
+        ("TERM", signal.SIGTERM, 143, True),
+        ("INT", signal.SIGINT, 130, True),
+    ],
 )
 def test_signal_finalization_records_nonzero_failure_once(
     tmp_path: Path,
     signal_name: str,
     signal_number: signal.Signals,
     expected_exit: int,
+    renderer_fails: bool,
 ) -> None:
-    result_dir = tmp_path / signal_name.lower()
-    ready_file = tmp_path / f"{signal_name.lower()}.ready"
+    case_name = f"{signal_name.lower()}-renderer-fail-{renderer_fails}"
+    result_dir = tmp_path / case_name
+    ready_file = tmp_path / f"{case_name}.ready"
+    renderer_environment = (
+        "export CUTEDSL_REPORT_PYTHON=false" if renderer_fails else ""
+    )
     command = f"""
 set -euo pipefail
 RESULT_DIR={result_dir!s}
@@ -381,6 +391,7 @@ EXPERIMENT_DIR={EXPERIMENT_DIR!s}
 export RESULT_DIR RUN_ID SLURM_JOB_ID
 source {EVENTS_PATH!s}
 export CUTEDSL_EVENT_CLUSTER=pre_tyche CUTEDSL_EVENT_JOB_ID="$SLURM_JOB_ID"
+{renderer_environment}
 cutedsl_events_init "$RESULT_DIR"
 on_exit() {{
     local exit_code=$?
@@ -419,6 +430,7 @@ while :; do sleep 0.1; done
     assert complete_events[0]["status"] == "fail"
     assert complete_events[0]["exit_code"] == expected_exit
     assert len([event for event in events if event["phase"] == "root_cause"]) == 1
+    assert (result_dir / "report.html").exists() is not renderer_fails
 
 
 def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:
@@ -713,11 +725,13 @@ exit $?
     assert completed.returncode == expected_exit
     assert status["exit_code"] == expected_exit
     assert not (result_dir / "report.html").exists()
-    assert any(
+    complete_events = [event for event in events if event["phase"] == "complete"]
+    assert len(complete_events) == 1
+    assert all(
         event["phase"] == "complete"
         and event["status"] == "fail"
         and event["exit_code"] == expected_exit
-        for event in events
+        for event in complete_events
     )
 
 

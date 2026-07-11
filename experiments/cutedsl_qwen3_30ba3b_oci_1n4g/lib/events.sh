@@ -185,12 +185,9 @@ _cutedsl_phase_has_terminal_event() {
 
 cutedsl_finalize_events() {
     local exit_code="${1:?cutedsl_finalize_events requires an exit code}"
-    local completion_message="${2:?cutedsl_finalize_events requires a message}"
     local phase
-    local completion_status=pass
 
     if [[ ${exit_code} -ne 0 ]]; then
-        completion_status=fail
         if [[ -n "${CUTEDSL_CURRENT_PHASE:-}" ]] && \
             ! _cutedsl_phase_has_terminal_event "${CUTEDSL_CURRENT_PHASE}"; then
             cutedsl_write_event "${CUTEDSL_CURRENT_PHASE}" fail "${exit_code}" \
@@ -206,8 +203,6 @@ cutedsl_finalize_events() {
             cutedsl_write_event "${phase}" skip 0 "Phase not reached" ''
         fi
     done
-    cutedsl_write_event complete "${completion_status}" "${exit_code}" \
-        "${completion_message}" report.html
 }
 
 cutedsl_finalize_run() {
@@ -216,6 +211,8 @@ cutedsl_finalize_run() {
     local renderer="${3:?cutedsl_finalize_run requires the renderer path}"
     local renderer_exit_code=0
     local final_exit_code=${original_exit_code}
+    local completion_artifact=report.html
+    local completion_status=pass
     local failure_symptom="Run exited with code ${original_exit_code} during ${CUTEDSL_CURRENT_PHASE:-preflight}"
 
     if [[ -n "${CUTEDSL_TERMINATING_SIGNAL:-}" ]]; then
@@ -232,18 +229,27 @@ cutedsl_finalize_run() {
             "Pending verification evidence"
     fi
 
-    cutedsl_finalize_events "${original_exit_code}" "${completion_message}"
+    cutedsl_finalize_events "${original_exit_code}"
     cutedsl_write_status "${original_exit_code}"
     "${CUTEDSL_REPORT_PYTHON:-python3}" "${renderer}" --run-dir "${RESULT_DIR}"
     renderer_exit_code=$?
     if [[ ${renderer_exit_code} -ne 0 ]]; then
+        completion_status=fail
+        completion_message="Report rendering failed with code ${renderer_exit_code}"
+        completion_artifact=$(basename "${renderer}")
         if [[ ${original_exit_code} -eq 0 ]]; then
             final_exit_code=${renderer_exit_code}
         fi
-        cutedsl_write_event complete fail "${final_exit_code}" \
-            "Report rendering failed with code ${renderer_exit_code}" \
-            "$(basename "${renderer}")"
-        cutedsl_write_status "${final_exit_code}"
+    elif [[ ${original_exit_code} -ne 0 ]]; then
+        completion_status=fail
+    fi
+
+    cutedsl_write_event complete "${completion_status}" "${final_exit_code}" \
+        "${completion_message}" "${completion_artifact}"
+    cutedsl_write_status "${final_exit_code}"
+
+    if [[ ${renderer_exit_code} -eq 0 ]]; then
+        "${CUTEDSL_REPORT_PYTHON:-python3}" "${renderer}" --run-dir "${RESULT_DIR}"
     fi
     return "${final_exit_code}"
 }
