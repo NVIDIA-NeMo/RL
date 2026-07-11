@@ -484,6 +484,41 @@ def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:
     assert "/runtime/tmp" in incident_text
 
 
+def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
+    """Committed live-job snapshots are small, local, and linked from the index."""
+    report_dir = EXPERIMENT_DIR / "report"
+    index_path = report_dir / "public/index.html"
+    incidents = json.loads((report_dir / "incidents.json").read_text())
+    collector = LinkCollector()
+    collector.feed(index_path.read_text())
+
+    assert {incident["run_id"] for incident in incidents} == {"1910599", "1911208"}
+    for incident in incidents:
+        relative_path = Path(incident["report_path"])
+        assert not relative_path.is_absolute()
+        assert ".." not in relative_path.parts
+        source = report_dir / relative_path
+        public = report_dir / "public" / relative_path
+        assert source.is_file(), source
+        assert public.is_file(), public
+        assert relative_path.as_posix() in collector.hrefs
+        for evidence_file in (source, public):
+            assert evidence_file.stat().st_size <= 8 * 1024
+            text = evidence_file.read_text()
+            assert len(text.splitlines()) <= 40
+            assert incident["run_id"] in text
+            assert "Original remote log:" in text
+            for secret_fragment in (
+                "AWS_SECRET_ACCESS_KEY=",
+                "Authorization:",
+                "Cookie:",
+                "PASSWORD=",
+                "PRIVATE_KEY=",
+                "TOKEN=",
+            ):
+                assert secret_fragment not in text
+
+
 def test_report_redacts_known_credentials_from_all_displayed_inputs(
     tmp_path: Path,
 ) -> None:

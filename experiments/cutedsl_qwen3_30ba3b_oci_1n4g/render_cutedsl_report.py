@@ -781,6 +781,22 @@ def refresh_aggregate(experiment_dir: Path) -> Path:
     return render_aggregate(report_dir)
 
 
+def aggregate_incident_evidence(report_dir: Path, incident: dict[str, Any]) -> str:
+    """Stage and link one safe report-root incident artifact when it exists."""
+    evidence = escape(incident.get("evidence"))
+    report_path = incident.get("report_path")
+    if not isinstance(report_path, str) or not report_path:
+        return evidence
+    if "<a href=" not in artifact_link(report_path, "evidence snapshot"):
+        return f"{evidence}<br><code>{escape(report_path)}</code>"
+    public_dir = report_dir / "public"
+    source = report_dir / report_path
+    destination = public_dir / report_path
+    copy_public_text(report_dir, source, destination)
+    link = existing_artifact_link(public_dir, report_path, "evidence snapshot")
+    return f"{evidence}<br>{link}"
+
+
 def render_aggregate(report_dir: Path) -> Path:
     """Render the committed aggregate index from incidents and run-index data."""
     incidents = sorted(
@@ -802,7 +818,7 @@ def render_aggregate(report_dir: Path) -> Path:
         "".join(
             "<tr>"
             f"<td>{escape(item.get('timestamp_utc'))}</td><td>{escape(item.get('symptom'))}</td>"
-            f"<td>{escape(item.get('evidence'))}</td><td>{escape(item.get('root_cause'))}</td>"
+            f"<td>{aggregate_incident_evidence(report_dir, item)}</td><td>{escape(item.get('root_cause'))}</td>"
             f"<td>{escape(item.get('fix_commit'))}</td><td>{escape(item.get('verification_job'))}</td>"
             f"<td>{escape(item.get('reproduction'))}</td><td>{escape(item.get('hypothesis'))}</td>"
             f"<td>{escape(item.get('tested_change'))}</td>"
