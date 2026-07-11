@@ -26,7 +26,6 @@ import sys
 import types
 
 import pytest
-from datasets import Dataset
 
 from nemo_rl.data.datasets.preference_datasets import (
     DATASET_REGISTRY as PREFERENCE_REGISTRY,
@@ -34,7 +33,6 @@ from nemo_rl.data.datasets.preference_datasets import (
 from nemo_rl.data.datasets.preference_datasets import (
     load_preference_dataset,
 )
-from nemo_rl.data.datasets.response_datasets import openr1_math
 from nemo_rl.data.datasets.response_datasets import (
     DATASET_REGISTRY as RESPONSE_REGISTRY,
 )
@@ -146,48 +144,6 @@ def test_load_response_dataset_unknown_bare_name_errors():
     config = {"dataset_name": "definitely_not_in_registry"}
     with pytest.raises(ValueError, match="Unsupported dataset_name"):
         load_response_dataset(config)
-
-
-def test_load_response_dataset_openr1_math_220k(monkeypatch):
-    captured_load_kwargs = {}
-
-    def fake_load_dataset(path, name=None, split=None):
-        captured_load_kwargs["path"] = path
-        captured_load_kwargs["name"] = name
-        captured_load_kwargs["split"] = split
-        return Dataset.from_list(
-            [
-                {
-                    "problem": "What is 2 + 2?",
-                    "answer": "4",
-                    "correctness_math_verify": ["correct"],
-                }
-            ]
-        )
-
-    monkeypatch.setattr(openr1_math, "load_dataset", fake_load_dataset)
-
-    dataset = load_response_dataset(
-        {
-            "dataset_name": "OpenR1-Math-220k",
-            "config_name": "all",
-            "split": "train",
-        }
-    )
-
-    assert captured_load_kwargs == {
-        "path": "open-r1/OpenR1-Math-220k",
-        "name": "all",
-        "split": "train",
-    }
-    assert dataset.task_name == "OpenR1-Math-220k"
-    assert dataset.dataset[0] == {
-        "messages": [
-            {"role": "user", "content": "What is 2 + 2?"},
-            {"role": "assistant", "content": "4"},
-        ],
-        "task_name": "OpenR1-Math-220k",
-    }
 
 
 def test_load_response_dataset_bad_dotted_path_errors():

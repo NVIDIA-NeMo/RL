@@ -23,7 +23,7 @@ class OpenR1Math220KDataset(RawDataset):
     """Simple wrapper around the OpenR1-Math-220k dataset.
 
     Args:
-        config_name: Hugging Face dataset config name, default is "default"
+        subset: Hugging Face dataset config (subset) name, default is "default"
         split: Split name for the dataset, default is "train"
         split_validation_size: Size of the validation data, default is 0
         seed: Seed for train/validation split when split_validation_size > 0, default is 42
@@ -31,7 +31,7 @@ class OpenR1Math220KDataset(RawDataset):
 
     def __init__(
         self,
-        config_name: str = "default",
+        subset: str = "default",
         split: str = "train",
         split_validation_size: float = 0.0,
         seed: int = 42,
@@ -40,9 +40,7 @@ class OpenR1Math220KDataset(RawDataset):
         self.task_name = "OpenR1-Math-220k"
 
         # load from huggingface
-        self.dataset = load_dataset(
-            "open-r1/OpenR1-Math-220k", config_name, split=split
-        )
+        self.dataset = load_dataset("open-r1/OpenR1-Math-220k", subset, split=split)
 
         # format the dataset
         self.dataset = self.dataset.map(
