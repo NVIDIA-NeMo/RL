@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: native-nccl-refit-sender
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: >-
+      [{"interfaceName":"eth0","network":"default"},
+       {"interfaceName":"rdma0","network":"rdma-0"},
+       {"interfaceName":"rdma1","network":"rdma-1"},
+       {"interfaceName":"rdma2","network":"rdma-2"},
+       {"interfaceName":"rdma3","network":"rdma-3"}]
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-GB200
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: sender
+      image: nvcr.io/nvidian/dynamo-dev/model-express-dev:native-ep8tp2-30175fa-3300035
+      command: [sleep, infinity]
+      env:
+        - {name: NCCL_MNNVL_ENABLE, value: "0"}
+        - {name: NCCL_DEBUG, value: INFO}
+        - {name: NCCL_NET_PLUGIN, value: none}
+        - {name: NCCL_IB_HCA, value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3"}
+        - {name: NCCL_SOCKET_IFNAME, value: eth0}
+      resources:
+        requests:
+          cpu: "16"
+          memory: 96Gi
+          nvidia.com/gpu: "1"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-0.IP: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-1.IP: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-2.IP: "1"
+          networking.gke.io.networks/rdma-3: "1"
+          networking.gke.io.networks/rdma-3.IP: "1"
+        limits:
+          cpu: "32"
+          memory: 192Gi
+          nvidia.com/gpu: "1"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-0.IP: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-1.IP: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-2.IP: "1"
+          networking.gke.io.networks/rdma-3: "1"
+          networking.gke.io.networks/rdma-3.IP: "1"
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      volumeMounts:
+        - {name: workspace, mountPath: /mnt/rl-workspace}
+        - {name: infiniband, mountPath: /dev/infiniband}
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: shared-model-cache
+    - name: infiniband
+      hostPath:
+        path: /dev/infiniband
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi

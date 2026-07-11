@@ -16,6 +16,8 @@ refit), plus apples-to-apples transport and per-phase refit timing.
 | `mdl_partial_smoke.py` | Runtime smoke for MDL incremental/partial-update (cold/warm/subset/incremental, byte-identical). No transport. |
 | `configs/nixl_ep4_tp1_gb200_rc_debug.yaml` | Sanitized EP4→TP1 GB200 topology and UCX/NIXL config, including the TCP-fallback baseline and validated `^tcp` fix (12/12 pulls on RDMA, ~7× steady-state refit speedup). |
 | `preflight_ep8_tp2.sh` | Fail-fast Kubernetes gate for the two 4-GPU EP8 trainer pods and 2-GPU TP2 rollout: GPU count, `rdma0..3`, `^tcp`, matching package versions, and native `mx` backend registration. |
+| `native_nccl_refit_bench.py` | Native-vLLM PyNccl sender/controller baseline. Uses the same NCCL implementation on sender and TP2 rollout, reports group init plus packed update wall time, and avoids the NeMo/vLLM communicator mismatch. |
+| `configs/native_nccl_sender.gb200.yaml` | One-GPU GB200 sender pod for `native_nccl_refit_bench.py`, with four RDMA interfaces and the shared checkpoint PVC. |
 
 ## Run
 
@@ -27,6 +29,11 @@ MX_PY=<repo>/…/modelexpress_client/python python3 ep_gt1_byte_pruning.py
 NS=<namespace> FRONTEND=http://<dgd-frontend>:<port> \
   MX_PY=<…/modelexpress_client/python> \
   bash run_differentiator_bench.sh
+
+# Native NCCL baseline (sender pod + TP2 DGD configured with backend=nccl):
+kubectl -n <namespace> apply -f configs/native_nccl_sender.gb200.yaml
+# Copy this bench file into the sender/controller environment, then run
+# `sender` and `controller` as described by `python native_nccl_refit_bench.py -h`.
 ```
 
 ## Scenarios
