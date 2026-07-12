@@ -8,5 +8,5 @@ The existing timeline uses bounded manual evidence under report/evidence, so no 
 Tested change: preserve existing incidents only when run_id is valid and report_path exactly matches evidence/job-<run_id>.txt.
 RED: test_refresh_preserves_manual_incident_evidence_without_run_directories returned [] instead of the manual incident.
 GREEN: the focused regression passed.
-Verification: a real aggregate refresh preserved the timeline and the combined recipe/report suite passed 57 tests.
+Verification: a real aggregate refresh preserved the timeline and the combined recipe/report suite passed 58 tests.
 No GPU job, performance measurement, or speedup conclusion is associated with this local incident.

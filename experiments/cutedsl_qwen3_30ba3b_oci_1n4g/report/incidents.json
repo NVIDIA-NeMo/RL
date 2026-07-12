@@ -131,7 +131,7 @@
     "symptom": "A deterministic report refresh erased the existing root-cause timeline.",
     "tested_change": "Seed refresh from existing incidents whose run ID and exact evidence/job-<run_id>.txt path pass the renderer's bounded evidence contract; continue rebuilding run-derived incidents from discovered runs.",
     "timestamp_utc": "2026-07-12T04:29:09Z",
-    "verification_evidence": "The focused regression changed from one failure to one pass, and the full recipe/report suite passes 57 tests after a real aggregate refresh preserved all prior incidents.",
+    "verification_evidence": "The focused regression changed from one failure to one pass, and the full recipe/report suite passes 58 tests after a real aggregate refresh preserved all prior incidents.",
     "verification_job": "local pytest"
   }
 ]

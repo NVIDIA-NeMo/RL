@@ -1510,3 +1510,15 @@ def test_payloads_do_not_refresh_tracked_aggregate_during_jobs() -> None:
     """Scheduled payloads never mutate the tracked aggregate report."""
     for payload_path in (FUNCTIONAL_PATH, MATRIX_PATH):
         assert "--refresh-experiment-dir" not in payload_path.read_text()
+
+
+def test_functional_wrapper_runs_vllm_discard_lifecycle_regressions() -> None:
+    payload = (EXPERIMENT_DIR / "run_cutedsl_functional.sbatch").read_text()
+
+    for fragment in (
+        "test_grpo_train_discards_weights_only_after_dynamic_sampling_completes",
+        "test_resolve_sleep_level_defaults_to_one_and_accepts_two",
+        "test_finish_generation_maps_weight_discard_to_sleep_level",
+        "test_finish_generation_preserves_variadic_backend_arguments",
+    ):
+        assert fragment in payload

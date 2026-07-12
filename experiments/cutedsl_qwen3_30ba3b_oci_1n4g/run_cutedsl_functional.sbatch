@@ -469,6 +469,12 @@ preserve_nemo_unit_results() {
         tests/unit/models/megatron/test_community_import.py \
         tests/test_cutedsl_policy_recipe.py \
         -q
+    readonly lifecycle_test_filter='test_grpo_train_discards_weights_only_after_dynamic_sampling_completes or test_resolve_sleep_level_defaults_to_one_and_accepts_two or test_sync_sleep_uses_requested_sleep_level or test_async_sleep_uses_requested_sleep_level or test_finish_generation_maps_weight_discard_to_sleep_level or test_finish_generation_rejects_non_boolean_discard or test_finish_generation_preserves_variadic_backend_arguments'
+    "${UV_BIN}" run --active --no-sync pytest \
+        tests/unit/algorithms/test_grpo.py \
+        tests/unit/models/generation/test_vllm_generation.py \
+        -k "${lifecycle_test_filter}" \
+        -q
 ) 2>&1 | tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"
 
 "${UV_BIN}" run --active --no-sync pyrefly check 2>&1 | tee "${CONTAINER_RESULT_DIR}/pyrefly.log"
