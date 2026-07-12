@@ -51,6 +51,7 @@ dependencies = [
   "pillow>=12.1.1",
   "torchvision==0.26.0",
   "torchaudio==2.11.0",
+  "torchcodec>=0.3.0",
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
   # Floor raised to 5.5.0 for Gemma 4 support.
   "transformers>=5.5.0,<5.9.0",
