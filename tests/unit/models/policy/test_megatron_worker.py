@@ -85,7 +85,7 @@ def _make_offload_diagnostics_worker(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 def test_megatron_offload_emits_host_memory_at_oom_boundaries(
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -106,7 +106,7 @@ def test_megatron_offload_emits_host_memory_at_oom_boundaries(
 
     MegatronPolicyWorkerImpl.offload_before_refit(worker)
 
-    output = capsys.readouterr().out.splitlines()
+    output = capfd.readouterr().out.splitlines()
     before_grad = (
         "event=megatron_policy_offload_memory phase=before_grad_move "
         "process_rss_gib=5.000 system_available_gib=10.000"
@@ -126,7 +126,7 @@ def test_megatron_offload_emits_host_memory_at_oom_boundaries(
 
 
 def test_megatron_offload_memory_diagnostics_are_best_effort(
-    capsys: pytest.CaptureFixture[str],
+    capfd: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -142,7 +142,7 @@ def test_megatron_offload_memory_diagnostics_are_best_effort(
 
     MegatronPolicyWorkerImpl.offload_before_refit(worker)
 
-    output = capsys.readouterr().out
+    output = capfd.readouterr().out
     for phase in ("before_grad_move", "before_optimizer_move", "after_completion"):
         assert (
             f"event=megatron_policy_offload_memory phase={phase} "
