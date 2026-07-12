@@ -92,6 +92,10 @@ def _patch_vllm_init_workers_ray(
         "NCCL_CUMEM_ENABLE",
         "NCCL_NVLS_ENABLE",
         "RAY_ENABLE_UV_RUN_RUNTIME_ENV",
+        # NRL sparse-refit control vars: must reach the vLLM internal workers
+        # that run VllmInternalWorkerExtension via collective_rpc.
+        "NRL_REFIT_SPARSE_APPLY_MODE",
+        "NRL_REFIT_DUMP_VLLM_PARAMS",
         *(extra_env_vars or []),
     ]
     additional_env_str = ", ".join(f'"{env_var}"' for env_var in additional_env_vars)

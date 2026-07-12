@@ -15,6 +15,7 @@
 """Direct sparse-delta placement and application for vLLM workers."""
 
 import io
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -46,6 +47,10 @@ class _SparseDeltaTargetPlan:
     identity: bool = False
 
 
+# Sentinel used when the additive apply path bypasses plan computation.
+_ADDITIVE_SENTINEL_PLAN = _SparseDeltaTargetPlan(target=None)
+
+
 class VllmSparseDeltaApplier:
     """Own sparse placement state without extending the normal refit path."""
 
@@ -67,6 +72,56 @@ class VllmSparseDeltaApplier:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = []
         self._direct_sparse_delta_verification_candidates = 0
+
+        # --- R5: one-shot param dump for E2E correctness comparison ---
+        self._dump_vllm_params_path: str | None = os.environ.get(
+            "NRL_REFIT_DUMP_VLLM_PARAMS", ""
+        ) or None
+        self._dump_vllm_params_done: bool = False
+
+        # --- M2: env-flag for additive apply path ---
+        _mode = os.environ.get("NRL_REFIT_SPARSE_APPLY_MODE", "plan").strip().lower()
+        if _mode not in ("plan", "additive", "allowlist"):
+            raise ValueError(
+                f"NRL_REFIT_SPARSE_APPLY_MODE must be 'plan', 'additive', or"
+                f" 'allowlist'; got {_mode!r}"
+            )
+        self._sparse_apply_mode: str = _mode
+        _allowlist_pat = os.environ.get("NRL_REFIT_SPARSE_APPLY_ALLOWLIST", "")
+        self._sparse_apply_allowlist: re.Pattern[str] | None = (
+            re.compile(_allowlist_pat) if _allowlist_pat else None
+        )
+
+    @staticmethod
+    def _is_plain_linear_name(target_name: str) -> bool:
+        """Return True if *target_name* falls through to the plain-linear (shard) path.
+
+        Mirrors the dispatch order in ``_direct_sparse_delta_target_plan``:
+        mamba / QKV / expert / gate_up names are NOT plain-linear.  Everything
+        else (``ColumnParallelLinear``, ``RowParallelLinear``, embed, lm_head …)
+        is treated as plain-linear and is safe to apply via the additive load path
+        for tp_size=1.
+        """
+        if ".mixer." in target_name:
+            return False
+        if any(f".{x}_proj." in target_name for x in ("q", "k", "v")):
+            return False
+        if _EXPERT_WEIGHT_RE.match(target_name):
+            return False
+        if any(f".{x}_proj." in target_name for x in ("gate", "up")):
+            return False
+        return True
+
+    def _additive_apply_mode(self, target_name: str) -> bool:
+        """Return True if the additive path should be used for *target_name*."""
+        mode = self._sparse_apply_mode
+        if mode == "plan":
+            return False
+        if mode == "additive":
+            return self._is_plain_linear_name(target_name)
+        # mode == "allowlist"
+        pat = self._sparse_apply_allowlist
+        return pat is not None and pat.search(target_name) is not None
 
     def _apply_sparse_weight_deltas(
         self,
@@ -95,25 +150,76 @@ class VllmSparseDeltaApplier:
         plan_cache = self._direct_sparse_delta_plan_cache
         if plan_cache is None:
             plan_cache = self._direct_sparse_delta_plan_cache = {}
-        plans = []
+        # Lazy import: only pay the cost when additive mode is active.
+        _use_additive_mode = self._sparse_apply_mode != "plan"
+        if _use_additive_mode:
+            from nemo_rl.models.generation.vllm.vllm_sparse_delta_additive import (
+                apply_sparse_delta_via_additive_load,
+            )
+            _mapper = getattr(self.model_runner.model, "hf_to_vllm_mapper", None)
+
+        plans: list[tuple[dict[str, Any], _SparseDeltaTargetPlan, str, bool]] = []
         for item in metadata:
             name = str(item["name"])
-            if name not in plan_cache:
-                plan_cache[name] = self._direct_sparse_delta_target_plan(item, targets)
-            plan = plan_cache[name]
-            if plan is None:
-                raise RuntimeError(
-                    f"No direct sparse delta target plan for {item['name']!r}."
+            # Compute target_name (same mapping as _direct_sparse_delta_target_plan).
+            if _use_additive_mode:
+                _mapped = (
+                    cast(Any, _mapper)._map_name(name) if _mapper is not None else name
                 )
-            plans.append((item, plan))
+                if _mapped is None or _mapped.startswith("draft."):
+                    # Mirrors the early-out in _direct_sparse_delta_target_plan;
+                    # fall through to plan path for these names.
+                    _target_name = name
+                    _use_additive = False
+                else:
+                    _target_name = _mapped
+                    _use_additive = self._additive_apply_mode(_target_name)
+            else:
+                _target_name = name
+                _use_additive = False
+
+            if not _use_additive:
+                if name not in plan_cache:
+                    plan_cache[name] = self._direct_sparse_delta_target_plan(
+                        item, targets
+                    )
+                plan = plan_cache[name]
+                if plan is None:
+                    raise RuntimeError(
+                        f"No direct sparse delta target plan for {item['name']!r}."
+                    )
+            else:
+                # Additive path: use a sentinel plan so the apply loop can
+                # `continue` past plan-specific logic.
+                plan = _ADDITIVE_SENTINEL_PLAN
+            plans.append((item, plan, _target_name, _use_additive))
 
         with torch.no_grad():
-            for item, plan in plans:
+            for item, plan, _target_name, _use_additive in plans:
                 target = plan.target
                 verification_locations = item.get("verification_locations", [])
                 self._direct_sparse_delta_verification_candidates += len(
                     verification_locations
                 )
+                if _use_additive:
+                    # Additive path: decode sparse payload and delegate to
+                    # apply_sparse_delta_via_additive_load.
+                    value_start = int(item["value_start"])
+                    value_end = int(item["value_end"])
+                    sparse_indices = sparse_codec.sparse_locations_for_item(
+                        item, raw_locations, device="cpu"
+                    )
+                    sparse_values = raw_values[value_start:value_end]
+                    apply_sparse_delta_via_additive_load(
+                        _target_name,
+                        sparse_indices,
+                        sparse_values,
+                        tuple(item["shape"]),
+                        targets[_target_name].dtype,
+                        self.model_runner.model,
+                        targets[_target_name].device,
+                    )
+                    continue
                 if target is None:
                     continue
 
@@ -714,6 +820,34 @@ class VllmSparseDeltaApplier:
     def finish_sparse_delta_refit(self) -> dict[str, Any]:
         """Synchronize and compare bounded producer samples with applied weights."""
         self.synchronize_device()
+
+        # R5 one-shot dump: write all vLLM-worker params AFTER full refit
+        # completes (all chunks applied + CUDA sync) for E2E correctness comparison.
+        # Use an exclusive flag file to ensure exactly one writer across all
+        # vLLM worker processes (TP=1 means all have identical weights).
+        dump_path = self._dump_vllm_params_path
+        if dump_path and not self._dump_vllm_params_done:
+            flag_path = dump_path + ".writing"
+            try:
+                fd = os.open(flag_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                won_race = True
+            except FileExistsError:
+                won_race = False
+            if won_race:
+                self._dump_vllm_params_done = True
+                snapshot = {
+                    name: param.data.detach().cpu().clone()
+                    for name, param in self.model_runner.model.named_parameters()
+                }
+                torch.save(snapshot, dump_path)
+                os.unlink(flag_path)
+                print(
+                    f"[R5] Saved vLLM param snapshot ({len(snapshot)} tensors)"
+                    f" -> {dump_path}",
+                    flush=True,
+                )
+
         verification = self._direct_sparse_delta_verification or []
         candidates = self._direct_sparse_delta_verification_candidates
         self._direct_sparse_delta_verification = []
