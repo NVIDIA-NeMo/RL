@@ -315,6 +315,13 @@ RAY_RESOURCES+='}'
 export RAY_RESOURCES
 TOPO_PROBE_EOF
 
+# TRTLLM engine requires unsetting SLURM/PMIx before ray start
+if [ "${NRL_CLEAN_SLURM_PMIX:-0}" = "1" ]; then
+  PMIX_CLEAN_CMD='unset ${!PMIX_@} ${!PMI_@} ${!OMPI_@} SLURM_STEP_ID 2>/dev/null || true'
+else
+  PMIX_CLEAN_CMD=':'
+fi
+
 # First we start the head of the ray cluster on one of the physical nodes
 # Give the head node actual resources to make it schedulable
 
@@ -415,6 +422,8 @@ while [[ \$count -lt $num_retries ]]; do
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
     bash "$SETUP_COMMAND_FILE"
   fi
+  # Gated PMIx env clean (NRL_CLEAN_SLURM_PMIX); no-op when disabled.
+  $PMIX_CLEAN_CMD
   bash /launch-head.sh
   count=\$((count+1))
   echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
@@ -524,6 +533,8 @@ while [[ \$count -lt $num_retries ]]; do
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
     bash "$SETUP_COMMAND_FILE"
   fi
+  # Gated PMIx env clean (NRL_CLEAN_SLURM_PMIX); no-op when disabled.
+  $PMIX_CLEAN_CMD
   bash /launch-worker.sh
   count=\$((count+1))
   echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
