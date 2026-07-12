@@ -18,14 +18,17 @@ policy:
   train_global_batch_size: 256
   megatron_cfg:
     optimizer:
-      lr: 2.5e-6
-      min_lr: 2.5e-6
+      # 1.0e-6 to match the reference branch (arigazzi/mlperf-training-
+      # qwen35-main); we previously ran 2.5e-6 and saw faster policy-KL
+      # divergence + greedy-val collapse (grpo-nocache-1: val 28.9%->5.5%
+      # by step 5 with 145/256 masked seqs).
+      lr: 1.0e-6
+      min_lr: 1.0e-6
     scheduler:
       lr_warmup_iters: 0
 
-env:
-  nemo_gym:
-    swe_agents_val:
-      responses_api_agents:
-        swe_agents:
-          swebench_agent_timeout: 600
+# NOTE: do NOT re-override swe_agents_val swebench_agent_timeout here — the
+# parent recipe sets it to 1200 deliberately (val engines were contended /
+# degenerate greedy decodes push episodes past 600s; see parent yaml comment).
+# A 600 override here silently shadowed that fix for all benchmark runs
+# through grpo-nocache-1 window 3.

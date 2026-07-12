@@ -133,7 +133,9 @@ policy:
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
     freeze_moe_router: true
-    moe_router_dtype: fp64
+    # fp32 to match the reference branch (arigazzi/mlperf-training-qwen35-main)
+    # for the aligned-config convergence comparison (was fp64).
+    moe_router_dtype: fp32
     moe_router_load_balancing_type: none
     moe_router_bias_update_rate: 0.0
     moe_permute_fusion: false
@@ -173,16 +175,11 @@ policy:
       override_opt_param_scheduler: true
     distributed_data_parallel_config:
       grad_reduce_in_fp32: false
-      # Bug #16 mitigation (2nd attempt): async per-bucket reduce-scatters
-      # enqueued from backward hooks interleave with PP p2p / TP / EP ops in
-      # rank-dependent order once mid-schedule D2H syncs (GDN
-      # _resolve_cu_seqlens .cpu().item(), formerly the NaN grad check)
-      # jitter CPU timing -> cross-communicator deadlock on every process's
-      # SECOND step (the first step is serialized by per-process triton JIT
-      # of the GDN kernels, masking the race). py-spy at the job-2293084
-      # hang: 12/32 ranks past the whole schedule in empty_cache while
-      # others sat mid-forward - whole DP replicas diverged.
-      overlap_grad_reduce: false
+      # Re-enabled (reference-branch alignment): was disabled as a bug #16
+      # mitigation, but the root cause turned out to be EP alltoall groups
+      # spanning NVL72 rack boundaries — fixed properly by --segment=8 +
+      # cluster.segment_size=8. The reference branch runs with overlap on.
+      overlap_grad_reduce: true
       overlap_param_gather: false
       # Bug #16 fix: the per-bucket NaN grad check D2H-syncs inside the DDP
       # grad-ready hook and deadlocked every process's second train step at
@@ -325,7 +322,11 @@ policy:
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 8
-      gpu_memory_utilization: 0.55
+      # 0.80 to match the reference branch (was 0.55): larger KV cache is
+      # paired with the doubled agent concurrency (256) below. If engine
+      # bringup or refit OOMs, dial back toward 0.65 before touching
+      # concurrency.
+      gpu_memory_utilization: 0.80
       max_model_len: 65536
       # Engines kept dying at first traffic: a TP rank stalls >600s in a
       # first-hit inductor dynamic-shape compile (persists even with
@@ -434,9 +435,12 @@ env:
             agent_cls: CodeActAgent
             diversify_tool_names: false
           agent_max_turns: 30
-          swebench_agent_timeout: 600
+          # 1200s + concurrency 256 to match the reference branch (was
+          # 600/128). At 600s the train side timeout-censored slow episodes
+          # (10.9% at step 0 rising to >60% as greedy decode degenerated).
+          swebench_agent_timeout: 1200
           swebench_tests_timeout: 300
-          concurrency: 128
+          concurrency: 256
           base_results_dir: /logs/nemo_gym/swe_agents_train
           dataset_path: ${data.train.data_path}
           # Fallback list: entries are tried in order per instance. Covers both
@@ -450,12 +454,16 @@ env:
         swe_agents:
           agent_framework_commit: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_framework_commit}
           agent_max_turns: 30
-          # 1200s (train side stays 600): in-loop validation (val_period=5)
-          # shares engines with in-flight async train rollouts; at 600s the
-          # contention pushed 93% of val rollouts into timeout (job 2319965,
-          # val@14 measured 0.78% vs 24.9% train-side). Doubling the val agent
-          # budget compensates for the contention latency.
-          swebench_agent_timeout: 1200
+          # Val protocol fix (grpo-aligned-1 evidence): at concurrency 256 the
+          # per-episode model-call time ballooned to median 843-1080s and
+          # 28-43% of val episodes STILL timed out at 1200s — val accuracy
+          # (3.5-15.2%) measured the censoring, not the policy (train solve
+          # 67% at the same steps). Val is a measurement, not a throughput
+          # workload: run it at low contention (128 ≈ 8 episodes/engine, the
+          # healthiest observed profile: 375s median, 10.9% timeouts) with the
+          # gym-default 1800s budget as headroom for longer late-training
+          # completions.
+          swebench_agent_timeout: 1800
           swebench_tests_timeout: 180
           concurrency: 128
           base_results_dir: /logs/nemo_gym/swe_agents_val
