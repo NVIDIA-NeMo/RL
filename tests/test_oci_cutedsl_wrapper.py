@@ -37,6 +37,73 @@ SMOKE_SCRIPT = (
 ).read_text()
 
 
+def _focused_srun_invocation_source() -> str:
+    phase_start = SCRIPT.index("cutedsl_write_event focused_tests start")
+    invocation_start = SCRIPT.index('"${SRUN[@]}" bash', phase_start)
+    invocation_end = SCRIPT.index(
+        "\ncutedsl_write_event focused_tests pass", invocation_start
+    )
+    return SCRIPT[invocation_start:invocation_end]
+
+
+def test_focused_srun_payload_is_single_parseable_stdin_script(tmp_path: Path) -> None:
+    """The exact focused invocation passes one intact, newline-preserving script."""
+    capture_script = tmp_path / "capture.py"
+    capture_path = tmp_path / "capture.json"
+    capture_script.write_text(
+        "import json, os, pathlib, sys\n"
+        "pathlib.Path(os.environ['CAPTURE_PATH']).write_text(\n"
+        "    json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()})\n"
+        ")\n"
+    )
+    command = (
+        "set -eo pipefail\n"
+        'SRUN=("$1" "$2")\n'
+        "export CAPTURE_PATH=$3\n" + _focused_srun_invocation_source() + "\n"
+    )
+    captured = subprocess.run(
+        [
+            "bash",
+            "-c",
+            command,
+            "focused-srun-capture",
+            sys.executable,
+            str(capture_script),
+            str(capture_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert captured.returncode == 0, captured.stderr
+    invocation = json.loads(capture_path.read_text())
+    assert invocation["argv"] == ["bash", "-s"], invocation["argv"]
+    payload = invocation["stdin"]
+    assert payload.startswith('export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"\n')
+    parsed = subprocess.run(
+        ["bash", "-n"], input=payload, capture_output=True, text=True
+    )
+    assert parsed.returncode == 0, parsed.stderr
+
+    bridge_printf_start = payload.index("        printf '%s\\n' \\\n")
+    bridge_printf_end = payload.index(
+        '        "${RUNTIME_PYTHON}" -m pytest', bridge_printf_start
+    )
+    bridge_diagnostics = subprocess.run(
+        ["bash", "-c", payload[bridge_printf_start:bridge_printf_end]],
+        env={**os.environ, "UV_PYTHON_VERSION": "3.13.13"},
+        capture_output=True,
+        text=True,
+    )
+    assert bridge_diagnostics.returncode == 0, bridge_diagnostics.stderr
+    assert bridge_diagnostics.stdout.splitlines() == [
+        "[INFO] Bridge MSC exclusions: exactly 2 tests are deselected because "
+        "multi-storage-client~=0.50 provides only CPython 3.12 wheels, while the "
+        "locked NeMo runtime is Python 3.13.13.",
+        "[INFO] Expected Bridge pytest summary: 203 passed, 2 deselected.",
+    ]
+
+
 def test_wrapper_runs_complete_locked_linux_validation_gate() -> None:
     required_fragments = (
         "Copyright (c) 2026, NVIDIA CORPORATION.",

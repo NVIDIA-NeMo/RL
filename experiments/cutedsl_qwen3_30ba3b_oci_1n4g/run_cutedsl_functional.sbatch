@@ -368,10 +368,10 @@ cutedsl_write_event config_validation pass 0 \
 echo "[INFO] Running focused Linux tests before the GPU smoke and GRPO launch."
 cutedsl_write_event focused_tests start '' \
     "Run focused tests, type checks, and pre-commit" focused_tests.log
-"${SRUN[@]}" bash -lc '
+"${SRUN[@]}" bash -s <<'BASH'
 export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
 set -euo pipefail
-printf '"'"'[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n'"'"' \
+printf '[INFO] Container temporary directory: TMPDIR=%s uid=%s gid=%s\n' \
     "${TMPDIR}" "$(id -u)" "$(id -g)"
 [[ "${TMPDIR}" == "${CONTAINER_RUNTIME_DIR}/tmp" ]]
 [[ -d "${TMPDIR}" && -w "${TMPDIR}" ]]
@@ -380,9 +380,9 @@ source "${CONTAINER_RUNTIME_DIR}/log_runtime_environment.sh"
 [[ "${NVTE_CUDA_ARCHS}" == "100" ]]
 [[ "${VIRTUAL_ENV}" == "${UV_PROJECT_ENVIRONMENT}" ]]
 [[ "$("${RUNTIME_PYTHON}" --version)" == "Python ${UV_PYTHON_VERSION}" ]]
-expected_runtime_python=$("${RUNTIME_PYTHON}" -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
-runtime_python=$("${UV_BIN}" run --active --no-sync python -c '"'"'import os, sys; print(os.path.realpath(sys.executable))'"'"')
-runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; print(sys.prefix)'"'"')
+expected_runtime_python=$("${RUNTIME_PYTHON}" -c 'import os, sys; print(os.path.realpath(sys.executable))')
+runtime_python=$("${UV_BIN}" run --active --no-sync python -c 'import os, sys; print(os.path.realpath(sys.executable))')
+runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c 'import sys; print(sys.prefix)')
 [[ "${runtime_python}" == "${expected_runtime_python}" ]]
 [[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
 # CUTEDSL_BRIDGE_SUMMARY_VALIDATOR_START
@@ -491,7 +491,7 @@ done
     printf '%s\n' \
         "[INFO] Parent pre-commit skips only taplo-format: mirrors-taplo v0.9.3 sdist is missing crates/taplo-lsp/Cargo.toml for CPython 3.13/aarch64; validating every changed parent TOML with locked runtime tomllib."
     if [[ ${#parent_toml_files[@]} -gt 0 ]]; then
-        "${RUNTIME_PYTHON}" - "${parent_toml_files[@]}" <<'"'"'PY'"'"'
+        "${RUNTIME_PYTHON}" - "${parent_toml_files[@]}" <<'PY'
 # CUTEDSL_PARENT_TOML_VALIDATOR_START
 import pathlib
 import sys
@@ -536,7 +536,7 @@ fi
     cd "${bridge_root}"
     "${UV_BIN}" run --active --no-sync pre-commit run --files "${bridge_changed_files[@]}"
 ) 2>&1 | tee "${CONTAINER_RESULT_DIR}/bridge_precommit.log"
-'
+BASH
 cutedsl_write_event focused_tests pass 0 \
     "Focused validation gate passed" focused_tests.log
 

@@ -477,7 +477,7 @@ def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:
     assert isinstance(incidents, list)
     assert run_index.startswith("run_id\treport_path\tstatus\tcluster\tfeature_cell\n")
     incident_text = json.dumps(incidents, sort_keys=True)
-    for job_id in ("1910599", "1911208"):
+    for job_id in ("1910599", "1911208", "2362239"):
         assert job_id in incident_text
         assert job_id in index
     assert "stale login-image TMPDIR" in incident_text
@@ -492,7 +492,11 @@ def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
     collector = LinkCollector()
     collector.feed(index_path.read_text())
 
-    assert {incident["run_id"] for incident in incidents} == {"1910599", "1911208"}
+    assert {incident["run_id"] for incident in incidents} == {
+        "1910599",
+        "1911208",
+        "2362239",
+    }
     for incident in incidents:
         relative_path = Path(incident["report_path"])
         assert not relative_path.is_absolute()

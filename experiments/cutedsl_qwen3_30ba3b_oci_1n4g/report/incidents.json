@@ -28,5 +28,20 @@
     "timestamp_utc": "2026-07-11T23:05:41Z",
     "verification_evidence": "Job 1911208 proved the boundary diagnosis; host regression tests simulate the stale post-login value, while remote verification remains pending.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2362239 passed runtime_bootstrap and Bridge validation (203 passed, 2 deselected, 82 warnings), then slurm.out lines 649-650 reported `Preserved: -c: line 74: syntax error: unexpected end of file` and task 0 exit 2.",
+    "fix_commit": "focused payload quoted-heredoc commit",
+    "hypothesis": "Raw single-quoted printf formats closed the outer single-quoted bash -lc payload and fragmented its argv.",
+    "report_path": "evidence/job-2362239.txt",
+    "reproduction": "Capture the exact focused-tests srun invocation from commit 9c32c95e7 with a stand-in SRUN executable and inspect its argv and stdin.",
+    "root_cause": "The focused-tests phase nested raw single-quoted printf strings inside an outer single-quoted bash -lc command. Host parsing removed quotes, split the payload into 17 arguments, changed Bridge printf %s\\n into %sn, and left the inner script syntactically incomplete.",
+    "run_id": "2362239",
+    "symptom": "Focused validation failed after Bridge passed, before the NeMo unit tests and remaining gates completed.",
+    "tested_change": "Convert only the focused-tests srun to bash -s with a quoted BASH heredoc; execute-capture the exact invocation, parse its complete stdin with bash -n, and verify two literal Bridge diagnostic lines.",
+    "timestamp_utc": "2026-07-12T00:01:07Z",
+    "verification_evidence": "The focused executable regression passes locally and all preserved gate contracts remain covered; remote verification is pending.",
+    "verification_job": "pending"
   }
 ]
