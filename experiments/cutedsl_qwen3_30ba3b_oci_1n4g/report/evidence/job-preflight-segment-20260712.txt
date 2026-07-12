@@ -1,0 +1,30 @@
+Pre-Tyche 2-node factorial topology preflight
+Run ID: preflight-segment-20260712
+Timestamp (UTC): 2026-07-12T08:16:45Z
+Branch: sna/nemo-2606-cutedsl-a2a-factorial-20260712
+Fix commit: b434c4dc596e996dd77a161d435520c17a75b483
+Original remote log: no training log; bounded sbatch --test-only output summarized below.
+
+Symptom
+- The fixed 2-node EP8 submitter inherited --segment=1 from the shared single-node cluster profile.
+
+Root cause
+- The profile correctly uses --segment=1 for the one-node functional gate.
+- The 2-node submitter copied that scheduler argument without adapting it to its fixed node count.
+- As a result, topology-sensitive A2A measurements did not request one two-node placement segment.
+
+Fix
+- The 2-node submitter now replaces the profile segment argument with --segment=2.
+- The one-node functional submitter still receives --segment=1.
+- A mocked sbatch regression requires --nodes=2 and --segment=2, and rejects --segment=1.
+- A stale report assertion was updated to require the dynamic TRAINING_GPU_COUNT topology source rather than hard-coded EP4.
+
+Verification
+- RED: focused harness test failed because argv contained --segment=1 and lacked --segment=2.
+- GREEN: 9 focused harness tests passed.
+- Regression: 153 harness/profile/wrapper/report tests passed.
+- Ruff 0.9.9, bash syntax, and git diff checks passed.
+- Pre-Tyche accepted test-only requests 2364786, 2364787, and 2364788.
+- Forecast node pair: ptyche[0285-0286].
+- No GPU jobs were submitted by the test-only requests.
+- This evidence validates submission topology and scheduler feasibility only; it supports no performance claim.

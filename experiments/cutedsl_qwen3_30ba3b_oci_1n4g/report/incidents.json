@@ -223,5 +223,20 @@
     "timestamp_utc": "2026-07-12T07:55:53Z",
     "verification_evidence": "Focused Pyrefly reports zero errors for host_memory.py; Ruff 0.9.9, bash syntax, three local vLLM tests, and all 52 wrapper regressions pass. Remote MCore and functional verification remain pending; this job provides no speedup evidence.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Pre-submit review found that the fixed 2-node EP8 harness inherited --segment=1 from the single-node cluster profile. The corrected source emitted --segment=2, and Pre-Tyche test-only requests 2364786-2364788 were accepted with the forecast node pair ptyche[0285-0286]; no GPU jobs were submitted.",
+    "fix_commit": "b434c4dc596e996dd77a161d435520c17a75b483",
+    "hypothesis": "A 2-node benchmark-specific segment override can preserve --segment=1 for the one-node functional gate while requesting one two-node NVLink placement segment for factorial measurements.",
+    "report_path": "evidence/job-preflight-segment-20260712.txt",
+    "reproduction": "Run the 2-node factorial submitter against the pre_tyche profile before b434c4dc5 and inspect mocked sbatch argv: --nodes=2 is paired with --segment=1.",
+    "root_cause": "The cluster profile was originally shared by one-node functional and two-node factorial submitters. Its valid one-node --segment=1 value was copied unchanged into the 2-node sbatch request, so the scheduler could place each node as a separate segment and invalidate topology-sensitive A2A comparisons.",
+    "run_id": "preflight-segment-20260712",
+    "symptom": "The planned EP8 A2A experiment did not guarantee that its two GB200 nodes shared the requested placement segment.",
+    "tested_change": "Replace the segment argument with --segment=2 only in the fixed 2-node factorial submitter; retain profile --segment=1 for functional jobs and assert the exact argv in the mocked submission contract.",
+    "timestamp_utc": "2026-07-12T08:16:45Z",
+    "verification_evidence": "The new assertion failed against --segment=1 before the fix. After the fix, 153 related harness/profile/wrapper/report tests, Ruff 0.9.9, bash syntax, and diff checks passed. Pre-Tyche accepted three test-only g0a0 requests; this is scheduler/preflight evidence, not a performance result.",
+    "verification_job": "2364786-2364788 (test-only; no jobs submitted)"
   }
 ]
