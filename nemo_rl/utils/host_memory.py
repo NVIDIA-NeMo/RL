@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from collections.abc import Mapping
 from typing import NamedTuple, Optional
 
@@ -35,8 +36,9 @@ def emit_structured_stdout(message: str) -> None:
 
 def _get_host_memory_snapshot() -> Optional[HostMemorySnapshot]:
     try:
+        process = psutil.Process(os.getpid())
         return HostMemorySnapshot(
-            process_rss_gib=psutil.Process().memory_info().rss / _GIB,
+            process_rss_gib=psutil.Process.memory_info(process).rss / _GIB,
             system_available_gib=psutil.virtual_memory().available / _GIB,
         )
     except Exception:

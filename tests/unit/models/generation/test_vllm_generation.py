@@ -178,12 +178,16 @@ def test_sync_sleep_uses_requested_sleep_level(
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {"vllm_cfg": {"async_engine": False}}
     worker.llm = MagicMock()
-    process = MagicMock()
-    process.memory_info.side_effect = [
-        types.SimpleNamespace(rss=5 * 1024**3),
-        types.SimpleNamespace(rss=3 * 1024**3),
-    ]
-    monkeypatch.setattr(psutil, "Process", lambda: process)
+    monkeypatch.setattr(
+        psutil.Process,
+        "memory_info",
+        MagicMock(
+            side_effect=[
+                types.SimpleNamespace(rss=5 * 1024**3),
+                types.SimpleNamespace(rss=3 * 1024**3),
+            ]
+        ),
+    )
     monkeypatch.setattr(
         psutil,
         "virtual_memory",
@@ -218,12 +222,16 @@ async def test_async_sleep_uses_requested_sleep_level(
     worker.llm.reset_prefix_cache = AsyncMock()
     worker.llm.reset_mm_cache = AsyncMock()
     worker.llm.sleep = AsyncMock()
-    process = MagicMock()
-    process.memory_info.side_effect = [
-        types.SimpleNamespace(rss=7 * 1024**3),
-        types.SimpleNamespace(rss=4 * 1024**3),
-    ]
-    monkeypatch.setattr(psutil, "Process", lambda: process)
+    monkeypatch.setattr(
+        psutil.Process,
+        "memory_info",
+        MagicMock(
+            side_effect=[
+                types.SimpleNamespace(rss=7 * 1024**3),
+                types.SimpleNamespace(rss=4 * 1024**3),
+            ]
+        ),
+    )
     monkeypatch.setattr(
         psutil,
         "virtual_memory",

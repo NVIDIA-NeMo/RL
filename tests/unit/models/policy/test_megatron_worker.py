@@ -93,8 +93,11 @@ def test_megatron_offload_emits_host_memory_at_oom_boundaries(
     )
 
     worker = _make_offload_diagnostics_worker(monkeypatch)
-    process = SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=5 * 1024**3))
-    monkeypatch.setattr(psutil, "Process", lambda: process)
+    monkeypatch.setattr(
+        psutil.Process,
+        "memory_info",
+        lambda _process: SimpleNamespace(rss=5 * 1024**3),
+    )
     monkeypatch.setattr(
         psutil,
         "virtual_memory",
@@ -134,7 +137,7 @@ def test_megatron_offload_memory_diagnostics_are_best_effort(
     monkeypatch.setattr(
         psutil,
         "Process",
-        lambda: (_ for _ in ()).throw(RuntimeError("procfs unavailable")),
+        lambda _pid=None: (_ for _ in ()).throw(RuntimeError("procfs unavailable")),
     )
 
     MegatronPolicyWorkerImpl.offload_before_refit(worker)
