@@ -32,6 +32,7 @@ from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
+    prepare_segment_topology,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
@@ -157,7 +158,7 @@ def setup(
     if policy_config["sequence_packing"]["enabled"]:
         assert not (
             policy_config["megatron_cfg"]["enabled"]
-            and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+            and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
         ), (
             "Linear CE fusion loss is not supported with sequence packing in DPO. "
             "The fusion path has not been validated with cu_seqlens-based logprob aggregation."
@@ -233,17 +234,21 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
+    num_nodes = cluster_config["num_nodes"]
+    segment_size = cluster_config.get("segment_size")
+    node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="dpo_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=1,
         port_range_low=cluster_config.get("master_port_range_low"),
         port_range_high=cluster_config.get("master_port_range_high"),
+        segment_size=segment_size,
+        node_resource_constraints=node_resource_constraints,
     )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+    print(f"  ✓ Ray cluster initialized with {num_nodes} nodes")
 
     # ==========================
     #   Training
@@ -278,8 +283,8 @@ def setup(
 
     loss_fn = DPOLossFn(
         master_config.dpo,
-        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"],
+        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"],
     )
     print("  ✓ Model initialized")
 
@@ -728,7 +733,10 @@ def dpo_train(
                             train_dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 

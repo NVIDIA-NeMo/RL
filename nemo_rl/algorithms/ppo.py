@@ -230,19 +230,31 @@ def setup(
         "A generation config in the PolicyConfig is required for PPO"
     )
 
-    # Value model on Megatron does not yet support sequence packing or context
-    # parallelism in the training-path forward. Reject up front rather than
-    # crashing inside a Megatron forward.
-    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2687.
-    if value_config.get("megatron_cfg", {}).get("enabled", False):
-        assert not value_config["sequence_packing"]["enabled"], (
-            "Sequence packing is currently not supported for the Megatron PPO "
-            "value model. See https://github.com/NVIDIA-NeMo/RL/issues/2687"
+    if value_config["megatron_cfg"]["enabled"]:
+        # Context parallelism for the Megatron value model requires sequence packing,
+        # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
+        if value_config["megatron_cfg"]["context_parallel_size"] > 1:
+            assert value_config["sequence_packing"]["enabled"], (
+                "Context parallelism (CP>1) for the Megatron PPO value model requires "
+                "value.sequence_packing.enabled=true."
+            )
+    else:
+        # DTensor PPO value model currently doesn't support sequence packing and CP.
+        assert value_config["dtensor_cfg"]["enabled"], (
+            "Exactly one of value.megatron_cfg.enabled or value.dtensor_cfg.enabled "
+            "must be true for the PPO value model."
         )
-        assert value_config["megatron_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the "
-            "Megatron PPO value model. See "
-            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
+        assert value_config["sequence_packing"]["enabled"] is False, (
+            "Sequence packing is currently not supported for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
+        )
+        assert value_config["dtensor_cfg"]["context_parallel_size"] == 1, (
+            "Context parallelism (CP>1) is currently not supported for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
+        )
+        assert value_config["dynamic_batching"]["enabled"] is False, (
+            "Dynamic batching currently has some issue for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
         )
 
     # Set seed for all random number generators
@@ -547,7 +559,7 @@ def setup(
         # Block until the policy worker's __init__ completes and offload to
         # CPU, freeing GPU for value model initialization. Policy will be
         # reloaded before the vLLM refit step below.
-        policy.offload_after_refit()
+        policy.offload_to_cpu()
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
         print("  ⚙️  Initializing value model for GAE...", flush=True)
@@ -1038,7 +1050,7 @@ def ppo_train(
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
-                            policy.offload_after_refit()
+                            policy.offload_to_cpu()
                         policy_generation.prepare_for_generation()
 
                 with timer.time("generation"):
@@ -1297,7 +1309,7 @@ def ppo_train(
                                 timer=timer,
                             )
                             if step < ppo_epochs - 1:
-                                policy.offload_after_refit()
+                                policy.offload_to_cpu()
 
                     if train_results is not None:
                         print(
@@ -1340,7 +1352,7 @@ def ppo_train(
                         POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
-                            policy.offload_after_refit()
+                            policy.offload_to_cpu()
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
                         policy_generation,
@@ -1562,7 +1574,7 @@ def ppo_train(
                                 ),
                                 checkpointing_cfg=master_config.checkpointing,
                             )
-                            policy.offload_after_refit()
+                            policy.offload_to_cpu()
                         else:
                             print(
                                 f"Skipping policy checkpoint (critic warmup: "
@@ -1581,6 +1593,7 @@ def ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config.checkpointing,
                         )
                         value_model.finish_training()
 
@@ -1588,7 +1601,13 @@ def ppo_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # The value worker finalizes its own write synchronously
+                        # (blocking=True) inside save_checkpoint, so only the
+                        # policy's async write needs to be awaited before rename.
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             # Logging
             memory_tracker.snapshot_start_of_stage("Logging", dir())

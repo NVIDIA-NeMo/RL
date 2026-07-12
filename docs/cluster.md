@@ -141,42 +141,116 @@ sbatch ray.sub \
     and reuse across container runs. This variable should point to a path on a shared 
     filesystem accessible by all nodes (head and workers). This path will be mounted 
     into the container and will override the container's default `UV_CACHE_DIR`.
-* - `CPUS_PER_WORKER=128`
-  - CPUs each Ray worker node claims. Default is `16 * GPUS_PER_NODE`.
+* - `CPUS_PER_WORKER`
+  - CPUs each Ray worker node claims. If unset, `ray.sub` auto-detects this from
+    Slurm (the `CPUTot` of the first allocated node) so that Ray sees every CPU
+    on the node. Detection assumes a homogeneous allocation (all nodes have the
+    same CPU count) and only queries a single node to avoid hammering the Slurm
+    controller with one RPC per node; set this explicitly for a heterogeneous
+    allocation or to override detection.
 * - `GPUS_PER_NODE=8`
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
-* - `NODE_MANAGER_PORT=53001`
+* - `NODE_MANAGER_PORT=1301`
   - Port for the Ray node manager on worker nodes.
-* - `OBJECT_MANAGER_PORT=53003`
+* - `OBJECT_MANAGER_PORT=1303`
   - Port for the Ray object manager on worker nodes.
-* - `RUNTIME_ENV_AGENT_PORT=53005`
+* - `RUNTIME_ENV_AGENT_PORT=1305`
   - Port for the Ray runtime environment agent on worker nodes.
-* - `DASHBOARD_AGENT_GRPC_PORT=53007`
+* - `DASHBOARD_AGENT_GRPC_PORT=1307`
   - gRPC port for the Ray dashboard agent on worker nodes.
-* - `METRICS_EXPORT_PORT=53009`
+* - `METRICS_EXPORT_PORT=1309`
   - Port for exporting metrics from worker nodes.
-* - `PORT=6379`
+* - `PORT=1200`
   - Main port for the Ray head node.
-* - `RAY_CLIENT_SERVER_PORT=10001`
+* - `RAY_CLIENT_SERVER_PORT=1201`
   - Port for the Ray client server on the head node.
 * - `DASHBOARD_GRPC_PORT=52367`
   - gRPC port for the Ray dashboard on the head node.
 * - `DASHBOARD_PORT=8265`
   - Port for the Ray dashboard UI on the head node. This is also the port
     used by the Ray distributed debugger.
-* - `DASHBOARD_AGENT_LISTEN_PORT=52365`
+* - `DASHBOARD_AGENT_LISTEN_PORT=1311`
   - Listening port for the dashboard agent on the head node.
-* - `MIN_WORKER_PORT=54001`
+* - `MIN_WORKER_PORT=2000`
   - Minimum port in the range for Ray worker processes.
-* - `MAX_WORKER_PORT=54257`
+* - `MAX_WORKER_PORT=2999`
   - Maximum port in the range for Ray worker processes.
 ``````
 
 > [!NOTE]
 > For the most part, you will not need to change ports unless these
 > are already taken by some other service backgrounded on your cluster.
+> The defaults above are the source-of-truth port layout defined in `ray.sub`;
+> keep this table in sync with that block if the defaults ever change.
+
+### Topology-Aware Placement for MoE (avoiding cross-rack stalls)
+
+On clusters where one NVLink domain spans a fixed set of nodes (e.g. a GB200
+NVL72 rack = 18 nodes = one fabric domain), a MoE job's expert-parallel (EP)
+`all_to_all` can intermittently stall under sustained load when an EP group is
+split across two NVLink domains (two racks). The fix is to keep every EP group
+inside a single NVLink domain. This requires **two coordinated knobs**, both
+sized to the EP group's node span:
+
+```
+segment_size (nodes) = expert_model_parallel_size / gpus_per_node
+```
+
+For example `expert_model_parallel_size=8` on a 4-GPU/node cluster spans 2
+nodes, so the segment size is `2`.
+
+* **`cluster.segment_size`** (recipe YAML) — application/Ray side. After the
+  Slurm allocation exists, NeMo RL selects topology-aligned nodes (complete
+  `segment_size`-node segments per NVLink domain) and orders global ranks so
+  each EP group lands on one segment. It is a *post-allocation selector*: it
+  cannot change what Slurm allocated, and raises `ResourceInsufficientError` if
+  the allocated nodes cannot form complete segments. The requested node count
+  must be evenly divisible by `segment_size`.
+
+  ```yaml
+  cluster:
+    gpus_per_node: 4
+    segment_size: 2   # = EP group node span; keeps each EP group intra-rack
+  ```
+
+* **`sbatch --segment=<size>`** (Slurm side, block topology) — allocation side.
+  Tells Slurm to allocate nodes in segments of `<size>` nodes, each segment
+  guaranteed within a single topology block (rack); segments themselves may
+  span blocks. This makes the physical allocation match what
+  `cluster.segment_size` expects (and forces an even node count per rack, so
+  odd splits like 5+3 cannot occur). The node count must be evenly divisible by
+  the segment size.
+
+  ```sh
+  ... \
+  sbatch --nodes=8 --segment=2 ray.sub \
+     ...
+  ```
+
+> [!NOTE]
+> Set both to the same value. `--segment` alone guarantees the physical layout
+> but not the rank→node mapping; `cluster.segment_size` alone aligns ranks but
+> can fail (or silently fall back) if Slurm hands you a layout that cannot form
+> complete segments. The guarantee also relies on EP being the contiguous
+> (inner) parallel dimension in the global rank order, which is the default for
+> `tp-...-ep-dp-pp` layouts with TP/PP not interleaving EP.
+
+For nightly/release tests launched with `tools/launch`, you do not pass
+`--segment` by hand: add `SEGMENT_SIZE=<size>` to the script's
+`# ===== BEGIN CONFIG =====` block (mirroring `cluster.segment_size` in the
+recipe) and `tools/launch` validates divisibility and appends
+`--segment=<size>` to the `sbatch` invocation automatically.
+
+```sh
+# ===== BEGIN CONFIG =====
+NUM_NODES=8
+GPUS_PER_NODE=4
+SEGMENT_SIZE=2     # nodes per NVLink-domain segment; -> sbatch --segment
+...
+# ===== END CONFIG =====
+```
 
 ## Kubernetes
 

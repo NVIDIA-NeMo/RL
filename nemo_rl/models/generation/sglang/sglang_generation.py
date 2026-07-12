@@ -22,7 +22,6 @@ import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     get_reordered_bundle,
@@ -46,6 +45,7 @@ from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -80,7 +80,7 @@ class SGLangGeneration(GenerationInterface):
             use_unified_pg=True,
         )
         self.pg = pgs[0]
-        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = (
+        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids, _ = (
             get_reordered_bundle(self.pg)
         )
         self._http_client = HttpClient(sglang_cfg)
@@ -169,13 +169,21 @@ class SGLangGeneration(GenerationInterface):
         reordered_bundle_indices = self.pg_reordered_bundle_indices
         reordered_gpu_ids = self.pg_reordered_gpu_ids
 
+        # Resolve the SGLang venv ONCE (mirrors the once-per-node RayWorkerBuilder path).
+        sglang_runtime_env_base = make_actor_runtime_env(
+            "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
+        )
+        sglang_runtime_env_base.update(
+            get_nsight_config_if_pattern_matches("sglang_generation_worker")
+        )
+
         local_all_engines = []
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
 
             global_rank = self.rank_offset + i
-            num_gpus = 0.2
+            num_gpus = min(0.2, 1 / self.cluster.max_colocated_worker_groups)
             num_cpus = num_gpus
 
             gpu_index = self.gpu_offset + i * num_gpu_per_engine
@@ -207,15 +215,20 @@ class SGLangGeneration(GenerationInterface):
             if global_cvd:
                 env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
 
+            # Resolve the SGLang venv on every node and pin VIRTUAL_ENV /
+            # UV_PROJECT_ENVIRONMENT so the actor (and its spawned children)
+            # actually run inside the sglang venv instead of inheriting the
+            # raylet's base venv (e.g. /opt/nemo_rl_venv inside the container).
+            sglang_runtime_env = {
+                **sglang_runtime_env_base,
+                "env_vars": {**sglang_runtime_env_base["env_vars"], **env_vars},
+            }
+
             actor_options = {
                 "num_cpus": num_cpus,
                 "num_gpus": num_gpus,
                 "scheduling_strategy": scheduling_strategy,
-                "runtime_env": {
-                    "py_executable": SGLANG_EXECUTABLE,
-                    "env_vars": env_vars,
-                    **get_nsight_config_if_pattern_matches("sglang_generation_worker"),
-                },
+                "runtime_env": sglang_runtime_env,
             }
             init_args = (self.num_gpus_per_node, self.sglang_cfg)
             init_kwargs = {
@@ -236,7 +249,9 @@ class SGLangGeneration(GenerationInterface):
         if len(local_all_engines) == 0:
             return [], port_cursors
 
-        base_port = max(port_cursors.values()) if port_cursors else 15000
+        # SGLang engine ports live in the below-ephemeral-floor engine band
+        # (7000-8999), shared with vLLM; see virtual_cluster.py port layout.
+        base_port = max(port_cursors.values()) if port_cursors else 7000
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             gpus_per_node=self.num_gpus_per_node,
             sglang_cfg=self.sglang_cfg,

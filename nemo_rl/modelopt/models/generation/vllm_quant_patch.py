@@ -14,15 +14,60 @@
 # limitations under the License.
 
 import os
+from contextlib import contextmanager
 from typing import Any
 
 import modelopt.torch.quantization as mtq
 import torch
+from modelopt.torch.quantization.calib.max import MaxCalibrator
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 from modelopt.torch.quantization.plugins.vllm import disable_compilation
 from vllm.v1.worker.gpu_worker import Worker as BaseWorker
 
 from nemo_rl.modelopt.utils import resolve_quant_cfg
+
+
+@contextmanager
+def _tolerate_dummy_weight_nan_amax():
+    """Scope-locally make `MaxCalibrator.collect` zero-fill on fully-NaN inputs.
+
+    When this prolog runs, vLLM's model still has *uninitialized / dummy*
+    weights — the real weights only arrive later via refit from the
+    Megatron policy worker. Cumulative BF16 matmuls on dummy weights can
+    overflow at deeper layers (e.g. Nemotron-3-Nano's Mamba `out_proj`
+    at layer 4) and produce NaN, which then cascades to every downstream
+    quantizer's input during dummy calibration.
+
+    The dummy-calibration amax is *meant* to be discarded — the prolog
+    sentinels every enabled quantizer's `_amax` to `-1.0` immediately
+    afterwards, and Megatron's real amax is loaded via
+    `vllm_quant_backend.input_amax_loader` during refit (`max(-1.0,
+    real)=real`). So a fully-NaN input here should produce zero amax
+    rather than crash the prolog.
+
+    Scoping this monkey-patch to the prolog (instead of editing
+    `MaxCalibrator.collect` in modelopt) keeps modelopt's source pristine
+    and limits the workaround to the single dummy-weight code path that
+    needs it. Genuine numerical NaN at runtime — when the calibrator is
+    no longer active — would still be caught by the production callsite.
+
+    Nonfinite dummy activations are sanitized before calibration reduce. The
+    patch is active only inside the dummy-weight prolog, before runtime
+    generation starts and before real amax values are loaded.
+    """
+    _original_collect = MaxCalibrator.collect
+
+    @torch.no_grad()
+    def _safe_collect(self, x):
+        if x.device.type != "meta" and x.numel() > 0 and not torch.isfinite(x).all():
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        _original_collect(self, x)
+
+    MaxCalibrator.collect = _safe_collect
+    try:
+        yield
+    finally:
+        MaxCalibrator.collect = _original_collect
 
 
 def _fakequant_run_prolog_worker(self) -> None:
@@ -36,7 +81,7 @@ def _fakequant_run_prolog_worker(self) -> None:
     if hasattr(model, "unwrap"):
         model = model.unwrap()
 
-    with disable_compilation(model):
+    with disable_compilation(model), _tolerate_dummy_weight_nan_amax():
         print("quantizing model...")
         mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
 
