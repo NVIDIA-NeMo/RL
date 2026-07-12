@@ -253,41 +253,56 @@ class AsyncTrajectoryCollector:
                 if not self.running:
                     break
 
-                # Check if manually paused and wait
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
+                # Wait until NO pause condition holds before launching. This
+                # must be a loop that re-checks every condition after each
+                # wake-up: the checks were previously sequential, so a thread
+                # blocked on the generation-limit wait could be woken by the
+                # driver's set_weight_version at a validation boundary and
+                # sail straight into _process_batch even though pause() had
+                # cleared the manual-pause event in the meantime. That race
+                # launched full 256-episode batches 3-8s into validation
+                # sweeps; they starved against the val burst, timed out en
+                # masse, and poisoned the replay buffer with zero-reward
+                # trajectories (grpo-aligned-1 steps 7/12/17/22).
+                while self.running:
+                    if not self._manual_pause_cleared.is_set():
+                        self._manual_pause_cleared.wait()
+                        continue  # re-check all conditions after waking
 
-                # Check if refit is in progress and wait
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
-                    print("▶️ Refit completed, resuming collection")
+                    if not self._refit_pause_cleared.is_set():
+                        print("⏸️ Pausing collection for refit...")
+                        self._refit_pause_cleared.wait()
+                        print("▶️ Refit completed, resuming collection")
+                        continue  # re-check all conditions after waking
 
-                # Check if generation limits require pausing collection
-                if self._should_pause_for_generation_limits() and self.running:
-                    # Only log warning once per weight version
-                    if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
+                    if self._should_pause_for_generation_limits():
+                        # Only log warning once per weight version
+                        if (
+                            self._last_limit_warning_version
+                            != self.current_weight_version
+                        ):
+                            async_cfg = self.master_config.grpo.get("async_grpo", {})
+                            max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                            target_weights = [
+                                self.current_weight_version + i
+                                for i in range(max_trajectory_age)
+                            ]
 
-                        print(
-                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
-                        )
-                        self._last_limit_warning_version = self.current_weight_version
+                            print(
+                                f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                                f"already exist in buffer. Waiting for weight update..."
+                            )
+                            self._last_limit_warning_version = (
+                                self.current_weight_version
+                            )
 
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
+                            self._generation_limit_cleared.clear()  # Clear the event to pause
 
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
+                        # Efficiently wait for generation limits to be cleared (no polling!)
+                        self._generation_limit_cleared.wait()
+                        continue  # re-check all conditions after waking
 
-                    # Double-check we're still running after being woken up
-                    if not self.running:
-                        break
+                    break  # nothing requires pausing; clear to launch
 
                 if not self.running:
                     break
@@ -359,6 +374,16 @@ class AsyncTrajectoryCollector:
                 self._spawning_targets.add(target_weight)
             try:
                 for prompt_idx in range(num_prompts_to_generate):
+                    # Honor a manual pause (e.g. validation boundary) mid-batch:
+                    # without this, a pause landing while the spawn loop is open
+                    # lets the remainder of the 256-episode batch launch into
+                    # the validation window and starve against the val burst.
+                    if not self._manual_pause_cleared.is_set() and self.running:
+                        print(
+                            f"⏸️ Manual pause mid-batch: holding after {started} launched generations"
+                        )
+                        self._manual_pause_cleared.wait()
+
                     # Wait for refit to complete if in progress
                     if not self._refit_pause_cleared.is_set() and self.running:
                         with self._threads_lock:
