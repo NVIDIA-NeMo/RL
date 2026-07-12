@@ -44,7 +44,9 @@ data:
   max_input_seq_length: ${generation.vllm_cfg.max_model_len} # useless since we directly use prompts in evaluation
   prompt_file: null
   system_prompt_file: null
-  dataset_name: "aime2024"
+  dataset_name: "AIME2024"
+  processor: "math_hf_data_processor"
+  repeat: 1
 
 env:
   math:
