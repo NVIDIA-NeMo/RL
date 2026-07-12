@@ -543,6 +543,7 @@ def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
         "2362916",
         "2363067",
         "2363339",
+        "2350825",
         "local-refresh-20260712",
     }
     for incident in incidents:

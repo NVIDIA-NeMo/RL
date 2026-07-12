@@ -148,5 +148,20 @@
     "timestamp_utc": "2026-07-12T05:07:19Z",
     "verification_evidence": "Job 2363339 verifies the focused lifecycle tests but provides no GPU-smoke, training-update, timing, throughput, or performance evidence. Ruff 0.9.9 verification passes locally; remote functional verification is job 2363729.",
     "verification_job": "2363729 (pending)"
+  },
+  {
+    "cluster": "lyris",
+    "evidence": "Job 2350825 passed focused validation, Cutlass import, and four-GPU Transformer Engine forward/backward smoke. It completed one policy update, instantiated GroupedGemmGluSm100, and captured four approximately 30-31 MB policy-worker Nsight reports. During step 2, all four policy ranks entered optimizer offload at approximately 105.70-105.71 GB GPU allocation; Slurm classified step 2350825.4 OUT_OF_MEMORY with exit 0:125 and MaxRSS 453952640K.",
+    "fix_commit": "pending direct vLLM lifecycle-memory instrumentation",
+    "hypothesis": "Either discard_weights=True did not resolve to vLLM sleep level 2 at runtime, or level 2 completed but the remaining four-rank mature optimizer offload still exceeded the 940000 MB host-memory cgroup. Existing vLLM logs do not distinguish these cases.",
+    "report_path": "evidence/job-2350825.txt",
+    "reproduction": "Run the three-update Lyris functional gate at fb97eb1bb on one four-GPU GB200 node. Observe one completed update, weight/KV wake, vLLM sleep messages, and the synchronized step-2 policy optimizer offload followed by host OOM.",
+    "root_cause": "The immediate failure was a host-memory cgroup OOM during the four policy ranks' synchronized mature optimizer-state offload. Sleep calls occurred, but the run did not log their requested/resolved level or process/system-memory delta, so the avoidable vLLM contribution remains unresolved rather than proven fixed.",
+    "run_id": "2350825",
+    "symptom": "The GB200 integration run crossed all smoke gates and one optimizer update, then policy actors died during step-2 optimizer offload.",
+    "tested_change": "Add fail-visible driver and sync/async worker logging for discard_weights, requested/resolved sleep level, process RSS, system available memory, and before/after deltas; rerun without changing the workload so the two memory hypotheses can be separated.",
+    "timestamp_utc": "2026-07-12T05:53:54Z",
+    "verification_evidence": "Job 2350825 verifies CuTeDSL smoke execution and one warm-up update only. Direct lifecycle-memory verification and a completed functional gate are pending; no ON/OFF speedup is supported.",
+    "verification_job": "pending"
   }
 ]
