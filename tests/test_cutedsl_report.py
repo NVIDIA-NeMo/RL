@@ -495,6 +495,22 @@ def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:
     assert "/runtime/tmp" in incident_text
 
 
+def test_superseded_verification_job_does_not_claim_success() -> None:
+    """A later failed verification cannot remain labeled running or clean."""
+    incidents = json.loads((EXPERIMENT_DIR / "report/incidents.json").read_text())
+    bootstrap_incident = next(
+        incident for incident in incidents if incident["run_id"] == "2363981"
+    )
+
+    assert bootstrap_incident["verification_job"] == "2364090 (failed)"
+    assert (
+        "clean remote verification" not in bootstrap_incident["verification_evidence"]
+    )
+    assert (
+        "failed after functional step 1" in bootstrap_incident["verification_evidence"]
+    )
+
+
 def test_refresh_preserves_manual_incident_evidence_without_run_directories(
     tmp_path: Path,
 ) -> None:
@@ -549,6 +565,7 @@ def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
         "2364090",
         "2364431",
         "2364630",
+        "2364903",
         "local-refresh-20260712",
         "preflight-segment-20260712",
     }
@@ -642,6 +659,38 @@ def test_job_2363067_disproves_profile_overlap_as_sufficient_cause() -> None:
     assert evidence == public_evidence
     assert "2363067" in index
     assert "No ON/OFF speedup or performance conclusion" in index
+
+
+def test_job_2364903_proves_mature_optimizer_offload_oom() -> None:
+    """The telemetry rerun closes the vLLM-level hypothesis without a perf claim."""
+    report_dir = EXPERIMENT_DIR / "report"
+    incidents = json.loads((report_dir / "incidents.json").read_text())
+    incident = next(item for item in incidents if item["run_id"] == "2364903")
+    evidence = (report_dir / incident["report_path"]).read_text()
+    public_evidence = (report_dir / "public" / incident["report_path"]).read_text()
+    index = (report_dir / "public/index.html").read_text()
+
+    for fragment in (
+        "01d730e26ad36b6fce8958756273b1d5cbc6090f",
+        "2 passed, 13 deselected",
+        "errors shown: 0",
+        "four GB200",
+        "requested_sleep_level=2",
+        "107.79 GiB",
+        "77.110-78.106 GiB",
+        "OUT_OF_MEMORY",
+        "0:125",
+        "430794304K",
+        "Detected 2 oom_kill events",
+        "No speedup or authoritative performance conclusion",
+    ):
+        assert fragment in evidence, fragment
+        assert fragment in public_evidence, fragment
+    assert "mature optimizer-state CPU offload" in incident["root_cause"]
+    assert "vLLM level-2 discard succeeded" in incident["verification_evidence"]
+    assert evidence == public_evidence
+    assert "2364903" in index
+    assert "No speedup or authoritative performance conclusion" in index
 
 
 @pytest.mark.parametrize(

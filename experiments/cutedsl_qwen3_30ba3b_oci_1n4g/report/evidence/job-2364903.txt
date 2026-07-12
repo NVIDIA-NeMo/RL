@@ -1,0 +1,37 @@
+CuTeDSL Pre-Tyche lifecycle-memory telemetry evidence snapshot
+
+Job: 2364903
+Cluster: Pre-Tyche
+Node: ptyche0137
+Source: 01d730e26ad36b6fce8958756273b1d5cbc6090f
+State: FAILED
+ExitCode: 1:0
+Elapsed: 00:38:51
+
+Original remote log: /lustre/fsw/coreai_dlalgo_llm/users/sna/nemo-2606-cutedsl-pre-tyche-20260711/src/RL/experiments/cutedsl_qwen3_30ba3b_oci_1n4g/results/2364903/slurm.out
+Original result directory: /lustre/fsw/coreai_dlalgo_llm/users/sna/nemo-2606-cutedsl-pre-tyche-20260711/src/RL/experiments/cutedsl_qwen3_30ba3b_oci_1n4g/results/2364903
+
+Verified gates:
+- Bridge: 203 passed, 2 deselected; NeMo lifecycle: 11 passed, 117 deselected.
+- Dedicated policy telemetry shard: 2 passed, 13 deselected; capfd Linux regression passed.
+- Pyrefly: errors shown: 0; pinned Ruff and pre-commit passed.
+- Transformer Engine forward/backward passed on all four GB200 GPUs.
+- CuTeDSL policy execution instantiated GroupedGemmGluSm100.
+
+Lifecycle evidence:
+- vLLM emitted requested_sleep_level=2 with discard_weights=True.
+- Each generation worker discarded 107.79 GiB instead of retaining a CPU weight backup.
+- Initial policy offload completed at approximately 58.734-59.730 GiB RSS per worker.
+- After the first optimizer update, the next offload reached 77.110-78.106 GiB RSS per worker.
+- The mature offload emitted before_grad_move and before_optimizer_move but no after_completion.
+
+Failure boundary:
+- policy.offload_before_refit raised ActorDiedError after two policy workers were killed.
+- Slurm step 2364903.4: OUT_OF_MEMORY, ExitCode 0:125, MaxRSS 430794304K.
+- Slurm reported: Detected 2 oom_kill events; task 0: Out Of Memory.
+- Timing, replicate comparison, and accepted profile analysis were not reached.
+
+Conclusion:
+- vLLM level-2 discard is working and is not the remaining failure.
+- The host/cgroup OOM is caused by concurrent mature optimizer-state CPU offload.
+- No speedup or authoritative performance conclusion is supported by this functional warm-up run.

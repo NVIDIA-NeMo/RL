@@ -191,8 +191,8 @@
     "symptom": "Authoritative lifecycle-memory tests passed, but the functional wrapper stopped in parent pre-commit before GPU work.",
     "tested_change": "Apply the remote hook's exact psutil, pytest, ray import order and verify it with both pinned Ruff 0.9.9 and the local current Ruff before resubmission.",
     "timestamp_utc": "2026-07-12T06:37:35Z",
-    "verification_evidence": "Job 2363981 establishes Linux GREEN for all 10 lifecycle tests and no performance evidence. Commit 6a699c45f passes both Ruff versions locally; job 2364090 is the clean remote verification.",
-    "verification_job": "2364090 (running)"
+    "verification_evidence": "Job 2363981 establishes Linux GREEN for all 10 lifecycle tests and no performance evidence. Commit 6a699c45f passes both Ruff versions locally. Job 2364090 crossed the lint boundary but failed after functional step 1 during step-2 optimizer offload, as recorded in its later incident.",
+    "verification_job": "2364090 (failed)"
   },
   {
     "cluster": "pre_tyche",
@@ -253,5 +253,20 @@
     "timestamp_utc": "2026-07-12T08:28:54Z",
     "verification_evidence": "The remote failure is the RED reproduction. Ruff 0.9.9, Python compilation, and 52 wrapper regressions pass after the fixture change. macOS cannot import the pinned MCore because Triton is unavailable, so authoritative Linux verification remains pending; this job provides no GPU or performance evidence.",
     "verification_job": "pending Linux rerun"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2364903 passed the locked bootstrap, Bridge 203 passed/2 deselected, all focused NeMo lifecycle shards including the two separately selected policy telemetry tests, Pyrefly with zero errors, and four-GPU GB200 Transformer Engine smoke. Runtime stdout proved vLLM level-2 discard released 107.79 GiB per worker. After one optimizer update, all four policy ranks entered the next offload at 77.110-78.106 GiB RSS and two died before after_completion; Slurm classified step 2364903.4 OUT_OF_MEMORY with MaxRSS 430794304K and two oom_kill events.",
+    "fix_commit": "pending colocated policy lifecycle memory fix",
+    "hypothesis": "Avoiding or restructuring the concurrent mature optimizer-state CPU copy at the refit boundary will keep the job below its host cgroup limit while retaining the validated level-2 vLLM discard.",
+    "report_path": "evidence/job-2364903.txt",
+    "reproduction": "At source 01d730e26, run the three-update one-node four-GPU functional gate. Let step 1 materialize Adam state, then observe policy.offload_before_refit at the Step 2 boundary emit 77-78 GiB worker RSS and lose two actors before after_completion.",
+    "root_cause": "The remaining failure is a host-memory cgroup OOM during the four policy ranks' concurrent mature optimizer-state CPU offload after the first optimizer update. vLLM level-2 discard succeeded and retained no CPU weight backup, so it is not the remaining cause.",
+    "run_id": "2364903",
+    "symptom": "The telemetry-enabled functional run passed every source and GPU gate and completed one warm-up update, then two policy actors were OOM-killed in offload_before_refit at the Step 2 boundary.",
+    "tested_change": "Keep the workload unchanged and replace suppressed INFO diagnostics with flushed structured stdout at each vLLM sleep and policy offload boundary; separately run the policy tests with --mcore-only and capfd.",
+    "timestamp_utc": "2026-07-12T09:10:55Z",
+    "verification_evidence": "Linux policy telemetry tests passed, vLLM level-2 discard succeeded, and the new runtime events identify the exact mature optimizer offload boundary. The functional gate still failed, so no timing matrix was submitted. No speedup or authoritative performance conclusion is supported.",
+    "verification_job": "pending lifecycle-memory fix"
   }
 ]
