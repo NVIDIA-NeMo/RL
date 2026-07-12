@@ -208,5 +208,20 @@
     "timestamp_utc": "2026-07-12T07:17:32Z",
     "verification_evidence": "The run proves fused forward/dgrad activation and repeated host OOM, not speedup. The next run must show actual runtime level/RSS lines and cross the step-2 boundary before any timing matrix is submitted.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2364431 passed immutable source/image preflight, the locked Linux bootstrap, and 11 general lifecycle tests. Pyrefly 0.24.2 then rejected psutil.Process().memory_info() as a missing-self call, so the run stopped before GPU smoke. Inspection of the pytest summary also proved that the mcore-marked policy offload tests were silently excluded from the default lifecycle invocation.",
+    "fix_commit": "173136922e9c325e4c8ce0454f768de93be2fa37",
+    "hypothesis": "Calling the psutil method with an explicit Process instance will avoid Pyrefly's decorated-method binding error, while a separate --mcore-only invocation will execute the policy telemetry tests instead of silently filtering them.",
+    "report_path": "evidence/job-2364431.txt",
+    "reproduction": "At source b9abdca71, run the Pre-Tyche functional gate. Observe 11 general lifecycle passes, no policy telemetry test names in the terminal summary, and Pyrefly missing-argument at nemo_rl/utils/host_memory.py before GPU smoke.",
+    "root_cause": "Pyrefly 0.24.2 did not bind psutil's decorated memory_info method through the instance expression. Independently, NeMo-RL's pytest_collection_modifyitems excludes pytest.mark.mcore tests unless --mcore-only is supplied, but the wrapper had placed policy telemetry tests in the default invocation.",
+    "run_id": "2364431",
+    "symptom": "The Linux lifecycle tests passed, but the functional gate failed in Pyrefly and never executed the policy offload telemetry tests.",
+    "tested_change": "Call psutil.Process.memory_info(process) explicitly, update the mocks at the same class-method boundary, and split the policy telemetry regressions into a dedicated --mcore-only pytest invocation.",
+    "timestamp_utc": "2026-07-12T07:55:53Z",
+    "verification_evidence": "Focused Pyrefly reports zero errors for host_memory.py; Ruff 0.9.9, bash syntax, three local vLLM tests, and all 52 wrapper regressions pass. Remote MCore and functional verification remain pending; this job provides no speedup evidence.",
+    "verification_job": "pending"
   }
 ]
