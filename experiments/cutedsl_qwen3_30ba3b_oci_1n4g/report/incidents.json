@@ -193,5 +193,20 @@
     "timestamp_utc": "2026-07-12T06:37:35Z",
     "verification_evidence": "Job 2363981 establishes Linux GREEN for all 10 lifecycle tests and no performance evidence. Commit 6a699c45f passes both Ruff versions locally; job 2364090 is the clean remote verification.",
     "verification_job": "2364090 (running)"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2364090 passed the full source/test/lint gate, four-GPU GB200 smoke, one warm-up optimizer update, and captured four policy Nsight reports. CSV evidence recorded the exact fused forward and dgrad class names on every rank. Step 2 then entered four-rank mature optimizer offload and Slurm classified step 2364090.4 OUT_OF_MEMORY with MaxRSS 455362368K and two OOM kills.",
+    "fix_commit": "pending fail-visible lifecycle and policy-offload telemetry",
+    "hypothesis": "The logger.info-based telemetry was suppressed by Ray worker logging, so the run cannot distinguish whether runtime level 2 released the expected vLLM host allocation or whether the policy optimizer copy alone exceeded the remaining host headroom.",
+    "report_path": "evidence/job-2364090.txt",
+    "reproduction": "Run the three-update functional gate at 6a699c45f on one four-GPU GB200 node. Observe all gates and step 1 succeed, then step-2 synchronized optimizer offload and host OOM; search all retained runtime logs and find lifecycle events only in focused-test output.",
+    "root_cause": "The immediate training failure remains host-memory cgroup OOM during mature optimizer offload. Separately, the diagnostic failure is now proven: normal module INFO logging is not emitted by these Ray workers, so the newly added level/RSS observations were absent at runtime even though their unit tests passed.",
+    "run_id": "2364090",
+    "symptom": "The complete functional path reached real fused CuTeDSL policy training and one update, but died at step-2 optimizer offload without runtime sleep-memory evidence.",
+    "tested_change": "Use flushed structured stdout for driver and vLLM worker lifecycle events, and add best-effort policy-worker RSS/system-available snapshots before grad movement, before optimizer movement, and after offload.",
+    "timestamp_utc": "2026-07-12T07:17:32Z",
+    "verification_evidence": "The run proves fused forward/dgrad activation and repeated host OOM, not speedup. The next run must show actual runtime level/RSS lines and cross the step-2 boundary before any timing matrix is submitted.",
+    "verification_job": "pending"
   }
 ]
