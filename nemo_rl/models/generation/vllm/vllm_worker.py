@@ -17,8 +17,9 @@ import gc
 import logging
 import os
 import sys
-from typing import Any, Optional, cast
+from typing import Any, Literal, NamedTuple, Optional, cast
 
+import psutil
 import ray
 import torch
 from transformers import AutoConfig
@@ -46,6 +47,51 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 
 logger = logging.getLogger(__name__)
+
+_GIB = 1024**3
+
+
+class _HostMemorySnapshot(NamedTuple):
+    process_rss_gib: float
+    system_available_gib: float
+
+
+def _get_host_memory_snapshot() -> _HostMemorySnapshot:
+    return _HostMemorySnapshot(
+        process_rss_gib=psutil.Process().memory_info().rss / _GIB,
+        system_available_gib=psutil.virtual_memory().available / _GIB,
+    )
+
+
+def _log_sleep_memory(
+    log: logging.Logger,
+    *,
+    phase: Literal["before", "after"],
+    sleep_level: int,
+    snapshot: _HostMemorySnapshot,
+    before_snapshot: Optional[_HostMemorySnapshot] = None,
+) -> None:
+    if phase == "before":
+        log.info(
+            "event=vllm_sleep_memory phase=before sleep_level=%d "
+            "process_rss_gib=%.3f system_available_gib=%.3f",
+            sleep_level,
+            snapshot.process_rss_gib,
+            snapshot.system_available_gib,
+        )
+        return
+
+    assert before_snapshot is not None
+    log.info(
+        "event=vllm_sleep_memory phase=after sleep_level=%d "
+        "process_rss_gib=%.3f process_rss_delta_gib=%.3f "
+        "system_available_gib=%.3f system_available_delta_gib=%.3f",
+        sleep_level,
+        snapshot.process_rss_gib,
+        snapshot.process_rss_gib - before_snapshot.process_rss_gib,
+        snapshot.system_available_gib,
+        snapshot.system_available_gib - before_snapshot.system_available_gib,
+    )
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -1033,10 +1079,25 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=_resolve_sleep_level(sleep_level))
+        resolved_sleep_level = _resolve_sleep_level(sleep_level)
+        before_snapshot = _get_host_memory_snapshot()
+        _log_sleep_memory(
+            logger,
+            phase="before",
+            sleep_level=resolved_sleep_level,
+            snapshot=before_snapshot,
+        )
+        self.llm.sleep(level=resolved_sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()
+        _log_sleep_memory(
+            logger,
+            phase="after",
+            sleep_level=resolved_sleep_level,
+            snapshot=_get_host_memory_snapshot(),
+            before_snapshot=before_snapshot,
+        )
 
     def wake_up(self, **kwargs):
         """Wake up the vLLM engine."""

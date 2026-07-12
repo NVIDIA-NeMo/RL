@@ -14,6 +14,7 @@
 
 import importlib.util
 import json
+import logging
 import os
 import sys
 import types
@@ -22,6 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import psutil
 import ray
 import requests
 import torch
@@ -170,28 +172,88 @@ def test_resolve_sleep_level_defaults_to_one_and_accepts_two():
             _resolve_sleep_level(invalid_value)
 
 
-def test_sync_sleep_uses_requested_sleep_level():
+def test_sync_sleep_uses_requested_sleep_level(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
     worker.cfg = {"vllm_cfg": {"async_engine": False}}
     worker.llm = MagicMock()
+    process = MagicMock()
+    process.memory_info.side_effect = [
+        types.SimpleNamespace(rss=5 * 1024**3),
+        types.SimpleNamespace(rss=3 * 1024**3),
+    ]
+    monkeypatch.setattr(psutil, "Process", lambda: process)
+    monkeypatch.setattr(
+        psutil,
+        "virtual_memory",
+        MagicMock(
+            side_effect=[
+                types.SimpleNamespace(available=10 * 1024**3),
+                types.SimpleNamespace(available=12 * 1024**3),
+            ]
+        ),
+    )
 
-    worker.sleep(sleep_level=2)
+    with caplog.at_level(
+        logging.INFO,
+        logger="nemo_rl.models.generation.vllm.vllm_worker",
+    ):
+        worker.sleep(sleep_level=2)
 
     worker.llm.sleep.assert_called_once_with(level=2)
+    assert [record.getMessage() for record in caplog.records] == [
+        "event=vllm_sleep_memory phase=before sleep_level=2 "
+        "process_rss_gib=5.000 system_available_gib=10.000",
+        "event=vllm_sleep_memory phase=after sleep_level=2 "
+        "process_rss_gib=3.000 process_rss_delta_gib=-2.000 "
+        "system_available_gib=12.000 system_available_delta_gib=2.000",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_async_sleep_uses_requested_sleep_level():
+async def test_async_sleep_uses_requested_sleep_level(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker.cfg = {"vllm_cfg": {"async_engine": True}}
     worker.llm = MagicMock()
     worker.llm.reset_prefix_cache = AsyncMock()
     worker.llm.reset_mm_cache = AsyncMock()
     worker.llm.sleep = AsyncMock()
+    process = MagicMock()
+    process.memory_info.side_effect = [
+        types.SimpleNamespace(rss=7 * 1024**3),
+        types.SimpleNamespace(rss=4 * 1024**3),
+    ]
+    monkeypatch.setattr(psutil, "Process", lambda: process)
+    monkeypatch.setattr(
+        psutil,
+        "virtual_memory",
+        MagicMock(
+            side_effect=[
+                types.SimpleNamespace(available=8 * 1024**3),
+                types.SimpleNamespace(available=11 * 1024**3),
+            ]
+        ),
+    )
 
-    await worker.sleep_async(sleep_level=2)
+    with caplog.at_level(
+        logging.INFO,
+        logger="nemo_rl.models.generation.vllm.vllm_worker_async",
+    ):
+        await worker.sleep_async(sleep_level=2)
 
     worker.llm.sleep.assert_awaited_once_with(level=2)
+    assert [record.getMessage() for record in caplog.records] == [
+        "event=vllm_sleep_memory phase=before sleep_level=2 "
+        "process_rss_gib=7.000 system_available_gib=8.000",
+        "event=vllm_sleep_memory phase=after sleep_level=2 "
+        "process_rss_gib=4.000 process_rss_delta_gib=-3.000 "
+        "system_available_gib=11.000 system_available_delta_gib=3.000",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -199,6 +261,7 @@ async def test_async_sleep_uses_requested_sleep_level():
     [(False, 1), (True, 2)],
 )
 def test_finish_generation_maps_weight_discard_to_sleep_level(
+    caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     discard_weights: bool,
     expected_sleep_level: int,
@@ -212,13 +275,21 @@ def test_finish_generation_maps_weight_discard_to_sleep_level(
     generation.worker_group.run_all_workers_single_data.return_value = [True]
     monkeypatch.setattr(ray, "get", lambda futures: futures)
 
-    assert generation.finish_generation(discard_weights=discard_weights)
+    with caplog.at_level(
+        logging.INFO,
+        logger="nemo_rl.models.generation.vllm.vllm_generation",
+    ):
+        assert generation.finish_generation(discard_weights=discard_weights)
 
     generation.worker_group.run_all_workers_single_data.assert_called_once_with(
         "sleep",
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         sleep_level=expected_sleep_level,
     )
+    assert [record.getMessage() for record in caplog.records] == [
+        f"event=vllm_sleep_request discard_weights={discard_weights} "
+        f"requested_sleep_level={expected_sleep_level}"
+    ]
 
 
 @pytest.mark.parametrize("invalid_value", [1, "true", None])

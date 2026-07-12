@@ -905,8 +905,16 @@ class VllmGeneration(GenerationInterface):
                     else "reset_prefix_cache"
                 )
             # Use run_all_workers_single_data for methods that don't need data
-            worker_kwargs = {"sleep_level": 2 if discard_weights else 1}
-            if not self.cfg["colocated"]["enabled"]:
+            requested_sleep_level = 2 if discard_weights else 1
+            if self.cfg["colocated"]["enabled"]:
+                logger.info(
+                    "event=vllm_sleep_request discard_weights=%s "
+                    "requested_sleep_level=%d",
+                    discard_weights,
+                    requested_sleep_level,
+                )
+                worker_kwargs = {"sleep_level": requested_sleep_level}
+            else:
                 worker_kwargs = {}
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,

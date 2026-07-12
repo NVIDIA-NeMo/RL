@@ -48,6 +48,8 @@ from nemo_rl.models.generation.vllm.utils import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
+    _get_host_memory_snapshot,
+    _log_sleep_memory,
     _resolve_sleep_level,
 )
 
@@ -1509,10 +1511,25 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # the receiver and sends data=None, causing an assertion error.
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=_resolve_sleep_level(sleep_level))
+        resolved_sleep_level = _resolve_sleep_level(sleep_level)
+        before_snapshot = _get_host_memory_snapshot()
+        _log_sleep_memory(
+            LOGGER,
+            phase="before",
+            sleep_level=resolved_sleep_level,
+            snapshot=before_snapshot,
+        )
+        await self.llm.sleep(level=resolved_sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()
+        _log_sleep_memory(
+            LOGGER,
+            phase="after",
+            sleep_level=resolved_sleep_level,
+            snapshot=_get_host_memory_snapshot(),
+            before_snapshot=before_snapshot,
+        )
 
     async def wake_up_async(self, **kwargs):
         """Async version of wake_up."""
