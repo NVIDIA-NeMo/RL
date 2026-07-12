@@ -1,0 +1,198 @@
+# DeepSeek V4 Flash-Base GRPO (DAPO) — Megatron (Megatron-Bridge / mcore) backend.
+#
+# Megatron-backend counterpart of grpo_dsv4_flash_base_3k_automodel_8n_ep64.yaml:
+# SAME DAPO algorithm / data / rewards / generation intent, but trains via
+# Megatron-Core instead of AutoModel/DTensor.
+#
+# Validated topology (initial 100-step functional run):
+#   16 nodes x 8 GPUs = 128 GPUs, colocated (training + rollout share the GPUs).
+#   Training: Pipeline Parallel PP=8 + Expert Parallel EP=16, BF16 weights.
+#   Generation: vLLM TP=8, FP8. Training offloads before each rollout phase.
+#
+# Notes vs the AutoModel config:
+#   - No hf_config_overrides / dequantize_base_checkpoint: the Megatron-Bridge
+#     converter (converter_type below) handles the DSv4 Flash-Base FP8 import.
+#   - Training is BF16 with NO FP8 fake-quant, so the train/inference mismatch is
+#     larger than the AutoModel FP8-fake-quant path (see the guide's Known Issues).
+#   - policy.optimizer (TE FusedAdam) is replaced by megatron_cfg.optimizer.
+defaults: grpo_math_1B_megatron.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  batch_multiplier: 4
+  max_rollout_turns: 1
+  max_num_epochs: 100
+  max_num_steps: 1000
+  use_leave_one_out_baseline: false
+  val_period: 10
+  max_val_samples: 960
+  val_batch_size: 960
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 128
+    max_response_length: 2048
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2
+  truncated_importance_sampling_type: tis
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+
+checkpointing:
+  enabled: true
+  keep_top_k: 1
+  save_period: 5
+  checkpoint_must_save_by: "00:03:45:00"
+  model_save_format: null
+  checkpoint_dir: results/grpo-dsv4-flash-base-3k-megatron-16n-pp8-ep16/checkpoints
+
+policy:
+  model_name: deepseek-ai/DeepSeek-V4-Flash-Base
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: deepseek_v4
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  precision: bfloat16
+  max_total_sequence_length: 3072
+  make_sequence_length_divisible_by: 64
+  max_grad_norm: 1.0
+  # Colocated always offloads the optimizer before refit; this also offloads it
+  # during the logprob pass to free memory.
+  offload_optimizer_for_logprob: true
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    converter_type: DeepseekV4ForCausalLM
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 8
+    # DSv4 with PP>1 REQUIRES an explicit layout: the hash-MoE (Et) layers must
+    # sit on stage 0 with the embedding. This 8-stage layout keeps mtp (m) and
+    # loss (L) on the last stage and matches mtp_num_layers: 1 below.
+    pipeline_model_parallel_layout: "Et*6|t*6|t*6|t*5|t*5|t*5|t*5|t*5,m,L"
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    # EP=16 -> 256 experts / 16 = 16 experts per rank. #1 knob to tune for memory;
+    # must divide the training world.
+    expert_model_parallel_size: 16
+    sequence_parallel: true
+    moe_token_dispatcher_type: flex
+    # DeepEP is disabled at this scale: the flex+DeepEP dispatcher can hang in the
+    # PP-group refit broadcast. Single-digit-node runs may re-enable it.
+    moe_enable_deepep: false
+    moe_grouped_gemm: true
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    # MUST be 1 for DSv4-Flash-Base: the checkpoint ships csa_compress_ratios for
+    # 43 decoder + 1 MTP = 44 layers, and megatron asserts
+    # len(csa_compress_ratios) == num_layers + mtp_num_layers (43 + 1). The bridge
+    # keeps the checkpoint's native num_nextn_predict_layers=1.
+    mtp_num_layers: 1
+    activation_checkpointing: true
+    gradient_accumulation_fusion: false
+    # Free reserved-but-unused cache at the tight refit boundary.
+    empty_unused_memory_level: 2
+
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+      weight_decay: 0.1
+      use_precision_aware_optimizer: true
+
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-8
+
+    fp8_cfg:
+      enabled: false
+
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      # Driver < 13.0 must keep "1" (the fused mHC proj-RMS kernel needs
+      # cuTile / CUDA driver >= 13). Set "0" to enable the fused path on newer drivers.
+      # NRL_DSV4_DISABLE_FUSED_MHC: "1"
+
+  sequence_packing:
+    enabled: false
+
+  dynamic_batching:
+    enabled: false
+
+  generation:
+    max_new_tokens: 2048
+    temperature: 1.0
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8_ds_mla
+      # vLLM internal data-parallel = expert_parallel_size / tensor_parallel_size.
+      # EP=1/TP=8 -> internal DP=1, which removes the vLLM V1 DP dummy-batch
+      # lockstep that can deadlock generation under DP load imbalance (hangs on a
+      # gloo collective; see vllm-project/vllm#41530).
+      tensor_parallel_size: 8
+      expert_parallel_size: 1
+      enable_expert_parallel: true
+      # Colocated: vLLM inits FIRST and reserves this fraction up front, leaving
+      # the rest for the Megatron model + distributed-optimizer checkpoint load.
+      # Drop further (e.g. 0.3) if Megatron OOMs at checkpoint load.
+      gpu_memory_utilization: 0.6
+      enforce_eager: true
+      async_engine: false
+      max_model_len: ${policy.max_total_sequence_length}
+      use_deep_gemm: true
+    vllm_kwargs:
+      tokenizer_mode: deepseek_v4
+    colocated:
+      # Generation shares the training GPUs (resources block only applies when false).
+      enabled: true
+
+data:
+  max_input_seq_length: 1024
+  filter_overlong_prompts: true
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+logger:
+  wandb_enabled: true
+  monitor_gpus: true
+  num_val_samples_to_print: 2
+  num_train_samples_to_print: 2
+  wandb:
+    project: nemo-rl
+    name: grpo-dsv4-flash-base-3k-megatron-16n-pp8-ep16
+  tensorboard_enabled: true
+  tensorboard:
+    log_dir: tb_logs/grpo-dsv4-flash-base-3k-megatron-16n-pp8-ep16
+  mlflow:
+    run_name: grpo-dsv4-flash-base-3k-megatron-16n-pp8-ep16
+
+cluster:
+  gpus_per_node: 8
+  # Colocated: all 16 nodes run both training and rollout.
+  num_nodes: 16
