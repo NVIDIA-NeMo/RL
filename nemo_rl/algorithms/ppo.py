@@ -15,7 +15,6 @@ import gc
 import os
 import time
 import warnings
-from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -414,24 +413,11 @@ def setup(
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
 
-    # Prepare checkpoint paths.  During critic warmup the policy is not saved,
-    # so the directory may not exist even when resuming from a valid checkpoint.
-    if last_checkpoint_path:
-        _policy_weights = Path(last_checkpoint_path) / "policy" / "weights"
-        _policy_optim = Path(last_checkpoint_path) / "policy" / "optimizer"
-        weights_path = _policy_weights if _policy_weights.exists() else None
-        optimizer_path = _policy_optim if _policy_optim.exists() else None
-        if weights_path is None:
-            print(
-                f"  ⚠ Policy weights not found in checkpoint {last_checkpoint_path} "
-                f"(likely saved during critic warmup). Using base model weights.",
-                flush=True,
-            )
-        else:
-            print(f"  ✓ Resuming policy from checkpoint: {weights_path}", flush=True)
-    else:
-        weights_path = None
-        optimizer_path = None
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
+        last_checkpoint_path,
+        model_component="value",
+    )
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
     # ticks once per train() call (matching upstream main's per-rollout
@@ -478,31 +464,6 @@ def setup(
     def init_value():
         """Initialize value model training workers."""
         t0 = time.perf_counter()
-        # Prepare checkpoint paths for value model. Mirror the policy's
-        # .exists() probe (see weights_path/optimizer_path resolution above):
-        # the previous run may not have had a value model, so the value sub-
-        # directory of last_checkpoint_path may be missing.
-        if last_checkpoint_path:
-            _value_weights = Path(last_checkpoint_path) / "value" / "weights"
-            _value_optim = Path(last_checkpoint_path) / "value" / "optimizer"
-            value_weights_path = _value_weights if _value_weights.exists() else None
-            value_optimizer_path = _value_optim if _value_optim.exists() else None
-            if value_weights_path is None:
-                print(
-                    f"  ⚠ Value weights not found in checkpoint {last_checkpoint_path} "
-                    f"(likely the previous run didn't have a value model). "
-                    f"Initializing value model from base weights.",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"  ✓ Resuming value from checkpoint: {value_weights_path}",
-                    flush=True,
-                )
-        else:
-            value_weights_path = None
-            value_optimizer_path = None
-
         v = Value(
             cluster=train_cluster,
             config=value_config,
@@ -1550,45 +1511,39 @@ def ppo_train(
                             total_steps + 1, ppo_save_state, master_config
                         )
 
-                        # Save policy FIRST, then value.  This ordering
-                        # matters: the resume path uses the presence of
-                        # policy/weights to decide whether the policy was
-                        # trained.  By saving policy first we guarantee that
-                        # if any policy dir exists in a finalized checkpoint
-                        # (tmp→step rename is atomic), its contents are
-                        # complete.  During critic warmup the policy optimizer
-                        # has no state yet (master_param not initialized), so
-                        # we skip it entirely — the resume path will fall back
-                        # to the base model weights.
-                        if total_steps >= policy_training_start_step:
-                            policy.prepare_for_training()
-                            policy.save_checkpoint(
-                                weights_path=os.path.join(
-                                    checkpoint_path, "policy", "weights"
-                                ),
-                                optimizer_path=os.path.join(
-                                    checkpoint_path, "policy", "optimizer"
-                                ),
-                                tokenizer_path=os.path.join(
-                                    checkpoint_path, "policy", "tokenizer"
-                                ),
-                                checkpointing_cfg=master_config.checkpointing,
-                            )
-                            policy.offload_to_cpu()
-                        else:
-                            print(
-                                f"Skipping policy checkpoint (critic warmup: "
-                                f"step {total_steps} < {policy_training_start_step})",
-                                flush=True,
-                            )
+                        # Always save policy weights so every PPO checkpoint has
+                        # the same component layout. Before the first real policy
+                        # update, omit optimizer and scheduler state because their
+                        # lazily initialized state is not yet safe to checkpoint.
+                        policy.prepare_for_training()
+                        policy.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
+                            optimizer_path=(
+                                os.path.join(checkpoint_path, "policy", "optimizer")
+                                if (
+                                    checkpointer.save_optimizer
+                                    and total_steps >= policy_training_start_step
+                                )
+                                else None
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config.checkpointing,
+                        )
+                        policy.offload_to_cpu()
 
                         value_model.prepare_for_training()
                         value_model.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "value", "weights"
                             ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "value", "optimizer"
+                            optimizer_path=(
+                                os.path.join(checkpoint_path, "value", "optimizer")
+                                if checkpointer.save_optimizer
+                                else None
                             ),
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
