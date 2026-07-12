@@ -178,5 +178,20 @@
     "timestamp_utc": "2026-07-12T06:02:35Z",
     "verification_evidence": "The real CSV has zero ellipses, 144 fused-forward instances, and 48 fused-dgrad instances. Local bash syntax, 52 wrapper tests, Ruff, and diff checks pass. The next functional job must verify the changed evidence path end to end; this diagnostic supports no speedup claim.",
     "verification_job": "pending functional rerun"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2363981 completed the locked bootstrap, passed 10 focused lifecycle tests including the new driver/sync/async sleep-level and host-memory telemetry assertions, and reported Pyrefly 0 errors. Parent pre-commit then rewrote one third-party import-order line and exited before GPU smoke or GRPO.",
+    "fix_commit": "6a699c45f71b094f49c1aea459e51577f0f09bd6",
+    "hypothesis": "The test file used an import order accepted by the local current Ruff but not by the remote pre-commit hook's pinned Ruff version.",
+    "report_path": "evidence/job-2363981.txt",
+    "reproduction": "At source ed4450b68, run the parent's pinned Ruff import hook over tests/unit/models/generation/test_vllm_generation.py and observe pytest/psutil reordering after all focused lifecycle tests pass.",
+    "root_cause": "The new psutil import was placed before neither all third-party imports nor the ordering required by pinned Ruff 0.9.9. Version-skewed local validation missed the exact pre-commit ordering, and hook mutation is a deliberate failure condition.",
+    "run_id": "2363981",
+    "symptom": "Authoritative lifecycle-memory tests passed, but the functional wrapper stopped in parent pre-commit before GPU work.",
+    "tested_change": "Apply the remote hook's exact psutil, pytest, ray import order and verify it with both pinned Ruff 0.9.9 and the local current Ruff before resubmission.",
+    "timestamp_utc": "2026-07-12T06:37:35Z",
+    "verification_evidence": "Job 2363981 establishes Linux GREEN for all 10 lifecycle tests and no performance evidence. Commit 6a699c45f passes both Ruff versions locally; job 2364090 is the clean remote verification.",
+    "verification_job": "2364090 (running)"
   }
 ]
