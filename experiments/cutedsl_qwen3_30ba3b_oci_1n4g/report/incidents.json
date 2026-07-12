@@ -163,5 +163,20 @@
     "timestamp_utc": "2026-07-12T05:53:54Z",
     "verification_evidence": "Job 2350825 verifies CuTeDSL smoke execution and one warm-up update only. Direct lifecycle-memory verification and a completed functional gate are pending; no ON/OFF speedup is supported.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "lyris",
+    "evidence": "Read-only job 2351138 reproduced human-table kernel-name truncation and successfully generated a 47,101-byte CSV from a job-2350825 policy profile. The CSV contained 144 BlockScaledMoEGroupedGemmGluBiasKernel instances and 48 BlockScaledMoEGroupedGemmDgluDbiasKernel instances with no ellipsis. The job then exited 127 because its final diagnostic grep was incorrectly shell-quoted.",
+    "fix_commit": "13dae596c4a133fb39eabd99dea11c13f0355e5d",
+    "hypothesis": "CSV output would preserve full names, but existing word-boundary regexes might still reject class tokens embedded without delimiters inside generated CUTLASS identifiers.",
+    "report_path": "evidence/job-2351138.txt",
+    "reproduction": "Run default and CSV cuda_gpu_kern_sum reports against one retained job-2350825 .nsys-rep, then test the exact forward/dgrad class-token regexes against the CSV Name field.",
+    "root_cause": "The functional evidence command used Nsight's human-readable table, which truncated kernel names. CSV preserved the names, but the full class tokens were concatenated with surrounding generated identifier characters, so leading/trailing word boundaries also produced false negatives. Job 2351138's nonzero status was a separate postprocessing quote error after both stats exports completed.",
+    "run_id": "2351138",
+    "symptom": "Real fused kernels existed in the retained profile, but the strict functional validator could classify activation as absent.",
+    "tested_change": "Emit cuda_gpu_kern_sum as CSV and retain the exact forward/dgrad class tokens while removing only their invalid word-boundary anchors; cover the real generated-identifier shape in the wrapper regression.",
+    "timestamp_utc": "2026-07-12T06:02:35Z",
+    "verification_evidence": "The real CSV has zero ellipses, 144 fused-forward instances, and 48 fused-dgrad instances. Local bash syntax, 52 wrapper tests, Ruff, and diff checks pass. The next functional job must verify the changed evidence path end to end; this diagnostic supports no speedup claim.",
+    "verification_job": "pending functional rerun"
   }
 ]

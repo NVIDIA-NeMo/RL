@@ -1,0 +1,31 @@
+CuTeDSL Lyris Nsight full-name diagnostic evidence snapshot
+
+Job: 2351138
+Cluster: Lyris
+Node: lyris0018
+State: FAILED
+ExitCode: 127:0
+Elapsed: 00:00:55
+
+Original remote log: /lustre/fsw/coreai_dlalgo_llm/users/sna/worktrees/nemo-2606-cutedsl-20260711/RL/experiments/cutedsl_qwen3_30ba3b_oci_1n4g/results/2350825/nsys_full_name_diagnostic/slurm-2351138.out
+Original source profile: job 2350825 policy-worker Nsight report
+Image SHA256: bb5beff9ade16a1eeb6badde7601731bb003a95b4cccf85b3bd9b11c84803a2a
+
+Diagnostic boundary:
+- Default nsys stats generated a 32,900-byte human-readable kernel table with truncated names.
+- nsys stats --report cuda_gpu_kern_sum --format csv generated kernel.csv successfully.
+- kernel.csv size: 47,101 bytes.
+- kernel.csv SHA256: 824342547193500af913f99cc794a609ca4d388578a056505ffe61d0b63f1da4.
+- Ellipsis count in CSV: 0.
+- BlockScaledMoEGroupedGemmGluBiasKernel instances: 144.
+- BlockScaledMoEGroupedGemmDgluDbiasKernel instances: 48.
+
+Failure boundary:
+- Both nsys stats commands completed before the failure.
+- A final diagnostic grep was shell-quoted incorrectly; alternation fragments were executed as commands.
+- The srun step therefore exited 127 even though the required CSV artifact was complete.
+
+Resolution:
+- The functional harness now emits CSV directly and does not use the faulty diagnostic grep.
+- Validator regexes retain the exact full kernel class tokens while allowing their placement inside generated CUTLASS identifiers.
+- This was a read-only evidence-format diagnostic, not a performance run, and supports no speedup conclusion.
