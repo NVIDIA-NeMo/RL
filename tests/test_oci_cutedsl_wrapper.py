@@ -1065,9 +1065,7 @@ def test_functional_profile_validator_fails_closed_and_requires_fused_signatures
 
 def test_functional_kernel_evidence_preserves_full_kernel_names() -> None:
     """CSV stats avoid the ellipsis emitted by the human-readable table."""
-    assert (
-        'nsys stats --report cuda_gpu_kern_sum --format csv "${report}"' in SCRIPT
-    )
+    assert 'nsys stats --report cuda_gpu_kern_sum --format csv "${report}"' in SCRIPT
     assert 'nsys stats --report cuda_gpu_kern_sum "${report}"' not in SCRIPT
 
 
