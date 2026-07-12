@@ -103,5 +103,35 @@
     "timestamp_utc": "2026-07-12T03:11:17Z",
     "verification_evidence": "Job 2362916 proves the FP32 router fix and first update, but its first-step metrics are warm-up and non-authoritative. No ON/OFF speedup or performance conclusion is supported. Local wrapper and report verification covers the scheduling and evidence change; remote verification is pending.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2363067 proved the 1:2 profile window stopped both profilers before step-2 refit, but all four policy workers still died while concurrently offloading mature Adam state; Slurm classified step 2363067.4 as OUT_OF_MEMORY with four oom_kill events.",
+    "fix_commit": "lifecycle-aware vLLM weight-discard commit",
+    "hypothesis": "vLLM level-1 sleep keeps a CPU weight backup that is redundant for full-weight refit and consumes approximately 32.32 GiB per generation worker, leaving insufficient host-cgroup headroom for four concurrent mature optimizer-state copies.",
+    "report_path": "evidence/job-2363067.txt",
+    "reproduction": "Run the three-update functional gate at 17addcb6a with profile range 1:2. Observe profiler stop at the start of step 2, then four approximately 105.7 GiB policy allocations enter optimizer offload and the Slurm step receives four OOM kills.",
+    "root_cause": "The repeated failure is a host-memory cgroup OOM during mature optimizer-state offload even after profiling has stopped. The second run disproves active profiling as a necessary cause; vLLM's level-1 CPU weight backup remains a large avoidable resident allocation for this full-weight-refit workflow.",
+    "run_id": "2363067",
+    "symptom": "Step 1 and its Nsight capture completed, then the four policy actors died during step-2 refit before the second update.",
+    "tested_change": "Keep intermediate dynamic-sampling and validation sleeps at level 1. Use the validated discard_weights=True interface only after a rollout batch is complete and the next generation is guaranteed to perform a full refit; that refit-safe boundary maps to vLLM sleep level 2.",
+    "timestamp_utc": "2026-07-12T04:10:35Z",
+    "verification_evidence": "Job 2363067 validates profile stop ordering and disproves the prior sufficient-cause hypothesis. Its step-1 values are warm-up/non-authoritative and support no speedup claim. Local lifecycle and recipe contracts pass; remote discard/refit verification is pending.",
+    "verification_job": "pending"
+  },
+  {
+    "cluster": "local",
+    "evidence": "Running the documented aggregate refresh with no completed result directories replaced eight bounded manual incidents with an empty JSON array; the committed report contract failed on missing job 1910599.",
+    "fix_commit": "manual-incident preservation commit",
+    "hypothesis": "Aggregate refresh assumed every incident was regenerated from a completed run directory, but this experiment also keeps manually curated bounded evidence under report/evidence.",
+    "report_path": "evidence/job-local-refresh-20260712.txt",
+    "reproduction": "Run the documented --refresh-experiment-dir command while results and benchmark_results contain no completed run directories, then inspect report/incidents.json.",
+    "root_cause": "refresh_aggregate initialized incidents as an empty list and populated it only from discovered run events, so valid report-root manual incidents were discarded.",
+    "run_id": "local-refresh-20260712",
+    "symptom": "A deterministic report refresh erased the existing root-cause timeline.",
+    "tested_change": "Seed refresh from existing incidents whose run ID and exact evidence/job-<run_id>.txt path pass the renderer's bounded evidence contract; continue rebuilding run-derived incidents from discovered runs.",
+    "timestamp_utc": "2026-07-12T04:29:09Z",
+    "verification_evidence": "The focused regression changed from one failure to one pass, and the full recipe/report suite passes 57 tests after a real aggregate refresh preserved all prior incidents.",
+    "verification_job": "local pytest"
   }
 ]

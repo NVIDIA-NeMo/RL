@@ -554,6 +554,17 @@ def read_run_index(path: Path) -> list[dict[str, str]]:
         return []
 
 
+def is_manual_incident(incident: dict[str, Any]) -> bool:
+    """Return whether an incident owns a bounded report-root evidence file."""
+    run_id = incident.get("run_id")
+    report_path = incident.get("report_path")
+    return (
+        isinstance(run_id, str)
+        and INCIDENT_RUN_ID_PATTERN.fullmatch(run_id) is not None
+        and report_path == f"evidence/job-{run_id}.txt"
+    )
+
+
 def feature_cell(metadata: dict[str, Any], manifest: dict[str, Any]) -> str:
     """Return a compact feature-cell label for the aggregate run index."""
     config = nested(metadata, "run", "effective_config", default={})
@@ -680,7 +691,11 @@ def refresh_aggregate(experiment_dir: Path) -> Path:
     if public_runs_dir.exists():
         shutil.rmtree(public_runs_dir)
     rows: list[dict[str, str]] = []
-    incidents: list[dict[str, Any]] = []
+    incidents = [
+        incident
+        for incident in read_incidents(report_dir / "incidents.json")
+        if is_manual_incident(incident)
+    ]
     incident_fields = [
         "timestamp_utc",
         "symptom",

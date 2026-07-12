@@ -14,7 +14,7 @@
 
 from contextlib import contextmanager
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call as mock_call, patch
 
 import pytest
 import ray
@@ -1815,6 +1815,84 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     assert train_metrics["num_masked_seqs_by_logprob_error"] == 2
     assert train_metrics["masked_correct_pct"] == 0.5
     assert train_metrics["optimizer_update_successful"] is False
+
+
+def test_grpo_train_discards_weights_only_after_dynamic_sampling_completes(
+    monkeypatch: pytest.MonkeyPatch, mock_grpo_components: dict[str, Any]
+) -> None:
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    policy_generation = MagicMock()
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.get_logger_metrics.return_value = {}
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    rollout_metrics = {"gen_kl_error": 0.0, "mean_gen_tokens_per_sample": 2.0}
+    mock_rollout = MagicMock(return_value=(mock_batch, rollout_metrics))
+    mock_refit = MagicMock()
+    sampling_round = 0
+
+    def fake_dynamic_sampling(
+        repeated_batch: BatchedDataDict,
+        _std: torch.Tensor,
+        _baseline: torch.Tensor,
+        _dynamic_sampling_num_gen_batches: int,
+        _master_config: MasterConfig,
+        _timer: Timer,
+        batch_cache: BatchedDataDict | None,
+    ) -> tuple[BatchedDataDict, bool, BatchedDataDict | None, dict[str, Any]]:
+        nonlocal sampling_round
+        sampling_round += 1
+        repeated_batch["filtered_reward"] = repeated_batch["total_reward"]
+        repeated_batch["baseline"] = torch.tensor([0.1])
+        repeated_batch["std"] = torch.tensor([1.0])
+        return repeated_batch, sampling_round == 2, repeated_batch, {}
+
+    monkeypatch.setattr(grpo_mod, "_should_use_async_rollouts", lambda *_: False)
+    monkeypatch.setattr(grpo_mod, "run_multi_turn_rollout", mock_rollout)
+    monkeypatch.setattr(
+        grpo_mod,
+        "calculate_baseline_and_std_per_prompt",
+        lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
+    )
+    monkeypatch.setattr(grpo_mod, "dynamic_sampling", fake_dynamic_sampling)
+    monkeypatch.setattr(grpo_mod, "refit_policy_generation", mock_refit)
+    monkeypatch.setattr(grpo_mod, "print_performance_metrics", lambda *_: {})
+    monkeypatch.setattr(grpo_mod, "maybe_gpu_profile_step", lambda *_: None)
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *_args, **_kwargs: _mock_seq_logprob_error_result(),
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["max_num_steps"] = 1
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["use_dynamic_sampling"] = True
+
+    with _patched_logprob_phase(mock_grpo_components["policy"]):
+        grpo_mod.grpo_train(
+            mock_grpo_components["policy"],
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    assert policy_generation.finish_generation.call_args_list == [
+        mock_call(discard_weights=False),
+        mock_call(discard_weights=True),
+    ]
+    assert mock_refit.call_count == 1
+    assert mock_rollout.call_count == 2
 
 
 def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):

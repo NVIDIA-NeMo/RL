@@ -1,0 +1,20 @@
+Job 2363067 bounded incident evidence
+Original remote log: selected redacted excerpts from events.jsonl, effective_config.yaml, grpo.log, slurm.out, and sacct.
+Source SHA: 17addcb6a2e31caf0d62be57414fb542bcd85b1e
+Focused validation and four-GPU GB200 Transformer Engine smoke: PASS.
+Effective recipe: logprob_batch_size: 1; moe_router_dtype: fp32.
+Step 1/3 completed with the policy-worker Nsight capture active.
+Total step time: 69.30s
+policy_training: 22.46s
+Interpretation: these first-step metrics are warm-up and non-authoritative.
+No ON/OFF speedup or performance conclusion is supported by this functional run.
+Step 2/3: policy and generation profilers both stopped before refit/offload.
+vLLM level-1 sleep retained 32.32 GiB of weights on CPU per generation worker in the preceding run; level 1 remained configured here.
+Policy workers: GPU Memory before optimizer offload was approximately 105.70-105.71GB on all four ranks.
+All four policy workers died during the mature Adam-state CPU offload.
+sacct 2363067.4: State=OUT_OF_MEMORY ExitCode=0:125 Elapsed=00:12:19 MaxRSS=614125440K.
+Slurm: Detected 4 oom_kill events in StepId=2363067.4.
+Slurm: task 0: Out Of Memory.
+Conclusion: moving the profile window to 1:2 was insufficient; profiling had stopped before the repeated host cgroup OOM.
+Next tested change: keep intermediate and validation sleeps at level 1, then call the validated discard_weights=True interface only after the rollout batch is complete and a full refit is guaranteed before the next generation. That refit-safe call uses vLLM sleep level 2 and discards the CPU weight backup.
+Verification: local lifecycle and recipe contracts pass; a three-update GB200 rerun is pending. No step 2 completion or performance result exists.

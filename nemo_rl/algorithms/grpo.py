@@ -965,7 +965,7 @@ def setup(
         """Initialize vLLM generation workers."""
         t0 = time.perf_counter()
         pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-        pg.finish_generation()
+        pg.finish_generation(discard_weights=True)
         return pg, time.perf_counter() - t0
 
     def init_sglang():
@@ -1136,7 +1136,7 @@ def setup(
                 """Complete the deferred vLLM model load started above."""
                 t0 = time.perf_counter()
                 deferred_vllm.load_and_start()
-                deferred_vllm.finish_generation()
+                deferred_vllm.finish_generation(discard_weights=True)
                 return deferred_vllm, time.perf_counter() - t0
 
             def init_nemo_gym():
@@ -2549,7 +2549,6 @@ def grpo_train(
                             max_rollout_turns=master_config.grpo["max_rollout_turns"],
                             greedy=False,
                         )
-                    policy_generation.finish_generation()
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
@@ -2645,10 +2644,16 @@ def grpo_train(
                     baseline = repeated_batch["baseline"]
                     std = repeated_batch["std"]
 
-                    # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
-                    if not is_batch_complete:
-                        continue
+                with timer.time("generation_finalize"):
+                    policy_generation.finish_generation(
+                        discard_weights=is_batch_complete
+                    )
 
+                # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
+                if not is_batch_complete:
+                    continue
+
+                with timer.time("reward_calculation"):
                     gen_step_metrics = {}
                     if hasattr(policy_generation, "get_step_metrics"):
                         gen_step_metrics = policy_generation.get_step_metrics()

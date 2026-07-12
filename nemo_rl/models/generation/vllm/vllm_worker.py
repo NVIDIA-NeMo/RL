@@ -55,6 +55,14 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
+def _resolve_sleep_level(sleep_level: int) -> int:
+    if type(sleep_level) is not int or sleep_level not in (1, 2):
+        raise ValueError(
+            f"sleep_level must be the integer 1 or 2, got {sleep_level!r}."
+        )
+    return sleep_level
+
+
 def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
     """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
 
@@ -1002,7 +1010,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def sleep(self):
+    def sleep(self, sleep_level: int = 1) -> None:
         """Put the vLLM engine to sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -1025,7 +1033,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=1)
+        self.llm.sleep(level=_resolve_sleep_level(sleep_level))
 
         gc.collect()
         torch.cuda.empty_cache()

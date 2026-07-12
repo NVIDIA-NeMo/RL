@@ -19,7 +19,7 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -37,7 +37,9 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    VllmGenerationWorkerImpl,
     _resolve_enable_prefix_caching,
+    _resolve_sleep_level,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -157,6 +159,95 @@ def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
 
     assert _resolve_enable_prefix_caching({}) is False
+
+
+def test_resolve_sleep_level_defaults_to_one_and_accepts_two():
+    assert _resolve_sleep_level(1) == 1
+    assert _resolve_sleep_level(2) == 2
+
+    for invalid_value in (True, 1.0, "2", 0, 3):
+        with pytest.raises(ValueError, match="integer 1 or 2"):
+            _resolve_sleep_level(invalid_value)
+
+
+def test_sync_sleep_uses_requested_sleep_level():
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = MagicMock()
+
+    worker.sleep(sleep_level=2)
+
+    worker.llm.sleep.assert_called_once_with(level=2)
+
+
+@pytest.mark.asyncio
+async def test_async_sleep_uses_requested_sleep_level():
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock()
+    worker.llm.reset_prefix_cache = AsyncMock()
+    worker.llm.reset_mm_cache = AsyncMock()
+    worker.llm.sleep = AsyncMock()
+
+    await worker.sleep_async(sleep_level=2)
+
+    worker.llm.sleep.assert_awaited_once_with(level=2)
+
+
+@pytest.mark.parametrize(
+    ("discard_weights", "expected_sleep_level"),
+    [(False, 1), (True, 2)],
+)
+def test_finish_generation_maps_weight_discard_to_sleep_level(
+    monkeypatch: pytest.MonkeyPatch,
+    discard_weights: bool,
+    expected_sleep_level: int,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {
+        "colocated": {"enabled": True},
+        "vllm_cfg": {"async_engine": False},
+    }
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = [True]
+    monkeypatch.setattr(ray, "get", lambda futures: futures)
+
+    assert generation.finish_generation(discard_weights=discard_weights)
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "sleep",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        sleep_level=expected_sleep_level,
+    )
+
+
+@pytest.mark.parametrize("invalid_value", [1, "true", None])
+def test_finish_generation_rejects_non_boolean_discard(invalid_value: object) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+
+    with pytest.raises(TypeError, match="discard_weights must be a bool"):
+        generation.finish_generation(discard_weights=invalid_value)
+
+
+def test_finish_generation_preserves_variadic_backend_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {
+        "colocated": {"enabled": True},
+        "vllm_cfg": {"async_engine": False},
+    }
+    generation.worker_group = MagicMock()
+    generation.worker_group.run_all_workers_single_data.return_value = [True]
+    monkeypatch.setattr(ray, "get", lambda futures: futures)
+
+    assert generation.finish_generation("legacy", tags=["weights"])
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "sleep",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        sleep_level=1,
+    )
 
 
 basic_lora_test_config: LoRAConfig = {

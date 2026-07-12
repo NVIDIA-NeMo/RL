@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -38,6 +39,7 @@ def test_cutedsl_policy_recipe_contract() -> None:
     assert megatron_cfg["moe_mlp_glu_interleave_size"] == 32
     assert megatron_cfg["moe_router_dtype"] == "fp32"
     assert megatron_cfg["env_vars"]["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] == "1"
+    assert "sleep_level" not in policy["generation"]["vllm_cfg"]
     assert policy["sequence_packing"]["enabled"] is False
     assert policy["dynamic_batching"]["enabled"] is False
     assert policy["train_global_batch_size"] == 4
@@ -73,3 +75,39 @@ def test_cutedsl_policy_recipe_contract() -> None:
     assert policy["generation"]["colocated"]["enabled"] is True
     assert policy["generation"]["vllm_cfg"]["precision"] == "fp8"
     assert policy["generation"]["vllm_cfg"]["is_mx"] is True
+
+
+def test_cutedsl_discards_rollout_weights_only_after_sampling_completes() -> None:
+    grpo_source = (PROJECT_ROOT / "nemo_rl/algorithms/grpo.py").read_text()
+    tree = ast.parse(grpo_source)
+    finish_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "finish_generation"
+        and any(keyword.arg == "discard_weights" for keyword in node.keywords)
+    ]
+
+    assert any(
+        isinstance(keyword.value, ast.Name) and keyword.value.id == "is_batch_complete"
+        for call in finish_calls
+        for keyword in call.keywords
+        if keyword.arg == "discard_weights"
+    )
+
+
+def test_vllm_finish_generation_preserves_variadic_backend_contract() -> None:
+    source = (
+        PROJECT_ROOT / "nemo_rl/models/generation/vllm/vllm_generation.py"
+    ).read_text()
+    tree = ast.parse(source)
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "finish_generation"
+    )
+
+    assert method.args.vararg is not None
+    assert method.args.kwarg is not None
+    assert any(arg.arg == "discard_weights" for arg in method.args.kwonlyargs)

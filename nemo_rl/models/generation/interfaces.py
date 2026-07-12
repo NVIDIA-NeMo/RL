@@ -249,7 +249,18 @@ class GenerationInterface(ABC):
         pass
 
     @abstractmethod
-    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+    def finish_generation(
+        self,
+        *args: Any,
+        discard_weights: bool = False,
+        **kwargs: Any,
+    ) -> bool:
+        """Release generation resources after a rollout.
+
+        Args:
+            discard_weights: Permit a backend to release its weight storage when
+                a full refit is guaranteed before the next generation.
+        """
         pass
 
     @property

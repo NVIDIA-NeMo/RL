@@ -873,8 +873,24 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy preparation: {e}")
             return False
 
-    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Sleep workers and reset prefix cache."""
+    def finish_generation(
+        self,
+        *args: Any,
+        discard_weights: bool = False,
+        **kwargs: Any,
+    ) -> bool:
+        """Sleep workers and reset prefix cache.
+
+        Args:
+            discard_weights: Use vLLM sleep level 2 to release weight storage.
+                Callers must set this only when a full refit is guaranteed before
+                the next generation.
+        """
+        if type(discard_weights) is not bool:
+            raise TypeError(
+                f"discard_weights must be a bool, got {type(discard_weights).__name__}."
+            )
+
         try:
             # Choose the appropriate method based on setting
             # non-colocated only needs reset prefix cache, no need to sleep.
@@ -889,9 +905,13 @@ class VllmGeneration(GenerationInterface):
                     else "reset_prefix_cache"
                 )
             # Use run_all_workers_single_data for methods that don't need data
+            worker_kwargs = {"sleep_level": 2 if discard_weights else 1}
+            if not self.cfg["colocated"]["enabled"]:
+                worker_kwargs = {}
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                **worker_kwargs,
             )
             # Wait for all futures to complete
             results = ray.get(futures)

@@ -485,11 +485,43 @@ def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:
         "2349175",
         "2362710",
         "2362916",
+        "2363067",
+        "local-refresh-20260712",
     ):
         assert job_id in incident_text
         assert job_id in index
     assert "stale login-image TMPDIR" in incident_text
     assert "/runtime/tmp" in incident_text
+
+
+def test_refresh_preserves_manual_incident_evidence_without_run_directories(
+    tmp_path: Path,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    report_dir = experiment_dir / "report"
+    report_dir.mkdir(parents=True)
+    manual_incident = {
+        "run_id": "manual-local-check",
+        "report_path": "evidence/job-manual-local-check.txt",
+        "cluster": "local",
+        "timestamp_utc": "2026-07-12T05:00:00Z",
+        "symptom": "manual evidence would be lost",
+        "evidence": "bounded local reproduction",
+        "root_cause": "aggregate refresh rebuilt only discovered runs",
+        "fix_commit": "pending",
+        "verification_job": "local",
+        "reproduction": "refresh an experiment with no run directories",
+        "hypothesis": "manual evidence must survive run discovery",
+        "tested_change": "preserve evidence/ incidents during refresh",
+        "verification_evidence": "pending",
+    }
+    write_json(report_dir / "incidents.json", [manual_incident])
+
+    renderer = load_renderer()
+    renderer.refresh_aggregate(experiment_dir)
+
+    incidents = json.loads((report_dir / "incidents.json").read_text())
+    assert incidents == [manual_incident]
 
 
 def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
@@ -508,6 +540,8 @@ def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
         "2349175",
         "2362710",
         "2362916",
+        "2363067",
+        "local-refresh-20260712",
     }
     for incident in incidents:
         relative_path = Path(incident["report_path"])
@@ -568,6 +602,36 @@ def test_job_2362916_reports_host_oom_without_perf_claim() -> None:
         assert fragment in evidence, fragment
         assert fragment in public_evidence, fragment
     assert "host-memory cgroup OOM" in incident["root_cause"]
+    assert "No ON/OFF speedup or performance conclusion" in index
+
+
+def test_job_2363067_disproves_profile_overlap_as_sufficient_cause() -> None:
+    report_dir = EXPERIMENT_DIR / "report"
+    incidents = json.loads((report_dir / "incidents.json").read_text())
+    incident = next(item for item in incidents if item["run_id"] == "2363067")
+    evidence = (report_dir / incident["report_path"]).read_text()
+    public_evidence = (report_dir / "public" / incident["report_path"]).read_text()
+    index = (report_dir / "public/index.html").read_text()
+
+    for fragment in (
+        "17addcb6a2e31caf0d62be57414fb542bcd85b1e",
+        "profilers both stopped before refit/offload",
+        "Total step time: 69.30s",
+        "policy_training: 22.46s",
+        "105.70-105.71GB",
+        "OUT_OF_MEMORY",
+        "0:125",
+        "614125440K",
+        "Detected 4 oom_kill events",
+        "warm-up and non-authoritative",
+        "No ON/OFF speedup or performance conclusion",
+        "discard_weights=True",
+    ):
+        assert fragment in evidence, fragment
+    assert "even after profiling has stopped" in incident["root_cause"]
+    assert incident["verification_job"] == "pending"
+    assert evidence == public_evidence
+    assert "2363067" in index
     assert "No ON/OFF speedup or performance conclusion" in index
 
 
