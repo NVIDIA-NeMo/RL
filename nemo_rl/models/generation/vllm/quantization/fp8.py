@@ -798,16 +798,13 @@ def _restore_model_linear_vllm_parameter_types(model: torch.nn.Module) -> None:
             _restore_linear_vllm_parameter_types(module)
 
 
-def load_weights(weights, model_runner):
-    ensure_fp8_patches_applied(model_runner)
-    weights_quantized = []
-    model = model_runner.model
-    fp8_config = _resolve_fp8_config(model_runner)
-
+def _iter_quantized_weights(weights, model, fp8_config):
+    """Yield refit weights lazily, quantizing at most one source tensor at a time."""
     for k, v in weights:
         if not _is_fp8_weight(k, model):
-            weights_quantized.append((k, v))
+            yield k, v
             continue
+
         # Cast the weight into fp8 and its scale factor
         param_lp, param_scale = cast_tensor_to_fp8_blockwise(
             v.to(torch.float),
@@ -815,9 +812,19 @@ def load_weights(weights, model_runner):
             fp8_config=fp8_config,
         )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        weights_quantized.append([k, param_lp])
-        weights_quantized.append([k + "_scale_inv", param_scale])
-    # Finally load the weights into vllm
+        yield k, param_lp
+        yield k + "_scale_inv", param_scale
+
+        # A generator frame retains its locals while suspended at ``yield``.
+        # Drop both outputs before quantizing the next source tensor so an IPC
+        # group's quantized results do not accumulate in GPU memory.
+        del param_lp, param_scale
+
+
+def load_weights(weights, model_runner):
+    ensure_fp8_patches_applied(model_runner)
+    model = model_runner.model
+    fp8_config = _resolve_fp8_config(model_runner)
     _restore_model_linear_vllm_parameter_types(model)
     # On Blackwell, the previous refit/startup leaves fp8 scales in the E8M0
     # DeepGEMM layout (packed int32), which the refit's raw fp32 block scales
@@ -833,7 +840,7 @@ def load_weights(weights, model_runner):
         _reset_e8m0_fp8_moe_scales_for_refit(model)
     original_weight_loaders = _wrap_weight_loaders_for_refit(model)
     try:
-        model.load_weights(weights_quantized)
+        model.load_weights(_iter_quantized_weights(weights, model, fp8_config))
     finally:
         _restore_weight_loaders(original_weight_loaders)
 

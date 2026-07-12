@@ -496,6 +496,21 @@ class DTensorPolicyWorkerV2Impl(
 
                 self.optimizer.zero_grad()
 
+                # Optionally offload optimizer state to CPU during fwd/bwd to free
+                # GPU for the backward (e.g. the ~2 GiB fp32 lm_head weight-grad on
+                # cu13). Reloaded to CUDA just before optimizer.step() below. The
+                # freed blocks are reused by the caching allocator (no empty_cache).
+                # No-op on step 1 (FusedAdam states not yet materialized) and in
+                # eval/cpu_offload. Env-gated; precision-neutral (states unchanged).
+                offload_opt_train = (
+                    os.environ.get("NRL_OFFLOAD_OPTIMIZER_FOR_TRAIN", "0") == "1"
+                    and not eval_mode
+                    and not self.cpu_offload
+                    and self.optimizer is not None
+                )
+                if offload_opt_train:
+                    self.move_optimizer_to_device("cpu")
+
                 # Get microbatch iterator based on batching strategy
                 processed_iterator, iterator_len = get_microbatch_iterator(
                     batch,
@@ -593,6 +608,11 @@ class DTensorPolicyWorkerV2Impl(
                     grad_norm = torch.tensor(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
+
+                    # Reload optimizer state to CUDA for the parameter update
+                    # (offloaded during fwd/bwd above to free GPU for the backward).
+                    if offload_opt_train:
+                        self.move_optimizer_to_device("cuda")
 
                     # Update parameters
                     self.optimizer.step()
