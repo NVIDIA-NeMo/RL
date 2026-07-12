@@ -142,13 +142,20 @@ def test_wrapper_isolates_bridge_and_nemo_rl_pytest_roots() -> None:
         tests/unit/models/megatron/test_megatron_setup.py \\
         tests/unit/models/megatron/test_community_import.py \\
         tests/test_cutedsl_policy_recipe.py \\
+        -q"""
+    lifecycle_pytest = """"${UV_BIN}" run --active --no-sync pytest \\
+        tests/unit/algorithms/test_grpo.py \\
+        tests/unit/models/generation/test_vllm_generation.py \\
+        -k "${lifecycle_test_filter}" \\
         -q
 ) 2>&1 | tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"""
 
     assert "set -euo pipefail" in focused_gate
     assert bridge_subshell in focused_gate
     assert nemo_rl_pytest in focused_gate
+    assert lifecycle_pytest in focused_gate
     assert focused_gate.index(bridge_subshell) < focused_gate.index(nemo_rl_pytest)
+    assert focused_gate.index(nemo_rl_pytest) < focused_gate.index(lifecycle_pytest)
     assert focused_gate.count('| tee "${CONTAINER_RESULT_DIR}/focused_tests.log"') == 1
     assert (
         focused_gate.count('| tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"') == 1

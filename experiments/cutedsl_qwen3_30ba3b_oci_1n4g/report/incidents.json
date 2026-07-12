@@ -133,5 +133,20 @@
     "timestamp_utc": "2026-07-12T04:29:09Z",
     "verification_evidence": "The focused regression changed from one failure to one pass, and the full recipe/report suite passes 58 tests after a real aggregate refresh preserved all prior incidents.",
     "verification_job": "local pytest"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2363339 passed Bridge validation (203 passed, 2 deselected), the focused NeMo validation, all 10 lifecycle regressions, and Pyrefly with 0 errors. The parent Ruff import hook then rewrote tests/unit/algorithms/test_grpo.py and the task exited 1 before GPU smoke or functional GRPO.",
+    "fix_commit": "65aa6efd56c26c543b3ac888e11d2103e7efc904",
+    "hypothesis": "The committed unittest.mock import was not in Ruff 0.9.9's canonical import order and would be rewritten by the parent's exact pre-commit gate.",
+    "report_path": "evidence/job-2363339.txt",
+    "reproduction": "At source fe4af31799f2f10bfdd011d5454d339394eb869d, run Ruff 0.9.9 check --select I against tests/unit/algorithms/test_grpo.py and observe it split the aliased call import from MagicMock and patch.",
+    "root_cause": "The lifecycle regression test combined aliased and unaliased unittest.mock imports on one line. Ruff 0.9.9 normalized them into separate imports; pre-commit treats hook modifications as failure, so the functional gate exited before GPU work.",
+    "run_id": "2363339",
+    "symptom": "Focused validation passed, but parent pre-commit failed before GPU smoke and functional GRPO.",
+    "tested_change": "Retain Ruff's import-only rewrite and verify the pinned lint, import-sort, and format checks without changing lifecycle behavior.",
+    "timestamp_utc": "2026-07-12T05:07:19Z",
+    "verification_evidence": "Job 2363339 verifies the focused lifecycle tests but provides no GPU-smoke, training-update, timing, throughput, or performance evidence. Ruff 0.9.9 verification passes locally; remote functional verification is job 2363729.",
+    "verification_job": "2363729 (pending)"
   }
 ]
