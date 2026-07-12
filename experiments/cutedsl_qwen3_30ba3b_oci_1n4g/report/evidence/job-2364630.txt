@@ -1,0 +1,29 @@
+Pre-Tyche functional gate job 2364630
+Run ID: 2364630
+Timestamp (UTC): 2026-07-12T08:28:54Z
+Source: 113d239c92467d6c49cd963b0e06bc8e9439accd
+Fix commit: 8313de7458fe7f4475bd4576d56d494213666249
+Original remote log: results/2364630/focused_tests.log and slurm.out on Pre-Tyche Lustre.
+
+Observed boundary
+- Runtime bootstrap passed in 22m57s.
+- Bridge: 203 passed, 2 deselected.
+- Recipe/community tests: 7 passed.
+- General lifecycle tests: 11 passed, 117 deselected.
+- The separate --mcore-only invocation selected the policy telemetry test.
+- It failed before the test body while importing MegatronPolicyWorkerImpl.
+- MCore inference coordinator called faulthandler.enable().
+- pytest capsys stderr raised io.UnsupportedOperation: fileno.
+- Job state FAILED, exit 1:0, elapsed 25m24s.
+- GPU smoke and GRPO were not reached.
+
+Root cause
+- capsys uses Python stream capture without the file descriptor required by MCore's import-time faulthandler registration.
+- Production telemetry code was not executed, so this does not disprove its behavior.
+
+Fix and verification
+- Both selected policy telemetry tests now use capfd and retain identical stdout assertions.
+- Ruff 0.9.9, Python compilation, and 52 wrapper tests pass locally.
+- Local macOS MCore execution is blocked earlier by missing Triton and is not accepted as runtime evidence.
+- A Linux rerun is required to verify both policy tests and continue to GPU smoke/GRPO.
+- No timing, throughput, or speedup conclusion is supported by this run.

@@ -238,5 +238,20 @@
     "timestamp_utc": "2026-07-12T08:16:45Z",
     "verification_evidence": "The new assertion failed against --segment=1 before the fix. After the fix, 153 related harness/profile/wrapper/report tests, Ruff 0.9.9, bash syntax, and diff checks passed. Pre-Tyche accepted three test-only g0a0 requests; this is scheduler/preflight evidence, not a performance result.",
     "verification_job": "2364786-2364788 (test-only; no jobs submitted)"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2364630 passed immutable source/image preflight, the 22m57s locked bootstrap, Bridge 203 passed/2 deselected, 7 recipe tests, and 11 general lifecycle tests. The newly separate MCore invocation selected the policy telemetry test, which failed during import when MCore called faulthandler.enable() against pytest capsys stderr without fileno(). GPU smoke and GRPO were not reached.",
+    "fix_commit": "8313de7458fe7f4475bd4576d56d494213666249",
+    "hypothesis": "Using pytest's file-descriptor capture fixture will keep stderr fileno-compatible during MCore import while preserving the same stdout telemetry assertions.",
+    "report_path": "evidence/job-2364630.txt",
+    "reproduction": "At source 113d239c9, run the two selected policy telemetry tests with --mcore-only in the locked Linux environment. During MegatronPolicyWorkerImpl import, MCore data_parallel_inference_coordinator calls faulthandler.enable() and capsys raises io.UnsupportedOperation: fileno.",
+    "root_cause": "The policy telemetry tests used capsys, which replaces Python stdout/stderr objects and does not provide fileno(). Current MCore enables faulthandler at inference-coordinator import time and requires a file-descriptor-backed stderr. This was a Linux test-fixture incompatibility, not a production telemetry failure.",
+    "run_id": "2364630",
+    "symptom": "The corrected MCore test selection exposed a test import failure before Pyrefly, GPU smoke, or functional GRPO.",
+    "tested_change": "Change only the two policy telemetry tests from capsys to capfd and retain their exact ordering and best-effort output assertions.",
+    "timestamp_utc": "2026-07-12T08:28:54Z",
+    "verification_evidence": "The remote failure is the RED reproduction. Ruff 0.9.9, Python compilation, and 52 wrapper regressions pass after the fixture change. macOS cannot import the pinned MCore because Triton is unavailable, so authoritative Linux verification remains pending; this job provides no GPU or performance evidence.",
+    "verification_job": "pending Linux rerun"
   }
 ]
