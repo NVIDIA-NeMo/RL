@@ -519,6 +519,10 @@ class AsyncTrajectoryCollector:
         # Invalidate&recompute vLLM caches after the in-flight weight updates if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
+        # NOTE: for drained (non-in-flight) refits with prefix caching enabled,
+        # cache invalidation is handled unconditionally in
+        # refit_policy_generation (grpo.py), which also covers the
+        # pre-validation refit path that never reaches this method.
         async_cfg = self.master_config.grpo.get("async_grpo", {})
         if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
             "recompute_kv_cache_after_weight_updates", False

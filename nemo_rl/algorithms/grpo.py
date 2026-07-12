@@ -2001,6 +2001,23 @@ def refit_policy_generation(
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
+    # With prefix caching enabled, vLLM's cached blocks are keyed only by
+    # token ids, so blocks prefilled under the OLD weights would be silently
+    # reused under the new ones (stale KV -> genuine train/gen logprob
+    # divergence on every rollout sharing a cached prefix). Invalidate on
+    # every refit, on every refit path (main loop, pre-validation, sync).
+    # Backends without reusable caches inherit the no-op interface default.
+    generation_cfg = getattr(policy_generation, "cfg", None) or {}
+    vllm_cfg = generation_cfg.get("vllm_cfg") or {}
+    if vllm_cfg.get("enable_prefix_caching"):
+        if not policy_generation.invalidate_kv_cache():
+            raise RuntimeError(
+                "❌ Error: prefix caching is enabled but invalidating the "
+                "vLLM prefix/KV cache after refit failed; continuing would "
+                "sample rollouts against stale KV computed under the "
+                "pre-refit weights."
+            )
+
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.resume_after_refit()
 
