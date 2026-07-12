@@ -1328,7 +1328,7 @@ def test_async_rollout_manager_matches_original(
         if key == "max_turns_reached_rate":
             return key
         for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
-            if key.startswith(prefix):
+            if key.startswith(prefix) and "/" not in key:
                 return f"{key[len(prefix) :]}{suffix}"
         return key
 
