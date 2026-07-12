@@ -70,7 +70,7 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
@@ -228,6 +228,26 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])
+
+        # Policy optimizer state first appears after critic warmup, so a cached
+        # checkpoint layout cannot represent both the warmup and training states.
+        assert not (
+            ppo_config["policy_training_start_step"] > 0
+            and master_config.checkpointing["enabled"]
+            and master_config.checkpointing["save_optimizer"]
+            and "checkpoint" in policy_megatron_config
+            and policy_megatron_config["checkpoint"].get(
+                "ckpt_assume_constant_structure"
+            )
+        ), (
+            "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
+            "is incompatible with PPO critic warmup when optimizer checkpointing "
+            "is enabled. Set ckpt_assume_constant_structure=false, "
+            "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
+        )
 
     if value_config["megatron_cfg"]["enabled"]:
         # Context parallelism for the Megatron value model requires sequence packing,
