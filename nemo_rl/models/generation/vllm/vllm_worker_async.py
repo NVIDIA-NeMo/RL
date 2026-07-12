@@ -48,10 +48,9 @@ from nemo_rl.models.generation.vllm.utils import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
-    _get_host_memory_snapshot,
-    _log_sleep_memory,
     _resolve_sleep_level,
 )
+from nemo_rl.utils.host_memory import emit_host_memory_event
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1512,23 +1511,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
         resolved_sleep_level = _resolve_sleep_level(sleep_level)
-        before_snapshot = _get_host_memory_snapshot()
-        _log_sleep_memory(
-            LOGGER,
+        before_snapshot = emit_host_memory_event(
+            event="vllm_sleep_memory",
             phase="before",
-            sleep_level=resolved_sleep_level,
-            snapshot=before_snapshot,
+            fields={"sleep_level": resolved_sleep_level},
         )
         await self.llm.sleep(level=resolved_sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()
-        _log_sleep_memory(
-            LOGGER,
+        emit_host_memory_event(
+            event="vllm_sleep_memory",
             phase="after",
-            sleep_level=resolved_sleep_level,
-            snapshot=_get_host_memory_snapshot(),
+            fields={"sleep_level": resolved_sleep_level},
             before_snapshot=before_snapshot,
+            include_deltas=True,
         )
 
     async def wake_up_async(self, **kwargs):

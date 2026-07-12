@@ -94,6 +94,7 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
+from nemo_rl.utils.host_memory import emit_host_memory_event
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -2010,6 +2011,10 @@ class MegatronPolicyWorkerImpl(
         print(
             f"GPU Memory before optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+        emit_host_memory_event(
+            event="megatron_policy_offload_memory",
+            phase="before_grad_move",
+        )
         self.model = self.move_model(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
@@ -2078,6 +2083,10 @@ class MegatronPolicyWorkerImpl(
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
         ):
+            emit_host_memory_event(
+                event="megatron_policy_offload_memory",
+                phase="before_optimizer_move",
+            )
             self.move_optimizer("cpu")
 
         gc.collect()
@@ -2088,6 +2097,10 @@ class MegatronPolicyWorkerImpl(
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+        emit_host_memory_event(
+            event="megatron_policy_offload_memory",
+            phase="after_completion",
         )
         no_grad.__exit__(None, None, None)
 

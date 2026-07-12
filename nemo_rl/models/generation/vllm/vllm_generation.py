@@ -43,6 +43,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.utils.host_memory import emit_structured_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -907,11 +908,9 @@ class VllmGeneration(GenerationInterface):
             # Use run_all_workers_single_data for methods that don't need data
             requested_sleep_level = 2 if discard_weights else 1
             if self.cfg["colocated"]["enabled"]:
-                logger.info(
-                    "event=vllm_sleep_request discard_weights=%s "
-                    "requested_sleep_level=%d",
-                    discard_weights,
-                    requested_sleep_level,
+                emit_structured_stdout(
+                    f"event=vllm_sleep_request discard_weights={discard_weights} "
+                    f"requested_sleep_level={requested_sleep_level}"
                 )
                 worker_kwargs = {"sleep_level": requested_sleep_level}
             else:

@@ -17,9 +17,10 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
+import psutil
 import pytest
 import ray
 import torch
@@ -51,6 +52,99 @@ class _FakeTrainableModel:
 
     def train(self):
         self.train_called = True
+
+
+def _make_offload_diagnostics_worker(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
+
+    def move_model(model: Any, device: str, move_params: bool, move_grads: bool) -> Any:
+        print("test_action=grad_move", flush=True)
+        return model
+
+    def move_optimizer(device: str) -> None:
+        print("test_action=optimizer_move", flush=True)
+
+    worker.move_model = move_model
+    worker.move_optimizer = move_optimizer
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch, "randn", lambda *_args, **_kwargs: SimpleNamespace(cuda=lambda: None)
+    )
+    return worker
+
+
+def test_megatron_offload_emits_host_memory_at_oom_boundaries(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = _make_offload_diagnostics_worker(monkeypatch)
+    process = SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=5 * 1024**3))
+    monkeypatch.setattr(psutil, "Process", lambda: process)
+    monkeypatch.setattr(
+        psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=10 * 1024**3),
+    )
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    output = capsys.readouterr().out.splitlines()
+    before_grad = (
+        "event=megatron_policy_offload_memory phase=before_grad_move "
+        "process_rss_gib=5.000 system_available_gib=10.000"
+    )
+    before_optimizer = (
+        "event=megatron_policy_offload_memory phase=before_optimizer_move "
+        "process_rss_gib=5.000 system_available_gib=10.000"
+    )
+    after_completion = (
+        "event=megatron_policy_offload_memory phase=after_completion "
+        "process_rss_gib=5.000 system_available_gib=10.000"
+    )
+    assert output.index(before_grad) < output.index("test_action=grad_move")
+    assert output.index("test_action=grad_move") < output.index(before_optimizer)
+    assert output.index(before_optimizer) < output.index("test_action=optimizer_move")
+    assert output.index("test_action=optimizer_move") < output.index(after_completion)
+
+
+def test_megatron_offload_memory_diagnostics_are_best_effort(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = _make_offload_diagnostics_worker(monkeypatch)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda: (_ for _ in ()).throw(RuntimeError("procfs unavailable")),
+    )
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    output = capsys.readouterr().out
+    for phase in ("before_grad_move", "before_optimizer_move", "after_completion"):
+        assert (
+            f"event=megatron_policy_offload_memory phase={phase} "
+            "process_rss_gib=unavailable system_available_gib=unavailable"
+        ) in output
 
 
 def test_megatron_prepare_for_training_restores_optimizer():

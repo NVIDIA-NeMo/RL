@@ -14,7 +14,6 @@
 
 import importlib.util
 import json
-import logging
 import os
 import sys
 import types
@@ -173,7 +172,7 @@ def test_resolve_sleep_level_defaults_to_one_and_accepts_two():
 
 
 def test_sync_sleep_uses_requested_sleep_level(
-    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
@@ -196,14 +195,10 @@ def test_sync_sleep_uses_requested_sleep_level(
         ),
     )
 
-    with caplog.at_level(
-        logging.INFO,
-        logger="nemo_rl.models.generation.vllm.vllm_worker",
-    ):
-        worker.sleep(sleep_level=2)
+    worker.sleep(sleep_level=2)
 
     worker.llm.sleep.assert_called_once_with(level=2)
-    assert [record.getMessage() for record in caplog.records] == [
+    assert capsys.readouterr().out.splitlines() == [
         "event=vllm_sleep_memory phase=before sleep_level=2 "
         "process_rss_gib=5.000 system_available_gib=10.000",
         "event=vllm_sleep_memory phase=after sleep_level=2 "
@@ -214,7 +209,7 @@ def test_sync_sleep_uses_requested_sleep_level(
 
 @pytest.mark.asyncio
 async def test_async_sleep_uses_requested_sleep_level(
-    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -240,14 +235,10 @@ async def test_async_sleep_uses_requested_sleep_level(
         ),
     )
 
-    with caplog.at_level(
-        logging.INFO,
-        logger="nemo_rl.models.generation.vllm.vllm_worker_async",
-    ):
-        await worker.sleep_async(sleep_level=2)
+    await worker.sleep_async(sleep_level=2)
 
     worker.llm.sleep.assert_awaited_once_with(level=2)
-    assert [record.getMessage() for record in caplog.records] == [
+    assert capsys.readouterr().out.splitlines() == [
         "event=vllm_sleep_memory phase=before sleep_level=2 "
         "process_rss_gib=7.000 system_available_gib=8.000",
         "event=vllm_sleep_memory phase=after sleep_level=2 "
@@ -261,7 +252,7 @@ async def test_async_sleep_uses_requested_sleep_level(
     [(False, 1), (True, 2)],
 )
 def test_finish_generation_maps_weight_discard_to_sleep_level(
-    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
     discard_weights: bool,
     expected_sleep_level: int,
@@ -275,20 +266,41 @@ def test_finish_generation_maps_weight_discard_to_sleep_level(
     generation.worker_group.run_all_workers_single_data.return_value = [True]
     monkeypatch.setattr(ray, "get", lambda futures: futures)
 
-    with caplog.at_level(
-        logging.INFO,
-        logger="nemo_rl.models.generation.vllm.vllm_generation",
-    ):
-        assert generation.finish_generation(discard_weights=discard_weights)
+    assert generation.finish_generation(discard_weights=discard_weights)
 
     generation.worker_group.run_all_workers_single_data.assert_called_once_with(
         "sleep",
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         sleep_level=expected_sleep_level,
     )
-    assert [record.getMessage() for record in caplog.records] == [
+    assert capsys.readouterr().out.splitlines() == [
         f"event=vllm_sleep_request discard_weights={discard_weights} "
         f"requested_sleep_level={expected_sleep_level}"
+    ]
+
+
+def test_sync_sleep_memory_diagnostics_are_best_effort(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = MagicMock()
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        MagicMock(side_effect=RuntimeError("procfs unavailable")),
+    )
+
+    worker.sleep(sleep_level=2)
+
+    worker.llm.sleep.assert_called_once_with(level=2)
+    assert capsys.readouterr().out.splitlines() == [
+        "event=vllm_sleep_memory phase=before sleep_level=2 "
+        "process_rss_gib=unavailable system_available_gib=unavailable",
+        "event=vllm_sleep_memory phase=after sleep_level=2 "
+        "process_rss_gib=unavailable process_rss_delta_gib=unavailable "
+        "system_available_gib=unavailable system_available_delta_gib=unavailable",
     ]
 
 

@@ -146,6 +146,7 @@ def test_wrapper_isolates_bridge_and_nemo_rl_pytest_roots() -> None:
     lifecycle_pytest = """"${UV_BIN}" run --active --no-sync pytest \\
         tests/unit/algorithms/test_grpo.py \\
         tests/unit/models/generation/test_vllm_generation.py \\
+        tests/unit/models/policy/test_megatron_worker.py \\
         -k "${lifecycle_test_filter}" \\
         -q
 ) 2>&1 | tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"""
@@ -156,6 +157,9 @@ def test_wrapper_isolates_bridge_and_nemo_rl_pytest_roots() -> None:
     assert lifecycle_pytest in focused_gate
     assert focused_gate.index(bridge_subshell) < focused_gate.index(nemo_rl_pytest)
     assert focused_gate.index(nemo_rl_pytest) < focused_gate.index(lifecycle_pytest)
+    assert "test_megatron_offload_emits_host_memory_at_oom_boundaries" in focused_gate
+    assert "test_megatron_offload_memory_diagnostics_are_best_effort" in focused_gate
+    assert "test_sync_sleep_memory_diagnostics_are_best_effort" in focused_gate
     assert focused_gate.count('| tee "${CONTAINER_RESULT_DIR}/focused_tests.log"') == 1
     assert (
         focused_gate.count('| tee -a "${CONTAINER_RESULT_DIR}/focused_tests.log"') == 1
