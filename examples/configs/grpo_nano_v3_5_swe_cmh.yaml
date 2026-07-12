@@ -414,13 +414,13 @@ env:
           dataset_path: ${data.train.data_path}
           apptainer_memory_limit_mb: 65536
           container_formatter:
-            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swerebench/{instance_id}.sif"
-            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/nv_internal/{instance_id}.sif"
-            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/r2e_gym/{instance_id}.sif"
-            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swegym/sweb.eval.arm64.{instance_id}.sif"
-            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/swebench/swe-bench.eval.arm64.{instance_id}.sif"
-            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/mercor/swebenchpro_ots/{instance_id}.sif"
-            - "/lustre/fsw/portfolios/llmservice/users/sdevare/images/mercor/{instance_id}.sif"
+            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/swerebench/{instance_id}.sif"
+            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/nv_internal/{instance_id}.sif"
+            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/r2e_gym/{instance_id}.sif"
+            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/sweb.eval.arm64.{instance_id}.sif"
+            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/swebench/swe-bench.eval.arm64.{instance_id}.sif"
+            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/mercor/swebenchpro_ots/{instance_id}.sif"
+            - "/scratch/fsw/portfolios/nemotron/projects/nemotron_rl_algo/images/swegym/sweb.eval.arm64.{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:

@@ -1974,6 +1974,19 @@ def run_async_nemo_gym_rollout(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
+            # Agent/env-driven mask flag — True means this sample should be masked
+            # from the GRPO gradient (kept for advantage computation).
+            "mask_sample": torch.tensor(
+                [
+                    bool(
+                        (r["full_result"].get("instance_config") or {}).get(
+                            "mask_sample", False
+                        )
+                    )
+                    for r in results
+                ],
+                dtype=torch.bool,
+            ),
         }
     )
 
