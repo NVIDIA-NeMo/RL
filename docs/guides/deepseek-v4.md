@@ -4,12 +4,13 @@ This guide describes the current state of DeepSeek V4 support in NeMo-RL: what
 works today, how to reproduce a reference run, the limitations you should expect,
 and what we are working on next.
 
-> [!WARNING]
+> [!IMPORTANT]
 > **Status: Functional Ready.** DeepSeek V4 Flash is runnable and has been numerically
-> validated with a short run on both base and non-base checkpoints, but it is **not yet validated for long-run
-> convergence**. Expect the known issues described [below](#known-issues) — in
-> particular, long runs can crash around step ~100 due to a train/inference
-> mismatch. Treat this as an early-access integration, not a production recipe.
+> validated: the `DeepSeek-V4-Flash-Base` reference recipe trains through a GRPO
+> run of more than 500 steps with a healthy reward curve. Full-length long-run
+> convergence is not yet confirmed. Expect the known issues described
+> [below](#known-issues). Treat this as an early-access integration, not a
+> production recipe.
 
 ## Support Status
 
@@ -17,7 +18,7 @@ We track model support in two stages:
 
 | Stage | Meaning |
 | --- | --- |
-| **Functional Ready** | Runnable end-to-end and numerically validated with a short run. |
+| **Functional Ready** | Runnable end-to-end and numerically validated with an initial training run. |
 | **Long-run convergence validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
 DeepSeek V4 Flash is currently **Functional Ready**. Reaching long-run convergence is
@@ -74,7 +75,10 @@ Key settings in this recipe:
 - Model: `deepseek-ai/DeepSeek-V4-Flash-Base`, chat template `deepseek_v4`
 - Training: BF16, `expert_parallel_size: 64`, sequence length **3072** (see
   [Known Issues](#known-issues))
-- Generation: vLLM FP8
+- Train/inference alignment: FP8 fake-quant is enabled on the AutoModel
+  (training) side (the `fp8_ds_mla_fake_quant_*` overrides) together with
+  `pow2_weight_scaling_factors`, so the training policy matches the FP8
+  generation policy and keeps the train/inference mismatch small. 
 - Dataset: DAPO Math (`DAPOMath17K` train / `DAPOMathAIME2024` val)
 
 ### 3. Launch
@@ -98,7 +102,8 @@ For multi-node setup (Ray on Slurm/Kubernetes), follow the standard NeMo-RL
 ### Reference training curve
 
 The following curves were produced with the reference recipe above
-(DeepSeek-V4-Flash-Base, DAPO Math, 8× H100 nodes):
+(DeepSeek-V4-Flash-Base, DAPO Math, 8× H100 nodes) over a GRPO run of more than
+500 steps:
 
 ![DeepSeek-V4-Flash-Base GRPO reward curve on DAPO Math](../assets/dsv4-flash-base-dapo.png)
 
@@ -118,6 +123,11 @@ The reference recipe targets `DeepSeek-V4-Flash-Base`, whose experts are stored 
 In short: AutoModel loads the FP4 checkpoint (dequantized to BF16 for training), vLLM
 serves the FP8/base layout, and the FP8 refit bridges the two each step.
 
+> [!NOTE]
+> The validation above (more than 500 steps) was run on `DeepSeek-V4-Flash-Base`. The non-base
+> FP4 checkpoint is runnable and Functional Ready, but has only been validated
+> with a shorter run.
+
 ## Known Issues
 
 - **Maximum sequence length is constrained by node count and the available
@@ -127,18 +137,11 @@ serves the FP8/base layout, and the FP8 refit bridges the two each step.
   adding nodes. In practice, **8 nodes** support up to a **3072-token** maximum
   sequence length, and **16 nodes** are required for **4096 tokens**. Adding
   Context Parallel (see [What's Next](#whats-next)) will relax this.
-- **Train/inference mismatch.** The discrepancy between the training and
-  generation paths is currently significant, and long runs tend to **crash
-  around step ~100**. This is our top active workstream — see below.
 
 ## What's Next
 
 In rough priority order:
 
-- **Stabilize long runs.** Mitigate the train/inference mismatch so DeepSeek V4 Flash
-  can train through a full-length run. We have found that applying FP8 fake
-  quantization on the AutoModel (training) side helps reduce the mismatch, and a
-  long-run validation is in progress.
 - **More parallelism.** Add Context Parallel (CP) to enable longer-context
   training, beyond what EP alone allows today.
 - **Megatron backend.** [Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)
