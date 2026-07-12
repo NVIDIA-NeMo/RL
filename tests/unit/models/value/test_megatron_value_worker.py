@@ -707,6 +707,10 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     # `test_megatron_checkpoint_save_kill_and_restore` policy-worker test,
     # which also saves while still in inference mode.
     value.prepare_for_inference()
+    values_trained = value.get_values(data)["values"].detach().cpu()
+    assert not torch.allclose(values_trained, values_fresh, atol=1e-4), (
+        "Training should change value predictions before checkpointing"
+    )
 
     # Save weights + optimizer alongside the way `ppo.setup()` does:
     #   <ckpt_root>/value/weights/  ,  <ckpt_root>/value/optimizer/
@@ -765,11 +769,12 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
             "Resumed worker get_values should not produce Infs"
         )
 
-        # The restored model must be the trained state, not a fresh value head.
-        assert not torch.allclose(values_resumed, values_fresh, atol=1e-4), (
-            "Resumed get_values should differ from fresh-init values. "
-            "If equal, the checkpoint load silently fell back to a fresh "
-            "initialization instead of loading the trained weights."
+        # The restored model must exactly reproduce the state that was saved,
+        # rather than merely differ from fresh initialization.
+        torch.testing.assert_close(
+            values_resumed,
+            values_trained,
+            msg="Resumed value predictions should match the saved trained model",
         )
         # Re-save without another update. Comparing the two logical distributed
         # checkpoints proves that optimizer tensors and scheduler state were
@@ -801,20 +806,43 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
 
         saved_iteration = str(saved_iteration_dirs[0])
         resaved_iteration = str(resaved_iteration_dirs[0])
-        saved_tensors = load_plain_tensors(saved_iteration)
-        resaved_tensors = load_plain_tensors(resaved_iteration)
-        assert any("optimizer" in str(key) for key in saved_tensors), (
-            "Saved MCore checkpoint should contain optimizer tensors"
-        )
-        tensor_diffs = diff(saved_tensors, resaved_tensors)
-        assert not any(map(bool, tensor_diffs)), tensor_diffs
+        # MCore's plain-tensor reader calls torch.distributed.get_rank() even
+        # though the underlying DCP load uses no_dist=True. The pytest driver is
+        # not part of the workers' process groups, so give this comparison a
+        # temporary, isolated single-rank group. This satisfies MCore's caller
+        # contract while following the test-local PG lifecycle used elsewhere.
+        created_process_group = False
+        try:
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(
+                    backend="gloo",
+                    init_method=f"file://{tmp_path / 'checkpoint_compare_pg'}",
+                    rank=0,
+                    world_size=1,
+                )
+                created_process_group = True
 
-        saved_common = load_common_state_dict(saved_iteration)
-        resaved_common = load_common_state_dict(resaved_iteration)
-        for state_key in ("optimizer", "opt_param_scheduler"):
-            assert state_key in saved_common
-            assert state_key in resaved_common
-            state_diffs = diff(saved_common[state_key], resaved_common[state_key])
-            assert not any(map(bool, state_diffs)), state_diffs
+            saved_tensors = load_plain_tensors(saved_iteration)
+            resaved_tensors = load_plain_tensors(resaved_iteration)
+            tensor_keys = {str(key) for key in saved_tensors}
+            for optimizer_state in ("exp_avg", "exp_avg_sq"):
+                assert any(
+                    key.startswith("optimizer.") and optimizer_state in key.split(".")
+                    for key in tensor_keys
+                ), f"Saved checkpoint should contain Adam {optimizer_state} tensors"
+            tensor_diffs = diff(saved_tensors, resaved_tensors)
+            assert not any(map(bool, tensor_diffs)), tensor_diffs
+
+            saved_common = load_common_state_dict(saved_iteration)
+            resaved_common = load_common_state_dict(resaved_iteration)
+            for state_key in ("optimizer", "opt_param_scheduler"):
+                assert state_key in saved_common
+                assert state_key in resaved_common
+                state_diffs = diff(saved_common[state_key], resaved_common[state_key])
+                assert not any(map(bool, state_diffs)), state_diffs
+            assert saved_common["opt_param_scheduler"]["num_steps"] > 0
+        finally:
+            if created_process_group and torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
     finally:
         resumed.shutdown()
