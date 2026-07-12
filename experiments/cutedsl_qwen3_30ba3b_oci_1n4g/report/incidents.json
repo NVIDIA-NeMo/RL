@@ -43,5 +43,20 @@
     "timestamp_utc": "2026-07-12T00:01:07Z",
     "verification_evidence": "The focused executable regression passes locally and all preserved gate contracts remain covered; remote verification is pending.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2362298 passed runtime bootstrap, Bridge (203 passed, 2 deselected), NeMo (5 passed), unit-result preservation, and Pyrefly (0 errors). The first Ruff hook passed; the second Ruff hook modified the renderer, reported one fixed import-format error, and the task exited 1.",
+    "fix_commit": "renderer import normalization commit",
+    "hypothesis": "The committed renderer retained one extra blank line that Ruff 0.9.9's import-format gate would remove.",
+    "report_path": "evidence/job-2362298.txt",
+    "reproduction": "Run Ruff 0.9.9 with `check --select I` against the committed renderer from 219f4eb56, or run the parent's changed-file pre-commit gate.",
+    "root_cause": "The renderer committed at 219f4eb56 was not normalized by the parent's exact Ruff import gate: two blank lines separated `from typing import Any` from `REQUIRED_PHASES`, while Ruff required one.",
+    "run_id": "2362298",
+    "symptom": "Remote functional validation passed the repaired quoted-heredoc boundary, then failed in parent pre-commit before GPU smoke and GRPO.",
+    "tested_change": "Delete only the extra blank line and verify the original Ruff 0.9.9 I001 reproduction changes from RED to GREEN; retain the existing pre-commit configuration unchanged.",
+    "timestamp_utc": "2026-07-12T00:39:31Z",
+    "verification_evidence": "Remote quoted-heredoc verification succeeded through Bridge, NeMo, unit-result preservation, and Pyrefly. Local Ruff regression passes after the one-line normalization; the full remote functional gate remains pending because job 2362298 did not reach GPU smoke or GRPO.",
+    "verification_job": "pending"
   }
 ]

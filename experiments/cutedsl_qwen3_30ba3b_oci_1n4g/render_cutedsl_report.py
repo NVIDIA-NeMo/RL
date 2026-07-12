@@ -18,7 +18,6 @@ import stat
 from pathlib import Path
 from typing import Any
 
-
 REQUIRED_PHASES = {
     "preflight",
     "image_hash",

@@ -1,0 +1,32 @@
+CuTeDSL Pre-Tyche parent-precommit evidence snapshot
+
+Job: 2362298
+Job name: coreai_dlalgo_llm-cutedsl.func
+Cluster profile: pre_tyche
+Node: ptyche0160
+State: FAILED
+ExitCode: 1:0
+Submit: 2026-07-11T17:14:49 (scheduler local time)
+Start: 2026-07-11T17:14:52 (scheduler local time)
+End: 2026-07-11T17:39:34 (scheduler local time)
+Elapsed: 00:24:42
+
+Original remote log: /lustre/fsw/coreai_dlalgo_llm/users/sna/nemo-2606-cutedsl-pre-tyche-20260711/src/RL/experiments/cutedsl_qwen3_30ba3b_oci_1n4g/results/2362298/slurm.out
+Original result directory: /lustre/fsw/coreai_dlalgo_llm/users/sna/nemo-2606-cutedsl-pre-tyche-20260711/src/RL/experiments/cutedsl_qwen3_30ba3b_oci_1n4g/results/2362298
+Provenance: bounded snapshot from live sacct, status, and slurm.out lines supplied by the operator on 2026-07-11; status finished 2026-07-12T00:39:31Z.
+
+Functional-gate boundary:
+slurm.out:539: Bridge expected summary diagnostic emitted.
+slurm.out:649: 203 passed, 2 deselected, 82 warnings in 1.25s
+slurm.out:679: 5 passed, 1 warning in 9.97s
+slurm.out:680-681: NeMo unit-result artifacts preserved.
+slurm.out:684: Pyrefly errors shown: 0
+slurm.out:699: first Ruff hook Passed
+slurm.out:700: second Ruff hook Failed
+slurm.out:702: files were modified by this hook
+slurm.out:704: warning: Failed to lint check: No such file or directory (os error 2)
+slurm.out:705: Found 1 error (1 fixed, 0 remaining)
+slurm.out:712: srun task exited with code 1
+
+Interpretation: the quoted-heredoc remote verification succeeded through Bridge, NeMo, unit-result preservation, and Pyrefly. The parent pre-commit gate then removed one extra blank line between `from typing import Any` and `REQUIRED_PHASES` in the committed renderer. The full functional gate remains pending because this separate formatting failure prevented the GPU smoke and GRPO phases from running.
+Redaction: only scheduler metadata and the bounded validation/pre-commit boundary are retained; credentials and unrelated environment values are omitted.
