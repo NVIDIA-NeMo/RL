@@ -945,8 +945,10 @@ def test_benchmark_separates_profiling_and_collects_raw_timing() -> None:
         "run_timing_arm()",
         "run_profile_arm()",
         "unset NRL_NSYS_WORKER_PATTERNS",
-        'profile_overrides+=("grpo.max_num_steps=7")',
-        'export NRL_NSYS_PROFILE_STEP_RANGE="6:7"',
+        "unset NRL_NSYS_PROFILE_STEP_RANGE",
+        "unset NRL_NSYS_EXTRA_OPTIONS",
+        'profile_overrides+=("grpo.max_num_steps=2")',
+        'export NRL_NSYS_PROFILE_STEP_RANGE="1:2"',
         '"raw_timing.json"',
         '"raw_timing.csv"',
         '"timing/train/policy_training"',
@@ -962,6 +964,18 @@ def test_benchmark_separates_profiling_and_collects_raw_timing() -> None:
     assert BENCHMARK_SCRIPT.index("run_timing_arm()") < BENCHMARK_SCRIPT.index(
         "run_profile_arm()"
     )
+
+
+def test_functional_profiles_first_update_and_keeps_post_update_refit_gate() -> None:
+    """Profiling ends before the mature optimizer-state offload on step two."""
+    assert (
+        "Launching the three-update GRPO gate with a step-1 policy-worker "
+        "Nsight capture."
+    ) in SCRIPT
+    assert "step-2 policy-worker Nsight capture" not in SCRIPT
+    assert '"grpo.max_num_steps=3"' in SCRIPT
+    assert 'export NRL_NSYS_PROFILE_STEP_RANGE="1:2"' in SCRIPT
+    assert 'export NRL_NSYS_PROFILE_STEP_RANGE="2:3"' not in SCRIPT
 
 
 def test_benchmark_reuses_pinned_image_and_node_local_bootstrap() -> None:

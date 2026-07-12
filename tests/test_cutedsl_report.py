@@ -484,6 +484,7 @@ def test_aggregate_report_uses_local_assets_and_incident_timeline() -> None:
         "2362298",
         "2349175",
         "2362710",
+        "2362916",
     ):
         assert job_id in incident_text
         assert job_id in index
@@ -506,6 +507,7 @@ def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
         "2362298",
         "2349175",
         "2362710",
+        "2362916",
     }
     for incident in incidents:
         relative_path = Path(incident["report_path"])
@@ -531,6 +533,42 @@ def test_committed_incident_evidence_is_bounded_redacted_and_linked() -> None:
                 "TOKEN=",
             ):
                 assert secret_fragment not in text
+        assert source.read_bytes() == public.read_bytes()
+
+
+def test_job_2362916_reports_host_oom_without_perf_claim() -> None:
+    """The latest incident separates functional evidence from benchmark evidence."""
+    report_dir = EXPERIMENT_DIR / "report"
+    incidents = json.loads((report_dir / "incidents.json").read_text())
+    incident = next(item for item in incidents if item["run_id"] == "2362916")
+    evidence = (report_dir / incident["report_path"]).read_text()
+    public_evidence = (report_dir / "public" / incident["report_path"]).read_text()
+    index = (report_dir / "public/index.html").read_text()
+
+    required_fragments = (
+        "30693c629514e71c44367f6b1ad7ebfd017f2275",
+        "203 passed, 2 deselected",
+        "5 passed, 1 warning",
+        "four-GPU",
+        "moe_router_dtype: fp32",
+        "Invalid type (7)",
+        "Total step time: 64.74s",
+        "policy_training: 20.98s",
+        "Policy Training (Tokens/sec/gpu): 46.84",
+        "Starting GPU profiling",
+        "GPU Memory before optimizer offload: 105.71GB",
+        "OUT_OF_MEMORY",
+        "0:125",
+        "633145024K",
+        "Detected 4 oom_kill events",
+        "warm-up and non-authoritative",
+        "No ON/OFF speedup or performance conclusion",
+    )
+    for fragment in required_fragments:
+        assert fragment in evidence, fragment
+        assert fragment in public_evidence, fragment
+    assert "host-memory cgroup OOM" in incident["root_cause"]
+    assert "No ON/OFF speedup or performance conclusion" in index
 
 
 @pytest.mark.parametrize(

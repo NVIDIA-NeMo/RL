@@ -1,0 +1,22 @@
+Job 2362916 bounded incident evidence
+Original remote log: selected redacted excerpts from metadata.json, focused_tests.log, gpu_smoke.log, effective_config.yaml, grpo.log, slurm.out, and sacct.
+Source SHA: 30693c629514e71c44367f6b1ad7ebfd017f2275
+Focused validation: Bridge 203 passed, 2 deselected; NeMo-RL 5 passed, 1 warning.
+four-GPU smoke: cuda:0 through cuda:3 NVIDIA GB200 Transformer Engine forward/backward=PASS.
+Effective recipe: logprob_batch_size: 1; moe_router_dtype: fp32.
+Prior failure boundary: GetTransformerEngineDType: Invalid type (7) did not recur; logprob and policy training completed.
+Step 1/3 completed one training update.
+Total step time: 64.74s
+policy_training: 20.98s
+Policy Training (Tokens/sec/gpu): 46.84
+Interpretation: these first-step metrics are warm-up and non-authoritative.
+No ON/OFF speedup or performance conclusion is supported by this functional run.
+Step 2/3: Starting GPU profiling for policy and generation.
+vLLM sleep: 32.32 GiB per rank backed up in CPU, repeated across four workers.
+Policy workers: GPU Memory before optimizer offload: 105.71GB allocated (rank 0; approximately 105.7GB on all four ranks).
+Driver stack: refit_policy_generation -> policy.offload_before_refit.
+sacct 2362916.4: State=OUT_OF_MEMORY ExitCode=0:125 Elapsed=00:11:54 MaxRSS=633145024K.
+Slurm: Detected 4 oom_kill events in StepId=2362916.4.
+Slurm: task 0: Out Of Memory.
+Classification: host-memory cgroup OOM during mature optimizer-state offload; no CUDA OOM was reported.
+Attribution limit: mature optimizer state, vLLM CPU backup, and active Nsight overlapped; exact byte shares were not measured.

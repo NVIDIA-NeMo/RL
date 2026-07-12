@@ -619,7 +619,7 @@ PY
 cutedsl_write_event gpu_smoke pass 0 \
     "Cutlass import and four-GPU Transformer Engine smoke passed" gpu_smoke.log
 
-echo "[INFO] Launching the three-update GRPO gate with a step-2 policy-worker Nsight capture."
+echo "[INFO] Launching the three-update GRPO gate with a step-1 policy-worker Nsight capture."
 cutedsl_write_event functional_grpo start '' \
     "Run three-update functional GRPO gate" grpo.log
 "${SRUN[@]}" bash -lc '
@@ -640,7 +640,7 @@ runtime_prefix=$("${UV_BIN}" run --active --no-sync python -c '"'"'import sys; p
 [[ "${runtime_python}" == "${expected_runtime_python}" ]]
 [[ "${runtime_prefix}" == "${VIRTUAL_ENV}" ]]
 export NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker"
-export NRL_NSYS_PROFILE_STEP_RANGE="2:3"
+export NRL_NSYS_PROFILE_STEP_RANGE="1:2"
 export NRL_NSYS_EXTRA_OPTIONS='"'"'{"cuda-memory-usage":"true","cpuctxsw":"none"}'"'"'
 export RAY_TMPDIR="${CONTAINER_RUNTIME_DIR}/ray_tmp"
 export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"

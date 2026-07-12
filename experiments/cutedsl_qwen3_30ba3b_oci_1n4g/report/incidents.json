@@ -88,5 +88,20 @@
     "timestamp_utc": "2026-07-12T02:22:17Z",
     "verification_evidence": "The resolved-recipe dtype contract changes from inherited fp64 to explicit fp32. Job 2362710 proves the earlier logprob_batch_size=1 fix crossed its boundary, but remote dtype verification remains pending and no training update or performance result exists.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2362916 at source 30693c629 passed focused validation and four-GPU GB200 smoke, resolved moe_router_dtype fp32, crossed the prior Invalid type (7) boundary, and completed one update. At step 2, policy and generation profiling began before vLLM CPU backup and the four policy ranks' mature optimizer-state offload; Slurm recorded step 2362916.4 OUT_OF_MEMORY, exit 0:125, MaxRSS 633145024K, and four oom_kill events.",
+    "fix_commit": "first-update profiling schedule commit",
+    "hypothesis": "Nsight trace collection beginning exactly at step 2 reduced host-memory headroom while vLLM retained 32.32 GiB per rank on CPU and all four policy ranks concurrently copied newly materialized optimizer state to CPU.",
+    "report_path": "evidence/job-2362916.txt",
+    "reproduction": "Run the three-update functional gate at 30693c629 with NRL_NSYS_PROFILE_STEP_RANGE=2:3; after the first optimizer update, observe profiling start, vLLM sleep, four approximately 105.7 GiB policy allocations entering offload, and the Slurm cgroup OOM.",
+    "root_cause": "The immediate failure was a host-memory cgroup OOM during the synchronized step-2 refit/offload, not a CUDA OOM. Mature Adam state, vLLM's CPU-backed sleep allocation, and active Nsight collection overlapped; the available evidence does not apportion their exact byte contributions.",
+    "run_id": "2362916",
+    "symptom": "The first training update completed, then all four policy workers died during the next refit's optimizer offload.",
+    "tested_change": "Profile update 1 with range 1:2, retain three functional updates so profiling stops before the mature step-2 optimizer offload, and use two updates for profile-only ON/OFF arms. Timing arms remain unprofiled.",
+    "timestamp_utc": "2026-07-12T03:11:17Z",
+    "verification_evidence": "Job 2362916 proves the FP32 router fix and first update, but its first-step metrics are warm-up and non-authoritative. No ON/OFF speedup or performance conclusion is supported. Local wrapper and report verification covers the scheduling and evidence change; remote verification is pending.",
+    "verification_job": "pending"
   }
 ]

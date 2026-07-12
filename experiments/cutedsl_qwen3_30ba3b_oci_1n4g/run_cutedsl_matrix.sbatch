@@ -794,7 +794,7 @@ for override in "${common_timing_overrides[@]}"; do
         profile_overrides+=("${override}")
     fi
 done
-profile_overrides+=("grpo.max_num_steps=7")
+profile_overrides+=("grpo.max_num_steps=2")
 IFS=',' read -r -a timing_arms <<< "${TIMING_ORDER}"
 
 run_profile_arm() {
@@ -814,7 +814,7 @@ run_profile_arm() {
     export RAY_TMPDIR="${CONTAINER_RUNTIME_DIR}/ray_profile"
     export TMPDIR="${CONTAINER_RUNTIME_DIR}/tmp"
     export NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker"
-    export NRL_NSYS_PROFILE_STEP_RANGE="6:7"
+    export NRL_NSYS_PROFILE_STEP_RANGE="1:2"
     export NRL_NSYS_EXTRA_OPTIONS='{"cuda-memory-usage":"true","cpuctxsw":"none"}'
 
     set +e
