@@ -665,7 +665,7 @@ mkdir -p "${CONTAINER_RESULT_DIR}/nsight"
 while IFS= read -r -d "" report; do
     cp -a "${report}" "${CONTAINER_RESULT_DIR}/nsight/"
     printf "\n===== %s =====\n" "${report}" >> "${CONTAINER_RESULT_DIR}/kernel_evidence.txt"
-    nsys stats --report cuda_gpu_kern_sum "${report}" \
+    nsys stats --report cuda_gpu_kern_sum --format csv "${report}" \
         >> "${CONTAINER_RESULT_DIR}/kernel_evidence.txt" 2>&1 || true
 done < <(find "${RAY_TMPDIR}" -type f -path '"'"'*/logs/nsight/*.nsys-rep'"'"' -print0 2>/dev/null)
 while IFS= read -r -d "" artifact; do
@@ -697,13 +697,13 @@ FUSED_FORWARD_SIGNATURES = {
         r"\bForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8\b"
     ),
     "cudnn_frontend_glu_bias_kernel": (
-        r"\bBlockScaledMoEGroupedGemmGluBiasKernel\b"
+        r"BlockScaledMoEGroupedGemmGluBiasKernel"
     ),
     "cudnn_frontend_glu_wrapper_sm100": r"\bgrouped_gemm_glu_wrapper_sm100\b",
 }
 FUSED_DGRAD_SIGNATURES = {
     "cudnn_frontend_dglu_dbias_kernel": (
-        r"\bBlockScaledMoEGroupedGemmDgluDbiasKernel\b"
+        r"BlockScaledMoEGroupedGemmDgluDbiasKernel"
     ),
     "cudnn_frontend_dglu_wrapper_sm100": (
         r"\bgrouped_gemm_dglu(?:_dbias)?_wrapper_sm100\b"

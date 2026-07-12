@@ -1063,6 +1063,35 @@ def test_functional_profile_validator_fails_closed_and_requires_fused_signatures
     assert attribution["fused_dgrad_match_count"] > 0
 
 
+def test_functional_kernel_evidence_preserves_full_kernel_names() -> None:
+    """CSV stats avoid the ellipsis emitted by the human-readable table."""
+    assert (
+        'nsys stats --report cuda_gpu_kern_sum --format csv "${report}"' in SCRIPT
+    )
+    assert 'nsys stats --report cuda_gpu_kern_sum "${report}"' not in SCRIPT
+
+
+def test_functional_profile_validator_matches_cudnn_csv_kernel_names(
+    tmp_path: Path,
+) -> None:
+    """cuDNN CSV embeds class names inside generated CUTLASS identifiers."""
+    evidence = (
+        "0.1,6551808,144,kernel_cutlass_kernel_cudnngrouped_gemm"
+        "grouped_gemm_glumoe_blockscaled_grouped_gemm_glu_bias"
+        "BlockScaledMoEGroupedGemmGluBiasKernel_object_at__TiledMMA\n"
+        "0.0,2669024,48,kernel_cutlass_kernel_cudnngrouped_gemm"
+        "grouped_gemm_dglumoe_blockscaled_grouped_gemm_dglu_dbias"
+        "BlockScaledMoEGroupedGemmDgluDbiasKernel_object_at__TiledMMA\n"
+    )
+    result = _run_functional_profile_validator(
+        tmp_path,
+        report_count=1,
+        evidence=evidence,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_functional_profile_pass_occurs_only_after_attribution_validation() -> None:
     assert SCRIPT.index("# CUTEDSL_FUNCTIONAL_PROFILE_VALIDATOR_START") < SCRIPT.index(
         "cutedsl_write_event profile pass"
