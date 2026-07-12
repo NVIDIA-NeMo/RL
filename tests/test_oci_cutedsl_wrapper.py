@@ -985,6 +985,91 @@ def test_functional_profiles_first_update_and_keeps_post_update_refit_gate() -> 
     assert 'export NRL_NSYS_PROFILE_STEP_RANGE="2:3"' not in SCRIPT
 
 
+def _functional_profile_validator_source() -> str:
+    start = "# CUTEDSL_FUNCTIONAL_PROFILE_VALIDATOR_START\n"
+    end = "# CUTEDSL_FUNCTIONAL_PROFILE_VALIDATOR_END\n"
+    assert start in SCRIPT
+    assert end in SCRIPT
+    return SCRIPT.split(start, 1)[1].split(end, 1)[0]
+
+
+def _run_functional_profile_validator(
+    tmp_path: Path,
+    *,
+    report_count: int,
+    evidence: str,
+) -> subprocess.CompletedProcess[str]:
+    result_dir = tmp_path / "functional-result"
+    (result_dir / "nsight").mkdir(parents=True)
+    for report_index in range(report_count):
+        (result_dir / "nsight" / f"worker-{report_index}.nsys-rep").touch()
+    (result_dir / "kernel_evidence.txt").write_text(evidence)
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _functional_profile_validator_source(),
+            str(result_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_functional_profile_validator_fails_closed_and_requires_fused_signatures(
+    tmp_path: Path,
+) -> None:
+    valid_evidence = (
+        "ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8\n"
+        "BlockScaledMoEGroupedGemmDgluDbiasKernel\n"
+    )
+    cases = (
+        ("missing-report", 0, valid_evidence, "no .nsys-rep"),
+        ("empty-evidence", 1, "", "kernel evidence is empty"),
+        (
+            "missing-dgrad",
+            1,
+            "ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8\n",
+            "fused CuTeDSL dgrad",
+        ),
+    )
+    for name, report_count, evidence, expected_error in cases:
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        result = _run_functional_profile_validator(
+            case_dir,
+            report_count=report_count,
+            evidence=evidence,
+        )
+        assert result.returncode != 0, name
+        assert expected_error in result.stderr, (name, result.stderr)
+
+    passing_dir = tmp_path / "passing"
+    passing_dir.mkdir()
+    passing = _run_functional_profile_validator(
+        passing_dir,
+        report_count=1,
+        evidence=valid_evidence,
+    )
+    assert passing.returncode == 0, passing.stderr
+    attribution = json.loads(
+        (
+            passing_dir / "functional-result/functional_profile_attribution.json"
+        ).read_text()
+    )
+    assert attribution["passed"] is True
+    assert attribution["nsight_report_count"] == 1
+    assert attribution["fused_forward_match_count"] > 0
+    assert attribution["fused_dgrad_match_count"] > 0
+
+
+def test_functional_profile_pass_occurs_only_after_attribution_validation() -> None:
+    assert SCRIPT.index("# CUTEDSL_FUNCTIONAL_PROFILE_VALIDATOR_START") < SCRIPT.index(
+        "cutedsl_write_event profile pass"
+    )
+    assert "functional_profile_attribution.json" in SCRIPT
+
+
 def test_benchmark_reuses_pinned_image_and_node_local_bootstrap() -> None:
     required_fragments = (
         'IMAGE="${CUTEDSL_IMAGE}"',
@@ -1029,8 +1114,8 @@ def test_benchmark_records_workload_and_normalized_throughput_as_primary() -> No
         '"measured_step_workload"',
         '"total_num_tokens"',
         '"global_valid_toks"',
-        '"normalized_policy_training_tokens_per_sec_per_gpu"',
-        '"workload_equality_required": False',
+        '"policy_training_tokens_per_sec_per_gpu"',
+        '"workload_equality_required": True',
         '"workload_equality_observed"',
         '"primary_metric": NORMALIZED_THROUGHPUT_METRIC',
         '"secondary_metric": POLICY_TIME_METRIC',
@@ -1052,9 +1137,13 @@ def _required_fake_metrics(*, omit: str | None = None) -> dict[str, dict[str, fl
     source_names = (
         "timing/train/total_step_time",
         "timing/train/generation",
+        "timing/train/generation_finalize",
         "timing/train/policy_and_reference_logprobs",
         "timing/train/policy_training",
         "timing/train/prepare_for_generation/transfer_and_update_weights",
+        "performance/tokens_per_sec_per_gpu",
+        "performance/generation_tokens_per_sec_per_gpu",
+        "performance/policy_and_reference_logprobs_tokens_per_sec_per_gpu",
         "performance/policy_training_tokens_per_sec_per_gpu",
         "train/total_num_tokens",
         "train/global_valid_toks",
@@ -1104,9 +1193,13 @@ def test_benchmark_extracts_all_required_measured_component_series(
     canonical_names = {
         "timing/train/total_step_time",
         "timing/train/generation",
+        "timing/train/generation_finalize",
         "timing/train/get_logprobs",
         "timing/train/policy_training",
         "timing/train/prepare_for_generation/transfer_and_update_weights",
+        "performance/tokens_per_sec_per_gpu",
+        "performance/generation_tokens_per_sec_per_gpu",
+        "performance/policy_and_reference_logprobs_tokens_per_sec_per_gpu",
         "performance/policy_training_tokens_per_sec_per_gpu",
         "train/total_num_tokens",
         "train/global_valid_toks",
@@ -1119,6 +1212,20 @@ def test_benchmark_extracts_all_required_measured_component_series(
     assert set(raw["measured_component_series"]) == canonical_names
     for series in raw["measured_component_series"].values():
         assert [point["step"] for point in series] == list(range(6, 26))
+    assert [
+        item["refit_effective_tokens_per_sec_per_gpu"]
+        for item in raw["measured_step_workload"]
+    ] == [0.25] * 20
+    csv_header = (tmp_path / "arm/raw_timing.csv").read_text().splitlines()[0]
+    for column in (
+        "generation_finalize_seconds",
+        "e2e_tokens_per_sec_per_gpu",
+        "generation_tokens_per_sec_per_gpu",
+        "policy_and_reference_logprobs_tokens_per_sec_per_gpu",
+        "policy_training_tokens_per_sec_per_gpu",
+        "refit_effective_tokens_per_sec_per_gpu",
+    ):
+        assert column in csv_header
 
 
 def test_benchmark_metric_extractor_fails_loudly_when_required_metric_is_missing(
@@ -1156,6 +1263,80 @@ def test_benchmark_metric_extractor_rejects_missing_measured_step(
     assert "timing/train/generation" in result.stderr
     assert "missing measured steps: [12]" in result.stderr
     assert not (tmp_path / "arm/raw_timing.json").exists()
+
+
+def _timing_summarizer_source() -> str:
+    start = "# CUTEDSL_TIMING_SUMMARIZER_START\n"
+    end = "# CUTEDSL_TIMING_SUMMARIZER_END\n"
+    assert start in BENCHMARK_SCRIPT
+    assert end in BENCHMARK_SCRIPT
+    return BENCHMARK_SCRIPT.split(start, 1)[1].split(end, 1)[0]
+
+
+def _run_timing_summarizer(
+    tmp_path: Path,
+    *,
+    on_workload: list[float],
+    off_workload: list[float],
+) -> subprocess.CompletedProcess[str]:
+    result_dir = tmp_path / "summary-result"
+    for order_index, (arm, workload) in enumerate(
+        (("on", on_workload), ("off", off_workload))
+    ):
+        arm_dir = result_dir / "timing" / f"{order_index}-{arm}"
+        arm_dir.mkdir(parents=True)
+        raw = {
+            "run_id": "fake-run",
+            "arm": arm,
+            "order_index": order_index,
+            "policy_training_seconds": [2.0, 3.0],
+            "resolved_metric_names": {},
+            "measured_step_workload": [
+                {
+                    "total_num_tokens": tokens,
+                    "policy_training_tokens_per_sec_per_gpu": 10.0,
+                }
+                for tokens in workload
+            ],
+        }
+        (arm_dir / "raw_timing.json").write_text(json.dumps(raw))
+    (result_dir / "benchmark_manifest.json").write_text("{}")
+    env = {**os.environ, "CONTAINER_RESULT_DIR": str(result_dir)}
+    return subprocess.run(
+        [sys.executable, "-c", _timing_summarizer_source()],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_benchmark_timing_summary_enforces_identical_measured_workloads(
+    tmp_path: Path,
+) -> None:
+    passing = _run_timing_summarizer(
+        tmp_path / "matching",
+        on_workload=[100.0, 200.0],
+        off_workload=[100.0, 200.0],
+    )
+    assert passing.returncode == 0, passing.stderr
+    passing_summary = json.loads(
+        (tmp_path / "matching/summary-result/timing_summary.json").read_text()
+    )
+    assert passing_summary["workload_equality_required"] is True
+    assert passing_summary["workload_equality_observed"] is True
+
+    failing = _run_timing_summarizer(
+        tmp_path / "mismatched",
+        on_workload=[100.0, 200.0],
+        off_workload=[100.0, 201.0],
+    )
+    assert failing.returncode != 0
+    assert "measured workload equality failed" in failing.stderr
+    failing_summary = json.loads(
+        (tmp_path / "mismatched/summary-result/timing_summary.json").read_text()
+    )
+    assert failing_summary["workload_equality_required"] is True
+    assert failing_summary["workload_equality_observed"] is False
 
 
 def _kernel_attribution_source() -> str:

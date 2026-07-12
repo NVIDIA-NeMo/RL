@@ -517,21 +517,32 @@ WARMUP_UPDATES = int(os.environ["WARMUP_UPDATES"])
 MEASURED_UPDATES = int(os.environ["MEASURED_UPDATES"])
 TOTAL_STEP_METRIC = "timing/train/total_step_time"
 GENERATION_METRIC = "timing/train/generation"
+GENERATION_FINALIZE_METRIC = "timing/train/generation_finalize"
 LOGPROB_METRIC = "timing/train/get_logprobs"
 POLICY_TIME_METRIC = "timing/train/policy_training"
 REFIT_METRIC = "timing/train/prepare_for_generation/transfer_and_update_weights"
 TOKEN_COUNT_METRIC = "train/total_num_tokens"
 VALID_TOKEN_COUNT_METRIC = "train/global_valid_toks"
 NORMALIZED_THROUGHPUT_METRIC = "performance/policy_training_tokens_per_sec_per_gpu"
+E2E_THROUGHPUT_METRIC = "performance/tokens_per_sec_per_gpu"
+GENERATION_THROUGHPUT_METRIC = "performance/generation_tokens_per_sec_per_gpu"
+LOGPROB_THROUGHPUT_METRIC = (
+    "performance/policy_and_reference_logprobs_tokens_per_sec_per_gpu"
+)
+TRAINING_GPU_COUNT = 4
 METRIC_ALIASES = {
     TOTAL_STEP_METRIC: (TOTAL_STEP_METRIC,),
     GENERATION_METRIC: (GENERATION_METRIC,),
+    GENERATION_FINALIZE_METRIC: (GENERATION_FINALIZE_METRIC,),
     LOGPROB_METRIC: (
         LOGPROB_METRIC,
         "timing/train/policy_and_reference_logprobs",
     ),
     POLICY_TIME_METRIC: (POLICY_TIME_METRIC,),
     REFIT_METRIC: (REFIT_METRIC,),
+    E2E_THROUGHPUT_METRIC: (E2E_THROUGHPUT_METRIC,),
+    GENERATION_THROUGHPUT_METRIC: (GENERATION_THROUGHPUT_METRIC,),
+    LOGPROB_THROUGHPUT_METRIC: (LOGPROB_THROUGHPUT_METRIC,),
     NORMALIZED_THROUGHPUT_METRIC: (NORMALIZED_THROUGHPUT_METRIC,),
     TOKEN_COUNT_METRIC: (TOKEN_COUNT_METRIC,),
     VALID_TOKEN_COUNT_METRIC: (VALID_TOKEN_COUNT_METRIC,),
@@ -593,25 +604,47 @@ measured_components = {
     for canonical_name in METRIC_ALIASES
 }
 generation_points = measured_components[GENERATION_METRIC]
+generation_finalize_points = measured_components[GENERATION_FINALIZE_METRIC]
 logprob_points = measured_components[LOGPROB_METRIC]
 policy_points = measured_components[POLICY_TIME_METRIC]
 refit_points = measured_components[REFIT_METRIC]
 token_points = measured_components[TOKEN_COUNT_METRIC]
 valid_token_points = measured_components[VALID_TOKEN_COUNT_METRIC]
-throughput_points = measured_components[NORMALIZED_THROUGHPUT_METRIC]
+e2e_throughput_points = measured_components[E2E_THROUGHPUT_METRIC]
+generation_throughput_points = measured_components[GENERATION_THROUGHPUT_METRIC]
+logprob_throughput_points = measured_components[LOGPROB_THROUGHPUT_METRIC]
+policy_throughput_points = measured_components[NORMALIZED_THROUGHPUT_METRIC]
 measured_values = [value for _, value in policy_points]
+
+nonpositive_refit_steps = [
+    step for step, duration in refit_points if duration <= 0.0
+]
+if nonpositive_refit_steps:
+    raise ValueError(
+        f"required metric {REFIT_METRIC!r} must be positive at measured steps; "
+        f"nonpositive steps: {nonpositive_refit_steps!r}"
+    )
 
 measured_step_workload = [
     {
         "step": step,
         "total_step_seconds": measured_components[TOTAL_STEP_METRIC][index][1],
         "generation_seconds": generation_points[index][1],
+        "generation_finalize_seconds": generation_finalize_points[index][1],
         "logprob_seconds": logprob_points[index][1],
         "policy_training_seconds": policy_points[index][1],
         "refit_transfer_update_seconds": refit_points[index][1],
         "total_num_tokens": token_points[index][1],
         "global_valid_toks": valid_token_points[index][1],
-        "normalized_policy_training_tokens_per_sec_per_gpu": throughput_points[index][1],
+        "e2e_tokens_per_sec_per_gpu": e2e_throughput_points[index][1],
+        "generation_tokens_per_sec_per_gpu": generation_throughput_points[index][1],
+        "policy_and_reference_logprobs_tokens_per_sec_per_gpu": (
+            logprob_throughput_points[index][1]
+        ),
+        "policy_training_tokens_per_sec_per_gpu": policy_throughput_points[index][1],
+        "refit_effective_tokens_per_sec_per_gpu": (
+            token_points[index][1] / refit_points[index][1] / TRAINING_GPU_COUNT
+        ),
     }
     for index, step in enumerate(measured_steps)
 ]
@@ -643,6 +676,8 @@ raw = {
     "token_count_metric": TOKEN_COUNT_METRIC,
     "valid_token_count_metric": VALID_TOKEN_COUNT_METRIC,
     "normalized_throughput_metric": NORMALIZED_THROUGHPUT_METRIC,
+    "refit_effective_throughput_metric": "refit_effective_tokens_per_sec_per_gpu",
+    "training_gpu_count": TRAINING_GPU_COUNT,
     "measured_step_workload": measured_step_workload,
     "timing_series": timing_series,
 }
@@ -658,12 +693,17 @@ with (arm_dir / "raw_timing.csv").open("w", newline="") as csv_file:
             "step",
             "total_step_seconds",
             "generation_seconds",
+            "generation_finalize_seconds",
             "logprob_seconds",
             "policy_training_seconds",
             "refit_transfer_update_seconds",
             "total_num_tokens",
             "global_valid_toks",
-            "normalized_policy_training_tokens_per_sec_per_gpu",
+            "e2e_tokens_per_sec_per_gpu",
+            "generation_tokens_per_sec_per_gpu",
+            "policy_and_reference_logprobs_tokens_per_sec_per_gpu",
+            "policy_training_tokens_per_sec_per_gpu",
+            "refit_effective_tokens_per_sec_per_gpu",
         ]
     )
     for item in measured_step_workload:
@@ -675,12 +715,17 @@ with (arm_dir / "raw_timing.csv").open("w", newline="") as csv_file:
                 item["step"],
                 item["total_step_seconds"],
                 item["generation_seconds"],
+                item["generation_finalize_seconds"],
                 item["logprob_seconds"],
                 item["policy_training_seconds"],
                 item["refit_transfer_update_seconds"],
                 item["total_num_tokens"],
                 item["global_valid_toks"],
-                item["normalized_policy_training_tokens_per_sec_per_gpu"],
+                item["e2e_tokens_per_sec_per_gpu"],
+                item["generation_tokens_per_sec_per_gpu"],
+                item["policy_and_reference_logprobs_tokens_per_sec_per_gpu"],
+                item["policy_training_tokens_per_sec_per_gpu"],
+                item["refit_effective_tokens_per_sec_per_gpu"],
             ]
         )
 # CUTEDSL_METRIC_EXTRACTOR_END
@@ -692,6 +737,7 @@ for order_index in "${!timing_arms[@]}"; do
 done
 
 "${UV_BIN}" run --active --no-sync python - <<'PY'
+# CUTEDSL_TIMING_SUMMARIZER_START
 import json
 import os
 import statistics
@@ -716,11 +762,11 @@ off_workload = [
     item["total_num_tokens"] for item in by_arm["off"]["measured_step_workload"]
 ]
 on_throughput = [
-    item["normalized_policy_training_tokens_per_sec_per_gpu"]
+    item["policy_training_tokens_per_sec_per_gpu"]
     for item in by_arm["on"]["measured_step_workload"]
 ]
 off_throughput = [
-    item["normalized_policy_training_tokens_per_sec_per_gpu"]
+    item["policy_training_tokens_per_sec_per_gpu"]
     for item in by_arm["off"]["measured_step_workload"]
 ]
 workload_equality_observed = on_workload == off_workload
@@ -738,7 +784,7 @@ summary = {
         "off": statistics.median(off_values),
     },
     "workload_metric": TOKEN_COUNT_METRIC,
-    "workload_equality_required": False,
+    "workload_equality_required": True,
     "workload_equality_observed": workload_equality_observed,
     "measured_total_num_tokens": {"on": on_workload, "off": off_workload},
     "primary_metric": NORMALIZED_THROUGHPUT_METRIC,
@@ -755,12 +801,19 @@ summary = {
     / statistics.median(on_values),
 }
 (result_dir / "timing_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+if not workload_equality_observed:
+    raise ValueError(
+        "measured workload equality failed: "
+        f"ON train/total_num_tokens={on_workload!r}; "
+        f"OFF train/total_num_tokens={off_workload!r}"
+    )
 manifest_path = result_dir / "benchmark_manifest.json"
 manifest = json.loads(manifest_path.read_text())
 manifest["resolved_metric_names"] = {
     arm: by_arm[arm]["resolved_metric_names"] for arm in ("on", "off")
 }
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+# CUTEDSL_TIMING_SUMMARIZER_END
 PY
 BASH
 cutedsl_write_event timing pass 0 \

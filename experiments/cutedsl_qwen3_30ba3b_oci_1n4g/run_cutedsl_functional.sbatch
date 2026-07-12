@@ -685,6 +685,80 @@ if [[ ${grpo_exit_code} -ne 0 ]]; then
     exit "${grpo_exit_code}"
 fi
 
+"${UV_BIN}" run --active --no-sync python - "${CONTAINER_RESULT_DIR}" <<'"'"'PY'"'"'
+# CUTEDSL_FUNCTIONAL_PROFILE_VALIDATOR_START
+import json
+import re
+import sys
+from pathlib import Path
+
+FUSED_FORWARD_SIGNATURES = {
+    "transformer_engine_forward_grouped_mlp": (
+        r"\bForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8\b"
+    ),
+    "cudnn_frontend_glu_bias_kernel": (
+        r"\bBlockScaledMoEGroupedGemmGluBiasKernel\b"
+    ),
+    "cudnn_frontend_glu_wrapper_sm100": r"\bgrouped_gemm_glu_wrapper_sm100\b",
+}
+FUSED_DGRAD_SIGNATURES = {
+    "cudnn_frontend_dglu_dbias_kernel": (
+        r"\bBlockScaledMoEGroupedGemmDgluDbiasKernel\b"
+    ),
+    "cudnn_frontend_dglu_wrapper_sm100": (
+        r"\bgrouped_gemm_dglu(?:_dbias)?_wrapper_sm100\b"
+    ),
+}
+
+
+def signature_counts(text: str, signatures: dict[str, str]) -> dict[str, int]:
+    return {
+        name: len(re.findall(pattern, text, flags=re.IGNORECASE))
+        for name, pattern in signatures.items()
+    }
+
+
+result_dir = Path(sys.argv[1])
+reports = sorted((result_dir / "nsight").glob("*.nsys-rep"))
+evidence_path = result_dir / "kernel_evidence.txt"
+evidence = evidence_path.read_text() if evidence_path.exists() else ""
+forward_counts = signature_counts(evidence, FUSED_FORWARD_SIGNATURES)
+dgrad_counts = signature_counts(evidence, FUSED_DGRAD_SIGNATURES)
+failures: list[str] = []
+if not reports:
+    failures.append("functional profiling produced no .nsys-rep artifact")
+if not evidence.strip():
+    failures.append("functional profiling kernel evidence is empty")
+if sum(forward_counts.values()) == 0:
+    failures.append("fused CuTeDSL forward kernel signature was not found")
+if sum(dgrad_counts.values()) == 0:
+    failures.append("fused CuTeDSL dgrad kernel signature was not found")
+
+attribution = {
+    "passed": not failures,
+    "nsight_reports": [path.name for path in reports],
+    "nsight_report_count": len(reports),
+    "kernel_evidence": "kernel_evidence.txt",
+    "signature_regexes": {
+        "fused_forward": FUSED_FORWARD_SIGNATURES,
+        "fused_dgrad": FUSED_DGRAD_SIGNATURES,
+    },
+    "signature_match_counts": {
+        "fused_forward": forward_counts,
+        "fused_dgrad": dgrad_counts,
+    },
+    "fused_forward_match_count": sum(forward_counts.values()),
+    "fused_dgrad_match_count": sum(dgrad_counts.values()),
+    "failures": failures,
+}
+(result_dir / "functional_profile_attribution.json").write_text(
+    json.dumps(attribution, indent=2, sort_keys=True) + "\n"
+)
+if failures:
+    raise RuntimeError("functional profile attribution failed: " + "; ".join(failures))
+# CUTEDSL_FUNCTIONAL_PROFILE_VALIDATOR_END
+PY
+
 "${UV_BIN}" run --active --no-sync tests/json_dump_tb_logs.py \
     "${CONTAINER_RESULT_DIR}/tensorboard" \
     --output_path "${CONTAINER_RESULT_DIR}/metrics.json"
@@ -763,7 +837,8 @@ cutedsl_write_event functional_grpo pass 0 \
 cutedsl_write_event timing skip 0 \
     "Timing matrix is handled by run_cutedsl_matrix.sbatch" ''
 cutedsl_write_event profile pass 0 \
-    "Functional Nsight evidence collected" kernel_evidence.txt
+    "Functional Nsight artifacts and fused forward+dgrad attribution passed" \
+    functional_profile_attribution.json
 cutedsl_write_event metrics_export start '' \
     "Validate and summarize functional metrics" metrics_summary.json
 cutedsl_write_event metrics_export pass 0 \
