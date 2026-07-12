@@ -22,8 +22,8 @@ from copy import deepcopy
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 import psutil
+import pytest
 import ray
 import requests
 import torch
