@@ -36,6 +36,7 @@ def test_cutedsl_policy_recipe_contract() -> None:
     assert megatron_cfg["moe_grouped_gemm"] is True
     assert megatron_cfg["use_transformer_engine_op_fuser"] is True
     assert megatron_cfg["moe_mlp_glu_interleave_size"] == 32
+    assert megatron_cfg["moe_router_dtype"] == "fp32"
     assert megatron_cfg["env_vars"]["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] == "1"
     assert policy["sequence_packing"]["enabled"] is False
     assert policy["dynamic_batching"]["enabled"] is False

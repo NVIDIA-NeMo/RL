@@ -73,5 +73,20 @@
     "timestamp_utc": "2026-07-12T01:25:42Z",
     "verification_evidence": "The resolved-recipe regression changes from 1 % 2 failure to a one-sample rank-local logprob microbatch. Remote verification is pending; job 2349175 supplies GPU-smoke evidence but no completed training update or performance result.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "pre_tyche",
+    "evidence": "Job 2362710 passed focused validation and four-GPU GB200 smoke, loaded logprob_batch_size 1, completed rollout, and entered fused expert logprob forward. All four policy ranks then failed in Transformer Engine padding with `GetTransformerEngineDType: Invalid type (7)`.",
+    "fix_commit": "shared FP32 router recipe commit",
+    "hypothesis": "The pinned Transformer Engine padding extension does not support the FP64 router-probability tensor produced by the inherited recipe setting.",
+    "report_path": "evidence/job-2362710.txt",
+    "reproduction": "Resolve the 1n4g recipe at 806f55da to inherited moe_router_dtype fp64, then trace MCore router Double probabilities through quantized TEGroupedMLP `_fused_forward` into Fp8Padding and the pinned TE 2.15 dtype converter, which has no Double case.",
+    "root_cause": "The 1n4g child inherited `moe_router_dtype=fp64`. MCore therefore produced Double router probabilities (PyTorch ScalarType 7), and its quantized op-fuser path padded them before fused expert execution. Pinned Transformer Engine 42b84005 does not map Double in `GetTransformerEngineDType`, so padding failed on every policy rank.",
+    "run_id": "2362710",
+    "symptom": "The functional gate passed four-GPU smoke and the prior logprob-batch boundary, then failed during fused expert logprob forward before the first training update.",
+    "tested_change": "Set only the shared 1n4g recipe's moe_router_dtype to fp32, matching Qwen/MoE and FP8 performance recipes. Both ON and OFF retain identical router precision, op-fuser configuration, topology, and workload; only the CuTeDSL selector differs.",
+    "timestamp_utc": "2026-07-12T02:22:17Z",
+    "verification_evidence": "The resolved-recipe dtype contract changes from inherited fp64 to explicit fp32. Job 2362710 proves the earlier logprob_batch_size=1 fix crossed its boundary, but remote dtype verification remains pending and no training update or performance result exists.",
+    "verification_job": "pending"
   }
 ]

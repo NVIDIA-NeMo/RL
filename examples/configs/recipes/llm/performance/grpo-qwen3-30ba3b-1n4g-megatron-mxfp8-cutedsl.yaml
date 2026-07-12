@@ -22,6 +22,7 @@ policy:
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 4
     moe_grouped_gemm: true
+    moe_router_dtype: fp32
     use_transformer_engine_op_fuser: true
     moe_mlp_glu_interleave_size: 32
     fp8_cfg:
