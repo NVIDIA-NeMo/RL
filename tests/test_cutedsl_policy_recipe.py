@@ -42,6 +42,25 @@ def test_cutedsl_policy_recipe_contract() -> None:
     assert policy["train_global_batch_size"] == 4
     assert policy["train_micro_batch_size"] == 1
     assert policy["train_global_batch_size"] // policy["train_micro_batch_size"] == 4
+    world_size = config["cluster"]["num_nodes"] * config["cluster"]["gpus_per_node"]
+    model_parallel_size = (
+        megatron_cfg["pipeline_model_parallel_size"]
+        * megatron_cfg["context_parallel_size"]
+        * megatron_cfg["tensor_model_parallel_size"]
+    )
+    assert world_size % model_parallel_size == 0
+    data_parallel_size = world_size // model_parallel_size
+    assert megatron_cfg["expert_model_parallel_size"] == data_parallel_size
+    rollout_batch_size = (
+        config["grpo"]["num_prompts_per_step"]
+        * config["grpo"]["num_generations_per_prompt"]
+    )
+    assert rollout_batch_size == policy["train_global_batch_size"] == 4
+    assert rollout_batch_size % data_parallel_size == 0
+    rank_local_logprob_batch_size = rollout_batch_size // data_parallel_size
+    assert rank_local_logprob_batch_size == 1
+    assert rank_local_logprob_batch_size % policy["logprob_batch_size"] == 0
+    assert policy["logprob_batch_size"] == policy["train_micro_batch_size"] == 1
     assert policy["max_total_sequence_length"] == 1024
     assert config["grpo"]["num_prompts_per_step"] == 2
     assert config["grpo"]["num_generations_per_prompt"] == 2

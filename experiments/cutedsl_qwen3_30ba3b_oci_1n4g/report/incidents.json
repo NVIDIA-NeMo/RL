@@ -58,5 +58,20 @@
     "timestamp_utc": "2026-07-12T00:39:31Z",
     "verification_evidence": "Remote quoted-heredoc verification succeeded through Bridge, NeMo, unit-result preservation, and Pyrefly. Local Ruff regression passes after the one-line normalization; the full remote functional gate remains pending because job 2362298 did not reach GPU smoke or GRPO.",
     "verification_job": "pending"
+  },
+  {
+    "cluster": "lyris",
+    "evidence": "Job 2349175 passed focused validation, both Ruff hooks, Cutlass import, and Transformer Engine forward/backward on four GB200 GPUs. GRPO completed setup and rollout generation, then a rank-local one-sample logprob shard failed microbatching with configured size 2.",
+    "fix_commit": "1n4g logprob microbatch recipe commit",
+    "hypothesis": "The 1n4g child inherited a 4n4g logprob microbatch size that exceeded its rank-local rollout shard.",
+    "report_path": "evidence/job-2349175.txt",
+    "reproduction": "Resolve the 1n4g recipe at 1fa29cf21: rollout batch 2 prompts x 2 generations equals 4, DP is 4 from world/(PP x CP x TP), and inherited logprob_batch_size 2 does not divide the one-sample rank-local shard.",
+    "root_cause": "The 1n4g child recipe inherited `policy.logprob_batch_size=2` from the 4n4g parent. With `data_plane.enabled=false`, plain `Policy._shard_for_logprob` pre-sharded the four-sample rollout batch over DP=4 into one sample per rank before MegatronPolicyWorker used the configured logprob microbatch size, triggering the exact 1 modulo 2 assertion.",
+    "run_id": "2349175",
+    "symptom": "The functional gate passed four-GPU GB200 smoke and generated rollouts, then failed in get_logprobs before the first training update.",
+    "tested_change": "Set only the 1n4g child recipe's logprob_batch_size to 1 and require the rollout-derived rank-local shard to be divisible by that value; ON and OFF continue to share the same recipe and workload.",
+    "timestamp_utc": "2026-07-12T01:25:42Z",
+    "verification_evidence": "The resolved-recipe regression changes from 1 % 2 failure to a one-sample rank-local logprob microbatch. Remote verification is pending; job 2349175 supplies GPU-smoke evidence but no completed training update or performance result.",
+    "verification_job": "pending"
   }
 ]

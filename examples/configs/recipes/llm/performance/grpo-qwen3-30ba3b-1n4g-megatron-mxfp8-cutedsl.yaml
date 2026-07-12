@@ -9,6 +9,7 @@ policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_global_batch_size: 4
   train_micro_batch_size: 1
+  logprob_batch_size: 1
   max_total_sequence_length: 1024
   dynamic_batching:
     enabled: false
