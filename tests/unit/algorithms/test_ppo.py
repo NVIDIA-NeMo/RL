@@ -24,6 +24,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     MseValueLossConfig,
     MseValueLossFn,
 )
+from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -693,3 +694,374 @@ def test_create_advantage_estimator_requires_adv_estimator_key():
 
     with pytest.raises(KeyError):
         _create_advantage_estimator(master_config)
+
+
+# ============================================================================
+# Tests for non-colocated setup
+# ============================================================================
+
+
+def _make_noncolocated_setup_config(
+    *,
+    backend: str = "vllm",
+    total_nodes: int = 1,
+    total_gpus_per_node: int = 8,
+    inference_nodes: int | None = None,
+    inference_gpus_per_node: int | None = 2,
+    reward_model_gpus_per_node: int | None = None,
+    segment_size: int | None = None,
+):
+    """Build the minimal config needed to exercise PPO cluster setup."""
+    from nemo_rl.algorithms.ppo import MasterConfig
+
+    data_config: DataConfig = {
+        "max_input_seq_length": 1,
+        "shuffle": False,
+        "num_workers": 0,
+        "train": {"dataset_name": "fake-dataset"},
+    }
+    env_config = {}
+    if reward_model_gpus_per_node is not None:
+        data_config["default"] = {"env_name": "reward_model"}
+        env_config["reward_model"] = {
+            "resources": {
+                "num_nodes": 1,
+                "gpus_per_node": reward_model_gpus_per_node,
+            }
+        }
+
+    return MasterConfig.model_construct(
+        policy={
+            "model_name": "fake-model",
+            "train_global_batch_size": 1,
+            "train_micro_batch_size": 1,
+            "dtensor_cfg": {"enabled": True},
+            "megatron_cfg": {"enabled": False},
+            "generation": {
+                "backend": backend,
+                "colocated": {
+                    "enabled": False,
+                    "resources": {
+                        "num_nodes": inference_nodes,
+                        "gpus_per_node": inference_gpus_per_node,
+                    },
+                },
+                "vllm_cfg": {
+                    "precision": "bf16",
+                    "kv_cache_dtype": "auto",
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                },
+                "vllm_kwargs": {},
+                "sglang_cfg": {},
+            },
+        },
+        value={
+            "megatron_cfg": {
+                "enabled": True,
+                "context_parallel_size": 1,
+            },
+            "sequence_packing": {"enabled": False},
+        },
+        loss_fn=ClippedPGLossConfig(),
+        value_loss_fn=MseValueLossConfig(),
+        env=env_config,
+        data=data_config,
+        ppo={
+            "max_num_steps": 1,
+            "max_num_epochs": 1,
+            "num_prompts_per_step": 1,
+            "num_generations_per_prompt": 1,
+            "max_rollout_turns": 1,
+            "val_period": 0,
+            "val_batch_size": 1,
+            "val_at_start": False,
+            "val_at_end": False,
+            "max_val_samples": 1,
+            "seed": 42,
+            "overlong_filtering": False,
+            "use_dynamic_sampling": False,
+            "batch_multiplier": 1,
+            "ppo_epochs": 1,
+            "policy_training_start_step": 0,
+            "reward_shaping": {"enabled": False},
+            "reward_scaling": {"enabled": False},
+            "adv_estimator": {"name": "raw_reward"},
+        },
+        logger={"num_val_samples_to_print": 0},
+        cluster={
+            "num_nodes": total_nodes,
+            "gpus_per_node": total_gpus_per_node,
+            "segment_size": segment_size,
+        },
+        checkpointing={
+            "enabled": False,
+            "save_optimizer": False,
+        },
+    )
+
+
+def _patch_ppo_setup_prerequisites(monkeypatch):
+    """Replace setup dependencies that are unrelated to resource validation."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    class DummyLogger:
+        def log_hyperparams(self, *_args, **_kwargs):
+            pass
+
+        def log_metrics(self, *_args, **_kwargs):
+            pass
+
+    class DummyCheckpointer:
+        def get_latest_checkpoint_path(self):
+            return None
+
+        def load_training_info(self, _path):
+            return None
+
+        def get_resume_paths(self, _path, *, model_component="policy"):
+            return None, None
+
+    class DummyLoader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(ppo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
+    monkeypatch.setattr(
+        ppo_mod,
+        "CheckpointManager",
+        lambda *_args, **_kwargs: DummyCheckpointer(),
+    )
+    monkeypatch.setattr(ppo_mod, "StatefulDataLoader", DummyLoader)
+    return ppo_mod
+
+
+def _setup_dataset():
+    from unittest.mock import MagicMock
+
+    dataset = MagicMock()
+    dataset.__len__.return_value = 1
+    return dataset
+
+
+def _run_noncolocated_setup(monkeypatch, config):
+    """Run setup with lightweight workers and return the observable topology."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_calls = []
+
+    class DummyCluster:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            cluster_calls.append(self)
+
+        def world_size(self):
+            return sum(self.kwargs["bundle_ct_per_node_list"])
+
+        def get_master_address_and_port(self):
+            return "127.0.0.1", 1234
+
+    policy = MagicMock()
+    policy.prepare_refit_info.return_value = {"state": "dict"}
+    policy.init_collective.return_value = ["policy-future"]
+    value_model = MagicMock()
+    generation = MagicMock()
+    generation.init_collective.return_value = ["generation-future"]
+    policy_factory = MagicMock(return_value=policy)
+    value_factory = MagicMock(return_value=value_model)
+    generation_factory = MagicMock(return_value=generation)
+
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", DummyCluster)
+    monkeypatch.setattr(ppo_mod, "Policy", policy_factory)
+    monkeypatch.setattr(ppo_mod, "Value", value_factory)
+    monkeypatch.setattr(ppo_mod, "VllmGeneration", generation_factory)
+    monkeypatch.setattr(ppo_mod.ray, "get", lambda futures: futures)
+
+    result = ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+    return (
+        result,
+        cluster_calls,
+        policy,
+        generation,
+        policy_factory,
+        value_factory,
+        generation_factory,
+    )
+
+
+def test_noncolocated_sglang_is_rejected_before_cluster_creation(monkeypatch):
+    """SGLang has no cross-cluster refit path, so setup must reject it early."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(backend="sglang")
+
+    with pytest.raises(
+        AssertionError,
+        match="Non-colocated PPO generation currently supports only vLLM",
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
+    monkeypatch,
+):
+    """A single-node split cannot infer how many GPUs belong to rollout."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(inference_gpus_per_node=None)
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            "policy.generation.colocated.resources.gpus_per_node must be explicitly set"
+        ),
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
+    monkeypatch,
+):
+    """A multi-node split requires full-node GPU allocation for rollout."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config(
+        total_nodes=2,
+        inference_nodes=1,
+        inference_gpus_per_node=None,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            "policy.generation.colocated.resources.gpus_per_node must be "
+            "explicitly set and equal to cluster.gpus_per_node"
+        ),
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_topology_requires_enough_alive_nodes(monkeypatch):
+    """Topology placement fails before creating partially schedulable clusters."""
+    from unittest.mock import MagicMock
+
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    monkeypatch.setattr(
+        ppo_mod,
+        "get_ray_cluster_topology",
+        lambda: {
+            "node-0": ("domain-0", 0),
+            "node-1": ("domain-0", 1),
+        },
+    )
+    config = _make_noncolocated_setup_config(
+        total_nodes=3,
+        inference_nodes=1,
+        inference_gpus_per_node=8,
+        segment_size=1,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="Not enough alive Ray nodes for all PPO roles",
+    ):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
+    """Policy/value share two slots while rollout gets a separate one-slot cluster."""
+    config = _make_noncolocated_setup_config(
+        total_gpus_per_node=8,
+        inference_gpus_per_node=2,
+    )
+    (
+        result,
+        cluster_calls,
+        policy,
+        generation,
+        policy_factory,
+        value_factory,
+        generation_factory,
+    ) = _run_noncolocated_setup(monkeypatch, config)
+
+    train_cluster, inference_cluster = result[3]
+    assert [cluster.kwargs["name"] for cluster in cluster_calls] == [
+        "ppo_train_cluster",
+        "ppo_inference_cluster",
+    ]
+    assert train_cluster.kwargs["bundle_ct_per_node_list"] == [6]
+    assert train_cluster.kwargs["max_colocated_worker_groups"] == 2
+    assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [2]
+    assert inference_cluster.kwargs["max_colocated_worker_groups"] == 1
+    assert policy_factory.call_args.kwargs["cluster"] is train_cluster
+    assert value_factory.call_args.kwargs["cluster"] is train_cluster
+    assert generation_factory.call_args.kwargs["cluster"] is inference_cluster
+
+    policy.init_collective.assert_called_once_with(
+        "127.0.0.1", 1234, 8, train_world_size=6
+    )
+    generation.init_collective.assert_called_once_with(
+        "127.0.0.1", 1234, 8, train_world_size=6
+    )
+
+
+def test_noncolocated_vllm_multi_node_cluster_and_collective_sizes(monkeypatch):
+    """A full inference node is carved out of a three-node PPO allocation."""
+    config = _make_noncolocated_setup_config(
+        total_nodes=3,
+        total_gpus_per_node=8,
+        inference_nodes=1,
+        inference_gpus_per_node=8,
+    )
+    result, _, policy, generation, *_ = _run_noncolocated_setup(monkeypatch, config)
+
+    train_cluster, inference_cluster = result[3]
+    assert train_cluster.kwargs["bundle_ct_per_node_list"] == [8, 8]
+    assert train_cluster.kwargs["max_colocated_worker_groups"] == 2
+    assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [8]
+    assert inference_cluster.kwargs["max_colocated_worker_groups"] == 1
+    policy.init_collective.assert_called_once_with(
+        "127.0.0.1", 1234, 24, train_world_size=16
+    )
+    generation.init_collective.assert_called_once_with(
+        "127.0.0.1", 1234, 24, train_world_size=16
+    )
+
+
+def test_noncolocated_vllm_single_node_reserves_reward_model_gpu(monkeypatch):
+    """Training receives GPUs left after rollout and reward-model reservations."""
+    config = _make_noncolocated_setup_config(
+        total_gpus_per_node=8,
+        inference_gpus_per_node=2,
+        reward_model_gpus_per_node=1,
+    )
+    result, *_ = _run_noncolocated_setup(monkeypatch, config)
+
+    train_cluster, inference_cluster = result[3]
+    assert train_cluster.kwargs["bundle_ct_per_node_list"] == [5]
+    assert train_cluster.kwargs["max_colocated_worker_groups"] == 2
+    assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [2]
+    assert inference_cluster.kwargs["max_colocated_worker_groups"] == 1

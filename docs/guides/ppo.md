@@ -38,9 +38,24 @@ We define a [ValueInterface](../../nemo_rl/models/value/interfaces.py) that cont
 
 The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **DTensor backend** (`value.dtensor_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
 
-### Colocated Architecture
+### Deployment Architectures
 
-PPO uses a colocated architecture where the **policy**, **value model**, and **vLLM generation engine** share the same set of GPUs. GPU memory is managed by offloading models to CPU between stages: the value model is loaded to GPU only during its inference and training phases, then offloaded to make room for other components.
+By default, PPO uses a colocated architecture where the **policy**, **value model**, and **generation engine** share one `RayVirtualCluster`. GPU memory is managed by offloading models to CPU between stages: the value model is loaded to GPU only during its inference and training phases, then offloaded to make room for the other components.
+
+PPO also supports non-colocated vLLM generation. In this mode, the policy and value model continue to time-share one training `RayVirtualCluster`, while vLLM runs on a separate inference `RayVirtualCluster` in the same Ray cluster. Updated policy weights are transferred to vLLM through the cross-cluster collective refit path.
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: null
+```
+
+When only one node remains for policy and generation after other resources are reserved, `gpus_per_node` reserves that many GPUs for generation and `num_nodes` must be `null` or `1`. When multiple policy nodes are available, generation uses complete nodes: set `num_nodes` to the number of inference nodes and `gpus_per_node` equal to `cluster.gpus_per_node`. Non-colocated SGLang generation is not currently supported by PPO.
 
 ### Value Model Configuration
 
