@@ -1,0 +1,83 @@
+# PPO + NeMo-Gym (Math / RLVR)
+#
+# Reuses the PPO-DAPO training setup from examples/configs/ppo_math_1B.yaml
+# (ppo / value / loss_fn / value_loss_fn / policy blocks) and swaps in a
+# NeMo-Gym math_with_judge (RLVR) rollout environment. Run with:
+#
+#   uv run examples/nemo_gym/run_ppo_nemo_gym.py \
+#     --config examples/nemo_gym/ppo_math_rlvr_nemo_gym.yaml
+#
+# NOTE: the `env.nemo_gym.config_paths` and `data.{train,validation}.data_path`
+# entries are specific to your NeMo-Gym install / prepared data — edit them to
+# match your environment (see examples/nemo_gym/grpo_nanov3.yaml).
+defaults: ../configs/ppo_math_1B.yaml
+
+policy:
+  generation:
+    # NeMo-Gym drives an HTTP-exposed async vLLM server (also force-set by
+    # setup_nemo_gym_config, but kept explicit here for clarity).
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+
+ppo:
+  # NeMo-Gym principle: the validation set is used verbatim (no hidden pre/post
+  # processing). run_ppo_nemo_gym.py rejects a preset max_val_samples and sets
+  # both to len(val_dataset), so they must start null.
+  max_val_samples: null
+  val_batch_size: null
+  # Use NeMo-Gym RLVR rewards as-is: turn OFF the DAPO reward rescaling and
+  # length shaping inherited from ppo_math_1B (every NeMo-Gym recipe disables
+  # both). They are applied unconditionally after the rollout, so leaving them on
+  # would silently remap / length-penalize the gym reward. reward_penalties
+  # (reward-zeroing) handle response quality instead.
+  reward_scaling:
+    enabled: false
+  reward_shaping:
+    enabled: false
+  # For async PPO + NeMo-Gym: set async_ppo.enabled=true AND
+  # policy.generation.colocated.enabled=false (async requires non-colocated
+  # generation). reward_scaling / reward_shaping / use_dynamic_sampling must stay
+  # off (the async entry path rejects them) — they already are, above.
+  async_ppo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+
+# Fully replace the parent's math (native-env) data block with the NeMo-Gym one.
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: "/path/to/train.jsonl"  # EDIT: ng_prepare_data output
+  validation:
+    data_path: "/path/to/validation.jsonl"  # EDIT: ng_prepare_data output
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+# Fully replace the parent's native math env with the NeMo-Gym env.
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  # true: skip expensive train_data_step*.jsonl; false: write full jsonl.
+  should_log_nemo_gym_responses: true
+  nemo_gym:  # Passed into NeMo-Gym as the initial_global_config_dict.
+    # Port range for Gym HTTP servers (kept below the OS ephemeral range and
+    # non-overlapping with NeMo-RL / vLLM ports — see ray.sub).
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required; must be *_for_training
+    # Base math_with_judge RLVR env (math-verify). It defines the
+    # math_with_judge_simple_agent that ng-prepared math records (incl. DAPO17k)
+    # reference via agent_ref, and already sets judge_model_server.name=policy_model
+    # + should_use_judge=false. Swap for another resources_servers/*/configs/*.yaml
+    # to target a different env.
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml

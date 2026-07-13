@@ -1062,14 +1062,10 @@ def test_async_ppo_requires_positive_ppo_epochs():
         _call_async_ppo_train(master_config)
 
 
-def test_async_ppo_rejects_nemo_gym():
-    """NeMo-Gym rollout is not wired for async PPO; guard fails loud at startup."""
-    master_config = _build_async_ppo_master_config()
-    master_config.env["should_use_nemo_gym"] = True
-    # _should_use_nemo_gym also requires the http server to be exposed.
-    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
-    with pytest.raises(AssertionError, match="NeMo-Gym rollout is not yet supported"):
-        _call_async_ppo_train(master_config)
+# NeMo-Gym IS supported for async PPO: the AsyncTrajectoryCollector runs the gym
+# rollout internally (checks _should_use_nemo_gym, passes master_config.reward_penalties),
+# so async_ppo_train no longer guards it out. Validate-side dispatch is covered by
+# test_validate_dispatches_to_nemo_gym_rollout below.
 
 
 # ---------------------------------------------------------------------------
@@ -1201,9 +1197,9 @@ def test_replay_buffer_admits_banked_frozen_rollout_at_boundary():
 # attribute 'generate') at the first validation step.
 # ---------------------------------------------------------------------------
 def _run_validate_with_mocked_rollouts(master_config):
-    """Drive validate() through one batch with both rollout fns mocked.
+    """Drive validate() through one batch with all three rollout fns mocked.
 
-    Returns (async_rollout_mock, sync_rollout_mock) for call assertions.
+    Returns (async_rollout_mock, sync_rollout_mock, nemo_gym_rollout_mock).
     """
     from unittest.mock import MagicMock, patch
 
@@ -1219,6 +1215,10 @@ def _run_validate_with_mocked_rollouts(master_config):
         {"total_reward": torch.tensor([1.0]), "message_log": []},
         {"mean_gen_tokens_per_sample": 5.0},
     )
+    # NeMo-Gym rollout returns a result object (not a tuple).
+    gym_result = MagicMock()
+    gym_result.final_batch = {"total_reward": torch.tensor([1.0]), "message_log": []}
+    gym_result.rollout_metrics = {"mean_gen_tokens_per_sample": 5.0}
     with (
         patch(
             "nemo_rl.algorithms.ppo.run_async_multi_turn_rollout",
@@ -1228,6 +1228,13 @@ def _run_validate_with_mocked_rollouts(master_config):
             "nemo_rl.algorithms.ppo.run_multi_turn_rollout",
             return_value=rollout_return,
         ) as sync_mock,
+        patch(
+            "nemo_rl.algorithms.ppo.run_async_nemo_gym_rollout",
+            return_value=gym_result,
+        ) as gym_mock,
+        # Isolate the dispatch decision from gym-config internals.
+        patch("nemo_rl.algorithms.ppo._get_effort_config", return_value=None),
+        patch("nemo_rl.algorithms.ppo.get_nemo_gym_thinking_tags", return_value=[]),
     ):
         validate(
             policy_generation=MagicMock(),
@@ -1238,7 +1245,7 @@ def _run_validate_with_mocked_rollouts(master_config):
             master_config=master_config,
             logger=MagicMock(),
         )
-    return async_mock, sync_mock
+    return async_mock, sync_mock, gym_mock
 
 
 def test_validate_dispatches_to_async_rollout_for_async_engine():
@@ -1246,18 +1253,38 @@ def test_validate_dispatches_to_async_rollout_for_async_engine():
     rollout path. The sync path calls policy_generation.generate(), which the
     async worker lacks -> AttributeError at the first validation step."""
     master_config = _build_async_ppo_master_config()  # vllm async_engine=True
-    async_mock, sync_mock = _run_validate_with_mocked_rollouts(master_config)
+    async_mock, sync_mock, gym_mock = _run_validate_with_mocked_rollouts(master_config)
     async_mock.assert_called_once()
     sync_mock.assert_not_called()
+    gym_mock.assert_not_called()
 
 
 def test_validate_dispatches_to_sync_rollout_when_not_async():
     """Non-async (colocated/sync) PPO validation uses the synchronous rollout."""
     master_config = _build_async_ppo_master_config()
     master_config.policy["generation"]["vllm_cfg"]["async_engine"] = False
-    async_mock, sync_mock = _run_validate_with_mocked_rollouts(master_config)
+    async_mock, sync_mock, gym_mock = _run_validate_with_mocked_rollouts(master_config)
     sync_mock.assert_called_once()
     async_mock.assert_not_called()
+    gym_mock.assert_not_called()
+
+
+def test_validate_dispatches_to_nemo_gym_rollout():
+    """Regression for the validation crash gap: under a NeMo-Gym config, validate()
+    must take the gym rollout path. Otherwise it falls into run_multi_turn_rollout
+    -> NemoGym.step() (NotImplementedError)."""
+    master_config = _build_async_ppo_master_config()  # vllm async_engine=True
+    master_config.env = {
+        "should_use_nemo_gym": True,
+        "should_log_nemo_gym_responses": True,
+        "nemo_gym": {},
+    }
+    # _should_use_nemo_gym also requires the http server to be exposed.
+    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    async_mock, sync_mock, gym_mock = _run_validate_with_mocked_rollouts(master_config)
+    gym_mock.assert_called_once()
+    async_mock.assert_not_called()
+    sync_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

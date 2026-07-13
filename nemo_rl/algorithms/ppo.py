@@ -22,7 +22,8 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -32,7 +33,10 @@ from nemo_rl.algorithms.advantage_estimator import (
     RawRewardAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    RewardPenaltyConfig,
     RewardScalingConfig,
+    _get_effort_config,
+    _raise_if_reward_penalties_enabled_without_nemo_gym,
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
@@ -77,7 +81,14 @@ from nemo_rl.distributed.virtual_cluster import (
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
+)
 from nemo_rl.experience.rollouts import (
+    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -188,12 +199,12 @@ class PPOConfig(TypedDict):
     max_num_steps: int
     max_rollout_turns: int
     val_period: int
-    val_batch_size: int
+    val_batch_size: int | None  # None for NeMo-Gym compatibility
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
-    max_val_samples: int
+    max_val_samples: int | None  # None for NeMo-Gym compatibility
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     overlong_filtering: bool
@@ -265,6 +276,12 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: PPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    # Reward-zeroing penalties applied to NeMo-Gym rollout results (see
+    # RewardPenaltyConfig). They set the reward to 0.0 for pathological responses
+    # BEFORE advantage/value computation, so they flow through GAE naturally.
+    # Only usable on the NeMo-Gym path (enforced by
+    # _raise_if_reward_penalties_enabled_without_nemo_gym). Defaults to all-off.
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
 
 
 # ===============================================================================
@@ -311,6 +328,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
+    Optional[NemoGym],
     ValueInterface,
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader,
@@ -325,9 +343,10 @@ def setup(
     """Main entry point for running PPO algorithm.
 
     Returns:
-        tuple of (policy, policy_generation, value_model, clusters,
-        dataloader, val_dataloader, loss_fn, value_loss_fn, logger,
-        checkpointer, ppo_save_state, master_config).
+        tuple of (policy, policy_generation, nemo_gym_actor, value_model,
+        clusters, dataloader, val_dataloader, loss_fn, value_loss_fn, logger,
+        checkpointer, ppo_save_state, master_config). ``nemo_gym_actor`` is None
+        unless NeMo-Gym is enabled (env.should_use_nemo_gym).
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -854,9 +873,98 @@ def setup(
 
         return policy_generation, policy, value_model
 
+    # -------------------------------------------------------------------------
+    # NeMo-Gym gating. Initialized inside setup() (rather than by the caller) so
+    # its CPU/HTTP spinup can overlap with vLLM model loading via deferred model
+    # load (see the vLLM branch below). vLLM-only: gym requires an HTTP-exposed
+    # async generation server, which SGLang/native paths don't provide here.
+    # -------------------------------------------------------------------------
+    enable_nemo_gym = _should_use_nemo_gym(master_config)
+    _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
+    # Message-level advantage-OVERWRITE penalties (invalid_tool_call_advantage /
+    # malformed_thinking_advantage) set advantage spans directly post-hoc. That is
+    # GRPO-specific: in PPO it would overwrite GAE advantages and break the
+    # advantage<->return consistency GAE relies on. Deferred; the reward-level
+    # reward_penalties (reward-zeroing, pre-GAE) are the PPO-compatible path.
+    for _unsupported in ("invalid_tool_call_advantage", "malformed_thinking_advantage"):
+        if master_config.ppo.get(_unsupported) is not None:
+            raise NotImplementedError(
+                f"ppo.{_unsupported} (message-level advantage-overwrite penalty) is "
+                "not supported for PPO: it overwrites GAE advantages and breaks the "
+                "advantage/return consistency GAE relies on. Use reward_penalties "
+                "(reward-zeroing, applied pre-GAE) instead."
+            )
+    if enable_nemo_gym:
+        nemo_gym_num_nodes = master_config.env.get("nemo_gym", {}).get(
+            "num_gpu_nodes", 0
+        )
+        ray_cur_node_id = ray.get_runtime_context().get_node_id()
+    else:
+        nemo_gym_num_nodes = 0
+        ray_cur_node_id = None
+    nemo_gym_actor = None
+
+    def _spinup_nemo_gym(base_urls, model_name):
+        """Spin up the NeMo-Gym actor against the given vLLM server URLs."""
+        t0 = time.perf_counter()
+        nemo_gym_py_exec = get_actor_python_env(
+            "nemo_rl.environments.nemo_gym.NemoGym"
+        )
+        if nemo_gym_py_exec.startswith("uv"):
+            nemo_gym_py_exec = create_local_venv_on_each_node(
+                nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
+            )
+        nemo_gym_dict = dict(master_config.env["nemo_gym"])
+        # NeMo-RL-side detection knobs are top-level NemoGymConfig fields (where
+        # the detector reads them), not part of Gym's global config.
+        invalid_tool_call_patterns = nemo_gym_dict.pop(
+            "invalid_tool_call_patterns", None
+        )
+        thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+        # Reuse image-baked cache + venv dirs so the gym doesn't rebuild them.
+        uv_cache_dir = get_nemo_gym_uv_cache_dir()
+        if uv_cache_dir is not None:
+            nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
+        uv_venv_dir = get_nemo_gym_venv_dir()
+        if uv_venv_dir is not None:
+            nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
+        nemo_gym_cfg = NemoGymConfig(
+            model_name=model_name,
+            base_urls=base_urls,
+            invalid_tool_call_patterns=invalid_tool_call_patterns,
+            thinking_tags=thinking_tags,
+            # PPO has no Megatron generation backend, so router-replay / routed-
+            # experts preservation is N/A (this gym path is vLLM-only).
+            require_routed_experts=False,
+            initial_global_config_dict=nemo_gym_dict,
+        )
+        nemo_gym_opts = {}
+        if nemo_gym_num_nodes:
+            nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                node_id=ray_cur_node_id,
+                soft=True,
+            )
+        nemo_gym_opts["runtime_env"] = {
+            "py_executable": nemo_gym_py_exec,
+            "env_vars": {
+                **os.environ,
+                "VIRTUAL_ENV": nemo_gym_py_exec,
+                "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+            },
+        }
+        actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+        ray.get(actor._spinup.remote())
+        return actor, time.perf_counter() - t0
+
     assert backend in ("vllm", "sglang"), (
         f"PPO requires vllm or sglang generation backend; got {backend!r}. "
         "The megatron generation backend is not supported."
+    )
+    assert not (enable_nemo_gym and backend != "vllm"), (
+        "NeMo-Gym requires the vLLM generation backend (HTTP-exposed async "
+        f"server); got backend={backend!r}."
     )
     assert colocated_inference or backend == "vllm", (
         "Non-colocated PPO currently requires the vLLM generation backend. "
@@ -895,13 +1003,86 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        policy_generation, policy, value_model = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
-        )
+        if enable_nemo_gym:
+            # Reserve vLLM ports up-front so we can hand the server URLs to
+            # NeMo-Gym and spin it up (CPU/HTTP) WHILE vLLM loads weights and the
+            # policy+value workers initialize.
+            print(
+                "  ⚡ Deferred vLLM load: reserving ports for overlapped NeMo-Gym init",
+                flush=True,
+            )
+            deferred_vllm = VllmGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                defer_model_load=True,
+            )
+            print(
+                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM "
+                f"server URLs: {deferred_vllm.dp_openai_server_base_urls}",
+                flush=True,
+            )
+
+            def init_vllm_deferred():
+                """Complete the deferred vLLM model load started above."""
+                t0 = time.perf_counter()
+                deferred_vllm.load_and_start()
+                deferred_vllm.finish_generation()
+                return deferred_vllm, time.perf_counter() - t0
+
+            def init_nemo_gym():
+                return _spinup_nemo_gym(
+                    deferred_vllm.dp_openai_server_base_urls,
+                    generation_config["model_name"],
+                )
+
+            # Colocated: vLLM + policy + value share GPUs, so run them as one
+            # sequential GPU task; non-colocated: vLLM (inference_cluster) and
+            # policy+value (train_cluster) run in parallel. NeMo-Gym overlaps
+            # either way (CPU/HTTP, no training-GPU contention).
+            init_tasks = {}
+            if colocated_inference:
+
+                def init_vllm_then_policy_value():
+                    pg, vllm_t = init_vllm_deferred()
+                    p, p_t, v, v_t = init_policy_and_value()
+                    return pg, vllm_t, p, p_t, v, v_t
+
+                init_tasks["vllm_policy_value"] = init_vllm_then_policy_value
+            else:
+                init_tasks["vllm"] = init_vllm_deferred
+                init_tasks["policy_value"] = init_policy_and_value
+            init_tasks["nemo_gym"] = init_nemo_gym
+
+            print(f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}", flush=True)
+            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                results = {k: f.result() for k, f in submitted.items()}
+
+            if colocated_inference:
+                (
+                    policy_generation,
+                    vllm_time,
+                    policy,
+                    policy_time,
+                    value_model,
+                    value_time,
+                ) = results["vllm_policy_value"]
+            else:
+                policy_generation, vllm_time = results["vllm"]
+                policy, policy_time, value_model, value_time = results["policy_value"]
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["value_init_time_s"] = value_time
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+        else:
+            policy_generation, policy, value_model = initialize_generation_with_policy(
+                init_generation_fn=init_vllm,
+                generation_name="vLLM",
+                init_time_key="vllm_init_time_s",
+                colocated_inference=colocated_inference,
+                worker_init_timing_metrics=worker_init_timing_metrics,
+            )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -1001,6 +1182,7 @@ def setup(
     return (
         policy,
         policy_generation,
+        nemo_gym_actor,
         value_model,
         (train_cluster, inference_cluster),
         dataloader,
@@ -1416,18 +1598,32 @@ def ppo_train(
                         policy_generation.clear_logger_metrics()
 
                     if _should_use_nemo_gym(master_config):
-                        generation_config = master_config.policy["generation"]
+                        # configure_generation_config auto-fills stop_token_ids from
+                        # the EOS token, but run_async_nemo_gym_rollout asserts these
+                        # are unset (NeMo-Gym manages its own stop criteria). Clear
+                        # them on a copy so the assertion reflects user intent.
+                        generation_config = {
+                            **master_config.policy["generation"],
+                            "stop_token_ids": None,
+                            "stop_strings": None,
+                        }
                         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            max_seq_len=None,
+                            max_seq_len=master_config.policy[
+                                "max_total_sequence_length"
+                            ],
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
+                            effort_config=_get_effort_config(master_config),
+                            reward_penalty_config=master_config.reward_penalties,
+                            thinking_tags=get_nemo_gym_thinking_tags(
+                                master_config.env
+                            ),
                         )
-                        input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
@@ -1494,6 +1690,25 @@ def ppo_train(
                         if isinstance(truncated, list):
                             truncated = torch.tensor(truncated, dtype=torch.bool)
                         loss_multiplier[truncated] = 0
+                        repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    # Mask samples the environment flagged (e.g. NeMo-Gym): keep them
+                    # for advantage/value targets but zero their gradient. Only present
+                    # on the gym path (final_batch["mask_sample"]); mirrors GRPO.
+                    if "mask_sample" in repeated_batch:
+                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                        mask_sample = repeated_batch["mask_sample"]
+                        if isinstance(mask_sample, list):
+                            mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+                        mask_sample_bool = mask_sample.bool()
+                        num_masked = int(mask_sample_bool.sum().item())
+                        if num_masked > 0:
+                            print(
+                                f"  📊 mask_sample filtering: masking {num_masked}/"
+                                f"{len(mask_sample_bool)} env-flagged samples",
+                                flush=True,
+                            )
+                        loss_multiplier[mask_sample_bool] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
                     for i, message_log in enumerate(repeated_batch["message_log"]):
@@ -2214,14 +2429,11 @@ def async_ppo_train(
     assert master_config.ppo["ppo_epochs"] >= 1, (
         f"ppo.ppo_epochs must be >= 1 (got {master_config.ppo['ppo_epochs']})."
     )
-    # NeMo-Gym rollout is not yet wired for async PPO. Without this guard the
-    # collector's gym branch would AttributeError on the (absent) reward_penalties
-    # field inside a worker thread, silently stalling the buffer instead of
-    # failing loudly here.
-    assert not _should_use_nemo_gym(master_config), (
-        "NeMo-Gym rollout is not yet supported for async PPO "
-        "(env.should_use_nemo_gym must be false)."
-    )
+    # NeMo-Gym for async PPO is handled inside the AsyncTrajectoryCollector: its
+    # _run_prompt_group_worker checks _should_use_nemo_gym and calls
+    # run_async_nemo_gym_rollout with master_config.reward_penalties (now a real
+    # field). reward_penalties zero rewards pre-GAE, so they flow through the value
+    # + GAE stage below like any other reward. No extra wiring is needed here.
     if max_trajectory_age_steps > 1:
         if not async_cfg.get("in_flight_weight_updates", False):
             print(
@@ -2584,6 +2796,25 @@ def async_ppo_train(
                         if isinstance(truncated, list):
                             truncated = torch.tensor(truncated, dtype=torch.bool)
                         loss_multiplier[truncated] = 0
+                        repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    # Mask samples the environment flagged (e.g. NeMo-Gym): keep them
+                    # for advantage/value targets but zero their gradient. Only present
+                    # on the gym path (final_batch["mask_sample"]); mirrors GRPO.
+                    if "mask_sample" in repeated_batch:
+                        loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                        mask_sample = repeated_batch["mask_sample"]
+                        if isinstance(mask_sample, list):
+                            mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+                        mask_sample_bool = mask_sample.bool()
+                        num_masked = int(mask_sample_bool.sum().item())
+                        if num_masked > 0:
+                            print(
+                                f"  📊 mask_sample filtering: masking {num_masked}/"
+                                f"{len(mask_sample_bool)} env-flagged samples",
+                                flush=True,
+                            )
+                        loss_multiplier[mask_sample_bool] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
                     # PPO's inline loss-mask setup (unmask all assistant messages),
@@ -3250,12 +3481,44 @@ def validate(
 
             additional_metrics_to_report = dict()
 
+            # NeMo-Gym runs its own async rollout loop; cascade it first (it also
+            # requires async generation). Without this branch a gym config would
+            # fall into run_multi_turn_rollout -> NemoGym.step() (NotImplementedError).
+            if _should_use_nemo_gym(master_config):
+                # NeMo-Gym manages its own stop criteria; clear the auto-filled
+                # stop_token_ids/stop_strings on a copy (asserted unset by the rollout).
+                generation_config = {
+                    **master_config.policy["generation"],
+                    "stop_token_ids": None,
+                    "stop_strings": None,
+                }
+                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    generation_config=generation_config,
+                    max_rollout_turns=None,
+                    greedy=False,
+                    effort_config=_get_effort_config(master_config),
+                    reward_penalty_config=master_config.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+                )
+                val_batch = nemo_gym_rollout_result.final_batch
+                gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                # NeMo-Gym responses can be huge; strip full_result unless opted in.
+                if not _should_log_nemo_gym_responses(master_config):
+                    for key in list(gen_metrics):
+                        if "full_result" in key:
+                            gen_metrics.pop(key)
+                additional_metrics_to_report = gen_metrics
             # Async PPO uses the vLLM async engine (async_engine=true), whose
             # generation worker exposes only the async rollout path — the sync
             # `run_multi_turn_rollout` -> policy_generation.generate() would raise
             # AttributeError ('generate') on the async worker. Dispatch the same way
             # the training loop does (see async_ppo_train / grpo.validate).
-            if _should_use_async_rollouts(master_config):
+            elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,

@@ -818,7 +818,17 @@ class AsyncTrajectoryCollector:
             # Async engine supports concurrent generation; avoid locking
             # Check if we should use nemo_gym (similar to synchronous GRPO)
             if _should_use_nemo_gym(self.master_config):
-                generation_config = self.master_config.policy["generation"]
+                # NeMo-Gym manages its own stop criteria; run_async_nemo_gym_rollout
+                # asserts stop_token_ids/stop_strings are unset. setup_nemo_gym_config
+                # nulls them globally, but clear them here too (on a copy) so this
+                # collector path is safe by construction, not just by convention —
+                # a stray auto-filled stop token would otherwise trip the assert
+                # inside this worker thread and silently stall the buffer.
+                generation_config = {
+                    **self.master_config.policy["generation"],
+                    "stop_token_ids": None,
+                    "stop_strings": None,
+                }
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=self.policy_generation,
                     input_batch=repeated_batch,
