@@ -1,0 +1,4 @@
+defaults: ./grpo-glm5.1-64n8g-megatron-8K-full-onpolicy-cudnn-vllmtp8-util70.yaml
+
+policy:
+  refit_buffer_size_gb: 9
