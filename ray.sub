@@ -300,9 +300,10 @@ export RAY_task_events_report_interval_ms="${RAY_task_events_report_interval_ms:
 export RAY_num_workers_soft_limit="${RAY_num_workers_soft_limit:-16}"
 
 # --- Reduce gRPC keepalive overhead ---
-# grpc_keepalive_time_ms (default 10s): interval between keepalive pings to the
-#   GCS. At many nodes these pings alone are a steady GCS load; 60s cuts the
-#   rate 6x during the init burst.
+# grpc_keepalive_time_ms (default 10s): interval at which the GCS gRPC server
+#   sends keepalive pings on its client connections (client->GCS pings are a
+#   separate knob, grpc_client_keepalive_time_ms, default 5min). At many nodes
+#   these pings are a steady GCS-side load; 60s cuts the rate 6x.
 # grpc_keepalive_timeout_ms (default 20s): keepalive ACK timeout. Keep it >= the
 #   ping interval so GCS load spikes don't trip false dead-connection detection.
 export RAY_grpc_keepalive_time_ms="${RAY_grpc_keepalive_time_ms:-60000}"
