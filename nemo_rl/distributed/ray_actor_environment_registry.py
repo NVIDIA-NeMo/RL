@@ -36,7 +36,6 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": PY_EXECUTABLES.AUTOMODEL,
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": MCORE_EXECUTABLE,
-    "nemo_rl.models.generation.trtllm.trtllm_worker.TrtllmGenerationWorker": PY_EXECUTABLES.TRTLLM,
     "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": PY_EXECUTABLES.TRTLLM,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.math_environment.MathMultiRewardEnvironment": PY_EXECUTABLES.SYSTEM,
