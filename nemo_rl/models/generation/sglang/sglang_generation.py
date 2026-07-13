@@ -249,7 +249,9 @@ class SGLangGeneration(GenerationInterface):
         if len(local_all_engines) == 0:
             return [], port_cursors
 
-        base_port = max(port_cursors.values()) if port_cursors else 15000
+        # SGLang engine ports live in the below-ephemeral-floor engine band
+        # (7000-8999), shared with vLLM; see virtual_cluster.py port layout.
+        base_port = max(port_cursors.values()) if port_cursors else 7000
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             gpus_per_node=self.num_gpus_per_node,
             sglang_cfg=self.sglang_cfg,

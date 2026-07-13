@@ -48,7 +48,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     sglang_cfg,
     local_all_engines,
     rank_offset=0,
-    base_port=15000,
+    base_port=7000,
 ):
     # get ports
     # there are 4 ports we need to allocate
@@ -85,8 +85,10 @@ def _allocate_rollout_engine_addr_and_ports_normal(
         )
 
         def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
+            # Keep engine ports below the OS ephemeral floor (9000 on some GB200 nodes,
+            # 32768 on stock Linux) to avoid TOCTOU collisions. SGLang shares
+            # the vLLM engine rendezvous band (7000-8999); see the port layout
+            # in ray.sub / nemo_rl/distributed/virtual_cluster.py.
             start_port = node_port_cursor.get(node_idx, base_port)
 
             def port(consecutive=1):
