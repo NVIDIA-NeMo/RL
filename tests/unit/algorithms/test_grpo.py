@@ -87,6 +87,21 @@ class TestMaskSampleFilter:
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
         )
 
+    def test_masks_list_valued_mask_sample(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "mask_sample": [True, False, True],
+            }
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([0.0, 0.5, 0.0])
+        )
+
     def test_missing_mask_sample_is_noop(self):
         repeated_batch = BatchedDataDict(
             {"loss_multiplier": torch.tensor([1.0, 0.5, 1.0])}
