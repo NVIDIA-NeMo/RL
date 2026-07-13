@@ -18,6 +18,7 @@ refit), plus apples-to-apples transport and per-phase refit timing.
 | `configs/nixl_ep4_tp1_gb200_rc_debug.yaml` | Sanitized EP4→TP1 GB200 topology and UCX/NIXL config, including the TCP-fallback baseline and validated `^tcp` fix (12/12 pulls on RDMA, ~7× steady-state refit speedup). |
 | `preflight_ep8_tp2.sh` | Fail-fast Kubernetes gate for the two 4-GPU EP8 trainer pods and 2-GPU TP2 rollout: GPU count, `rdma0..3`, `^tcp`, matching package versions, and native `mx` backend registration. |
 | `native_nccl_refit_bench.py` | Native-vLLM PyNccl sender/controller baseline. Coordinates one excluded warmup plus N measured packed updates with versioned trigger/ack files and emits raw plus aggregate canonical-stage records. |
+| `pure_nccl_wire_bench.py` | P6 two-rank pure NCCL broadcast. It bypasses vLLM, separates allocation/preload/communicator initialization from CUDA-event wire timing, and emits JSON plus CSV. |
 | `configs/native_nccl_sender.gb200.yaml` | One-GPU GB200 sender pod for `native_nccl_refit_bench.py`, with four RDMA interfaces and the shared checkpoint PVC. |
 | `configs/native_nccl_receiver_30b.gb200.yaml` | Standalone Qwen3-30B-A3B TP2 Dynamo rollout for the NCCL arm. It uses `--load-format auto`, the default vLLM Worker, and `DYN_WEIGHT_TRANSFER_BACKEND=nccl`. |
 | `differentiator_suite.py` | Standard JSON analyzers and assertions for all seven differentiators: EP filtering, TP slicing, partial refit, elastic join, straggler isolation, fan-out, and trainer egress balance. |
@@ -70,6 +71,87 @@ kubectl -n <namespace> exec "$WORKER" -- \
   --result "$RUN.controller.json" --warmup-cycles 1 --cycles 5
 
 # Seven differentiators consume only the live paths shown above.
+```
+
+## P6: pure NCCL wire baseline
+
+`pure_nccl_wire_bench.py` is a two-rank transport microbenchmark: external
+source rank 0 broadcasts one preallocated GPU byte tensor to receiver rank 1.
+The default payload is exactly 61,064,245,248 bytes (Qwen3-30B BF16). It uses
+the repository's stable `StatelessProcessGroup`/`nccl.core` communicator and
+does not construct or invoke vLLM. Both GPUs must have enough free memory for
+the payload.
+
+The reported wire sample is the maximum CUDA-event duration across the two
+ranks. Warmups are excluded. GPU allocation, source fill, and one-time
+communicator initialization (including its one-element connectivity check) are
+reported separately. Rank 0 writes both outputs; `effective_gbps` is payload
+bits divided by each critical-path wire duration.
+
+For two Kubernetes pods, expose the rank-0 pod IP/hostname on an unused TCP
+port and run one process in each pod:
+
+```bash
+BENCH=infra/nrl_k8s/dynamo_mx/bench/pure_nccl_wire_bench.py
+MASTER=<rank-0-pod-ip>
+OUT=/shared/results/pure-nccl-wire.json
+
+# Source pod (rank 0); start this first.
+python3 "$BENCH" sender --master-address "$MASTER" --master-port 29610 \
+  --result-json "$OUT" --warmups 2 --iterations 10
+
+# Receiver pod (rank 1).
+python3 "$BENCH" receiver --master-address "$MASTER" --master-port 29610 \
+  --result-json "$OUT" --warmups 2 --iterations 10
+```
+
+For `torchrun`, use exactly two ranks. The NCCL benchmark TCPStore port must be
+different from torchrun's rendezvous port:
+
+```bash
+torchrun --nnodes=1 --nproc-per-node=2 --master-port=29500 \
+  "$BENCH" torchrun --master-address 127.0.0.1 --master-port 29610 \
+  --result-json ./pure-nccl-wire.json
+```
+
+For two pods, use the normal two-node torchrun arguments
+(`--nnodes=2 --nproc-per-node=1 --node-rank=0|1`) on rendezvous port 29500 and
+pass rank 0's reachable address plus a separately exposed port 29610 to the
+benchmark. `--bytes`, `--fill-byte`, `--warmups`, `--iterations`, `--device`,
+and `--result-csv` are configurable.
+
+## P5: EP4 source-layout semantics for NCCL
+
+`native_nccl_refit_bench.py` labels source semantics explicitly:
+
+- `preconsolidated_transport_only`: one actual sender rank already owns the
+  complete HF payload. Any EP4 shard consolidation happened before the
+  benchmark and is excluded. This is **not** a true EP4 NCCL source topology.
+- `consolidated_e2e`: reserved for an explicit four-shard consolidation phase.
+  This repository has no checkpoint-independent way to reconstruct HF weights
+  from Megatron EP shards, so this mode writes a structured `status:
+  unsupported` result with
+  `reason_code: ep_shard_consolidation_not_implemented` and performs no NCCL
+  transfer. It must not be reported as an EP4 topology measurement.
+
+The existing default remains TP2. For the EP4→TP1 transport-only semantic,
+deploy a real TP1 receiver (the checked-in `native_nccl_receiver_30b.gb200.yaml`
+is TP2), then add these flags to both sender and controller commands:
+
+```bash
+--source-layout preconsolidated_transport_only \
+--source-ep-size 4 --destination-tp-size 1
+```
+
+The output records `actual_source_processes: 1`,
+`true_ep_topology_match: false`, and `consolidation_included: false`. To
+materialize the unsupported consolidated result without starting a receiver:
+
+```bash
+python3 native_nccl_refit_bench.py sender \
+  --master-address unused --result ./nccl-ep4-consolidated.json \
+  --source-layout consolidated_e2e \
+  --source-ep-size 4 --destination-tp-size 1
 ```
 
 ## Canonical artifact contract

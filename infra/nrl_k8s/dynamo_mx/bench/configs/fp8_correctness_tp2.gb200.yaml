@@ -12,7 +12,7 @@ spec:
     - operator: Exists
   containers:
     - name: test
-      image: nvcr.io/nvidian/dynamo-dev/model-express-dev:real30b-matrix-v10-mxstage
+      image: nvcr.io/nvidian/dynamo-dev/model-express-dev:real30b-matrix-v12-fp8fix
       command: [sleep, infinity]
       env:
         - {name: VLLM_USE_DEEP_GEMM, value: "0"}

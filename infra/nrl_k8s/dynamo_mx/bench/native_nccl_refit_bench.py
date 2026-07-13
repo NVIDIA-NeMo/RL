@@ -1,4 +1,4 @@
-"""Native-vLLM NCCL baseline for a TP2 rollout.
+"""Native-vLLM NCCL baseline for a TP rollout (TP2 by default).
 
 This deliberately uses vLLM's PyNccl implementation on both sides, avoiding the
 metadata/communicator mismatch between NeMo's ``nccl.core`` package and vLLM.
@@ -7,15 +7,15 @@ Workflow:
 
 1. Start ``sender`` in a one-GPU pod using the same vLLM image as the rollout.
 2. Run ``controller`` where it can reach the rollout pod's DYN_SYSTEM_PORT.
-3. Controller initializes a 3-rank group (sender rank 0, TP ranks 1–2), then
-   starts packed send/receive concurrently and reports update wall time.
+3. Controller initializes a 1+TP-rank group (sender rank 0, receiver ranks
+   1..TP), then starts packed send/receive concurrently and reports update wall
+   time.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
 import time
 import urllib.request
@@ -26,6 +26,10 @@ import torch
 
 
 SCHEMA_VERSION = "refit-stage-v1"
+SOURCE_LAYOUT_MODES = (
+    "preconsolidated_transport_only",
+    "consolidated_e2e",
+)
 STAGE_NAMES = (
     "control_discovery",
     "source_preparation",
@@ -130,6 +134,59 @@ def _aggregate_cycles(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _measured_cycles(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [record for record in records if not record.get("excluded", False)]
+
+
+def _source_layout_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    preconsolidated = args.source_layout == "preconsolidated_transport_only"
+    return {
+        "mode": args.source_layout,
+        "declared_source_layout": f"EP{args.source_ep_size}",
+        "destination_layout": f"TP{args.destination_tp_size}",
+        "actual_source_processes": 1 if preconsolidated else 0,
+        "true_ep_topology_match": False,
+        "consolidation_requested": not preconsolidated,
+        "consolidation_included": False,
+        "detail": (
+            "One rank already owns the complete HF payload; EP shard consolidation "
+            "is excluded. This is transport-only source-layout semantics, not a "
+            f"true EP{args.source_ep_size} source topology."
+            if preconsolidated
+            else "Megatron-independent EP shard consolidation is not implemented."
+        ),
+    }
+
+
+def _unsupported_source_layout_result(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "backend": "nccl",
+        "role": args.role,
+        "status": "unsupported",
+        "reason_code": "ep_shard_consolidation_not_implemented",
+        "source_layout": _source_layout_metadata(args),
+        "stages": {
+            name: _stage(
+                "unsupported" if name == "source_preparation" else "not_run",
+                detail=(
+                    "An explicit EP shard consolidation implementation requires "
+                    "checkpoint-specific/Megatron layout metadata."
+                    if name == "source_preparation"
+                    else None
+                ),
+            )
+            for name in STAGE_NAMES
+        },
+        "bytes": None,
+        "total_seconds": None,
+        "gbps": None,
+    }
+
+
+def _write_unsupported_source_layout(args: argparse.Namespace) -> int:
+    result = _unsupported_source_layout_result(args)
+    Path(args.result).write_text(json.dumps(result, indent=2) + "\n")
+    print("NCCL_SOURCE_LAYOUT_UNSUPPORTED", json.dumps(result), flush=True)
+    return 0
 
 
 def _post(url: str, body: dict, timeout: float) -> dict:
@@ -347,7 +404,7 @@ def sender(args) -> int:
         {
             "master_address": args.master_address,
             "master_port": args.master_port,
-            "world_size": 3,
+            "world_size": 1 + args.destination_tp_size,
         }
     )
     init_seconds = time.perf_counter() - init_start
@@ -441,6 +498,7 @@ def sender(args) -> int:
                 "trigger_path": str(trigger_path),
                 "ack_path": str(ack_path),
                 "packed": True,
+                "source_layout": _source_layout_metadata(args),
             },
         )
         timing.update(
@@ -481,6 +539,7 @@ def sender(args) -> int:
             else None
         ),
         "process_seconds": time.perf_counter() - total_start,
+        "source_layout": _source_layout_metadata(args),
         "refit_timing": last_timing,
     }
     Path(args.result).write_text(json.dumps(result, indent=2))
@@ -505,7 +564,7 @@ def controller(args) -> int:
             "master_address": args.master_address,
             "master_port": args.master_port,
             "rank_offset": 1,
-            "world_size": 3,
+            "world_size": 1 + args.destination_tp_size,
         },
         args.timeout,
     )
@@ -689,8 +748,9 @@ def controller(args) -> int:
                 "excluded": index < args.warmup_cycles,
                 "trigger_path": str(trigger_path),
                 "ack_path": str(ack_path),
-                "workers": 2,
+                "workers": args.destination_tp_size,
                 "packed": True,
+                "source_layout": _source_layout_metadata(args),
                 "cache": cache,
                 "cache_seconds_from_response": cache_seconds,
                 "controller_boundary_seconds": {
@@ -748,8 +808,9 @@ def controller(args) -> int:
             if update_stats["median"]
             else None
         ),
-        "workers": 2,
+        "workers": args.destination_tp_size,
         "process_seconds": time.perf_counter() - total_start,
+        "source_layout": _source_layout_metadata(args),
         "refit_timing": last_timing,
     }
     Path(args.result).write_text(json.dumps(result, indent=2))
@@ -757,14 +818,14 @@ def controller(args) -> int:
     return 0
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
     parser.add_argument("role", choices=("sender", "controller"))
     parser.add_argument("--master-address", required=True)
     parser.add_argument("--master-port", type=int, default=29600)
     parser.add_argument("--checkpoint")
     parser.add_argument("--system-url")
-    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--manifest")
     parser.add_argument(
         "--manifest-path-on-worker",
         default="",
@@ -773,7 +834,7 @@ def parse_args():
             "FP8 manifests through the Dynamo HTTP body"
         ),
     )
-    parser.add_argument("--trigger", required=True)
+    parser.add_argument("--trigger")
     parser.add_argument("--ack")
     parser.add_argument("--result", required=True)
     parser.add_argument("--cycles", type=int, default=1)
@@ -783,17 +844,57 @@ def parse_args():
     parser.add_argument("--num-buffers", type=int, default=2)
     parser.add_argument("--preload-gpu", action="store_true")
     parser.add_argument("--timeout", type=float, default=900)
-    args = parser.parse_args()
-    if args.role == "sender" and not args.checkpoint:
+    parser.add_argument(
+        "--source-layout",
+        choices=SOURCE_LAYOUT_MODES,
+        default="preconsolidated_transport_only",
+        help=(
+            "preconsolidated_transport_only: one sender already owns full HF "
+            "weights; consolidated_e2e: emit an explicit unsupported result"
+        ),
+    )
+    parser.add_argument(
+        "--source-ep-size",
+        type=int,
+        default=1,
+        help="declared original EP shard count; metadata only in preconsolidated mode",
+    )
+    parser.add_argument(
+        "--destination-tp-size",
+        type=int,
+        default=2,
+        help="number of rollout receiver ranks (default 2 preserves existing behavior)",
+    )
+    args = parser.parse_args(argv)
+    if (
+        args.source_layout == "preconsolidated_transport_only"
+        and args.role == "sender"
+        and not args.checkpoint
+    ):
         parser.error("sender requires --checkpoint")
-    if args.role == "controller" and not args.system_url:
+    if (
+        args.source_layout == "preconsolidated_transport_only"
+        and args.role == "controller"
+        and not args.system_url
+    ):
         parser.error("controller requires --system-url")
+    if args.source_layout == "preconsolidated_transport_only" and not args.manifest:
+        parser.error("preconsolidated_transport_only requires --manifest")
+    if args.source_layout == "preconsolidated_transport_only" and not args.trigger:
+        parser.error("preconsolidated_transport_only requires --trigger")
     if args.cycles < 1:
         parser.error("--cycles must be at least 1")
     if args.warmup_cycles < 0:
         parser.error("--warmup-cycles cannot be negative")
+    if args.source_ep_size < 1:
+        parser.error("--source-ep-size must be at least 1")
+    if args.destination_tp_size < 1:
+        parser.error("--destination-tp-size must be at least 1")
     return args
 
 
 if __name__ == "__main__":
-    raise SystemExit(sender(parse_args()) if os.sys.argv[1] == "sender" else controller(parse_args()))
+    parsed = parse_args()
+    if parsed.source_layout == "consolidated_e2e":
+        raise SystemExit(_write_unsupported_source_layout(parsed))
+    raise SystemExit(sender(parsed) if parsed.role == "sender" else controller(parsed))
