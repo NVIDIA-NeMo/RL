@@ -230,24 +230,41 @@ based on the additive path's structure and the shadow's known dominance
 of the apply step. **Milestone 3 benchmarks (plan §M3) are the way to
 resolve these — do not treat these numbers as ground truth.**
 
-#### Memory overhead per apply
+#### Memory overhead — essentially a non-issue with buffer reuse
 
-The additive path allocates one HF-shape dense tensor per param (`torch.zeros(shape)`) and frees it before the next param. Peak transient allocation is bounded by the single largest per-rank tensor, not by the model size.
+Naive implementation allocates one HF-shape dense tensor per param. That
+sounds bad but doesn't have to be. The refactor should allocate **one
+scratch buffer sized to `max(numel across all params) × sizeof(dtype)`**
+once at receiver init (or lazily on first apply), and reuse it for every
+param throughout the refit loop by `narrow`+`view`:
 
-| Model | Largest per-rank param (bf16) | Additive peak (transient, MB) | Plan peak (sparse buf, MB) | Δ (MB) |
-|---|---|---|---|---|
-| Llama-3.2-1B, tp=1 | `embed_tokens` = 128256 × 2048 | ~500 | ~25 (5% sparsity of the same param) | +475 |
-| Llama-3.1-8B, tp=2 | `embed_tokens` shard = 128256 × 2048 | ~500 | ~25 | +475 |
-| Llama-3.1-70B, tp=8 | `embed_tokens` shard = 128256 × 1024 | ~250 | ~13 | +237 |
-| DeepSeek-V3 (671B), tp=16 | `embed_tokens` shard ≈ 256256 × 448 | ~220 | ~11 | +209 |
+```python
+scratch = torch.empty(max_numel, dtype=..., device=cuda)   # once
+for item in metadata:
+    numel = math.prod(item["shape"])
+    view = scratch.narrow(0, 0, numel).view(item["shape"])
+    # zero-only-dirty-indices trick, or plain view.zero_()
+    view.view(-1).index_copy_(0, indices, values)
+    model.load_weights([(name, view)])
+```
 
-**Bottom line:** per-worker RSS peak grows by O(largest_param / tp_size).
-For all realistic configs this is **<1 GiB extra per worker**, and it is
-transient (freed before the next param starts). Not a deal-breaker; not
-free either.
+Peak memory watermark per worker for the duration of the refit is one
+tensor sized to the largest per-rank param:
 
-Steady-state RSS delta after the refit: 0 — the tensor is freed. Only the
-watermark matters.
+| Model | Watermark (bf16) | Plan peak (sparse buf, MB) | Δ (MB) |
+|---|---|---|---|
+| Llama-3.2-1B, tp=1 | ~500 | ~25 (5% sparsity of the same param) | +475 |
+| Llama-3.1-8B, tp=2 | ~500 | ~25 | +475 |
+| Llama-3.1-70B, tp=8 | ~250 | ~13 | +237 |
+| DeepSeek-V3 (671B), tp=16 | ~220 | ~11 | +209 |
+
+**Bottom line: <1 GiB per worker, allocated once, released at the end
+of the refit.** On H100/H200 with 80–141 GiB per device this is a
+rounding error against KV cache, model weights, activations, and vLLM's
+own working buffers. **Not a concern in practice.**
+
+Steady-state RSS delta after the refit: 0 — release the scratch buffer
+if you want to be tidy. Only the watermark matters, and it's small.
 
 #### Compute overhead per apply
 
