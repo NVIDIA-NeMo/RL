@@ -1380,10 +1380,21 @@ class VllmInternalWorkerExtension:
                 t0 = time.perf_counter()
                 scratch_bytes = 0
                 for cand in v0_cands:
+                    include_names = v0_names_by_source[cand.ref.mx_source_id]
+                    tensor_shapes = {
+                        td.name: tuple(int(dim) for dim in td.global_shape)
+                        for td in (
+                            cand.registry.get("tensors", [])
+                            if cand.registry
+                            else []
+                        )
+                        if td.name in include_names and tuple(td.global_shape)
+                    }
                     buf_dict: dict[str, "torch.Tensor"] = {}
                     for name, t in self._mx_receiver._receiver.receive_weights_scratch(
                         cand.ref, timeout_seconds=mx_config.timeout_seconds,
-                        include_names=v0_names_by_source[cand.ref.mx_source_id],
+                        tensor_shapes=tensor_shapes or None,
+                        include_names=include_names,
                     ):
                         buf_dict[name] = t
                         scratch_bytes += t.numel() * t.element_size()
