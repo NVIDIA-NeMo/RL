@@ -1,0 +1,15 @@
+defaults: ./grpo-glm5.1-64n8g-megatron-8K-full-onpolicy-new.yaml
+
+grpo:
+  val_period: -1
+  reward_shaping:
+    max_response_length: 512
+
+data:
+  max_input_seq_length: 7680
+
+policy:
+  megatron_cfg:
+    dsa_kernel_backend: cudnn
+  generation:
+    max_new_tokens: 512
