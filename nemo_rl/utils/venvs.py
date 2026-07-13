@@ -31,6 +31,32 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=None)
+def _switch_megatron_lm_branch() -> None:
+    """Check the nested Megatron-LM submodule out to Megatron-Bridge's pinned dev/main commit.
+
+    nemo-rl pins the upstream Megatron-Bridge submodule, whose recorded nested
+    Megatron-LM gitlink is the ``main`` pin. DeepSeek-V4 needs the Megatron-LM
+    ``dev`` line, which Bridge tracks via ``scripts/switch_mcore.sh`` and a committed
+    ``.dev.commit``. Run that switch before ``uv sync`` so the editable
+    ``megatron-core`` is built from the right source and matches ``uv.lock``.
+
+    Controlled by ``NRL_MCORE_LM_BRANCH`` (default ``dev``); set to ``main`` to keep
+    Bridge's pinned main commit. Cached so it runs once per driver process.
+    """
+    branch = os.environ.get("NRL_MCORE_LM_BRANCH", "dev")
+    script = os.path.join(
+        git_root,
+        "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/scripts/switch_mcore.sh",
+    )
+    if branch not in ("dev", "main") or not os.path.exists(script):
+        return
+    logger.info(
+        "Switching nested Megatron-LM to Megatron-Bridge's pinned '%s' commit", branch
+    )
+    subprocess.run(["bash", script, branch], check=True)
+
+
+@lru_cache(maxsize=None)
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
 ) -> str:
@@ -92,6 +118,10 @@ def create_local_venv(
     exec_cmd = shlex.split(py_executable)
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
+
+    # DeepSeek-V4 needs Megatron-Bridge's dev-pinned Megatron-LM; align the nested
+    # submodule before syncing so the editable megatron-core matches uv.lock.
+    _switch_megatron_lm_branch()
 
     # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
     subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
