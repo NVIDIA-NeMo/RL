@@ -39,7 +39,7 @@ class ClusterConfig(TypedDict):
     # kept below the OS ephemeral range (32768-60999 on stock Linux) to avoid
     # TOCTOU collisions with kernel-assigned source ports.  When absent,
     # RayVirtualCluster falls back to DEFAULT_MASTER_PORT_RANGE_LOW/HIGH
-    # (25000-28000).  See ray.sub for the full port layout.
+    # (1400-1999).  See ray.sub for the full port layout.
     master_port_range_low: NotRequired[int]
     master_port_range_high: NotRequired[int]
     segment_size: NotRequired[
@@ -77,27 +77,27 @@ class PY_EXECUTABLES:
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
-# Default port ranges — kept below the OS ephemeral range (32768-60999 on
-# stock Linux) to avoid TOCTOU collisions.  See ray.sub for the full layout
-# including Ray's own GCS / worker gRPC ports.
+# Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
+# nodes the ephemeral floor is as low as 9000 (32768 on stock Linux), so every
+# service port is pinned below 9000 to avoid TOCTOU collisions.  See ray.sub for
+# the full layout including Ray's own GCS / worker gRPC ports.
 #
-#   11001-15000  vLLM / SGLang HTTP servers  (policy.generation.port_range_low/high)
-#   15001-20000  NeMo Gym HTTP servers       (env.nemo_gym.port_range_low/high)
-#   20001+       vLLM TP/DP rendezvous       (VLLM_PORT env var, 100-port spacing)
-#   25000-28000  Master address / TCPStore    (cluster.master_port_range_low/high)
-DEFAULT_GENERATION_PORT_RANGE_LOW = 11001
-DEFAULT_GENERATION_PORT_RANGE_HIGH = 15000
-DEFAULT_GYM_PORT_RANGE_LOW = 15001
-DEFAULT_GYM_PORT_RANGE_HIGH = 20000
-# vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports
-# starting at LOW + engine_index * PORTS_PER_ENGINE.  The effective upper
-# bound is LOW + max_engines_per_node * PORTS_PER_ENGINE.  With 8 GPUs and
-# TP=1 (8 engines): 20001 + 8*100 = 20801.  There is no fixed ceiling —
-# ensure the range does not overlap with MASTER (25000+) on very large nodes.
-DEFAULT_VLLM_PORT_RANGE_LOW = 20001
+#   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
+#   3000-4999    NeMo RL generation HTTP servers (policy.generation.port_range_low/high)
+#   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
+#   7000-8999    vLLM / SGLang engine rendezvous (VLLM_PORT env var / SGLang base_port)
+DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
+DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
+DEFAULT_GYM_PORT_RANGE_LOW = 5000
+DEFAULT_GYM_PORT_RANGE_HIGH = 5999
+# vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting
+# at LOW + engine_index * PORTS_PER_ENGINE.  With 8 GPUs and TP=1 (8 engines):
+# 7000 + 8*100 = 7800, still below the 9000 ephemeral floor.
+DEFAULT_VLLM_PORT_RANGE_LOW = 7000
 DEFAULT_VLLM_PORTS_PER_ENGINE = 100
-DEFAULT_MASTER_PORT_RANGE_LOW = 25000
-DEFAULT_MASTER_PORT_RANGE_HIGH = 28000
+# Master address / TCPStore range, tucked below the Ray worker-gRPC band (2000+).
+DEFAULT_MASTER_PORT_RANGE_LOW = 1400
+DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
 
 # ---------------------------------------------------------------------------
 # Topology resource keys

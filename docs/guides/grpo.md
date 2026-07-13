@@ -631,7 +631,7 @@ grpo:
     normalize_rewards: true
     use_leave_one_out_baseline: false
 ```
-Note that this method only has an effect when training involve more than one reward function.
+Note that this method only has an effect when training involves more than one reward function.
 
 ## LoRA Configuration
 

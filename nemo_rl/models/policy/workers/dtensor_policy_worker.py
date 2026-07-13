@@ -202,6 +202,14 @@ class DTensorPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorker."""
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Pin to this worker's GPU-local CPUs/memory before CUDA init or model
+        # load; FSDP's D2H paths (weight refit, optimizer/checkpoint offload)
+        # benefit. ray.get_gpu_ids()[0] is the physical GPU index that keys the
+        # affinity file, and reading it does not initialize CUDA.
+        bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None

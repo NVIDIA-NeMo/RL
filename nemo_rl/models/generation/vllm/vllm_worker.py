@@ -55,6 +55,23 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
+def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
+    """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
+
+    ``init_fp8`` returns a nested ``hf_overrides`` (holding ``quantization_config``),
+    so a blanket ``vllm_kwargs.update(fp8_kwargs)`` would wholesale-replace any
+    user-supplied ``hf_overrides``. We pop ``hf_overrides`` before the shallow
+    update and merge it separately so that fp8's ``quantization_config`` is the
+    base while user overrides (e.g. ``max_position_embeddings``) survive and take
+    precedence. This regression was reintroduced once already; see #1413/#2904.
+    """
+    fp8_kwargs = dict(fp8_kwargs)
+    fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
+    vllm_kwargs.update(fp8_kwargs)
+    existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
+    vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -182,6 +199,19 @@ class BaseVllmGenerationWorker:
                 _load_model() later to perform the heavy model loading. This
                 enables overlapping vLLM model loading with NeMo Gym init.
         """
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Only bind single-GPU workers to their GPU's NUMA node.
+        # For TP>1 workers, the parent process spans multiple NUMA nodes;
+        # binding it would incorrectly constrain the EngineCore subprocess
+        # (which inherits sched_setaffinity + numa_set_membind via fork).
+        # Individual TP workers get their own NUMA binding via collective_rpc
+        # in post_init / post_init_async.
+        # ray.get_gpu_ids()[0] is this worker's physical GPU index, which keys
+        # the affinity file.
+        if bundle_indices is not None and len(bundle_indices) == 1:
+            bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
@@ -339,7 +369,9 @@ class BaseVllmGenerationWorker:
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
             )
 
-            vllm_kwargs.update(fp8_kwargs)
+            # Merge (rather than replace) so fp8's quantization_config coexists
+            # with user-supplied hf_overrides, which take precedence.
+            _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
@@ -589,6 +621,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.llm = vllm.LLM(**llm_kwargs)
 
     def post_init(self):
+        if self.llm is not None:
+            self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
         if self._mtp_load_from_disk:
             self.llm.collective_rpc(
