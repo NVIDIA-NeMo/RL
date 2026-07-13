@@ -223,6 +223,96 @@ Incremental items (must be paid before the deletion PR merges):
 | Nightly regression sweep after the deletion | Existing GRPO nightly.txt | ~20–40 |
 | **Total incremental** | | **~50–70 GPU-hours** |
 
+### Runtime overhead (memory + compute + wall-clock)
+
+Not measured this session — R5 was correctness-only. Estimates below are
+based on the additive path's structure and the shadow's known dominance
+of the apply step. **Milestone 3 benchmarks (plan §M3) are the way to
+resolve these — do not treat these numbers as ground truth.**
+
+#### Memory overhead per apply
+
+The additive path allocates one HF-shape dense tensor per param (`torch.zeros(shape)`) and frees it before the next param. Peak transient allocation is bounded by the single largest per-rank tensor, not by the model size.
+
+| Model | Largest per-rank param (bf16) | Additive peak (transient, MB) | Plan peak (sparse buf, MB) | Δ (MB) |
+|---|---|---|---|---|
+| Llama-3.2-1B, tp=1 | `embed_tokens` = 128256 × 2048 | ~500 | ~25 (5% sparsity of the same param) | +475 |
+| Llama-3.1-8B, tp=2 | `embed_tokens` shard = 128256 × 2048 | ~500 | ~25 | +475 |
+| Llama-3.1-70B, tp=8 | `embed_tokens` shard = 128256 × 1024 | ~250 | ~13 | +237 |
+| DeepSeek-V3 (671B), tp=16 | `embed_tokens` shard ≈ 256256 × 448 | ~220 | ~11 | +209 |
+
+**Bottom line:** per-worker RSS peak grows by O(largest_param / tp_size).
+For all realistic configs this is **<1 GiB extra per worker**, and it is
+transient (freed before the next param starts). Not a deal-breaker; not
+free either.
+
+Steady-state RSS delta after the refit: 0 — the tensor is freed. Only the
+watermark matters.
+
+#### Compute overhead per apply
+
+Per param the additive path adds three things beyond the plan path:
+
+1. `torch.zeros(target_shape)` — HF-shape allocation.
+2. `dense.view(-1).index_copy_(0, indices, values)` — scatter of the
+   sparse subset.
+3. vLLM's `weight_loader` doing an HF-shape → shard `.narrow(...).copy_(...)`,
+   which our context redirects to `.add_()`.
+
+The plan path skips (1) and (2) and does a shard-local `index_add_`
+directly on `param.data`. Cost ratio scales with sparsity:
+
+- At 10% sparsity: additive ≈ 3–5× the apply-only cost of plan.
+- At 5% sparsity: additive ≈ 5–10× the apply-only cost of plan.
+- At 1% sparsity: additive ≈ 20–50× the apply-only cost of plan.
+- At 0.5% sparsity: additive ≈ 50–100× the apply-only cost of plan.
+
+Reason: the scatter + `weight_loader` work is O(HF-shape), not
+O(sparse-values). Sparser deltas make the constant HF-shape work
+proportionally more expensive.
+
+#### Wall-clock overhead per refit
+
+Refit wall-clock = payload upload (Megatron) + transport (S3/ZMQ) +
+payload download (vLLM worker) + decode + apply + Ray sync. Apply is one
+of several segments.
+
+If apply is 10–30% of total refit wall-clock (workstream plan's
+assumption), then apply getting 5× slower means total refit wall-clock
+regresses by ~5–20%. Getting 50× slower means ~40–150% regression.
+
+**Bar to hit**: the plan doc's success criterion (§Success criteria) is
+"Default-path apply latency regression ≤ 15% of total refit wall-clock at
+typical sparsity." Whether M4 lands with a universal-additive default or
+keeps a hot-param allowlist depends entirely on this measurement.
+
+#### Additional per-block overhead of the context manager itself
+
+The context patches `torch.Tensor.copy_` at the class level for the block.
+Every `.copy_()` inside the block dispatches through a Python wrapper —
+one extra attribute lookup (`self.untyped_storage().data_ptr()`), one set
+membership check, one branch. Per-call cost is measured in single-digit
+microseconds. For a full refit with ~200 params, this is ~1ms of pure
+wrapper overhead. Ignorable.
+
+Global side effect: the patch is process-wide for the block. Any other
+tensor `.copy_()` happening concurrently in the same process (e.g., a Ray
+callback firing on another thread) would go through the wrapper. Not
+observed to be a problem in this session but worth flagging for
+maintainers who might parallelize apply in the future.
+
+#### Benchmark cost to resolve these estimates
+
+Executing plan §Milestone 3 as spec'd:
+
+- 4 sparsity levels (0.5%, 1%, 5%, 10%) × 3 model families × 2 transports = 24 configs.
+- Llama-3.1-8B at 1n8g: 4 × 2 = 8 configs × ~10 min = **~10.7 GPU-hours**.
+- MoE (~70B) at 4n8g: 8 configs × ~15 min = **~64 GPU-hours** (dominant).
+- Mamba at 1n8g: 8 configs × ~10 min = **~10.7 GPU-hours**.
+- **Full benchmark sweep: ~85 GPU-hours.**
+
+This is in addition to the correctness-validation GPU-hours listed above.
+
 ### Risk (silent-breakage cost if we're wrong)
 
 | Family | Risk | Cost if it breaks |
