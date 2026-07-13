@@ -1884,8 +1884,9 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
             "expose_http_server"
         )
     elif generation_config["backend"] == "trtllm":
-        should_expose_http_server = generation_config["trtllm_cfg"].get(
-            "expose_http_server"
+        raise NotImplementedError(
+            "NeMo-Gym is not supported with the TRT-LLM generation backend "
+            "(the TRT-LLM OpenAI-compatible HTTP server was removed)."
         )
     else:
         should_expose_http_server = False
