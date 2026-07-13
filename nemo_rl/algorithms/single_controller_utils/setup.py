@@ -78,6 +78,7 @@ class SingleControllerBundle:
     tq_buffer: TQReplayBuffer
     partition_id: str
     save_state: GRPOSaveState
+    last_checkpoint_path: Optional[str]
 
 
 def _build_clusters(
@@ -456,4 +457,5 @@ def setup_single_controller(
         tq_buffer=tq_buffer,
         partition_id=partition_id,
         save_state=save_state,
+        last_checkpoint_path=last_checkpoint_path,
     )

@@ -122,7 +122,8 @@ class SingleControllerActor:
 
         # Built here, not on the driver: TimeoutChecker must capture wall-clock
         # start times inside the actor, not at driver setup time. The bundle
-        # only carries the driver-side restore product (save_state).
+        # only carries the driver-side restore products (save_state,
+        # last_checkpoint_path).
         self._checkpointer = CheckpointManager(master_config.checkpointing)
         self._timeout = TimeoutChecker(
             timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -133,6 +134,7 @@ class SingleControllerActor:
         # Loaded (or default) GRPOSaveState; keys SC does not own
         # (val_reward, ...) pass through to saved checkpoints untouched.
         self._save_state: GRPOSaveState = bundle.save_state
+        self._last_checkpoint_path: Optional[str] = bundle.last_checkpoint_path
         self._consumed_samples: int = bundle.save_state["consumed_samples"]
         self._current_epoch: int = bundle.save_state["current_epoch"]
         self._total_valid_tokens: int = bundle.save_state.get(
@@ -249,6 +251,42 @@ class SingleControllerActor:
         """Main entry point. Runs until max_train_steps is reached."""
         # Synchronize weights before starting the pumps
         await self._sync_weights()
+
+        # Restore committed rollout groups from the previous run. Only when
+        # over_sampling=True — with the strict quota the restored window can
+        # never be completed (see the checkpointing plan's design note).
+        if self._async_cfg.over_sampling and self._last_checkpoint_path is not None:
+            buffer_path = os.path.join(self._last_checkpoint_path, "replay_buffer.pt")
+            if os.path.exists(buffer_path):
+                print(f"📦 Restoring replay buffer from checkpoint: {buffer_path}")
+                # weights_only=False: groups hold pickled KVBatchMeta/TensorDicts,
+                # not plain tensors. The checkpoint is a trusted same-job artifact.
+                buffer_state = await asyncio.to_thread(
+                    torch.load, buffer_path, weights_only=False
+                )
+                restored = await self._buffer.load_state_dict(
+                    buffer_state,
+                    max_groups=self._async_cfg.max_buffered_rollouts,
+                    expected_partition_id=self._partition_id,
+                    expected_group_size=self._master_config.grpo[
+                        "num_generations_per_prompt"
+                    ],
+                )
+                # Each buffered group holds one _buffer_capacity permit. The
+                # load truncation guarantees restored <= capacity, so these
+                # acquisitions never wait — blocking here would hang run()
+                # forever (no pump is running yet to release permits). Any
+                # restored group now outside the staleness window is dropped
+                # by the train pump's first sampler.evict, which releases its
+                # permit — load does not stale-filter.
+                assert restored <= self._async_cfg.max_buffered_rollouts
+                for _ in range(restored):
+                    await self._buffer_capacity.acquire()
+            else:
+                print(
+                    f"⚠️ No replay buffer checkpoint found at {buffer_path}. "
+                    "Starting with an empty replay buffer."
+                )
 
         # Start the rollout and train pumps
         rollout_task = asyncio.create_task(self._rollout_pump())
@@ -628,6 +666,15 @@ class SingleControllerActor:
                             dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
+                        if self._async_cfg.over_sampling:
+                            buffer_state = await self._buffer.state_dict(
+                                saved_capacity=self._async_cfg.max_buffered_rollouts
+                            )
+                            await asyncio.to_thread(
+                                torch.save,
+                                buffer_state,
+                                os.path.join(checkpoint_path, "replay_buffer.pt"),
+                            )
                         await asyncio.to_thread(
                             self._checkpointer.finalize_checkpoint, checkpoint_path
                         )

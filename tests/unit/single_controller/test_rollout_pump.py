@@ -251,6 +251,7 @@ def test_rollout_pump_writes_expected_tq_data(
         tq_buffer=tq_buffer,
         partition_id=_PARTITION_ID,
         save_state=_default_grpo_save_state(),
+        last_checkpoint_path=None,
     )
     ctrl = SingleControllerActor.remote(master_config=mc, bundle=bundle)
 

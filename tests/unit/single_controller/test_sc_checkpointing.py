@@ -175,6 +175,42 @@ class _FakeRolloutManager:
         self.weight_versions.append(version)
 
 
+class _FakeTQBuffer:
+    """TQReplayBuffer stand-in for the SC save/restore integration tests."""
+
+    def __init__(
+        self,
+        state: Optional[dict[str, Any]] = None,
+        load_return: int = 0,
+    ) -> None:
+        self._state = state if state is not None else {"fake_buffer_envelope": 1}
+        self.load_return = load_return
+        self.state_dict_calls: list[int] = []
+        self.load_calls: list[dict[str, Any]] = []
+
+    async def state_dict(self, *, saved_capacity: int) -> dict[str, Any]:
+        self.state_dict_calls.append(saved_capacity)
+        return dict(self._state)
+
+    async def load_state_dict(
+        self,
+        state: dict[str, Any],
+        *,
+        max_groups: int,
+        expected_partition_id: str,
+        expected_group_size: int,
+    ) -> int:
+        self.load_calls.append(
+            {
+                "state": state,
+                "max_groups": max_groups,
+                "expected_partition_id": expected_partition_id,
+                "expected_group_size": expected_group_size,
+            }
+        )
+        return self.load_return
+
+
 # Default position sentinel the fake dataloader reports via state_dict().
 _SENTINEL_DL_STATE = {"fake_position": 42}
 
@@ -208,6 +244,8 @@ def _actor_master_config(
     save_optimizer: bool = True,
     checkpoint_must_save_by: Optional[str] = None,
     num_prompts_per_step: int = 2,
+    max_num_epochs: int = 1,
+    over_sampling: bool = True,
 ) -> MasterConfig:
     """MasterConfig for in-process SingleControllerActor tests.
 
@@ -224,7 +262,7 @@ def _actor_master_config(
         data={"shuffle": False, "num_workers": 0},
         grpo={
             "max_num_steps": max_num_steps,
-            "max_num_epochs": 1,
+            "max_num_epochs": max_num_epochs,
             "num_prompts_per_step": num_prompts_per_step,
             "num_generations_per_prompt": 2,
             "seed": 42,
@@ -249,13 +287,15 @@ def _actor_master_config(
             "checkpoint_must_save_by": checkpoint_must_save_by,
         },
         data_plane={"enabled": True, "impl": "transfer_queue"},
+        # over_sampling=False keeps __init__'s strict-quota check satisfied:
+        # max_buffered_rollouts == num_prompts_per_step * (staleness + 1) == 4.
         async_rl=AsyncRLConfig(
             batch_selection_strategy="staleness_window",
             max_weight_staleness_versions=1,
             min_prompt_groups_per_batch=1,
             max_inflight_prompts=4,
             max_buffered_rollouts=4,
-            over_sampling=True,
+            over_sampling=over_sampling,
         ),
     )
 
@@ -265,6 +305,8 @@ def _make_bundle(
     trainer: Optional[_FakeTrainer] = None,
     save_state: Optional[dict[str, Any]] = None,
     dataloader: Optional[_FakeDataloader] = None,
+    tq_buffer: Optional[_FakeTQBuffer] = None,
+    last_checkpoint_path: Optional[str] = None,
 ) -> SingleControllerBundle:
     return SingleControllerBundle(
         gen_handle=object(),
@@ -278,11 +320,12 @@ def _make_bundle(
         advantage_estimator=None,
         loss_fn=object(),
         rollout_manager=_FakeRolloutManager(),
-        tq_buffer=object(),
+        tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),
         partition_id=_PARTITION_ID,
         save_state=(
             save_state if save_state is not None else _default_grpo_save_state()
         ),
+        last_checkpoint_path=last_checkpoint_path,
     )
 
 
@@ -772,3 +815,132 @@ class TestDataloaderState:
         assert any("No dataloader state found" in line for line in printed)
         trainer_kwargs = patched_factories["_build_trainer"].call_args.kwargs
         assert trainer_kwargs["weights_path"] == step_3 / "policy" / "weights"
+
+
+# ── replay buffer persistence (Phase 3) ──────────────────────────────────────
+
+
+def _run_actor_run(mc: MasterConfig, bundle: SingleControllerBundle):
+    """Construct the actor in-process and drive run() to completion.
+
+    max_num_steps=0 makes _train_pump exit immediately, so run() executes
+    only the restore block + pump startup/teardown. The wait_for bounds the
+    would-be-deadlock cases (an over-capacity permit acquisition would hang
+    run() forever).
+    """
+
+    async def _main():
+        actor = _ACTOR_CLS(mc, bundle)
+        result = await asyncio.wait_for(actor.run(), timeout=60.0)
+        return actor, result
+
+    return asyncio.run(_main())
+
+
+class TestReplayBufferPersistence:
+    def test_save_writes_replay_buffer_when_over_sampling(self, tmp_path):
+        mc = _actor_master_config(tmp_path, max_num_steps=2, save_period=2)
+        envelope = {"groups": [], "sentinel": "abc"}
+        buffer = _FakeTQBuffer(state=envelope)
+
+        _run_train_pump(mc, _make_bundle(tq_buffer=buffer))
+
+        ckpt_dir = tmp_path / "checkpoints"
+        buffer_path = ckpt_dir / "step_2" / "replay_buffer.pt"
+        assert buffer_path.exists()
+        assert torch.load(buffer_path, weights_only=False) == envelope
+        # state_dict is stamped with the capacity at save time.
+        assert buffer.state_dict_calls == [4]
+
+    def test_no_replay_buffer_when_not_over_sampling(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path, max_num_steps=2, save_period=2, over_sampling=False
+        )
+        buffer = _FakeTQBuffer()
+
+        _run_train_pump(mc, _make_bundle(tq_buffer=buffer))
+
+        ckpt_dir = tmp_path / "checkpoints"
+        assert (ckpt_dir / "step_2" / "training_info.json").exists()
+        assert not (ckpt_dir / "step_2" / "replay_buffer.pt").exists()
+        assert buffer.state_dict_calls == []
+
+    def test_run_restores_replay_buffer_and_permits(self, tmp_path):
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        envelope = {"groups": ["g0", "g1", "g2"]}
+        torch.save(envelope, ckpt_dir / "replay_buffer.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+        buffer = _FakeTQBuffer(load_return=3)
+
+        actor, result = _run_actor_run(
+            mc,
+            _make_bundle(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
+        )
+
+        assert buffer.load_calls == [
+            {
+                "state": envelope,
+                "max_groups": 4,
+                "expected_partition_id": _PARTITION_ID,
+                "expected_group_size": 2,
+            }
+        ]
+        # Each restored group holds one _buffer_capacity permit.
+        assert actor._buffer_capacity._value == 4 - 3
+        assert result["train_steps"] == 0
+
+    def test_run_restore_at_full_capacity_does_not_hang(self, tmp_path):
+        # K == max_buffered_rollouts: the acquisitions must all complete
+        # without waiting (no pump is running yet to release permits).
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+        buffer = _FakeTQBuffer(load_return=4)
+
+        actor, result = _run_actor_run(
+            mc,
+            _make_bundle(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
+        )
+
+        assert len(buffer.load_calls) == 1
+        assert actor._buffer_capacity._value == 0
+        assert result["train_steps"] == 0
+
+    def test_run_missing_replay_buffer_file_starts_empty(self, tmp_path, monkeypatch):
+        # Resuming from a pre-Phase-3 checkpoint: no replay_buffer.pt.
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        mc = _actor_master_config(tmp_path, max_num_steps=0)
+        buffer = _FakeTQBuffer()
+        printed: list[str] = []
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+        )
+
+        actor, _ = _run_actor_run(
+            mc,
+            _make_bundle(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
+        )
+
+        assert buffer.load_calls == []
+        assert actor._buffer_capacity._value == 4  # zero permits consumed
+        assert any("No replay buffer checkpoint found" in line for line in printed)
+
+    def test_run_no_restore_when_not_over_sampling(self, tmp_path):
+        # File present but over_sampling=False: nothing is restored.
+        ckpt_dir = tmp_path / "resume_ckpt"
+        ckpt_dir.mkdir()
+        torch.save({"groups": []}, ckpt_dir / "replay_buffer.pt")
+        mc = _actor_master_config(tmp_path, max_num_steps=0, over_sampling=False)
+        buffer = _FakeTQBuffer(load_return=2)
+
+        actor, _ = _run_actor_run(
+            mc,
+            _make_bundle(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
+        )
+
+        assert buffer.load_calls == []
+        assert actor._buffer_capacity._value == 4
