@@ -13,6 +13,10 @@ import time
 import uuid
 from typing import Any, Optional
 
+from nemo_rl.models.generation.openai_server_utils import (
+    replace_prefix_tokens,
+)
+
 logger = logging.getLogger(__name__)
 
 # Qwen3 tool-call delimiters — must match Qwen3ToolParser exactly so that
@@ -81,7 +85,7 @@ def create_app(
             messages, tokenizer, tools, _default_template_kwargs
         )
 
-        adj_prompt = _replace_prefix_tokens(
+        adj_prompt = replace_prefix_tokens(
             tokenizer=tokenizer,
             model_prefix_token_ids=required_prefix_ids,
             template_prefix_token_ids=template_prefix_ids,
@@ -301,61 +305,13 @@ def _strip_token_fields(msg: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in msg.items() if k not in skip}
 
 
-# ---------------------------------------------------------------------------
-#  Prefix splice
-# ---------------------------------------------------------------------------
-
-def _replace_prefix_tokens(
-    tokenizer: Any,
-    model_prefix_token_ids: list[int],
-    template_prefix_token_ids: list[int],
-    template_token_ids: list[int],
-) -> list[int]:
-    """Splice ground-truth model token IDs into the re-templated prompt.
-
-    Empty model_prefix_token_ids (turn 1) → returns template_token_ids unchanged.
-    """
-    if not model_prefix_token_ids:
-        return template_token_ids
-
-    eos_token_id = tokenizer.eos_token_id
-    assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
-
-    model_cut_end = len(model_prefix_token_ids)
-    if model_prefix_token_ids[-1] == eos_token_id:
-        model_cut_end -= 1
-
-    # Use N-th EOS count for splice boundary — robust to Qwen3 last_query_index quirk that
-    # strips <think> blocks when the last message is a user turn, shifting template lengths.
-    count_needed = template_prefix_token_ids.count(eos_token_id)
-    count_seen = 0
-    template_cut_start = -1
-    for pos, tid in enumerate(template_token_ids):
-        if tid == eos_token_id:
-            count_seen += 1
-            if count_seen == count_needed:
-                template_cut_start = pos
-                break
-
-    assert template_cut_start >= 0, (
-        f"EOS token #{count_needed} not found in template_token_ids "
-        f"(only found {count_seen} EOS tokens total)!\n"
-        f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
-        f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}\n\n"
-        f"Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}\n\n"
-        f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
-    )
-
-    return model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
-
-
 def _compute_splice_inputs(
     messages: list[dict[str, Any]],
     tokenizer: Any,
     tools: list[dict[str, Any]] | None,
     default_template_kwargs: dict[str, Any],
 ) -> tuple[list[int], list[int]]:
-    """Return (required_prefix_ids, template_prefix_ids) for _replace_prefix_tokens.
+    """Return (required_prefix_ids, template_prefix_ids) for replace_prefix_tokens.
 
     required_prefix_ids: last assistant's prompt+gen token IDs (empty on turn 1).
     template_prefix_ids: apply_chat_template up to last assistant turn, used only to count EOS.
