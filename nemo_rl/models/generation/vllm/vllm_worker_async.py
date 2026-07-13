@@ -442,11 +442,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
-    def report_refit_server_base_url(self) -> str | None:
-        if self.cfg.get("refit_transport") is None or self.base_url is None:
-            return None
-        return self.base_url.removesuffix("/v1")
-
     # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         from copy import deepcopy

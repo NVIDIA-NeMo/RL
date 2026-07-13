@@ -18,6 +18,7 @@ import pytest
 
 from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
     VllmRemoteSparseWeightSynchronizer,
+    validate_vllm_remote_sparse_refit,
 )
 
 
@@ -36,7 +37,6 @@ def _remote_sparse_sync(
     policy.worker_group.run_all_workers_single_data.return_value = commit_refs
 
     generation = MagicMock()
-    generation.worker_group.workers = [object()]
     generation.worker_group.run_all_workers_single_data.side_effect = [
         [MagicMock()],
         *([[MagicMock()]] if transport == "zmq" else []),
@@ -46,15 +46,103 @@ def _remote_sparse_sync(
     get_results: list[object] = [["http://receiver"]]
     if transport == "zmq":
         get_results.append(["tcp://relay:19090"])
-    get_results.extend([None, stream_result])
+    get_results.extend([[{"weight": ((8,), "float32")}], stream_result])
     mock_ray.get.side_effect = get_results
 
     sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport=transport)
-    sync.init_communicator()
+    with patch(
+        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer."
+        "prepare_vllm_sparse_refit_urls"
+    ):
+        sync.init_communicator()
     return sync, policy, generation
 
 
+def _valid_config() -> dict:
+    return {
+        "refit_transport": "vllm_s3_sparse",
+        "delta_compression": {"encoding": "overwrite"},
+        "vllm_cfg": {"precision": "bfloat16", "kv_cache_dtype": "auto"},
+    }
+
+
+def test_validate_remote_sparse_refit_accepts_supported_scope():
+    assert (
+        validate_vllm_remote_sparse_refit(
+            _valid_config(), colocated=False, megatron_enabled=True
+        )
+        == "s3"
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "kwargs"),
+    [
+        ({"refit_transport": "unknown"}, {}),
+        ({}, {"colocated": True}),
+        ({}, {"megatron_enabled": False}),
+        ({"delta_compression": None}, {}),
+        ({"quant_cfg": "fp8"}, {}),
+        ({"vllm_cfg": {"precision": "fp8", "kv_cache_dtype": "auto"}}, {}),
+        (
+            {"vllm_cfg": {"precision": "bfloat16", "kv_cache_dtype": "fp8_e4m3"}},
+            {},
+        ),
+    ],
+)
+def test_validate_remote_sparse_refit_rejects_unsupported_scope(change, kwargs):
+    config = _valid_config()
+    config.update(change)
+    arguments = {"colocated": False, "megatron_enabled": True}
+    arguments.update(kwargs)
+
+    with pytest.raises(ValueError):
+        validate_vllm_remote_sparse_refit(config, **arguments)
+
+
 class TestVllmRemoteSparseWeightSynchronizer:
+    @patch(
+        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer."
+        "prepare_vllm_sparse_refit_urls"
+    )
+    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
+    def test_init_communicator_joins_prelaunched_baseline(self, mock_ray, prepare):
+        baseline_ref = MagicMock()
+        policy = MagicMock()
+        generation = MagicMock()
+        generation.worker_group.run_all_workers_single_data.return_value = [MagicMock()]
+        mock_ray.get.side_effect = [
+            ["http://receiver"],
+            [{"weight": ((8,), "float32")}],
+        ]
+        sync = VllmRemoteSparseWeightSynchronizer(
+            policy,
+            generation,
+            transport="s3",
+            baseline_init_refs=[baseline_ref],
+        )
+
+        sync.init_communicator()
+
+        policy.worker_group.run_all_workers_multiple_data.assert_not_called()
+        mock_ray.get.assert_any_call([baseline_ref])
+        prepare.assert_called_once_with(
+            ["http://receiver"],
+            {"weight": ((8,), "float32")},
+            api_key_env_var=None,
+            timeout_s=600.0,
+        )
+        assert sync._baseline_init_refs == []
+
+    def test_merge_refit_info_rejects_conflicting_metadata(self):
+        with pytest.raises(ValueError, match="Conflicting sparse refit metadata"):
+            VllmRemoteSparseWeightSynchronizer._merge_refit_info(
+                [
+                    {"weight": ((8,), "float32")},
+                    {"weight": ((16,), "float32")},
+                ]
+            )
+
     @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
     def test_init_communicator_requires_receiver_endpoints(self, mock_ray):
         policy = MagicMock()
@@ -141,7 +229,10 @@ class TestVllmRemoteSparseWeightSynchronizer:
         assert [
             entry.args[0]
             for entry in generation.worker_group.run_all_workers_single_data.call_args_list
-        ] == ["report_refit_server_base_url", "start_zmq_sparse_refit_relay"]
+        ] == [
+            "report_refit_server_base_url",
+            "start_zmq_sparse_refit_relay",
+        ]
         generation.worker_group.run_all_workers_single_data.assert_any_call(
             "start_zmq_sparse_refit_relay",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],

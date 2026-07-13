@@ -18,6 +18,7 @@ import io
 import re
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from math import prod
 from typing import Any, cast
@@ -87,7 +88,7 @@ class _SparseLoadTracer(TorchDispatchMode):
     def __torch_dispatch__(
         self,
         func: Any,
-        types: Any,
+        _types: Any,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
     ) -> Any:
@@ -194,35 +195,59 @@ class VllmSparseDeltaApplier:
                 copies, log_transform, identity
             )
 
+    def sparse_delta_source_plans(
+        self, metadata: list[dict[str, Any]]
+    ) -> dict[str, sparse_codec.SparseSourcePlan]:
+        """Describe which canonical source views this worker consumes."""
+        self._compile_plans(metadata)
+        return {
+            name: sparse_codec.SparseSourcePlan(
+                routes=tuple(
+                    sparse_codec.SparseSourceRoute(
+                        copy.source_offset,
+                        copy.source_strides,
+                        copy.shape,
+                        copy.linear,
+                    )
+                    for copy in plan.copies
+                ),
+                identity=plan.identity,
+            )
+            for name, plan in (
+                (str(item["name"]), self._plan_cache[str(item["name"])])
+                for item in metadata
+            )
+        }
+
+    def prewarm(
+        self, state_dict_info: Mapping[str, tuple[tuple[int, ...], torch.dtype]]
+    ) -> None:
+        self._compile_plans(
+            [
+                {
+                    "name": name,
+                    "shape": shape,
+                    "dtype": str(dtype).removeprefix("torch."),
+                }
+                for name, (shape, dtype) in state_dict_info.items()
+            ]
+        )
+
     @staticmethod
     def _map_copy(
         locations: torch.Tensor,
         values: torch.Tensor,
         copy: _SparseDeltaCopyPlan,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if copy.linear:
-            end = copy.source_offset + prod(copy.shape)
-            keep = (locations >= copy.source_offset) & (locations < end)
-            return (
-                locations[keep] + copy.target_offset - copy.source_offset,
-                values[keep],
-            )
-        mapped = torch.full_like(locations, copy.target_offset)
-        reconstructed = torch.full_like(locations, copy.source_offset)
-        relative = locations - copy.source_offset
-        for size, source_stride, target_stride in zip(
-            copy.shape, copy.source_strides, copy.target_strides, strict=True
-        ):
-            coordinate = (
-                torch.div(relative, source_stride, rounding_mode="floor").remainder(
-                    size
-                )
-                if size > 1
-                else torch.zeros_like(locations)
-            )
-            reconstructed.add_(coordinate * source_stride)
-            mapped.add_(coordinate * target_stride)
-        keep = reconstructed == locations
+        mapped, keep = sparse_codec.map_sparse_locations(
+            locations,
+            copy.source_offset,
+            copy.source_strides,
+            copy.shape,
+            copy.linear,
+            copy.target_offset,
+            copy.target_strides,
+        )
         return mapped[keep], values[keep]
 
     def _record_verification(
@@ -307,12 +332,12 @@ class VllmSparseDeltaApplier:
         )
         return target.data.view(-1), replacement
 
-    def _apply_item(
+    def _apply_decoded_item(
         self,
         item: dict[str, Any],
         plan: _SparseDeltaTargetPlan,
-        raw_locations: torch.Tensor,
-        raw_value_groups: tuple[torch.Tensor, ...],
+        locations: torch.Tensor,
+        values: torch.Tensor,
     ) -> None:
         operation = sparse_codec.sparse_operation(item["operation"])
         source_dtype = sparse_codec.dtype_from_name(str(item["dtype"]))
@@ -330,8 +355,6 @@ class VllmSparseDeltaApplier:
             )
         if operation == "xor" and self._xor_target_mappings_overlap(plan):
             raise RuntimeError(f"XOR target mappings overlap for {item['name']!r}.")
-        value_start, value_end = int(item["value_start"]), int(item["value_end"])
-        values = raw_value_groups[int(item["value_group"])][value_start:value_end]
         expected_dtype = sparse_codec.integer_dtype_for_element_size(
             source_dtype.itemsize
         )
@@ -344,20 +367,20 @@ class VllmSparseDeltaApplier:
         if plan.identity and item["index_encoding"] == "range":
             if operation == "xor":
                 target = self._integer_flat(first_target)
-                target.narrow(
-                    0, int(item["range_start"]), value_end - value_start
-                ).bitwise_xor_(values)
+                target.narrow(0, int(item["range_start"]), values.numel()).bitwise_xor_(
+                    values
+                )
             else:
                 target, replacement = self._overwrite_target_values(
                     first_target, values, source_dtype, log_transform=False
                 )
-                target.narrow(
-                    0, int(item["range_start"]), value_end - value_start
-                ).copy_(replacement)
+                target.narrow(0, int(item["range_start"]), values.numel()).copy_(
+                    replacement
+                )
             return
 
-        locations = sparse_codec.sparse_locations_for_item(
-            item, raw_locations, device=first_target.device
+        locations = locations.to(
+            device=first_target.device, dtype=torch.int64, non_blocking=True
         )
         if plan.identity:
             if operation == "xor":
@@ -387,70 +410,76 @@ class VllmSparseDeltaApplier:
                 )
                 target.index_copy_(0, mapped, replacement)
 
-    def _apply_sparse_weight_deltas(
-        self,
-        payload_tensors: tuple[torch.Tensor, tuple[torch.Tensor, ...]],
-        metadata: list[dict[str, Any]],
+    def _apply_decoded_sparse_weight_deltas(
+        self, decoded: list[sparse_codec.DecodedSparseItem]
     ) -> None:
-        self._compile_plans(metadata)
-        raw_locations, raw_value_groups = payload_tensors
         with torch.no_grad():
-            for item in metadata:
-                self._apply_item(
+            for item, locations, values in decoded:
+                self._apply_decoded_item(
                     item,
                     self._plan_cache[str(item["name"])],
-                    raw_locations,
-                    raw_value_groups,
+                    locations,
+                    values,
                 )
 
     @wrap_with_nvtx_name(
-        "vllm_internal_worker_extension/update_weights_from_serialized_sparse_payload"
+        "vllm_internal_worker_extension/update_weights_from_decoded_sparse_payload"
     )
-    def update_weights_from_serialized_sparse_payload(
+    def update_weights_from_decoded_sparse_payload(
         self, *serialized_payloads: bytes
     ) -> dict[str, Any]:
-        return self._load_and_apply_sparse_payloads(
+        return self._load_decoded_sparse_payloads(
             tuple(io.BytesIO(payload) for payload in serialized_payloads)
         )
 
-    def _load_and_apply_sparse_payloads(
+    def _load_decoded_sparse_payloads(
         self, sources: tuple[str | io.BytesIO, ...]
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        deserialize_s = sparse_apply_s = 0.0
-        payloads = []
+        deserialize_s = 0.0
+        payloads: list[sparse_codec.DecodedSparsePayload] = []
         for source in sources:
             item_started = time.perf_counter()
             payloads.append(
                 cast(
-                    sparse_codec.TensorPayload,
-                    torch.load(source, map_location="cpu", weights_only=True),
+                    sparse_codec.DecodedSparsePayload,
+                    torch.load(
+                        source,
+                        map_location="cpu",
+                        weights_only=True,
+                        mmap=isinstance(source, str),
+                    ),
                 )
             )
             deserialize_s += time.perf_counter() - item_started
 
         item_started = time.perf_counter()
-        self._compile_plans([item for _, _, metadata in payloads for item in metadata])
+        metadata = [item for _, _, items in payloads for item in items]
+        source_plans = self.sparse_delta_source_plans(metadata)
         plan_s = time.perf_counter() - item_started
-        for locations, values, metadata in payloads:
+        partition_s = sparse_apply_s = 0.0
+        for payload in payloads:
             item_started = time.perf_counter()
-            self._apply_sparse_weight_deltas((locations, values), metadata)
+            selected = sparse_codec.partition_decoded_sparse_entries(
+                sparse_codec.iter_decoded_sparse_payload(payload), source_plans
+            )
+            partition_s += time.perf_counter() - item_started
+            item_started = time.perf_counter()
+            self._apply_decoded_sparse_weight_deltas(selected)
             sparse_apply_s += time.perf_counter() - item_started
         return {
             "ok": True,
             "receiver_deserialize_s": deserialize_s,
             "receiver_plan_s": plan_s,
+            "receiver_partition_s": partition_s,
             "receiver_sparse_apply_s": sparse_apply_s,
             "receiver_total_s": time.perf_counter() - started,
         }
 
-    @wrap_with_nvtx_name(
-        "vllm_internal_worker_extension/update_weights_from_sparse_payload_files"
-    )
-    def update_weights_from_sparse_payload_files(
+    def update_weights_from_decoded_sparse_payload_files(
         self, *payload_paths: str
     ) -> dict[str, Any]:
-        return self._load_and_apply_sparse_payloads(payload_paths)
+        return self._load_decoded_sparse_payloads(payload_paths)
 
     def synchronize_device(self) -> None:
         if torch.cuda.is_available():
@@ -461,51 +490,50 @@ class VllmSparseDeltaApplier:
         self.synchronize_device()
         verification, self._verification = self._verification, []
         candidates, self._verification_candidates = self._verification_candidates, 0
-        if not verification:
-            return {
-                "ok": True,
-                "verification_candidates": candidates,
-                "verification_samples": 0,
-                "verification_exact_mismatches": 0,
-                "verification_mismatches": 0,
-                "verification_abs_sum": 0.0,
-                "verification_max_abs": 0.0,
-            }
-
-        with torch.no_grad():
-            differences = []
-            exact_mismatches = []
-            mismatches = []
-            samples = 0
-            for target, locations, expected_bits in verification:
-                integer_dtype = sparse_codec.integer_dtype_for_element_size(
-                    target.element_size()
+        samples = 0
+        stats = [0.0] * 4
+        if verification:
+            with torch.no_grad():
+                differences = []
+                exact_mismatches = []
+                mismatches = []
+                for target, locations, expected_bits in verification:
+                    integer_dtype = sparse_codec.integer_dtype_for_element_size(
+                        target.element_size()
+                    )
+                    actual_bits = (
+                        target.data.view(integer_dtype)
+                        .view(-1)
+                        .index_select(0, locations)
+                    )
+                    bit_mismatches = actual_bits.ne(expected_bits)
+                    actual = target.data.view(-1).index_select(0, locations).float()
+                    expected = expected_bits.view(target.dtype).float()
+                    difference = torch.where(
+                        bit_mismatches,
+                        (actual - expected).abs(),
+                        torch.zeros_like(actual),
+                    )
+                    differences.append(torch.nan_to_num(difference, nan=float("inf")))
+                    exact_mismatches.append(bit_mismatches)
+                    mismatches.append(
+                        bit_mismatches
+                        & ~torch.isclose(actual, expected, rtol=1e-6, atol=1e-8)
+                    )
+                    samples += actual.numel()
+                difference = torch.cat(differences)
+                stats = (
+                    torch.stack(
+                        (
+                            difference.sum(),
+                            difference.max(),
+                            torch.cat(exact_mismatches).sum().float(),
+                            torch.cat(mismatches).sum().float(),
+                        )
+                    )
+                    .cpu()
+                    .tolist()
                 )
-                actual_bits = (
-                    target.data.view(integer_dtype).view(-1).index_select(0, locations)
-                )
-                bit_mismatches = actual_bits.ne(expected_bits)
-                actual = target.data.view(-1).index_select(0, locations).float()
-                expected = expected_bits.view(target.dtype).float()
-                difference = torch.where(
-                    bit_mismatches, (actual - expected).abs(), torch.zeros_like(actual)
-                )
-                differences.append(torch.nan_to_num(difference, nan=float("inf")))
-                exact_mismatches.append(bit_mismatches)
-                mismatches.append(
-                    bit_mismatches
-                    & ~torch.isclose(actual, expected, rtol=1e-6, atol=1e-8)
-                )
-                samples += actual.numel()
-            difference = torch.cat(differences)
-            stats = torch.stack(
-                (
-                    difference.sum(),
-                    difference.max(),
-                    torch.cat(exact_mismatches).sum().float(),
-                    torch.cat(mismatches).sum().float(),
-                )
-            ).cpu()
         return {
             "ok": True,
             "verification_candidates": candidates,

@@ -20,18 +20,21 @@ import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from typing import Any
 
 import zmq
 
 from nemo_rl.utils.weight_transfer_remote_sparse import (
     SparseDeltaStreamResult,
+    SparsePartitionMode,
     merge_vllm_refit_metrics,
     post_vllm_refit_endpoints,
     refit_env_int,
     sparse_payload_checksum,
     stream_sparse_delta_payloads,
     vllm_refit_api_key,
+    vllm_refit_endpoints,
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     DeltaCompressionTracker,
@@ -161,11 +164,8 @@ class ZmqSparseRefitServer:
         api_key_env_var: str | None,
         timeout_s: float,
     ) -> None:
-        self._refit_endpoints = tuple(
-            f"{url}{G_VLLM_REFIT_ZMQ_PAYLOAD_PATH}"
-            for url in dict.fromkeys(
-                url.strip().rstrip("/") for url in refit_urls if url.strip()
-            )
+        self._refit_endpoints = vllm_refit_endpoints(
+            refit_urls, G_VLLM_REFIT_ZMQ_PAYLOAD_PATH
         )
         if not self._refit_endpoints:
             raise ValueError("ZeroMQ sparse refit requires receiver HTTP URLs.")
@@ -242,12 +242,10 @@ class ZmqSparseRefitServer:
         kind: bytes,
         reply: Mapping[str, Any],
     ) -> None:
-        try:
+        with suppress(zmq.ZMQError):
             socket.send_multipart(
                 [identity, kind, _json_bytes(reply)], flags=zmq.NOBLOCK
             )
-        except zmq.ZMQError:
-            pass
 
     def _parse_data_message(
         self,
@@ -299,28 +297,29 @@ class ZmqSparseRefitServer:
             self._ready.set()
 
             while not self._stop.is_set() or pending:
-                if not self._stop.is_set() and len(pending) < self._payload_workers:
-                    if socket.poll(10, zmq.POLLIN):
-                        frames = socket.recv_multipart()
-                        identity = frames[0] if frames else b""
-                        try:
-                            identity, key, body, metadata = self._parse_data_message(
-                                frames
-                            )
-                            future = payload_executor.submit(
-                                self._fanout,
-                                body,
-                                metadata,
-                                http_executor,
-                            )
-                            pending[future] = (identity, key)
-                        except Exception as exc:
-                            self._send_reply(
-                                socket,
-                                identity,
-                                _NACK,
-                                {"ok": False, "error": str(exc)},
-                            )
+                if (
+                    not self._stop.is_set()
+                    and len(pending) < self._payload_workers
+                    and socket.poll(10, zmq.POLLIN)
+                ):
+                    frames = socket.recv_multipart()
+                    identity = frames[0] if frames else b""
+                    try:
+                        identity, key, body, metadata = self._parse_data_message(frames)
+                        future = payload_executor.submit(
+                            self._fanout,
+                            body,
+                            metadata,
+                            http_executor,
+                        )
+                        pending[future] = (identity, key)
+                    except Exception as exc:
+                        self._send_reply(
+                            socket,
+                            identity,
+                            _NACK,
+                            {"ok": False, "error": str(exc)},
+                        )
 
                 for future, (identity, key) in list(pending.items()):
                     if not future.done():
@@ -361,6 +360,7 @@ def stream_sparse_delta_payloads_via_zmq(
     timeout_s: float,
     shard_rank: int,
     shard_count: int,
+    partition: SparsePartitionMode = "chunks",
 ) -> SparseDeltaStreamResult:
     addresses = [address.strip() for address in refit_targets if address.strip()]
     if not addresses:
@@ -403,4 +403,5 @@ def stream_sparse_delta_payloads_via_zmq(
         transfer_workers=refit_env_int("NRL_REFIT_ZMQ_SEND_WORKERS", default=4),
         shard_rank=shard_rank,
         shard_count=shard_count,
+        partition=partition,
     )

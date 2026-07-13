@@ -26,8 +26,14 @@ from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.weight_transfer_remote_sparse import (
     flush_vllm_refit_urls,
     merge_vllm_refit_metrics,
+    prepare_vllm_sparse_refit_urls,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+
+_REMOTE_SPARSE_TRANSPORTS = {
+    "vllm_s3_sparse": "s3",
+    "vllm_zmq_sparse": "zmq",
+}
 
 
 def validate_vllm_remote_sparse_refit(
@@ -36,9 +42,9 @@ def validate_vllm_remote_sparse_refit(
     colocated: bool,
     megatron_enabled: bool,
 ) -> str | None:
-    """Validate the optional transport without exposing its rules to GRPO."""
+    """Validate the optional config and return its internal transport name."""
     transport = config.get("refit_transport")
-    if transport not in (None, "vllm_s3_sparse", "vllm_zmq_sparse"):
+    if transport is not None and transport not in _REMOTE_SPARSE_TRANSPORTS:
         raise ValueError(f"Unsupported vLLM refit transport {transport!r}.")
     vllm_cfg = config["vllm_cfg"]
     if transport is not None and (
@@ -54,7 +60,7 @@ def validate_vllm_remote_sparse_refit(
             f"{transport} requires a non-colocated Megatron policy, BF16/FP16 "
             "vLLM, delta compression, and an unquantized rollout."
         )
-    return transport
+    return None if transport is None else _REMOTE_SPARSE_TRANSPORTS[transport]
 
 
 class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
@@ -66,6 +72,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         transport: str,
         api_key_env_var: str | None = None,
         request_timeout_s: float = 600.0,
+        baseline_init_refs: list[Any] | None = None,
     ) -> None:
         self._policy = policy
         self._generation = generation
@@ -74,7 +81,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         self._request_timeout_s = request_timeout_s
         self._refit_urls: list[str] = []
         self._targets: list[str] = []
-        self._baseline_init_refs: list[Any] = []
+        self._baseline_init_refs = list(baseline_init_refs or ())
         self._baseline_commit_refs: list[Any] = []
         self._stale = True
 
@@ -237,10 +244,31 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             )
         )
 
-    def init_communicator(self) -> None:
-        self._baseline_init_refs = self._run_policy_workers(
-            "init_remote_sparse_delta_baseline", transport=self._transport
+    @staticmethod
+    def start_baseline(policy: Any, transport: str) -> list[Any]:
+        workers = policy.worker_group
+        count = len(workers.workers)
+        return workers.run_all_workers_multiple_data(
+            "init_remote_sparse_delta_baseline",
+            common_kwargs={"transport": transport, "shard_count": count},
+            shard_rank=list(range(count)),
         )
+
+    @staticmethod
+    def _merge_refit_info(parts: list[dict[str, Any]]) -> dict[str, Any]:
+        merged = {}
+        for part in parts:
+            for name, info in part.items():
+                if name in merged and merged[name] != info:
+                    raise ValueError(f"Conflicting sparse refit metadata for {name!r}.")
+                merged[name] = info
+        return merged
+
+    def init_communicator(self) -> None:
+        if not self._baseline_init_refs:
+            self._baseline_init_refs = self.start_baseline(
+                self._policy, self._transport
+            )
         self._refit_urls = [
             url
             for url in self._run_generation_workers("report_refit_server_base_url")
@@ -259,6 +287,16 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             raise ValueError(
                 f"vLLM {self._transport} sparse refit endpoints are missing."
             )
+        state_dict_info = self._merge_refit_info(
+            ray.get(list(self._baseline_init_refs))
+        )
+        self._baseline_init_refs.clear()
+        prepare_vllm_sparse_refit_urls(
+            self._refit_urls,
+            state_dict_info,
+            api_key_env_var=self._api_key_env_var,
+            timeout_s=self._request_timeout_s,
+        )
         self._stale = False
 
     def shutdown(self) -> None:

@@ -907,7 +907,7 @@ def setup(
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
-    refit_transport = None
+    remote_transport = None
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
@@ -1007,6 +1007,8 @@ def setup(
             )
         return mg, time.perf_counter() - t0
 
+    init_policy_for_generation = init_policy
+
     def initialize_generation_with_policy(
         init_generation_fn,
         generation_name: str,
@@ -1040,7 +1042,7 @@ def setup(
             parallel_start_time = time.perf_counter()
             with ThreadPoolExecutor(max_workers=2) as executor:
                 generation_future = executor.submit(init_generation_fn)
-                policy_future = executor.submit(init_policy)
+                policy_future = executor.submit(init_policy_for_generation)
                 policy_generation, generation_time = generation_future.result()
                 policy, policy_time = policy_future.result()
             parallel_wall_time = time.perf_counter() - parallel_start_time
@@ -1062,7 +1064,7 @@ def setup(
             policy_generation, generation_time = init_generation_fn()
             worker_init_timing_metrics[init_time_key] = generation_time
 
-            policy, policy_time = init_policy()
+            policy, policy_time = init_policy_for_generation()
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
             worker_init_timing_metrics["parallel_init_enabled"] = 0.0
 
@@ -1096,6 +1098,7 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
+        remote_baseline_init_refs: list[Any] = []
         if generation_config.get("refit_transport") is not None:
             # Keep optional remote transport dependencies off the default path.
             from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
@@ -1103,11 +1106,23 @@ def setup(
                 validate_vllm_remote_sparse_refit,
             )
 
-            refit_transport = validate_vllm_remote_sparse_refit(
-                generation_config,
-                colocated=colocated_inference,
-                megatron_enabled=policy_config["megatron_cfg"]["enabled"],
+            remote_transport = cast(
+                str,
+                validate_vllm_remote_sparse_refit(
+                    generation_config,
+                    colocated=colocated_inference,
+                    megatron_enabled=policy_config["megatron_cfg"]["enabled"],
+                ),
             )
+
+            def init_policy_for_generation():
+                policy, policy_time = init_policy()
+                remote_baseline_init_refs.extend(
+                    VllmRemoteSparseWeightSynchronizer.start_baseline(
+                        policy, remote_transport
+                    )
+                )
+                return policy, policy_time
 
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config.use_importance_sampling_correction, (
@@ -1174,13 +1189,13 @@ def setup(
 
                 def init_vllm_then_policy():
                     pg, vllm_t = init_vllm_deferred()
-                    p, policy_t = init_policy()
+                    p, policy_t = init_policy_for_generation()
                     return pg, vllm_t, p, policy_t
 
                 init_tasks["vllm_policy"] = init_vllm_then_policy
             else:
                 init_tasks["vllm"] = init_vllm_deferred
-                init_tasks["policy"] = init_policy
+                init_tasks["policy"] = init_policy_for_generation
             init_tasks["nemo_gym"] = init_nemo_gym
 
             print(
@@ -1246,7 +1261,7 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference and refit_transport is None:
+    if not colocated_inference and remote_transport is None:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -1285,19 +1300,20 @@ def setup(
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    if refit_transport is not None:
+    if remote_transport is not None:
         t0 = time.perf_counter()
         assert isinstance(policy_generation, VllmGeneration)
         policy_generation.weight_synchronizer = VllmRemoteSparseWeightSynchronizer(
             policy,
             policy_generation,
-            transport=refit_transport.removeprefix("vllm_").removesuffix("_sparse"),
+            transport=remote_transport,
             api_key_env_var=generation_config["vllm_cfg"].get(
                 "http_refit_api_key_env_var"
             ),
+            baseline_init_refs=remote_baseline_init_refs,
         )
         policy_generation.weight_synchronizer.init_communicator()
-        worker_init_timing_metrics[f"{refit_transport}_init_time_s"] = (
+        worker_init_timing_metrics[f"vllm_{remote_transport}_sparse_init_time_s"] = (
             time.perf_counter() - t0
         )
     else:

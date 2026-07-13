@@ -15,6 +15,7 @@
 import math
 from types import MethodType, SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -24,8 +25,13 @@ from nemo_rl.models.generation.vllm.vllm_sparse_delta import (
     _SparseLoadTracer,
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import (
+    SparseSourcePlan,
+    SparseSourceRoute,
+    decode_sparse_tensor_payload_for_staging,
     encode_sparse_infos,
     integer_dtype_for_element_size,
+    iter_decoded_sparse_payload,
+    partition_decoded_sparse_entries,
 )
 
 
@@ -83,39 +89,226 @@ def _bits(values: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _decode_staged(payload: Any) -> list[Any]:
+    return list(
+        iter_decoded_sparse_payload(decode_sparse_tensor_payload_for_staging(payload))
+    )
+
+
+def _apply_payload(applier: VllmSparseDeltaApplier, payload: Any) -> None:
+    decoded = _decode_staged(payload)
+    plans = applier.sparse_delta_source_plans([item for item, _, _ in decoded])
+    applier._apply_decoded_sparse_weight_deltas(
+        partition_decoded_sparse_entries(decoded, plans)
+    )
+
+
+def test_sparse_plan_prewarm_uses_native_loader_without_applying_values() -> None:
+    target = torch.zeros(8)
+    applier = _applier(_NativeLoaderModel(identity=target))
+
+    applier.prewarm({"weight": ((8,), torch.float32)})
+
+    assert applier._plan_cache["weight"].identity
+    assert torch.equal(target, torch.zeros_like(target))
+
+
+def test_canonical_payload_is_partitioned_by_worker_source_plan() -> None:
+    tensor = torch.empty((8, 2), dtype=torch.float32)
+    locations = torch.tensor([1, 3, 8, 13])
+    values = _bits(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    payload = encode_sparse_infos([("weight", tensor, locations, values, "overwrite")])
+    payload[2][0].update(
+        verification_locations=[1, 13],
+        verification_values=[int(values[0]), int(values[3])],
+    )
+    decoded = _decode_staged(payload)
+
+    first = partition_decoded_sparse_entries(
+        decoded,
+        {
+            "weight": SparseSourcePlan(
+                routes=(SparseSourceRoute(0, (2, 1), (4, 2), True),)
+            )
+        },
+    )
+    second = partition_decoded_sparse_entries(
+        decoded,
+        {
+            "weight": SparseSourcePlan(
+                routes=(SparseSourceRoute(8, (2, 1), (4, 2), True),)
+            )
+        },
+    )
+
+    first_item, first_locations, first_values = first[0]
+    second_item, second_locations, second_values = second[0]
+    assert first_locations.tolist() == [1, 3]
+    assert first_values.tolist() == values[:2].tolist()
+    assert first_item["verification_locations"] == [1]
+    assert second_locations.tolist() == [8, 13]
+    assert second_values.tolist() == values[2:].tolist()
+    assert second_item["verification_locations"] == [13]
+
+
+def test_canonical_payload_partition_handles_strided_source_view() -> None:
+    values = torch.arange(8, dtype=torch.int32)
+    payload = encode_sparse_infos(
+        [
+            (
+                "weight",
+                torch.empty((8,), dtype=torch.float32),
+                torch.arange(8),
+                values,
+                "overwrite",
+            )
+        ]
+    )
+    partition = partition_decoded_sparse_entries(
+        _decode_staged(payload),
+        {
+            "weight": SparseSourcePlan(
+                routes=(SparseSourceRoute(1, (4, 1), (2, 2), False),)
+            )
+        },
+    )
+
+    _, locations, selected = partition[0]
+    assert locations.tolist() == [1, 2, 5, 6]
+    assert selected.tolist() == values[[1, 2, 5, 6]].tolist()
+
+
+def test_canonical_payload_partitions_row_shards() -> None:
+    values = torch.arange(16, dtype=torch.int32)
+    payload = encode_sparse_infos(
+        [
+            (
+                "weight",
+                torch.empty((2, 8), dtype=torch.float32),
+                torch.arange(16),
+                values,
+                "overwrite",
+            )
+        ]
+    )
+    left = SparseSourcePlan(routes=(SparseSourceRoute(0, (8, 1), (2, 4), False),))
+    right = SparseSourcePlan(routes=(SparseSourceRoute(4, (8, 1), (2, 4), False),))
+    expected = {0: [0, 1, 2, 3, 8, 9, 10, 11], 1: [4, 5, 6, 7, 12, 13, 14, 15]}
+    for rank, plan in ((0, left), (1, right)):
+        _, locations, selected = partition_decoded_sparse_entries(
+            _decode_staged(payload), {"weight": plan}
+        )[0]
+        assert locations.tolist() == expected[rank]
+        assert selected.tolist() == values[expected[rank]].tolist()
+
+
 @pytest.mark.vllm
-def test_serialized_sparse_payload_batch_preserves_order(tmp_path) -> None:
+def test_backend_applies_decoded_sparse_payload_files() -> None:
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    applier = MagicMock()
+    applier.update_weights_from_decoded_sparse_payload.return_value = {"ok": True}
+    applier.update_weights_from_decoded_sparse_payload_files.return_value = {"ok": True}
+    ext._get_sparse_delta_applier = MagicMock(return_value=applier)
+
+    ext.prepare_sparse_delta_refit_info({"weight": ((8,), torch.float32)})
+
+    assert ext.update_weights_from_decoded_sparse_payload(b"payload") == {"ok": True}
+    assert ext.update_weights_from_decoded_sparse_payload_files("first", "second") == {
+        "ok": True
+    }
+    applier.update_weights_from_decoded_sparse_payload.assert_called_once_with(
+        b"payload"
+    )
+    applier.update_weights_from_decoded_sparse_payload_files.assert_called_once_with(
+        "first", "second"
+    )
+    applier.prewarm.assert_called_once_with({"weight": ((8,), torch.float32)})
+
+
+@pytest.mark.vllm
+def test_sparse_payload_batches_preserve_order(tmp_path) -> None:
     applier = VllmSparseDeltaApplier(SimpleNamespace(), torch.device("cpu"))
-    payloads = [
+    decoded_paths = [tmp_path / f"decoded-{index}.pt" for index in range(3)]
+    decoded_payloads = [
         (
-            torch.tensor([index]),
-            (torch.tensor([float(index)]),),
-            [{"index": index}],
+            (
+                torch.tensor([index], dtype=torch.int32),
+                torch.empty(0, dtype=torch.int64),
+            ),
+            (torch.tensor([index]),),
+            [
+                {
+                    "name": "weight",
+                    "index": index,
+                    "decoded_location_group": 0,
+                    "decoded_location_start": 0,
+                    "decoded_location_end": 1,
+                    "value_group": 0,
+                    "value_start": 0,
+                    "value_end": 1,
+                }
+            ],
         )
         for index in range(3)
     ]
-    paths = [tmp_path / f"{index}.pt" for index in range(3)]
-    for path, payload in zip(paths, payloads, strict=True):
+    for path, payload in zip(decoded_paths, decoded_payloads, strict=True):
         torch.save(payload, path)
-    applied: list[Any] = []
-    compiled: list[Any] = []
-    applier._compile_plans = compiled.append
-    applier._apply_sparse_weight_deltas = lambda tensors, metadata: applied.append(
-        (*tensors, metadata)
+    decoded_applied: list[Any] = []
+    applier.sparse_delta_source_plans = lambda _metadata: {
+        "weight": SparseSourcePlan(identity=True)
+    }
+    applier._apply_decoded_sparse_weight_deltas = decoded_applied.append
+    result = applier.update_weights_from_decoded_sparse_payload(
+        *(path.read_bytes() for path in decoded_paths)
+    )
+    decoded_result = applier.update_weights_from_decoded_sparse_payload_files(
+        *(str(path) for path in reversed(decoded_paths))
     )
 
-    result = applier.update_weights_from_sparse_payload_files(
-        *(str(path) for path in paths)
-    )
-    applier.update_weights_from_serialized_sparse_payload(
-        *(path.read_bytes() for path in paths)
-    )
-
-    assert [[item["index"] for item in batch] for batch in compiled] == [[0, 1, 2]] * 2
-    assert [item[2][0]["index"] for item in applied] == [0, 1, 2] * 2
+    assert [payload[0][0]["index"] for payload in decoded_applied] == [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+    ]
     assert result["receiver_deserialize_s"] >= 0.0
     assert result["receiver_plan_s"] >= 0.0
     assert result["receiver_sparse_apply_s"] >= 0.0
+    assert decoded_result["receiver_deserialize_s"] >= 0.0
+    assert decoded_result["receiver_partition_s"] >= 0.0
+
+
+@pytest.mark.vllm
+def test_decoded_sparse_payload_converts_compact_locations_for_apply(tmp_path) -> None:
+    target = torch.zeros(8)
+    payload = encode_sparse_infos(
+        [
+            (
+                "weight",
+                target,
+                torch.tensor([1, 5]),
+                _bits(torch.tensor([2.0, 6.0])),
+                "overwrite",
+            )
+        ]
+    )
+    decoded = decode_sparse_tensor_payload_for_staging(payload)
+    assert decoded[0][0].dtype == torch.int32
+    path = tmp_path / "decoded.pt"
+    torch.save(decoded, path)
+
+    result = _applier(
+        _NativeLoaderModel(identity=target)
+    ).update_weights_from_decoded_sparse_payload_files(str(path))
+
+    assert torch.equal(target, torch.tensor([0.0, 2.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0]))
+    assert result["receiver_partition_s"] >= 0.0
 
 
 @pytest.mark.vllm
@@ -174,7 +367,8 @@ def test_native_loaders_compile_sparse_placement() -> None:
     )
 
     applier = _applier(_NativeLoaderModel(**targets))
-    applier._apply_sparse_weight_deltas(payload[:2], payload[2])
+    _apply_payload(applier, payload)
+    plans = applier.sparse_delta_source_plans(payload[2])
     verification = applier.finish_sparse_delta_refit()
 
     assert torch.equal(targets["identity"], torch.tensor([0.0, 1.0, 2.0, 0.0]))
@@ -184,7 +378,10 @@ def test_native_loaders_compile_sparse_placement() -> None:
     assert targets["w2"].view(-1)[[8, 11, 12, 15]].tolist() == [5, 5, 5, 5]
     assert targets["mamba"].view(-1)[[0, 3, 4, 11]].tolist() == [6, 6, 6, 6]
     assert torch.allclose(targets["a"], torch.tensor([-3.0, -2.0]))
-    assert verification["verification_candidates"] == 3
+    assert plans["model.layers.0.self_attn.k_proj.weight"].routes == (
+        SparseSourceRoute(4, (2, 1), (2, 2), True),
+    )
+    assert verification["verification_candidates"] == 2
     assert verification["verification_samples"] == 2
     assert verification["verification_exact_mismatches"] == 0
 
@@ -244,9 +441,7 @@ def test_xor_applies_through_packed_native_loaders() -> None:
         ]
     )
 
-    _applier(_NativeLoaderModel(**targets))._apply_sparse_weight_deltas(
-        payload[:2], payload[2]
-    )
+    _apply_payload(_applier(_NativeLoaderModel(**targets)), payload)
 
     assert targets["qkv"].view(-1)[[8, 9, 11]].tolist() == [1.0, 1.0, 1.0]
     assert targets["merged"].view(-1)[[0, 1, 7, 8, 15]].tolist() == [2, 2, 2, 3, 3]
@@ -361,7 +556,7 @@ def test_unknown_native_loader_fails_closed() -> None:
             ],
         )
         with pytest.raises(RuntimeError, match=error):
-            _applier(model)._apply_sparse_weight_deltas(payload[:2], payload[2])
+            _apply_payload(_applier(model), payload)
 
 
 @pytest.mark.vllm
@@ -381,9 +576,7 @@ def test_unknown_sparse_operation_fails_closed() -> None:
     payload[2][0]["operation"] = "unknown"
 
     with pytest.raises(ValueError, match="Unsupported sparse-refit operation"):
-        _applier(_NativeLoaderModel(identity=target))._apply_sparse_weight_deltas(
-            payload[:2], payload[2]
-        )
+        _apply_payload(_applier(_NativeLoaderModel(identity=target)), payload)
 
 
 @pytest.mark.vllm
@@ -421,7 +614,7 @@ def test_sparse_delta_verification_compares_replacement(
     )
     applier = _applier(_NativeLoaderModel(identity=target))
 
-    applier._apply_sparse_weight_deltas(payload[:2], payload[2])
+    _apply_payload(applier, payload)
     result = applier.finish_sparse_delta_refit()
 
     assert torch.equal(target, torch.tensor([1.0, initial + 4.0, 3.0, initial + 4.0]))
@@ -469,8 +662,8 @@ def test_fp8_weight_and_scale_use_exact_bit_overwrite() -> None:
     )
     applier = _applier(_NativeLoaderModel(identity=target, scale=scale))
 
-    applier._apply_sparse_weight_deltas(payload[:2], payload[2])
-    applier._apply_sparse_weight_deltas(payload[:2], payload[2])
+    _apply_payload(applier, payload)
+    _apply_payload(applier, payload)
     result = applier.finish_sparse_delta_refit()
 
     assert target.view(torch.uint8).tolist() == [0x38, 0x41, 0x7F]
@@ -495,14 +688,14 @@ def test_xor_applies_exact_bits_and_replay_reverts() -> None:
     )
     applier = _applier(_NativeLoaderModel(identity=target))
 
-    applier._apply_sparse_weight_deltas(payload[:2], payload[2])
+    _apply_payload(applier, payload)
     result = applier.finish_sparse_delta_refit()
 
     assert torch.equal(_bits(target), _bits(current))
     assert result["verification_exact_mismatches"] == 0
     assert result["verification_mismatches"] == 0
 
-    applier._apply_sparse_weight_deltas(payload[:2], payload[2])
+    _apply_payload(applier, payload)
     assert torch.equal(_bits(target), _bits(baseline))
 
 
@@ -522,9 +715,7 @@ def test_overwrite_casts_absolute_source_values() -> None:
         ]
     )
 
-    _applier(_NativeLoaderModel(identity=target))._apply_sparse_weight_deltas(
-        payload[:2], payload[2]
-    )
+    _apply_payload(_applier(_NativeLoaderModel(identity=target)), payload)
 
     assert torch.equal(target, source.to(torch.float16))
 
@@ -558,9 +749,7 @@ def test_xor_rejects_non_bitwise_compatible_targets(
     )
 
     with pytest.raises(RuntimeError, match=error):
-        _applier(_NativeLoaderModel(**targets))._apply_sparse_weight_deltas(
-            payload[:2], payload[2]
-        )
+        _apply_payload(_applier(_NativeLoaderModel(**targets)), payload)
 
 
 @pytest.mark.vllm
@@ -589,6 +778,4 @@ def test_xor_rejects_overlapping_target_mappings() -> None:
     )
 
     with pytest.raises(RuntimeError, match="target mappings overlap"):
-        _applier(RepeatedCopyModel())._apply_sparse_weight_deltas(
-            payload[:2], payload[2]
-        )
+        _apply_payload(_applier(RepeatedCopyModel()), payload)

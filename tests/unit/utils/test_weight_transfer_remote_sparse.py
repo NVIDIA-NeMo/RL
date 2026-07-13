@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,9 +23,13 @@ import torch
 import zstandard
 
 from nemo_rl.utils import weight_transfer_remote_sparse, weight_transfer_zmq
-from nemo_rl.utils.weight_transfer_remote_sparse import download_s3_refit_payload
+from nemo_rl.utils.weight_transfer_remote_sparse import (
+    download_s3_refit_payload,
+    sparse_payload_checksum,
+)
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     DeltaCompressionTracker,
+    SparseShardProjection,
     _bytewise_diff_mask,
     encode_sparse_infos,
     sparse_locations_for_item,
@@ -36,7 +41,6 @@ from nemo_rl.utils.weight_transfer_zmq import (
     G_VLLM_REFIT_TRANSFER_HEADER,
     ZmqSparseRefitClient,
     ZmqSparseRefitServer,
-    sparse_payload_checksum,
 )
 
 
@@ -45,7 +49,20 @@ class _SparsePipelineTracker:
 
     @staticmethod
     def prepare_sparse_delta_payload(chunk):
-        return (chunk, torch.ones(1), [1]), 1, 1
+        count = sum(tensor.numel() for _, tensor in chunk)
+        payload = encode_sparse_infos(
+            (
+                (
+                    name,
+                    tensor,
+                    torch.arange(tensor.numel()),
+                    tensor.reshape(-1),
+                    "overwrite",
+                )
+                for name, tensor in chunk
+            )
+        )
+        return payload, count, count
 
 
 def _stream_sparse_test_payloads(tensors, send_payload):
@@ -78,6 +95,22 @@ def test_delta_tracker_commits_only_successful_syncs(monkeypatch) -> None:
     assert tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
     tracker.on_sync_succeeded()
     assert not tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
+
+
+def test_delta_tracker_change_summary_is_transactional(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+    tracker = _delta_tracker()
+    first = torch.tensor([1.0, 2.0])
+    second = torch.tensor([3.0, 4.0])
+    tensors = [("first", first), ("second", second)]
+    tracker.snapshot_baseline(tensors)
+    second[0] = 5
+
+    assert tracker.prepare_change_summary(tensors) == ({"second"}, 1, 4)
+    tracker.on_sync_failed()
+    assert tracker.prepare_change_summary(tensors) == ({"second"}, 1, 4)
+    tracker.on_sync_succeeded()
+    assert tracker.prepare_change_summary(tensors) == (set(), 0, 4)
 
 
 def test_delta_tracker_emits_bounded_delta_samples(monkeypatch) -> None:
@@ -140,6 +173,45 @@ def test_delta_tracker_xor_encodes_against_baseline(monkeypatch) -> None:
     tracker.on_sync_succeeded()
     tracker.prepare_sparse_delta_payload([("weight", tensor)])
     assert torch.equal(tracker.baseline["weight"], tensor)
+
+
+@pytest.mark.parametrize(
+    ("projection", "expected_locations"),
+    [
+        (SparseShardProjection("hf.weight", (2, 4), (0, 2)), [2, 7]),
+        (SparseShardProjection("hf.weight", (4, 2), (2, 0)), [4, 7]),
+    ],
+)
+def test_delta_tracker_projects_local_shards_to_hf_locations(
+    monkeypatch,
+    projection: SparseShardProjection,
+    expected_locations: list[int],
+) -> None:
+    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+    monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
+    tracker = DeltaCompressionTracker(
+        {"encoding": "overwrite", "sparse_bucket_size_bytes": 1024},
+        projections={"local.weight": projection},
+    )
+    tensor = torch.zeros(2, 2)
+    tracker.snapshot_baseline([("local.weight", tensor)])
+    tensor[0, 0] = 1
+    tensor[1, 1] = 2
+
+    (locations, _, metadata), changed, total = tracker.prepare_sparse_delta_payload(
+        [("local.weight", tensor)]
+    )
+
+    assert (changed, total) == (2, 4)
+    assert metadata[0]["name"] == "hf.weight"
+    assert metadata[0]["shape"] == projection.global_shape
+    assert metadata[0]["verification_locations"] == expected_locations
+    assert (
+        sparse_locations_for_item(metadata[0], locations, device="cpu").tolist()
+        == expected_locations
+    )
+    tracker.on_sync_succeeded()
+    assert not tracker.prepare_sparse_delta_payload([("local.weight", tensor)])[0][2]
 
 
 def test_sparse_index_encoding_preserves_uint64_locations() -> None:
@@ -230,7 +302,7 @@ def test_s3_download_verifies_checksum(monkeypatch) -> None:
     monkeypatch.setattr(
         weight_transfer_remote_sparse,
         "_get_manifest_s3_store",
-        lambda *_args: SimpleNamespace(get=lambda _key: compressed),
+        lambda *_args: SimpleNamespace(get=lambda _key: bytearray(compressed)),
     )
     manifest = {
         "bucket": "bucket",
@@ -254,6 +326,34 @@ def test_refit_http_session_does_not_retry_application_errors() -> None:
 
     assert 500 not in retry.status_forcelist
     assert {502, 503, 504} <= set(retry.status_forcelist)
+
+
+def test_prepare_sparse_refit_urls_serializes_metadata(monkeypatch) -> None:
+    posts = []
+    monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
+    monkeypatch.setattr(
+        weight_transfer_remote_sparse,
+        "post_vllm_refit_endpoints",
+        lambda *args, **kwargs: posts.append((args, kwargs)) or [{"ok": True}],
+    )
+
+    result = weight_transfer_remote_sparse.prepare_vllm_sparse_refit_urls(
+        [" http://receiver/ "],
+        {"weight": ((2, 3), torch.bfloat16)},
+        api_key_env_var="NRL_TEST_REFIT_KEY",
+        timeout_s=7.0,
+    )
+
+    assert result == [{"ok": True}]
+    assert posts == [
+        (
+            (
+                ["http://receiver/nemo-rl/refit/prepare"],
+                {"tensors": {"weight": [[2, 3], "bfloat16"]}},
+            ),
+            {"api_key": "secret", "timeout_s": 7.0},
+        )
+    ]
 
 
 def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
@@ -306,6 +406,53 @@ def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
     assert exported == list(range(4))
 
 
+def test_sparse_stream_coalesces_export_chunks(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "2")
+    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
+    tracker = _delta_tracker()
+    tracker.sparse_bucket_size_bytes = 8
+    tensors = [(f"weight-{index}", torch.zeros(1)) for index in range(4)]
+    tracker.snapshot_baseline(tensors)
+    for _, tensor in tensors:
+        tensor.fill_(1)
+    payloads = {}
+
+    def send(body, payload_index):
+        raw = zstandard.ZstdDecompressor().decompress(body)
+        payloads[payload_index] = torch.load(
+            io.BytesIO(raw), map_location="cpu", weights_only=True
+        )
+        return {"receiver": {}}
+
+    result = weight_transfer_remote_sparse.stream_sparse_delta_payloads(
+        tensors,
+        delta_tracker=tracker,
+        transport="zmq",
+        send_payload=send,
+        transfer_workers=1,
+        shard_rank=0,
+        shard_count=1,
+        partition="none",
+    )
+
+    assert result == {"payloads": 2, "changed_elements": 4, "total_elements": 4}
+    payload_names = [
+        [item["name"] for item in payloads[index][2]] for index in sorted(payloads)
+    ]
+    assert all(len(names) == 2 for names in payload_names)
+    assert sorted(name for names in payload_names for name in names) == [
+        f"weight-{index}" for index in range(4)
+    ]
+    for locations, value_groups, metadata in payloads.values():
+        for item in metadata:
+            assert sparse_locations_for_item(
+                item, locations, device="cpu"
+            ).tolist() == [0]
+            assert value_groups[item["value_group"]][
+                item["value_start"] : item["value_end"]
+            ].tolist() == [1065353216]
+
+
 def test_sparse_baseline_snapshots_only_owned_export_chunks(
     monkeypatch, capsys
 ) -> None:
@@ -331,6 +478,60 @@ def test_sparse_baseline_snapshots_only_owned_export_chunks(
 
     assert tracker.names == ["weight-1", "weight-3"]
     assert "chunks=4" in capsys.readouterr().out
+
+    tracker = Tracker()
+    weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
+        [(f"weight-{index}", torch.tensor([float(index)])) for index in range(4)],
+        delta_tracker=tracker,
+        shard_rank=1,
+        shard_count=2,
+        transport="zmq",
+        partition="none",
+    )
+    assert tracker.names == [f"weight-{index}" for index in range(4)]
+
+
+def test_sparse_name_partition_is_stable_for_filtered_exports(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
+
+    class Tracker:
+        sparse_bucket_size_bytes = 4
+
+        def __init__(self) -> None:
+            self.names = []
+
+        def snapshot_baseline(self, chunk) -> None:
+            self.names.extend(name for name, _tensor in chunk)
+
+    tensors = [(f"weight-{index}", torch.tensor([float(index)])) for index in range(8)]
+    owners = []
+    for rank in range(2):
+        tracker = Tracker()
+        weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
+            tensors,
+            delta_tracker=tracker,
+            shard_rank=rank,
+            shard_count=2,
+            transport="zmq",
+            partition="names",
+        )
+        owners.append(set(tracker.names))
+
+    assert owners[0].isdisjoint(owners[1])
+    assert owners[0] | owners[1] == {name for name, _tensor in tensors}
+
+    filtered = tensors[::2]
+    for rank in range(2):
+        tracker = Tracker()
+        weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
+            filtered,
+            delta_tracker=tracker,
+            shard_rank=rank,
+            shard_count=2,
+            transport="zmq",
+            partition="names",
+        )
+        assert set(tracker.names) == owners[rank] & {name for name, _tensor in filtered}
 
 
 def test_s3_manifest_transport_validates_configuration(monkeypatch) -> None:

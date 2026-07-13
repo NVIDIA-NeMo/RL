@@ -1,10 +1,12 @@
 # Remote Sparse-Delta vLLM Refit
 
 Remote sparse-delta refit updates non-colocated vLLM workers without sending a
-full checkpoint after every optimizer step. Megatron workers export Hugging
-Face (HF) weights, compare them with a sharded CPU baseline, and send changed
-locations and byte-encoded values through S3 or ZeroMQ. vLLM maps those HF
-coordinates into its local TP and EP layouts and applies the updates in place.
+full checkpoint after every optimizer step. Megatron workers compare every
+uniquely owned MCore tensor against a policy-local CPU baseline. Exact affine
+mappings emit sparse Hugging Face (HF) coordinates directly; only changed tasks
+whose conversion is not affine traverse Megatron Bridge. S3 or ZeroMQ carries
+the resulting payloads, and vLLM maps the HF coordinates into its local TP and
+EP layout before applying them in place.
 
 The feature is opt-in. Its synchronizer, codec, transports, receiver queue, and
 placement engine are separate from existing NCCL, CUDA IPC, and packed refit
@@ -31,11 +33,15 @@ the global flush completes.
 ```mermaid
 flowchart LR
   subgraph P["Megatron policy cluster"]
-    B["Megatron Bridge HF export"]
-    C["Sharded CPU or mmap baseline"]
+    T["Bridge conversion-task metadata"]
+    L["All unique MCore shards"]
+    B["Changed residual Bridge export"]
+    C["Local source and sharded HF baselines"]
     E["Compare, encode, and compress"]
+    T --> L
+    T --> B
+    L --> C
     B --> C
-    B --> E
     C --> E
   end
 
@@ -44,7 +50,7 @@ flowchart LR
 
   subgraph G["vLLM generation cluster"]
     H["HTTP receiver"]
-    Q["Bounded FIFO apply queue"]
+    Q["Eager node staging and bounded FIFO apply queue"]
     A["Sparse placement and apply"]
     H --> Q --> A
   end
@@ -70,12 +76,39 @@ and commit protocol.*
 
 ### Initialize the baseline
 
-`VllmRemoteSparseWeightSynchronizer.init_communicator()` starts baseline
-construction on every policy worker and then discovers the vLLM HTTP endpoints.
-Each worker participates in the HF export but stores only chunks assigned by
-`chunk_index % shard_count`. The baseline is therefore sharded across policy
-workers. It uses file-backed `torch.from_file` tensors by default;
-`NRL_REFIT_BASELINE_IN_MEMORY=1` keeps it in RAM.
+The policy initialization task starts baseline construction as soon as its
+workers are ready, while the independent vLLM model load continues.
+`VllmRemoteSparseWeightSynchronizer.init_communicator()` discovers the receiver
+endpoints and then joins the prelaunched baseline before setup returns. The
+first rollout therefore does not enter a redundant weight sync or race an
+unfinished snapshot with policy training. Conversion tasks are split into two
+deterministic paths without changing Megatron Bridge:
+
+- Every conversion task keeps its source baseline in MCore layout. A stable name
+  hash assigns replicated dense tensors across their combined DP/CP and TP
+  replicas, and expert tensors across their expert-DP replicas. TP, PP, EP, and
+  ETP still contribute their unique shards. This keeps exactly one source copy
+  while sharing baseline scans and uploads across equivalent ranks.
+- Exact direct, column, row, replicated, and gated mappings use that baseline
+  to produce HF-coordinate deltas without Bridge export. The decision is based
+  on the resolved Bridge mapping type, not a model name or weight suffix.
+- Tasks with a transform also keep a canonical HF baseline, sharded across
+  workers by a stable hash of the HF name. Stable ownership is required because
+  later refits export only changed residual tasks and therefore have a different
+  chunk sequence.
+
+The local baselines contain one copy of each unique source element across the
+policy workers, rather than a full HF copy per DP replica. Residual tasks have
+one additional canonical HF copy distributed across the workers. Baselines use
+file-backed `torch.from_file` tensors by default;
+`NRL_REFIT_BASELINE_IN_MEMORY=1` keeps them in RAM. Local snapshotting and the
+residual Bridge export run concurrently.
+
+Baseline initialization also returns each canonical tensor's name, shape, and
+dtype. The synchronizer merges that metadata and asks every vLLM worker to
+compile its native weight-loader placement plan before the first transfer.
+This does not export HF values or mutate vLLM weights; it moves loader tracing
+and plan validation out of the first timed refit.
 
 On a fresh run, vLLM already holds the shared checkpoint. Baseline construction
 starts early and can overlap initial generation, so the redundant initial full
@@ -83,24 +116,67 @@ sync is skipped. On resume, both clusters must still start from the same HF
 weight version; sparse refit does not reconstruct a rollout baseline from an
 arbitrary training checkpoint.
 
-### Export and encode deltas
+### Compare and encode deltas
 
-Every refit still traverses `MegatronBridge.export_hf_weights()`. Sharding the
-baseline avoids duplicate baseline storage and payload production, but it does
-not remove Bridge export or the full CPU comparison. Low changed density mainly
-reduces encoded and transferred bytes.
+Every uniquely owned local tensor is copied to CPU and compared bytewise. For
+an affine mapping, changed flat locations are mapped into the unsharded HF
+tensor using the TP or ETP rank, shard dimension, and EP-global expert number.
+This covers more than FFNs: attention output projections, Mamba affine weights,
+norms, routers, shared experts, and other exact mappings use the same path.
+
+For non-affine tasks, one integer flag per conversion task is reduced across the
+policy world. Bridge exports only globally changed tasks, after which the
+canonical HF tracker computes the sparse payload. If one member of a grouped
+export changes, the complete group is exported. A model-specific Bridge
+postprocessor can have undeclared cross-task dependencies, so such bridges keep
+the full residual task set whenever any residual task changes. Compound QKV,
+Mamba packing, permutations, grouped or fused exports, padded or tied
+embeddings, and other custom transformations therefore retain Bridge semantics.
+
+Policy-local comparison removes full-tensor TP/EP gathers and PP broadcasts for
+directly projectable weights, but comparison itself is still proportional to
+model size: every unique local element is copied to CPU and scanned. Let `P` be
+directly projectable bytes, `R` residual source bytes, `R_changed` the residual
+HF tensors selected by the task flags, and `s` the element change fraction. The
+leading work is approximately:
+
+```text
+old: Bridge(P + R) + HF D2H/scan(P + R) + wire(s(P + R))
+new: local D2H/scan(P + R) + Bridge(R_changed) + HF scan(R_changed)
+     + wire(s(P + R)) + one O(number_of_tasks) flag all-reduce
+```
+
+When Adam changes at least one element in every residual tensor,
+`R_changed` approaches `R`; the gain then comes from removing Bridge work for
+`P`, not from task filtering. It helps less when local D2H or CPU scanning is
+the bottleneck, most bytes use custom transformations, or `s` is high. The
+reported changed percentage is computed from unique policy-local source
+elements, so the extra detector does not inflate it with a second HF scan.
 
 For each assigned chunk, `DeltaCompressionTracker` finds changed flat
 locations through an integer view with the same element width. It encodes
 either the absolute new bits (`overwrite`) or new bits XOR baseline bits
-(`xor`). Both encodings are dtype-blind and preserve FP8 bit patterns.
+(`xor`). Both encodings are dtype-blind and preserve FP8 bit patterns in
+the codec, although end-to-end FP8 rollout refit is outside the supported scope.
 `overwrite` is idempotent and recommended. `xor` can compress better, but it
 requires an exact same-dtype receiver baseline and exactly-once application.
-The pending source baseline always records the exact new source bits.
+Selecting `xor` enables mixed operation: directly projected, bitwise-compatible
+policy shards use XOR, while Bridge residuals and the full-HF compatibility
+path use overwrite. A payload batch may therefore contain both operations. The
+receiver validates direct-loader compatibility and fails closed on a transform,
+dtype cast, or overlapping mapping; use `overwrite` for models with any such
+direct loader. The pending source baseline always records the exact new source
+bits.
 
-The producer overlaps export, encoding, `torch.save` serialization, zstd level
-1 compression, and transfer with fixed-size executors. Source baselines do not
-commit until the entire transfer succeeds.
+The producer pulls bounded export chunks and compares them in parallel. A
+separate bounded stage coalesces encoded chunks up to
+`sparse_bucket_size_bytes`, serializes them, and applies zstd level 1 before the
+transport executor. Separating the 256 MiB S3 compare chunk from the 1 GiB wire
+bucket preserves D2H/scan parallelism while reducing object and manifest count.
+The stages run concurrently, so payload N transfers while later chunks are
+compared and encoded. Source baselines do not commit until the entire transfer
+succeeds. Worker errors are reported only after every rank drains its Bridge
+export iterator; stopping early can strand peers in a conversion collective.
 
 ### Transfer and apply
 
@@ -116,10 +192,31 @@ throughput target. ZeroMQ assigns each producer to one relay; that relay fans
 the compressed payload out to every generation replica. Both transports use
 the same receiver endpoints and checksum validation.
 
-The receiver deduplicates payload identities, batches them in a bounded FIFO
-queue, and applies batches on one worker thread. When all vLLM ranks share a
-node, payloads are staged under `/dev/shm` and passed to collective RPC by file
-path. Otherwise, the serialized batch is sent through one collective RPC.
+The receiver deduplicates payload identities and applies bounded batches on one
+FIFO worker thread. Each generation replica downloads a transport payload
+once. When its vLLM ranks share a node, decode and flat-file staging under
+`/dev/shm` begin as soon as each payload arrives, without waiting for the batch
+to fill. Staging futures then feed the serial collective apply worker, so
+download, decompression, staging, and earlier GPU applies can overlap. Queue
+depth provides backpressure; the default depth and batch size bound the pending
+window at 256 payloads.
+
+Locations use `int32` unless a single canonical tensor exceeds the signed
+32-bit index range; values remain grouped by dtype. The collective RPC passes
+only file paths, and workers use `torch.load(..., mmap=True)`. The mmap is not
+a second baseline: it lets eight colocated ranks share the staged file's page
+cache instead of materializing eight independent CPU copies, while each rank
+copies only its selected entries to its GPU.
+
+Each worker selects the canonical entries consumed by its TP/EP placement plan
+on CPU, converts only those selected locations to CUDA `int64`, and then copies
+the selected locations and values to its GPU. Thus transport bytes are not
+duplicated within a node and irrelevant canonical entries do not cross H2D.
+The staged format flattens locations into one `int32` and one `int64` tensor;
+it does not serialize one tensor object per model parameter. If ranks do not
+share a node, the receiver still decodes once and sends that flat
+representation through one collective RPC. Every worker derives and caches its
+source plan from the native loader before CPU partitioning.
 
 The final `/nemo-rl/refit/flush` drains the queue, synchronizes CUDA, and checks
 optional delta samples. Only then does the source commit pending baseline
@@ -153,12 +250,20 @@ later sparse values directly with bitwise XOR or `index_copy_`, without
 materializing a dense HF tensor or duplicating QKV, MoE, Mamba, or TP placement
 rules.
 
+The same recorded copies define a source plan for node-local partitioning. A
+source plan contains the canonical offset, shape, and strides consumed by one
+worker. Linear routes use sorted-range lookup; strided routes use affine source
+coordinates. Verification samples are partitioned by the same plan. An unknown
+or transformed loader fails while compiling the plan, before the receiver
+stages or applies that tensor.
+
 The tracer accepts affine tensor views. Absolute overwrite also supports the
-Mamba `A_log` transform and source-to-target dtype casts. XOR rejects either
-case because target bits no longer match the source representation. XOR also
-rejects overlapping target mappings. An element-expanding copy, unknown
-transform, or unplaced non-expert tensor fails before any payload update. There
-is no dense fallback for an unknown layout.
+Mamba `A_log` transform and source-to-target dtype casts. Bridge residuals use
+overwrite even when `encoding: xor` is configured because their target bits may
+not match the HF source representation. XOR also rejects overlapping target
+mappings. An element-expanding copy, unknown transform, or unplaced non-expert
+tensor fails before any payload update. There is no dense fallback for an
+unknown layout.
 
 ## Configuration
 
@@ -170,8 +275,8 @@ policy:
     backend: vllm
     refit_transport: vllm_s3_sparse  # or vllm_zmq_sparse
     delta_compression:
-      encoding: overwrite  # xor requires an exact baseline and exactly-once apply
-      sparse_bucket_size_bytes: 268435456
+      encoding: overwrite  # xor requires bitwise-compatible direct vLLM loaders
+      sparse_bucket_size_bytes: 1073741824
     colocated:
       enabled: false
     vllm_cfg:
@@ -192,19 +297,21 @@ must contain the same nonempty token on producers and receivers.
 | Control | Default |
 |---|---:|
 | `NRL_REFIT_S3_EXPORT_CHUNK_BYTES` | 256 MiB |
-| `NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES` | 1 GiB |
+| `NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES` | 256 MiB |
 | `NRL_REFIT_{S3,ZMQ}_ENCODE_WORKERS` | 2-8 from CPU count |
 | `NRL_REFIT_S3_UPLOAD_WORKERS` | 4-32 from CPU count |
 | `NRL_REFIT_ZMQ_SEND_WORKERS` | 4 |
 | `NRL_REFIT_ZMQ_RELAY_PAYLOAD_WORKERS` | 16 |
 | `NRL_REFIT_ZMQ_RELAY_FANOUT_WORKERS` | 8-32 from replica count |
-| `NRL_REFIT_APPLY_QUEUE_DEPTH` / `NRL_REFIT_APPLY_BATCH_SIZE` | 2 / 8 |
+| `NRL_REFIT_APPLY_QUEUE_DEPTH` / `NRL_REFIT_APPLY_BATCH_SIZE` | 32 / 8 |
+| `NRL_REFIT_PARTITION_WORKERS` | 2-8 from CPU count |
 | `NRL_REFIT_{S3,ZMQ}_ZSTD_THREADS` | 0 |
 | `NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD` | 0 |
 
-Export chunks are also capped by `sparse_bucket_size_bytes` and the packed
-tensor limit. Increase one concurrency control at a time; excessive parallelism
-can move the bottleneck into host memory, collective export, relay fanout, or
+Export chunks are capped by `sparse_bucket_size_bytes` and the packed tensor
+limit, but they intentionally remain smaller than the recommended S3 wire
+bucket. Increase one concurrency control at a time; excessive parallelism can
+move the bottleneck into host memory, collective export, relay fanout, or
 receiver apply.
 
 ## Metrics and profiling
@@ -212,15 +319,26 @@ receiver apply.
 | Signal | Meaning |
 |---|---|
 | `REFIT_BASELINE_INIT` | Baseline export and snapshot time |
+| `REFIT_RECEIVER_PREWARM` | Native vLLM placement plans compiled during initialization |
 | `REFIT_{S3,ZMQ}_TIMING` | Producer wall time, stage service time, payloads, bytes, and changed density |
 | `REFIT_{S3,ZMQ}_DELTA_CHANGE` | Global changed and total element counts |
-| `REFIT_RECEIVER_TIMING` | Receiver batches, apply time, and verification counts |
+| `REFIT_RECEIVER_TIMING` | Receiver staging span/wait, batches, apply time, and verification counts |
 | `REFIT_{S3,ZMQ}_DELTA_VERIFY` | Sampled transmitted-delta accuracy |
 | `REFIT_{S3,ZMQ}_GLOBAL_COMMIT` | Successful transfer flush |
 
 `total_s` is producer wall time. Stage fields such as `encode_s`, `s3_put_s`,
 and `zmq_send_s` are sums across concurrent tasks and can exceed `total_s`; do
-not add them as serial phases.
+not add them as serial phases. Receiver responses additionally expose node
+decode/staging, worker deserialization, CPU partition, and sparse apply time.
+These are also concurrent sums; compare them with receiver wall time rather
+than adding them. The `partition` field is `none` for uniquely owned
+policy-local shards, `names` for stable name-sharded residual exports, and
+`chunks` for the full-HF compatibility path.
+
+Benchmark and profiler reports are dated artifacts under `profiles/`. They must
+record the exact commit, image, topology, model revision, changed density,
+payload settings, per-stage overlap, and sampled correctness. Do not copy an
+older report's fitted values into this document as current results.
 
 The synchronizer returns metrics under `refit/delta/*`,
 `refit/delta_verify/*`, and `refit/transfer/*` when GRPO logs them. These are
@@ -252,6 +370,18 @@ Codec changes must update encoder and decoder together, preserve 64-bit-safe
 locations, and commit exact source bits only after global success. Receiver
 changes must preserve FIFO application, bounded memory, deferred-error
 propagation, flush, CUDA synchronization, and clean shutdown.
+
+Every conversion task must remain represented by a unique local baseline unless
+the complete policy-local path is disabled for FP8 parameters, quantization, or
+custom FSDP. Those configurations retain the canonical full-HF baseline path.
+Direct payload mappings must be rectangular affine shards of the exact HF
+tensor. Tests must cover column and row offsets, gated splits, replicated
+ownership, nonzero TP/ETP ranks, EP-global expert naming, DP/CP and expert-DP
+ownership, transactional baseline updates, global changed-task agreement,
+stable residual ownership under filtering, grouped-task expansion, and fallback
+for transformed mappings. Do not infer an unknown mapping from its parameter
+suffix, drop Bridge task dependencies, or modify Megatron Bridge to expose a
+transport-specific hook.
 
 Run the focused suite:
 
@@ -285,13 +415,15 @@ the receiver before retrying.
 benchmark-specific estimator for the current S3 and ZeroMQ implementation. It
 is not a general fabric or topology model.
 
-The sparse side embeds July 2026 end-to-end latency fits from 32 GB300 sender
-GPUs in `us-east-2` to 64 H100 receiver GPUs in `us-east-1`. Measurements cover
-63.2-1121.0 GB of indexed BF16 weights, S3 and ZeroMQ, raw and zstd payloads,
-and 3% and 5% changed density. Any positive `--changed-pct` is accepted; values
-outside 3-5% use an extrapolated power curve through the two measured-density
-fits. Estimated wire bytes use the measured raw or zstd payload ratio.
-The coefficients in `_SPARSE_LATENCY_FITS` implement
+The zstd side embeds the July 12, 2026 end-to-end latency fits from 8 GB300
+sender GPUs in `us-east-2` to 64 H100 receiver GPUs in `us-east-1` shown above.
+Measurements cover 63.2-1121.0 GB of indexed BF16 weights, S3 and ZeroMQ, and
+3% and 5% changed density. The raw rows retain historical uncompressed
+benchmark coefficients and are not a current production arm. Any positive
+`--changed-pct` is accepted; values outside 3-5% use an extrapolated power
+curve through the two measured-density fits. Estimated wire bytes use the
+measured raw or zstd payload ratio. The coefficients in
+`_SPARSE_LATENCY_FITS` implement
 `fixed_seconds + seconds_per_1000_GB * model_size_GB / 1000`; they are latency
 regressions, not bandwidth measurements.
 

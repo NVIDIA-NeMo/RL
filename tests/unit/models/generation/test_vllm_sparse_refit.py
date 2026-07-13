@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import io
 import threading
 import time
 from collections.abc import Iterator
@@ -24,9 +25,11 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+import torch
 
 from nemo_rl.models.generation.vllm.vllm_sparse_refit import (
     VllmSparseRefitReceiver,
+    _stage_sparse_payload,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -34,7 +37,12 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 from nemo_rl.utils.weight_transfer_remote_sparse import (
     G_VLLM_REFIT_API_KEY_HEADER,
     G_VLLM_REFIT_FLUSH_PATH,
+    G_VLLM_REFIT_PREPARE_PATH,
     G_VLLM_REFIT_S3_MANIFEST_PATH,
+)
+from nemo_rl.utils.weight_transfer_sparse_codec import (
+    encode_sparse_infos,
+    iter_decoded_sparse_payload,
 )
 from nemo_rl.utils.weight_transfer_zmq import (
     G_VLLM_REFIT_CHECKSUM_HEADER,
@@ -67,6 +75,42 @@ def _sparse_refit_receiver(
         yield receiver
     finally:
         receiver._refit_apply_executor.shutdown(wait=True)
+        receiver._refit_partition_executor.shutdown(wait=True)
+
+
+def _serialized_sparse_payload() -> bytes:
+    values = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    payload = encode_sparse_infos(
+        [
+            (
+                "weight",
+                torch.empty((8,), dtype=torch.float32),
+                torch.tensor([1, 3, 4, 7]),
+                values,
+                "overwrite",
+            )
+        ]
+    )
+    payload[2][0].update(
+        verification_locations=[1, 7],
+        verification_values=[1, 4],
+    )
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    return buffer.getvalue()
+
+
+def _stage_payloads(
+    receiver: VllmSparseRefitReceiver,
+    staging_dir: Path,
+    *payloads: bytes,
+):
+    return tuple(
+        receiver._refit_partition_executor.submit(
+            _stage_sparse_payload, payload, str(staging_dir)
+        )
+        for payload in payloads
+    )
 
 
 def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
@@ -97,6 +141,31 @@ def test_sparse_refit_queue_batches_payloads_in_fifo_order() -> None:
     assert sum(result.get("receiver_total_s", 0.0) for result in responses) == 5.0
     receiver._worker.llm.collective_rpc.assert_called_once_with(
         "finish_sparse_delta_refit", args=()
+    )
+
+
+def test_sparse_refit_queue_stages_payload_before_batch_is_full(
+    tmp_path: Path,
+) -> None:
+    with _sparse_refit_receiver(batch_size=2) as receiver:
+        receiver._refit_workers_share_node = True
+        receiver._refit_batch_staging_dir = str(tmp_path)
+
+        response = receiver._enqueue_sparse_payload_apply(
+            _serialized_sparse_payload(), ("transfer", 0, 0), "checksum"
+        )
+        pending = receiver._refit_apply_pending_payloads[0]
+        assert isinstance(pending, Future)
+        staged = pending.result(timeout=1.0)
+
+        assert response["ok"]
+        assert Path(staged.path).is_file()
+        assert receiver._refit_apply_futures == []
+        receiver._flush_queued_sparse_payloads()
+
+    assert not list(tmp_path.iterdir())
+    assert receiver._worker.llm.collective_rpc.call_args_list[0].args[0] == (
+        "update_weights_from_decoded_sparse_payload_files"
     )
 
 
@@ -189,37 +258,59 @@ def test_sparse_refit_queue_releases_condition_while_backpressured() -> None:
             assert pending_call.result(timeout=1.0)["ok"]
 
 
-def test_sparse_refit_batch_uses_one_collective_rpc(tmp_path: Path) -> None:
+def test_sparse_refit_batch_decodes_once_before_collective_apply(
+    tmp_path: Path,
+) -> None:
     with _sparse_refit_receiver() as receiver:
-        staged_payloads: list[bytes] = []
+        staged_locations: list[int] = []
 
-        def collective_rpc(method: str, args: tuple[str, ...]) -> list[dict[str, Any]]:
-            assert method == "update_weights_from_sparse_payload_files"
-            staged_payloads.extend(Path(path).read_bytes() for path in args)
-            return [{"ok": True, "receiver_total_s": 1.0}]
+        def collective_rpc(method: str, args: tuple[Any, ...]) -> list[Any]:
+            assert method == "update_weights_from_decoded_sparse_payload_files"
+            for path in args:
+                staged_locations.extend(
+                    int(location)
+                    for _, locations, _ in iter_decoded_sparse_payload(
+                        torch.load(path, weights_only=True)
+                    )
+                    for location in locations
+                )
+            return [
+                {"ok": True, "receiver_total_s": 1.0},
+                {"ok": True, "receiver_total_s": 1.0},
+                {"ok": True, "receiver_total_s": 1.0},
+            ]
 
         receiver._worker.llm = MagicMock(
             collective_rpc=MagicMock(side_effect=collective_rpc)
         )
-        receiver._refit_workers_share_node = True
-        receiver._refit_batch_staging_dir = str(tmp_path)
-        response = receiver.update_weights_from_serialized_sparse_payloads(
-            (b"0", b"1", b"2")
+        response = receiver.update_weights_from_staged_sparse_payloads(
+            _stage_payloads(receiver, tmp_path, _serialized_sparse_payload())
+        )
+        receiver.update_weights_from_staged_sparse_payloads(
+            _stage_payloads(receiver, tmp_path, _serialized_sparse_payload())
         )
 
-        assert staged_payloads == [b"0", b"1", b"2"]
+        assert staged_locations == [1, 3, 4, 7] * 2
         assert not list(tmp_path.iterdir())
-        receiver._worker.llm.collective_rpc.assert_called_once()
-        assert response == {"ok": True, "receiver_total_s": 1.0, "payloads": 3}
+        assert [
+            item.args[0] for item in receiver._worker.llm.collective_rpc.call_args_list
+        ] == [
+            "update_weights_from_decoded_sparse_payload_files",
+            "update_weights_from_decoded_sparse_payload_files",
+        ]
+        assert response["payloads"] == 1
+        assert response["receiver_worker_total_s"] == 1.0
+        assert response["receiver_total_s"] >= 0.0
+        assert receiver._refit_verification_candidates == 4
 
 
 def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) -> None:
     with _sparse_refit_receiver() as receiver:
         staged_paths: tuple[str, ...] = ()
 
-        def collective_rpc(method: str, args: tuple[str, ...]) -> list[Any]:
+        def collective_rpc(method: str, args: tuple[Any, ...]) -> list[Any]:
             nonlocal staged_paths
-            if method == "update_weights_from_sparse_payload_files":
+            if method == "update_weights_from_decoded_sparse_payload_files":
                 staged_paths = args
                 raise RuntimeError("apply failed")
             assert method == "synchronize_device"
@@ -229,17 +320,16 @@ def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) 
         receiver._worker.llm = MagicMock(
             collective_rpc=MagicMock(side_effect=collective_rpc)
         )
-        receiver._refit_workers_share_node = True
-        receiver._refit_batch_staging_dir = str(tmp_path)
-
         with pytest.raises(RuntimeError, match="apply failed"):
-            receiver.update_weights_from_serialized_sparse_payloads((b"0", b"1"))
+            receiver.update_weights_from_staged_sparse_payloads(
+                _stage_payloads(receiver, tmp_path, _serialized_sparse_payload())
+            )
 
         assert [
             entry.args[0]
             for entry in receiver._worker.llm.collective_rpc.call_args_list
         ] == [
-            "update_weights_from_sparse_payload_files",
+            "update_weights_from_decoded_sparse_payload_files",
             "synchronize_device",
         ]
         assert not list(tmp_path.iterdir())
@@ -255,12 +345,15 @@ def test_sparse_refit_batch_uses_one_collective_rpc_across_nodes() -> None:
         )
 
         response = receiver.update_weights_from_serialized_sparse_payloads(
-            (b"0", b"1", b"2")
+            (_serialized_sparse_payload(),) * 3
         )
 
-        receiver._worker.llm.collective_rpc.assert_called_once_with(
-            "update_weights_from_serialized_sparse_payload",
-            args=(b"0", b"1", b"2"),
+        rpc = receiver._worker.llm.collective_rpc.call_args
+        assert rpc.args[0] == "update_weights_from_decoded_sparse_payload"
+        assert len(rpc.kwargs["args"]) == 3
+        assert all(
+            len(torch.load(io.BytesIO(payload), weights_only=True)[2]) == 1
+            for payload in rpc.kwargs["args"]
         )
         assert response == {"ok": True, "receiver_total_s": 1.0, "payloads": 3}
 
@@ -270,28 +363,33 @@ async def test_async_sparse_refit_batch_bridges_to_async_collective(
     tmp_path: Path,
 ) -> None:
     with _sparse_refit_receiver(async_engine=True) as receiver:
-        staged_payloads: list[bytes] = []
+        staged_locations: list[int] = []
 
         class AsyncLlm:
             async def collective_rpc(
-                self, method: str, args: tuple[str, ...]
-            ) -> list[dict[str, Any]]:
-                assert method == "update_weights_from_sparse_payload_files"
-                staged_payloads.extend(Path(path).read_bytes() for path in args)
+                self, method: str, args: tuple[Any, ...]
+            ) -> list[Any]:
+                assert method == "update_weights_from_decoded_sparse_payload_files"
+                for path in args:
+                    staged_locations.extend(
+                        location
+                        for _, locations, _ in iter_decoded_sparse_payload(
+                            torch.load(path, weights_only=True)
+                        )
+                        for location in locations.tolist()
+                    )
                 return [{"ok": True, "receiver_total_s": 1.0}]
 
         receiver._worker.llm = AsyncLlm()
         receiver._refit_async_loop = asyncio.get_running_loop()
-        receiver._refit_workers_share_node = True
-        receiver._refit_batch_staging_dir = str(tmp_path)
-
         response = await asyncio.to_thread(
-            receiver.update_weights_from_serialized_sparse_payloads,
-            (b"0", b"1"),
+            receiver.update_weights_from_staged_sparse_payloads,
+            _stage_payloads(receiver, tmp_path, _serialized_sparse_payload()),
         )
 
-        assert staged_payloads == [b"0", b"1"]
-        assert response == {"ok": True, "receiver_total_s": 1.0, "payloads": 2}
+        assert staged_locations == [1, 3, 4, 7]
+        assert response["payloads"] == 1
+        assert response["receiver_worker_total_s"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -360,6 +458,7 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
         receiver._flush_queued_sparse_payloads = MagicMock(
             return_value={"ok": True, "payloads": 2}
         )
+        receiver._refit_collective_rpc = MagicMock(return_value=[])
         app = FastAPI()
         receiver.setup_api_server(app)
         headers = {G_VLLM_REFIT_API_KEY_HEADER: "secret"}
@@ -372,6 +471,11 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
                 headers=headers,
             )
             flush_response = client.post(G_VLLM_REFIT_FLUSH_PATH, headers=headers)
+            prepare_response = client.post(
+                G_VLLM_REFIT_PREPARE_PATH,
+                json={"tensors": {"weight": [[2, 3], "bfloat16"]}},
+                headers=headers,
+            )
             zmq_response = client.post(
                 G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
                 content=b"payload",
@@ -381,11 +485,16 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
         assert unauthorized.status_code == 403
         assert s3_response.status_code == 200
         assert flush_response.status_code == 200
+        assert prepare_response.status_code == 200
         assert zmq_response.status_code == 500
         assert receiver._refit_async_loop is not None
         receiver._apply_s3_manifest_payload.assert_awaited_once_with({"key": "key"})
         receiver._apply_zmq_payload.assert_awaited_once()
         receiver._flush_queued_sparse_payloads.assert_called_once_with()
+        receiver._refit_collective_rpc.assert_called_once_with(
+            "prepare_sparse_delta_refit_info",
+            ({"weight": ((2, 3), torch.bfloat16)},),
+        )
 
 
 def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
@@ -424,6 +533,8 @@ def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
     }
 
     with _sparse_refit_receiver(config=config) as receiver:
+        receiver._worker.base_url = "http://10.0.0.2:8000/v1"
+        assert receiver.report_refit_server_base_url() == "http://10.0.0.2:8000"
         receiver.setup_api_server = MagicMock()
         receiver._setup_vllm_refit_server()
         assert configs[0].host == "0.0.0.0"

@@ -173,6 +173,12 @@ class VllmInternalWorkerExtension:
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
+    def prepare_sparse_delta_refit_info(
+        self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
+    ) -> None:
+        """Compile sparse placement plans before the first timed refit."""
+        self._get_sparse_delta_applier().prewarm(state_dict_info)
+
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
         use_fp8_kv_cache = False
@@ -504,22 +510,22 @@ class VllmInternalWorkerExtension:
         torch.cuda.empty_cache()
         return True
 
-    def update_weights_from_serialized_sparse_payload(
+    def update_weights_from_decoded_sparse_payload(
         self,
         *serialized_payloads: bytes,
     ) -> dict[str, Any]:
-        return self._get_sparse_delta_applier().update_weights_from_serialized_sparse_payload(
-            *serialized_payloads
+        return (
+            self._get_sparse_delta_applier().update_weights_from_decoded_sparse_payload(
+                *serialized_payloads
+            )
         )
 
-    def update_weights_from_sparse_payload_files(
+    def update_weights_from_decoded_sparse_payload_files(
         self,
         *payload_paths: str,
     ) -> dict[str, Any]:
-        return (
-            self._get_sparse_delta_applier().update_weights_from_sparse_payload_files(
-                *payload_paths
-            )
+        return self._get_sparse_delta_applier().update_weights_from_decoded_sparse_payload_files(
+            *payload_paths
         )
 
     def synchronize_device(self) -> None:

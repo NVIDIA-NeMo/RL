@@ -153,6 +153,7 @@ class MegatronPolicyWorkerImpl(
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
     _train_step_state: Optional[dict[str, Any]] = None
+    _remote_sparse_refit: Any = None
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -364,18 +365,6 @@ class MegatronPolicyWorkerImpl(
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
         self.sampling_params = runtime_config.sampling_params
-        generation_config = self.cfg.get("generation")
-        delta_config = None
-        if generation_config and generation_config.get("refit_transport") is not None:
-            delta_config = cast(VllmConfig, generation_config).get("delta_compression")
-        self._remote_sparse_refit = None
-        if delta_config:
-            # Keep codec and remote transport state out of standard policy workers.
-            from nemo_rl.models.policy.workers.megatron_remote_sparse_refit import (
-                MegatronRemoteSparseRefit,
-            )
-
-            self._remote_sparse_refit = MegatronRemoteSparseRefit(self, delta_config)
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
@@ -1815,8 +1804,8 @@ class MegatronPolicyWorkerImpl(
         shard_rank: int,
         shard_count: int,
         transport: str,
-    ) -> None:
-        self._require_remote_sparse_refit().initialize_baseline(
+    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        return self._require_remote_sparse_refit().initialize_baseline(
             shard_rank=shard_rank,
             shard_count=shard_count,
             transport=transport,
@@ -1847,14 +1836,12 @@ class MegatronPolicyWorkerImpl(
 
     def _require_remote_sparse_refit(self) -> Any:
         if self._remote_sparse_refit is None:
-            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
-        return self._remote_sparse_refit
+            from nemo_rl.models.policy.workers.megatron_remote_sparse_refit import (
+                MegatronRemoteSparseRefit,
+            )
 
-    def _get_refit_conversion_tasks(self) -> list[Any]:
-        if self.refit_conversion_tasks is None:
-            tasks = self.megatron_bridge.get_conversion_tasks([self.model])
-            self.refit_conversion_tasks = [task for task in tasks if task is not None]
-        return self.refit_conversion_tasks
+            self._remote_sparse_refit = MegatronRemoteSparseRefit.from_worker(self)
+        return self._remote_sparse_refit
 
     def finish_remote_sparse_delta_sync(self, *, succeeded: bool) -> None:
         self._require_remote_sparse_refit().finish(succeeded)
@@ -1873,7 +1860,11 @@ class MegatronPolicyWorkerImpl(
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        conversion_tasks = self._get_refit_conversion_tasks()
+        self.refit_conversion_tasks = [
+            task
+            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            if task is not None
+        ]
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):
@@ -1897,7 +1888,7 @@ class MegatronPolicyWorkerImpl(
             # Broadcast size_in_bytes across pipeline parallel ranks
             return broadcast_obj_from_pp_rank(size_in_bytes)
 
-        for task in conversion_tasks:
+        for task in self.refit_conversion_tasks:
             param_info.append(
                 (
                     task.param_name,
@@ -1913,6 +1904,7 @@ class MegatronPolicyWorkerImpl(
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        conversion_tasks: Optional[list[Any]] = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -1926,7 +1918,11 @@ class MegatronPolicyWorkerImpl(
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=self._get_refit_conversion_tasks(),
+            conversion_tasks=(
+                self.refit_conversion_tasks
+                if conversion_tasks is None
+                else conversion_tasks
+            ),
         )
 
         # Yield the original parameters first.

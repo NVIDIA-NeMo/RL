@@ -658,19 +658,15 @@ class BaseVllmGenerationWorker:
                     metrics[metric.name] = metric.value
         return metrics
 
-    def _require_sparse_refit_receiver(self) -> Any:
-        if self._sparse_refit_receiver is None:
-            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
-        return self._sparse_refit_receiver
-
     def report_refit_server_base_url(self) -> str | None:
         receiver = self._sparse_refit_receiver
         return receiver.report_refit_server_base_url() if receiver is not None else None
 
     def start_zmq_sparse_refit_relay(self, refit_urls: list[str]) -> str:
-        return self._require_sparse_refit_receiver().start_zmq_sparse_refit_relay(
-            refit_urls
-        )
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        return receiver.start_zmq_sparse_refit_relay(refit_urls)
 
     def stop_zmq_sparse_refit_relay(self) -> None:
         receiver = self._sparse_refit_receiver

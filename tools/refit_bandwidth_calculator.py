@@ -32,9 +32,9 @@ _SPARSE_LATENCY_FITS: dict[
     tuple[Transport, Compression], tuple[tuple[float, float], tuple[float, float]]
 ] = {
     ("s3", "raw"): ((2.370, 116.138), (2.646, 183.431)),
-    ("s3", "zstd"): ((0.000, 84.746), (0.000, 134.041)),
+    ("s3", "zstd"): ((0.677, 84.672), (3.741, 145.597)),
     ("zmq", "raw"): ((0.000, 264.753), (0.000, 428.008)),
-    ("zmq", "zstd"): ((6.517, 73.621), (8.165, 157.339)),
+    ("zmq", "zstd"): ((5.813, 73.257), (0.000, 169.991)),
 }
 _NCCL_ANCHORS = (
     (63.2, 0.84, 1.60),
@@ -42,7 +42,7 @@ _NCCL_ANCHORS = (
     (470.2, 2.31, 2.73),
     (1342.0, 3.27, 3.46),
 )
-_WIRE_MULTIPLIER: dict[Compression, float] = {"raw": 2.0, "zstd": 0.74}
+_WIRE_MULTIPLIER: dict[Compression, float] = {"raw": 2.0, "zstd": 0.747}
 
 
 @dataclass(frozen=True)
