@@ -251,25 +251,40 @@ watermark matters.
 
 #### Compute overhead per apply
 
-Per param the additive path adds three things beyond the plan path:
+Concrete comparison against `_direct_sparse_delta_target_plan` (the
+current shadow path this replaces):
 
-1. `torch.zeros(target_shape)` — HF-shape allocation.
-2. `dense.view(-1).index_copy_(0, indices, values)` — scatter of the
-   sparse subset.
-3. vLLM's `weight_loader` doing an HF-shape → shard `.narrow(...).copy_(...)`,
-   which our context redirects to `.add_()`.
+**What plan does per apply:**
+1. Look up the cached `_SparseDeltaTargetPlan` for this param (O(1) dict access).
+2. `_local_sparse_delta_update_inputs`: filter HF-shape sparse indices → this rank's shard-local indices. O(sparse_count).
+3. `param.data.view(-1).index_add_(local_indices, local_values)` — in-place scatter-add. O(sparse_count).
+4. **Zero extra allocation.**
 
-The plan path skips (1) and (2) and does a shard-local `index_add_`
-directly on `param.data`. Cost ratio scales with sparsity:
+**What additive does per apply:**
+1. `torch.zeros(target_shape, dtype, device)` — HF-shape allocation + memset. **O(HF-shape).**
+2. `dense.view(-1).index_copy_(0, indices, values)` — scatter of sparse subset into dense. O(sparse_count).
+3. `model.load_weights([(name, dense)])` → vLLM's `weight_loader`:
+   - `.narrow(output_dim, start_idx, shard_size)` on dense — view, O(1).
+   - `param_data.copy_(narrowed)` → intercepted → `param_data.add_(narrowed)`. **O(shard_size) = O(HF-shape / tp_size).**
+4. **One HF-shape allocation per param, freed before next.**
 
-- At 10% sparsity: additive ≈ 3–5× the apply-only cost of plan.
-- At 5% sparsity: additive ≈ 5–10× the apply-only cost of plan.
-- At 1% sparsity: additive ≈ 20–50× the apply-only cost of plan.
-- At 0.5% sparsity: additive ≈ 50–100× the apply-only cost of plan.
+Per-apply compute ratio ≈ (HF-shape work) / (sparse work) ≈ 1 / sparsity.
 
-Reason: the scatter + `weight_loader` work is O(HF-shape), not
-O(sparse-values). Sparser deltas make the constant HF-shape work
-proportionally more expensive.
+| Sparsity | Additive vs plan (per apply) |
+|---|---|
+| 10% | ~10× |
+| 5% | ~20× |
+| 1% | ~100× |
+| 0.5% | ~200× |
+
+The dominant additive costs are the **memset of the HF-shape zeros tensor** (step 1) and the **shard-size add** inside `weight_loader` (step 3). Both scale with HF-shape / tp_size, not with sparse_count. Sparser deltas make the constant HF-shape work proportionally more expensive.
+
+**A note on "why not just allocate the shard-sized buffer?"** — the entire
+point of routing through `weight_loader` is that nemo_rl doesn't need to
+know the shard split. If we allocate only shard-sized, we've re-adopted
+the shard math the workstream is trying to delete. So the HF-shape
+allocation is intrinsic to the design choice, not an optimization we
+skipped.
 
 #### Wall-clock overhead per refit
 
