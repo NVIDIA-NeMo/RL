@@ -211,10 +211,61 @@ def _exchange_json(store: Any, rank: int, name: str, value: Any) -> dict[int, An
     }
 
 
+def _init_group(args: argparse.Namespace, rank: int, device: int, torch: Any):
+    """Return ``(tcp_store, broadcast_fn)`` for a two-rank NCCL group.
+
+    Prefers NeMo-RL's ``StatelessProcessGroup`` (matches the production refit
+    path) and falls back to plain ``torch.distributed`` with a ``TCPStore`` so the
+    baseline also runs in images that do not ship ``nemo_rl`` (e.g. the
+    model-express-dev sender/receiver pods).
+    """
+    try:
+        from nemo_rl.distributed.stateless_process_group import (
+            StatelessProcessGroup,
+        )
+    except ModuleNotFoundError:
+        import datetime as _dt
+
+        import torch.distributed as dist
+
+        timeout = _dt.timedelta(seconds=600)
+        store = torch.distributed.TCPStore(
+            args.master_address,
+            args.master_port,
+            WORLD_SIZE,
+            rank == 0,
+            timeout=timeout,
+        )
+        dist.init_process_group(
+            backend="nccl",
+            store=store,
+            rank=rank,
+            world_size=WORLD_SIZE,
+            timeout=timeout,
+        )
+
+        def broadcast(payload, stream):
+            with torch.cuda.stream(stream):
+                dist.broadcast(payload, src=0)
+
+        return store, broadcast
+
+    group = StatelessProcessGroup(
+        master_address=args.master_address,
+        port=args.master_port,
+        rank=rank,
+        world_size=WORLD_SIZE,
+    )
+    group.init_nccl_communicator(device=device)
+
+    def broadcast(payload, stream):
+        group.broadcast(payload, src=0, stream=stream)
+
+    return group.tcp_store, broadcast
+
+
 def run(args: argparse.Namespace) -> int:
     import torch
-
-    from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
     rank, device = resolve_rank_and_device(args)
     torch.cuda.set_device(device)
@@ -232,13 +283,7 @@ def run(args: argparse.Namespace) -> int:
         preload_seconds = time.perf_counter() - preload_start
 
     init_start = time.perf_counter()
-    group = StatelessProcessGroup(
-        master_address=args.master_address,
-        port=args.master_port,
-        rank=rank,
-        world_size=WORLD_SIZE,
-    )
-    group.init_nccl_communicator(device=device)
+    store, broadcast = _init_group(args, rank, device, torch)
     torch.cuda.synchronize(device)
     init_seconds = time.perf_counter() - init_start
 
@@ -248,7 +293,7 @@ def run(args: argparse.Namespace) -> int:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record(stream)
-        group.broadcast(payload, src=0, stream=stream)
+        broadcast(payload, stream)
         end.record(stream)
         end.synchronize()
         seconds = start.elapsed_time(end) / 1000.0
@@ -260,7 +305,6 @@ def run(args: argparse.Namespace) -> int:
             flush=True,
         )
 
-    store = group.tcp_store
     rank_seconds = _exchange_json(store, rank, "measured_seconds", measured)
     init_by_rank = _exchange_json(store, rank, "init_seconds", init_seconds)
     allocation_by_rank = _exchange_json(
