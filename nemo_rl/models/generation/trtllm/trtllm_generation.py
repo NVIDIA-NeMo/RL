@@ -152,8 +152,8 @@ class TrtllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
-        # post-init on workers (finishes async engine setup on each worker's
-        # asyncio loop).
+        # post-init on workers (starts HTTP server when expose_http_server=true,
+        # finishes async engine setup for the async worker variant).
         post_init_method = "post_init_async"
         futures = self.worker_group.run_all_workers_single_data(
             post_init_method,
@@ -163,6 +163,8 @@ class TrtllmGeneration(GenerationInterface):
 
         # Round-robin DP shard used by generate_async for per-sample dispatch.
         self.current_generate_dp_shard_idx = 0
+
+        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
 
         self.device_uuids = self._report_device_id()
 
@@ -256,6 +258,16 @@ class TrtllmGeneration(GenerationInterface):
                 "Unable to allocate any worker groups with the available resources."
             )
         return tied_groups
+
+    def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
+        """Collect HTTP server base URLs from each DP-rank-0 worker."""
+        if not self.cfg["trtllm_cfg"].get("expose_http_server"):
+            return [None] * self.dp_size
+        futures = self.worker_group.run_all_workers_single_data(
+            "report_dp_openai_server_base_url",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        return ray.get(futures)
 
     def _report_device_id(self) -> list[list[str]]:
         futures = self.worker_group.run_all_workers_single_data(
