@@ -323,8 +323,10 @@ export RAY_event_stats="${RAY_event_stats:-false}"
 # core_worker_internal_heartbeat_ms (default 1s): worker->raylet heartbeat.
 #   Thousands of workers at 1s add indirect GCS load via raylet aggregation;
 #   5s is sufficient.
-# health_check_period_ms (default 3s): node->GCS health checks. 10s cuts the
-#   aggregate rate; slower node-failure detection is acceptable during init.
+# health_check_period_ms (default 3s): GCS->node health probes. 10s applies for
+#   the whole job, not just init: with defaults (threshold 5, timeout 10s),
+#   dead-node detection slows ~3x (~15s -> ~50s; up to ~100s if probes hang to
+#   the timeout) — accepted in exchange for GCS headroom during the burst.
 export RAY_ray_syncer_message_refresh_interval_ms="${RAY_ray_syncer_message_refresh_interval_ms:-10000}"
 export RAY_core_worker_internal_heartbeat_ms="${RAY_core_worker_internal_heartbeat_ms:-5000}"
 export RAY_health_check_period_ms="${RAY_health_check_period_ms:-10000}"
