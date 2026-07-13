@@ -342,10 +342,14 @@ policy:
       # RAY_CGRAPH_get_timeout=1800, combo-kernel benchmarking off, and the
       # gym 120s retry cap (an engine death back-fills instead of wedging).
       enforce_eager: false
-      # Internal practice: prefix caching off - completed blocks are NOT
-      # invalidated across weight refits (stale KV under new weights;
-      # confirmed lifecycle gap, see resume_after_refit gating).
-      enable_prefix_caching: false
+      # Prefix caching ON: refit_policy_generation now invalidates the cache
+      # on every refit path (96a0226d), closing the stale-KV lifecycle gap
+      # that previously forced this off. For 25-30-turn SWE agent episodes
+      # this is a ~6x latency win (each turn no longer re-prefills the full
+      # 22-29k-token conversation). Validated in grpo-cachetest-1
+      # (2354981): masking 2/256 with caching on, step reward identical to
+      # the caching-off twin, val 56.2% resolved with 0% timeouts.
+      enable_prefix_caching: true
       use_deep_gemm: false
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
