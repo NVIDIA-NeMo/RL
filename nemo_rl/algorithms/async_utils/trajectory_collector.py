@@ -560,16 +560,16 @@ class AsyncTrajectoryCollector:
         async_cfg = self.master_config.grpo.get("async_grpo", {})
         if async_cfg.get("recompute_kv_cache_after_weight_updates", False):
             try:
-                print("🔄 Invalidating vLLM prefix/KV caches after weight update")
+                print("🔄 Invalidating generation backend KV caches after weight update")
                 invalidated = self.policy_generation.invalidate_kv_cache()
                 if invalidated:
-                    print("✅ Invalidated vLLM prefix/KV caches after weight update")
+                    print("✅ Invalidated generation backend KV caches after weight update")
                 else:
                     print(
-                        "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
+                        "⚠️ KV cache invalidation not supported or only partially applied by the generation backend"
                     )
             except Exception as e:
-                print(f"⚠️ Failed to invalidate vLLM caches: {e}")
+                print(f"⚠️ Failed to invalidate generation backend KV caches: {e}")
 
         self._refit_pause_cleared.set()
 

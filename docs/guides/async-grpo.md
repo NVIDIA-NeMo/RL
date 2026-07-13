@@ -42,7 +42,7 @@ grpo:
     enabled: true
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
     in_flight_weight_updates: false  # Enable for faster weight synchronization
-    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
 ```
 
 ### Complete Example Config
@@ -68,7 +68,7 @@ grpo:
     enabled: true
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false  # Enable for faster weight synchronization
-    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after weight-updates
 
 cluster:
   num_nodes: 2
@@ -189,8 +189,7 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 
 4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` when using `async_engine: true` for updating the weights of vLLM engine during generation. This prevents stalling training pipeline until longest generation finishes and provides significant performance benefits.
 
-5. **Recompute KV Cache After Weight Updates**: While using in-flight weight update, user can choose whether to recompute
-KV caches after weight udpate by configuring `recompute_kv_cache_after_weight_update` configuration.
+5. **Recompute KV Cache After Weight Updates**: A user can choose whether to invalidate and recompute KV caches after weight updates by setting the `recompute_kv_cache_after_weight_updates` configuration. This is applicable to async GRPO and independent of in-flight updates.
 
 ## Why Importance Sampling Correction Is Required for Async
 
