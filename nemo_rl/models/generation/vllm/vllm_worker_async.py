@@ -993,6 +993,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             ),
         )
 
+    async def adjust_refit_comm_group_async(
+        self, exclude_ranks: list[int]
+    ) -> list[tuple[int, int, int]]:
+        """Shrink the refit communicator on every internal vLLM rank."""
+        result_or_coro = await self.llm.collective_rpc(
+            "adjust_refit_comm_group", args=(exclude_ranks,)
+        )
+        if asyncio.iscoroutine(result_or_coro):
+            result_or_coro = await result_or_coro
+        return cast(list[tuple[int, int, int]], result_or_coro)
+
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],

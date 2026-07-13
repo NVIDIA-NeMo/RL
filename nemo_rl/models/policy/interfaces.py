@@ -171,6 +171,11 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
+    def adjust_refit_comm_group(self, exclude_ranks: list[int]) -> list[ray.ObjectRef]:
+        """Remove failed generation ranks from the refit communicator."""
+        pass
+
+    @abstractmethod
     def offload_before_refit(self) -> None:
         pass
 

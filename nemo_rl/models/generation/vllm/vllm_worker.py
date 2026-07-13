@@ -648,6 +648,15 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             ),
         )
 
+    def adjust_refit_comm_group(
+        self, exclude_ranks: list[int]
+    ) -> list[tuple[int, int, int]]:
+        """Shrink the refit communicator on every internal vLLM rank."""
+        return cast(
+            list[tuple[int, int, int]],
+            self.llm.collective_rpc("adjust_refit_comm_group", args=(exclude_ranks,)),
+        )
+
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

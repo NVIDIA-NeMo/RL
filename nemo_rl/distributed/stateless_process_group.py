@@ -15,7 +15,7 @@
 from typing import Optional
 
 import torch
-from nccl.core.communicator import Communicator
+from nccl.core.communicator import NCCLConfig, Communicator
 from nccl.core.utils import UniqueId, get_unique_id
 
 
@@ -25,6 +25,7 @@ class StatelessProcessGroup:
         self.port = port
         self.rank = rank
         self.world_size = world_size
+        self._retired_nccl_communicators: list[Communicator] = []
         self.tcp_store = torch.distributed.TCPStore(
             host_name=self.master_address,
             port=self.port,
@@ -61,6 +62,53 @@ class StatelessProcessGroup:
             self.broadcast(data, 0, stream=stream)
             torch.cuda.current_stream().synchronize()
             assert torch.allclose(data, torch.ones(1, device=device))
+
+    def shrink(self, exclude_ranks: list[int]) -> tuple[int, int, int]:
+        """Shrink the NCCL communicator around failed ranks.
+
+        Every rank that remains in the communicator must call this method with
+        the same ``exclude_ranks``. Excluded ranks must not call it.
+
+        Args:
+            exclude_ranks: Ranks in the current communicator to remove.
+
+        Returns:
+            The old rank, compacted new rank, and new communicator world size.
+        """
+        if not exclude_ranks:
+            raise ValueError("exclude_ranks must contain at least one rank")
+
+        excluded = sorted(set(exclude_ranks))
+        if len(excluded) != len(exclude_ranks):
+            raise ValueError(f"exclude_ranks contains duplicates: {exclude_ranks}")
+        if excluded[0] < 0 or excluded[-1] >= self.world_size:
+            raise ValueError(
+                f"exclude_ranks must be in [0, {self.world_size}), got {excluded}"
+            )
+        if self.rank in excluded:
+            raise ValueError(
+                f"Excluded rank {self.rank} must not call communicator shrink"
+            )
+
+        # CommShrinkFlag.DEFAULT requires all outstanding communicator work to
+        # be complete. packed_tensor uses multiple CUDA streams, so quiesce the
+        # device before entering this collective operation.
+        torch.cuda.synchronize()
+
+        old_rank = self.rank
+        old_communicator = self.nccl_communicator
+        self.nccl_communicator = old_communicator.shrink(
+            exclude_ranks=excluded,
+            config=NCCLConfig(shrink_share=True),
+        )
+
+        # The child shares resources with its parent. Keep the parent alive for
+        # the process lifetime instead of destroying and recreating resources.
+        self._retired_nccl_communicators.append(old_communicator)
+        self.rank -= sum(excluded_rank < old_rank for excluded_rank in excluded)
+        self.world_size -= len(excluded)
+
+        return old_rank, self.rank, self.world_size
 
     def broadcast(
         self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None

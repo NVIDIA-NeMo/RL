@@ -256,6 +256,11 @@ class VllmGeneration(GenerationInterface):
         # Used to track the round-robin selection of worker groups for generate_async
         self.current_generate_dp_shard_idx = 0
 
+        # Generation keeps using every instance after the demo fault, but refit
+        # collectives use only these active instance IDs.
+        self._active_refit_instance_ids = list(range(self.dp_size))
+        self._refit_train_world_size: Optional[int] = None
+
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
             # the heavy model loading (and HTTP server start) to load_and_start().
@@ -587,6 +592,7 @@ class VllmGeneration(GenerationInterface):
         """Initialize the collective communication."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
+        self._refit_train_world_size = train_world_size
 
         # Choose the appropriate method based on async_engine setting
         method_name = (
@@ -618,6 +624,69 @@ class VllmGeneration(GenerationInterface):
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
+
+    def adjust_refit_comm_group(
+        self, faulty_instance_id: int
+    ) -> tuple[list[int], int, list[ray.ObjectRef]]:
+        """Exclude one generation instance from future refit collectives.
+
+        The failed instance is intentionally left running for this demo. It no
+        longer participates in weight updates and therefore generates with
+        stale weights after the communicator is shrunk.
+        """
+        if self._refit_train_world_size is None:
+            raise RuntimeError("Refit collective is not initialized")
+        if faulty_instance_id not in self._active_refit_instance_ids:
+            raise ValueError(
+                f"Generation instance {faulty_instance_id} is not in the active "
+                f"refit set {self._active_refit_instance_ids}"
+            )
+
+        active_position = self._active_refit_instance_ids.index(faulty_instance_id)
+        first_rank = (
+            self._refit_train_world_size + active_position * self.model_parallel_size
+        )
+        exclude_ranks = list(range(first_rank, first_rank + self.model_parallel_size))
+
+        method_name = (
+            "adjust_refit_comm_group_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "adjust_refit_comm_group"
+        )
+        surviving_instance_ids = [
+            instance_id
+            for instance_id in self._active_refit_instance_ids
+            if instance_id != faulty_instance_id
+        ]
+        futures = self._run_refit_method_on_instances(
+            method_name,
+            surviving_instance_ids,
+            exclude_ranks=exclude_ranks,
+        )
+        self._active_refit_instance_ids = surviving_instance_ids
+        new_world_size = self._refit_train_world_size + (
+            len(surviving_instance_ids) * self.model_parallel_size
+        )
+        return exclude_ranks, new_world_size, futures
+
+    def _run_refit_method_on_instances(
+        self,
+        method_name: str,
+        instance_ids: list[int],
+        **kwargs: Any,
+    ) -> list[ray.ObjectRef]:
+        """Run a refit method on the model-owner worker for each instance."""
+        futures = []
+        for instance_id in instance_ids:
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(instance_id)
+            futures.append(
+                self.worker_group.run_single_worker_single_data(
+                    method_name,
+                    worker_idx=worker_idx,
+                    **kwargs,
+                )
+            )
         return futures
 
     def generate(
@@ -961,10 +1030,9 @@ class VllmGeneration(GenerationInterface):
             else "update_weights_from_collective"
         )
 
-        # Use run_all_workers_single_data for methods that don't need data
-        futures = self.worker_group.run_all_workers_single_data(
+        futures = self._run_refit_method_on_instances(
             method_name,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            self._active_refit_instance_ids,
         )
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside

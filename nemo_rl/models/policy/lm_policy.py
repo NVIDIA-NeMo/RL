@@ -403,6 +403,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def adjust_refit_comm_group(self, exclude_ranks: list[int]) -> list[ray.ObjectRef]:
+        """Remove failed generation ranks from every training communicator."""
+        return self.worker_group.run_all_workers_single_data(
+            "adjust_refit_comm_group",
+            exclude_ranks=exclude_ranks,
+        )
+
     def init_collective_mcore_generation(
         self,
         ip: str,
