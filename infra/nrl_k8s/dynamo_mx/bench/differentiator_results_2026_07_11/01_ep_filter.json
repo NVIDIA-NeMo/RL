@@ -1,0 +1,28 @@
+{
+  "assertions": [
+    {
+      "expected": "128/2",
+      "name": "local expert count",
+      "observed": 64,
+      "passed": true
+    },
+    {
+      "expected": 29000000000.0,
+      "name": "wire bytes match local expert ownership",
+      "observed": 29036000000.0,
+      "passed": true
+    }
+  ],
+  "inputs": {},
+  "metrics": {
+    "actual_bytes": 29036000000.0,
+    "byte_reduction_fraction": 0.49937931034482763,
+    "full_expert_bytes": 58000000000.0,
+    "global_experts": 128,
+    "local_experts": 64,
+    "savings_factor": 1.9975203196032512
+  },
+  "scenario": "ep_filter",
+  "schema_version": 1,
+  "status": "pass"
+}

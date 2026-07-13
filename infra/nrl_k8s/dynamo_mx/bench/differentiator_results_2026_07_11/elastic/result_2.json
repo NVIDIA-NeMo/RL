@@ -1,0 +1,9 @@
+{
+  "receiver_id": 2,
+  "delay_s": 20,
+  "bytes": 61064245248,
+  "pull_start_epoch": 1783525443.150,
+  "pull_end_epoch": 1783525443.727,
+  "pull_dur_s": 0.577,
+  "gbps": 846.0
+}

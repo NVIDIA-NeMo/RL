@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fp8-correctness-tp2
+spec:
+  restartPolicy: Never
+  imagePullSecrets:
+    - name: nvcr-imagepullsecret
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-GB200
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: test
+      image: nvcr.io/nvidian/dynamo-dev/model-express-dev:real30b-matrix-v10-mxstage
+      command: [sleep, infinity]
+      env:
+        - {name: VLLM_USE_DEEP_GEMM, value: "0"}
+        - {name: VLLM_ALLOW_INSECURE_SERIALIZATION, value: "1"}
+        - {name: TP, value: "2"}
+      resources:
+        requests:
+          cpu: "16"
+          memory: 128Gi
+          nvidia.com/gpu: "2"
+        limits:
+          cpu: "32"
+          memory: 256Gi
+          nvidia.com/gpu: "2"
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      volumeMounts:
+        - {name: workspace, mountPath: /mnt/rl-workspace}
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: shared-model-cache
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 32Gi

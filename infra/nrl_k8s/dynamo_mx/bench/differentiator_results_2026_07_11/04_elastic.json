@@ -1,0 +1,35 @@
+{
+  "assertions": [
+    {
+      "expected": ">= 1",
+      "name": "has early receiver",
+      "observed": 2,
+      "passed": true
+    },
+    {
+      "expected": ">= 1",
+      "name": "has late joiner",
+      "observed": 1,
+      "passed": true
+    },
+    {
+      "expected": "< late start 1783525443.15",
+      "name": "early receivers finish independently",
+      "observed": 1783525422.689,
+      "passed": true
+    }
+  ],
+  "inputs": {
+    "results": "differentiator_results_2026_07_11/elastic"
+  },
+  "metrics": {
+    "early_finish_before_late_start_s": 20.461000204086304,
+    "late_receivers": 1,
+    "median_gbps": 864.0,
+    "min_gbps": 846.0,
+    "receivers": 3
+  },
+  "scenario": "elastic_join",
+  "schema_version": 1,
+  "status": "pass"
+}

@@ -1,42 +1,76 @@
-"""MDL H1 — FP8 warm-path correctness on a block-fp8 MoE (e.g. Qwen3.6-35B-A3B-FP8).
+"""MDL FP8 warm-path correctness for exact Qwen3-30B-A3B architecture.
 
 Same corrupt -> warm-reload -> generate proof as the bf16 case, but on an
-fp8-quantized MoE. Surfaces the fp8 refit blocker + exercises MDL's loaderless
-cold path.
+FP8-quantized MoE. The input must be either Qwen/Qwen3-30B-A3B-FP8 or a
+vLLM-supported checkpoint produced by quantize_qwen3_30b_fp8.py.
 
 Run (inside a vLLM+MX pod, deep_gemm off for fast iteration):
   VLLM_USE_DEEP_GEMM=0 VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
-    python3 fp8_h1_test.py Qwen/Qwen3.6-35B-A3B-FP8
-
-Findings 2026-07-08 (GB200, Qwen3.6-35B-A3B-FP8): the model loads + serves, but
-vLLM's own model.load_weights is NOT re-entrant after fp8
-process_weights_after_loading (params lose output_dim ->
-AttributeError at linear.py:906). MDL's loaderless path + hf_to_vllm_mapper maps
-683/813 (84%); the 130 unmapped are Gated-DeltaNet fusions + fp8 SCALE tensors,
-which MDL's generic stacked/expert logic doesn't cover yet. The fail-loud
-coverage guard refuses (<90%) rather than serving a half-written model.
-Remaining: fp8 scale-tensor handling; validate on a standard (non-DeltaNet) fp8
-MoE (NVIDIA-Nemotron-3-Nano-30B-A3B-FP8); file upstream vLLM re-entrancy issue.
+    python3 fp8_h1_test.py /mnt/.../Qwen3-30B-A3B-FP8-block
 """
-import os, sys, glob
+import glob
+import json
+import os
+import sys
+
 os.environ["VLLM_USE_DEEP_GEMM"] = "0"
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-MODEL_ID = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3.6-35B-A3B-FP8"
+MODEL_ID = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3-30B-A3B-FP8"
 PROMPT = "The capital of France is"
 
 
 def _read_hf_weights(model_id):
     from safetensors.torch import safe_open
-    hub = os.path.join(os.environ["HF_HOME"], "hub",
-                       "models--" + model_id.replace("/", "--"), "snapshots")
-    snap = sorted(glob.glob(hub + "/*/"))[-1]
+    if os.path.isdir(model_id):
+        snap = model_id
+    else:
+        from huggingface_hub import snapshot_download
+
+        snap = snapshot_download(
+            model_id,
+            allow_patterns=["*.safetensors", "*.json"],
+        )
     out = []
-    for sh in sorted(glob.glob(snap + "*.safetensors")):
+    for sh in sorted(glob.glob(os.path.join(snap, "*.safetensors"))):
         with safe_open(sh, framework="pt", device="cpu") as f:
             for k in f.keys():
                 out.append((k, f.get_tensor(k)))
     return out
+
+
+def _validate_checkpoint(model_id):
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=False).to_dict()
+    expected = {
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "model_type": "qwen3_moe",
+        "hidden_size": 2048,
+        "num_hidden_layers": 48,
+        "num_experts": 128,
+        "num_experts_per_tok": 8,
+        "moe_intermediate_size": 768,
+    }
+    actual = dict(config)
+    if actual.get("num_experts") is None:
+        actual["num_experts"] = actual.get("num_local_experts")
+    mismatches = {
+        key: {"expected": value, "actual": actual.get(key)}
+        for key, value in expected.items()
+        if actual.get(key) != value
+    }
+    quant = config.get("quantization_config")
+    if not isinstance(quant, dict):
+        mismatches["quantization_config"] = {
+            "expected": "vLLM-supported FP8 metadata",
+            "actual": quant,
+        }
+    if mismatches:
+        raise RuntimeError(
+            "checkpoint is not exact Qwen3-30B-A3B FP8: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
 
 
 def mdl_setup(worker, model_id):
@@ -82,8 +116,10 @@ def _gen(llm):
 
 def main():
     from vllm import LLM
-    print(f"[load] {MODEL_ID} (language_model_only, triton) ...", flush=True)
-    llm = LLM(model=MODEL_ID, enforce_eager=True, tensor_parallel_size=1,
+    tp_size = int(os.environ.get("TP", os.environ.get("TENSOR_PARALLEL_SIZE", "1")))
+    _validate_checkpoint(MODEL_ID)
+    print(f"[load] {MODEL_ID} (language_model_only, triton, tp={tp_size}) ...", flush=True)
+    llm = LLM(model=MODEL_ID, enforce_eager=True, tensor_parallel_size=tp_size,
               language_model_only=True, moe_backend="triton",
               gpu_memory_utilization=0.9, max_model_len=4096, trust_remote_code=True)
     out0 = _gen(llm); print("OUT0 baseline :", repr(out0), flush=True)

@@ -1,0 +1,21 @@
+{
+  "assertions": [
+    {
+      "expected": 30532122624.0,
+      "name": "TP-local bytes",
+      "observed": 61064245248.0,
+      "passed": false
+    }
+  ],
+  "inputs": {},
+  "metrics": {
+    "actual_bytes_per_rank": 61064245248.0,
+    "byte_reduction_fraction": 0.0,
+    "expected_bytes_per_rank": 30532122624.0,
+    "full_bytes": 61064245248.0,
+    "tp_world_size": 2
+  },
+  "scenario": "tp_local_slice",
+  "schema_version": 1,
+  "status": "fail"
+}

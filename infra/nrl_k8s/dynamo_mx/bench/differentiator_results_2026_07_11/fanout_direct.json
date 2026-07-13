@@ -1,0 +1,7 @@
+{
+  "workers": 13,
+  "makespan_seconds": 0.94,
+  "model": "Qwen3-4B",
+  "scope": "pure_wire",
+  "topology": "trainer_to_13_receivers"
+}

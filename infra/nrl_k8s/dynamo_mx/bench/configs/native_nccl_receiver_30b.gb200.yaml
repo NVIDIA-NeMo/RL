@@ -1,0 +1,121 @@
+# Standalone Real-30B NCCL benchmark rollout. Replace angle-bracket values
+# before applying. This intentionally uses vLLM's default Worker: load-format
+# auto does not activate ModelExpressWorker.
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: native-nccl-qwen3-30b-tp2
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests: {cpu: "2", memory: 4Gi}
+        limits: {cpu: "4", memory: 8Gi}
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: <CPU_NODE_GROUP>
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        imagePullSecrets:
+          - name: <IMAGE_PULL_SECRET>
+        mainContainer:
+          image: <DYNAMO_VLLM_0_22_IMAGE>
+          command: [python3, -m, dynamo.frontend]
+          args: [--router-reset-states]
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: <SECRETS_NAME>
+      resources:
+        requests: {gpu: "2", memory: 192Gi}
+        limits: {gpu: "2", memory: 384Gi}
+      extraPodSpec:
+        metadata:
+          annotations:
+            networking.gke.io/default-interface: eth0
+            networking.gke.io/interfaces: >-
+              [{"interfaceName":"eth0","network":"default"},
+               {"interfaceName":"rdma0","network":"rdma-0"},
+               {"interfaceName":"rdma1","network":"rdma-1"},
+               {"interfaceName":"rdma2","network":"rdma-2"},
+               {"interfaceName":"rdma3","network":"rdma-3"}]
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB200
+        tolerations:
+          - operator: Exists
+        imagePullSecrets:
+          - name: <IMAGE_PULL_SECRET>
+        securityContext:
+          runAsUser: 0
+        volumes:
+          - name: workspace
+            persistentVolumeClaim:
+              claimName: <WORKSPACE_PVC>
+          - name: infiniband
+            hostPath:
+              path: /dev/infiniband
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 32Gi
+        mainContainer:
+          image: <DYNAMO_VLLM_0_22_IMAGE>
+          command: [python3, -m, dynamo.vllm]
+          args:
+            - --model
+            - Qwen/Qwen3-30B-A3B
+            - --served-model-name
+            - Qwen/Qwen3-30B-A3B
+            - --load-format
+            - auto
+            - --tensor-parallel-size
+            - "2"
+            - --dtype
+            - bfloat16
+            - --gpu-memory-utilization
+            - "0.6"
+            - --max-model-len
+            - "1024"
+            - --max-num-seqs
+            - "16"
+            - --max-num-batched-tokens
+            - "2048"
+            - --enforce-eager
+            - --moe-backend
+            - triton
+          env:
+            - {name: DYN_HEALTH_CHECK_ENABLED, value: "false"}
+            - {name: DYN_SYSTEM_PORT, value: "9090"}
+            - {name: DYN_WEIGHT_TRANSFER_BACKEND, value: nccl}
+            - {name: HF_HOME, value: <HF_CACHE_PATH>}
+            - {name: NCCL_MNNVL_ENABLE, value: "0"}
+            - {name: NCCL_DEBUG, value: INFO}
+            - {name: NCCL_NET_PLUGIN, value: none}
+            - {name: NCCL_IB_HCA, value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3"}
+            - {name: NCCL_SOCKET_IFNAME, value: eth0}
+          resources:
+            requests:
+              networking.gke.io.networks/rdma-0: "1"
+              networking.gke.io.networks/rdma-0.IP: "1"
+              networking.gke.io.networks/rdma-1: "1"
+              networking.gke.io.networks/rdma-1.IP: "1"
+              networking.gke.io.networks/rdma-2: "1"
+              networking.gke.io.networks/rdma-2.IP: "1"
+              networking.gke.io.networks/rdma-3: "1"
+              networking.gke.io.networks/rdma-3.IP: "1"
+            limits:
+              networking.gke.io.networks/rdma-0: "1"
+              networking.gke.io.networks/rdma-0.IP: "1"
+              networking.gke.io.networks/rdma-1: "1"
+              networking.gke.io.networks/rdma-1.IP: "1"
+              networking.gke.io.networks/rdma-2: "1"
+              networking.gke.io.networks/rdma-2.IP: "1"
+              networking.gke.io.networks/rdma-3: "1"
+              networking.gke.io.networks/rdma-3.IP: "1"
+          volumeMounts:
+            - {name: workspace, mountPath: /mnt/rl-workspace}
+            - {name: infiniband, mountPath: /dev/infiniband}
+            - {name: dshm, mountPath: /dev/shm}

@@ -1,0 +1,38 @@
+{
+  "assertions": [
+    {
+      "expected": ">= 1",
+      "name": "source logs present",
+      "observed": 16,
+      "passed": true
+    },
+    {
+      "expected": "<= 0.05",
+      "name": "egress balanced",
+      "observed": 0.13341378582316535,
+      "passed": false
+    }
+  ],
+  "inputs": {
+    "log": "-"
+  },
+  "metrics": {
+    "byte_coefficient_of_variation": 0.13341378582316535,
+    "bytes_by_source_rank": {
+      "0": 20660000000.0,
+      "1": 14500000000.0,
+      "2": 14500000000.0,
+      "3": 14500000000.0,
+      "4": 14500000000.0,
+      "5": 14500000000.0,
+      "6": 14500000000.0,
+      "7": 14500000000.0
+    },
+    "median_source_gbps": 592.7,
+    "sources": 8,
+    "transfers": 16
+  },
+  "scenario": "trainer_egress_balance",
+  "schema_version": 1,
+  "status": "fail"
+}

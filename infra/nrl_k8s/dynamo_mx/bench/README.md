@@ -10,37 +10,128 @@ refit), plus apples-to-apples transport and per-phase refit timing.
 
 | File | What it does |
 |---|---|
-| `run_differentiator_bench.sh` | Push-button orchestrator for all scenarios. Preflight-checks the cluster and **skips gracefully** when a prereq (publishing trainer, NCCL path, EP>1 deploy) is missing, so it's safe to run incrementally. |
-| `mx_vs_nccl_refit_bench.py` | Deployment-agnostic driver: runs N refit cycles per backend (`mx` vs `nccl`) over the native weight-transfer API, times register/wire/translate/load/e2e, and `--compare`s the JSON. |
-| `ep_gt1_byte_pruning.py` | Synthetic-but-real-planner proof that EP>1 pulls only 1/EP of expert bytes (EP=8 → 8.0×). Runnable now, no cluster. |
+| `run_differentiator_bench.sh` | Canonical analyzer orchestrator. It accepts only checkpoint-identified live artifacts for Qwen3-30B-A3B and skips scenarios whose artifacts are absent. |
+| `mx_vs_nccl_refit_bench.py` | Deployment-agnostic driver: runs one excluded warmup plus N measured cycles per backend, aggregates the canonical ten stages, emits JSON/CSV, and `--compare`s old or new JSON. Optional versioned trigger/ack flags coordinate an MX publisher. |
+| `mx_hf_publisher_bench.py` | One-GPU MX source for receiver-matched comparisons. Preloads checkpoint `hf_weights`, publishes each triggered version through `MxTrainingPublisher`, marks it READY, and acknowledges the matching cycle. |
+| `ep_gt1_byte_pruning.py` | Planner-only developer check. It is not accepted as differentiator evidence by the canonical runner. |
 | `mdl_partial_smoke.py` | Runtime smoke for MDL incremental/partial-update (cold/warm/subset/incremental, byte-identical). No transport. |
 | `configs/nixl_ep4_tp1_gb200_rc_debug.yaml` | Sanitized EP4→TP1 GB200 topology and UCX/NIXL config, including the TCP-fallback baseline and validated `^tcp` fix (12/12 pulls on RDMA, ~7× steady-state refit speedup). |
 | `preflight_ep8_tp2.sh` | Fail-fast Kubernetes gate for the two 4-GPU EP8 trainer pods and 2-GPU TP2 rollout: GPU count, `rdma0..3`, `^tcp`, matching package versions, and native `mx` backend registration. |
-| `native_nccl_refit_bench.py` | Native-vLLM PyNccl sender/controller baseline. Uses the same NCCL implementation on sender and TP2 rollout, reports group init plus packed update wall time, and avoids the NeMo/vLLM communicator mismatch. |
+| `native_nccl_refit_bench.py` | Native-vLLM PyNccl sender/controller baseline. Coordinates one excluded warmup plus N measured packed updates with versioned trigger/ack files and emits raw plus aggregate canonical-stage records. |
 | `configs/native_nccl_sender.gb200.yaml` | One-GPU GB200 sender pod for `native_nccl_refit_bench.py`, with four RDMA interfaces and the shared checkpoint PVC. |
+| `configs/native_nccl_receiver_30b.gb200.yaml` | Standalone Qwen3-30B-A3B TP2 Dynamo rollout for the NCCL arm. It uses `--load-format auto`, the default vLLM Worker, and `DYN_WEIGHT_TRANSFER_BACKEND=nccl`. |
 | `differentiator_suite.py` | Standard JSON analyzers and assertions for all seven differentiators: EP filtering, TP slicing, partial refit, elastic join, straggler isolation, fan-out, and trainer egress balance. |
 | `fanout_bench.py` | Real-model NIXL data producer for direct-vs-tree fan-out. Trainer, seed, and receiver roles publish timeline JSON consumed by `differentiator_suite.py fanout`. |
 
 ## Run
 
 ```bash
-# synthetic EP proof (no cluster):
-MX_PY=<repo>/…/modelexpress_client/python python3 ep_gt1_byte_pruning.py
+# Analyze live differentiator artifacts. Numeric-only and synthetic inputs are
+# rejected. See "Canonical artifact contract" below for required metadata.
+EP_ARTIFACT=/results/ep.json FULL_EXPERT_BYTES=<measured-expert-bytes> \
+TP_ARTIFACT=/results/tp.json PARTIAL_MANIFEST=/results/manifest.json \
+PARTIAL_SELECTOR=model.layers.0 MX_ARTIFACT=/results/publisher.json \
+MX_LOG=/results/rollout.log MX_STEPS=1 \
+ELASTIC_RESULTS=/results/elastic STRAGGLER_RESULTS=/results/straggler \
+FANOUT_DIRECT=/results/fanout-direct FANOUT_TREE=/results/fanout-tree \
+FANOUT_N=13 OUT=./differentiator_results \
+bash run_differentiator_bench.sh
 
-# full differentiator matrix (once GPUs/deploy are up):
-NS=<namespace> FRONTEND=http://<dgd-frontend>:<port> \
-  MX_PY=<…/modelexpress_client/python> \
-  bash run_differentiator_bench.sh
-
-# Native NCCL baseline (sender pod + TP2 DGD configured with backend=nccl):
+# Native NCCL Real-30B baseline. First replace all <...> placeholders in the
+# receiver manifest and the sender image/PVC values for the target namespace.
+kubectl -n <namespace> apply -f configs/native_nccl_receiver_30b.gb200.yaml
 kubectl -n <namespace> apply -f configs/native_nccl_sender.gb200.yaml
-# Copy this bench file into the sender/controller environment, then run
-# `sender` and `controller` as described by `python native_nccl_refit_bench.py -h`.
+kubectl -n <namespace> wait --for=condition=Ready pod/native-nccl-refit-sender --timeout=30m
+kubectl -n <namespace> wait --for=condition=Ready pod \
+  -l nvidia.com/dynamo-component-type=worker --timeout=30m
 
-# Seven differentiators (runs D1/D2 immediately; live scenarios consume paths
-# supplied through PARTIAL_MANIFEST, ELASTIC_RESULTS, FANOUT_DIRECT/TREE, MX_LOG):
-OUT=./differentiator_results bash run_differentiator_bench.sh
+# Put native_nccl_refit_bench.py at this shared-PVC path before running:
+BENCH=/mnt/rl-workspace/bench/native_nccl_refit_bench.py
+RUN=/mnt/rl-workspace/bench/native-nccl-30b
+SENDER_IP=$(kubectl -n <namespace> get pod native-nccl-refit-sender \
+  -o jsonpath='{.status.podIP}')
+WORKER=$(kubectl -n <namespace> get pod \
+  -l nvidia.com/dynamo-component-type=worker \
+  -o jsonpath='{.items[0].metadata.name}')
+
+# Terminal 1: trainer rank 0. The checkpoint must contain hf_weights or a flat
+# HF-compatible state dict whose names match Qwen/Qwen3-30B-A3B.
+kubectl -n <namespace> exec native-nccl-refit-sender -- \
+  python3 "$BENCH" sender --master-address "$SENDER_IP" --master-port 29600 \
+  --checkpoint /mnt/rl-workspace/<checkpoint>.pt \
+  --manifest "$RUN.manifest.json" --trigger "$RUN.trigger" \
+  --result "$RUN.sender.json" --warmup-cycles 1 --cycles 5 --preload-gpu
+
+# Terminal 2: controller in the TP2 worker (localhost reaches DYN_SYSTEM_PORT).
+kubectl -n <namespace> exec "$WORKER" -- \
+  python3 "$BENCH" controller --master-address "$SENDER_IP" --master-port 29600 \
+  --system-url http://127.0.0.1:9090 \
+  --manifest "$RUN.manifest.json" --trigger "$RUN.trigger" \
+  --result "$RUN.controller.json" --warmup-cycles 1 --cycles 5
+
+# Seven differentiators consume only the live paths shown above.
 ```
+
+## Canonical artifact contract
+
+Every accepted artifact identifies the exact real checkpoint:
+
+```json
+{
+  "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+  "checkpoint": "<snapshot hash or immutable checkpoint ID>",
+  "checkpoint_bytes": 61064245248,
+  "tensor_source": "safetensors",
+  "bytes": 61064245248
+}
+```
+
+Receiver artifacts use `tensor_source: "received_safetensors"`. EP/TP artifacts
+put the actual filtered transfer in `bytes` while retaining
+`checkpoint_bytes: 61064245248`. Partial manifests put the same identity fields
+beside their `tensors` array. The egress analyzer takes this metadata separately
+with `--artifact`. Qwen3-4B, missing checkpoint IDs, shape-only/random tensors,
+and byte counts from any checkpoint other than the 61,064,245,248-byte checkpoint
+are rejected.
+
+## Live direct-vs-tree fan-out
+
+Set `HF_SNAPSHOT` to the immutable local snapshot directory, not a model name or
+download target. The trainer reads every safetensors shard and copies the real
+weights to GPU; seeds republish only bytes they received from that trainer.
+Use N=13 when resources permit. For a smaller allocation, choose
+`N=min(13, available_receiver_GPUs)` and analyze with `FANOUT_N=adaptive`.
+
+Run each role in its assigned GPU/RDMA pod with the benchmark file on the shared
+PVC. Use a fresh `RESULT_DIR` for each trial:
+
+```bash
+BENCH=/mnt/rl-workspace/bench/fanout_bench.py
+SNAP=/mnt/rl-workspace/kavink/hf-cache/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/<hash>
+N=13
+
+# Direct trial: one trainer and N receivers.
+HF_SNAPSHOT="$SNAP" RESULT_DIR=/mnt/rl-workspace/fanout/direct \
+  EXPECTED_RECEIVERS="$N" python3 "$BENCH" trainer
+HF_SNAPSHOT="$SNAP" RESULT_DIR=/mnt/rl-workspace/fanout/direct \
+  PARENT=trainer python3 "$BENCH" receiver <0..N-1>
+
+# Tree trial example for N=13: four seeds, with 4/3/3/3 children.
+HF_SNAPSHOT="$SNAP" RESULT_DIR=/mnt/rl-workspace/fanout/tree \
+  EXPECTED_RECEIVERS="$N" python3 "$BENCH" trainer
+HF_SNAPSHOT="$SNAP" RESULT_DIR=/mnt/rl-workspace/fanout/tree \
+  EXPECTED_RECEIVERS=<children-for-this-seed> python3 "$BENCH" seed <0..3>
+HF_SNAPSHOT="$SNAP" RESULT_DIR=/mnt/rl-workspace/fanout/tree \
+  PARENT=seed:<seed-id> python3 "$BENCH" receiver <0..N-1>
+
+python3 differentiator_suite.py fanout \
+  --direct /mnt/rl-workspace/fanout/direct \
+  --tree /mnt/rl-workspace/fanout/tree --workers 13
+```
+
+The role commands are intentionally pod-local; launch them through the
+deployment's normal Kubernetes exec/job mechanism. This harness does not create
+or mutate cluster resources.
 
 ## Scenarios
 

@@ -1,0 +1,23 @@
+{
+  "assertions": [
+    {
+      "expected": ">= 1.05",
+      "name": "tree beats direct",
+      "observed": 1.5932203389830508,
+      "passed": true
+    }
+  ],
+  "inputs": {
+    "direct": "differentiator_results_2026_07_11/fanout_direct.json",
+    "tree": "differentiator_results_2026_07_11/fanout_tree.json"
+  },
+  "metrics": {
+    "direct_makespan_seconds": 0.94,
+    "speedup": 1.5932203389830508,
+    "tree_makespan_seconds": 0.59,
+    "workers": 13
+  },
+  "scenario": "tree_fanout",
+  "schema_version": 1,
+  "status": "pass"
+}

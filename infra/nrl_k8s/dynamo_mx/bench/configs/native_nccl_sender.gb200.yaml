@@ -12,13 +12,15 @@ metadata:
        {"interfaceName":"rdma3","network":"rdma-3"}]
 spec:
   restartPolicy: Never
+  imagePullSecrets:
+    - name: nvcr-imagepullsecret
   nodeSelector:
     nvidia.com/gpu.product: NVIDIA-GB200
   tolerations:
     - operator: Exists
   containers:
     - name: sender
-      image: nvcr.io/nvidian/dynamo-dev/model-express-dev:native-ep8tp2-30175fa-3300035
+      image: nvcr.io/nvidian/dynamo-dev/model-express-dev:real30b-matrix-v8-collrpc
       command: [sleep, infinity]
       env:
         - {name: NCCL_MNNVL_ENABLE, value: "0"}
@@ -26,6 +28,13 @@ spec:
         - {name: NCCL_NET_PLUGIN, value: none}
         - {name: NCCL_IB_HCA, value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3"}
         - {name: NCCL_SOCKET_IFNAME, value: eth0}
+        - {name: UCX_TLS, value: "^tcp"}
+        - {name: NIXL_UCX_TLS, value: "^tcp"}
+        - {name: UCX_NET_DEVICES, value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1"}
+        - {name: UCX_MAX_RMA_RAILS, value: "4"}
+        - {name: UCX_CUDA_COPY_DMABUF, value: "yes"}
+        - {name: UCX_CUDA_COPY_REG_WHOLE_ALLOC, value: "off"}
+        - {name: MX_RDMA_NIC_PIN, value: "stripe"}
       resources:
         requests:
           cpu: "16"

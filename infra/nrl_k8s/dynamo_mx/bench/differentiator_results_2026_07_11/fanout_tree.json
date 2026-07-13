@@ -1,0 +1,7 @@
+{
+  "workers": 13,
+  "makespan_seconds": 0.59,
+  "model": "Qwen3-4B",
+  "scope": "pure_wire",
+  "topology": "trainer_to_3_seeds_to_10_followers"
+}

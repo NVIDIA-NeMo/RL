@@ -13,7 +13,6 @@ in separate result directories, then summarize makespan and compare them with
 from __future__ import annotations
 
 import base64
-import glob
 import json
 import os
 import pickle
@@ -31,18 +30,32 @@ IDENT = sys.argv[2] if len(sys.argv) > 2 else "0"
 PARENT = os.environ.get("PARENT", "trainer")
 RESULT_DIR = Path(os.environ.get("RESULT_DIR", "/mnt/rl-workspace/fanout_bench"))
 EXPECTED_RECEIVERS = int(os.environ.get("EXPECTED_RECEIVERS", "1"))
-SNAPSHOT_GLOB = os.environ.get(
-    "HF_SNAPSHOT_GLOB",
-    "/mnt/rl-workspace/*/hf-cache/hub/models--Qwen--Qwen3-30B-A3B*/snapshots/*/",
+MODEL_ID = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+CHECKPOINT_BYTES = 61_064_245_248
+STAGE_NAMES = (
+    "control_discovery", "source_preparation", "setup_registration",
+    "transfer_planning", "wire_transfer", "receive_sync", "transformation",
+    "installation", "post_install", "rollout_readiness",
 )
+HF_SNAPSHOT = os.environ.get("HF_SNAPSHOT")
+if not HF_SNAPSHOT:
+    raise RuntimeError("HF_SNAPSHOT must name an immutable Qwen3-30B-A3B snapshot")
+SNAPSHOT = Path(HF_SNAPSHOT)
 
 
-def specs():
-    snapshots = glob.glob(SNAPSHOT_GLOB)
-    if not snapshots:
-        raise RuntimeError(f"No model snapshot matched {SNAPSHOT_GLOB}")
-    snapshot = snapshots[0]
-    index = json.loads(Path(snapshot, "model.safetensors.index.json").read_text())
+def resolve_snapshot():
+    snapshot = SNAPSHOT.resolve()
+    index_path = snapshot / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise RuntimeError(
+            f"HF_SNAPSHOT must identify a local {MODEL_ID} snapshot: {SNAPSHOT}"
+        )
+    if "Qwen3-30B-A3B" not in str(snapshot):
+        raise RuntimeError(f"Refusing non-30B snapshot: {snapshot}")
+    return snapshot, json.loads(index_path.read_text())
+
+
+def specs(snapshot, index):
     dtype_map = {
         "BF16": torch.bfloat16,
         "F16": torch.float16,
@@ -55,13 +68,48 @@ def specs():
     }
     output = {}
     for shard in sorted(set(index["weight_map"].values())):
-        with safe_open(snapshot + shard, framework="pt") as handle:
+        with safe_open(str(snapshot / shard), framework="pt") as handle:
             for name in handle.keys():
                 tensor_slice = handle.get_slice(name)
+                dtype_name = tensor_slice.get_dtype()
+                if dtype_name not in dtype_map:
+                    raise RuntimeError(f"Unsupported safetensors dtype {dtype_name}: {name}")
                 output[name] = (
                     list(tensor_slice.get_shape()),
-                    dtype_map.get(tensor_slice.get_dtype(), torch.bfloat16),
+                    dtype_map[dtype_name],
                 )
+    return output
+
+
+def load_checkpoint(snapshot, index):
+    output = {}
+    for shard in sorted(set(index["weight_map"].values())):
+        with safe_open(str(snapshot / shard), framework="pt", device="cpu") as handle:
+            for name in handle.keys():
+                output[name] = handle.get_tensor(name).to("cuda:0")
+    return output
+
+
+def artifact(tensor_source):
+    return {
+        "schema_version": "refit-stage-v1",
+        "model": MODEL_ID,
+        "checkpoint": snapshot.name,
+        "checkpoint_bytes": CHECKPOINT_BYTES,
+        "tensor_source": tensor_source,
+    }
+
+
+def stages(wire_seconds=None):
+    output = {
+        name: {"status": "unavailable", "seconds": None} for name in STAGE_NAMES
+    }
+    if wire_seconds is not None:
+        output["wire_transfer"] = {
+            "status": "available",
+            "seconds": wire_seconds,
+            "source": "NixlTransferManager.receive_from_source",
+        }
     return output
 
 
@@ -94,11 +142,15 @@ def wait_metadata(path):
 
 assert is_nixl_available()
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
-layout = specs()
-buffers = {
-    name: torch.empty(shape, dtype=dtype, device="cuda:0")
-    for name, (shape, dtype) in layout.items()
-}
+snapshot, checkpoint_index = resolve_snapshot()
+layout = specs(snapshot, checkpoint_index)
+if ROLE == "trainer":
+    buffers = load_checkpoint(snapshot, checkpoint_index)
+else:
+    buffers = {
+        name: torch.empty(shape, dtype=dtype, device="cuda:0")
+        for name, (shape, dtype) in layout.items()
+    }
 manager = NixlTransferManager(
     agent_name=f"fanout-{ROLE}-{IDENT}",
     device_id=0,
@@ -107,10 +159,12 @@ manager = NixlTransferManager(
 manager.initialize()
 manager.register_tensors(buffers)
 total_bytes = sum(t.numel() * t.element_size() for t in buffers.values())
+if total_bytes != CHECKPOINT_BYTES:
+    raise RuntimeError(
+        f"{MODEL_ID} checkpoint is {total_bytes} bytes; expected {CHECKPOINT_BYTES}"
+    )
 
 if ROLE == "trainer":
-    for tensor in buffers.values():
-        tensor.normal_()
     torch.cuda.synchronize()
     write_metadata(metadata_path("trainer"), manager)
     start = time.time()
@@ -121,6 +175,8 @@ if ROLE == "trainer":
         "bytes": total_bytes,
         "start_epoch": start,
         "end_epoch": time.time(),
+        "stages": stages(),
+        **artifact("safetensors"),
     }
     Path(RESULT_DIR, "trainer_result.json").write_text(json.dumps(result, indent=2))
 elif ROLE == "seed":
@@ -143,8 +199,10 @@ elif ROLE == "seed":
         "bytes": transferred,
         "tensors": tensors,
         "pull_seconds": duration,
+        "stages": stages(duration),
         "start_epoch": start,
         "ready_epoch": ready,
+        **artifact("received_safetensors"),
     }
     Path(RESULT_DIR, f"seed_{IDENT}.json").write_text(json.dumps(result, indent=2))
 elif ROLE == "receiver":
@@ -165,8 +223,10 @@ elif ROLE == "receiver":
         "tensors": tensors,
         "pull_seconds": duration,
         "gbps": transferred * 8 / duration / 1e9,
+        "stages": stages(duration),
         "start_epoch": start,
         "end_epoch": end,
+        **artifact("received_safetensors"),
     }
     suffix = PARENT.replace(":", "_")
     Path(RESULT_DIR, f"receiver_{IDENT}_{suffix}.json").write_text(

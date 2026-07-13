@@ -1,0 +1,28 @@
+{
+  "assertions": [
+    {
+      "expected": ">= 1",
+      "name": "straggler injected",
+      "observed": 1,
+      "passed": true
+    },
+    {
+      "expected": "<= 1.25x median",
+      "name": "healthy tail bounded",
+      "observed": 0.565,
+      "passed": true
+    }
+  ],
+  "inputs": {
+    "results": "differentiator_results_2026_07_11/elastic"
+  },
+  "metrics": {
+    "healthy_max_seconds": 0.565,
+    "healthy_median_seconds": 0.542,
+    "healthy_receivers": 2,
+    "injected_stragglers": 1
+  },
+  "scenario": "straggler_isolation",
+  "schema_version": 1,
+  "status": "pass"
+}

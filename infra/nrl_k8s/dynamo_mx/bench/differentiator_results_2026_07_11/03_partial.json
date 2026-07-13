@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "scenario": "partial_refit",
+  "status": "pass",
+  "scope": "load_side_runtime_smoke",
+  "metrics": {
+    "cold_direct_parameters": 2,
+    "cold_fused_mappings": 5,
+    "warm_fallbacks": 0,
+    "subset_parameters_updated": 2,
+    "incremental_fused_mappings_added": 5
+  },
+  "assertions": [
+    {
+      "name": "full warm fused slots are byte-identical",
+      "passed": true
+    },
+    {
+      "name": "subset update leaves unselected slots unchanged",
+      "passed": true
+    },
+    {
+      "name": "previously unseen fused groups map incrementally",
+      "passed": true
+    }
+  ],
+  "limitations": [
+    "No NIXL transport was exercised.",
+    "End-to-end partial-refit bytes and latency remain unmeasured."
+  ]
+}
