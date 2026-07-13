@@ -261,13 +261,10 @@ policy:
       vllm_metrics_logger_interval: 0.5
     vllm_kwargs: {}
     colocated:
-      # true: policy, value, and generation share the training GPUs
-      # false: policy/value share training GPUs and vLLM uses dedicated resources
       enabled: true
-      # only relevant when enabled is false
       resources:
-        gpus_per_node: null # Generation GPUs when policy_nodes=1; otherwise must equal cluster.gpus_per_node
-        num_nodes: null # Number of nodes dedicated to generation when policy_nodes>1
+        gpus_per_node: null
+        num_nodes: null
 
 # Value Model with DTensor (Automodel) Backend (for GAE in PPO)
 value:
