@@ -81,11 +81,11 @@ class AbstractPolicyWorker:
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.REQ)
             self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
+                zmq.SNDTIMEO, 600000
+            )  # 600s: first refit overlaps vLLM engine warmup on aarch64, 120s flaked
             self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
+                zmq.RCVTIMEO, 600000
+            )  # 600s: first refit overlaps vLLM engine warmup on aarch64, 120s flaked
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 

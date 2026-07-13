@@ -1,0 +1,126 @@
+# Qwen3-30B-A3B trace-collection run: the compute/batch shape of
+# examples/configs/recipes/llm/grpo-qwen3-30ba3b-8n4g-megatron.yaml, but running
+# through the NeMo-Gym rollout path (workplace_assistant env) so the sechoi/traces
+# Dynamo-mocker trace hooks fire.
+#
+# We inherit the PROVEN gym recipe (grpo_qwen3_30ba3b_instruct.yaml) so the gym
+# env/data/HTTP-server/tool-parser wiring is unchanged, then override only:
+#   - the four knobs you pinned (GPUs, train_global_batch_size,
+#     num_prompts_per_step, num_generations_per_prompt),
+#   - model + parallelism to match the 8n4g recipe (TP4/EP8 can't fit 4 GPUs/node),
+#   - trace outputs, 20-step cap, validation off.
+#
+# Trace output -> /lustre/fsw/... (a DIFFERENT mount from the working dir on
+# /lustre/fs1), so it must be added to MOUNTS at launch. See the sbatch command.
+defaults: "grpo_qwen3_30ba3b_instruct.yaml"
+
+grpo:
+  # --- pinned to match grpo-qwen3-30ba3b-8n4g-megatron.yaml ---
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 32
+  # --- trace-run controls ---
+  max_num_steps: 20
+  # Async GRPO: rollout collection overlaps training; weights stream to the
+  # generation engines in-flight instead of pausing generation for the refit.
+  # Changes the serving pattern in the traces (continuous request flow with
+  # mid-stream weight updates) — trajectories at most 1 step stale.
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+  # Disable ALL validation so no validation rollouts land in the trace JSONL
+  # (validate() calls the same run_async_nemo_gym_rollout).
+  val_at_start: false
+  val_at_end: false
+  val_period: 0
+
+policy:
+  # 8n4g recipe trains the base (hybrid-thinking) A3B model, not the Instruct-2507
+  # variant the parent gym recipe uses. The gym policy_model config disables
+  # thinking (enable_thinking: false) and uses the hermes tool parser, both of
+  # which apply to the Qwen3 family, so tool-calling rollouts still work.
+  model_name: Qwen/Qwen3-30B-A3B
+  # --- pinned to match the 8n4g recipe ---
+  train_global_batch_size: 512
+  # NOT pinned to the 8n4g recipe's 4096: that recipe is single-turn math, but
+  # workplace_assistant rollouts are multi-turn tool-calling (up to 6 tool
+  # rounds) whose accumulated context blows past 4096 mid-rollout — vLLM then
+  # rejects the turn and the gym env hard-fails the step ("no generation
+  # data"). Use the parent gym recipe's proven value; vllm max_model_len
+  # follows via interpolation.
+  max_total_sequence_length: 32768
+
+  megatron_cfg:
+    # Back to the 8n4g recipe's parallelism (TP2/PP2/EP2). TP2*EP2=4 GPUs, so
+    # every TP/EP group fits inside ONE 4-GPU node — critical on this cluster:
+    # cross-node EP groups (e.g. TP4/EP8, which we briefly used) intermittently
+    # stall in EP allgather when the group straddles two NVL72 racks (see
+    # docs/cluster.md "Topology-Aware Placement for MoE"); job 1497520 died
+    # exactly that way (600s NCCL watchdog timeout in
+    # EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP mid-step-1 training).
+    # The step-1 refit failure originally blamed on this combo was actually
+    # vLLM's FlashInfer MoE kernel re-blocking weights on Blackwell — fixed
+    # orthogonally via VLLM_USE_FLASHINFER_MOE_FP16=0 in the launch script.
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    expert_model_parallel_size: 2
+    context_parallel_size: 1
+    moe_token_dispatcher_type: allgather
+
+  generation:
+    # Async GRPO requires non-colocated inference (grpo.py asserts): generation
+    # gets dedicated nodes, training gets the remainder of cluster.num_nodes.
+    # 4/4 split of the 8 nodes: 16 GPUs -> 8 vLLM TP2 engines generating
+    # continuously; 16 GPUs -> training DP2 (TP2*PP2*EP2 = 8 GPUs/replica).
+    # Weights flow via NCCL collective broadcast (in-flight) instead of the
+    # colocated ZMQ path.
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4
+        gpus_per_node: 4
+    # Rollout-level Dynamo mocker DirectRequest trace (one row per assistant turn).
+    mocker_request_trace_jsonl: /lustre/fsw/portfolios/coreai/users/sechoi/nemotron/RL-traces/qwen3_30ba3b_8n4g_mocker_requests.jsonl
+    vllm_cfg:
+      # Match the 8n4g recipe's generation TP.
+      tensor_parallel_size: 2
+      # Per-request vLLM HTTP server trace (one row per /v1/chat/completions call).
+      mocker_request_server_trace_jsonl: /lustre/fsw/portfolios/coreai/users/sechoi/nemotron/RL-traces/qwen3_30ba3b_8n4g_vllm_server_requests.jsonl
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.2
+
+checkpointing:
+  # Trace-collection run: don't checkpoint (parent gym recipe saves every step,
+  # save_period: 1, which would dominate wall-clock for a 30B MoE over 20 steps).
+  enabled: false
+
+# Async GRPO trains on samples up to 1 step off-policy; the loss must apply
+# importance-sampling correction or convergence degrades (grpo.py asserts this).
+loss_fn:
+  use_importance_sampling_correction: true
+
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          # Assign new rollout sessions to the engine with the least cumulative
+          # served tokens (from response usage stats) instead of round-robin by
+          # arrival count. Session->engine affinity (prefix cache reuse) is
+          # unchanged; only initial placement is load-aware.
+          least_loaded_routing: false
+          two_choice_routing: true
+          # Book each session's PREDICTED output length (trace-derived, same
+          # labels file as LPT admission) as provisional load at assignment,
+          # instead of the running-average estimate — monsters reserve their
+          # true weight up front.
+          predicted_cost_json: /home/scratch.sechoi_coreai/nrl/RL-traces/traces/qwen3-30ba3b-trace20d/length_order_absolute_gymkey.json
+
+logger:
+  # No W&B for a trace run -- avoids needing WANDB_API_KEY at launch.
+  wandb_enabled: false
+
+cluster:
+  # --- pinned to match the 8n4g recipe: 4 GPUs/node x 8 nodes = 32 GPUs ---
+  gpus_per_node: 4
+  num_nodes: 8

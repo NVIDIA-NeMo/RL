@@ -284,7 +284,22 @@ def _snapshot_vllm_trace_metrics() -> dict[str, float | int | None]:
     return metrics
 
 
+def _sharded_trace_path(path: str) -> str:
+    """Per-process shard of the configured trace path.
+
+    Many vLLM server processes across nodes append to this file; O_APPEND is
+    not atomic on NFS, so a shared file gets torn/interleaved lines (~6% of
+    rows observed). Each process writes its own shard; concatenate
+    `<base>.shard-*.jsonl` after the run to produce the configured file.
+    """
+    import socket
+
+    base, ext = os.path.splitext(path)
+    return f"{base}.shard-{socket.gethostname()}-{os.getpid()}{ext}"
+
+
 def _append_trace_jsonl(path: str, record: dict[str, Any]) -> None:
+    path = _sharded_trace_path(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     line = json.dumps(record, separators=(",", ":"), default=str) + "\n"
     encoded = line.encode("utf-8")

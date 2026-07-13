@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import os
 import re
 import traceback
 from typing import Any
@@ -130,11 +131,11 @@ class VllmInternalWorkerExtension:
                 zmq.REP
             )
             self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
+                zmq.SNDTIMEO, 600000
+            )  # 600s: first refit overlaps vLLM engine warmup on aarch64, 120s flaked
             self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
+                zmq.RCVTIMEO, 600000
+            )  # 600s: first refit overlaps vLLM engine warmup on aarch64, 120s flaked
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
@@ -415,10 +416,44 @@ class VllmInternalWorkerExtension:
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            print(
+            try:
+                chunk_keys = [
+                    (k, tuple(self.state_dict_info[k][0]), str(self.state_dict_info[k][1]))
+                    for k in locals().get("list_keys", [])
+                ]
+            except Exception:
+                chunk_keys = "<unavailable>"
+            try:
+                expert_params = [
+                    (n, tuple(p.shape), getattr(p, "is_transposed", None))
+                    for n, p in self.model_runner.model.named_parameters()
+                    if "experts" in n and ("layers.0." in n or "layers.24." in n)
+                ]
+            except Exception:
+                expert_params = "<unavailable>"
+            msg = (
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
+                f"model expert params(shape,is_transposed)={expert_params}\n"
+                f"chunk keys(shape,dtype)={chunk_keys}\n"
                 f"{traceback.format_exc()}"
             )
+            print(msg)
+            # EngineCore stdout is lost when the job dies; persist the real
+            # exception to shared storage so refit failures are debuggable.
+            try:
+                import datetime
+                import socket
+
+                err_log = os.environ.get("NRL_REFIT_ERROR_LOG")
+                if err_log:
+                    with open(err_log, "a") as f:
+                        f.write(
+                            f"=== {datetime.datetime.now().isoformat()} host={socket.gethostname()} "
+                            f"device={getattr(self.device, 'index', '?')} zmq_addr={self.get_zmq_address()}\n"
+                            f"{msg}\n"
+                        )
+            except Exception:
+                pass
             return False
 
     @wrap_with_nvtx_name(

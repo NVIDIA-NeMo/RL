@@ -89,6 +89,19 @@ class AsyncTrajectoryCollector:
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
 
+        # Optional LPT (longest-first) admission: predicted per-prompt output
+        # lengths from a length-ordering file. See AsyncGRPOConfig.
+        self._lpt_labels: dict[str, dict[str, Any]] | None = None
+        lpt_json = self.master_config.grpo["async_grpo"].get("lpt_admission_json")
+        if lpt_json:
+            from nemo_rl.data.length_ordering import load_length_order
+
+            self._lpt_labels = load_length_order(lpt_json)
+            print(
+                f"🔀 LPT admission enabled: {len(self._lpt_labels)} prompt labels "
+                f"from {lpt_json} (longest predicted output first)"
+            )
+
         # Track when generation limits cause collection to pause
         self._last_limit_warning_version = None
 
@@ -303,6 +316,36 @@ class AsyncTrajectoryCollector:
             self.running = False
             print("🛑 Trajectory collection stopped")
 
+    def _lpt_admission_order(
+        self, batch: BatchedDataDict[DatumSpec], num_prompts: int
+    ) -> list[int]:
+        """Order prompt indices for dispatch, predicted-longest first.
+
+        Returns a permutation of range(num_prompts). Without an LPT labels
+        file this is the identity (dataloader order). With one, prompts are
+        dispatched by predicted total output length descending so the deepest
+        rollout chains start earliest; prompts without a label sort first
+        (unknown length is treated as potentially long).
+        """
+        if not self._lpt_labels:
+            return list(range(num_prompts))
+
+        from nemo_rl.data.length_ordering import first_turn_prompt_hash
+
+        def predicted_len(idx: int) -> float:
+            datum = {
+                k: batch[k][idx]
+                for k in ("message_log", "extra_env_info")
+                if k in batch
+            }
+            key = first_turn_prompt_hash(datum)
+            entry = self._lpt_labels.get(key) if key else None
+            if entry is None:
+                return float("inf")
+            return float(entry.get("value_absolute", 0.0))
+
+        return sorted(range(num_prompts), key=predicted_len, reverse=True)
+
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
         target_weight: Optional[int] = None
@@ -358,7 +401,9 @@ class AsyncTrajectoryCollector:
             with self._counter_lock:
                 self._spawning_targets.add(target_weight)
             try:
-                for prompt_idx in range(num_prompts_to_generate):
+                for prompt_idx in self._lpt_admission_order(
+                    batch, num_prompts_to_generate
+                ):
                     # Wait for refit to complete if in progress
                     if not self._refit_pause_cleared.is_set() and self.running:
                         with self._threads_lock:

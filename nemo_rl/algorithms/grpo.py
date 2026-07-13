@@ -149,6 +149,15 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # Optional: length-ordering JSON (tools/build_length_ordering.py, gym-rekeyed)
+    # used for LPT (longest-first) rollout admission in the async trajectory
+    # collector. Each batch's prompt groups are dispatched predicted-longest
+    # first so deep chains start early and short chains backfill, instead of a
+    # late-admitted long chain defining the batch's completion tail. Admission
+    # order does not change which prompts train in which step (curriculum
+    # neutral). Prompts absent from the file are admitted first (unknown length
+    # is treated as potentially long).
+    lpt_admission_json: NotRequired[str | None]
 
 
 class AdvEstimatorConfig(TypedDict):

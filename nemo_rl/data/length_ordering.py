@@ -58,18 +58,36 @@ def first_turn_prompt_hash(datum_spec: dict[str, Any]) -> str | None:
     Mirrors the rollout writer: the prompt is every message preceding the first
     assistant message. A training datum has no assistant message yet, so this is
     the concatenation of all message token-id lists.
+
+    Gym datasets (`nemo_gym_data_processor`) carry only a placeholder
+    message_log — the real prompt is built by the gym agent at rollout time —
+    so the token hash is unmatchable there. For those data, fall back to the
+    SHA-256 of the first user-message *content string* from ``extra_env_info``;
+    pair with an ordering file re-keyed the same way
+    (tools/rekey_length_ordering_gym.py).
     """
     message_log = datum_spec.get("message_log")
-    if not message_log:
-        return None
     prompt_tokens: list[int] = []
-    for message in message_log:
-        if message.get("role") == "assistant":
-            break
-        prompt_tokens.extend(_token_ids_to_list(message.get("token_ids")))
-    if not prompt_tokens:
-        return None
-    return token_ids_hash(prompt_tokens)
+    if message_log:
+        for message in message_log:
+            if message.get("role") == "assistant":
+                break
+            prompt_tokens.extend(_token_ids_to_list(message.get("token_ids")))
+    if prompt_tokens:
+        return token_ids_hash(prompt_tokens)
+
+    extra = datum_spec.get("extra_env_info") or {}
+    params = extra.get("responses_create_params") or {}
+    for message in params.get("input", []):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    p.get("text", "") for p in content if isinstance(p, dict)
+                )
+            if isinstance(content, str) and content:
+                return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return None
 
 
 def load_length_order(path: str | Path) -> dict[str, dict[str, Any]]:
