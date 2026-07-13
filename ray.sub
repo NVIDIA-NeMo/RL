@@ -403,8 +403,12 @@ ip_head=$head_node_ip:$PORT
 TOPO_PROBE_SCRIPT="$LOG_DIR/topology_probe.sh"
 cat > "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
 CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
-if [[ -z "\$CLUSTER_UUID" ]]; then
-  CLUSTER_UUID=""
+# H100 nodes do not expose an NVLink fabric ClusterUUID. Use the Slurm leaf
+# switch as the placement domain so multi-node EP/DP groups can still be kept
+# within one leaf by cluster.segment_size.
+if [[ -z "\$CLUSTER_UUID" && -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "switch.switch.switch.node" ]]; then
+  _leaf_domain="\${SLURM_TOPOLOGY_ADDR%.*}"
+  CLUSTER_UUID=\$(printf '%s' "\$_leaf_domain" | tr -c '[:alnum:]_' '_')
 fi
 
 TOPO_RANK=""
@@ -417,6 +421,12 @@ if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "
     # Force base-10 interpretation; leading-zero digits like "08" would otherwise
     # be parsed as invalid octal by bash arithmetic, silently leaving TOPO_RANK empty.
     TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
+  fi
+elif [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "switch.switch.switch.node" ]]; then
+  _node_part="\${SLURM_TOPOLOGY_ADDR##*.}"
+  _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
+  if [[ -n "\$_node_digits" ]]; then
+    TOPO_RANK=\$(( 10#\$_node_digits ))
   fi
 elif [[ -n "\${SLURM_PROCID:-}" ]]; then
   TOPO_RANK=\$(( 10#\$SLURM_PROCID ))
