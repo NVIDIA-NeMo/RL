@@ -11,6 +11,9 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
   scheduler: null
@@ -23,6 +26,9 @@ value:
     enabled: false
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
   make_sequence_length_divisible_by: ${value.megatron_cfg.tensor_model_parallel_size}
   optimizer: null
   scheduler: null

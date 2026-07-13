@@ -1,4 +1,4 @@
-# Audio Post-training with Nemo-RL
+# Audio Post-training with NeMo RL
 
 > **Audio dependencies are not pre-installed in the NeMo-RL container.**
 > Run the following script once before training or evaluation:
@@ -9,9 +9,9 @@
 >
 > The script is a no-op if they are already installed. Audio tests run it automatically.
 
-This guide explains how to use NeMo-RL to train [Qwen2.5-Omni](https://huggingface.co/Qwen) (3B or 7B) and [Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) with GRPO on audio question-answering data, convert the resulting Megatron checkpoint to Hugging Face format, and evaluate it on the [MMAU benchmark](https://huggingface.co/datasets/TwinkStart/MMAU).
+This guide explains how to use NeMo RL to train [Qwen2.5-Omni](https://huggingface.co/Qwen) (3B or 7B) and [Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) with GRPO on audio question-answering data, convert the resulting Megatron checkpoint to Hugging Face format, and evaluate it on the [MMAU benchmark](https://huggingface.co/datasets/TwinkStart/MMAU).
 
-NeMo-RL ships three recipes out of the box, but the pieces are independent and can be mixed:
+NeMo RL ships three recipes out of the box, but the pieces are independent and can be mixed:
 
 | Recipe | Model | Default dataset | Config |
 | --- | --- | --- | --- |
@@ -25,7 +25,7 @@ The 3B recipe accepts the AudioMCQ dataset via a CLI override (no new YAML neede
 
 ### AVQA
 
-The [Audio-Visual Question Answering (AVQA)](https://mn.cs.tsinghua.edu.cn/avqa) dataset is the original training corpus from the [R1-AQA paper](https://arxiv.org/abs/2503.11197). NeMo-RL exposes it under the registry key `audiomcq`'s sibling, `dataset_name: avqa`, and pulls the pre-processed split from [`gijs/avqa-processed`](https://huggingface.co/datasets/gijs/avqa-processed) on the Hub. AVQA has native `train` and `validation` splits, so the 3B recipe references both directly.
+The [Audio-Visual Question Answering (AVQA)](https://mn.cs.tsinghua.edu.cn/avqa) dataset is the original training corpus from the [R1-AQA paper](https://arxiv.org/abs/2503.11197). NeMo RL exposes it under the registry key `audiomcq`'s sibling, `dataset_name: avqa`, and pulls the pre-processed split from [`gijs/avqa-processed`](https://huggingface.co/datasets/gijs/avqa-processed) on the Hub. AVQA has native `train` and `validation` splits, so the 3B recipe references both directly.
 
 ### AudioMCQ-StrongAC-GeminiCoT
 
@@ -36,7 +36,7 @@ The [Audio-Visual Question Answering (AVQA)](https://mn.cs.tsinghua.edu.cn/avqa)
 
 It contains ~19,480 multiple-choice rows totalling ~9.72 GB across seven source folders (AudioCaps, SpeechCraft, CompA-R, Tacos, LP-MusicCaps-MTT, Clotho, MusicCaps). The snapshot ships every audio file inline next to a `data.jsonl` manifest, so a one-time `snapshot_download` is sufficient — no per-source corpus fetch is needed.
 
-NeMo-RL exposes the dataset under `dataset_name: audiomcq`. The wrapper performs an eager head-row asset probe at construction time, so a missing or partial snapshot fails fast with a clear error before any Ray actor or model spins up. To pre-stage:
+NeMo RL exposes the dataset under `dataset_name: audiomcq`. The wrapper performs an eager head-row asset probe at construction time, so a missing or partial snapshot fails fast with a clear error before any Ray actor or model spins up. To pre-stage:
 
 ```
 huggingface-cli download Harland/AudioMCQ-StrongAC-GeminiCoT --repo-type=dataset
@@ -132,7 +132,7 @@ Key hyperparameters (sized for 4 × 8 × H100/H200 80 GB):
 The Qwen3-Omni recipe has two model-specific gotchas baked into the yaml:
 
 - **Thinker-only training.** The Megatron `Qwen3OmniBridge` only converts the thinker (LLM + audio + vision encoders); talker / code2wav modules emit a one-line `talker/code2wav audio-output is not supported yet` warning at convert time and stay frozen at the original HF weights, so checkpoint conversion in §3 needs `--no-strict`.
-- **vLLM `tensor_parallel_size: 4`, not 1.** With TP=1 + EP > 1, NeMo-RL's `VllmGenerationWorker` enters the `else` branch in `vllm_worker.py:431` (no `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`, no `VLLM_RAY_PER_WORKER_GPUS`); vLLM then auto-picks `RayDistributedExecutor` (because the worker actor itself runs inside a Ray actor) and `_init_workers_ray` blocks forever in `ray.get` waiting for a Ray sub-worker that has no GPU bundle to land on. TP=4 enters the `if model_parallel_size > 1` branch, which sets the per-worker GPU fraction so the sub-workers can co-tenant the parent actor's GPU bundle. TP must also divide the audio tower's 20 attention heads, which rules out TP=8.
+- **vLLM `tensor_parallel_size: 4`, not 1.** With TP=1 + EP > 1, NeMo RL's `VllmGenerationWorker` enters the `else` branch in `vllm_worker.py:431` (no `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`, no `VLLM_RAY_PER_WORKER_GPUS`); vLLM then auto-picks `RayDistributedExecutor` (because the worker actor itself runs inside a Ray actor) and `_init_workers_ray` blocks forever in `ray.get` waiting for a Ray sub-worker that has no GPU bundle to land on. TP=4 enters the `if model_parallel_size > 1` branch, which sets the per-worker GPU fraction so the sub-workers can co-tenant the parent actor's GPU bundle. TP must also divide the audio tower's 20 attention heads, which rules out TP=8.
 
 ## 3. Convert checkpoint (Megatron → HF)
 
@@ -186,9 +186,9 @@ score=0.7210 (721.0/1000)
 | --- | --- |
 | Qwen2.5-Omni-3B (baseline) | 69.8 |
 | Qwen2.5-Omni-3B + GRPO (HF vanilla, R1-AQA) | 71.6 |
-| Qwen2.5-Omni-3B + GRPO (NeMo-RL) | **72.1** |
+| Qwen2.5-Omni-3B + GRPO (NeMo RL) | **72.1** |
 
-The NeMo-RL number is comparable to and slightly higher than the Hugging Face Transformers reference implementation, confirming that the pipeline reproduces the expected improvement over baseline.
+The NeMo RL number is comparable to and slightly higher than the Hugging Face Transformers reference implementation, confirming that the pipeline reproduces the expected improvement over baseline.
 
 ### 7B + AudioMCQ
 

@@ -157,6 +157,9 @@ policy:
 
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     use_fused_linear_logprobs: false
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
@@ -320,8 +323,8 @@ policy:
     - milestones: [50]
 
   generation:
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -451,8 +454,8 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
-  master_port_range_low: 25000
-  master_port_range_high: 28000
+  master_port_range_low: 1400
+  master_port_range_high: 1999
   segment_size: null
 
 # TransferQueue-mediated data plane for sync GRPO.
