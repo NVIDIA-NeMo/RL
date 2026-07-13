@@ -1,0 +1,230 @@
+# DeepSeek-V4-Flash GRPO (DAPO) — AutoModel/DTensor backend with Context Parallel.
+#
+# Long-context counterpart of grpo_dsv4_flash_base_3k_automodel_8n_ep64.yaml:
+# adds manual DSV4 context-parallel (CP=8) and the TileLang sparse-attention
+# backend to train at max_total_sequence_length=10240 (10k). Validated on 8x H100
+# nodes (64 GPUs) with a healthy reward curve.
+#
+# CP notes:
+#   - DSV4 uses a manual context-parallel path (NRL_DSV4_MANUAL_CP=1): NeMo-RL
+#     seq-shards the microbatch and the model all-gathers KV across CP ranks
+#     itself (separate from NeMo-RL's DTensor/ring CP). Gated on cp_size>1.
+#   - CP is overlaid on dp*cp*tp; EP=64 is still valid with CP=8 (they are NOT
+#     multiplicative here — see device_mesh.py _create_fsdp2_device_mesh).
+#
+# This recipe targets the non-base `DeepSeek-V4-Flash` (FP4 experts): AutoModel
+# dequantizes to BF16 for training (dequantize_base_checkpoint), vLLM serves the
+# FP8 base layout, and the FP8 refit bridges the two each step.
+defaults: grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  batch_multiplier: 3
+  max_rollout_turns: 1
+  max_num_epochs: 100
+  max_num_steps: 1000
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  adv_estimator:
+    name: grpo
+    normalize_rewards: false
+    use_leave_one_out_baseline: false
+    minus_baseline: true
+  val_period: 10
+  max_val_samples: 960
+  val_batch_size: 960
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 1024
+    max_response_length: 8192
+
+loss_fn:
+  # Average each response loss before averaging responses, so long negative
+  # rollouts do not get extra weight solely from token count.
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+
+checkpointing:
+  keep_top_k: 1
+  save_period: 2
+  checkpoint_must_save_by: "00:03:40:00"
+  model_save_format: null
+  checkpoint_dir: results/grpo-dsv4-flash-10k-cp8-automodel-8n-ep64/checkpoints
+
+policy:
+  model_name: deepseek-ai/DeepSeek-V4-Flash
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: deepseek_v4
+    chat_template_kwargs:
+      enable_thinking: false
+  dequantize_base_checkpoint: true
+  hf_config_overrides:
+    num_nextn_predict_layers: 0
+    freeze_indexer_query_projection: false
+    # Training-side FP8 fake-quant on all DSV4 submodules so the training policy
+    # matches the FP8 generation policy (keeps gen_kl_error low).
+    fp8_ds_mla_fake_quant_kv: true
+    fp8_ds_mla_fake_quant_o_proj: true
+    fp8_ds_mla_fake_quant_moe: true
+    fp8_ds_mla_fake_quant_attn_proj: true
+    fp8_ds_mla_fake_quant_indexer: true
+    expert_dtype: fp8
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  precision: bfloat16
+  max_total_sequence_length: 10240
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
+  make_sequence_length_divisible_by: 64
+  max_grad_norm: 1.0
+  optimizer:
+    name: "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: "torch.bfloat16"
+      exp_avg_sq_dtype: "torch.bfloat16"
+      split_fp32_params_to_torch_adamw: true
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-02
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    env_vars:
+      # Non-base Flash (FP4) experts: load the flash layout.
+      NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT: flash
+      # Seq-chunk the lm_head so the full [seq x vocab] fp32 logits is never
+      # materialized (relieves the long-context backward peak). Numerically
+      # identical to the full lm_head.
+      NEMO_AUTOMODEL_LMHEAD_CHUNK_TOKENS: "256"
+      # Offload optimizer state to CPU during train fwd/bwd, reload only for
+      # optimizer.step() — frees the resident FusedAdam states so the fp32
+      # lm_head weight-grad fits. Precision-neutral (states unchanged, just moved
+      # CPU<->GPU); costs a PCIe transfer per global batch.
+      NRL_OFFLOAD_OPTIMIZER_FOR_TRAIN: "1"
+      # Chunk the MoE token scatter to cut the train-forward peak.
+      NEMO_AUTOMODEL_MOE_SCATTER_CHUNK_ROWS: "4096"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # DSV4 manual context-parallel: only takes effect when context_parallel_size>1.
+      NRL_DSV4_MANUAL_CP: "1"
+      # Persistent SHARED TileLang kernel cache. Point at a persistent path on a
+      # shared filesystem so JIT'd kernels are reused across ranks and runs (the
+      # default ~/.tilelang/cache is container-ephemeral and cold-JITs every run).
+      TILELANG_CACHE_DIR: /path/to/shared/tilelang-cache-dsv4
+    # cpu_offload:true BREAKS the DSV4 _torch_mm_experts_fwd path (expert weights
+    # stay on CPU while activations are CUDA -> grouped_mm device mismatch). Keep false.
+    cpu_offload: false
+    sequence_parallel: false
+    tensor_parallel_size: 1
+    context_parallel_size: 8
+    expert_parallel_size: 64
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+      reshard_after_forward: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        # Genuine DeepSeek-V4 TileLang sparse attention + indexer + Sinkhorn
+        # kernels (exact custom backward, native head_dim=512). Requires the
+        # tile_kernels dep (CUDA >= 13.1).
+        attn: tilelang
+        linear: torch
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: hybridep
+        # dispatcher_async_dispatch:true CRASHES on cu13 (NVSHMEM 3.6.5): async
+        # dispatch returns before recv metadata is ready. Keep sync (default false).
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+        gate_precision: float32
+  megatron_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 8192
+    temperature: 1.0
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8_ds_mla
+      tensor_parallel_size: 8
+      expert_parallel_size: 1
+      enable_expert_parallel: true
+      # Round FP8 weight scales to powers of 2 (UE8M0) so generation matches the
+      # DSV4 checkpoint scale_fmt and the training-side fake-quant.
+      pow2_weight_scaling_factors: true
+      gpu_memory_utilization: 0.6  # FLOOR — below 0.6 the vLLM KV cache is too small and engine init fails.
+      enforce_eager: true
+      max_model_len: ${policy.max_total_sequence_length}
+      use_deep_gemm: true
+      sleep_level: 1
+    vllm_kwargs:
+      tokenizer_mode: deepseek_v4
+
+data:
+  max_input_seq_length: 1024
+  filter_overlong_prompts: true
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+
+logger:
+  wandb_enabled: true
+  monitor_gpus: true
+  num_val_samples_to_print: 2
+  num_train_samples_to_print: 2
+  wandb:
+    project: nemo-rl
+    name: grpo-dsv4-flash-10k-cp8-automodel-8n-ep64
+  tensorboard_enabled: true
+  tensorboard:
+    log_dir: tb_logs/grpo-dsv4-flash-10k-cp8-automodel-8n-ep64
+  mlflow:
+    run_name: grpo-dsv4-flash-10k-cp8-automodel-8n-ep64
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
