@@ -30,7 +30,7 @@ def _ensure_package(monkeypatch, name: str) -> ModuleType:
     if "." in name:
         parent_name, child_name = name.rsplit(".", 1)
         parent_module = _ensure_package(monkeypatch, parent_name)
-        setattr(parent_module, child_name, module)
+        monkeypatch.setattr(parent_module, child_name, module, raising=False)
 
     return module
 
@@ -87,14 +87,16 @@ def _install_runtime_stubs_for_hf_import(monkeypatch):
     parallel_state = ModuleType("megatron.core.parallel_state")
     parallel_state.model_parallel_is_initialized = lambda: False
     monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", parallel_state)
-    core_module.parallel_state = parallel_state
+    monkeypatch.setattr(core_module, "parallel_state", parallel_state, raising=False)
 
     rerun_state_machine = ModuleType("megatron.core.rerun_state_machine")
     rerun_state_machine.destroy_rerun_state_machine = lambda: None
     monkeypatch.setitem(
         sys.modules, "megatron.core.rerun_state_machine", rerun_state_machine
     )
-    core_module.rerun_state_machine = rerun_state_machine
+    monkeypatch.setattr(
+        core_module, "rerun_state_machine", rerun_state_machine, raising=False
+    )
 
     tensor_parallel = ModuleType("megatron.core.tensor_parallel")
     tensor_parallel.model_parallel_cuda_manual_seed = lambda seed: None
@@ -106,7 +108,7 @@ def _install_runtime_stubs_for_hf_import(monkeypatch):
     monkeypatch.setitem(
         sys.modules, "megatron.core.tensor_parallel.random", tensor_parallel_random
     )
-    core_module.tensor_parallel = tensor_parallel
+    monkeypatch.setattr(core_module, "tensor_parallel", tensor_parallel, raising=False)
 
 
 def test_prefer_nvrx_is_noop_when_strategy_import_fails(monkeypatch):
