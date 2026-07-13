@@ -102,6 +102,9 @@ class TrtllmAsyncGenerationWorkerImpl:
         self._seed = seed
         self.llm = None
         self.TrtSamplingParams = None
+        self._http_thread = None
+        self._http_base_url: Optional[str] = None
+        self._http_server = None
 
         if not self.is_model_owner:
             return
@@ -230,13 +233,16 @@ class TrtllmAsyncGenerationWorkerImpl:
         return True
 
     async def post_init_async(self) -> None:
-        """Finish async-side engine setup on the Ray actor's asyncio loop."""
+        """Finish async engine setup on the Ray actor's asyncio loop and (optionally) start HTTP server."""
         if not self.is_model_owner or self.llm is None:
             return
 
         print("[TrtllmAsyncWorker] post_init_async: awaiting setup_async…", flush=True)
         await self.llm.setup_async()
         print("[TrtllmAsyncWorker] AsyncLLM ready", flush=True)
+
+        if self.cfg["trtllm_cfg"].get("expose_http_server"):
+            self.start_http_server()
 
     def shutdown(self) -> bool:
         try:

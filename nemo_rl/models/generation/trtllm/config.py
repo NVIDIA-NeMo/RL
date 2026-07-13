@@ -24,6 +24,7 @@ class TrtllmSpecificArgs(TypedDict):
     precision: str
     max_batch_size: int
     max_num_tokens: int
+    expose_http_server: NotRequired[bool]
     async_engine: NotRequired[bool]
     # MoE expert parallelism. TRT-LLM splits the TP dimension on MoE layers
     # into moe_tp × moe_ep, so the constraint is
