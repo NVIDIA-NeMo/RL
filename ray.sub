@@ -251,10 +251,10 @@ fi
 # GB200/Grace).
 # gcs_server_rpc_server_thread_num: threads that poll for incoming gRPC requests.
 # num_server_call_thread: threads that send gRPC replies.
-# gcs_server_rpc_client_thread_num (default max(1, cores/4)): threads the GCS
-#   uses as a gRPC client to send replies back to raylets. Match it to the
-#   inbound server pool so the reply path does not become the bottleneck once
-#   the request pool is widened.
+# gcs_server_rpc_client_thread_num (default max(1, cores/4)): threads that poll
+#   replies to the GCS's own outbound RPCs to raylets/workers. Match it to the
+#   inbound server pool so the outbound reply path does not become the
+#   bottleneck once the request pool is widened.
 export RAY_gcs_server_rpc_server_thread_num="${RAY_gcs_server_rpc_server_thread_num:-$CPUS_PER_WORKER}"
 export RAY_num_server_call_thread="${RAY_num_server_call_thread:-$(( CPUS_PER_WORKER / 2 > 0 ? CPUS_PER_WORKER / 2 : 1 ))}"
 export RAY_gcs_server_rpc_client_thread_num="${RAY_gcs_server_rpc_client_thread_num:-$CPUS_PER_WORKER}"
