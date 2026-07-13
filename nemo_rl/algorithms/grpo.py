@@ -1722,7 +1722,11 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
         return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
 
     if backend == "trtllm":
-        return bool(generation_config.get("trtllm_cfg", {}).get("async_engine", False))
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
+            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
+        return True
 
     if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
@@ -1760,13 +1764,6 @@ def _build_async_grpo_train_data(
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
     return train_data
 
-    if backend == "trtllm":
-        trtllm_cfg = generation_config.get("trtllm_cfg", {})
-        return trtllm_cfg.get("async_engine", False)
-
-    return False
-
-
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     """Determine if NeMo-Gym should be used for rollouts and validation based on the configuration."""
     env_config = master_config.env
@@ -1774,6 +1771,7 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     if not should_use_nemo_gym:
         return should_use_nemo_gym
 
+    # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
         "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
     )
