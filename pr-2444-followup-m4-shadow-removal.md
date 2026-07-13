@@ -286,6 +286,52 @@ the shard math the workstream is trying to delete. So the HF-shape
 allocation is intrinsic to the design choice, not an optimization we
 skipped.
 
+#### Compute overhead after two straightforward optimizations
+
+The numbers above assume the naive path (fresh `torch.zeros` per param).
+Two optimizations are essentially free code-wise and shift the picture
+substantially:
+
+1. **Buffer reuse via PyTorch's caching allocator** — `torch.zeros(shape,
+   device=cuda)` after the first call hits the cached pool. Allocation
+   itself is ~free after warm-up. Not a code change; PyTorch does this by
+   default.
+2. **Dirty-index tracking** — instead of `torch.zeros`, use
+   `torch.empty` + a per-buffer "indices scattered last time" list;
+   zero only those indices at the top of each apply. Converts the
+   O(HF-shape) memset into O(sparse_count). ~30 extra lines of
+   bookkeeping.
+
+Post-optimization the per-apply cost breakdown is:
+
+- O(sparse_count) memset (dirty-index rewrite)
+- O(sparse_count) scatter (`index_copy_`)
+- O(shard_size) = O(HF-shape / tp_size) inside vLLM's `weight_loader` (unavoidable — this is the delegation cost)
+
+Dominant term: O(HF-shape / tp_size). Ratio vs plan (which is O(sparse_count)):
+
+| tp_size | Sparsity | Additive vs plan (after opts) |
+|---|---|---|
+| 1 | 5% | ~20× |
+| 8 | 5% | ~2.5× |
+| 16 | 5% | ~1.3× |
+| 1 | 1% | ~100× |
+| 8 | 1% | ~12.5× |
+| 16 | 1% | ~6.25× |
+
+**The real trade-off named:** at TP=1 the O(shard)=O(HF) `.copy_→.add_`
+inside `weight_loader` still dominates and additive stays ~20× at 5%
+sparsity. Buffer-reuse doesn't save you. You'd need to abandon
+`weight_loader` delegation to fix it — which defeats the workstream. At
+TP≥8 the shard shrinks enough that additive gets within 3× of plan and
+the delegation cost is a comfortable trade for -1000 lines of code.
+
+**Implication for M4:** if the deployment targets are exclusively TP=1
+(unusual for the models this receiver serves), the regression may exceed
+the plan doc's 15% success bar and universal-additive is not viable.
+Otherwise it's a defensible default with the two optimizations wired in.
+Measure via §M3 to be sure.
+
 #### Wall-clock overhead per refit
 
 Refit wall-clock = payload upload (Megatron) + transport (S3/ZMQ) +
