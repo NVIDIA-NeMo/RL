@@ -1,8 +1,7 @@
 # Audio Post-training with Nemo-RL
 
-> **Audio dependencies are not pre-installed in the NeMo-RL container.** `torchaudio` and
-> `torchcodec` bundle an FFmpeg build that includes H.264/AAC decoder implementations
-> subject to patent licensing. Run the following script once before training or evaluation:
+> **Audio dependencies are not pre-installed in the NeMo-RL container.**
+> Run the following script once before training or evaluation:
 >
 > ```bash
 > bash scripts/install_audio_deps.sh

@@ -1,10 +1,6 @@
 #!/bin/bash
 # Install audio dependencies that are NOT shipped in the NeMo-RL container.
 #
-# torchaudio and torchcodec bundle an FFmpeg build containing H.264/AAC decoder
-# implementations that are subject to patent licensing and require org3 approval
-# to distribute. They are therefore excluded from the container image.
-#
 # Run this script before using audio features or running audio tests:
 #
 #   bash scripts/install_audio_deps.sh

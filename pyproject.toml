@@ -50,10 +50,8 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=12.1.1",
   "torchvision==0.26.0",
-  # torchaudio and torchcodec bundle an FFmpeg build that includes H.264/AAC
-  # decoder implementations subject to patent licensing (requires org3 approval
-  # to ship). They are NOT installed in the container image. Run
-  # scripts/install_audio_deps.sh before using audio features or audio tests.
+  # torchaudio and torchcodec are NOT installed in the container image.
+  # Run scripts/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
   # Floor raised to 5.5.0 for Gemma 4 support.
   "transformers>=5.5.0,<5.9.0",
