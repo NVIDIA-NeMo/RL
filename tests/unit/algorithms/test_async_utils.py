@@ -1165,6 +1165,25 @@ class TestReplayBufferNew:
         ray.kill(buf)
 
 
+class _EpochListLoader:
+    """Fake dataloader for collection-loop tests: each ``iter()`` is one epoch
+    yielding ``sizes[i]`` batches (the last size repeats for further epochs).
+
+    Models StatefulDataLoader resume-once semantics: the FIRST epoch may be
+    short/empty (a resumed loader replays only the remainder from the restored
+    ``samples_yielded``), and later ``iter()`` calls start fresh full epochs.
+    """
+
+    def __init__(self, sizes):
+        self._sizes = list(sizes)
+        self.iter_count = 0
+
+    def __iter__(self):
+        n = self._sizes[min(self.iter_count, len(self._sizes) - 1)]
+        self.iter_count += 1
+        return iter([{"batch": i} for i in range(n)])
+
+
 class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
 
@@ -1559,6 +1578,92 @@ class TestAsyncTrajectoryCollector:
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)
+
+    # ------------------------------------------------------------------
+    # Dataloader epoch-cycling in the async collection loop. A single
+    # `for batch in self.dataloader` is ONE epoch; the collector must cycle
+    # epochs to feed the buffer for the whole run. Without it an exhausted
+    # dataset — most acutely a RESUMED StatefulDataLoader whose restored
+    # samples_yielded is already at the epoch end — makes the loop return
+    # immediately, stop the collector, and silently stall the buffer forever.
+    # ------------------------------------------------------------------
+    def _prime_collector_for_loop(self, collector, dataloader):
+        """Wire a collector so _collection_loop's body reduces to _process_batch.
+
+        __init__ leaves the manual/refit pause events SET (cleared), so with
+        generation-limit pausing stubbed off the loop body is just
+        `if not running: break; _process_batch(batch)`.
+        """
+        collector.dataloader = dataloader
+        collector.running = True
+        collector._should_pause_for_generation_limits = lambda: False
+        return collector
+
+    def _run_collection_loop(self, collector, timeout=15.0):
+        """Run _collection_loop to completion in a watchdog thread."""
+        t = threading.Thread(target=collector._collection_loop, daemon=True)
+        t.start()
+        t.join(timeout)
+        assert not t.is_alive(), "collection loop did not terminate (possible hang)"
+
+    def test_collection_loop_recovers_from_exhausted_first_epoch_on_resume(self):
+        """Regression for the resume-hang: a resumed dataloader whose FIRST epoch
+        yields 0 batches must NOT stop the collector. The outer epoch loop
+        re-iterates a fresh full epoch and keeps feeding the buffer (otherwise the
+        driver waits on an empty buffer forever)."""
+        collector = self.create_local_collector()
+        # First iter() -> 0 batches (resumed at epoch end); next iter() -> full.
+        loader = _EpochListLoader(sizes=[0, 3])
+        self._prime_collector_for_loop(collector, loader)
+
+        processed = []
+
+        def _fake_process(batch):
+            processed.append(batch)
+            if len(processed) >= 3:
+                collector.running = False  # stop after the fresh epoch
+
+        collector._process_batch = _fake_process
+        self._run_collection_loop(collector)
+
+        # The buggy single-pass loop processes 0 and stops; cycling re-iterates
+        # past the empty first epoch and processes the fresh epoch's 3 batches.
+        assert processed == [{"batch": 0}, {"batch": 1}, {"batch": 2}]
+        assert loader.iter_count >= 2  # re-iterated past the empty first epoch
+
+    def test_collection_loop_cycles_multiple_epochs(self):
+        """A finite dataset must be re-iterated so the collector can feed more
+        steps than a single dataset pass provides."""
+        collector = self.create_local_collector()
+        loader = _EpochListLoader(sizes=[2])  # 2 batches every epoch
+        self._prime_collector_for_loop(collector, loader)
+
+        processed = []
+
+        def _fake_process(batch):
+            processed.append(batch)
+            if len(processed) >= 5:  # 5 > 2/epoch -> must cross epoch boundaries
+                collector.running = False
+
+        collector._process_batch = _fake_process
+        self._run_collection_loop(collector)
+
+        assert len(processed) == 5
+        assert loader.iter_count >= 3  # 2 + 2 + 1 spans three epochs
+
+    def test_collection_loop_stops_on_empty_dataset(self):
+        """A genuinely empty dataloader (0 batches for two consecutive epochs)
+        must stop the loop, not busy-spin the outer while forever."""
+        collector = self.create_local_collector()
+        loader = _EpochListLoader(sizes=[0])  # always empty
+        self._prime_collector_for_loop(collector, loader)
+        collector._process_batch = mock.MagicMock()
+
+        self._run_collection_loop(collector)  # must return (watchdog asserts)
+
+        collector._process_batch.assert_not_called()
+        assert collector.running is False
+        assert loader.iter_count == 2  # stopped after two empty epochs
 
 
 class TestAsyncUtilsIntegration:
