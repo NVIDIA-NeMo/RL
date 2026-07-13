@@ -117,8 +117,35 @@ suitable starting point for long-reasoning runs.
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml
+  --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel.yaml \
+  grpo.use_dynamic_sampling=true \
+  grpo.batch_multiplier=3 \
+  grpo.max_val_samples=960 \
+  grpo.val_batch_size=960 \
+  +policy.hf_config_overrides.text_config.router_aux_loss_coef=0.0
 ```
+
+#### 100-Step Long-Run Results
+
+This recipe was validated for long-run convergence with a 100-step run on 4 nodes
+(32 GPUs), using the command above: dynamic sampling enabled and the MoE router
+auxiliary loss disabled (`router_aux_loss_coef=0.0`). Disabling the auxiliary loss
+matters: the AutoModel backend reads `router_aux_loss_coef` from the Hugging Face
+config (Qwen3.5 default: 0.001) and silently injects the MoE load-balancing
+gradient into the router during RL training, which conflicts with the policy
+objective and severely degrades accuracy. See
+[#3169](https://github.com/NVIDIA-NeMo/RL/pull/3169) for more details.
+
+The run shows healthy convergence behavior:
+
+- **Validation accuracy** climbs from ~0.33 to ~0.69.
+- **Training reward** rises steadily from about -0.7 to about 0.5–0.6.
+- **Mean generated tokens per sample** decreases from ~5,500 to ~2,500 as the policy
+  learns to reason more concisely within the generation budget.
+- **Approximate entropy** declines gradually without collapsing, and **generation KL
+  error** and **gradient norm** stay low and stable throughout.
+
+![100-step training curves for grpo-qwen3.5-35ba3b-dapo-4n8g-automodel: validation accuracy, training reward, mean generated tokens per sample, approximate entropy, generation KL error, and gradient norm](../../../assets/qwen3-5/grpo-qwen3.5-35ba3b-dapo-4n8g-automodel-100steps.png)
 
 ### Large MoE (397B-A17B)
 
