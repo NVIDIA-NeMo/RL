@@ -524,9 +524,11 @@ class AsyncTrajectoryCollector:
                 "async_engine", False
             )
         elif backend == "trtllm":
-            is_async_engine = generation_cfg.get("trtllm_cfg", {}).get(
-                "async_engine", False
+            assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
+                "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+                "synchronous engine path (async_engine=false) is no longer supported."
             )
+            is_async_engine = True
         else:
             is_async_engine = False
         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
@@ -544,10 +546,9 @@ class AsyncTrajectoryCollector:
                 f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
             )
         else:
-            # Sync engine or in-flight refit disabled: wait for all pending
-            # generations to complete before refit.
+            # For non-async engines, wait for all pending generations to complete
             print(
-                "⏸️ Waiting for all pending generations to complete..."
+                "⏸️ Non-async engine: waiting for all pending generations to complete..."
             )
             self.wait_for_pending_generations()
 

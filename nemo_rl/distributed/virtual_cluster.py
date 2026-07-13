@@ -53,18 +53,7 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
-    # Driver's own interpreter (under `uv run` this is the uv-managed venv).
     SYSTEM = sys.executable
-
-    # Interpreter for TRT-LLM actors. Uses an isolated uv role venv (same pattern
-    # as VLLM/MCORE) — tensorrt-llm is tracked in uv.lock as a path source pointing
-    # to /opt/trtllm_wheels/ (populated by build-custom-trtllm.sh during docker build).
-    # Override with NEMO_RL_PY_EXECUTABLES_TRTLLM to use a different interpreter,
-    # e.g. the base image's system Python if tensorrt_llm is in /usr/local/lib/python3.12.
-    TRTLLM = os.environ.get(
-        "NEMO_RL_PY_EXECUTABLES_TRTLLM",
-        f"uv run --locked --extra trtllm --directory {git_root}",
-    )
 
     # Use NeMo-RL direct dependencies.
     BASE = f"uv run --locked --directory {git_root}"
@@ -86,6 +75,9 @@ class PY_EXECUTABLES:
 
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and TRT-LLM.
+    TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
 
 
 # Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
