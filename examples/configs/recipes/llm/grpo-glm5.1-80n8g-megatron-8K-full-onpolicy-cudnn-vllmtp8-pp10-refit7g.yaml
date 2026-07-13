@@ -1,0 +1,18 @@
+defaults: ./grpo-glm5.1-64n8g-megatron-8K-full-onpolicy-cudnn-vllmtp8-util70-refit9g.yaml
+
+cluster:
+  num_nodes: 80
+
+policy:
+  refit_buffer_size_gb: 7
+  megatron_cfg:
+    pipeline_model_parallel_size: 10
+    num_layers_in_first_pipeline_stage: 3
+    num_layers_in_last_pipeline_stage: 3
+    clear_memory_caches_before_refit: true
+    empty_unused_memory_level: 2
+  generation:
+    vllm_kwargs:
+      max_num_batched_tokens: 2048
+      max_num_seqs: 2
+      enable_chunked_prefill: true
