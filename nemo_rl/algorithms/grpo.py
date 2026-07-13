@@ -3546,6 +3546,10 @@ def async_grpo_train(
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
+
+    faulty_step = 5
+    faulty_instance_id = 3
+
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
     # SGLang async rollouts do not support the async GRPO replay path.
@@ -3865,6 +3869,14 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with timer.time("total_step_time"):
+                # Fault handling demo
+                with timer.time("fault_handling_time"):
+                    if step == faulty_step:
+                        print(f"[FAULTY STEP] Assuming we detect a fault from the generation instance {faulty_instance_id} at step {faulty_step}", flush=True)
+                        # TODO: implement and call model update group adjustment logic here
+                        # the logic will call nccl comm group shrink API to shrink the comm group
+                        print("[FAULTY STEP] Fault handling completed", flush=True)
+
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
                 with timer.time("exposed_generation"):
@@ -4556,6 +4568,8 @@ def async_grpo_train(
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
 
             print("\n⏱️  Timing:")
+            fault_handling_time = timing_metrics.get("fault_handling_time", 0)
+            print(f"  • Fault Handling Time: {fault_handling_time:.2f}s")
             total_time = timing_metrics.get("total_step_time", 0)
             print(f"  • Total step time: {total_time:.2f}s")
             for k, v in sorted(
