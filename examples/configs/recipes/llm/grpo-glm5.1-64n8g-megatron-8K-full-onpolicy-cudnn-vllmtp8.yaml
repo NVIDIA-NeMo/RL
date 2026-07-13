@@ -1,0 +1,6 @@
+defaults: ./grpo-glm5.1-64n8g-megatron-8K-full-onpolicy-cudnn.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
