@@ -1,7 +1,6 @@
 #!/bin/bash
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
-bash "$PROJECT_ROOT/scripts/install_audio_deps.sh"
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
