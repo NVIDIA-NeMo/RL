@@ -361,7 +361,7 @@ index 7c00229..e2b2536 100755
  echo "Installing R2E-Gym in editable mode..."
  uv pip install -p $r2e_gym_dir/venv/bin/python -e . --no-cache
 -
-+uv pip install -p $r2e_gym_dir/venv/bin/python openai docker
++uv pip install -p $r2e_gym_dir/venv/bin/python openai docker kubernetes
 +uv pip install -p $r2e_gym_dir/venv/bin/python --reinstall cffi cryptography
  echo "Verifying installation..."
 -$r2e_gym_dir/venv/bin/python -c "import r2egym; print('✓ r2egym installed successfully')"

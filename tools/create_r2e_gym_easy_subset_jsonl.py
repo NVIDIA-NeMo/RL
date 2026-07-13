@@ -500,13 +500,14 @@ def split_jsonl_by_instance_ids(
                 row = json.loads(line)
                 instance_id = converted_row_instance_id(row, row_number)
                 if instance_id in train_ids:
-                    row["agent_ref"]["name"] = "swe_agents_train"
+                    # setdefault: rows written with --no-agent-ref lack the key
+                    row.setdefault("agent_ref", {})["name"] = "swe_agents_train"
                     train_file.write(json.dumps(row, separators=(",", ":")))
                     train_file.write("\n")
                     train_found.add(instance_id)
                     train_rows += 1
                 elif instance_id in val_ids:
-                    row["agent_ref"]["name"] = "swe_agents_val"
+                    row.setdefault("agent_ref", {})["name"] = "swe_agents_val"
                     val_file.write(json.dumps(row, separators=(",", ":")))
                     val_file.write("\n")
                     val_found.add(instance_id)

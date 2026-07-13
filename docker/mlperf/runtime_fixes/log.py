@@ -4,7 +4,8 @@ try:
 except ModuleNotFoundError:
 
     class RichHandler(logging.StreamHandler):  # type: ignore[no-redef]
-        pass
+        def __init__(self, *args, **kwargs):  # accept rich-only kwargs
+            super().__init__()
 
 
 def get_logger(

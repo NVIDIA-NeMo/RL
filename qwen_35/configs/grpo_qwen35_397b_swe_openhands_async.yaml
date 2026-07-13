@@ -73,9 +73,9 @@ checkpointing:
   # window A trains steps 1..N and saves, window B (same EXP_NAME ->
   # same mounted /checkpoint dir) auto-resumes from the latest step_* and
   # trains N+1..2N (grpo.max_num_steps is an ABSOLUTE cumulative count).
-  # save_period=5 aligns saves right after val@5/@10 so every checkpoint
-  # carries the val metric; keep_top_k large so the LATEST checkpoint is
-  # never pruned away (resume picks the highest step dir, not the best).
+  # NOTE: with val_period=0 mid-run checkpoints carry no val metric, so the
+  # metric_name ranking is inert; keep_top_k large so the LATEST checkpoint
+  # is never pruned away (resume picks the highest step dir, not the best).
   # save_optimizer=false keeps saves at ~0.8 TB (bf16 weights only) at the
   # cost of Adam moments resetting at window boundaries - acceptable for
   # evidence runs; set true (~5.5 TB/save) for bit-clean continuation.
