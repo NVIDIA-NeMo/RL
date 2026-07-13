@@ -194,24 +194,31 @@ for node in $nodes; do
     ip_address=$(host $node 2>/dev/null | awk '/has address/ { print $4 }' | head -1 || true)
     echo "[DEBUG] host result: '$ip_address'"
     
-    # Method 2: If host fails, try getent
+    # Method 2: If host fails, try getent. IPv4 only (ahostsv4): plain
+    # `getent hosts` can return an IPv6 link-local address first (theia
+    # nodes, job 2322868), which Ray cannot use — `$IP:$PORT` needs brackets
+    # for IPv6 and link-local needs a scope id.
     if [[ -z "$ip_address" ]]; then
-        echo "[DEBUG] Method 2: getent hosts"
-        ip_address=$(getent hosts $node 2>/dev/null | awk '{ print $1 }' | head -1 || true)
+        echo "[DEBUG] Method 2: getent ahostsv4"
+        ip_address=$(getent ahostsv4 $node 2>/dev/null | awk '{ print $1; exit }' || true)
         echo "[DEBUG] getent result: '$ip_address'"
     fi
-    
-    # Method 3: If getent fails, try nslookup
+
+    # Method 3: If getent fails, try nslookup (IPv4 answers only)
     if [[ -z "$ip_address" ]]; then
         echo "[DEBUG] Method 3: nslookup"
-        ip_address=$(nslookup $node 2>/dev/null | awk '/^Address: / { print $2 }' | head -1 || true)
+        ip_address=$(nslookup $node 2>/dev/null | awk '/^Address: / && $2 !~ /:/ { print $2 }' | head -1 || true)
         echo "[DEBUG] nslookup result: '$ip_address'"
     fi
-    
+
     # Method 4: If all DNS methods fail, try ping to extract IP
     if [[ -z "$ip_address" ]]; then
         echo "[DEBUG] Method 4: ping"
         ip_address=$(ping -c 1 $node 2>/dev/null | grep "PING" | sed 's/.*(\([^)]*\)).*/\1/' || true)
+        # Reject IPv6 results for the same reason as above
+        if [[ "$ip_address" == *:* ]]; then
+            ip_address=""
+        fi
         echo "[DEBUG] ping result: '$ip_address'"
     fi
     
