@@ -27,7 +27,8 @@ grpo.num_prompts_per_step=${pps} \
 grpo.num_generations_per_prompt=${gpp} \
 policy.max_total_sequence_length=${seq_len} \
 grpo.max_num_steps=10 \
-checkpointing.enabled=False"
+checkpointing.enabled=False \
+logger.wandb_enabled=False"
 
 
 wandb_log_name=CWDFW-${test_case}-refit-shrink
