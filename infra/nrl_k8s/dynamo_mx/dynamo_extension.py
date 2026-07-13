@@ -1289,17 +1289,34 @@ class MxRefitWorkerExtension:
 
             scratch: dict[str, dict[str, torch.Tensor]] = {}
             if v0_plans:
-                v0_source_ids = set()
+                v0_names_by_source: dict[str, set[str]] = {}
                 for plan in v0_plans:
                     for src in plan.sources:
-                        v0_source_ids.add(src.mx_source_id)
-                for cand in [c for c in megatron_cands if c.ref.mx_source_id in v0_source_ids]:
+                        v0_names_by_source.setdefault(src.mx_source_id, set()).add(
+                            plan.tensor_name
+                        )
+                scratch_bytes = 0
+                for cand in [
+                    c
+                    for c in megatron_cands
+                    if c.ref.mx_source_id in v0_names_by_source
+                ]:
                     buf_dict: dict[str, torch.Tensor] = {}
                     for name, t in self._mx_receiver._receiver.receive_weights_scratch(
                         cand.ref, timeout_seconds=mx_config.timeout_seconds,
+                        include_names=v0_names_by_source[cand.ref.mx_source_id],
                     ):
                         buf_dict[name] = t
+                        scratch_bytes += t.numel() * t.element_size()
                     scratch[cand.ref.mx_source_id] = buf_dict
+                logger.info(
+                    "[mx-megatron] mixed-TP v0 fallback: %d plans, %d "
+                    "source-tensor ranges, %d wire bytes across %d sources",
+                    len(v0_plans),
+                    sum(len(names) for names in v0_names_by_source.values()),
+                    scratch_bytes,
+                    len(v0_names_by_source),
+                )
 
             ctx = MegatronReceiverContext(
                 target_tp_layout=layout,

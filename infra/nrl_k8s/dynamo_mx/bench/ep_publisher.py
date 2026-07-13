@@ -109,6 +109,8 @@ pub.set_megatron_sidecar({
 
 added = 0
 roles: Counter = Counter()
+published_bytes = 0
+expert_bytes = 0
 for name, local, spec, extras in collect_megatron_publish_set(
     model, tp_size=1, pp_size=1, pp_rank=0, ep_size=EP, ep_rank=ep_rank, tp_rank=0,
     num_local_experts=num_local_experts,
@@ -122,7 +124,16 @@ for name, local, spec, extras in collect_megatron_publish_set(
         megatron_role=spec.role, megatron_extras=spec.descriptor_extras)
     roles[spec.role] += 1
     added += 1
-print(f"[pub r{RANK}] ep_rank={ep_rank} added {added} tensors; roles={dict(roles)}", flush=True)
+    tensor_bytes = local.numel() * local.element_size()
+    published_bytes += tensor_bytes
+    if spec.is_expert:
+        expert_bytes += tensor_bytes
+print(
+    f"[pub r{RANK}] ep_rank={ep_rank} added {added} tensors / "
+    f"{published_bytes} bytes (expert={expert_bytes}, "
+    f"nonexpert={published_bytes - expert_bytes}); roles={dict(roles)}",
+    flush=True,
+)
 
 sid = pub.publish(version=1)
 pub.mark_ready()

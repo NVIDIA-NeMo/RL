@@ -2,7 +2,7 @@
 set -x
 V=/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker
 B=/mnt/rl-workspace/kavink/ep_bench
-LIBS=$V/lib/python3.13/site-packages/nixl_cu12.libs
+LIBS=$V/lib/python3.13/site-packages/nixl_cu13.libs
 # overlay MX Megatron helpers into the image's nemo_rl + today's modelexpress into the venv
 cp "$B/mx_megatron_helpers.py" /opt/nemo-rl/nemo_rl/distributed/ || exit 1
 cp "$B/mx_helpers.py" /opt/nemo-rl/nemo_rl/distributed/ || exit 1

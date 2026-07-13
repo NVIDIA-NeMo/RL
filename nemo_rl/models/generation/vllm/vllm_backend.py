@@ -1363,23 +1363,36 @@ class VllmInternalWorkerExtension:
             # ------ Phase 4: v0 fallback for plans that needed scratch ------
             scratch: dict[str, dict[str, "torch.Tensor"]] = {}
             if v0_plans:
-                # Identify which sources contribute to the v0 plans.
-                v0_source_ids = set()
+                # Pull only tensors used by non-contiguous/per-expert fallback
+                # plans. Pulling every tensor from each contributing source
+                # avoids descriptor explosion but wastes wire bytes.
+                v0_names_by_source: dict[str, set[str]] = {}
                 for plan in v0_plans:
                     for src in plan.sources:
-                        v0_source_ids.add(src.mx_source_id)
-                v0_cands = [c for c in megatron_cands if c.ref.mx_source_id in v0_source_ids]
+                        v0_names_by_source.setdefault(src.mx_source_id, set()).add(
+                            plan.tensor_name
+                        )
+                v0_cands = [
+                    c
+                    for c in megatron_cands
+                    if c.ref.mx_source_id in v0_names_by_source
+                ]
                 t0 = time.perf_counter()
+                scratch_bytes = 0
                 for cand in v0_cands:
                     buf_dict: dict[str, "torch.Tensor"] = {}
                     for name, t in self._mx_receiver._receiver.receive_weights_scratch(
                         cand.ref, timeout_seconds=mx_config.timeout_seconds,
+                        include_names=v0_names_by_source[cand.ref.mx_source_id],
                     ):
                         buf_dict[name] = t
+                        scratch_bytes += t.numel() * t.element_size()
                     scratch[cand.ref.mx_source_id] = buf_dict
                 print(
                     f"[mx-megatron] v0 fallback: scratch-pulled {len(v0_plans)} "
-                    f"plans from {len(v0_cands)} sources in "
+                    f"plans / {sum(len(v) for v in v0_names_by_source.values())} "
+                    f"source-tensor ranges / {scratch_bytes} bytes from "
+                    f"{len(v0_cands)} sources in "
                     f"{time.perf_counter() - t0:.2f}s"
                 )
             # ------ Phase 5: assemble + translate per plan ------
