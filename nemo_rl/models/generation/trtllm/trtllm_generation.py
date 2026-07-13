@@ -40,7 +40,7 @@ from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 
 
 class TrtllmGeneration(GenerationInterface):
-    """TRT-LLM generation backend (colocated requires async_engine=true)."""
+    """TRT-LLM generation backend (requires trtllm_cfg.async_engine=true)."""
 
     def __init__(
         self,
@@ -95,12 +95,14 @@ class TrtllmGeneration(GenerationInterface):
         self.colocated_enabled = bool(
             self.cfg.get("colocated", {}).get("enabled", False)
         )
-        self.async_engine = self.cfg["trtllm_cfg"].get("async_engine", False)
-        if self.colocated_enabled and not self.async_engine:
-            raise NotImplementedError(
-                "TRT-LLM colocated mode requires trtllm_cfg.async_engine=true "
-                "(sleep/wakeup is only wired through the async worker)."
-            )
+        # The synchronous TRT-LLM engine path is no longer supported: only the
+        # async worker wires up colocated sleep/wakeup, IPC-ZMQ refit, and
+        # per-sample streaming. Fail loudly at setup rather than silently
+        # running a half-supported path.
+        assert self.cfg["trtllm_cfg"].get("async_engine", False), (
+            "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
+            "synchronous engine path (async_engine=false) is no longer supported."
+        )
 
         # Colocated reuses the policy's placement group → no PACK rearrangement.
         # Non-colocated uses PACK so inference workers cluster together rather
@@ -121,10 +123,7 @@ class TrtllmGeneration(GenerationInterface):
             use_unified_pg=needs_cross_node_parallelism,
         )
 
-        if self.async_engine:
-            worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
-        else:
-            worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker.TrtllmGenerationWorker"
+        worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
         worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # NCCL_CUMEM_ENABLE=1 is needed for the non-colocated NCCL collective
@@ -155,7 +154,7 @@ class TrtllmGeneration(GenerationInterface):
 
         # post-init on workers (starts HTTP server when expose_http_server=true,
         # finishes async engine setup for the async worker variant).
-        post_init_method = "post_init_async" if self.async_engine else "post_init"
+        post_init_method = "post_init_async"
         futures = self.worker_group.run_all_workers_single_data(
             post_init_method,
             run_rank_0_only_axes=["tensor_parallel"],
@@ -262,7 +261,7 @@ class TrtllmGeneration(GenerationInterface):
 
     def _report_device_id(self) -> list[list[str]]:
         futures = self.worker_group.run_all_workers_single_data(
-            "report_device_id_async" if self.async_engine else "report_device_id",
+            "report_device_id_async",
             run_rank_0_only_axes=["tensor_parallel"],
         )
         return ray.get(futures)
@@ -292,7 +291,7 @@ class TrtllmGeneration(GenerationInterface):
         rank_prefix_list = list(range(0, total_workers, workers_per_group))
 
         return self.worker_group.run_all_workers_multiple_data(
-            "init_collective_async" if self.async_engine else "init_collective",
+            "init_collective_async",
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel"],
             common_kwargs={
@@ -314,7 +313,7 @@ class TrtllmGeneration(GenerationInterface):
             dp_size, allow_uneven_shards=True,
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
-            "generate_async" if self.async_engine else "generate",
+            "generate_async",
             data=sharded_data,
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=None,
@@ -345,11 +344,6 @@ class TrtllmGeneration(GenerationInterface):
         in-flight Ray calls share the same AsyncLLM, which batches them
         internally via asyncio.gather.
         """
-        if not self.async_engine:
-            raise RuntimeError(
-                "generate_async requires trtllm_cfg.async_engine=true."
-            )
-
         if "input_ids" not in data or "input_lengths" not in data:
             raise AssertionError(
                 "input_ids and input_lengths are required in data for generate_async"
@@ -413,10 +407,7 @@ class TrtllmGeneration(GenerationInterface):
             if self.colocated_enabled:
                 method_name = "sleep_async"
             else:
-                method_name = (
-                    "reset_prefix_cache_async" if self.async_engine
-                    else "reset_prefix_cache"
-                )
+                method_name = "reset_prefix_cache_async"
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel"],
@@ -429,7 +420,7 @@ class TrtllmGeneration(GenerationInterface):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         futures = self.worker_group.run_all_workers_single_data(
-            "prepare_refit_info_async" if self.async_engine else "prepare_refit_info",
+            "prepare_refit_info_async",
             state_dict_info=state_dict_info,
             run_rank_0_only_axes=["tensor_parallel"],
         )
@@ -448,8 +439,7 @@ class TrtllmGeneration(GenerationInterface):
             trtllm_cfg.get("recompute_kv_cache_after_weight_updates")
         )
         return self.worker_group.run_all_workers_single_data(
-            "update_weights_from_collective_async" if self.async_engine
-            else "update_weights_from_collective",
+            "update_weights_from_collective_async",
             run_rank_0_only_axes=["tensor_parallel"],
             drain=not in_flight,
             recompute_kv=recompute_kv,
@@ -460,8 +450,7 @@ class TrtllmGeneration(GenerationInterface):
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
         return self.worker_group.run_all_workers_single_data(
-            "update_weights_via_ipc_zmq_async" if self.async_engine
-            else "update_weights_via_ipc_zmq",
+            "update_weights_via_ipc_zmq_async",
             run_rank_0_only_axes=["tensor_parallel"],
         )
 
