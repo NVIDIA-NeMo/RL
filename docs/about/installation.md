@@ -6,7 +6,7 @@ The fastest way to get started is with the pre-built NGC container, which includ
 
 ```sh
 # Pull the latest stable release
-docker pull nvcr.io/nvidia/nemo-rl:v0.6.0
+docker pull nvcr.io/nvidia/nemo-rl:latest
 
 # Clone the repo (needed to mount your source into the container)
 git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
@@ -32,7 +32,7 @@ docker run --rm -it \
   -e HF_TOKEN \
   -e WANDB_API_KEY \
   -w /opt/nemo-rl \
-  nvcr.io/nvidia/nemo-rl:v0.6.0 \
+  nvcr.io/nvidia/nemo-rl:latest \
   bash
 ```
 
