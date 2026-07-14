@@ -29,10 +29,16 @@ throughput regression ever revealed it. These tests lock today's known-good
 values so such a drop fails loudly in CI instead.
 
 These are pure file-parsing / config-resolution checks -- no GPU, no model
-download -- so they run in the default unit-test lane. The matching *runtime*
-perf-floor guard lives in the nightly suite (see
-``tests/test_suites/llm/grpo-nemotron-super-*-mxfp8.sh`` and
-``tests/check_moe_fast_path.py``).
+download -- so they run in the default (pre-submit) unit lane in milliseconds,
+and ``pytest.skip`` where the guarded recipe is absent (e.g. public upstream,
+which does not ship the MXFP8 Nemotron recipes), so they are safe to merge
+anywhere and activate wherever the recipe exists.
+
+The matching *runtime* guards -- an in-log kernel-dispatch assertion and an
+MXFP8-vs-BF16 perf floor -- run as post-run steps inside the nightly
+Nemotron-Super MXFP8 suite scripts (alongside ``tests/check_metrics.py``), so
+they run at that suite's cadence with no added per-PR GPU cost. Those land with
+the MXFP8 recipes themselves rather than in this test-only change.
 """
 
 import os
