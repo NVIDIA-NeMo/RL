@@ -40,7 +40,10 @@ from nemo_rl.modelopt.models.policy.workers.utils import (
     quantize_model,
     symlink_pre_quantized_model,
 )
-from nemo_rl.modelopt.utils import MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+from nemo_rl.modelopt.utils import (
+    MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
+    resolve_nvfp4_real_quant_mode,
+)
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -460,8 +463,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     def _get_real_quant_mode(self) -> str:
         """Resolve and cross-check the training and rollout quantization modes."""
-        from nemo_rl.modelopt.utils import resolve_nvfp4_real_quant_mode
-
         cached_mode = getattr(self, "_real_quant_mode", None)
         if cached_mode is not None:
             return cached_mode

@@ -16,14 +16,6 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-MEGATRON_BRIDGE_ROOT=${MEGATRON_BRIDGE_ROOT:-$HOME/modelopt/Megatron-Bridge}
-MEGATRON_LM_ROOT=${MEGATRON_LM_ROOT:-$PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM}
-if ! grep -q '"w4a16_nvfp4"' \
-    "$MEGATRON_BRIDGE_ROOT/src/megatron/bridge/models/conversion/modelopt_utils.py"; then
-    echo "[ERROR] Megatron-Bridge lacks W4A16 ModelOpt export support: $MEGATRON_BRIDGE_ROOT"
-    exit 1
-fi
-export PYTHONPATH="$MEGATRON_BRIDGE_ROOT/src:$MEGATRON_LM_ROOT:$PROJECT_ROOT:${PYTHONPATH:-}"
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \

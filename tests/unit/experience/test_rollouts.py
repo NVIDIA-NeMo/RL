@@ -1045,6 +1045,18 @@ def test_run_async_nemo_gym_rollout(
         },
     }
 
+    additional_diagnostics = {
+        "turns_per_sample/p95",
+        "turns_per_sample/p99",
+        "max_gen_tokens_per_turn/mean",
+        "max_gen_tokens_per_turn/max",
+        "max_gen_tokens_per_turn/min",
+        "max_gen_tokens_per_turn/median",
+        "max_gen_tokens_per_turn/stddev",
+        "max_gen_tokens_per_turn/histogram",
+        "max_gen_tokens_per_turn/p95",
+    }
+
     def _standardize(d: dict) -> dict:
         final_batch = d["final_batch"].copy()
         final_batch.pop("message_log", None)
@@ -1064,13 +1076,22 @@ def test_run_async_nemo_gym_rollout(
             )
             final_batch.pop("mask_sample")
 
-        for key in d["rollout_metrics"]:
-            # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
-            d["rollout_metrics"][key] = None
+        rollout_metrics = d["rollout_metrics"].copy()
+        unexpected_metrics = (
+            set(rollout_metrics)
+            - set(expected_result["rollout_metrics"])
+            - additional_diagnostics
+        )
+        assert not unexpected_metrics
+        for key in additional_diagnostics:
+            rollout_metrics.pop(key, None)
+        for key in rollout_metrics:
+            # We cannot guarantee exact generation reproducibility.
+            rollout_metrics[key] = None
 
         return {
             "final_batch": final_batch,
-            "rollout_metrics": d["rollout_metrics"],
+            "rollout_metrics": rollout_metrics,
         }
 
     assert _standardize(expected_result) == _standardize(actual_result)
@@ -1378,6 +1399,10 @@ def test_async_rollout_manager_matches_original(
     for key in original_metrics.keys():
         if key.startswith("timing/") or key.startswith("histogram/"):
             continue
+        if key in {"turns_per_sample/p95", "turns_per_sample/p99"} or key.startswith(
+            "max_gen_tokens_per_turn/"
+        ):
+            continue
 
         new_key = _translate_legacy_key(key)
         assert new_key in new_metrics, (
@@ -1613,8 +1638,11 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         # Skip timing and full_result fields
         if key.startswith("timing/") or key.endswith("/full_result"):
             continue
+        if key in {"turns_per_sample/p95", "turns_per_sample/p99"} or key.startswith(
+            "max_gen_tokens_per_turn/"
+        ):
+            continue
 
-        # Check that the key is present in the new metrics
         assert key in new_metrics, f"rollout_metrics[{key!r}] missing from manager"
 
         orig_val = orig_metrics[key]

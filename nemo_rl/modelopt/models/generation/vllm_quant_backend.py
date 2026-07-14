@@ -34,6 +34,7 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
+from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
 _FUSED_MODELOPT_MOE_SUFFIXES = {
     ".experts.w13_weight": "w13_weight",
@@ -723,13 +724,35 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             prepare_modelopt_for_weight_reload,
         )
 
+        assert self.state_dict_info is not None, (
+            "state_dict_info is not prepared. "
+            "Please call prepare_refit_info when initializing the worker."
+        )
+
         self._nrl_fused_moe_scales = {}
         prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
-        result = super().update_weights_from_collective()
-        if not result:
-            raise RuntimeError("ModelOpt real-quant collective refit failed")
-        _restore_fused_modelopt_moe_scales(self)
-        modelopt_process_weights_after_loading(self.model_runner.model)
+        try:
+            # Mirror the IPC refit ordering instead of reusing
+            # super().update_weights_from_collective(): consume the broadcast
+            # without vLLM's post-load conversion, restore the per-expert scales
+            # stashed during _load_weights, and only then run the ModelOpt
+            # conversion. The base override converts first, which rewrites the
+            # scales out of their HF layout and makes the restore fail.
+            packed_broadcast_consumer(
+                iterator=iter(self.state_dict_info.items()),
+                group=self.model_update_group,
+                src=0,
+                post_unpack_func=self._load_weights,
+            )
+            _restore_fused_modelopt_moe_scales(self)
+            modelopt_process_weights_after_loading(self.model_runner.model)
+            self._maybe_process_fp8_kv_cache()
+        except Exception as error:
+            self._nrl_fused_moe_scales = {}
+            raise RuntimeError("ModelOpt real-quant collective refit failed") from error
+
+        gc.collect()
+        torch.cuda.empty_cache()
         return True
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:

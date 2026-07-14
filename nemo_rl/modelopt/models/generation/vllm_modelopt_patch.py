@@ -63,6 +63,12 @@ _ORIGINAL_KV_CACHE_PROCESS_WEIGHTS_ATTR = (
 )
 _MODELOPT_PROCESS_WEIGHTS_CALL_COUNT_ATTR = "_nrl_process_weights_call_count"
 _MODELOPT_PROCESSED_TENSOR_REFS_ATTR = "_nrl_modelopt_processed_tensor_refs"
+# Guards against processing a layer more than once per reload cycle. vLLM's
+# post-load pass runs twice when an fp8 KV cache is present (once via
+# modelopt_process_weights_after_loading, once via _maybe_process_fp8_kv_cache),
+# and the dense/MoE conversions delete their HF scale params, so a second call
+# would fail. prepare_modelopt_for_weight_reload clears it before each refit.
+_MODELOPT_PROCESSED_RELOAD_ATTR = "_nrl_modelopt_processed_this_reload"
 _MODELOPT_MOE_QUANT_CONFIG_SCALE_ATTRS = (
     "g1_alphas",
     "g2_alphas",
@@ -347,6 +353,9 @@ def _modelopt_dense_process_w4a16_weights(self, layer: torch.nn.Module) -> None:
 
 def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
     """Convert dense ModelOpt NVFP4 weights after initial load or refit."""
+    if getattr(layer, _MODELOPT_PROCESSED_RELOAD_ATTR, False):
+        return
+    setattr(layer, _MODELOPT_PROCESSED_RELOAD_ATTR, True)
     if _is_w4a16_modelopt_quant_config(getattr(self, "quant_config", None)):
         _modelopt_dense_process_w4a16_weights(self, layer)
         return
@@ -959,6 +968,9 @@ def _modelopt_kv_cache_process_weights(self, layer: torch.nn.Module) -> None:
 
 def _modelopt_moe_process_weights(self, layer: torch.nn.Module) -> None:
     """Convert MoE ModelOpt NVFP4 weights after initial load or refit."""
+    if getattr(layer, _MODELOPT_PROCESSED_RELOAD_ATTR, False):
+        return
+    setattr(layer, _MODELOPT_PROCESSED_RELOAD_ATTR, True)
     if not _is_w4a16_marlin_moe_quant_method(self):
         missing = [
             name
@@ -995,6 +1007,10 @@ def prepare_modelopt_for_weight_reload(
     """Prepare a ModelOpt-vLLM model for one weight reload cycle."""
     inner_model = _unwrap_vllm_model(model)
     for module in inner_model.modules():
+        # Reset the once-per-reload processing guard so this cycle's post-load
+        # conversion runs again on the freshly received weights.
+        if hasattr(module, _MODELOPT_PROCESSED_RELOAD_ATTR):
+            delattr(module, _MODELOPT_PROCESSED_RELOAD_ATTR)
         layer_meta = getattr(module, _MODELOPT_PARAM_META_ATTR, None)
         if layer_meta is None:
             continue

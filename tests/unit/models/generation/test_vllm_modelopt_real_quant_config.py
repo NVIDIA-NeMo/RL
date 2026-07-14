@@ -237,16 +237,20 @@ def test_quant_ignore_name_candidates_include_model_prefix_and_base_names():
     ]
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
+def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, tmp_path):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
     monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
     monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
 
+    quant_cfg = "quant.yaml"
+    (tmp_path / quant_cfg).touch()
+    monkeypatch.chdir(tmp_path)
+
     llm_kwargs = {}
     worker_mod._configure_quant_engine_kwargs(
-        {"quant_cfg": "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml"},
+        {"quant_cfg": quant_cfg},
         llm_kwargs,
     )
 
@@ -256,9 +260,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
     assert llm_kwargs["worker_extension_cls"] == (
         "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
     )
-    assert os.environ["VLLM_QUANT_CFG"] == os.path.abspath(
-        "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml"
-    )
+    assert os.environ["VLLM_QUANT_CFG"] == os.path.abspath(quant_cfg)
     assert "quantization" not in llm_kwargs
 
 
@@ -274,6 +276,9 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     patch_calls = []
     monkeypatch.setattr(
         patch_mod, "apply_modelopt_nvfp4_patches", lambda: patch_calls.append(True)
+    )
+    monkeypatch.setattr(
+        modelopt_utils, "resolve_nvfp4_real_quant_mode", lambda _: "w4a16"
     )
 
     llm_kwargs = {}
@@ -305,6 +310,9 @@ def test_configure_quant_engine_kwargs_preserves_hf_overrides(monkeypatch):
     )
     monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
     monkeypatch.setattr(patch_mod, "apply_modelopt_nvfp4_patches", lambda: None)
+    monkeypatch.setattr(
+        modelopt_utils, "resolve_nvfp4_real_quant_mode", lambda _: "w4a16"
+    )
 
     llm_kwargs = {"hf_overrides": {"trust_remote_code": True}}
     worker_mod._configure_quant_engine_kwargs(
@@ -781,6 +789,9 @@ def test_real_quant_collective_reload_runs_modelopt_hooks(monkeypatch):
     model = torch.nn.Linear(1, 1)
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(model=model)
+    extension.device = torch.device("cpu")
+    extension.state_dict_info = {}
+    extension.model_update_group = object()
     calls = []
 
     monkeypatch.setattr(
@@ -794,25 +805,40 @@ def test_real_quant_collective_reload_runs_modelopt_hooks(monkeypatch):
         lambda model_arg, device: calls.append(("prepare", model_arg, device)),
     )
     monkeypatch.setattr(
+        backend,
+        "packed_broadcast_consumer",
+        lambda **kwargs: calls.append(("consume", kwargs["post_unpack_func"].__name__)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_restore_fused_modelopt_moe_scales",
+        lambda ext: calls.append(("restore", ext)),
+    )
+    monkeypatch.setattr(
         patch_mod,
         "modelopt_process_weights_after_loading",
         lambda model_arg: calls.append(("process", model_arg)),
     )
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
-        "update_weights_from_collective",
-        lambda self: True,
+        "_maybe_process_fp8_kv_cache",
+        lambda self: calls.append(("kv",)),
     )
-    extension.device = torch.device("cpu")
 
     assert extension.update_weights_from_collective() is True
+    # The refit must restore the per-expert scales stashed during _load_weights
+    # BEFORE running the ModelOpt conversion; otherwise it writes HF-layout
+    # scales into already-converted kernel params. The kv-cache pass runs last.
     assert calls == [
         ("prepare", model, torch.device("cpu")),
+        ("consume", "_load_weights"),
+        ("restore", extension),
         ("process", model),
+        ("kv",),
     ]
 
 
-def test_real_quant_collective_reload_raises_when_base_fails(monkeypatch):
+def test_real_quant_collective_reload_raises_on_failure(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     patch_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_modelopt_patch"
@@ -822,6 +848,8 @@ def test_real_quant_collective_reload_raises_when_base_fails(monkeypatch):
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(model=model)
     extension.device = torch.device("cpu")
+    extension.state_dict_info = {}
+    extension.model_update_group = object()
     calls = []
 
     monkeypatch.setattr(
@@ -834,20 +862,22 @@ def test_real_quant_collective_reload_raises_when_base_fails(monkeypatch):
         "prepare_modelopt_for_weight_reload",
         lambda model_arg, device: calls.append(("prepare", model_arg, device)),
     )
+
+    def _raise_consume(**kwargs):
+        raise ValueError("broadcast boom")
+
+    monkeypatch.setattr(backend, "packed_broadcast_consumer", _raise_consume)
     monkeypatch.setattr(
         patch_mod,
         "modelopt_process_weights_after_loading",
         lambda model_arg: calls.append(("process", model_arg)),
     )
-    monkeypatch.setattr(
-        backend.VllmInternalWorkerExtension,
-        "update_weights_from_collective",
-        lambda self: False,
-    )
 
     with pytest.raises(RuntimeError, match="collective refit failed"):
         extension.update_weights_from_collective()
+    # A transfer failure must not run the conversion, and it clears the stash.
     assert calls == [("prepare", model, torch.device("cpu"))]
+    assert extension._nrl_fused_moe_scales == {}
 
 
 def test_non_real_quant_collective_reload_delegates(monkeypatch):

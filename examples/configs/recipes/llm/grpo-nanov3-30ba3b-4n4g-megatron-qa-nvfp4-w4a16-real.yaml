@@ -5,7 +5,7 @@ grpo:
 checkpointing:
   checkpoint_dir: results/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
 policy:
-  model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/nvidia_nvidia-nemotron-3-nano-30b-a3b-bf16/hf/hf-cbd3fa9_orig
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   tokenizer:
     name: ${policy.model_name}
   quant_calib_size: 16

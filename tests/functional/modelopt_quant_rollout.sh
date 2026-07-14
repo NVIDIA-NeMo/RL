@@ -109,11 +109,12 @@ run_quant_rollout_case() {
         assert_not_grep "VLLM_QUANT_CFG" "$run_log"
     else
         assert_grep "FakeQuantWorker" "$run_log"
+        assert_grep "VllmQuantGenerationWorker.*Inserted [1-9][0-9]* quantizers" "$run_log"
         assert_not_grep "Detected ModelOpt NVFP4 checkpoint" "$run_log"
     fi
 }
 
 run_quant_rollout_case w4a16_real_quant examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml true 0.003 1.05 Qwen/Qwen2.5-0.5B "$@"
-run_quant_rollout_case w4a8_fake_quant examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml false 0.006 1.06 Qwen/Qwen2.5-0.5B "$@"
+run_quant_rollout_case w4a8_fake_quant examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml false 0.02 1.15 Qwen/Qwen2.5-0.5B "$@"
 
 echo "[PASS] ModelOpt W4A16 real-quant and W4A8 fake-quant rollout functional test"

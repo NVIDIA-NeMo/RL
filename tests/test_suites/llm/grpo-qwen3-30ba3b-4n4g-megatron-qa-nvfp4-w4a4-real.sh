@@ -16,30 +16,6 @@ SNAPSHOT_MEGATRON_BRIDGE=1
 exit_if_max_steps_reached
 
 cd "$PROJECT_ROOT"
-MEGATRON_BRIDGE_ROOT=${MEGATRON_BRIDGE_ROOT:-$HOME/modelopt/Megatron-Bridge}
-MEGATRON_LM_ROOT=${MEGATRON_LM_ROOT:-$PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM}
-if [[ ! -f "$MEGATRON_BRIDGE_ROOT/src/megatron/bridge/models/conversion/modelopt_utils.py" ]]; then
-    echo "[ERROR] Invalid Megatron-Bridge source root: $MEGATRON_BRIDGE_ROOT"
-    exit 1
-fi
-if ! grep -q "modelopt_finalize_ep_weight" \
-    "$MEGATRON_BRIDGE_ROOT/src/megatron/bridge/models/conversion/auto_bridge.py"; then
-    echo "[ERROR] Megatron-Bridge lacks grouped-MoE ModelOpt export support: $MEGATRON_BRIDGE_ROOT"
-    exit 1
-fi
-if [[ ! -f "$MEGATRON_LM_ROOT/megatron/core/__init__.py" ]]; then
-    echo "[ERROR] Invalid Megatron-LM source root: $MEGATRON_LM_ROOT"
-    exit 1
-fi
-BRIDGE_REVISION=$(git -C "$MEGATRON_BRIDGE_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
-if ! git -C "$MEGATRON_BRIDGE_ROOT" diff-index --quiet HEAD --; then
-    BRIDGE_REVISION="${BRIDGE_REVISION}-dirty"
-fi
-echo "[INFO] Megatron-Bridge source: $MEGATRON_BRIDGE_ROOT ($BRIDGE_REVISION)"
-# Actor-specific binary dependencies come from each Ray actor's virtualenv.
-# Only source roots belong on the shared PYTHONPATH.
-export PYTHONPATH="$MEGATRON_BRIDGE_ROOT/src:$MEGATRON_LM_ROOT:$PROJECT_ROOT:${PYTHONPATH:-}"
-
 uv run --no-sync examples/run_grpo.py \
     --config "$CONFIG_PATH" \
     grpo.max_num_steps=$MAX_STEPS \

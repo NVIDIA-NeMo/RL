@@ -58,6 +58,8 @@ policy:
       env_vars:
         VLLM_USE_RAY_V2_EXECUTOR_BACKEND: 1
     vllm_kwargs:
+      # Equal bytes keep KV capacity comparable across different model footprints.
+      kv_cache_memory_bytes: 12884901888
       mamba_ssm_cache_dtype: float32
       max_num_seqs: 2
       max_num_batched_tokens: 131072

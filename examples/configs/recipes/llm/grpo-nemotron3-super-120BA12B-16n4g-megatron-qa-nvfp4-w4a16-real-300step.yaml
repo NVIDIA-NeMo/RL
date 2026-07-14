@@ -5,16 +5,14 @@ checkpointing:
 
 policy:
   disable_modelopt_layer_spec: true
-  quant_cfg: ${oc.env:PROJECT_ROOT}/examples/modelopt/quant_configs/super120b_nvfp4_weightonly.yaml
+  quant_cfg: examples/modelopt/quant_configs/super120b_nvfp4_weightonly.yaml
   quant_calib_data: random
   quant_calib_size: 16
   quant_batch_size: 1
   quant_sequence_length: 1024
   generation:
-    quant_cfg: ${oc.env:PROJECT_ROOT}/examples/modelopt/quant_configs/super120b_nvfp4_weightonly.yaml
+    quant_cfg: examples/modelopt/quant_configs/super120b_nvfp4_weightonly.yaml
     real_quant: true
-    vllm_cfg:
-      gpu_memory_utilization: 0.4
     real_quant_ignore:
       - lm_head
       - '*output_layer*'

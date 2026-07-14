@@ -1393,6 +1393,9 @@ def test_megatron_checkpoint_save_kill_and_restore(
                 weights_path=weights_path,
                 optimizer_path=optimizer_path,
             )
+            # save_checkpoint() may use MCore's async save path.  Complete the
+            # write before inspecting the checkpoint or terminating its workers.
+            policy1.finalize_async_save()
 
             # Verify checkpoint was created
             assert os.path.exists(checkpoint_dir), "Checkpoint directory not created"
