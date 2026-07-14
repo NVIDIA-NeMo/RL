@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -105,10 +105,11 @@ class SGLangGeneration(GenerationInterface):
         self.needs_offload: bool = sglang_server_cfg["needs_offload"]
         self.model_path: str | None = sglang_cfg["sglang_cfg"]["model_path"]
 
-        # --- Fault-tolerance state ----------------------------------------
+        # --- Weight-refit / fault-tolerance state ------------------------
         # Number of engines created by the most recent ``_start_engines``
-        # call that have not been reconnected for weight updates yet.
+        # call that the refit dispatch has not connected yet.
         self.num_new_engines: int = 0
+        self.pause_generation_mode: str = sglang_server_cfg["pause_generation_mode"]
         self._health_monitor: RolloutHealthMonitor | None = None
 
         # --- Router bootstrap --------------------------------------------
@@ -228,6 +229,10 @@ class SGLangGeneration(GenerationInterface):
             # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
             # all engines see the same global value (Ray would otherwise remap it
             # because we set the NOSET_* flags above).
+            # Trainer and engine must agree on the NCCL transport; sglang's
+            # scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0.
+            env_vars["NCCL_CUMEM_ENABLE"] = "0"
+
             global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
             if global_cvd:
                 env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
@@ -374,6 +379,55 @@ class SGLangGeneration(GenerationInterface):
         # When fault tolerance is not enabled, num_new_engines must be cleared
         # manually after the refit dispatch connects the new engines.
         self.num_new_engines = 0
+
+    def pause_generation(self, mode: Optional[str] = None) -> None:
+        """Pause generation on every node-0 engine.
+
+        Args:
+            mode: Pause mode override. When ``None`` (default), the mode
+                configured in ``sglang_server_config.pause_generation_mode``
+                is used. Callers (e.g. the SGLang refit dispatch helpers)
+                pass an explicit mode when they also need to gate follow-up
+                steps such as ``invalidate_kv_cache`` on the same value.
+        """
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        if mode is None:
+            mode = self.pause_generation_mode
+        ray.get([e.pause_generation.remote(mode=mode) for e in engines])
+
+    def continue_generation(self) -> None:
+        """Resume generation on every node-0 engine."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.continue_generation.remote() for e in engines])
+
+    def post_process_weights(
+        self,
+        *,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = True,
+    ) -> None:
+        """Run SGLang's ``/post_process_weights`` RPC on every node-0 engine.
+
+        Called by the refit dispatch helpers after a colocate IPC or
+        distributed broadcast refit so SGLang finalizes its weight tables
+        (e.g. materializes quantized scales, swaps in the fresh buffer).
+        """
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get(
+            [
+                e.post_process_weights.remote(
+                    restore_weights_before_load=restore_weights_before_load,
+                    post_process_quantization=post_process_quantization,
+                )
+                for e in engines
+            ]
+        )
 
     def health_monitoring_pause(self) -> None:
         if self._health_monitor:
