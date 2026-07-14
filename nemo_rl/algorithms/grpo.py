@@ -1390,6 +1390,31 @@ def setup(
                 f"is inconsistent with colocated.enabled={colocated_inference}: "
                 f"expected {expected_weight_transfer_mode!r}."
             )
+        # Quantized online refit requires SGLang to boot from a checkpoint
+        # with the exact same tensor layout and high-precision exclusions.
+        # Resolve it before ``init_sglang`` starts the engines.
+        sglang_quantization_cfg = generation_config["sglang_cfg"]["quantization"]
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            ensure_sglang_quantized_checkpoint,
+            get_sglang_quantization_scheme,
+            validate_sglang_quantized_refit_backend,
+        )
+
+        sglang_quantization_scheme = get_sglang_quantization_scheme(
+            sglang_quantization_cfg
+        )
+        validate_sglang_quantized_refit_backend(
+            scheme=sglang_quantization_scheme,
+            use_megatron=bool(
+                policy_config.get("megatron_cfg", {}).get("enabled", False)
+            ),
+        )
+        generation_config["sglang_cfg"]["model_path"] = (
+            ensure_sglang_quantized_checkpoint(
+                model_path=generation_config["sglang_cfg"]["model_path"],
+                quantization_config=sglang_quantization_cfg,
+            )
+        )
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,

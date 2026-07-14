@@ -127,7 +127,7 @@ class _SGLangWeightSynchronizer(WeightSynchronizer):
             )
 
     def _refit(self, buffer_size_bytes: int) -> None:
-        from nemo_rl.models.generation.sglang.config import (
+        from nemo_rl.models.generation.sglang.quantization_utils import (
             get_sglang_quantization_scheme,
         )
 

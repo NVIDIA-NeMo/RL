@@ -12,32 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, Required, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
-class SglangQuantizationConfig(TypedDict):
-    """SGLang weight precision. Only BF16 on this layer."""
+class SglangQuantizationConfig(TypedDict, total=False):
+    """SGLang weight-precision config.
 
-    scheme: Literal["bf16"]
-
-
-SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16"})
-
-
-def get_sglang_quantization_scheme(quantization_config: dict[str, Any]) -> str:
-    """Return the configured SGLang weight precision.
-
-    The block must declare a supported ``scheme`` so omissions and typos fail.
+    ``scheme="bf16"`` means BF16 rollout/refit. Set ``scheme="mxfp8"`` to boot
+    SGLang from a matching quantized HF checkpoint and quantize HF tensors
+    during online refit. High-precision exclusions are shared by conversion
+    and online refit.
     """
-    scheme = quantization_config["scheme"]
-    if scheme not in SUPPORTED_SGLANG_QUANTIZATION_SCHEMES:
-        supported = ", ".join(sorted(SUPPORTED_SGLANG_QUANTIZATION_SCHEMES))
-        raise ValueError(
-            f"SGLang quantization.scheme must be one of {{{supported}}}, got {scheme!r}."
-        )
-    return scheme
+
+    scheme: Required[Literal["bf16", "mxfp8"]]
+    # HF module-name substrings that the checkpoint loader and refit both skip.
+    modules_to_not_convert: list[str]
+    # Additional HF weight-name substrings to keep in high precision.
+    extra_high_precision_layers_hf: list[str]
+    # Number of decoder layers at each edge to keep in high precision.
+    num_layers_at_start_in_bf16: int
+    num_layers_at_end_in_bf16: int
+    converted_model_path: str
+    cache_root: str
 
 
 class SGLangServerConfig(TypedDict):
@@ -99,9 +97,6 @@ class SglangSpecificArgs(TypedDict):
     sglang_server_config: SGLangServerConfig
     sglang_router_config: SGLangRouterConfig
 
-    # Weight precision for rollout/refit.
-    quantization: SglangQuantizationConfig
-
     # Fault tolerance (RolloutHealthMonitor). When True, a daemon thread health-checks
     # each engine and restarts hung/dead actors. Absent is equivalent to False, which
     # is what the recipes that predate this feature rely on; the three fields below
@@ -110,6 +105,8 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_interval: NotRequired[int]
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
+    # Weight precision and quantized-checkpoint conversion/refit knobs.
+    quantization: SglangQuantizationConfig
 
     # Path to model weights (local folder or HF repo id).
     model_path: NotRequired[str]
