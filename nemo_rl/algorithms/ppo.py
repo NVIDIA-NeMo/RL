@@ -15,7 +15,6 @@ import gc
 import os
 import time
 import warnings
-from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -71,7 +70,7 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.value import Value, ValueConfig
@@ -229,6 +228,26 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+
+    if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
+        policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])
+
+        # Policy optimizer state first appears after critic warmup, so a cached
+        # checkpoint layout cannot represent both the warmup and training states.
+        assert not (
+            ppo_config["policy_training_start_step"] > 0
+            and master_config.checkpointing["enabled"]
+            and master_config.checkpointing["save_optimizer"]
+            and "checkpoint" in policy_megatron_config
+            and policy_megatron_config["checkpoint"].get(
+                "ckpt_assume_constant_structure"
+            )
+        ), (
+            "policy.megatron_cfg.checkpoint.ckpt_assume_constant_structure=true "
+            "is incompatible with PPO critic warmup when optimizer checkpointing "
+            "is enabled. Set ckpt_assume_constant_structure=false, "
+            "ppo.policy_training_start_step=0, or checkpointing.save_optimizer=false."
+        )
 
     if value_config["megatron_cfg"]["enabled"]:
         # Context parallelism for the Megatron value model requires sequence packing,
@@ -414,24 +433,11 @@ def setup(
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
 
-    # Prepare checkpoint paths.  During critic warmup the policy is not saved,
-    # so the directory may not exist even when resuming from a valid checkpoint.
-    if last_checkpoint_path:
-        _policy_weights = Path(last_checkpoint_path) / "policy" / "weights"
-        _policy_optim = Path(last_checkpoint_path) / "policy" / "optimizer"
-        weights_path = _policy_weights if _policy_weights.exists() else None
-        optimizer_path = _policy_optim if _policy_optim.exists() else None
-        if weights_path is None:
-            print(
-                f"  ⚠ Policy weights not found in checkpoint {last_checkpoint_path} "
-                f"(likely saved during critic warmup). Using base model weights.",
-                flush=True,
-            )
-        else:
-            print(f"  ✓ Resuming policy from checkpoint: {weights_path}", flush=True)
-    else:
-        weights_path = None
-        optimizer_path = None
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+    value_weights_path, value_optimizer_path = checkpointer.get_resume_paths(
+        last_checkpoint_path,
+        model_component="value",
+    )
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
     # ticks once per train() call (matching upstream main's per-rollout
@@ -478,31 +484,6 @@ def setup(
     def init_value():
         """Initialize value model training workers."""
         t0 = time.perf_counter()
-        # Prepare checkpoint paths for value model. Mirror the policy's
-        # .exists() probe (see weights_path/optimizer_path resolution above):
-        # the previous run may not have had a value model, so the value sub-
-        # directory of last_checkpoint_path may be missing.
-        if last_checkpoint_path:
-            _value_weights = Path(last_checkpoint_path) / "value" / "weights"
-            _value_optim = Path(last_checkpoint_path) / "value" / "optimizer"
-            value_weights_path = _value_weights if _value_weights.exists() else None
-            value_optimizer_path = _value_optim if _value_optim.exists() else None
-            if value_weights_path is None:
-                print(
-                    f"  ⚠ Value weights not found in checkpoint {last_checkpoint_path} "
-                    f"(likely the previous run didn't have a value model). "
-                    f"Initializing value model from base weights.",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"  ✓ Resuming value from checkpoint: {value_weights_path}",
-                    flush=True,
-                )
-        else:
-            value_weights_path = None
-            value_optimizer_path = None
-
         v = Value(
             cluster=train_cluster,
             config=value_config,
@@ -971,6 +952,8 @@ def ppo_train(
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
 
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
@@ -1497,6 +1480,10 @@ def ppo_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = timeout.check_save()
 
@@ -1550,45 +1537,39 @@ def ppo_train(
                             total_steps + 1, ppo_save_state, master_config
                         )
 
-                        # Save policy FIRST, then value.  This ordering
-                        # matters: the resume path uses the presence of
-                        # policy/weights to decide whether the policy was
-                        # trained.  By saving policy first we guarantee that
-                        # if any policy dir exists in a finalized checkpoint
-                        # (tmp→step rename is atomic), its contents are
-                        # complete.  During critic warmup the policy optimizer
-                        # has no state yet (master_param not initialized), so
-                        # we skip it entirely — the resume path will fall back
-                        # to the base model weights.
-                        if total_steps >= policy_training_start_step:
-                            policy.prepare_for_training()
-                            policy.save_checkpoint(
-                                weights_path=os.path.join(
-                                    checkpoint_path, "policy", "weights"
-                                ),
-                                optimizer_path=os.path.join(
-                                    checkpoint_path, "policy", "optimizer"
-                                ),
-                                tokenizer_path=os.path.join(
-                                    checkpoint_path, "policy", "tokenizer"
-                                ),
-                                checkpointing_cfg=master_config.checkpointing,
-                            )
-                            policy.offload_to_cpu()
-                        else:
-                            print(
-                                f"Skipping policy checkpoint (critic warmup: "
-                                f"step {total_steps} < {policy_training_start_step})",
-                                flush=True,
-                            )
+                        # Always save policy weights so every PPO checkpoint has
+                        # the same component layout. Before the first real policy
+                        # update, omit optimizer and scheduler state because their
+                        # lazily initialized state is not yet safe to checkpoint.
+                        policy.prepare_for_training()
+                        policy.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "policy", "weights"
+                            ),
+                            optimizer_path=(
+                                os.path.join(checkpoint_path, "policy", "optimizer")
+                                if (
+                                    checkpointer.save_optimizer
+                                    and total_steps >= policy_training_start_step
+                                )
+                                else None
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "policy", "tokenizer"
+                            ),
+                            checkpointing_cfg=master_config.checkpointing,
+                        )
+                        policy.offload_to_cpu()
 
                         value_model.prepare_for_training()
                         value_model.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "value", "weights"
                             ),
-                            optimizer_path=os.path.join(
-                                checkpoint_path, "value", "optimizer"
+                            optimizer_path=(
+                                os.path.join(checkpoint_path, "value", "optimizer")
+                                if checkpointer.save_optimizer
+                                else None
                             ),
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
@@ -1601,7 +1582,13 @@ def ppo_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # The value worker finalizes its own write synchronously
+                        # (blocking=True) inside save_checkpoint, so only the
+                        # policy's async write needs to be awaited before rename.
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             # Logging
             memory_tracker.snapshot_start_of_stage("Logging", dir())
@@ -1683,10 +1670,12 @@ def ppo_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -1696,6 +1685,13 @@ def ppo_train(
 
         current_epoch += 1
         current_step = 0
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
 
 
 def validate(

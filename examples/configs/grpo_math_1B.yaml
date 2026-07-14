@@ -157,6 +157,9 @@ policy:
   
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     # Compute next-token logprobs directly from hidden states with a chunked
     # linear cross-entropy fusion, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
@@ -201,6 +204,7 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
     mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -326,8 +330,8 @@ policy:
   generation:
     # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
     # See ray.sub for the full port layout.
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -460,8 +464,8 @@ cluster:
   # Port range for the distributed master address (TCPStore / NCCL rendezvous)
   # and per-worker available ports.  Kept below the OS ephemeral range
   # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
-  master_port_range_low: 25000
-  master_port_range_high: 28000
+  master_port_range_low: 1400
+  master_port_range_high: 1999
   segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
 
 # TransferQueue-mediated data plane for sync GRPO.

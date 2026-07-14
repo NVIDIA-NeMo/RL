@@ -35,6 +35,7 @@ from megatron.bridge.training.config import (
     CheckpointConfig,
     ConfigContainer,
     DistributedDataParallelConfig,
+    DistributedInitConfig,
     LoggerConfig,
     OptimizerConfig,
     SchedulerConfig,
@@ -594,6 +595,7 @@ def setup_model_config(
         weights_path,
         optimizer_path,
         load_main_params_from_ckpt,
+        ckpt_cfg=config["megatron_cfg"].get("checkpoint"),
     )
 
     # Validate training configuration
@@ -909,20 +911,59 @@ def _create_checkpoint_config(
     weights_path: Optional[str],
     optimizer_path: Optional[str],
     load_main_params_from_ckpt: bool = False,
+    ckpt_cfg: Optional[dict[str, Any]] = None,
 ) -> CheckpointConfig:
-    """Create checkpoint configurations."""
-    return CheckpointConfig(
+    """Create checkpoint configurations.
+
+    Args:
+        pretrained_path: Path to the pretrained checkpoint.
+        weights_path: Path to save/load training weights.
+        optimizer_path: Path to the optimizer state (None if not resuming optimizer).
+        load_main_params_from_ckpt: Load optimizer main params from the checkpoint.
+        ckpt_cfg: MegatronCheckpointConfig dict from YAML (``megatron_cfg.checkpoint``).
+            Every knob (``async_save``, ``ckpt_assume_constant_structure``, and the
+            parallel-IO fields) is forwarded only when explicitly set in YAML — no
+            call-site default. When a field (or the whole block) is absent, Megatron
+            Bridge's own ``CheckpointConfig`` default applies, so ``async_save``
+            falls back to synchronous save for configs that don't set it.
+    """
+    cfg = ckpt_cfg or {}
+
+    kwargs: dict[str, Any] = dict(
         save_interval=100,
         save=weights_path,
         load=weights_path,
         load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
-        async_save=False,
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
+    # Forward checkpoint knobs only when explicitly set in YAML; otherwise Megatron
+    # Bridge's own CheckpointConfig defaults apply (the exemplar configs own the
+    # values). async_save is presence-checked exactly like the sibling Bridge knobs
+    # — no call-site default — so a config that omits the block keeps Bridge's
+    # default (synchronous save).
+    _optional_ckpt_fields = (
+        "async_save",
+        "ckpt_assume_constant_structure",
+        "ckpt_fully_parallel_save_process_group",
+        "ckpt_fully_parallel_load_process_group",
+        "ckpt_fully_parallel_load_exchange_algo",
+    )
+    for field in _optional_ckpt_fields:
+        if field in cfg:
+            kwargs[field] = cfg[field]
+
+    # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
+    # On a fresh run (no prior checkpoint), weights_path is None, so fall back to
+    # pretrained_path as a placeholder — save_checkpoint() overwrites it with the
+    # real path before each write.
+    if kwargs.get("async_save") and kwargs["save"] is None:
+        kwargs["save"] = pretrained_path
+
+    return CheckpointConfig(**kwargs)
 
 
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
@@ -1019,10 +1060,18 @@ def _create_megatron_config(
             "Set policy.megatron_cfg.distributed_data_parallel_config."
             "overlap_param_gather=false."
         )
+
+    dist_cfg = DistributedInitConfig()
+    if "use_gloo_process_groups" in config["megatron_cfg"]:
+        dist_cfg.use_gloo_process_groups = config["megatron_cfg"][
+            "use_gloo_process_groups"
+        ]
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
         logger=LoggerConfig(logging_level=0),
+        dist=dist_cfg,
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
             global_batch_size=config["train_global_batch_size"],  # ignored
@@ -1164,6 +1213,13 @@ def setup_model_and_optimizer(
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
+    # Must be called before initialize_megatron (before CUDA init) so the
+    # persistent async-checkpoint worker subprocess is spawned in a clean process.
+    # Bridge hardcodes mp_mode='spawn', the only safe option inside Ray actors
+    # (fork with Ray is an anti-pattern). This is a no-op unless async_save is
+    # enabled (see GlobalState.initialize_async_checkpoint_worker).
+    state.initialize_async_checkpoint_worker()
+
     megatron_cfg.dist.external_gpu_device_mapping = True
     initialize_megatron(
         cfg=megatron_cfg,
@@ -1197,11 +1253,10 @@ def setup_model_and_optimizer(
     # Context used for persisting some state between checkpoint saves.
     checkpointing_context = init_checkpointing_context(megatron_cfg.checkpoint)
 
-    # Tokenizer
-    if megatron_cfg.tokenizer.hf_tokenizer_kwargs is None:
-        megatron_cfg.tokenizer.hf_tokenizer_kwargs = {}
-    megatron_cfg.tokenizer.hf_tokenizer_kwargs["trust_remote_code"] = True
-    megatron_cfg.tokenizer.hf_tokenizer_kwargs["use_fast"] = True
+    # Set the attribute directly instead of updating hf_tokenizer_kwargs, because
+    # Megatron-Bridge's TokenizerConfig snapshots hf_tokenizer_kwargs into plain
+    # attributes at __post_init__ and never re-reads the dict afterwards.
+    megatron_cfg.tokenizer.trust_remote_code = True
     build_tokenizer(
         megatron_cfg.tokenizer,
         make_vocab_size_divisible_by=megatron_cfg.model.make_vocab_size_divisible_by
