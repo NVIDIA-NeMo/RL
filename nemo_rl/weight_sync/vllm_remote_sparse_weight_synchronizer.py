@@ -24,9 +24,12 @@ import ray
 
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.weight_transfer_remote_sparse import (
-    flush_vllm_refit_urls,
+    G_VLLM_REFIT_FLUSH_PATH,
+    G_VLLM_REFIT_PREPARE_PATH,
     merge_vllm_refit_metrics,
-    prepare_vllm_sparse_refit_urls,
+    post_vllm_refit_endpoints,
+    vllm_refit_api_key,
+    vllm_refit_endpoints,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -44,10 +47,12 @@ def validate_vllm_remote_sparse_refit(
 ) -> str | None:
     """Validate the optional config and return its internal transport name."""
     transport = config.get("refit_transport")
-    if transport is not None and transport not in _REMOTE_SPARSE_TRANSPORTS:
+    if transport is None:
+        return None
+    if transport not in _REMOTE_SPARSE_TRANSPORTS:
         raise ValueError(f"Unsupported vLLM refit transport {transport!r}.")
     vllm_cfg = config["vllm_cfg"]
-    if transport is not None and (
+    if (
         colocated
         or not megatron_enabled
         or vllm_cfg["precision"] == "fp8"
@@ -60,7 +65,7 @@ def validate_vllm_remote_sparse_refit(
             f"{transport} requires a non-colocated Megatron policy, BF16/FP16 "
             "vLLM, delta compression, and an unquantized rollout."
         )
-    return None if transport is None else _REMOTE_SPARSE_TRANSPORTS[transport]
+    return _REMOTE_SPARSE_TRANSPORTS[transport]
 
 
 class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
@@ -140,11 +145,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                     verification.update(
                         merge_vllm_refit_metrics(
                             {},
-                            flush_vllm_refit_urls(
-                                self._refit_urls,
-                                api_key_env_var=self._api_key_env_var,
-                                timeout_s=self._request_timeout_s,
-                            ),
+                            self._request_receivers(G_VLLM_REFIT_FLUSH_PATH, {}),
                             maximum=True,
                             candidate_maximum=False,
                         )
@@ -180,9 +181,9 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             finally:
                 if not succeeded:
                     with suppress(Exception):
-                        flush_vllm_refit_urls(
-                            self._refit_urls,
-                            api_key_env_var=self._api_key_env_var,
+                        self._request_receivers(
+                            G_VLLM_REFIT_FLUSH_PATH,
+                            {},
                             timeout_s=min(self._request_timeout_s, 60.0),
                         )
                 self._baseline_commit_refs = (
@@ -244,6 +245,20 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             )
         )
 
+    def _request_receivers(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        timeout_s: float | None = None,
+    ) -> list[dict[str, Any]]:
+        return post_vllm_refit_endpoints(
+            vllm_refit_endpoints(self._refit_urls, path),
+            body,
+            api_key=vllm_refit_api_key(self._api_key_env_var),
+            timeout_s=self._request_timeout_s if timeout_s is None else timeout_s,
+        )
+
     @staticmethod
     def start_baseline(policy: Any, transport: str) -> list[Any]:
         workers = policy.worker_group
@@ -291,11 +306,14 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             ray.get(list(self._baseline_init_refs))
         )
         self._baseline_init_refs.clear()
-        prepare_vllm_sparse_refit_urls(
-            self._refit_urls,
-            state_dict_info,
-            api_key_env_var=self._api_key_env_var,
-            timeout_s=self._request_timeout_s,
+        self._request_receivers(
+            G_VLLM_REFIT_PREPARE_PATH,
+            {
+                "tensors": {
+                    name: [list(shape), str(dtype).removeprefix("torch.")]
+                    for name, (shape, dtype) in state_dict_info.items()
+                }
+            },
         )
         self._stale = False
 

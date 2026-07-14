@@ -92,36 +92,24 @@ class SparseShardProjection:
 
     name: str
     global_shape: tuple[int, ...]
-    offsets: tuple[int, ...]
+    shard_dim: int | None = None
+    offset: int = 0
 
     def map_locations(
         self, locations: torch.Tensor, local_shape: tuple[int, ...]
     ) -> torch.Tensor:
-        if len(local_shape) != len(self.global_shape) or len(local_shape) != len(
-            self.offsets
-        ):
-            raise ValueError(f"Sparse shard {self.name!r} has inconsistent ranks.")
-        if any(
-            offset < 0 or offset + local > global_size
-            for local, global_size, offset in zip(
-                local_shape, self.global_shape, self.offsets, strict=True
-            )
-        ):
-            raise ValueError(f"Sparse shard {self.name!r} exceeds its global shape.")
-        if local_shape == self.global_shape and not any(self.offsets):
+        if self.shard_dim is None:
             return locations
-
-        mapped = torch.zeros_like(locations)
-        for dim, (local_size, global_size, offset) in enumerate(
-            zip(local_shape, self.global_shape, self.offsets, strict=True)
-        ):
-            local_stride = prod(local_shape[dim + 1 :])
-            global_stride = prod(self.global_shape[dim + 1 :])
-            coordinate = torch.div(
-                locations, local_stride, rounding_mode="floor"
-            ).remainder(local_size)
-            mapped.add_((coordinate + offset) * global_stride)
-        return mapped
+        if self.shard_dim == 0:
+            return locations + self.offset * prod(local_shape[1:])
+        inner = prod(local_shape[self.shard_dim + 1 :])
+        local_slab = local_shape[self.shard_dim] * inner
+        outer = torch.div(locations, local_slab, rounding_mode="floor")
+        return (
+            locations
+            + self.offset * inner
+            + outer * (prod(self.global_shape[self.shard_dim :]) - local_slab)
+        )
 
 
 def integer_dtype_for_element_size(element_size: int) -> torch.dtype:
@@ -145,10 +133,8 @@ def sparse_operation(value: object) -> SparseOperation:
     raise ValueError(f"Unsupported sparse-refit operation {value!r}.")
 
 
-def _integer_view(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.contiguous().view(
-        integer_dtype_for_element_size(tensor.element_size())
-    )
+def integer_view(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.view(integer_dtype_for_element_size(tensor.element_size()))
 
 
 def _bytewise_diff_mask(current: torch.Tensor, baseline: torch.Tensor) -> torch.Tensor:
@@ -156,7 +142,7 @@ def _bytewise_diff_mask(current: torch.Tensor, baseline: torch.Tensor) -> torch.
         raise ValueError(
             "Current tensor and baseline must have identical shape and dtype."
         )
-    return _integer_view(current) != _integer_view(baseline)
+    return integer_view(current) != integer_view(baseline)
 
 
 def encode_sparse_infos(
@@ -351,15 +337,12 @@ class DeltaCompressionTracker:
     def prepare_sparse_delta_payload(
         self, tensors: TensorBatch
     ) -> PreparedTensorPayload:
-        self._wait_for_baseline_commits()
-        sparse_infos = []
-        pending_updates = {}
+        sparse_infos: list[SparseInfo] = []
         changed_elements = total_elements = 0
-        for name, tensor in tensors:
-            baseline, current, locations, current_values = self._find_changes(
-                name, tensor
-            )
-            baseline_bits = _integer_view(baseline).view(-1)
+        for name, baseline, current, locations, current_values in self._changes(
+            tensors
+        ):
+            baseline_bits = integer_view(baseline).view(-1)
             total_elements += current.numel()
             changed_elements += locations.numel()
             if locations.numel():
@@ -390,9 +373,6 @@ class DeltaCompressionTracker:
                         self.encoding,
                     )
                 )
-                pending_updates[name] = (locations, current_values)
-        with self._pending_updates_lock:
-            self._pending_updates.update(pending_updates)
         payload = encode_sparse_infos(sparse_infos)
         if self.verification_samples:
             self._add_verification_samples(payload[2])
@@ -402,31 +382,34 @@ class DeltaCompressionTracker:
         self, tensors: Iterable[NamedTensor]
     ) -> tuple[set[str], int, int]:
         """Scan local tensors without constructing a wire payload."""
-        self._wait_for_baseline_commits()
         changed_names = set()
-        pending_updates = {}
         changed_elements = total_elements = 0
-        for name, tensor in tensors:
-            _, current, locations, current_values = self._find_changes(name, tensor)
+        for name, _, current, locations, _ in self._changes(tensors):
             total_elements += current.numel()
             changed_elements += locations.numel()
             if locations.numel():
                 changed_names.add(name)
-                pending_updates[name] = (locations, current_values)
-        with self._pending_updates_lock:
-            self._pending_updates.update(pending_updates)
         return changed_names, changed_elements, total_elements
 
-    def _find_changes(
-        self, name: str, tensor: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        baseline = self.baseline.get(name)
-        if baseline is None:
-            raise RuntimeError(f"Sparse delta baseline is missing {name!r}.")
-        current = tensor.detach().cpu().contiguous()
-        locations = _bytewise_diff_mask(current, baseline).view(-1).nonzero().view(-1)
-        current_values = _integer_view(current).view(-1)[locations]
-        return baseline, current, locations, current_values
+    def _changes(
+        self, tensors: Iterable[NamedTensor]
+    ) -> Iterable[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        self._wait_for_baseline_commits()
+        pending_updates = {}
+        for name, tensor in tensors:
+            baseline = self.baseline.get(name)
+            if baseline is None:
+                raise RuntimeError(f"Sparse delta baseline is missing {name!r}.")
+            current = tensor.detach().cpu().contiguous()
+            locations = (
+                _bytewise_diff_mask(current, baseline).view(-1).nonzero().view(-1)
+            )
+            values = integer_view(current).view(-1)[locations]
+            if locations.numel():
+                pending_updates[name] = (locations, values)
+            yield name, baseline, current, locations, values
+        with self._pending_updates_lock:
+            self._pending_updates.update(pending_updates)
 
     def _add_verification_samples(
         self,
@@ -483,7 +466,7 @@ class DeltaCompressionTracker:
         updates: Iterable[tuple[str, tuple[torch.Tensor, torch.Tensor]]],
     ) -> None:
         for name, (locations, values) in updates:
-            target = _integer_view(self.baseline[name]).view(-1)
+            target = integer_view(self.baseline[name]).view(-1)
             count = locations.numel()
             first = int(locations[0])
             if int(locations[-1]) - first + 1 == count:

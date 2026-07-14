@@ -1840,7 +1840,9 @@ class MegatronPolicyWorkerImpl(
                 MegatronRemoteSparseRefit,
             )
 
-            self._remote_sparse_refit = MegatronRemoteSparseRefit.from_worker(self)
+            self._remote_sparse_refit = MegatronRemoteSparseRefit(
+                self, self.cfg["generation"]["delta_compression"]
+            )
         return self._remote_sparse_refit
 
     def finish_remote_sparse_delta_sync(self, *, succeeded: bool) -> None:

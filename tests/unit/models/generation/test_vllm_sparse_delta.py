@@ -28,9 +28,17 @@ from nemo_rl.utils.weight_transfer_sparse_codec import (
     SparseOperation,
     decode_sparse_tensor_payload_for_staging,
     encode_sparse_infos,
-    integer_dtype_for_element_size,
     iter_decoded_sparse_payload,
 )
+from nemo_rl.utils.weight_transfer_sparse_codec import (
+    integer_view as _bits,
+)
+
+_PACKED_LOADER_INFOS = [
+    ("row_slice", (4, 2), [4, 5, 7], [1.0] * 3),
+    ("column_slice", (2, 8), [4, 7, 12, 15], [2.0] * 4),
+    ("split", (6, 2), [2, 5, 8, 11], [3.0, 3.0, 4.0, 4.0]),
+]
 
 
 class _NativeLoaderModel:
@@ -55,27 +63,15 @@ class _NativeLoaderModel:
                 target["identity"].copy_(source)
             elif name == "weight_scale_inv":
                 target["scale"].copy_(source)
-            elif name.endswith("self_attn.k_proj.weight"):
-                target["qkv"][4:6].copy_(source[2:4])
-            elif name.endswith("mlp.gate_proj.weight"):
-                target["merged"][:4].copy_(source[4:8])
-            elif name.endswith("mlp.up_proj.weight"):
-                target["merged"][4:8].copy_(source[4:8])
-            elif name.endswith("experts.3.gate_proj.weight"):
-                target["w13"][1, :4].copy_(source[4:8])
-            elif name.endswith("experts.3.down_proj.weight"):
-                target["w2"][1].copy_(source[:, 4:8])
-            elif name.endswith("mixer.in_proj.weight"):
-                target["mamba"][:2].copy_(source[2:4])
-                target["mamba"][2:].copy_(source[6:10])
-            elif name.endswith(("mixer.A", "mixer.A_log")):
-                target["a"].copy_(source)
-                target["a"].copy_(-torch.exp(target["a"]))
-            elif name == "transformed":
-                target["identity"].copy_(source + 1)
-            elif name == "raise_after_copy":
-                target["identity"].copy_(source)
-                raise RuntimeError("loader failed")
+            elif name == "row_slice":
+                target[name].copy_(source[2:4])
+            elif name == "column_slice":
+                target[name].copy_(source[:, 4:8])
+            elif name == "split":
+                target[name][:2].copy_(source[1:3])
+                target[name][2:].copy_(source[4:6])
+            elif name == "exp_transform":
+                target[name].copy_(-torch.exp(source))
             else:
                 continue
             loaded.add(name)
@@ -89,12 +85,6 @@ def _applier(model: Any) -> VllmSparseDeltaApplier:
             vllm_config=SimpleNamespace(),
         ),
         torch.device("cpu"),
-    )
-
-
-def _bits(values: torch.Tensor) -> torch.Tensor:
-    return values.contiguous().view(
-        integer_dtype_for_element_size(values.element_size())
     )
 
 
@@ -117,8 +107,7 @@ def _payload(
 
 
 def _apply_payload(applier: VllmSparseDeltaApplier, payload: Any) -> None:
-    for item, locations, values in _decode_staged(payload):
-        applier._apply_decoded_item(item, locations, values)
+    applier._apply_decoded_items(_decode_staged(payload))
 
 
 def test_sparse_prewarm_reserves_largest_source_without_loading_weights() -> None:
@@ -151,7 +140,7 @@ def test_sparse_prewarm_caches_rank_local_native_loader_skips() -> None:
 
 
 @pytest.mark.vllm
-def test_backend_applies_decoded_sparse_payload_files() -> None:
+def test_backend_applies_decoded_sparse_payload_sources() -> None:
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtension,
     )
@@ -159,21 +148,18 @@ def test_backend_applies_decoded_sparse_payload_files() -> None:
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     applier = MagicMock()
     applier.update_weights_from_decoded_sparse_payload.return_value = {"ok": True}
-    applier.update_weights_from_decoded_sparse_payload_files.return_value = {"ok": True}
     ext._get_sparse_delta_applier = MagicMock(return_value=applier)
 
     ext.prepare_sparse_delta_refit_info({"weight": ((8,), torch.float32)})
 
     assert ext.update_weights_from_decoded_sparse_payload(b"payload") == {"ok": True}
-    assert ext.update_weights_from_decoded_sparse_payload_files("first", "second") == {
+    assert ext.update_weights_from_decoded_sparse_payload("first", "second") == {
         "ok": True
     }
-    applier.update_weights_from_decoded_sparse_payload.assert_called_once_with(
-        b"payload"
-    )
-    applier.update_weights_from_decoded_sparse_payload_files.assert_called_once_with(
-        "first", "second"
-    )
+    assert [
+        item.args
+        for item in applier.update_weights_from_decoded_sparse_payload.call_args_list
+    ] == [(b"payload",), ("first", "second")]
     applier.prewarm.assert_called_once_with({"weight": ((8,), torch.float32)})
     applier.discover_native_skips.assert_called_once_with(
         {"weight": ((8,), torch.float32)}
@@ -185,29 +171,13 @@ def test_sparse_payload_batches_preserve_order(tmp_path) -> None:
     applier = _applier(_NativeLoaderModel(identity=torch.zeros(1)))
     decoded_paths = [tmp_path / f"decoded-{index}.pt" for index in range(3)]
     decoded_payloads = [
-        (
-            (
-                torch.tensor([index], dtype=torch.int32),
-                torch.empty(0, dtype=torch.int64),
-            ),
-            (torch.tensor([index]),),
-            [
-                {
-                    "name": "weight",
-                    "index": index,
-                    "shape": (1,),
-                    "dtype": "float32",
-                    "operation": "overwrite",
-                    "index_encoding": "range",
-                    "range_start": 0,
-                    "decoded_location_group": 0,
-                    "decoded_location_start": 0,
-                    "decoded_location_end": 1,
-                    "value_group": 0,
-                    "value_start": 0,
-                    "value_end": 1,
-                }
-            ],
+        decode_sparse_tensor_payload_for_staging(
+            _payload(
+                f"weight-{index}",
+                torch.empty(1),
+                [0],
+                _bits(torch.tensor([float(index)])),
+            )
         )
         for index in range(3)
     ]
@@ -220,20 +190,19 @@ def test_sparse_payload_batches_preserve_order(tmp_path) -> None:
     result = applier.update_weights_from_decoded_sparse_payload(
         *(path.read_bytes() for path in decoded_paths)
     )
-    decoded_result = applier.update_weights_from_decoded_sparse_payload_files(
+    decoded_result = applier.update_weights_from_decoded_sparse_payload(
         *(str(path) for path in reversed(decoded_paths))
     )
 
-    assert [item["index"] for item in decoded_applied] == [
-        0,
-        1,
-        2,
-        2,
-        1,
-        0,
+    assert [item["name"] for item in decoded_applied] == [
+        "weight-0",
+        "weight-1",
+        "weight-2",
+        "weight-2",
+        "weight-1",
+        "weight-0",
     ]
     assert result["receiver_deserialize_s"] >= 0.0
-    assert result["receiver_scratch_s"] >= 0.0
     assert result["receiver_sparse_apply_s"] >= 0.0
     assert decoded_result["receiver_deserialize_s"] >= 0.0
 
@@ -270,38 +239,26 @@ def test_decoded_sparse_payload_converts_compact_locations_for_apply(tmp_path) -
 
     result = _applier(
         _NativeLoaderModel(identity=target)
-    ).update_weights_from_decoded_sparse_payload_files(str(path))
+    ).update_weights_from_decoded_sparse_payload(str(path))
 
     assert torch.equal(target, torch.tensor([0.0, 2.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0]))
     assert result["receiver_sparse_apply_s"] >= 0.0
 
 
 @pytest.mark.vllm
-def test_native_loaders_apply_sparse_overwrite_without_family_plans() -> None:
+def test_native_loaders_apply_sparse_views_and_transforms() -> None:
     targets = {
         "identity": torch.zeros(4),
-        "qkv": torch.zeros(8, 2),
-        "merged": torch.zeros(8, 2),
-        "w13": torch.zeros(2, 4, 2),
-        "w2": torch.zeros(2, 2, 4),
-        "mamba": torch.zeros(6, 2),
-        "a": torch.tensor([-2.0, -4.0]),
+        "row_slice": torch.zeros(2, 2),
+        "column_slice": torch.zeros(2, 4),
+        "split": torch.zeros(4, 2),
+        "exp_transform": torch.tensor([-2.0, -4.0]),
     }
     infos = [
         ("weight", (4,), [1, 2], [1.0, 2.0]),
-        ("model.layers.0.self_attn.k_proj.weight", (4, 2), [0, 4, 5, 7], [1] * 4),
-        ("model.layers.0.mlp.gate_proj.weight", (8, 2), [0, 8, 9, 15], [2] * 4),
-        ("model.layers.0.mlp.up_proj.weight", (8, 2), [8, 15], [3] * 2),
-        ("model.layers.0.mlp.experts.3.gate_proj.weight", (8, 2), [8, 15], [4] * 2),
+        *_PACKED_LOADER_INFOS,
         (
-            "model.layers.0.mlp.experts.3.down_proj.weight",
-            (2, 8),
-            [3, 4, 7, 12, 15],
-            [5] * 5,
-        ),
-        ("model.layers.0.mixer.in_proj.weight", (10, 2), [0, 4, 7, 12, 19], [6] * 5),
-        (
-            "backbone.layers.0.mixer.A_log",
+            "exp_transform",
             (2,),
             [0, 1],
             [math.log(3.0), math.log(2.0)],
@@ -319,19 +276,26 @@ def test_native_loaders_apply_sparse_overwrite_without_family_plans() -> None:
             for name, shape, locations, values in infos
         ]
     )
-    payload[2][7]["verification_samples"] = 2
+    payload[2][-1]["verification_samples"] = 2
 
     applier = _applier(_NativeLoaderModel(**targets))
     _apply_payload(applier, payload)
     verification = applier.finish_sparse_delta_refit()
 
     assert torch.equal(targets["identity"], torch.tensor([0.0, 1.0, 2.0, 0.0]))
-    assert targets["qkv"].view(-1)[[8, 9, 11]].tolist() == [1.0, 1.0, 1.0]
-    assert targets["merged"].view(-1)[[0, 1, 7, 8, 15]].tolist() == [2, 2, 2, 3, 3]
-    assert targets["w13"].view(-1)[[8, 15]].tolist() == [4, 4]
-    assert targets["w2"].view(-1)[[8, 11, 12, 15]].tolist() == [5, 5, 5, 5]
-    assert targets["mamba"].view(-1)[[0, 3, 4, 11]].tolist() == [6, 6, 6, 6]
-    assert torch.allclose(targets["a"], torch.tensor([-3.0, -2.0]))
+    assert targets["row_slice"].view(-1).tolist() == [1.0, 1.0, 0.0, 1.0]
+    assert targets["column_slice"].view(-1).tolist() == [2.0, 0.0, 0.0, 2.0] * 2
+    assert targets["split"].view(-1).tolist() == [
+        3.0,
+        0.0,
+        0.0,
+        3.0,
+        4.0,
+        0.0,
+        0.0,
+        4.0,
+    ]
+    assert torch.allclose(targets["exp_transform"], torch.tensor([-3.0, -2.0]))
     assert verification["verification_candidates"] == 2
     assert verification["verification_samples"] == 2
     assert verification["verification_exact_mismatches"] == 0
@@ -340,43 +304,10 @@ def test_native_loaders_apply_sparse_overwrite_without_family_plans() -> None:
 @pytest.mark.vllm
 def test_xor_applies_through_packed_native_loaders() -> None:
     targets = {
-        "qkv": torch.zeros(8, 2),
-        "merged": torch.zeros(8, 2),
-        "w13": torch.zeros(2, 4, 2),
-        "mamba": torch.zeros(6, 2),
+        "row_slice": torch.zeros(2, 2),
+        "column_slice": torch.zeros(2, 4),
+        "split": torch.zeros(4, 2),
     }
-    infos = [
-        (
-            "model.layers.0.self_attn.k_proj.weight",
-            (4, 2),
-            [0, 4, 5, 7],
-            [1.0] * 4,
-        ),
-        (
-            "model.layers.0.mlp.gate_proj.weight",
-            (8, 2),
-            [0, 8, 9, 15],
-            [2.0] * 4,
-        ),
-        (
-            "model.layers.0.mlp.up_proj.weight",
-            (8, 2),
-            [8, 15],
-            [3.0] * 2,
-        ),
-        (
-            "model.layers.0.mlp.experts.3.gate_proj.weight",
-            (8, 2),
-            [8, 15],
-            [4.0] * 2,
-        ),
-        (
-            "model.layers.0.mixer.in_proj.weight",
-            (10, 2),
-            [0, 4, 7, 12, 19],
-            [6.0] * 5,
-        ),
-    ]
     payload = encode_sparse_infos(
         [
             (
@@ -388,16 +319,24 @@ def test_xor_applies_through_packed_native_loaders() -> None:
                 ),
                 "xor",
             )
-            for name, shape, locations, values in infos
+            for name, shape, locations, values in _PACKED_LOADER_INFOS
         ]
     )
 
     _apply_payload(_applier(_NativeLoaderModel(**targets)), payload)
 
-    assert targets["qkv"].view(-1)[[8, 9, 11]].tolist() == [1.0, 1.0, 1.0]
-    assert targets["merged"].view(-1)[[0, 1, 7, 8, 15]].tolist() == [2, 2, 2, 3, 3]
-    assert targets["w13"].view(-1)[[8, 15]].tolist() == [4.0, 4.0]
-    assert targets["mamba"].view(-1)[[0, 3, 4, 11]].tolist() == [6, 6, 6, 6]
+    assert targets["row_slice"].view(-1).tolist() == [1.0, 1.0, 0.0, 1.0]
+    assert targets["column_slice"].view(-1).tolist() == [2.0, 0.0, 0.0, 2.0] * 2
+    assert targets["split"].view(-1).tolist() == [
+        3.0,
+        0.0,
+        0.0,
+        3.0,
+        4.0,
+        0.0,
+        0.0,
+        4.0,
+    ]
 
 
 @pytest.mark.vllm
@@ -406,7 +345,7 @@ def test_native_loader_explicit_skip_is_accepted() -> None:
     payload = _payload("skipped", torch.empty(1), [0], _bits(torch.tensor([1.0])))
     item, locations, values = _decode_staged(payload)[0]
 
-    _applier(model)._apply_decoded_item(item, locations, values)
+    _applier(model)._apply_decoded_items(((item, locations, values),))
 
     assert torch.equal(model.targets["identity"], torch.zeros(1))
 
@@ -425,26 +364,15 @@ def test_native_loader_claim_without_copy_fails_closed() -> None:
 def test_sparse_overwrite_preserves_unselected_transform_inputs() -> None:
     target = torch.tensor([-2.0, -4.0, -6.0, -8.0])
     payload = _payload(
-        "backbone.layers.0.mixer.A_log",
+        "exp_transform",
         target,
         [1],
         _bits(torch.tensor([math.log(3.0)])),
     )
 
-    _apply_payload(_applier(_NativeLoaderModel(a=target)), payload)
+    _apply_payload(_applier(_NativeLoaderModel(exp_transform=target)), payload)
 
     assert torch.allclose(target, torch.tensor([-2.0, -3.0, -6.0, -8.0]))
-
-
-@pytest.mark.vllm
-def test_sparse_overwrite_rolls_back_loader_failure() -> None:
-    target = torch.tensor([1.0, 2.0])
-    payload = _payload("raise_after_copy", target, [1], _bits(torch.tensor([3.0])))
-
-    with pytest.raises(RuntimeError, match="loader failed"):
-        _apply_payload(_applier(_NativeLoaderModel(identity=target)), payload)
-
-    assert torch.equal(target, torch.tensor([1.0, 2.0]))
 
 
 @pytest.mark.vllm
@@ -571,9 +499,9 @@ def test_overwrite_casts_absolute_source_values() -> None:
     ("name", "source", "targets", "error"),
     [
         (
-            "backbone.layers.0.mixer.A_log",
+            "exp_transform",
             torch.tensor([math.log(2.0)]),
-            {"a": torch.tensor([-1.0])},
+            {"exp_transform": torch.tensor([-1.0])},
             "transforms its input",
         ),
         (

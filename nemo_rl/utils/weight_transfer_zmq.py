@@ -26,7 +26,6 @@ from typing import Any
 import zmq
 
 from nemo_rl.utils.weight_transfer_remote_sparse import (
-    SparseDeltaStreamResult,
     SparsePartitionMode,
     merge_vllm_refit_metrics,
     post_vllm_refit_endpoints,
@@ -58,6 +57,13 @@ def _json_bytes(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
 
 
+def _configure_socket(socket: zmq.Socket, high_water_mark: int) -> None:
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.setsockopt(zmq.SNDHWM, high_water_mark)
+    socket.setsockopt(zmq.RCVHWM, high_water_mark)
+    socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+
+
 class ZmqSparseRefitClient:
     """One-thread DEALER client with retry-safe payload identifiers."""
 
@@ -74,16 +80,12 @@ class ZmqSparseRefitClient:
         self._producer_id = producer_id
         self._api_key = api_key
         self._socket = zmq.Context.instance().socket(zmq.DEALER)
+        _configure_socket(self._socket, 2)
         self._socket.setsockopt(
-            zmq.IDENTITY,
-            f"nrl-{producer_id}-{uuid.uuid4().hex}".encode(),
+            zmq.IDENTITY, f"nrl-{producer_id}-{uuid.uuid4().hex}".encode()
         )
-        self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.setsockopt(zmq.IMMEDIATE, 1)
-        self._socket.setsockopt(zmq.SNDHWM, 2)
-        self._socket.setsockopt(zmq.RCVHWM, 2)
         self._socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
-        self._socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
         self._socket.connect(address)
 
     def send_payload(
@@ -267,11 +269,6 @@ class ZmqSparseRefitServer:
         checksum = str(metadata["checksum"])
         if not transfer_id or producer_id < 0 or payload_id < 0:
             raise ValueError("Invalid ZeroMQ sparse refit payload identity.")
-        actual = sparse_payload_checksum(body)
-        if actual != checksum:
-            raise ValueError(
-                f"Sparse refit payload checksum mismatch: expected={checksum}, actual={actual}."
-            )
         return identity, (transfer_id, producer_id, payload_id), body, metadata
 
     def _run(self) -> None:
@@ -287,11 +284,8 @@ class ZmqSparseRefitServer:
         )
         pending: dict[Any, tuple[bytes, tuple[str, int, int]]] = {}
         try:
-            socket.setsockopt(zmq.LINGER, 0)
+            _configure_socket(socket, 16)
             socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
-            socket.setsockopt(zmq.SNDHWM, 16)
-            socket.setsockopt(zmq.RCVHWM, 16)
-            socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
             socket.bind(self._bind_address)
             self._endpoint = socket.getsockopt_string(zmq.LAST_ENDPOINT)
             self._ready.set()
@@ -361,7 +355,7 @@ def stream_sparse_delta_payloads_via_zmq(
     shard_rank: int,
     shard_count: int,
     partition: SparsePartitionMode = "chunks",
-) -> SparseDeltaStreamResult:
+) -> dict[str, int]:
     addresses = [address.strip() for address in refit_targets if address.strip()]
     if not addresses:
         raise ValueError("At least one ZeroMQ sparse refit address is required.")

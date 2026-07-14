@@ -21,6 +21,20 @@ from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
     validate_vllm_remote_sparse_refit,
 )
 
+_MODULE = "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer"
+
+
+@pytest.fixture
+def mock_ray():
+    with patch(f"{_MODULE}.ray") as value:
+        yield value
+
+
+@pytest.fixture
+def post():
+    with patch(f"{_MODULE}.post_vllm_refit_endpoints") as value:
+        yield value
+
 
 def _remote_sparse_sync(
     mock_ray: MagicMock,
@@ -50,10 +64,7 @@ def _remote_sparse_sync(
     mock_ray.get.side_effect = get_results
 
     sync = VllmRemoteSparseWeightSynchronizer(policy, generation, transport=transport)
-    with patch(
-        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer."
-        "prepare_vllm_sparse_refit_urls"
-    ):
+    with patch(f"{_MODULE}.post_vllm_refit_endpoints"):
         sync.init_communicator()
     return sync, policy, generation
 
@@ -101,12 +112,7 @@ def test_validate_remote_sparse_refit_rejects_unsupported_scope(change, kwargs):
 
 
 class TestVllmRemoteSparseWeightSynchronizer:
-    @patch(
-        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer."
-        "prepare_vllm_sparse_refit_urls"
-    )
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_init_communicator_joins_prelaunched_baseline(self, mock_ray, prepare):
+    def test_init_communicator_joins_prelaunched_baseline(self, mock_ray, post):
         baseline_ref = MagicMock()
         policy = MagicMock()
         generation = MagicMock()
@@ -126,10 +132,10 @@ class TestVllmRemoteSparseWeightSynchronizer:
 
         policy.worker_group.run_all_workers_multiple_data.assert_not_called()
         mock_ray.get.assert_any_call([baseline_ref])
-        prepare.assert_called_once_with(
-            ["http://receiver"],
-            {"weight": ((8,), "float32")},
-            api_key_env_var=None,
+        post.assert_called_once_with(
+            ["http://receiver/nemo-rl/refit/prepare"],
+            {"tensors": {"weight": [[8], "float32"]}},
+            api_key=None,
             timeout_s=600.0,
         )
         assert sync._baseline_init_refs == []
@@ -143,7 +149,6 @@ class TestVllmRemoteSparseWeightSynchronizer:
                 ]
             )
 
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
     def test_init_communicator_requires_receiver_endpoints(self, mock_ray):
         policy = MagicMock()
         policy.worker_group.workers = [object()]
@@ -157,7 +162,6 @@ class TestVllmRemoteSparseWeightSynchronizer:
         with pytest.raises(ValueError, match="endpoints are missing"):
             sync.init_communicator()
 
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
     def test_shutdown_cancels_pending_work_and_stops_zmq(self, mock_ray):
         policy = MagicMock()
         generation = MagicMock()
@@ -187,8 +191,7 @@ class TestVllmRemoteSparseWeightSynchronizer:
         assert sync._refit_urls == []
         assert sync._targets == []
 
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_fails_before_transfer_when_kv_cache_invalidation_fails(self, _mock_ray):
+    def test_fails_before_transfer_when_kv_cache_invalidation_fails(self, mock_ray):
         policy = MagicMock()
         generation = MagicMock()
         generation.invalidate_kv_cache.return_value = False
@@ -198,19 +201,15 @@ class TestVllmRemoteSparseWeightSynchronizer:
             sync.sync_weights()
         policy.worker_group.run_all_workers_multiple_data.assert_not_called()
 
-    @patch(
-        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
-    )
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
     def test_initializes_streams_commits_and_updates_baseline(
-        self, mock_ray, flush, capsys
+        self, mock_ray, post, capsys
     ):
         sync, policy, generation = _remote_sparse_sync(
             mock_ray,
             "zmq",
             [{"payloads": 3, "changed_elements": 3, "total_elements": 100}],
         )
-        flush.return_value = [
+        post.return_value = [
             {
                 "verification_candidates": 4,
                 "verification_samples": 4,
@@ -238,8 +237,11 @@ class TestVllmRemoteSparseWeightSynchronizer:
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             refit_urls=["http://receiver"],
         )
-        flush.assert_called_once_with(
-            ["http://receiver"], api_key_env_var=None, timeout_s=600.0
+        post.assert_called_once_with(
+            ["http://receiver/nemo-rl/refit/flush"],
+            {},
+            api_key=None,
+            timeout_s=600.0,
         )
         policy.worker_group.run_all_workers_single_data.assert_called_once_with(
             "finish_remote_sparse_delta_sync", succeeded=True
@@ -258,17 +260,13 @@ class TestVllmRemoteSparseWeightSynchronizer:
         assert metrics["transfer/payloads"] == 3.0
         assert not sync.is_stale
 
-    @patch(
-        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
-    )
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_sample_mismatch_does_not_commit_baseline(self, mock_ray, flush):
+    def test_sample_mismatch_does_not_commit_baseline(self, mock_ray, post):
         sync, policy, _ = _remote_sparse_sync(
             mock_ray,
             "zmq",
             [{"payloads": 3, "changed_elements": 3, "total_elements": 100}],
         )
-        flush.return_value = [
+        post.return_value = [
             {
                 "verification_samples": 4,
                 "verification_mismatches": 1,
@@ -284,13 +282,7 @@ class TestVllmRemoteSparseWeightSynchronizer:
             "finish_remote_sparse_delta_sync", succeeded=False
         )
 
-    @patch(
-        "nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.flush_vllm_refit_urls"
-    )
-    @patch("nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer.ray")
-    def test_failure_drains_receivers_without_committing_baseline(
-        self, mock_ray, flush
-    ):
+    def test_failure_drains_receivers_without_committing_baseline(self, mock_ray, post):
         sync, policy, _ = _remote_sparse_sync(
             mock_ray, "s3", RuntimeError("stream failed")
         )
@@ -298,8 +290,11 @@ class TestVllmRemoteSparseWeightSynchronizer:
         with pytest.raises(RuntimeError, match="stream failed"):
             sync.sync_weights()
 
-        flush.assert_called_once_with(
-            ["http://receiver"], api_key_env_var=None, timeout_s=60.0
+        post.assert_called_once_with(
+            ["http://receiver/nemo-rl/refit/flush"],
+            {},
+            api_key=None,
+            timeout_s=60.0,
         )
         policy.worker_group.run_all_workers_single_data.assert_called_once_with(
             "finish_remote_sparse_delta_sync", succeeded=False

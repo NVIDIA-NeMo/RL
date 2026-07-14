@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare measured sparse refit with NCCL projected from H100 IB to Ethernet."""
+"""Compare measured zstd sparse refit with NCCL projected to Ethernet."""
 
 import argparse
 import json
@@ -22,33 +22,30 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 Transport = Literal["s3", "zmq"]
-Compression = Literal["raw", "zstd"]
 
 _REFERENCE_IB_GBPS = 400.0
 _DENSITIES = (3.0, 5.0)
 _SPARSE_SIZE_RANGE_GB = (63.2, 1121.0)
-# Each pair is (fixed seconds, seconds per 1,000 GB) at 3% and 5%.
+# Each pair is (fixed seconds, seconds per 1,000 GB) at 3% and 5% changed.
 _SPARSE_LATENCY_FITS: dict[
-    tuple[Transport, Compression], tuple[tuple[float, float], tuple[float, float]]
+    Transport, tuple[tuple[float, float], tuple[float, float]]
 ] = {
-    ("s3", "raw"): ((2.370, 116.138), (2.646, 183.431)),
-    ("s3", "zstd"): ((0.677, 84.672), (3.741, 145.597)),
-    ("zmq", "raw"): ((0.000, 264.753), (0.000, 428.008)),
-    ("zmq", "zstd"): ((5.813, 73.257), (0.000, 169.991)),
+    "s3": ((2.271898, 90.539029), (9.132526, 164.284601)),
+    "zmq": ((5.290113, 78.016171), (10.586558, 124.416925)),
 }
+# Unique compressed wire GB per 1,000 GB of indexed BF16 weights at 3% and 5%.
+_SPARSE_WIRE_GB_PER_TB = (22.430807, 37.362273)
 _NCCL_ANCHORS = (
     (63.2, 0.84, 1.60),
     (247.2, 1.46, 1.74),
     (470.2, 2.31, 2.73),
     (1342.0, 3.27, 3.46),
 )
-_WIRE_MULTIPLIER: dict[Compression, float] = {"raw": 2.0, "zstd": 0.747}
 
 
 @dataclass(frozen=True)
 class Estimate:
     transport: Transport
-    compression: Compression
     model_size_gb: float
     changed_pct: float
     sparse_seconds: float
@@ -68,16 +65,24 @@ def predict_sparse_seconds(
     changed_pct: float,
     *,
     transport: Transport,
-    compression: Compression,
 ) -> float:
     """Evaluate the campaign fit at any positive changed density."""
     if model_size_gb <= 0 or changed_pct <= 0:
         raise ValueError("model_size_gb and changed_pct must be positive")
     size_tb = model_size_gb / 1000.0
-    (a3, b3), (a5, b5) = _SPARSE_LATENCY_FITS[(transport, compression)]
+    (a3, b3), (a5, b5) = _SPARSE_LATENCY_FITS[transport]
     latency_3, latency_5 = a3 + b3 * size_tb, a5 + b5 * size_tb
     exponent = math.log(latency_5 / latency_3) / math.log(5.0 / 3.0)
     return latency_3 * (changed_pct / 3.0) ** exponent
+
+
+def predict_sparse_wire_gb(model_size_gb: float, changed_pct: float) -> float:
+    """Scale the measured zstd wire fit to model size and changed density."""
+    if model_size_gb <= 0 or changed_pct <= 0:
+        raise ValueError("model_size_gb and changed_pct must be positive")
+    wire_3, wire_5 = _SPARSE_WIRE_GB_PER_TB
+    exponent = math.log(wire_5 / wire_3) / math.log(5.0 / 3.0)
+    return model_size_gb / 1000.0 * wire_3 * (changed_pct / 3.0) ** exponent
 
 
 def _nccl_reference(model_size_gb: float) -> tuple[float, float]:
@@ -95,7 +100,6 @@ def estimate(
     model_size_gb: float,
     changed_pct: float,
     transport: Transport,
-    compression: Compression = "zstd",
     candidate_ethernet_gbps: float | None = None,
 ) -> Estimate:
     """Estimate sparse latency and the NCCL-over-Ethernet crossover."""
@@ -105,7 +109,6 @@ def estimate(
         model_size_gb,
         changed_pct,
         transport=transport,
-        compression=compression,
     )
     nccl_low, nccl_high = _nccl_reference(model_size_gb)
     crossover_low = _REFERENCE_IB_GBPS * nccl_low / sparse_seconds
@@ -129,11 +132,10 @@ def estimate(
 
     return Estimate(
         transport,
-        compression,
         model_size_gb,
         changed_pct,
         sparse_seconds,
-        model_size_gb * changed_pct / 100 * _WIRE_MULTIPLIER[compression],
+        predict_sparse_wire_gb(model_size_gb, changed_pct),
         nccl_low,
         nccl_high,
         candidate_ethernet_gbps,
@@ -160,7 +162,7 @@ def _print_results(results: list[Estimate]) -> None:
     first = results[0]
     print(
         f"Model: {first.model_size_gb:g} GB indexed BF16; "
-        f"changed: {first.changed_pct:g}%; compression: {first.compression}"
+        f"changed: {first.changed_pct:g}%; compression: zstd"
     )
     print(
         "Measured NCCL on 400 Gbps/rank H100 IB: "
@@ -204,7 +206,6 @@ def main() -> None:
         "--changed-pct", "--sparsity-pct", type=_positive, required=True
     )
     parser.add_argument("--transport", choices=("all", "s3", "zmq"), default="all")
-    parser.add_argument("--compression", choices=("raw", "zstd"), default="zstd")
     parser.add_argument("--candidate-ethernet-gbps", type=_positive)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -216,7 +217,6 @@ def main() -> None:
             model_size_gb=args.model_size_gb,
             changed_pct=args.changed_pct,
             transport=transport,
-            compression=args.compression,
             candidate_ethernet_gbps=args.candidate_ethernet_gbps,
         )
         for transport in transports

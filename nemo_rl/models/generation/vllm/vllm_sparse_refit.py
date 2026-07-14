@@ -202,7 +202,7 @@ class VllmSparseRefitReceiver:
                 self._submit_pending_sparse_payloads()
         return response
 
-    def _submit_pending_sparse_payloads(self) -> Future[dict[str, Any]]:
+    def _submit_pending_sparse_payloads(self) -> None:
         payloads = tuple(self._refit_apply_pending_payloads)
         self._refit_apply_pending_payloads.clear()
         apply = (
@@ -213,7 +213,6 @@ class VllmSparseRefitReceiver:
         future = self._refit_apply_executor.submit(cast(Any, apply), payloads)
         self._refit_apply_futures.append(future)
         future.add_done_callback(self._notify_refit_apply_waiters)
-        return future
 
     def _notify_refit_apply_waiters(self, _future: Future[dict[str, Any]]) -> None:
         with self._refit_apply_queue_condition:
@@ -306,7 +305,7 @@ class VllmSparseRefitReceiver:
             try:
                 response = self._refit_collective_response(
                     self._refit_collective_rpc(
-                        "update_weights_from_decoded_sparse_payload_files",
+                        "update_weights_from_decoded_sparse_payload",
                         tuple(payload.path for payload in staged),
                     )
                 )

@@ -162,7 +162,7 @@ def test_sparse_refit_queue_stages_payload_before_batch_is_full(
 
     assert not list(tmp_path.iterdir())
     assert receiver._worker.llm.collective_rpc.call_args_list[0].args[0] == (
-        "update_weights_from_decoded_sparse_payload_files"
+        "update_weights_from_decoded_sparse_payload"
     )
 
 
@@ -262,7 +262,7 @@ def test_sparse_refit_batch_decodes_once_before_collective_apply(
         staged_locations: list[int] = []
 
         def collective_rpc(method: str, args: tuple[Any, ...]) -> list[Any]:
-            assert method == "update_weights_from_decoded_sparse_payload_files"
+            assert method == "update_weights_from_decoded_sparse_payload"
             for path in args:
                 staged_locations.extend(
                     int(location)
@@ -292,8 +292,8 @@ def test_sparse_refit_batch_decodes_once_before_collective_apply(
         assert [
             item.args[0] for item in receiver._worker.llm.collective_rpc.call_args_list
         ] == [
-            "update_weights_from_decoded_sparse_payload_files",
-            "update_weights_from_decoded_sparse_payload_files",
+            "update_weights_from_decoded_sparse_payload",
+            "update_weights_from_decoded_sparse_payload",
         ]
         assert response["payloads"] == 1
         assert response["receiver_worker_total_s"] == 1.0
@@ -307,7 +307,7 @@ def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) 
 
         def collective_rpc(method: str, args: tuple[Any, ...]) -> list[Any]:
             nonlocal staged_paths
-            if method == "update_weights_from_decoded_sparse_payload_files":
+            if method == "update_weights_from_decoded_sparse_payload":
                 staged_paths = args
                 raise RuntimeError("apply failed")
             assert method == "synchronize_device"
@@ -326,7 +326,7 @@ def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) 
             entry.args[0]
             for entry in receiver._worker.llm.collective_rpc.call_args_list
         ] == [
-            "update_weights_from_decoded_sparse_payload_files",
+            "update_weights_from_decoded_sparse_payload",
             "synchronize_device",
         ]
         assert not list(tmp_path.iterdir())
@@ -366,7 +366,7 @@ async def test_async_sparse_refit_batch_bridges_to_async_collective(
             async def collective_rpc(
                 self, method: str, args: tuple[Any, ...]
             ) -> list[Any]:
-                assert method == "update_weights_from_decoded_sparse_payload_files"
+                assert method == "update_weights_from_decoded_sparse_payload"
                 for path in args:
                     staged_locations.extend(
                         location

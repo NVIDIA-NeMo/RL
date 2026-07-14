@@ -43,12 +43,8 @@ class _AutoMapping:
         return self.parallelism
 
 
-class _ColumnMapping(_AutoMapping):
-    pass
-
-
-class _DirectMapping(_AutoMapping):
-    pass
+_ColumnMapping = type("_ColumnMapping", (_AutoMapping,), {})
+_DirectMapping = type("_DirectMapping", (_AutoMapping,), {})
 
 
 class _GatedMapping(_AutoMapping):
@@ -56,12 +52,8 @@ class _GatedMapping(_AutoMapping):
         super().__init__({"gate": gate, "up": up})
 
 
-class _RowMapping(_AutoMapping):
-    pass
-
-
-class _ReplicatedMapping(_AutoMapping):
-    pass
+_RowMapping = type("_RowMapping", (_AutoMapping,), {})
+_ReplicatedMapping = type("_ReplicatedMapping", (_AutoMapping,), {})
 
 
 def _install_mapping_types(monkeypatch, remote_refit_type):
@@ -73,7 +65,7 @@ def _install_mapping_types(monkeypatch, remote_refit_type):
                 _AutoMapping,
                 {
                     _ColumnMapping: megatron_remote_sparse_refit._COLUMN,
-                    _DirectMapping: megatron_remote_sparse_refit._DIRECT,
+                    _DirectMapping: megatron_remote_sparse_refit._REPLICATED,
                     _GatedMapping: megatron_remote_sparse_refit._GATED,
                     _ReplicatedMapping: megatron_remote_sparse_refit._REPLICATED,
                     _RowMapping: megatron_remote_sparse_refit._ROW,
@@ -205,70 +197,58 @@ def test_remote_sparse_globalizes_expert_name():
 
 def test_remote_sparse_projects_bridge_affine_mappings(monkeypatch):
     _install_mapping_types(monkeypatch, MegatronRemoteSparseRefit)
-
-    def task(mapping, module_name, tensor, global_name):
-        module = type(module_name, (torch.nn.Module,), {})()
-        return SimpleNamespace(
+    cases = (
+        (
+            _AutoMapping("backbone.layers.0.mixer.D"),
+            torch.arange(8).view(4, 2),
+            "decoder.layers.0.mixer.D",
+            megatron_remote_sparse_refit._COLUMN,
+            ("backbone.layers.0.mixer.D", (8, 2), 0, 4),
+        ),
+        (
+            _AutoMapping("backbone.layers.0.mixer.o_proj.weight", parallelism="row"),
+            torch.arange(8).view(2, 4),
+            "decoder.layers.0.self_attention.linear_proj.weight",
+            megatron_remote_sparse_refit._ROW,
+            ("backbone.layers.0.mixer.o_proj.weight", (2, 8), 1, 4),
+        ),
+        (
+            _AutoMapping("backbone.layers.0.norm.weight", parallelism="replicated"),
+            torch.arange(4),
+            "decoder.layers.0.input_layernorm.weight",
+            megatron_remote_sparse_refit._REPLICATED,
+            ("backbone.layers.0.norm.weight", (4,), None, 0),
+        ),
+    )
+    for mapping, tensor, global_name, kind, expected in cases:
+        mapping.tp_size = 2
+        mapping.tp_rank = 1
+        task = SimpleNamespace(
             mapping=mapping,
-            megatron_module=module,
+            megatron_module=torch.nn.Module(),
             param_weight=tensor,
             global_param_name=global_name,
         )
+        projection = MegatronRemoteSparseRefit._task_local_tensors(task, kind)[0][2]
+        assert (
+            projection.name,
+            projection.global_shape,
+            projection.shard_dim,
+            projection.offset,
+        ) == expected
 
-    column = task(
-        _AutoMapping("backbone.layers.0.mixer.D"),
-        "TEColumnParallelLinear",
-        torch.arange(8).view(4, 2),
-        "decoder.layers.0.mixer.D",
-    )
-    column.mapping.tp_size = 2
-    column.mapping.tp_rank = 1
-    row = task(
-        _AutoMapping("backbone.layers.0.mixer.o_proj.weight", parallelism="row"),
-        "TERowParallelLinear",
-        torch.arange(8).view(2, 4),
-        "decoder.layers.0.self_attention.linear_proj.weight",
-    )
-    row.mapping.tp_size = 2
-    row.mapping.tp_rank = 1
-    replicated = task(
-        _AutoMapping("backbone.layers.0.norm.weight", parallelism="replicated"),
-        "TENorm",
-        torch.arange(4),
-        "decoder.layers.0.input_layernorm.weight",
-    )
-    gated = task(
-        _GatedMapping(
+    gated = SimpleNamespace(
+        mapping=_GatedMapping(
             gate="model.mlp.gate_proj.weight",
             up="model.mlp.up_proj.weight",
         ),
-        "TEColumnParallelLinear",
-        torch.arange(16).view(8, 2),
-        "mlp.linear_fc1.weight",
+        megatron_module=torch.nn.Module(),
+        param_weight=torch.arange(16).view(8, 2),
+        global_param_name="mlp.linear_fc1.weight",
     )
-
-    column_projection = MegatronRemoteSparseRefit._task_local_tensors(
-        column, megatron_remote_sparse_refit._COLUMN
-    )[0][2]
-    row_projection = MegatronRemoteSparseRefit._task_local_tensors(
-        row, megatron_remote_sparse_refit._ROW
-    )[0][2]
-    replicated_projection = MegatronRemoteSparseRefit._task_local_tensors(
-        replicated, megatron_remote_sparse_refit._REPLICATED
-    )[0][2]
     gated_projections = MegatronRemoteSparseRefit._task_local_tensors(
         gated, megatron_remote_sparse_refit._GATED
     )
-
-    assert column_projection.name == "backbone.layers.0.mixer.D"
-    assert column_projection.global_shape == (8, 2)
-    assert column_projection.offsets == (4, 0)
-    assert row_projection.name == "backbone.layers.0.mixer.o_proj.weight"
-    assert row_projection.global_shape == (2, 8)
-    assert row_projection.offsets == (0, 4)
-    assert replicated_projection.name == "backbone.layers.0.norm.weight"
-    assert replicated_projection.global_shape == (4,)
-    assert replicated_projection.offsets == (0,)
     assert [projection.name for _, _, projection in gated_projections] == [
         "model.mlp.gate_proj.weight",
         "model.mlp.up_proj.weight",

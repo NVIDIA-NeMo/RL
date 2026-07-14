@@ -513,18 +513,10 @@ class VllmInternalWorkerExtension:
         return True
 
     def update_weights_from_decoded_sparse_payload(
-        self,
-        *serialized_payloads: bytes,
+        self, *payloads: bytes | str
     ) -> dict[str, Any]:
         applier = self._get_sparse_delta_applier()
-        return applier.update_weights_from_decoded_sparse_payload(*serialized_payloads)
-
-    def update_weights_from_decoded_sparse_payload_files(
-        self,
-        *payload_paths: str,
-    ) -> dict[str, Any]:
-        applier = self._get_sparse_delta_applier()
-        return applier.update_weights_from_decoded_sparse_payload_files(*payload_paths)
+        return applier.update_weights_from_decoded_sparse_payload(*payloads)
 
     def synchronize_device(self) -> None:
         self._get_sparse_delta_applier().synchronize_device()

@@ -24,7 +24,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 from urllib.parse import quote
 
 import requests
@@ -48,12 +48,6 @@ G_VLLM_REFIT_API_KEY_HEADER = "x-nemo-rl-refit-key"
 _CONTROL_SESSION_LOCAL = threading.local()
 _S3_PART_SIZE = 64 * 1024**2
 _S3_MEMORY_LIMIT = 2 * 1024**3
-
-
-class SparseDeltaStreamResult(TypedDict):
-    payloads: int
-    changed_elements: int
-    total_elements: int
 
 
 SparsePartitionMode = Literal["chunks", "names", "none"]
@@ -230,9 +224,11 @@ def vllm_refit_endpoints(base_urls: Sequence[str], path: str) -> list[str]:
 def _partition_sparse_weights_by_name(
     tensors: Iterable[NamedTensor], shard_rank: int, shard_count: int
 ) -> Iterator[NamedTensor]:
-    for name, tensor in tensors:
-        if sparse_name_shard(name, shard_count) == shard_rank:
-            yield name, tensor
+    return (
+        (name, tensor)
+        for name, tensor in tensors
+        if sparse_name_shard(name, shard_count) == shard_rank
+    )
 
 
 def refit_http_session() -> requests.Session:
@@ -336,7 +332,7 @@ def stream_sparse_delta_payloads(
     shard_rank: int,
     shard_count: int,
     partition: SparsePartitionMode = "chunks",
-) -> SparseDeltaStreamResult:
+) -> dict[str, int]:
     if partition == "names":
         iterator = _partition_sparse_weights_by_name(iterator, shard_rank, shard_count)
     prefix = transport.upper()
@@ -408,29 +404,28 @@ def stream_sparse_delta_payloads(
     }
     chunk_count = 0
     export_pull_s = 0.0
-    encode_inflight: set[Any] = set()
+    encode_inflight: dict[Any, None] = {}
     serialize_inflight: dict[Any, int] = {}
-    transfer_inflight: set[Any] = set()
-    worker_errors: list[Exception] = []
+    transfer_inflight: dict[Any, None] = {}
     max_encode_inflight = encode_workers * 2
     max_serialize_inflight = serialize_workers * 2
     max_transfer_inflight = transfer_workers * 2
     bucket = _SparsePayloadBucket([])
 
-    def collect_transfers(*, block: bool) -> None:
-        if not transfer_inflight:
+    def resolved(inflight: dict[Any, Any], *, block: bool) -> Iterator[tuple[Any, Any]]:
+        if not inflight:
             return
-        if block:
-            completed, _ = wait(transfer_inflight, return_when=FIRST_COMPLETED)
-        else:
-            completed = {future for future in transfer_inflight if future.done()}
+        completed = (
+            wait(inflight, return_when=FIRST_COMPLETED)[0]
+            if block
+            else tuple(future for future in inflight if future.done())
+        )
         for future in completed:
-            transfer_inflight.remove(future)
-            try:
-                result = future.result()
-            except Exception as error:
-                worker_errors.append(error)
-                continue
+            metadata = inflight.pop(future)
+            yield metadata, future.result()
+
+    def collect_transfers(*, block: bool) -> None:
+        for _, result in resolved(transfer_inflight, block=block):
             counts["payloads"] += 1
             counts["wire_bytes"] += int(result["body_size"])
             for key, value in result.items():
@@ -441,24 +436,12 @@ def stream_sparse_delta_payloads(
             )
 
     def collect_serialized(*, block: bool) -> None:
-        if not serialize_inflight:
-            return
-        if block:
-            completed, _ = wait(serialize_inflight, return_when=FIRST_COMPLETED)
-        else:
-            completed = {future for future in serialize_inflight if future.done()}
-        for future in completed:
-            index = serialize_inflight.pop(future)
-            try:
-                encoded = future.result()
-            except Exception as error:
-                worker_errors.append(error)
-                continue
+        for index, encoded in resolved(serialize_inflight, block=block):
             while len(transfer_inflight) >= max_transfer_inflight:
                 collect_transfers(block=True)
-            transfer_inflight.add(
+            transfer_inflight[
                 transfer_executor.submit(transfer_payload, encoded, index)
-            )
+            ] = None
         collect_transfers(block=False)
 
     def submit_bucket() -> None:
@@ -496,13 +479,8 @@ def stream_sparse_delta_payloads(
             submit_bucket()
 
     def drain_encodes() -> None:
-        completed, _ = wait(encode_inflight, return_when=FIRST_COMPLETED)
-        for future in completed:
-            encode_inflight.remove(future)
-            try:
-                consume_encoded(future.result())
-            except Exception as error:
-                worker_errors.append(error)
+        for _, encoded in resolved(encode_inflight, block=True):
+            consume_encoded(encoded)
 
     stream_start = time.perf_counter()
     try:
@@ -515,7 +493,7 @@ def stream_sparse_delta_payloads(
                 continue
             while len(encode_inflight) >= max_encode_inflight:
                 drain_encodes()
-            encode_inflight.add(encode_executor.submit(encode_chunk, chunk))
+            encode_inflight[encode_executor.submit(encode_chunk, chunk)] = None
 
         while encode_inflight:
             drain_encodes()
@@ -524,8 +502,6 @@ def stream_sparse_delta_payloads(
             collect_serialized(block=True)
         while transfer_inflight:
             collect_transfers(block=True)
-        if worker_errors:
-            raise worker_errors[0]
     except Exception:
         for futures in (encode_inflight, serialize_inflight, transfer_inflight):
             for future in futures:
@@ -576,7 +552,7 @@ def stream_sparse_delta_payloads_via_s3_manifest(
     shard_rank: int,
     shard_count: int,
     partition: SparsePartitionMode = "chunks",
-) -> SparseDeltaStreamResult:
+) -> dict[str, int]:
     urls = [url.strip().rstrip("/") for url in refit_targets if url.strip()]
     if not urls:
         raise ValueError("At least one vLLM S3 refit URL is required.")
@@ -668,51 +644,16 @@ def post_vllm_refit_endpoints(
         return result
 
     pool = executor or _executor("refit-fanout", len(endpoint_urls))
-    futures = [pool.submit(post, url) for url in endpoint_urls]
-    return [future.result() for future in futures]
-
-
-def flush_vllm_refit_urls(
-    base_urls: Sequence[str],
-    *,
-    api_key_env_var: str | None,
-    timeout_s: float,
-) -> list[dict[str, Any]]:
-    return post_vllm_refit_endpoints(
-        vllm_refit_endpoints(base_urls, G_VLLM_REFIT_FLUSH_PATH),
-        {},
-        api_key=vllm_refit_api_key(api_key_env_var),
-        timeout_s=timeout_s,
-    )
-
-
-def prepare_vllm_sparse_refit_urls(
-    base_urls: Sequence[str],
-    state_dict_info: Mapping[str, tuple[tuple[int, ...], torch.dtype]],
-    *,
-    api_key_env_var: str | None,
-    timeout_s: float,
-) -> list[dict[str, Any]]:
-    tensors = {
-        name: [list(shape), str(dtype).removeprefix("torch.")]
-        for name, (shape, dtype) in state_dict_info.items()
-    }
-    return post_vllm_refit_endpoints(
-        vllm_refit_endpoints(base_urls, G_VLLM_REFIT_PREPARE_PATH),
-        {"tensors": tensors},
-        api_key=vllm_refit_api_key(api_key_env_var),
-        timeout_s=timeout_s,
-    )
+    return list(pool.map(post, endpoint_urls))
 
 
 def download_s3_refit_payload(
     manifest: Mapping[str, Any],
 ) -> bytes:
-    bucket, region, key, checksum = (
-        str(manifest[field]) for field in ("bucket", "region", "key", "checksum")
+    body = _get_manifest_s3_store(str(manifest["bucket"]), str(manifest["region"])).get(
+        str(manifest["key"])
     )
-    body = _get_manifest_s3_store(bucket, region).get(key)
-    return decode_sparse_payload(body, checksum)
+    return decode_sparse_payload(body, str(manifest["checksum"]))
 
 
 def merge_vllm_refit_metrics(

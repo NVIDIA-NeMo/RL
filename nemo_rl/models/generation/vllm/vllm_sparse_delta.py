@@ -26,19 +26,25 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from nemo_rl.utils import weight_transfer_sparse_codec as sparse_codec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
+_TensorViewKey = tuple[int, int, tuple[int, ...], tuple[int, ...]]
+_LoaderWeight = tuple[str, torch.Tensor, sparse_codec.SparseOperation, int, int | None]
+
 
 def _storage_key(tensor: torch.Tensor) -> int:
     return tensor.untyped_storage()._cdata
 
 
-def _integer_view(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.view(
-        sparse_codec.integer_dtype_for_element_size(tensor.element_size())
+def _view_key(tensor: torch.Tensor) -> _TensorViewKey:
+    return (
+        _storage_key(tensor),
+        int(tensor.storage_offset()),
+        tuple(map(int, tensor.shape)),
+        tuple(map(int, tensor.stride())),
     )
 
 
 class _SparseWeightLoadMode(TorchDispatchMode):
-    """Turn native loader copies into sparse XOR or transactional overwrite."""
+    """Turn native loader copies into sparse XOR or overwrite."""
 
     def __init__(
         self,
@@ -52,13 +58,9 @@ class _SparseWeightLoadMode(TorchDispatchMode):
         self._operation: sparse_codec.SparseOperation = "overwrite"
         self._sample_limit = 0
         self._exact_sentinel: int | None = None
-        self._backups: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        self._active_masks: dict[
-            tuple[int, int, tuple[int, ...], tuple[int, ...]], torch.Tensor
-        ] = {}
+        self._active_masks: dict[_TensorViewKey, torch.Tensor] = {}
         self._verification_masks: dict[
-            tuple[int, int, tuple[int, ...], tuple[int, ...]],
-            tuple[torch.Tensor, torch.Tensor],
+            _TensorViewKey, tuple[torch.Tensor, torch.Tensor]
         ] = {}
         self._xor_spans: dict[int, list[tuple[int, int]]] = {}
         self.copies = 0
@@ -70,8 +72,6 @@ class _SparseWeightLoadMode(TorchDispatchMode):
         sample_limit: int,
         exact_sentinel: int | None,
     ) -> None:
-        if self._backups:
-            raise RuntimeError("Previous sparse native-loader item was not finished.")
         self._source_storage = _storage_key(source)
         self._operation = operation
         self._sample_limit = sample_limit
@@ -81,25 +81,12 @@ class _SparseWeightLoadMode(TorchDispatchMode):
         self._xor_spans.clear()
         self.copies = 0
 
-    def _overwrite_changed(
-        self,
-        destination: torch.Tensor,
-        changed: torch.Tensor,
-        values: torch.Tensor,
-    ) -> None:
-        backup = destination.masked_select(changed)
-        self._backups.append((destination, changed, backup))
-        destination.masked_scatter_(changed, values.to(destination.dtype))
-
     def _remember_changed(
         self, destination: torch.Tensor, changed: torch.Tensor
     ) -> None:
-        view_key = (
-            _storage_key(destination),
-            int(destination.storage_offset()),
-            tuple(int(size) for size in destination.shape),
-            tuple(int(stride) for stride in destination.stride()),
-        )
+        if self._sample_limit <= 0:
+            return
+        view_key = _view_key(destination)
         previous = self._verification_masks.get(view_key)
         if previous is not None:
             changed = previous[1] | changed
@@ -124,12 +111,7 @@ class _SparseWeightLoadMode(TorchDispatchMode):
             if not source.dtype.is_floating_point:
                 raise RuntimeError("Sparse overwrite requires a floating-point loader.")
             source = source.expand_as(destination)
-            view_key = (
-                _storage_key(destination),
-                int(destination.storage_offset()),
-                tuple(int(size) for size in destination.shape),
-                tuple(int(stride) for stride in destination.stride()),
-            )
+            view_key = _view_key(destination)
             if self._exact_sentinel is not None:
                 if (
                     _storage_key(source) != self._source_storage
@@ -138,13 +120,11 @@ class _SparseWeightLoadMode(TorchDispatchMode):
                     raise RuntimeError(
                         "Exact FP8 overwrite cannot pass through a transforming loader."
                     )
-                source_bits = _integer_view(source)
+                source_bits = sparse_codec.integer_view(source)
                 changed = source_bits.ne(self._exact_sentinel)
-                destination_bits = _integer_view(destination)
-                self._overwrite_changed(
-                    destination_bits,
-                    changed,
-                    source_bits.masked_select(changed),
+                destination_bits = sparse_codec.integer_view(destination)
+                destination_bits.masked_scatter_(
+                    changed, source_bits.masked_select(changed)
                 )
                 self._remember_changed(destination, changed)
                 return destination
@@ -152,10 +132,8 @@ class _SparseWeightLoadMode(TorchDispatchMode):
             if changed is None or _storage_key(source) == self._source_storage:
                 changed = ~torch.isnan(source)
                 self._active_masks[view_key] = changed
-            self._overwrite_changed(
-                destination,
-                changed,
-                source.masked_select(changed),
+            destination.masked_scatter_(
+                changed, source.masked_select(changed).to(destination.dtype)
             )
             self._remember_changed(destination, changed)
             return destination
@@ -182,41 +160,31 @@ class _SparseWeightLoadMode(TorchDispatchMode):
         if any(span[0] <= other[1] and other[0] <= span[1] for other in spans):
             raise RuntimeError("XOR native loader produced overlapping target copies.")
         spans.append(span)
-        destination_bits = _integer_view(destination)
-        source_bits = _integer_view(source)
+        destination_bits = sparse_codec.integer_view(destination)
+        source_bits = sparse_codec.integer_view(source)
         changed = source_bits.ne(0)
         values = destination_bits.masked_select(changed).bitwise_xor(
             source_bits.masked_select(changed)
         )
-        self._overwrite_changed(destination_bits, changed, values)
+        destination_bits.masked_scatter_(changed, values)
         self._remember_changed(destination, changed)
         return destination
 
-    def _record(self, target: torch.Tensor, changed: torch.Tensor) -> None:
-        if self._sample_limit <= 0 or not target.is_contiguous():
-            return
-        locations = changed.reshape(-1).nonzero().reshape(-1)[: self._sample_limit]
-        if not locations.numel():
-            return
-        target_bits = _integer_view(target).reshape(-1)
-        self._verification.append(
-            (target, locations, target_bits.index_select(0, locations).clone())
-        )
-        self._sample_limit -= locations.numel()
-
     @torch.no_grad()
     def finish(self) -> None:
-        """Commit the sparse copies after the loader finishes all transforms."""
-        for destination, changed in self._verification_masks.values():
-            self._record(destination, changed)
-        self._backups.clear()
-        self._verification_masks.clear()
-
-    @torch.no_grad()
-    def rollback(self) -> None:
-        for destination, changed, backup in reversed(self._backups):
-            destination.masked_scatter_(changed, backup)
-        self._backups.clear()
+        """Record bounded target samples after the loader finishes transforms."""
+        for target, changed in self._verification_masks.values():
+            if self._sample_limit <= 0:
+                break
+            if not target.is_contiguous():
+                continue
+            locations = changed.reshape(-1).nonzero().reshape(-1)[: self._sample_limit]
+            if locations.numel():
+                target_bits = sparse_codec.integer_view(target).reshape(-1)
+                self._verification.append(
+                    (target, locations, target_bits.index_select(0, locations).clone())
+                )
+                self._sample_limit -= locations.numel()
         self._verification_masks.clear()
 
 
@@ -231,10 +199,8 @@ class VllmSparseDeltaApplier:
             _storage_key(tensor) for tensor in (*model.parameters(), *model.buffers())
         }
         self._scratch = torch.empty(0, dtype=torch.uint8, device=device)
-        self._classified_names: set[str] = set()
         self._skipped_names: set[str] = set()
         self._verification: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        self._verification_candidates = 0
 
     def prewarm(
         self, state_dict_info: Mapping[str, tuple[tuple[int, ...], torch.dtype]]
@@ -256,61 +222,30 @@ class VllmSparseDeltaApplier:
         pending = [
             (name, shape, dtype)
             for name, (shape, dtype) in state_dict_info.items()
-            if name not in self._classified_names and dtype.is_floating_point
+            if dtype.is_floating_point
         ]
         if not pending:
             return
 
-        mode = _SparseWeightLoadMode(self._target_storages, [])
-        observations: list[tuple[str, int]] = []
-
-        def weights() -> Iterator[tuple[str, torch.Tensor]]:
-            active_name = None
+        def weights() -> Iterator[_LoaderWeight]:
             for name, shape, dtype in pending:
-                if active_name is not None:
-                    mode.finish()
-                    observations.append((active_name, mode.copies))
                 source = self._source_tensor(
-                    {
-                        "name": name,
-                        "shape": shape,
-                        "dtype": str(dtype).removeprefix("torch."),
-                    }
+                    {"shape": shape, "dtype": str(dtype).removeprefix("torch.")}
                 )
                 source.fill_(float("nan"))
                 exact_sentinel = (
-                    int(_integer_view(source).reshape(-1)[0].item())
+                    int(sparse_codec.integer_view(source).reshape(-1)[0].item())
                     if source.element_size() == 1
                     else None
                 )
-                mode.start(source, "overwrite", 0, exact_sentinel)
-                active_name = name
-                yield name, source
-            if active_name is not None:
-                mode.finish()
-                observations.append((active_name, mode.copies))
+                yield name, source, "overwrite", 0, exact_sentinel
 
-        loader_weights = weights()
-        try:
-            with torch.no_grad(), mode:
-                loaded = self.model_runner.model.load_weights(loader_weights)
-        except Exception:
-            mode.rollback()
-            raise
-        finally:
-            loader_weights.close()
-
+        loaded, observations = self._load_weights(weights(), [])
         if len(observations) != len(pending):
             raise RuntimeError(
                 "Native loader did not consume all sparse weight metadata."
             )
-        copied = sum(copies > 0 for _, copies in observations)
-        if loaded is not None and len(loaded) > copied:
-            raise RuntimeError(
-                "Native loader reported a loaded sparse weight without a "
-                "supported target copy."
-            )
-        self._classified_names.update(name for name, _ in observations)
+        self._validate_loader_report(loaded, observations, allow_unknown_skips=True)
         if loaded is not None:
             self._skipped_names.update(
                 name for name, copies in observations if copies == 0
@@ -321,7 +256,9 @@ class VllmSparseDeltaApplier:
         dtype = sparse_codec.dtype_from_name(str(item["dtype"]))
         byte_count = prod(shape) * dtype.itemsize
         if byte_count > self._scratch.numel():
-            self.prewarm({str(item["name"]): (shape, dtype)})
+            self._scratch = torch.empty(
+                byte_count, dtype=torch.uint8, device=self._scratch.device
+            )
         return self._scratch[:byte_count].view(dtype).view(shape)
 
     @staticmethod
@@ -331,7 +268,7 @@ class VllmSparseDeltaApplier:
         locations: torch.Tensor,
         values: torch.Tensor,
     ) -> None:
-        source_bits = _integer_view(source).reshape(-1)
+        source_bits = sparse_codec.integer_view(source).reshape(-1)
         expected_dtype = sparse_codec.integer_dtype_for_element_size(
             source.element_size()
         )
@@ -356,8 +293,7 @@ class VllmSparseDeltaApplier:
         item: dict[str, Any],
         locations: torch.Tensor,
         values: torch.Tensor,
-        mode: _SparseWeightLoadMode,
-    ) -> tuple[str, torch.Tensor]:
+    ) -> _LoaderWeight:
         operation = sparse_codec.sparse_operation(item["operation"])
         source = self._source_tensor(item)
         exact_sentinel = None
@@ -368,7 +304,7 @@ class VllmSparseDeltaApplier:
         else:
             source.fill_(float("nan"))
             if source.element_size() == 1:
-                source_bits = _integer_view(source)
+                source_bits = sparse_codec.integer_view(source)
                 exact_sentinel = int(source_bits.reshape(-1)[0].item())
                 if bool(values.eq(exact_sentinel).any()):
                     exact_sentinel ^= 0x80
@@ -379,91 +315,99 @@ class VllmSparseDeltaApplier:
                     source_bits.fill_(exact_sentinel)
         self._scatter_values(source, item, locations, values)
 
-        sample_limit = int(item.get("verification_samples", 0))
-        self._verification_candidates += sample_limit
-        mode.start(
+        return (
+            str(item["name"]),
             source,
             operation,
-            sample_limit,
+            int(item.get("verification_samples", 0)),
             exact_sentinel,
         )
-        return str(item["name"]), source
+
+    def _load_weights(
+        self,
+        weights: Iterable[_LoaderWeight],
+        verification: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> tuple[Any, list[tuple[str, int]]]:
+        mode = _SparseWeightLoadMode(self._target_storages, verification)
+        yielded_names: list[str] = []
+        observations: list[tuple[str, int]] = []
+
+        def observed_weights() -> Iterator[tuple[str, torch.Tensor]]:
+            active = False
+            for name, source, operation, sample_limit, exact_sentinel in weights:
+                if active:
+                    mode.finish()
+                    observations.append((yielded_names[-1], mode.copies))
+                mode.start(source, operation, sample_limit, exact_sentinel)
+                active = True
+                yielded_names.append(name)
+                yield name, source
+            if active:
+                mode.finish()
+                observations.append((yielded_names[-1], mode.copies))
+
+        with torch.no_grad(), mode:
+            loaded = self.model_runner.model.load_weights(observed_weights())
+        if len(observations) != len(yielded_names):
+            raise RuntimeError("Native loader did not consume all sparse weights.")
+        return loaded, observations
+
+    @staticmethod
+    def _validate_loader_report(
+        loaded: Any,
+        observations: list[tuple[str, int]],
+        *,
+        allow_unknown_skips: bool,
+    ) -> None:
+        copied = sum(copies > 0 for _, copies in observations)
+        if loaded is None:
+            if not allow_unknown_skips and copied != len(observations):
+                raise RuntimeError(
+                    "Native loader did not report whether uncopied sparse weights "
+                    "were skipped."
+                )
+        elif len(loaded) > copied:
+            raise RuntimeError(
+                "Native loader reported a loaded sparse weight without a supported "
+                "target copy."
+            )
 
     def _apply_decoded_items(
         self,
         items: Iterable[tuple[dict[str, Any], torch.Tensor, torch.Tensor]],
     ) -> None:
-        mode = _SparseWeightLoadMode(self._target_storages, self._verification)
-        yielded_names: list[str] = []
-        copy_counts: list[int] = []
-
-        def weights() -> Iterator[tuple[str, torch.Tensor]]:
-            active = False
+        def weights() -> Iterator[_LoaderWeight]:
             for item, locations, values in items:
                 if str(item["name"]) in self._skipped_names:
                     continue
-                if active:
-                    mode.finish()
-                    copy_counts.append(mode.copies)
-                weight = self._prepare_loader_weight(item, locations, values, mode)
-                active = True
-                yielded_names.append(weight[0])
-                yield weight
-            if active:
-                mode.finish()
-                copy_counts.append(mode.copies)
+                yield self._prepare_loader_weight(item, locations, values)
 
-        loader_weights = weights()
-        try:
-            with torch.no_grad(), mode:
-                loaded = self.model_runner.model.load_weights(loader_weights)
-            if len(copy_counts) != len(yielded_names):
-                raise RuntimeError("Native loader did not consume all sparse weights.")
-            copied_items = sum(copies > 0 for copies in copy_counts)
-            if loaded is None and copied_items != len(yielded_names):
-                raise RuntimeError(
-                    "Native loader did not report whether uncopied sparse weights "
-                    "were skipped."
-                )
-            if loaded is not None and len(loaded) > copied_items:
-                raise RuntimeError(
-                    "Native loader reported a loaded sparse weight without a "
-                    "supported target copy."
-                )
-        except Exception:
-            mode.rollback()
-            raise
-        finally:
-            loader_weights.close()
-
-    def _apply_decoded_item(
-        self,
-        item: dict[str, Any],
-        locations: torch.Tensor,
-        values: torch.Tensor,
-    ) -> None:
-        self._apply_decoded_items(((item, locations, values),))
+        loaded, observations = self._load_weights(weights(), self._verification)
+        self._validate_loader_report(loaded, observations, allow_unknown_skips=False)
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_decoded_sparse_payload"
     )
     def update_weights_from_decoded_sparse_payload(
-        self, *serialized_payloads: bytes
+        self, *payloads: bytes | str
     ) -> dict[str, Any]:
         return self._load_decoded_sparse_payloads(
-            tuple(io.BytesIO(payload) for payload in serialized_payloads)
+            tuple(
+                io.BytesIO(payload) if isinstance(payload, bytes) else payload
+                for payload in payloads
+            )
         )
 
     def _load_decoded_sparse_payloads(
         self, sources: tuple[str | io.BytesIO, ...]
     ) -> dict[str, Any]:
         started = time.perf_counter()
-        deserialize_s = 0.0
-        payloads: list[sparse_codec.DecodedSparsePayload] = []
-        for source in sources:
-            item_started = time.perf_counter()
-            payloads.append(
-                cast(
+        deserialize_s = [0.0]
+
+        def decoded_items() -> Iterator[sparse_codec.DecodedSparseItem]:
+            for source in sources:
+                item_started = time.perf_counter()
+                payload = cast(
                     sparse_codec.DecodedSparsePayload,
                     torch.load(
                         source,
@@ -472,40 +416,18 @@ class VllmSparseDeltaApplier:
                         mmap=isinstance(source, str),
                     ),
                 )
-            )
-            deserialize_s += time.perf_counter() - item_started
+                deserialize_s[0] += time.perf_counter() - item_started
+                yield from sparse_codec.iter_decoded_sparse_payload(payload)
 
         item_started = time.perf_counter()
-        self.prewarm(
-            {
-                str(item["name"]): (
-                    tuple(item["shape"]),
-                    sparse_codec.dtype_from_name(str(item["dtype"])),
-                )
-                for _, _, items in payloads
-                for item in items
-            }
-        )
-        scratch_s = time.perf_counter() - item_started
-        item_started = time.perf_counter()
-        self._apply_decoded_items(
-            decoded_item
-            for payload in payloads
-            for decoded_item in sparse_codec.iter_decoded_sparse_payload(payload)
-        )
+        self._apply_decoded_items(decoded_items())
         sparse_apply_s = time.perf_counter() - item_started
         return {
             "ok": True,
-            "receiver_deserialize_s": deserialize_s,
-            "receiver_scratch_s": scratch_s,
+            "receiver_deserialize_s": deserialize_s[0],
             "receiver_sparse_apply_s": sparse_apply_s,
             "receiver_total_s": time.perf_counter() - started,
         }
-
-    def update_weights_from_decoded_sparse_payload_files(
-        self, *payload_paths: str
-    ) -> dict[str, Any]:
-        return self._load_decoded_sparse_payloads(payload_paths)
 
     def synchronize_device(self) -> None:
         if torch.cuda.is_available():
@@ -515,7 +437,6 @@ class VllmSparseDeltaApplier:
         """Synchronize and compare bounded samples of target entries just changed."""
         self.synchronize_device()
         verification, self._verification = self._verification, []
-        candidates, self._verification_candidates = self._verification_candidates, 0
         stats = (
             torch.zeros(4, device=verification[0][0].device) if verification else None
         )
@@ -523,7 +444,9 @@ class VllmSparseDeltaApplier:
         with torch.no_grad():
             for target, locations, expected_bits in verification:
                 actual_bits = (
-                    _integer_view(target).reshape(-1).index_select(0, locations)
+                    sparse_codec.integer_view(target)
+                    .reshape(-1)
+                    .index_select(0, locations)
                 )
                 bit_mismatches = actual_bits.ne(expected_bits)
                 actual = actual_bits.view(target.dtype).float()
@@ -548,7 +471,7 @@ class VllmSparseDeltaApplier:
         values = [0.0] * 4 if stats is None else stats.cpu().tolist()
         return {
             "ok": True,
-            "verification_candidates": candidates,
+            "verification_candidates": samples,
             "verification_samples": samples,
             "verification_exact_mismatches": int(values[2]),
             "verification_mismatches": int(values[3]),

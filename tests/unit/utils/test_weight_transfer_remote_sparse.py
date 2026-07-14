@@ -30,7 +30,6 @@ from nemo_rl.utils.weight_transfer_remote_sparse import (
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     DeltaCompressionTracker,
     SparseShardProjection,
-    _bytewise_diff_mask,
     encode_sparse_infos,
     sparse_locations_for_item,
 )
@@ -93,8 +92,25 @@ def _delta_tracker(encoding: str = "overwrite") -> DeltaCompressionTracker:
     )
 
 
-def test_delta_tracker_commits_only_successful_syncs(monkeypatch) -> None:
+def _baseline_names(tensors, *, rank: int, partition: str = "chunks"):
+    tracker = _BaselineNamesTracker()
+    weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
+        tensors,
+        delta_tracker=tracker,
+        shard_rank=rank,
+        shard_count=2,
+        transport="zmq",
+        partition=partition,
+    )
+    return tracker.names
+
+
+@pytest.fixture(autouse=True)
+def _in_memory_baseline(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+
+
+def test_delta_tracker_commits_only_successful_syncs() -> None:
     tracker = _delta_tracker()
     tensor = torch.tensor([1.0, 2.0, 3.0])
     tracker.snapshot_baseline([("weight", tensor)])
@@ -107,8 +123,7 @@ def test_delta_tracker_commits_only_successful_syncs(monkeypatch) -> None:
     assert not tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
 
 
-def test_delta_tracker_change_summary_is_transactional(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+def test_delta_tracker_change_summary_is_transactional() -> None:
     tracker = _delta_tracker()
     first = torch.tensor([1.0, 2.0])
     second = torch.tensor([3.0, 4.0])
@@ -124,7 +139,6 @@ def test_delta_tracker_change_summary_is_transactional(monkeypatch) -> None:
 
 
 def test_delta_tracker_emits_bounded_verification_budget(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
     monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
     tracker = _delta_tracker()
     tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -140,8 +154,7 @@ def test_delta_tracker_emits_bounded_verification_budget(monkeypatch) -> None:
     assert (changed, total) == (2, 4)
 
 
-def test_delta_tracker_commits_exact_source_baseline(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+def test_delta_tracker_commits_exact_source_baseline() -> None:
     tracker = _delta_tracker()
     tensor = torch.tensor([1.0])
     tracker.snapshot_baseline([("weight", tensor)])
@@ -157,8 +170,7 @@ def test_delta_tracker_commits_exact_source_baseline(monkeypatch) -> None:
     assert torch.equal(tracker.baseline["weight"], tensor)
 
 
-def test_delta_tracker_xor_encodes_against_baseline(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+def test_delta_tracker_xor_encodes_against_baseline() -> None:
     tracker = _delta_tracker("xor")
     tensor = torch.tensor([1.0, 2.0, 3.0])
     baseline = tensor.clone()
@@ -184,8 +196,8 @@ def test_delta_tracker_xor_encodes_against_baseline(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("projection", "expected_locations"),
     [
-        (SparseShardProjection("hf.weight", (2, 4), (0, 2)), [2, 7]),
-        (SparseShardProjection("hf.weight", (4, 2), (2, 0)), [4, 7]),
+        (SparseShardProjection("hf.weight", (2, 4), 1, 2), [2, 7]),
+        (SparseShardProjection("hf.weight", (4, 2), 0, 2), [4, 7]),
     ],
 )
 def test_delta_tracker_projects_local_shards_to_hf_locations(
@@ -193,7 +205,6 @@ def test_delta_tracker_projects_local_shards_to_hf_locations(
     projection: SparseShardProjection,
     expected_locations: list[int],
 ) -> None:
-    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
     monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
     tracker = DeltaCompressionTracker(
         {"encoding": "overwrite", "sparse_bucket_size_bytes": 1024},
@@ -238,21 +249,10 @@ def test_sparse_index_encoding_preserves_uint64_locations() -> None:
     assert torch.equal(decoded, locations)
 
 
-def test_bytewise_diff_mask_supports_float8() -> None:
-    baseline = torch.tensor([0x38, 0x7F, 0x00], dtype=torch.uint8).view(
-        torch.float8_e4m3fn
-    )
-    current = baseline.clone()
-    current.view(torch.uint8)[1] = 0x7E
-
-    assert _bytewise_diff_mask(current, baseline).tolist() == [False, True, False]
-
-
 @pytest.mark.parametrize("encoding", ["xor", "overwrite"])
 def test_delta_tracker_encodes_fp8_weight_and_scale_bits(
     monkeypatch, encoding: str
 ) -> None:
-    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
     monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
     tracker = _delta_tracker(encoding)
     weight = torch.tensor([0x38, 0x40, 0x48], dtype=torch.uint8).view(
@@ -322,34 +322,6 @@ def test_refit_http_session_does_not_retry_application_errors() -> None:
 
     assert 500 not in retry.status_forcelist
     assert {502, 503, 504} <= set(retry.status_forcelist)
-
-
-def test_prepare_sparse_refit_urls_serializes_metadata(monkeypatch) -> None:
-    posts = []
-    monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
-    monkeypatch.setattr(
-        weight_transfer_remote_sparse,
-        "post_vllm_refit_endpoints",
-        lambda *args, **kwargs: posts.append((args, kwargs)) or [{"ok": True}],
-    )
-
-    result = weight_transfer_remote_sparse.prepare_vllm_sparse_refit_urls(
-        [" http://receiver/ "],
-        {"weight": ((2, 3), torch.bfloat16)},
-        api_key_env_var="NRL_TEST_REFIT_KEY",
-        timeout_s=7.0,
-    )
-
-    assert result == [{"ok": True}]
-    assert posts == [
-        (
-            (
-                ["http://receiver/nemo-rl/refit/prepare"],
-                {"tensors": {"weight": [[2, 3], "bfloat16"]}},
-            ),
-            {"api_key": "secret", "timeout_s": 7.0},
-        )
-    ]
 
 
 def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
@@ -453,62 +425,31 @@ def test_sparse_baseline_snapshots_only_owned_export_chunks(
     monkeypatch, capsys
 ) -> None:
     monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
-    tracker = _BaselineNamesTracker()
-    weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
-        [(f"weight-{index}", torch.tensor([float(index)])) for index in range(4)],
-        delta_tracker=tracker,
-        shard_rank=1,
-        shard_count=2,
-        transport="zmq",
-    )
+    tensors = [(f"weight-{index}", torch.tensor([float(index)])) for index in range(4)]
 
-    assert tracker.names == ["weight-1", "weight-3"]
+    assert _baseline_names(tensors, rank=1) == ["weight-1", "weight-3"]
     assert "chunks=4" in capsys.readouterr().out
-
-    tracker = _BaselineNamesTracker()
-    weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
-        [(f"weight-{index}", torch.tensor([float(index)])) for index in range(4)],
-        delta_tracker=tracker,
-        shard_rank=1,
-        shard_count=2,
-        transport="zmq",
-        partition="none",
-    )
-    assert tracker.names == [f"weight-{index}" for index in range(4)]
+    assert _baseline_names(tensors, rank=1, partition="none") == [
+        f"weight-{index}" for index in range(4)
+    ]
 
 
 def test_sparse_name_partition_is_stable_for_filtered_exports(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
 
     tensors = [(f"weight-{index}", torch.tensor([float(index)])) for index in range(8)]
-    owners = []
-    for rank in range(2):
-        tracker = _BaselineNamesTracker()
-        weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
-            tensors,
-            delta_tracker=tracker,
-            shard_rank=rank,
-            shard_count=2,
-            transport="zmq",
-            partition="names",
-        )
-        owners.append(set(tracker.names))
+    owners = [
+        set(_baseline_names(tensors, rank=rank, partition="names")) for rank in range(2)
+    ]
 
     assert owners[0].isdisjoint(owners[1])
     assert owners[0] | owners[1] == {name for name, _tensor in tensors}
 
     filtered = tensors[::2]
     for rank in range(2):
-        tracker = _BaselineNamesTracker()
-        weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
-            filtered,
-            delta_tracker=tracker,
-            shard_rank=rank,
-            shard_count=2,
-            transport="zmq",
-            partition="names",
-        )
-        assert set(tracker.names) == owners[rank] & {name for name, _tensor in filtered}
+        assert set(_baseline_names(filtered, rank=rank, partition="names")) == owners[
+            rank
+        ] & {name for name, _tensor in filtered}
 
 
 def test_s3_manifest_transport_validates_configuration(monkeypatch) -> None:
@@ -760,7 +701,6 @@ def test_zmq_server_rejects_malformed_messages() -> None:
         (frames(protocol="other"), ValueError, "protocol"),
         (frames(api_key="wrong"), PermissionError, "authentication"),
         (frames(transfer_id=""), ValueError, "identity"),
-        (frames(checksum="wrong"), ValueError, "checksum mismatch"),
     ):
         with pytest.raises(error, match=match):
             server._parse_data_message(message)
@@ -775,8 +715,13 @@ def _receiver_server(received):
             received.append(
                 ({key.lower(): value for key, value in self.headers.items()}, body)
             )
-            response = json.dumps({"ok": True, "receiver_total_s": 0.25}).encode()
-            self.send_response(200)
+            ok = self.headers[G_VLLM_REFIT_CHECKSUM_HEADER] == sparse_payload_checksum(
+                body
+            )
+            response = json.dumps(
+                {"ok": ok, "receiver_total_s": 0.25, "error": "checksum mismatch"}
+            ).encode()
+            self.send_response(200 if ok else 500)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(response)))
             self.end_headers()

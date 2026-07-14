@@ -23,7 +23,6 @@ from typing import Any, cast
 import torch
 
 from nemo_rl.utils.weight_transfer_remote_sparse import (
-    SparseDeltaStreamResult,
     init_sparse_delta_baseline_from_iterator,
     sparse_name_shard,
     stream_sparse_delta_payloads_via_s3_manifest,
@@ -38,25 +37,18 @@ _UNSUPPORTED = 0
 _COLUMN = 1
 _ROW = 2
 _REPLICATED = 3
-_DIRECT = 4
-_GATED = 5
+_GATED = 4
 
 
 class MegatronRemoteSparseRefit:
-    @classmethod
-    def from_worker(cls, worker: Any) -> "MegatronRemoteSparseRefit":
-        generation_config = worker.cfg.get("generation") or {}
-        delta_config = generation_config.get("delta_compression")
-        if generation_config.get("refit_transport") is None or not delta_config:
-            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
-        return cls(worker, delta_config)
-
     def __init__(self, worker: Any, delta_config: Mapping[str, Any]) -> None:
         self._worker = worker
         self._delta_config = delta_config
         residual_config = dict(delta_config)
         if residual_config["encoding"] == "xor":
             residual_config["encoding"] = "overwrite"
+        # Residual Bridge outputs need a canonical-HF overwrite baseline; the
+        # optional policy tracker owns MCore-local projections and can retain XOR.
         self._tracker = DeltaCompressionTracker(residual_config)
         self._policy_tracker: DeltaCompressionTracker | None = None
         self._local_tensors: list[tuple[str, torch.Tensor]] = []
@@ -79,7 +71,7 @@ class MegatronRemoteSparseRefit:
 
         return AutoMapping, {
             ColumnParallelMapping: _COLUMN,
-            DirectMapping: _DIRECT,
+            DirectMapping: _REPLICATED,
             GatedMLPMapping: _GATED,
             ReplicatedMapping: _REPLICATED,
             RowParallelMapping: _ROW,
@@ -172,7 +164,7 @@ class MegatronRemoteSparseRefit:
     @classmethod
     def _task_ownership(cls, task: Any, kind: int) -> tuple[torch.Tensor | None, bool]:
         tensor = task.param_weight
-        replicated = kind in (_DIRECT, _REPLICATED) or (
+        replicated = kind == _REPLICATED or (
             kind == _ROW and tensor is not None and tensor.ndim == 1
         )
         return (
@@ -228,10 +220,13 @@ class MegatronRemoteSparseRefit:
         if tensor.ndim <= shard_dim:
             raise ValueError(f"Cannot shard {name!r} on dimension {shard_dim}.")
         global_shape = list(tensor.shape)
-        offsets = [0] * tensor.ndim
         global_shape[shard_dim] *= shard_count
-        offsets[shard_dim] = tensor.shape[shard_dim] * shard_rank
-        return SparseShardProjection(name, tuple(global_shape), tuple(offsets))
+        return SparseShardProjection(
+            name,
+            tuple(global_shape),
+            shard_dim,
+            tensor.shape[shard_dim] * shard_rank,
+        )
 
     @classmethod
     def _task_local_tensors(
@@ -279,7 +274,7 @@ class MegatronRemoteSparseRefit:
 
         name = cls._canonical_hf_name(task, cast(str, hf_param))
         projection = (
-            SparseShardProjection(name, tuple(tensor.shape), (0,) * tensor.ndim)
+            SparseShardProjection(name, tuple(tensor.shape))
             if replicated
             else cls._projection(
                 name,
@@ -440,7 +435,7 @@ class MegatronRemoteSparseRefit:
         timeout_s: float,
         shard_rank: int,
         shard_count: int,
-    ) -> SparseDeltaStreamResult:
+    ) -> dict[str, int]:
         self._prepare_paths()
         streamer = {
             "s3": stream_sparse_delta_payloads_via_s3_manifest,
@@ -486,7 +481,7 @@ class MegatronRemoteSparseRefit:
                     if local_future is not None
                     else {"payloads": 0, "changed_elements": 0, "total_elements": 0}
                 )
-            result = SparseDeltaStreamResult(
+            result = dict(
                 payloads=int(local_result["payloads"]) + int(misc_result["payloads"]),
                 changed_elements=int(local_result["changed_elements"]) + misc_changed,
                 total_elements=int(local_result["total_elements"]) + misc_total,
