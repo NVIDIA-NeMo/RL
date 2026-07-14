@@ -146,15 +146,6 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     advantage_policy_logprobs_field: str | None = None
     advantage_reference_logprobs_field: str | None = None
 
-    # Loss-driven logprob refresh. The loss can consume prev/reference
-    # logprob columns even when the advantage estimator does not — sync GRPO
-    # refreshes reference logprobs iff
-    # ``loss_fn.reference_policy_kl_penalty != 0``. The wiring layer sets
-    # these from the loss config; either trigger (loss flag or advantage
-    # field) enables the corresponding refresh.
-    refresh_prev_logprobs_for_loss: bool = False
-    refresh_reference_logprobs_for_loss: bool = False
-
     # Diagnostics
     diagnostics: bool = False
 
@@ -497,15 +488,11 @@ class SingleControllerActor:
         rollout pump makes progress during trainer calls; exceptions
         surface at the corresponding ``await``.
         """
-        refresh_policy_logprobs = (
-            self._cfg.refresh_prev_logprobs_for_loss
-            or self._cfg.advantage_policy_logprobs_field is not None
+        # TODO: fix the prev_logprobs_required and reference_logprobs_required logic
+        prev_logprobs_required = self._cfg.advantage_policy_logprobs_field is not None
+        reference_logprobs_required = (
+            self._cfg.advantage_reference_logprobs_field is not None
         )
-        refresh_reference_logprobs = (
-            self._cfg.refresh_reference_logprobs_for_loss
-            or self._cfg.advantage_reference_logprobs_field is not None
-        )
-        logprobs_required = refresh_policy_logprobs or refresh_reference_logprobs
 
         while self._train_steps < self._cfg.max_train_steps:
             # __init__ coerces None → min_groups_per_batch (int);
@@ -570,16 +557,14 @@ class SingleControllerActor:
                     group_meta = self._claimed_meta.subset(group_indices)
                     self._claimed_meta = self._claimed_meta.drop(group_indices)
 
-                    if logprobs_required:
-                        # Block here — advantage stage downstream reads the
-                        # refreshed prev_lp / ref_lp columns.
-                        with self._timed("prepare_logprobs"):
-                            if refresh_policy_logprobs:
+                    if prev_logprobs_required or reference_logprobs_required:
+                        with self._timed("policy_and_reference_logprobs"):
+                            if prev_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta,
                                     group_meta,
                                 )
-                            if refresh_reference_logprobs:
+                            if reference_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     group_meta,
