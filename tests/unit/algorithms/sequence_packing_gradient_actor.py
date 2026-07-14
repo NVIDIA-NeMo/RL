@@ -48,6 +48,10 @@ class SequencePackingGradientTestActor:
             LossPostProcessor,
             forward_with_post_processing_fn,
         )
+        from nemo_rl.models.policy import (
+            DynamicBatchingConfigDisabled,
+            SequencePackingConfig,
+        )
 
         # Initialize process group
         torch.distributed.init_process_group(backend="nccl")
@@ -306,8 +310,11 @@ class SequencePackingGradientTestActor:
                 return self.logits
 
         cfg = {
-            "sequence_packing": {"enabled": True},
-            "dynamic_batching": {"enabled": False},
+            "sequence_packing": SequencePackingConfig(
+                train_mb_tokens=512,
+                algorithm="modified_first_fit_decreasing",
+            ),
+            "dynamic_batching": DynamicBatchingConfigDisabled(),
             "megatron_cfg": {
                 "tensor_model_parallel_size": 1,
                 "sequence_parallel": False,

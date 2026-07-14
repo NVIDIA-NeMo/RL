@@ -27,6 +27,8 @@ identity preserved across shards).
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import torch
 
 from nemo_rl.data_plane import KVBatchMeta
@@ -34,7 +36,14 @@ from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.preshard import shard_meta_for_dp
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import (
+    DynamicBatchingConfig,
+    DynamicBatchingConfigDisabled,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+)
 
 from ._rollout_shapes import (
     keys_from_uids,
@@ -53,6 +62,52 @@ def _final_batch(n_samples: int = 4, *, with_extras: bool = False) -> BatchedDat
     if with_extras:
         d["pixel_values"] = torch.zeros((n_samples, 3, 4, 4), dtype=torch.float32)
     return d
+
+
+def test_packing_prep_reads_sequence_packing_basemodel() -> None:
+    worker = object.__new__(TQWorkerMixin)
+    worker.cfg = {
+        "sequence_packing": SequencePackingConfig(
+            train_mb_tokens=512,
+            algorithm="modified_first_fit_decreasing",
+        ),
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+        "make_sequence_length_divisible_by": 8,
+    }
+    data = MagicMock()
+    packed = object()
+    data.shard_by_batch_size.return_value = ([packed], None)
+
+    assert worker._apply_packing_prep(data) is packed
+    assert data.shard_by_batch_size.call_args.kwargs["sequence_packing_args"] == {
+        "algorithm": "modified_first_fit_decreasing",
+        "input_key": "input_ids",
+        "input_lengths_key": "input_lengths",
+        "sequence_length_pad_multiple": 8,
+        "max_tokens_per_microbatch": 512,
+    }
+
+
+def test_packing_prep_reads_dynamic_batching_basemodel() -> None:
+    worker = object.__new__(TQWorkerMixin)
+    worker.cfg = {
+        "sequence_packing": SequencePackingConfigDisabled(),
+        "dynamic_batching": DynamicBatchingConfig(
+            train_mb_tokens=256,
+            sequence_length_round=64,
+        ),
+    }
+    data = MagicMock()
+    sharded = object()
+    data.shard_by_batch_size.return_value = ([sharded], None)
+
+    assert worker._apply_packing_prep(data) is sharded
+    assert data.shard_by_batch_size.call_args.kwargs["dynamic_batching_args"] == {
+        "input_key": "input_ids",
+        "input_lengths_key": "input_lengths",
+        "sequence_length_round": 64,
+        "max_tokens_per_microbatch": 256,
+    }
 
 
 # ── kv_first_write schema extensibility ────────────────────────────────

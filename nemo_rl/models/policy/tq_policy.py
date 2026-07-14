@@ -118,8 +118,9 @@ class TQPolicy(Policy):
         self.dp_cfg = dp_cfg
         self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
         self.tq_partition_id = tq_partition_id
-        self._router_replay_enabled = bool(
-            (self.cfg.get("router_replay") or {}).get("enabled", False)
+        router_replay_config = self.cfg.get("router_replay")
+        self._router_replay_enabled = (
+            router_replay_config is not None and router_replay_config.enabled
         )
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
@@ -255,15 +256,19 @@ class TQPolicy(Policy):
         """
         if getattr(self, "use_dynamic_batches", False):
             args = dict(self.dynamic_batching_args)
-            args["max_tokens_per_microbatch"] = self.cfg["dynamic_batching"][
-                mb_tokens_key
-            ]
+            max_tokens_per_microbatch = getattr(
+                self.cfg["dynamic_batching"], mb_tokens_key
+            )
+            assert max_tokens_per_microbatch is not None
+            args["max_tokens_per_microbatch"] = max_tokens_per_microbatch
             return None, args
         if getattr(self, "use_sequence_packing", False):
             args = dict(self.sequence_packing_args)
-            args["max_tokens_per_microbatch"] = self.cfg["sequence_packing"][
-                mb_tokens_key
-            ]
+            max_tokens_per_microbatch = getattr(
+                self.cfg["sequence_packing"], mb_tokens_key
+            )
+            assert max_tokens_per_microbatch is not None
+            args["max_tokens_per_microbatch"] = max_tokens_per_microbatch
             return args, None
         return None, None
 
