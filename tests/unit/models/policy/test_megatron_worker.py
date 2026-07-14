@@ -38,7 +38,14 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import (
+    DraftConfigDisabled,
+    DynamicBatchingConfigDisabled,
+    PolicyConfig,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
@@ -654,7 +661,7 @@ def create_megatron_test_config(
     """Create a test config for Megatron policy worker."""
     return {
         "model_name": model_name,
-        "tokenizer": {"name": model_name},
+        "tokenizer": TokenizerConfig(name=model_name),
         "generation_batch_size": 2,  # Small batch size for testing
         "train_global_batch_size": 8,
         "train_micro_batch_size": 2,
@@ -699,12 +706,8 @@ def create_megatron_test_config(
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
-        "dynamic_batching": {
-            "enabled": False,  # Start with simple batching
-        },
-        "sequence_packing": {
-            "enabled": False,  # Start with simple batching
-        },
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+        "sequence_packing": SequencePackingConfigDisabled(),
         "megatron_cfg": {
             "enabled": True,
             "empty_unused_memory_level": 0,
@@ -775,13 +778,7 @@ def create_megatron_test_config(
             },
             "attention_backend": attention_backend,
         },
-        "draft": {
-            "enabled": False,
-            "model_name": None,
-            "loss_weight": 0.1,
-            "num_layers": None,
-            "aux_layer_indices": None,
-        },
+        "draft": DraftConfigDisabled(),
         "make_sequence_length_divisible_by": tp,
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
@@ -2291,12 +2288,11 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
 
     # Enable sequence packing
-    config_no_cp["sequence_packing"] = {
-        "enabled": True,
-        "train_mb_tokens": seq_len,
-        "logprob_mb_tokens": seq_len,
-        "algorithm": "modified_first_fit_decreasing",
-    }
+    config_no_cp["sequence_packing"] = SequencePackingConfig(
+        train_mb_tokens=seq_len,
+        logprob_mb_tokens=seq_len,
+        algorithm="modified_first_fit_decreasing",
+    )
 
     tokenizer = get_tokenizer(config_no_cp["tokenizer"])
     config_no_cp["generation"] = configure_generation_config(
@@ -2321,7 +2317,7 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     # Cleanup non-CP resources and run without packing
     policy_no_cp.shutdown()
     config_no_cp_no_packing = config_no_cp.copy()
-    config_no_cp_no_packing["sequence_packing"] = {"enabled": False}
+    config_no_cp_no_packing["sequence_packing"] = SequencePackingConfigDisabled()
     policy_no_cp_no_packing = Policy(
         cluster=cluster_no_cp,
         config=config_no_cp_no_packing,
@@ -2375,12 +2371,11 @@ def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
     config_cp["make_sequence_length_divisible_by"] *= 4
 
     # Enable sequence packing
-    config_cp["sequence_packing"] = {
-        "enabled": True,
-        "train_mb_tokens": seq_len,
-        "logprob_mb_tokens": seq_len,
-        "algorithm": "modified_first_fit_decreasing",
-    }
+    config_cp["sequence_packing"] = SequencePackingConfig(
+        train_mb_tokens=seq_len,
+        logprob_mb_tokens=seq_len,
+        algorithm="modified_first_fit_decreasing",
+    )
     config_cp["generation"] = configure_generation_config(
         config_cp["generation"], tokenizer
     )
@@ -2853,12 +2848,11 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
 
     # Enable sequence packing
-    config_no_cp["sequence_packing"] = {
-        "enabled": True,
-        "train_mb_tokens": seq_len,
-        "logprob_mb_tokens": seq_len,
-        "algorithm": "modified_first_fit_decreasing",
-    }
+    config_no_cp["sequence_packing"] = SequencePackingConfig(
+        train_mb_tokens=seq_len,
+        logprob_mb_tokens=seq_len,
+        algorithm="modified_first_fit_decreasing",
+    )
 
     tokenizer = get_tokenizer(config_no_cp["tokenizer"])
     config_no_cp["generation"] = configure_generation_config(
@@ -2884,9 +2878,7 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     policy_no_cp.shutdown()
 
     config_no_cp_no_packing = config_no_cp.copy()
-    config_no_cp_no_packing["sequence_packing"] = {
-        "enabled": False,
-    }
+    config_no_cp_no_packing["sequence_packing"] = SequencePackingConfigDisabled()
     policy_no_cp_no_packing = Policy(
         cluster=cluster_no_cp,
         config=config_no_cp_no_packing,
@@ -2938,12 +2930,11 @@ def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
     config_cp["make_sequence_length_divisible_by"] *= 4
 
     # Enable sequence packing
-    config_cp["sequence_packing"] = {
-        "enabled": True,
-        "train_mb_tokens": seq_len,
-        "logprob_mb_tokens": seq_len,
-        "algorithm": "modified_first_fit_decreasing",
-    }
+    config_cp["sequence_packing"] = SequencePackingConfig(
+        train_mb_tokens=seq_len,
+        logprob_mb_tokens=seq_len,
+        algorithm="modified_first_fit_decreasing",
+    )
 
     config_cp["generation"] = configure_generation_config(
         config_cp["generation"], tokenizer
@@ -3081,12 +3072,11 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     config_no_cp["train_global_batch_size"] = 2
 
     # Enable sequence packing
-    config_no_cp["sequence_packing"] = {
-        "enabled": True,
-        "train_mb_tokens": seq_len,
-        "logprob_mb_tokens": seq_len,
-        "algorithm": "modified_first_fit_decreasing",
-    }
+    config_no_cp["sequence_packing"] = SequencePackingConfig(
+        train_mb_tokens=seq_len,
+        logprob_mb_tokens=seq_len,
+        algorithm="modified_first_fit_decreasing",
+    )
 
     tokenizer = get_tokenizer(config_no_cp["tokenizer"])
     config_no_cp["generation"] = configure_generation_config(
@@ -3136,12 +3126,11 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     config_cp["train_global_batch_size"] = 2
 
     # Enable sequence packing
-    config_cp["sequence_packing"] = {
-        "enabled": True,
-        "train_mb_tokens": seq_len,
-        "logprob_mb_tokens": seq_len,
-        "algorithm": "modified_first_fit_decreasing",
-    }
+    config_cp["sequence_packing"] = SequencePackingConfig(
+        train_mb_tokens=seq_len,
+        logprob_mb_tokens=seq_len,
+        algorithm="modified_first_fit_decreasing",
+    )
 
     config_cp["generation"] = configure_generation_config(
         config_cp["generation"], tokenizer

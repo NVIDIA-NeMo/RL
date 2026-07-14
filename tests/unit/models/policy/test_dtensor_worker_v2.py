@@ -25,7 +25,16 @@ import torch.nn as nn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.policy import AutomodelKwargs, PolicyConfig
+from nemo_rl.models.policy import (
+    AutomodelKwargs,
+    DynamicBatchingConfig,
+    PolicyConfig,
+    PytorchOptimizerConfig,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+    SinglePytorchSchedulerConfig,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointManager
 from tests.unit.test_utils import SimpleLossFn
@@ -115,7 +124,7 @@ def create_test_config(
 ) -> PolicyConfig:
     config = {
         "model_name": model_name,
-        "tokenizer": {"name": model_name},
+        "tokenizer": TokenizerConfig(name=model_name),
         "generation_batch_size": 1,  # Small batch size for testing
         "train_global_batch_size": 4,
         "train_micro_batch_size": 1,
@@ -150,19 +159,22 @@ def create_test_config(
             "custom_parallel_plan": custom_parallel_plan,
             "expert_parallel_size": expert_parallel_size,
         },
-        "dynamic_batching": {
-            "enabled": True,
-            "train_mb_tokens": 128,
-            "logprob_mb_tokens": 128,
-            "sequence_length_round": 4,
-        },
-        "sequence_packing": {
-            "enabled": sequence_packing_enabled,
-            "train_mb_tokens": 128,
-        },
-        "optimizer": {
-            "name": "torch.optim.AdamW",
-            "kwargs": {
+        "dynamic_batching": DynamicBatchingConfig(
+            train_mb_tokens=128,
+            logprob_mb_tokens=128,
+            sequence_length_round=4,
+        ),
+        "sequence_packing": (
+            SequencePackingConfig(
+                train_mb_tokens=128,
+                algorithm="modified_first_fit_decreasing",
+            )
+            if sequence_packing_enabled
+            else SequencePackingConfigDisabled()
+        ),
+        "optimizer": PytorchOptimizerConfig(
+            name="torch.optim.AdamW",
+            kwargs={
                 "lr": 5e-6,
                 "weight_decay": 0.01,
                 "betas": [0.9, 0.999],
@@ -170,13 +182,13 @@ def create_test_config(
                 "foreach": False,
                 "fused": False,
             },
-        },
-        "scheduler": {
-            "name": "torch.optim.lr_scheduler.CosineAnnealingLR",
-            "kwargs": {
+        ),
+        "scheduler": SinglePytorchSchedulerConfig(
+            name="torch.optim.lr_scheduler.CosineAnnealingLR",
+            kwargs={
                 "T_max": 100,
             },
-        },
+        ),
         "max_grad_norm": 1.0,
     }
     if automodel_kwargs is not None:
