@@ -7,7 +7,6 @@ test_case="grpo-qwen3-30ba3b-4n8g-async-1off"
 TOTAL_GPUS="${TOTAL_GPUS:-32}"
 GPUS_PER_NODE=8
 JOB_TIME="${JOB_TIME:-00:40:00}"
-SLURM_DEPENDENCY="${SLURM_DEPENDENCY:-}"
 
 if ! [[ "$TOTAL_GPUS" =~ ^[0-9]+$ ]]; then
   echo "TOTAL_GPUS must be a positive integer, got: $TOTAL_GPUS"
@@ -70,5 +69,5 @@ sbatch \
     --partition=batch \
     --time=${JOB_TIME} \
     --gres=gpu:${GPUS_PER_NODE} \
-    --dependency="${SLURM_DEPENDENCY}" \
+    --dependency="" \
     ray.sub
