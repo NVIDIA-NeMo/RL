@@ -11,3 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+"""SingleController utilities: config schema + setup factories."""
+
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AdvantageConfig,
+    AsyncRLConfig,
+    MasterConfig,
+    WeightSyncConfig,
+)
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    SingleControllerBundle,
+    setup_single_controller,
+)
+
+__all__ = [
+    "AdvantageConfig",
+    "AsyncRLConfig",
+    "MasterConfig",
+    "SingleControllerBundle",
+    "WeightSyncConfig",
+    "setup_single_controller",
+]
