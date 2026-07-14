@@ -2517,33 +2517,61 @@ class MegatronPolicyWorkerImpl(
     ) -> Iterator[list[tuple[str, torch.Tensor]]]:
         """Yield HF tensor buckets for SGLang refit.
 
-        Reuses the same two pieces as every other transport: the
-        ``export_hf_weights`` walk in ``_iter_params_with_optional_kv_scales``
-        (without vLLM KV/Q scales or draft weights — SGLang keeps drafts
-        engine-side via ``enable_draft_weights_cpu_backup``) and the shared
-        ``iter_named_tensor_buckets`` packing.
+        Reuses the shared ``export_hf_weights`` walk and bucket packing. MXFP8
+        expands eligible weights into weight/scale groups that must stay in the
+        same transport bucket.
         """
-        from nemo_rl.models.policy.utils import iter_named_tensor_buckets
+        from nemo_rl.models.generation.sglang.config import (
+            get_sglang_quantization_scheme,
+        )
+        from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
+            SKIP_WEIGHT_SUBSTRINGS as MXFP8_SKIP_WEIGHT_SUBSTRINGS,
+        )
+        from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
+            iter_mxfp8_quantized_tensor_groups,
+        )
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            build_dynamic_skip_substrings,
+        )
+        from nemo_rl.models.policy.utils import (
+            iter_named_tensor_buckets,
+            iter_named_tensor_group_buckets,
+        )
 
         if sglang_quantization_cfg is None:
             raise ValueError("SGLang refit requires an explicit quantization config.")
-        configured_precision = sglang_quantization_cfg["scheme"]
+        configured_precision = get_sglang_quantization_scheme(sglang_quantization_cfg)
         if target_precision != configured_precision:
             raise ValueError(
                 "SGLang refit target precision does not match its quantization "
                 f"config: target={target_precision!r}, "
                 f"configured={configured_precision!r}."
             )
-        if target_precision != "bf16":
-            raise ValueError(f"Unsupported SGLang target precision: {target_precision}")
-
         if self.refit_conversion_tasks is None:
             self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
                 [self.model]
             )
 
-        return iter_named_tensor_buckets(
-            self._iter_params_with_optional_kv_scales(include_draft=False),
+        named_tensors = self._iter_params_with_optional_kv_scales(include_draft=False)
+        if target_precision == "bf16":
+            return iter_named_tensor_buckets(
+                named_tensors,
+                buffer_size_bytes=buffer_size_bytes,
+            )
+
+        num_hidden_layers = int(
+            getattr(self.megatron_bridge.transformer_config, "num_layers", 0)
+        )
+        skip_weight_substrings = build_dynamic_skip_substrings(
+            quantization_config=sglang_quantization_cfg,
+            num_hidden_layers=num_hidden_layers,
+            static_skip_substrings=MXFP8_SKIP_WEIGHT_SUBSTRINGS,
+        )
+        return iter_named_tensor_group_buckets(
+            iter_mxfp8_quantized_tensor_groups(
+                named_tensors,
+                skip_weight_substrings=skip_weight_substrings,
+            ),
             buffer_size_bytes=buffer_size_bytes,
         )
 
