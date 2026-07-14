@@ -1372,6 +1372,50 @@ def _calculate_single_metric(
     }
 
 
+def _calculate_agent_result_metrics(
+    agent_results: Sequence[dict[str, Any]], agent_name: str
+) -> dict:
+    metrics = {}
+    for key in agent_results[0].keys():
+        values = [
+            float(r[key])
+            for r in agent_results
+            if isinstance(r.get(key), (bool, int, float))
+        ]
+        if values:
+            metrics.update(
+                _calculate_single_metric(
+                    values, len(agent_results), f"{agent_name}/{key}"
+                )
+            )
+
+    reward_component_keys: set[str] = set()
+    for result in agent_results:
+        reward_components = result.get("reward_components")
+        if isinstance(reward_components, dict):
+            reward_component_keys.update(
+                key
+                for key, value in reward_components.items()
+                if isinstance(key, str) and isinstance(value, (bool, int, float))
+            )
+
+    for key in sorted(reward_component_keys):
+        values = []
+        for result in agent_results:
+            reward_components = result.get("reward_components")
+            if isinstance(reward_components, dict) and isinstance(
+                reward_components.get(key), (bool, int, float)
+            ):
+                values.append(float(reward_components[key]))
+        metrics.update(
+            _calculate_single_metric(
+                values, len(agent_results), f"{agent_name}/reward_components/{key}"
+            )
+        )
+
+    return metrics
+
+
 def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
     """Return thinking tags used by the Gym-side detector."""
     nemo_gym_config = env_config.get("nemo_gym")
@@ -1980,19 +2024,9 @@ def run_async_nemo_gym_rollout(
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
-            keys = agent_results[0].keys()
-            for key in keys:
-                values = [
-                    float(r[key])
-                    for r in agent_results
-                    if isinstance(r.get(key), (bool, int, float))
-                ]
-                if values:
-                    per_agent_metrics.update(
-                        _calculate_single_metric(
-                            values, len(agent_results), f"{agent_name}/{key}"
-                        )
-                    )
+            per_agent_metrics.update(
+                _calculate_agent_result_metrics(agent_results, agent_name)
+            )
 
             # Log the full result
             to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]

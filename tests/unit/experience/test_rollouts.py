@@ -40,6 +40,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
+    _calculate_agent_result_metrics,
     _calculate_single_metric,
     generate_responses_async,
     run_async_multi_turn_rollout,
@@ -102,6 +103,37 @@ class TestCalculateSingleMetric:
         result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+def test_calculate_agent_result_metrics_flattens_reward_components():
+    metrics = _calculate_agent_result_metrics(
+        [
+            {
+                "reward": 1.0,
+                "reward_components": {
+                    "correctness": 0.5,
+                    "format": 0.2,
+                    "details": {"reason": "ignored"},
+                    "note": "ignored",
+                },
+            },
+            {
+                "reward": 0.0,
+                "reward_components": {
+                    "correctness": 1.0,
+                    "format": 0.4,
+                },
+            },
+        ],
+        "test_agent",
+    )
+
+    assert metrics["test_agent/reward/mean"] == 0.5
+    assert metrics["test_agent/reward_components/correctness/mean"] == 0.75
+    assert metrics["test_agent/reward_components/format/mean"] == pytest.approx(0.3)
+    assert "test_agent/reward_components/mean" not in metrics
+    assert "test_agent/reward_components/details/mean" not in metrics
+    assert "test_agent/reward_components/note/mean" not in metrics
 
 
 class _DummyTokenizer:
