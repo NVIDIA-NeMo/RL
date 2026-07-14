@@ -55,6 +55,21 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+    """Return True for samples the environment asks GRPO to mask from loss."""
+    return torch.tensor(
+        [
+            bool(
+                (result["full_result"].get("instance_config") or {}).get(
+                    "mask_sample", False
+                )
+            )
+            for result in results
+        ],
+        dtype=torch.bool,
+    )
+
+
 def generate_responses(
     policy_generation: GenerationInterface,
     generation_input_data: BatchedDataDict[GenerationDatumSpec],
@@ -1473,6 +1488,9 @@ def run_async_nemo_gym_rollout(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
+            # Agent/env-driven mask flag: keep its reward for advantage
+            # computation, but let GRPO exclude it from the policy loss.
+            "mask_sample": _extract_mask_sample_flags(results),
         }
     )
 

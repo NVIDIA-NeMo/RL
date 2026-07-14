@@ -42,6 +42,7 @@ from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     _calculate_refine_metrics,
+    _extract_mask_sample_flags,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -192,6 +193,23 @@ def test_calculate_refine_metrics_ignores_non_refine_results():
             [{"full_result": {"reward": 1.0}, "message_log": []}], 100
         )
         == {}
+)
+
+
+def test_extract_mask_sample_flags():
+    results = [
+        {"full_result": {"instance_config": {"mask_sample": True}}},
+        {"full_result": {"instance_config": {"mask_sample": False}}},
+        {"full_result": {"instance_config": {}}},
+        {"full_result": {}},
+        {"full_result": {"instance_config": None}},
+    ]
+
+    mask_sample = _extract_mask_sample_flags(results)
+
+    assert mask_sample.dtype == torch.bool
+    assert torch.equal(
+        mask_sample, torch.tensor([True, False, False, False, False])
     )
 
 
@@ -960,6 +978,7 @@ def test_run_async_nemo_gym_rollout(
             ],
             "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "mask_sample": torch.tensor([False, False]),
             "total_reward": torch.tensor([0.0, 0.0]),
             "truncated": torch.tensor([False, False]),
         },
@@ -1048,6 +1067,11 @@ def test_run_async_nemo_gym_rollout(
                 isinstance(v, (bool, int)) for v in final_batch["truncated"].tolist()
             )
             final_batch.pop("truncated")
+        if "mask_sample" in final_batch:
+            assert all(
+                isinstance(v, (bool, int)) for v in final_batch["mask_sample"].tolist()
+            )
+            final_batch.pop("mask_sample")
 
         for key in d["rollout_metrics"]:
             # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
