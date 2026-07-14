@@ -1,0 +1,62 @@
+defaults: ../../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: true
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-32n8g-async-1off
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 4
+    expert_model_parallel_size: 32
+    sequence_parallel: true
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    moe_router_dtype: fp32
+    moe_router_bias_update_rate: 0.001
+    moe_router_enable_expert_bias: true
+    defer_fp32_logits: true
+    # MTP — disabled
+    mtp_num_layers: 0
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 24
+        gpus_per_node: 8
+    vllm_cfg:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.7
+      async_engine: true
+    # vllm_kwargs:
+    #   # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible,
+    #   # change to triton to keep same behavior as vLLM 0.17.
+    #   moe_backend: triton
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nemotron3-super-120BA12B-32n8g-megatron-async-1off
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32
