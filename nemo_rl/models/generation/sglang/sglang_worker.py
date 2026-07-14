@@ -304,6 +304,17 @@ class SGLangGenerationWorker:
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
+    def _simulate_crash(self):
+        """Test-only: tear the engine down to simulate a crash.
+
+        Underscore-prefixed to signal this is **not** part of the public
+        worker API; production code should never call it.
+        """
+        logger.info(
+            f"Simulating crash on engine {self.server_host}:{self.server_port}..."
+        )
+        self.shutdown()
+
     def start_profile(
         self,
         # The output directory
