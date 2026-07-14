@@ -362,31 +362,26 @@ class DTensorPolicyWorkerV2Impl(
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
-        # Rollout topology constant for SGLang colocated refit: set once via
-        # ``set_rollout_num_gpus_per_engine`` after the SGLang generation
-        # handle exists and consumed by ``stream_weights_via_http`` on each
-        # refit. Only initialized on the SGLang colocated path since no other
-        # generation backend uses this attribute.
+        ## SGLang weight-update state. Populated lazily by
+        ## ``connect_sglang_rollout_engines`` on the first colocated refit.
         generation_backend = config.get("generation", {}).get("backend")
         if generation_backend == "sglang":
-            from nemo_rl.models.generation.sglang.utils.train_utils import (
-                monkey_patch_torch_reductions,
-            )
-
-            monkey_patch_torch_reductions()
+            self._sglang_ipc_state: dict = {}
             if self.is_generation_colocated:
-                self._rollout_num_gpus_per_engine: Optional[int] = None
-                self._ipc_worker_state: dict = {}
+                # Colocate refit serializes CUDA-IPC tensor handles for
+                # SGLang; the torch reductions monkey patch must be in place
+                # before any tensor is serialized.
+                from nemo_rl.models.generation.sglang.utils.train_utils import (
+                    monkey_patch_torch_reductions,
+                )
+
+                monkey_patch_torch_reductions()
 
     def _update_moe_gate_bias_if_supported(self) -> None:
         """Update the non-gradient MoE routing bias after the optimizer step."""
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
-
-    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
-        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
-        self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -1123,45 +1118,70 @@ class DTensorPolicyWorkerV2Impl(
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
-    def stream_weights_via_http(
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/connect_sglang_rollout_engines")
+    def connect_sglang_rollout_engines(
         self,
-        rollout_engine_urls: list[str],
-        buffer_size_bytes: int,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
     ) -> None:
-        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
+        """Set up the colocate Gloo gather topology for SGLang weight refit.
 
-        Args:
-            rollout_engine_urls: ``http://host:port`` base URLs of each
-                engine's ``node_rank=0`` SGLang HTTP server. The driver
-                resolves these once via ``engine.get_base_url`` and passes
-                them down so every FSDP rank doesn't redo the Ray RPC.
-            buffer_size_bytes: Max bucket size in bytes before flushing.
-
-        ``num_gpus_per_engine`` is recorded once via
-        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
-        is created, so the caller doesn't have to pass it on every refit.
+        Must be called collectively by every FSDP rank when SGLang engines
+        are added or recovered. Subsequent calls with the same layout are
+        no-ops.
         """
-        assert self._rollout_num_gpus_per_engine is not None, (
-            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
-            "wire the rollout TP size on the policy after SGLangGeneration is built."
+        from nemo_rl.models.policy.utils import connect_colocate_topology
+
+        connect_colocate_topology(
+            engine_gpu_counts=list(engine_gpu_counts),
+            engine_gpu_offsets=(
+                list(engine_gpu_offsets) if engine_gpu_offsets is not None else None
+            ),
+            worker_state=self._sglang_ipc_state,
         )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/update_weights_to_sglang_colocated")
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Send FSDP weights to colocated SGLang engines via Ray CUDA IPC.
+
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk is
+        sent, so trainer-side IPC tensors stay alive until the engine has
+        copied them and per-chunk engine failures surface immediately.
+        """
+        if target_precision != "bf16":
+            raise NotImplementedError(
+                "The FSDP/DTensor policy only supports BF16 SGLang refits; "
+                f"got target_precision={target_precision!r}."
+            )
+        del sglang_quantization_cfg  # accepted for dispatch parity, bf16-only
 
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
-        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
+        from nemo_rl.models.policy.utils import (
+            iter_named_tensor_buckets,
+            send_hf_buckets_via_ipc_actor_impl,
+        )
 
-        stream_weights_via_http_impl(
-            params_generator=dtensor_params_generator(self.model, self.dtype),
-            rollout_engine_urls=rollout_engine_urls,
-            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
-            rank=self.rank,
-            world_size=torch.distributed.get_world_size(),
-            worker_name=str(self),
+        bucket_iter = iter_named_tensor_buckets(
+            dtensor_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
-            worker_state=self._ipc_worker_state,
+        )
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            worker_state=self._sglang_ipc_state,
         )
 
     @torch.no_grad()
@@ -1369,3 +1389,78 @@ class DTensorPolicyWorkerV2Impl(
 )  # pragma: no cover
 class DTensorPolicyWorkerV2(DTensorPolicyWorkerV2Impl):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Driver-side SGLang weight-update dispatch (FSDP backend)
+# ---------------------------------------------------------------------------
+def refit_sglang_colocated(
+    *,
+    policy: Any,
+    policy_generation: Any,
+    buffer_size_bytes: int,
+) -> bool:
+    """Refit colocated SGLang engines from the FSDP/DTensor policy.
+
+    Lifecycle: optional fault-tolerance recover, connect (when new /
+    recovered engines), pause + KV invalidation, send HF tensor buckets via
+    Ray IPC, post-process, continue. Mirrors the Megatron colocated driver;
+    the FSDP path is BF16-only.
+    """
+    from nemo_rl.models.policy.utils import fetch_updatable_engines_with_recover
+
+    (
+        rollout_engines,
+        _rollout_engine_lock,
+        num_new_engines,
+        engine_gpu_counts,
+        engine_gpu_offsets,
+    ) = fetch_updatable_engines_with_recover(policy_generation)
+
+    if num_new_engines > 0:
+        policy.connect_sglang_rollout_engines(
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+        policy_generation.clear_updatable_num_new_engines()
+        assert policy_generation.num_new_engines == 0, (
+            "clear_updatable_num_new_engines did not zero num_new_engines"
+        )
+
+    # Pause with the configured mode, but only invalidate the KV cache when
+    # the mode actually drops generation state. "in_place" leaves the engine
+    # paused without dropping its KV cache, so flushing would clobber the
+    # still-valid in-place state.
+    pause_mode = policy_generation.pause_generation_mode
+    policy_generation.pause_generation(mode=pause_mode)
+    policy_generation.invalidate_kv_cache()
+    try:
+        futures = policy.update_weights_to_sglang_colocated(
+            rollout_engines=rollout_engines,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+        ray.get(futures)
+        policy_generation.post_process_weights()
+    finally:
+        policy_generation.continue_generation()
+    return True
+
+
+def refit_sglang_distributed(
+    *,
+    policy: Any,  # noqa: ARG001 — accepted for dispatch parity
+    policy_generation: Any,  # noqa: ARG001
+    buffer_size_bytes: int,  # noqa: ARG001
+) -> bool:
+    """SGLang disaggregate broadcast is not currently supported for FSDP.
+
+    Per the design, only the Megatron backend implements the distributed
+    refit path (it depends on AutoBridge restoring full HF tensors on
+    trainer rank 0). FSDP non-colocated refits should keep using the
+    legacy ``broadcast_weights_for_collective`` flow with a non-SGLang
+    generation backend.
+    """
+    raise NotImplementedError(
+        "SGLang weight_transfer_mode='broadcast' is currently only supported "
+        "for the Megatron policy backend."
+    )
