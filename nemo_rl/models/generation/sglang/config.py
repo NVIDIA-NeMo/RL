@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, Required, TypedDict, cast
 
 from pydantic import (
     BaseModel,
@@ -25,28 +25,46 @@ from pydantic import (
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
-
-class SglangQuantizationConfig(TypedDict):
-    """SGLang weight precision. Only BF16 on this layer."""
-
-    scheme: Literal["bf16"]
+SglangQuantizationScheme = Literal["bf16", "mxfp8"]
+SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16", "mxfp8"})
 
 
-SUPPORTED_SGLANG_QUANTIZATION_SCHEMES = frozenset({"bf16"})
+def get_sglang_quantization_scheme(
+    quantization_config: dict[str, Any],
+) -> SglangQuantizationScheme:
+    """Return and validate the configured SGLang weight precision.
 
-
-def get_sglang_quantization_scheme(quantization_config: dict[str, Any]) -> str:
-    """Return the configured SGLang weight precision.
-
-    The block must declare a supported ``scheme`` so omissions and typos fail.
+    The block must declare ``scheme`` so omissions and misspellings fail.
     """
     scheme = quantization_config["scheme"]
     if scheme not in SUPPORTED_SGLANG_QUANTIZATION_SCHEMES:
         supported = ", ".join(sorted(SUPPORTED_SGLANG_QUANTIZATION_SCHEMES))
         raise ValueError(
-            f"SGLang quantization.scheme must be one of {{{supported}}}, got {scheme!r}."
+            "SGLang quantization.scheme must be one of "
+            f"{{{supported}}}, got {scheme!r}."
         )
-    return scheme
+    return cast(SglangQuantizationScheme, scheme)
+
+
+class SglangQuantizationConfig(TypedDict, total=False):
+    """SGLang weight-precision config.
+
+    ``scheme="bf16"`` means BF16 rollout/refit. Set ``scheme="mxfp8"`` to boot
+    SGLang from a matching quantized HF checkpoint and quantize HF tensors
+    during online refit. High-precision exclusions are shared by conversion
+    and online refit.
+    """
+
+    scheme: Required[SglangQuantizationScheme]
+    # HF module-name substrings that the checkpoint loader and refit both skip.
+    modules_to_not_convert: list[str]
+    # Additional HF weight-name substrings to keep in high precision.
+    extra_high_precision_layers_hf: list[str]
+    # Number of decoder layers at each edge to keep in high precision.
+    num_layers_at_start_in_bf16: int
+    num_layers_at_end_in_bf16: int
+    converted_model_path: str
+    cache_root: str
 
 
 class SGLangServerConfig(TypedDict):
@@ -175,7 +193,7 @@ class SglangSpecificArgs(TypedDict):
     sglang_http_client_config: NotRequired[SGLangHttpClientConfig]
     sglang_fault_tolerance_config: NotRequired[SGLangFaultToleranceConfig]
 
-    # Weight precision for rollout/refit.
+    # Weight precision and quantized-checkpoint conversion/refit knobs.
     quantization: SglangQuantizationConfig
 
     # Legacy flat spellings, accepted only without sglang_fault_tolerance_config.
