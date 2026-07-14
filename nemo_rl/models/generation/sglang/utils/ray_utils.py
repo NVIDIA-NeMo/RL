@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import os
-import random
 import socket
 
 import ray
+
+from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
 
 # Env vars Ray uses to gate its visible-device manipulation. Setting any of
 # these to "1" tells Ray not to override the corresponding *_VISIBLE_DEVICES
@@ -33,29 +34,26 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
 ]
 
 
-def find_available_port(base_port: int):
-    port = base_port + random.randint(100, 1000)
-    while True:
-        if is_port_available(port):
-            return port
-        if port < 60000:
-            port += 42
-        else:
-            port -= 43
+@ray.remote
+class Lock:
+    def __init__(self):
+        self._locked = False  # False: unlocked, True: locked
 
+    def acquire(self):
+        """Try to acquire the lock.
 
-def is_port_available(port):
-    """Return whether a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", port))
-            s.listen(1)
+        Returns True if acquired, False otherwise. Caller should retry until
+        it returns True.
+        """
+        if not self._locked:
+            self._locked = True
             return True
-        except OSError:
-            return False
-        except OverflowError:
-            return False
+        return False
+
+    def release(self):
+        """Release the lock, allowing others to acquire."""
+        assert self._locked, "Lock is not acquired, cannot release."
+        self._locked = False
 
 
 def get_host_info():
@@ -123,15 +121,6 @@ def get_host_info():
 
 
 def get_current_node_ip():
-    address = ray._private.services.get_node_ip_address()
-    # strip ipv6 address
-    address = address.strip("[]")
-    return address
-
-
-def get_free_port(start_port=7000, consecutive=1):
-    # find the port where port, port + 1, port + 2, ... port + consecutive - 1 are all available
-    port = start_port
-    while not all(is_port_available(port + i) for i in range(consecutive)):
-        port += 1
-    return port
+    ip = _get_node_ip_local()
+    # strip ipv6 brackets so callers get a bare ip
+    return ip.strip("[]") if ip is not None else None
