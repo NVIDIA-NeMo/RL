@@ -40,12 +40,14 @@ def _make_master_config(
     max_num_steps: int = 100,
     max_num_epochs: int = 1,
     num_prompts_per_step: int = 4,
+    checkpoint_dir: str = "/nonexistent/nemo-rl-sc-test-checkpoints",
 ) -> MasterConfig:
     """Build a partially-populated MasterConfig for unit tests.
 
-    Cross-cutting components (cluster/checkpointing/...) are required by pydantic for
+    Cross-cutting components (cluster/logger/...) are required by pydantic for
     normal load but unused here — model_construct skips validation, and we hand-fill
-    only the dict-shaped fields setup reads.
+    only the dict-shaped fields setup reads (including checkpointing; the default
+    checkpoint_dir never exists, so setup takes the fresh-start path).
     """
     return MasterConfig.model_construct(
         data_plane={"enabled": dp_enabled, "impl": "transfer_queue"},
@@ -61,6 +63,17 @@ def _make_master_config(
             "num_prompts_per_step": num_prompts_per_step,
             "num_generations_per_prompt": 2,
             "max_rollout_turns": 1,
+            "seed": 42,
+        },
+        checkpointing={
+            "enabled": False,
+            "checkpoint_dir": checkpoint_dir,
+            "metric_name": None,
+            "higher_is_better": True,
+            "keep_top_k": None,
+            "save_period": 10,
+            "save_optimizer": True,
+            "checkpoint_must_save_by": None,
         },
         policy={
             "max_total_sequence_length": 32,
