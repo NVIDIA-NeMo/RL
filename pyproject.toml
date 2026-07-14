@@ -45,7 +45,7 @@ dependencies = [
   "pillow>=11.3.0",
   "torchvision>=0.22.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
-  "mlflow>=3.5.0,<3.6.0",
+  "mlflow>=3.5.0",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
@@ -54,6 +54,7 @@ dependencies = [
   "cuda-bindings",                                                                                                    # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "setuptools_scm",
+  "ijson",
 ]
 
 [project.optional-dependencies]
