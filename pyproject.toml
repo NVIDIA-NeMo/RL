@@ -134,15 +134,15 @@ vllm = [
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Default wheels on GitHub are cu130. See v0.20.0 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.20.0
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.20.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Default wheels on GitHub are cu130. See v0.24.0 release assets:
+  # https://github.com/vllm-project/vllm/releases/tag/v0.24.0
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.24.0/vllm-0.24.0-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.24.0/vllm-0.24.0-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm==0.24.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.8.post1",
-  "flashinfer-cubin==0.6.8.post1",
-  "flashinfer-jit-cache==0.6.8.post1",
+  "flashinfer-python==0.6.12",
+  "flashinfer-cubin==0.6.12",
+  "flashinfer-jit-cache==0.6.12",
   "nvidia-cutlass-dsl[cu13]==4.5.2",
 ]
 sglang = [
@@ -356,19 +356,19 @@ override-dependencies = [
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
   "torchaudio==2.11.0",
-  # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
-  "llguidance>=1.3.0,<1.4.0",
+  # sglang has conflicting llguidance versions than vllm, so enforce vLLM 0.24's newer range.
+  "llguidance>=1.7.0,<1.8.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # vLLM 0.20.0 imports CUTLASS CUTE during Qwen3.5 MoE profiling.
+  # vLLM imports CUTLASS CUTE during Qwen3.5 MoE profiling.
   # 4.5.0 has a broken cutlass.cute import path for increment_coord.
   "nvidia-cutlass-dsl[cu13]==4.5.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
-  "xgrammar==0.1.33",
+  # vLLM 0.24 requires xgrammar>=0.2.1, superseding the old 0.1.33 CVE workaround.
+  "xgrammar>=0.2.1,<1.0.0",
   # Override dependencies to address CVEs
   "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
@@ -408,6 +408,11 @@ constraint-dependencies = [
   "prometheus-fastapi-instrumentator>=8.0.2",
   "av>=17.1.0",                               # Address CVE-2026-40962 (FFmpeg 8.0.1 bundled in av.libs; 17.1.0+ ships FFmpeg 8.1.x)
 ]
+
+# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
+# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
+# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
+exclude-dependencies = ["nvidia-cutlass-dsl-libs-base"]
 
 conflicts = [
   [

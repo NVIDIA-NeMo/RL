@@ -163,7 +163,9 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     )
 
     assert any("ModelOptMxFp8LinearMethod" in path for path in patched_paths)
-    assert any("ModelOptMxFp8FusedMoE.create_weights" in path for path in patched_paths)
+    assert not any(
+        "ModelOptMxFp8FusedMoE.create_weights" in path for path in patched_paths
+    )
     assert any(
         "ModelOptMxFp8FusedMoE.process_weights_after_loading" in path
         for path in patched_paths

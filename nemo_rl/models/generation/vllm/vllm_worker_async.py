@@ -467,7 +467,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             OpenAIServingRender,
         )
         from vllm.entrypoints.serve.tokenize.serving import (
-            OpenAIServingTokenization,
+            ServingTokenization,
         )
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
@@ -543,7 +543,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
 
-            # vLLM 0.20 moved chat preprocessing from
+            # vLLM routes chat preprocessing through
             # OpenAIServing._preprocess_chat to OpenAIServingRender.preprocess_chat,
             # so this override now applies via the render subclass.
             async def preprocess_chat(
@@ -554,8 +554,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 default_template_content_format,
                 default_template_kwargs,
                 tool_dicts=None,
-                tool_parser=None,
-                reasoning_parser=None,
+                parser=None,
                 *,
                 skip_mm_cache: bool = False,
             ):
@@ -587,8 +586,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         default_template_content_format=default_template_content_format,
                         default_template_kwargs=default_template_kwargs,
                         tool_dicts=tool_dicts,
-                        tool_parser=tool_parser,
-                        reasoning_parser=reasoning_parser,
+                        parser=parser,
                         skip_mm_cache=skip_mm_cache,
                     )
                 except (ValueError, VLLMValidationError) as e:
@@ -641,8 +639,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     default_template_content_format=default_template_content_format,
                     default_template_kwargs=default_template_kwargs,
                     tool_dicts=tool_dicts,
-                    tool_parser=tool_parser,
-                    reasoning_parser=reasoning_parser,
+                    parser=parser,
                     skip_mm_cache=skip_mm_cache,
                 )
                 actual_corresponding_token_ids = corresponding_res[1][0][
@@ -680,7 +677,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ):
             required_prefix_token_ids: Optional[List[int]] = None
 
-        # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
+        # vLLM routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
         # belongs on the render subclass.
         worker_self = self
@@ -782,7 +779,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     request, raw_request
                 )
             except VLLMValidationError as e:
-                # vLLM 0.20 raises VLLMValidationError for prompts exceeding
+                # vLLM raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
                 # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
                 # detect context-length overflow and handle it gracefully.
@@ -823,9 +820,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
 
-        # Tokenize path delegates to OpenAIServingRender.preprocess_chat in
-        # vLLM 0.20, where the prefix-token override lives.
-        class NeMoRLOpenAIServingTokenization(OpenAIServingTokenization):
+        # Tokenize path delegates to OpenAIServingRender.preprocess_chat, where
+        # the prefix-token override lives.
+        class NeMoRLServingTokenization(ServingTokenization):
             pass
 
         serving_tokenization_kwargs = dict(
@@ -834,11 +831,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
-            engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
             openai_serving_render=openai_serving_render,
         )
-        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
+        openai_serving_tokenization = NeMoRLServingTokenization(
             **serving_tokenization_kwargs
         )
 

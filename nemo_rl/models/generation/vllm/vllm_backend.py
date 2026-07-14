@@ -226,7 +226,7 @@ class VllmInternalWorkerExtension:
     ) -> list[tuple[str, torch.Tensor]]:
         """Trim padded vocab dimensions from draft weights.
 
-        Megatron pads vocab to a multiple, but vLLM 0.20's autoloader
+        Megatron pads vocab to a multiple, but vLLM's autoloader
         strictly asserts loaded_weight.shape[0] == org_vocab_size on
         VocabParallelEmbedding layers. Each such layer may have a
         different org_vocab_size (e.g. embed_tokens uses vocab_size

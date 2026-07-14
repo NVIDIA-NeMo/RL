@@ -230,7 +230,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class OpenAIServingTokenization:
+    class ServingTokenization:
         instances = []
 
         def __init__(self, **kwargs):
@@ -279,7 +279,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
-        OpenAIServingTokenization=OpenAIServingTokenization,
+        ServingTokenization=ServingTokenization,
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
