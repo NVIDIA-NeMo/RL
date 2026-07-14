@@ -100,3 +100,25 @@ def get_current_node_ip():
     ip = _get_node_ip_local()
     # strip ipv6 brackets so callers get a bare ip
     return ip.strip("[]") if ip is not None else None
+
+
+@ray.remote  # pragma: no cover
+class Lock:
+    def __init__(self):
+        self._locked = False  # False: unlocked, True: locked
+
+    def acquire(self):
+        """Try to acquire the lock.
+
+        Returns True if acquired, False otherwise. Caller should retry until
+        it returns True.
+        """
+        if not self._locked:
+            self._locked = True
+            return True
+        return False
+
+    def release(self):
+        """Release the lock, allowing others to acquire."""
+        assert self._locked, "Lock is not acquired, cannot release."
+        self._locked = False

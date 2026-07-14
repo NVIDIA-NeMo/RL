@@ -311,8 +311,18 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
+def setup_distributed(config: Optional[PolicyConfig] = None) -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
+    generation_cfg = (config or {}).get("generation") or {}
+    rollout_backend = generation_cfg.get("backend")
+    is_generation_colocated = (generation_cfg.get("colocated") or {}).get("enabled")
+
+    # SGLang's scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0 and the
+    # trainer has to agree with it, so this one has to land before the process
+    # group below picks a transport.
+    if rollout_backend == "sglang":
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
@@ -320,6 +330,13 @@ def setup_distributed() -> None:
     destroy_parallel_state()
     # Initialize process group
     torch.distributed.init_process_group("nccl")
+
+    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+    # Deliberately after init_process_group: it targets the refit communicator,
+    # not the training process group.
+    if not is_generation_colocated and rollout_backend != "sglang":
+        os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
 
 def validate_and_set_config(
@@ -345,22 +362,19 @@ def validate_and_set_config(
 
     # Handle generation configuration
     is_generation_colocated = None
+    rollout_backend = None
     sampling_params = None
     if "generation" in config and config["generation"] is not None:
         generation_cfg = config["generation"]
         # set generation colocated
         is_generation_colocated = generation_cfg["colocated"]["enabled"]
+        rollout_backend = generation_cfg.get("backend")
         # set sampling params
         sampling_params = TrainingSamplingParams(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
         )
-
-    # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
-    # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
-    if not is_generation_colocated:
-        os.environ["NCCL_CUMEM_ENABLE"] = "1"
 
     # Setup data types
     dtype_map = {
