@@ -33,7 +33,7 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object())
+    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
