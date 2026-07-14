@@ -302,9 +302,14 @@ def setup_single_controller(
         or grpo_config["val_at_start"]
         or grpo_config["val_at_end"]
     )
-    if validation_enabled and bool(master_config.env.get("should_use_nemo_gym")):
+    if (
+        validation_enabled
+        and bool(master_config.env.get("should_use_nemo_gym"))
+        and master_config.env.get("nemo_gym", {}).get("effort_levels") is not None
+    ):
         raise NotImplementedError(
-            "SingleController validation does not support NeMo-Gym yet."
+            "SingleController NeMo-Gym validation does not support "
+            "env.nemo_gym.effort_levels yet."
         )
 
     set_seed(grpo_config["seed"])
@@ -352,25 +357,45 @@ def setup_single_controller(
                 "A nonempty validation dataset is required when validation is enabled."
             )
         val_batch_size = grpo_config["val_batch_size"]
-        if (
-            not isinstance(val_batch_size, int)
-            or isinstance(val_batch_size, bool)
-            or val_batch_size <= 0
-        ):
-            raise ValueError(
-                "grpo.val_batch_size must be a positive integer for native "
-                "SingleController validation."
-            )
         max_val_samples = grpo_config["max_val_samples"]
-        if (
-            not isinstance(max_val_samples, int)
-            or isinstance(max_val_samples, bool)
-            or max_val_samples <= 0
-        ):
-            raise ValueError(
-                "grpo.max_val_samples must be a positive integer for native "
-                "SingleController validation."
-            )
+        if use_nemo_gym:
+            if max_val_samples is not None:
+                raise ValueError(
+                    "grpo.max_val_samples must be None for NeMo-Gym "
+                    "SingleController validation."
+                )
+            if val_batch_size is None:
+                val_batch_size = min(
+                    len(val_dataset), master_config.async_rl.max_inflight_prompts
+                )
+            elif (
+                not isinstance(val_batch_size, int)
+                or isinstance(val_batch_size, bool)
+                or val_batch_size <= 0
+            ):
+                raise ValueError(
+                    "grpo.val_batch_size must be a positive integer or None for "
+                    "NeMo-Gym SingleController validation."
+                )
+        else:
+            if (
+                not isinstance(val_batch_size, int)
+                or isinstance(val_batch_size, bool)
+                or val_batch_size <= 0
+            ):
+                raise ValueError(
+                    "grpo.val_batch_size must be a positive integer for native "
+                    "SingleController validation."
+                )
+            if (
+                not isinstance(max_val_samples, int)
+                or isinstance(max_val_samples, bool)
+                or max_val_samples <= 0
+            ):
+                raise ValueError(
+                    "grpo.max_val_samples must be a positive integer for native "
+                    "SingleController validation."
+                )
         val_dataloader = StatefulDataLoader(
             val_dataset,
             batch_size=val_batch_size,
@@ -444,12 +469,14 @@ def setup_single_controller(
                 f"only; got {generation_config['backend']!r}"
             )
         enable_router_replay = router_replay_enabled(master_config.policy)
-        env_handles["nemo_gym"] = spinup_nemo_gym_actor(
+        nemo_gym_actor = spinup_nemo_gym_actor(
             env_configs=master_config.env,
             base_urls=generation.dp_openai_server_base_urls,
             model_name=generation_config["model_name"],
             enable_router_replay=enable_router_replay,
         )
+        env_handles["nemo_gym"] = nemo_gym_actor
+        val_env_handles["nemo_gym"] = nemo_gym_actor
 
     # ==========================
     # Setup Data Plane Client & Weight Sync
@@ -501,7 +528,7 @@ def setup_single_controller(
             max_rollout_turns=grpo_config.get("max_rollout_turns"),
             policy_generation=generation,
             generation_config=generation_config,
-            use_nemo_gym=False,
+            use_nemo_gym=use_nemo_gym,
             tq_buffer=None,
         )
 

@@ -23,6 +23,7 @@ import pytest
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
+    AsyncRLConfig,
     MasterConfig,
     SingleControllerBundle,
     setup_single_controller,
@@ -40,6 +41,12 @@ def _make_master_config(
     max_num_steps: int = 100,
     max_num_epochs: int = 1,
     num_prompts_per_step: int = 4,
+    val_period: int = 0,
+    val_at_start: bool = False,
+    val_at_end: bool = False,
+    val_batch_size: int | None = 2,
+    max_val_samples: int | None = 3,
+    max_inflight_prompts: int = 4,
     checkpoint_dir: str = "/nonexistent/nemo-rl-sc-test-checkpoints",
 ) -> MasterConfig:
     """Build a partially-populated MasterConfig for unit tests.
@@ -63,6 +70,11 @@ def _make_master_config(
             "num_prompts_per_step": num_prompts_per_step,
             "num_generations_per_prompt": 2,
             "max_rollout_turns": 1,
+            "val_period": val_period,
+            "val_at_start": val_at_start,
+            "val_at_end": val_at_end,
+            "val_batch_size": val_batch_size,
+            "max_val_samples": max_val_samples,
             "seed": 42,
         },
         checkpointing={
@@ -81,10 +93,19 @@ def _make_master_config(
             "generation": {
                 "backend": backend,
                 "colocated": {"enabled": colocated, "resources": {}},
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "vllm_cfg": {
+                    "async_engine": True,
+                    "expose_http_server": True,
+                },
             },
         },
         loss_fn=ClippedPGLossConfig(),
         env=env if env is not None else {},
+        async_rl=AsyncRLConfig(max_inflight_prompts=max_inflight_prompts),
     )
 
 
@@ -96,21 +117,35 @@ def patched_factories():
     without re-importing the patch handles.
     """
     fake_dataset = list(range(8))
+    fake_val_dataset = list(range(3))
     fake_dataloader = MagicMock(name="dataloader")
+    fake_val_dataloader = MagicMock(name="val_dataloader")
     # len(dataloader) used by the Megatron train_iters injection.
     fake_dataloader.__len__ = MagicMock(return_value=4)
     fake_env_handles = {"math": MagicMock(name="math_env")}
+    fake_val_env_handles = {"math": MagicMock(name="val_math_env")}
+
+    def _make_dataloader(dataset, *args, **kwargs):
+        del args, kwargs
+        if dataset is fake_val_dataset:
+            return fake_val_dataloader
+        return fake_dataloader
 
     with (
         patch.object(
             sc_setup_mod,
             "setup_response_data",
-            return_value=(fake_dataset, None, fake_env_handles, {}),
+            return_value=(
+                fake_dataset,
+                fake_val_dataset,
+                fake_env_handles,
+                fake_val_env_handles,
+            ),
         ) as mock_setup_response,
         patch.object(
             sc_setup_mod,
             "StatefulDataLoader",
-            return_value=fake_dataloader,
+            side_effect=_make_dataloader,
         ) as mock_dataloader,
         patch.object(
             sc_setup_mod,
@@ -146,6 +181,11 @@ def patched_factories():
         ) as mock_loss,
         patch.object(
             sc_setup_mod,
+            "spinup_nemo_gym_actor",
+            return_value=MagicMock(name="nemo_gym_actor"),
+        ) as mock_nemo_gym_actor,
+        patch.object(
+            sc_setup_mod,
             "_generation_max_seq_len",
             return_value=32,
         ),
@@ -160,8 +200,12 @@ def patched_factories():
             "create_weight_synchronizer": mock_weight_sync,
             "_create_advantage_estimator": mock_adv,
             "ClippedPGLossFn": mock_loss,
+            "spinup_nemo_gym_actor": mock_nemo_gym_actor,
             "dataloader": fake_dataloader,
+            "val_dataloader": fake_val_dataloader,
+            "val_dataset": fake_val_dataset,
             "env_handles": fake_env_handles,
+            "val_env_handles": fake_val_env_handles,
         }
 
 
@@ -193,6 +237,8 @@ class TestSetup:
             is patched_factories["build_data_plane_client"].return_value
         )
         assert bundle.dataloader is patched_factories["dataloader"]
+        assert bundle.val_dataloader is None
+        assert bundle.validation_rollout_manager is None
         assert bundle.weight_synchronizer is (
             patched_factories["create_weight_synchronizer"].return_value
         )
@@ -209,6 +255,164 @@ class TestSetup:
         assert bundle.tq_buffer._dp_client is bundle.dp_client
         assert bundle.partition_id == "rollout_data"
         assert bundle.tq_buffer._partition_id == "rollout_data"
+
+    def test_enabled_validation_builds_native_resources(self, patched_factories):
+        mc = _make_master_config(val_at_start=True)
+        tokenizer = MagicMock(pad_token_id=0)
+
+        bundle = setup_single_controller(mc, tokenizer)
+
+        assert bundle.val_dataloader is patched_factories["val_dataloader"]
+        assert bundle.val_env_handles is patched_factories["val_env_handles"]
+        val_loader_call = patched_factories["StatefulDataLoader"].call_args_list[1]
+        assert val_loader_call.args[0] is patched_factories["val_dataset"]
+        assert val_loader_call.kwargs == {
+            "batch_size": 2,
+            "shuffle": False,
+            "collate_fn": sc_setup_mod.rl_collate_fn,
+            "drop_last": False,
+            "num_workers": 0,
+        }
+
+        validation_manager = bundle.validation_rollout_manager
+        assert validation_manager is not None
+        assert validation_manager._num_generations_per_prompt == 1
+        assert validation_manager._tq_buffer is None
+        assert validation_manager._impl._env_handles is bundle.val_env_handles
+        assert (
+            validation_manager._impl._policy_generation
+            is patched_factories["_build_generation"].return_value
+        )
+
+    def test_enabled_validation_requires_nonempty_dataset(self, patched_factories):
+        mc = _make_master_config(val_period=1)
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+            patched_factories["env_handles"],
+            patched_factories["val_env_handles"],
+        )
+
+        with pytest.raises(ValueError, match="nonempty validation dataset"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        ("config_key", "invalid_value"),
+        [
+            ("val_batch_size", None),
+            ("val_batch_size", 0),
+            ("max_val_samples", None),
+            ("max_val_samples", 0),
+        ],
+    )
+    def test_enabled_validation_requires_positive_native_limits(
+        self,
+        patched_factories,
+        config_key,
+        invalid_value,
+    ):
+        kwargs = {"val_at_end": True, config_key: invalid_value}
+        mc = _make_master_config(**kwargs)
+
+        with pytest.raises(ValueError, match=f"grpo.{config_key}"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    @pytest.mark.parametrize(
+        ("val_batch_size", "max_inflight_prompts", "expected_batch_size"),
+        [(2, 4, 2), (None, 2, 2)],
+    )
+    def test_enabled_nemo_gym_validation_reuses_actor(
+        self,
+        patched_factories,
+        val_batch_size,
+        max_inflight_prompts,
+        expected_batch_size,
+    ):
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            patched_factories["val_dataset"],
+        )
+        mc = _make_master_config(
+            val_at_end=True,
+            val_batch_size=val_batch_size,
+            max_val_samples=None,
+            max_inflight_prompts=max_inflight_prompts,
+            env={"should_use_nemo_gym": True, "nemo_gym": {}},
+        )
+
+        bundle = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        nemo_gym_actor = patched_factories["spinup_nemo_gym_actor"].return_value
+        assert bundle.env_handles["nemo_gym"] is nemo_gym_actor
+        assert bundle.val_env_handles["nemo_gym"] is nemo_gym_actor
+        assert (
+            bundle.rollout_manager._impl._env_handles["nemo_gym"] is nemo_gym_actor
+        )
+        validation_manager = bundle.validation_rollout_manager
+        assert validation_manager is not None
+        assert validation_manager._impl._env_handles["nemo_gym"] is nemo_gym_actor
+        assert type(validation_manager._impl) is type(bundle.rollout_manager._impl)
+        assert (
+            validation_manager._impl._generation_config
+            is bundle.rollout_manager._impl._generation_config
+        )
+        assert validation_manager._num_generations_per_prompt == 1
+        assert validation_manager._tq_buffer is None
+        val_loader_call = patched_factories["StatefulDataLoader"].call_args_list[1]
+        assert val_loader_call.kwargs["batch_size"] == expected_batch_size
+        patched_factories["spinup_nemo_gym_actor"].assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("config_key", "invalid_value"),
+        [("max_val_samples", 3), ("val_batch_size", 0)],
+    )
+    def test_enabled_nemo_gym_validation_rejects_invalid_limits(
+        self,
+        patched_factories,
+        config_key,
+        invalid_value,
+    ):
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            patched_factories["val_dataset"],
+        )
+        kwargs = {
+            "val_at_end": True,
+            "val_batch_size": 2,
+            "max_val_samples": None,
+            config_key: invalid_value,
+            "env": {"should_use_nemo_gym": True, "nemo_gym": {}},
+        }
+
+        with pytest.raises(ValueError, match=f"grpo.{config_key}"):
+            setup_single_controller(
+                _make_master_config(**kwargs), MagicMock(pad_token_id=0)
+            )
+
+    def test_nemo_gym_validation_rejects_effort_before_external_setup(
+        self, patched_factories
+    ):
+        mc = _make_master_config(
+            val_at_end=True,
+            val_batch_size=None,
+            max_val_samples=None,
+            env={
+                "should_use_nemo_gym": True,
+                "nemo_gym": {"effort_levels": {"low_weight": 0.0}},
+            },
+        )
+
+        with pytest.raises(NotImplementedError, match="effort_levels"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        for factory_name in (
+            "setup_response_data",
+            "_build_clusters",
+            "_build_generation",
+            "_build_trainer",
+            "spinup_nemo_gym_actor",
+        ):
+            patched_factories[factory_name].assert_not_called()
 
     def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
         """setup_response_data receives master_config.env and supplies env handles."""

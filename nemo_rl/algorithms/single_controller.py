@@ -350,13 +350,15 @@ class SingleControllerActor:
         return result
 
     async def _run_validation(self, *, step: int) -> dict[str, Any]:
-        """Run one native validation pass against the synchronized generator."""
+        """Run one validation pass against the synchronized generator."""
         if self._val_dataloader is None or self._validation_rollout_manager is None:
             raise RuntimeError(
                 "SingleController validation resources were not initialized."
             )
 
-        max_val_samples = cast(int, self._master_config.grpo["max_val_samples"])
+        max_val_samples = cast(
+            Optional[int], self._master_config.grpo["max_val_samples"]
+        )
 
         timer = Timer()
         rewards: list[float] = []
@@ -366,11 +368,14 @@ class SingleControllerActor:
         print(f"▶ Starting validation at step {step}...", flush=True)
         with timer.time("total_validation_time"):
             for val_batch in self._val_dataloader:
-                remaining = max_val_samples - len(rewards)
-                if remaining <= 0:
-                    break
+                if max_val_samples is None:
+                    selected_rows = val_batch.size
+                else:
+                    remaining = max_val_samples - len(rewards)
+                    if remaining <= 0:
+                        break
 
-                selected_rows = min(val_batch.size, remaining)
+                    selected_rows = min(val_batch.size, remaining)
                 prompts: list[DatumSpec] = []
                 for row_idx in range(selected_rows):
                     prompt: DatumSpec = {  # type: ignore
