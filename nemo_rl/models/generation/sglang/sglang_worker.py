@@ -21,12 +21,14 @@ from collections.abc import Callable
 import ray
 import requests
 
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _get_free_consecutive_ports_local,
+)
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _format_v6_uri
 from nemo_rl.models.generation.sglang.utils.patches import _apply_sglang_compat_patches
-from nemo_rl.models.generation.sglang.utils.ray_utils import (
-    get_current_node_ip,
-    get_free_port,
-)
+from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
 
 logger = logging.getLogger(__name__)
 
@@ -162,10 +164,22 @@ class SGLangGenerationWorker:
         return response.json()
 
     @staticmethod
-    def _get_current_node_ip_and_free_port(start_port=7000, consecutive=1):
-        return get_current_node_ip(), get_free_port(
-            start_port=start_port, consecutive=consecutive
+    def _get_current_free_port(
+        port_range_low=DEFAULT_GENERATION_PORT_RANGE_LOW,
+        port_range_high=DEFAULT_GENERATION_PORT_RANGE_HIGH,
+        consecutive=1,
+        start_port=None,
+    ):
+        return _get_free_consecutive_ports_local(
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+            consecutive=consecutive,
+            start_port=start_port,
         )
+
+    @staticmethod
+    def _get_current_node_ip():
+        return get_current_node_ip()
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
@@ -289,6 +303,108 @@ class SGLangGenerationWorker:
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
+
+    def get_weight_version(self):
+        if self.node_rank != 0:
+            return
+        # newer sglang moved /get_weight_version into /model_info
+        for endpoint in ("/model_info", "/get_weight_version"):
+            response = requests.get(f"{self.server_base_url}{endpoint}")
+            if response.status_code == 200:
+                return response.json()["weight_version"]
+        response.raise_for_status()
+
+    def init_weights_update_group(
+        self, master_address, master_port, rank_offset, world_size, group_name, backend
+    ):
+        return self._make_request(
+            "init_weights_update_group",
+            {
+                "master_address": master_address,
+                "master_port": master_port,
+                "rank_offset": rank_offset,
+                "world_size": world_size,
+                "group_name": group_name,
+                "backend": backend,
+            },
+        )
+
+    def destroy_weights_update_group(self, group_name):
+        try:
+            return self._make_request(
+                "destroy_weights_update_group",
+                {
+                    "group_name": group_name,
+                },
+            )
+        except requests.exceptions.RequestException:
+            # catch the case where the engine is just created and does not have the group.
+            pass
+
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        flush_cache=False,
+        weight_version: str | None = None,
+    ):
+        payload = {
+            "names": names,
+            "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
+            "shapes": shapes,
+            "group_name": group_name,
+            "flush_cache": flush_cache,
+        }
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+        return self._make_request(
+            "update_weights_from_distributed",
+            payload,
+        )
+
+    def pause_generation(self, mode: str = "retract"):
+        response = requests.post(
+            f"{self.server_base_url}/pause_generation",
+            json={"mode": mode},
+        )
+        response.raise_for_status()
+        return response
+
+    def continue_generation(self):
+        response = requests.post(f"{self.server_base_url}/continue_generation", json={})
+        response.raise_for_status()
+        return response
+
+    def post_process_weights(
+        self,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = False,
+    ):
+        """Finalize engine-side weights after a distributed/IPC refit.
+
+        The HTTP server only posts metadata; the real weights were already
+        copied on-GPU by the preceding update path.
+        """
+        return self._make_request(
+            "post_process_weights",
+            {
+                "restore_weights_before_load": restore_weights_before_load,
+                "post_process_quantization": post_process_quantization,
+            },
+        )
+
+    def _simulate_crash(self):
+        """Test-only: tear the engine down to simulate a crash.
+
+        Underscore-prefixed to signal this is **not** part of the public
+        worker API; production code should never call it.
+        """
+        logger.info(
+            f"Simulating crash on engine {self.server_host}:{self.server_port}..."
+        )
+        self.shutdown()
 
     def start_profile(
         self,

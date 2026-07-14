@@ -31,6 +31,10 @@ class SGLangServerConfig(TypedDict):
     pause_generation_mode: str
     # Total number of GPUs allocated to inference across all engines.
     num_gpus: NotRequired[int]
+    # "ipc" -> CUDA-IPC to the colocated SGLang HTTP server (default for
+    # colocated inference). "broadcast" -> NCCL broadcast over a shared
+    # weight-update group (used when SGLang engines run on disaggregate GPUs).
+    weight_transfer_mode: NotRequired[str]
     # GPUs per SGLang engine
     # num_gpus_per_engine = tp_size * pp_size; set ep, dp-attn are not orthgonal to those
     # nodes_per_engine: max(1, num_gpus_per_engine // num_gpus_per_node)
@@ -67,6 +71,13 @@ class SglangSpecificArgs(TypedDict):
     # Nested server/router configs. Kept under ``sglang_cfg`` so YAML and call
     # sites have a single sglang namespace instead of three sibling fields.
     sglang_server_config: SGLangServerConfig
+
+    # Fault tolerance (RolloutHealthMonitor). Off by default; when enabled, a
+    # daemon thread health-checks each engine and restarts hung/dead actors.
+    use_fault_tolerance: NotRequired[bool]
+    rollout_health_check_interval: NotRequired[int]
+    rollout_health_check_timeout: NotRequired[int]
+    rollout_health_check_first_wait: NotRequired[int]
     sglang_router_config: SGLangRouterConfig
 
     # Path to model weights (local folder or HF repo id).
