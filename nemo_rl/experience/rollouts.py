@@ -1394,6 +1394,16 @@ def run_async_nemo_gym_rollout(
     )
     input_ids = batched_flat["token_ids"]
 
+    # Honor NeMo Gym's sample mask: agent servers set `mask_sample` on the
+    # verify response when a rollout's reward is unreliable (agent/eval
+    # timeout, OOM-killed container, failed trace capture). Zero the loss
+    # multiplier so the sample drops out of the gradient, mirroring the
+    # truncated-sample handling.
+    loss_multiplier = input_batch["loss_multiplier"].clone()
+    masked_samples = [bool(r["full_result"].get("mask_sample")) for r in results]
+    if any(masked_samples):
+        loss_multiplier[torch.tensor(masked_samples, dtype=torch.bool)] = 0
+
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
@@ -1402,7 +1412,7 @@ def run_async_nemo_gym_rollout(
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
             ),
-            "loss_multiplier": input_batch["loss_multiplier"],
+            "loss_multiplier": loss_multiplier,
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
             # idx: int
