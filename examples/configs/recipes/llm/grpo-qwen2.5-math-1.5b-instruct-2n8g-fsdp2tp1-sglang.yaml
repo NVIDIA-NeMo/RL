@@ -42,6 +42,7 @@ policy:
         pause_generation_mode: retract
         num_gpus: 16
         num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
+        weight_transfer_mode: ipc
       sglang_router_config:
         use_external_router: false
         use_distributed_post: true
