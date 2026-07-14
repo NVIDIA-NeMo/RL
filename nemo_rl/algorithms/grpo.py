@@ -1286,9 +1286,6 @@ def setup(
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
-        # Capture rollout TP size on the policy once; refit calls no longer need it.
-        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
-
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -1332,11 +1329,14 @@ def setup(
             "https://github.com/NVIDIA-NeMo/RL/issues/3288."
         )
 
-    # if it is not colocated inference, initialize collective communication for update weights
+    # If it is not colocated inference, initialize collective communication for
+    # weight updates. Sparse/checkpoint-engine transports initialize separately,
+    # and SGLang owns a process group created lazily by its refit driver.
     if (
         not colocated_inference
         and remote_transport is None
         and checkpoint_engine_config is None
+        and not isinstance(policy_generation, SGLangGeneration)
     ):
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
@@ -1375,6 +1375,18 @@ def setup(
             )  # type: ignore
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    if backend == "sglang" and isinstance(policy_generation, SGLangGeneration):
+        weight_transfer_mode = generation_config["sglang_cfg"][
+            "sglang_server_config"
+        ].get("weight_transfer_mode", "ipc" if colocated_inference else "broadcast")
+        expected = "ipc" if colocated_inference else "broadcast"
+        if weight_transfer_mode != expected:
+            raise ValueError(
+                f"sglang_server_config.weight_transfer_mode={weight_transfer_mode!r} "
+                f"is inconsistent with colocated.enabled={colocated_inference}: "
+                f"expected {expected!r}."
+            )
+
     if remote_transport is not None:
         t0 = time.perf_counter()
         assert isinstance(policy_generation, VllmGeneration)
@@ -2180,6 +2192,44 @@ def _clip_grpo_advantages(
     return advantages
 
 
+def _refit_sglang_dispatch(
+    *,
+    policy: ColocatablePolicyInterface,
+    policy_generation: SGLangGeneration,
+    buffer_size_bytes: int,
+    mode: str,
+) -> bool:
+    """Route an SGLang refit to the backend-specific helper.
+
+    Backend-specific lifecycle (lock + pause/flush + send + post_process +
+    continue) lives in the corresponding worker module:
+
+    - ``megatron_policy_worker.refit_sglang_{colocated,distributed}``
+    - ``dtensor_policy_worker_v2.refit_sglang_{colocated,distributed}``
+
+    so this function only picks the right module by trainer backend and
+    transfer mode.
+    """
+    use_megatron = bool(policy.cfg.get("megatron_cfg", {}).get("enabled", False))
+    if use_megatron:
+        from nemo_rl.models.policy.workers import megatron_policy_worker as _backend
+    else:
+        from nemo_rl.models.policy.workers import dtensor_policy_worker_v2 as _backend
+
+    if mode == "ipc":
+        helper = _backend.refit_sglang_colocated
+    elif mode == "broadcast":
+        helper = _backend.refit_sglang_distributed
+    else:
+        raise ValueError(f"unknown SGLang weight_transfer_mode: {mode!r}")
+
+    return helper(
+        policy=policy,
+        policy_generation=policy_generation,
+        buffer_size_bytes=buffer_size_bytes,
+    )
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -2235,8 +2285,9 @@ def refit_policy_generation(
     with timer_context:
         # update weights
         update_success = False
-        if colocated_inference:
-            # get model param keys, which is grouped by size
+        # Bucket size for streamed refits: every colocated path and the SGLang
+        # broadcast dispatch group parameters into buffers of this size.
+        if colocated_inference or isinstance(policy_generation, SGLangGeneration):
             if _refit_buffer_size_gb is not None:
                 buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
             else:
@@ -2247,15 +2298,14 @@ def refit_policy_generation(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
 
+        if colocated_inference:
             if isinstance(policy_generation, SGLangGeneration):
-                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
-                futures_train = policy.stream_weights_via_http(
-                    rollout_engine_urls=policy_generation.get_rollout_engine_urls(),
+                update_success = _refit_sglang_dispatch(
+                    policy=policy,
+                    policy_generation=policy_generation,
                     buffer_size_bytes=buffer_size_bytes,
+                    mode="ipc",
                 )
-                # Wait for all workers to complete
-                ray.get(futures_train)
-                update_success = True
             else:
                 # ZMQ IPC path: shared by vLLM and TRT-LLM colocated. Trainer
                 # streams CUDA IPC handles in chunks; receiver reconstructs
@@ -2271,23 +2321,27 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl (vLLM) or megatron reshard
-            # SGLang haven't implemented non-colocated inference mode.
+            # update weights through nccl (vLLM), megatron reshard, or the
+            # SGLang broadcast dispatch
             if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
+                update_success = _refit_sglang_dispatch(
+                    policy=policy,
+                    policy_generation=policy_generation,
+                    buffer_size_bytes=buffer_size_bytes,
+                    mode="broadcast",
                 )
-            if isinstance(policy_generation, MegatronGeneration):
-                futures_train = policy.swap_weights_via_reshard(is_source=True)
             else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
-                )
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+                if isinstance(policy_generation, MegatronGeneration):
+                    futures_train = policy.swap_weights_via_reshard(is_source=True)
+                else:
+                    futures_train = policy.broadcast_weights_for_collective(
+                        kv_scales=kv_scales
+                    )
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
 
         # check if update is successful
         if not update_success:

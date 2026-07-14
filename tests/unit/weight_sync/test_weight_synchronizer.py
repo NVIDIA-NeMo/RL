@@ -34,6 +34,9 @@ from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.ipc_weight_synchronizer import (
     IPCWeightSynchronizer,
 )
+from nemo_rl.weight_sync.sglang_weight_synchronizer import (
+    SGLangColocatedWeightSynchronizer,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,6 +50,7 @@ def _mock_policy(**overrides):
     policy.prepare_refit_info.return_value = {"layer_0": {"shape": [4096, 4096]}}
     policy.stream_weights_via_ipc_zmq.return_value = [MagicMock()]
     policy.stream_weights_via_http.return_value = [MagicMock()]
+    policy.cfg = {"megatron_cfg": {"enabled": False}}
     policy.broadcast_weights_for_collective.return_value = [MagicMock()]
     policy.init_collective.return_value = [MagicMock()]
     policy.get_free_memory_bytes.return_value = 1024**3  # 1 GB
@@ -63,7 +67,6 @@ def _mock_generation(**overrides):
     gen.prepare_refit_info.return_value = None
     gen.update_weights_via_ipc_zmq.return_value = [MagicMock()]
     gen.update_weights_from_collective.return_value = [MagicMock()]
-    gen.get_rollout_engine_urls.return_value = ["http://localhost:30000"]
     gen.init_collective.return_value = [MagicMock()]
     for k, v in overrides.items():
         setattr(gen, k, v)
@@ -341,6 +344,105 @@ class TestHTTPWeightSynchronizer:
 
 
 # ---------------------------------------------------------------------------
+# SGLangColocatedWeightSynchronizer
+# ---------------------------------------------------------------------------
+
+_SGLANG_REFIT_DRIVER = (
+    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.refit_sglang_colocated"
+)
+
+
+class TestSGLangColocatedWeightSynchronizer:
+    @patch(_SGLANG_REFIT_DRIVER)
+    def test_sync_weights_calls_full_lifecycle(self, mock_refit):
+        mock_refit.return_value = True
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+
+        assert sync.is_stale
+        sync.sync_weights()
+        assert not sync.is_stale
+
+        policy.offload_before_refit.assert_called_once()
+        gen.prepare_for_generation.assert_any_call(tags=["weights"])
+        mock_refit.assert_called_once()
+        call_kwargs = mock_refit.call_args.kwargs
+        assert call_kwargs["policy"] is policy
+        assert call_kwargs["policy_generation"] is gen
+        assert call_kwargs["buffer_size_bytes"] == int((1024**3) * 0.3)
+        policy.offload_after_refit.assert_called_once()
+        gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
+
+    @patch(_SGLANG_REFIT_DRIVER)
+    def test_fixed_buffer_size(self, mock_refit):
+        mock_refit.return_value = True
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen, refit_buffer_size_gb=2)
+
+        sync.sync_weights()
+        assert mock_refit.call_args.kwargs["buffer_size_bytes"] == 2 * (1024**3)
+
+    def test_mark_stale(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+
+        sync._stale = False
+        assert not sync.is_stale
+        sync.mark_stale()
+        assert sync.is_stale
+
+    def test_init_communicator(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+
+        sync.init_communicator()
+        policy.prepare_refit_info.assert_called_once()
+        gen.prepare_refit_info.assert_called_once()
+
+    @patch(_SGLANG_REFIT_DRIVER)
+    def test_phase_restoration_on_transfer_failure(self, mock_refit):
+        """offload_after_refit and kv_cache prep run even when transfer raises."""
+        mock_refit.side_effect = RuntimeError("IPC transfer exploded")
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+
+        with pytest.raises(RuntimeError, match="IPC transfer exploded"):
+            sync.sync_weights()
+
+        policy.offload_after_refit.assert_called_once()
+        gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
+        assert sync.is_stale
+
+    def test_negative_buffer_size_raises(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen, refit_buffer_size_gb=-1)
+        with pytest.raises(ValueError, match="refit_buffer_size_gb must be > 0"):
+            sync._compute_buffer_size()
+
+    def test_invalid_env_ratio_raises(self, monkeypatch):
+        monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "not_a_number")
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+        with pytest.raises(ValueError, match="must be a valid float"):
+            sync._compute_buffer_size()
+
+    def test_zero_env_ratio_raises(self, monkeypatch):
+        monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0")
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = SGLangColocatedWeightSynchronizer(policy, gen)
+        with pytest.raises(ValueError, match="must be > 0"):
+            sync._compute_buffer_size()
+
+
+# ---------------------------------------------------------------------------
 # CollectiveWeightSynchronizer
 # ---------------------------------------------------------------------------
 
@@ -433,7 +535,7 @@ class TestFactory:
         )
         assert isinstance(sync, IPCWeightSynchronizer)
 
-    def test_colocated_sglang_returns_http(self):
+    def test_colocated_sglang_returns_sglang_colocated(self):
         policy = _mock_policy()
         gen = _mock_generation()
         sync = create_weight_synchronizer(
@@ -442,7 +544,7 @@ class TestFactory:
             generation_backend=SGLANG_BACKEND,
             colocated=True,
         )
-        assert isinstance(sync, HTTPWeightSynchronizer)
+        assert isinstance(sync, SGLangColocatedWeightSynchronizer)
 
     def test_colocated_megatron_returns_ipc(self):
         policy = _mock_policy()

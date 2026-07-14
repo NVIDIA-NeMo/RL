@@ -90,7 +90,14 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ReferenceLogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    broadcast_hf_buckets_via_distributed_impl,
+    connect_colocate_topology,
+    connect_rollout_engines_from_distributed,
+    disconnect_rollout_engines_from_distributed,
+    get_runtime_env_for_policy_worker,
+    send_hf_buckets_via_ipc_actor_impl,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
@@ -308,7 +315,7 @@ class MegatronPolicyWorkerImpl(
         self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
         )
@@ -467,6 +474,29 @@ class MegatronPolicyWorkerImpl(
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+        ## SGLang weight-update state. Populated lazily by
+        ## ``connect_sglang_rollout_engines`` (colocate) or
+        ## ``connect_sglang_rollout_engines_distributed`` (broadcast).
+        self._sglang_ipc_state: dict = {}
+        generation_cfg = config.get("generation")
+        if (
+            generation_cfg is not None
+            and generation_cfg.get("backend") == "sglang"
+            and generation_cfg["colocated"]["enabled"]
+        ):
+            # Colocate refit serializes CUDA-IPC tensor handles for SGLang;
+            # the torch reductions monkey patch must be in place before any
+            # tensor is serialized.
+            from nemo_rl.models.generation.sglang.utils.train_utils import (
+                monkey_patch_torch_reductions,
+            )
+
+            monkey_patch_torch_reductions()
+        self._sglang_dist_group: Any = None
+        self._sglang_dist_group_name: str = "nemo_rl_sglang"
+        self._sglang_dist_engines: list = []
+        self._sglang_weight_version: int = 0
 
         self._init_inference_engine_state()
 
@@ -1983,6 +2013,162 @@ class MegatronPolicyWorkerImpl(
             ).reshape(1)
             yield param_name, scale_tensor
 
+    # ------------------------------------------------------------------
+    # SGLang weight update (colocate IPC + disaggregate broadcast)
+    # ------------------------------------------------------------------
+    def _build_sglang_hf_iterator(self):
+        from nemo_rl.models.policy.workers.megatron_sglang_weight_iterator import (
+            MegatronSGLangHfWeightIterator,
+        )
+
+        if self.refit_conversion_tasks is None:
+            self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+                [self.model]
+            )
+
+        return MegatronSGLangHfWeightIterator(
+            megatron_bridge=self.megatron_bridge,
+            models=[self.model],
+            conversion_tasks=self.refit_conversion_tasks,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/connect_sglang_rollout_engines")
+    def connect_sglang_rollout_engines(
+        self,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
+        """Set up the colocate Gloo gather topology for SGLang weight refit.
+
+        Must be called collectively by every Megatron rank when SGLang
+        engines are added or recovered. Subsequent calls with the same
+        layout are no-ops.
+        """
+        connect_colocate_topology(
+            engine_gpu_counts=list(engine_gpu_counts),
+            engine_gpu_offsets=(
+                list(engine_gpu_offsets) if engine_gpu_offsets is not None else None
+            ),
+            worker_state=self._sglang_ipc_state,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_colocated")
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict] = None,
+    ) -> None:
+        """Send finalized HF tensor buckets to colocated SGLang engines.
+
+        Synchronous: each chunk is awaited via ``ray.get`` inside
+        :func:`send_hf_buckets_via_ipc_actor_impl` before the next chunk
+        is sent, so trainer-side IPC tensors stay alive until the engine
+        has copied them and per-chunk engine failures surface immediately.
+        Raises ``RuntimeError`` on any chunk failure.
+        """
+        self._sglang_weight_version += 1
+        iterator = self._build_sglang_hf_iterator()
+        bucket_iter = iterator.iter_hf_weight_buckets(
+            buffer_size_bytes=buffer_size_bytes,
+        )
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            worker_state=self._sglang_ipc_state,
+            weight_version=self._sglang_weight_version,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name(
+        "megatron_policy_worker/connect_sglang_rollout_engines_distributed"
+    )
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list,
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit.
+
+        Only trainer rank 0 broadcasts to SGLang, so only rank 0 owns the
+        torch process group. Other ranks return immediately. Calling this
+        again after engines recover destroys the stale group first.
+        """
+        if self.rank != 0:
+            return
+
+        if group_name is not None:
+            self._sglang_dist_group_name = group_name
+
+        if self._sglang_dist_group is not None:
+            disconnect_rollout_engines_from_distributed(
+                group_name=self._sglang_dist_group_name,
+                model_update_group=self._sglang_dist_group,
+                rollout_engines=self._sglang_dist_engines,
+            )
+            self._sglang_dist_group = None
+            self._sglang_dist_engines = []
+
+        self._sglang_dist_group = connect_rollout_engines_from_distributed(
+            group_name=self._sglang_dist_group_name,
+            rollout_engines=list(rollout_engines),
+            engine_gpu_counts=list(engine_gpu_counts),
+        )
+        self._sglang_dist_engines = list(rollout_engines)
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/update_weights_to_sglang_distributed")
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list,
+        rollout_engine_lock,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict] = None,
+    ) -> None:
+        """Broadcast finalized HF tensors to SGLang engines from trainer rank 0.
+
+        Non-rank-0 trainers still walk the AutoBridge iterator (Megatron
+        gather + AutoBridge restoration is a collective), but they do not
+        participate in the NCCL broadcast. This matches the design's "trainer
+        rank 0 as the only source" decision.
+        """
+        self._sglang_weight_version += 1
+        iterator = self._build_sglang_hf_iterator()
+        bucket_iter = iterator.iter_hf_weight_buckets(
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+        if self.rank != 0:
+            # Drain the iterator so AutoBridge collectives complete on every
+            # rank, but do not broadcast.
+            for _ in bucket_iter:
+                pass
+            return
+
+        if self._sglang_dist_group is None:
+            raise RuntimeError(
+                "connect_sglang_rollout_engines_distributed must be called "
+                "before update_weights_to_sglang_distributed."
+            )
+
+        broadcast_hf_buckets_via_distributed_impl(
+            bucket_iterator=bucket_iter,
+            rollout_engines=list(rollout_engines),
+            rollout_engine_lock=rollout_engine_lock,
+            group_name=self._sglang_dist_group_name,
+            model_update_group=self._sglang_dist_group,
+            weight_version=self._sglang_weight_version,
+        )
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
@@ -2633,3 +2819,130 @@ class MegatronPolicyWorkerImpl(
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Driver-side SGLang weight-update dispatch (Megatron backend)
+# ---------------------------------------------------------------------------
+def refit_sglang_colocated(
+    *,
+    policy: Any,
+    policy_generation: Any,
+    buffer_size_bytes: int,
+) -> bool:
+    """Refit colocated SGLang engines from the Megatron policy.
+
+    Lifecycle: optional fault-tolerance recover, connect (when new /
+    recovered engines), pause + flush, send HF tensor buckets via Ray
+    IPC, post-process, continue.
+    """
+    from nemo_rl.models.policy.utils import (
+        fetch_updatable_engines_with_recover,
+        get_sglang_quantization_cfg,
+    )
+
+    sglang_quant = get_sglang_quantization_cfg(policy_generation)
+    target_precision = sglang_quant.get("scheme", "bf16")
+
+    (
+        rollout_engines,
+        _rollout_engine_lock,
+        num_new_engines,
+        engine_gpu_counts,
+        engine_gpu_offsets,
+    ) = fetch_updatable_engines_with_recover(policy_generation)
+
+    if num_new_engines > 0:
+        policy.connect_sglang_rollout_engines(
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+        policy_generation.clear_updatable_num_new_engines()
+        assert policy_generation.num_new_engines == 0, (
+            "clear_updatable_num_new_engines did not zero num_new_engines"
+        )
+
+    # Pause with the configured mode, but only invalidate the KV cache when
+    # the mode actually drops generation state. "in_place" leaves the engine
+    # paused without dropping its KV cache, so flushing would clobber the
+    # still-valid in-place state.
+    pause_mode = policy_generation.pause_generation_mode
+    policy_generation.pause_generation(mode=pause_mode)
+    policy_generation.invalidate_kv_cache()
+    try:
+        # Per-worker actor method is now synchronous (per-chunk ray.get +
+        # lifetime-safe IPC handled inside send_hf_buckets_via_ipc_actor_impl),
+        # but the policy-group dispatch still returns one Ray future per
+        # worker; we await those here to wait for all trainer ranks.
+        futures = policy.update_weights_to_sglang_colocated(
+            rollout_engines=rollout_engines,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quant,
+        )
+        ray.get(futures)
+        policy_generation.post_process_weights()
+    finally:
+        policy_generation.continue_generation()
+    return True
+
+
+def refit_sglang_distributed(
+    *,
+    policy: Any,
+    policy_generation: Any,
+    buffer_size_bytes: int,
+) -> bool:
+    """Broadcast Megatron-restored HF tensors to disaggregate SGLang via NCCL.
+
+    Trainer rank 0 owns the SGLang weight-update group; non-rank-0 ranks still
+    walk the AutoBridge collective inside ``update_weights_to_sglang_distributed``
+    but do not broadcast. Includes optional fault-tolerance recover prelude.
+    """
+    from nemo_rl.models.policy.utils import (
+        fetch_updatable_engines_with_recover,
+        get_sglang_quantization_cfg,
+    )
+
+    sglang_quant = get_sglang_quantization_cfg(policy_generation)
+    target_precision = sglang_quant.get("scheme", "bf16")
+
+    (
+        rollout_engines,
+        rollout_engine_lock,
+        num_new_engines,
+        engine_gpu_counts,
+        _engine_gpu_offsets,
+    ) = fetch_updatable_engines_with_recover(policy_generation)
+
+    if num_new_engines > 0:
+        policy.connect_sglang_rollout_engines_distributed(
+            rollout_engines=rollout_engines,
+            engine_gpu_counts=engine_gpu_counts,
+        )
+        policy_generation.clear_updatable_num_new_engines()
+        assert policy_generation.num_new_engines == 0, (
+            "clear_updatable_num_new_engines did not zero num_new_engines"
+        )
+
+    # Pause with the configured mode, but only invalidate the KV cache when
+    # the mode actually drops generation state. "in_place" leaves the engine
+    # paused without dropping its KV cache, so flushing would clobber the
+    # still-valid in-place state.
+    pause_mode = policy_generation.pause_generation_mode
+    policy_generation.pause_generation(mode=pause_mode)
+    if pause_mode != "in_place":
+        policy_generation.invalidate_kv_cache()
+    try:
+        futures = policy.update_weights_to_sglang_distributed(
+            rollout_engines=rollout_engines,
+            rollout_engine_lock=rollout_engine_lock,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quant,
+        )
+        ray.get(futures)
+        policy_generation.post_process_weights()
+    finally:
+        policy_generation.continue_generation()
+    return True
