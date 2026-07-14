@@ -536,16 +536,14 @@ class SingleControllerActor:
             rollout_exhausted = False
 
             for mb_idx in range(num_minibatches):
-                step_id = f"sc-step-{self._train_steps:06d}-mb-{mb_idx:02d}"
                 groups_dispatched = 0
                 step_open = False
                 step_min_weight_version: int | None = None
 
-                # No SC-side error handling here (yuki, #2700 review):
-                # a mid-cycle worker failure propagates out of run() —
-                # the worker restores its own hooks on failure (see
-                # megatron_policy_worker), and abort_train_step + a retry
-                # policy return with fault-tolerance support.
+                # No SC-side error handling: a mid-cycle worker failure
+                # propagates out of run(). The worker restores its own hooks
+                # on failure (see megatron_policy_worker); abort_train_step
+                # + a retry policy return with fault-tolerance support.
                 while groups_dispatched < groups_per_minibatch:
                     await asyncio.sleep(0)
                     await self._claim_available_meta()
@@ -586,12 +584,8 @@ class SingleControllerActor:
                     self._claimed_meta = self._claimed_meta.drop(group_indices)
 
                     if logprobs_required:
-                        # Trainer writes refreshed prev_lp / ref_lp back to
-                        # the TQ partition under the configured field names.
-                        # SC decides which columns to refresh and calls the
-                        # getters directly (yuki, #2700 review — no dispatcher
-                        # indirection). Block here: advantage estimation
-                        # downstream reads them.
+                        # Block here — advantage stage downstream reads the
+                        # refreshed prev_lp / ref_lp columns.
                         with self._timed("prepare_logprobs"):
                             if refresh_policy_logprobs:
                                 await asyncio.to_thread(
