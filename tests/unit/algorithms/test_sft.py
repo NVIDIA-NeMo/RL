@@ -253,3 +253,38 @@ def test_training_with_negative_val_period(mock_components):
     )
 
     assert mock_components["policy"].train.call_count == 3
+
+
+def test_ft_save_period_triggers_periodic_saves(mock_components):
+    """ft_save_period triggers checkpoint saves independent of save_period."""
+    cfg = mock_components["master_config"]
+    cfg.sft.val_period = 0
+    cfg.sft.max_num_steps = 5
+    cfg.sft.max_num_epochs = 1
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100  # only the final step would save
+    cfg.checkpointing["ft_save_period"] = 2
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
+
+    sft_save_state = _initial_sft_save_state()
+
+    with patch("nemo_rl.algorithms.sft.torch.save"):
+        sft_train(
+            mock_components["policy"],
+            mock_components["train_dataloader"],
+            None,
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            cfg,
+            mock_components["logger"],
+            checkpointer,
+            sft_save_state,
+        )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last
+    # step (5). Each save calls init_tmp_checkpoint(step, ...).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]

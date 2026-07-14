@@ -831,6 +831,17 @@ class StubAsyncTrajectoryCollector:
         mock.remote = MagicMock(return_value={})
         return mock
 
+    @property
+    def get_dataloader_state(self):
+        """Return a remote-callable mock yielding a checkpointable dataloader state.
+
+        Exercised by async_grpo_train's checkpoint-save path, which persists the
+        collector's dataloader state alongside the replay buffer.
+        """
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={})
+        return mock
+
 
 def mock_async_grpo_infrastructure(
     mock_batch, mock_rollout_metrics, seq_logprob_error_result=None
@@ -1973,6 +1984,97 @@ def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path)
 
     checkpointer.begin_finalization.assert_called_once()
     checkpointer.shutdown.assert_called_once()
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_ft_save_period_triggers_periodic_saves(
+    mock_grpo_components, train_func, tmp_path
+):
+    """ft_save_period triggers checkpoint saves independent of save_period.
+
+    Covers both GRPO training paths (grpo_train and async_grpo_train). With
+    save_period large enough to only fire on the final step, ft_save_period=2
+    must add saves at steps 2 and 4, and the last step (5) is saved as usual.
+    """
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    checkpointer = mock_grpo_components["checkpointer"]
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["max_num_steps"] = 5
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["val_at_end"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.checkpointing["enabled"] = True
+    master_config.checkpointing["save_period"] = 100  # only the final step saves
+    master_config.checkpointing["ft_save_period"] = 2
+    master_config.checkpointing["metric_name"] = None
+
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/checkpoint"
+    # Both paths write latest_checkpoint_status.json under checkpoint_dir; give
+    # the mocked checkpointer a real directory so that write succeeds.
+    checkpointer.checkpoint_dir = tmp_path
+
+    if train_func == async_grpo_train:
+        master_config.policy["generation"]["colocated"]["enabled"] = False
+        with (
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+            _patched_logprob_phase(policy),
+            patch("nemo_rl.algorithms.grpo.torch.save"),
+        ):
+            train_func(
+                policy,
+                _mock_policy_generation(),
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                checkpointer,
+                _default_grpo_save_state(),
+                master_config,
+            )
+    else:
+        with (
+            _patched_logprob_phase(policy),
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=_mock_seq_logprob_error_result(),
+            ),
+            patch("nemo_rl.algorithms.grpo.torch.save"),
+        ):
+            train_func(
+                policy,
+                _mock_policy_generation(),
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                checkpointer,
+                _default_grpo_save_state(),
+                master_config,
+            )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last
+    # step (5). Each save calls init_tmp_checkpoint(step, ...).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
