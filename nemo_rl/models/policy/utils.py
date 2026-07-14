@@ -803,6 +803,7 @@ def init_process_group(
     from torch.distributed.distributed_c10d import (
         Backend,
         PrefixStore,
+        _get_default_group,
         _new_process_group_helper,
         _world,
         default_pg_timeout,
@@ -836,16 +837,28 @@ def init_process_group(
     # False because ``"1"`` sorts before ``"6"`` lexicographically.
     _torch_mm = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
     pg_options_kw = "backend_options" if _torch_mm >= (2, 6) else "pg_options"
-    pg, _ = _new_process_group_helper(
-        world_size,
-        rank,
-        [],
-        backend,
-        store,
-        group_name=group_name,
-        **{pg_options_kw: pg_options},
-        timeout=timeout,
-    )
+
+    # Disable the ncclCommSplit path (see docstring). Safe to mutate here:
+    # nothing else reads ``bound_device_id`` during group construction, and
+    # refit setup does not create process groups from other threads.
+    default_pg = _get_default_group() if dist.is_initialized() else None
+    saved_bound_device_id = getattr(default_pg, "bound_device_id", None)
+    if saved_bound_device_id is not None:
+        default_pg.bound_device_id = None
+    try:
+        pg, _ = _new_process_group_helper(
+            world_size,
+            rank,
+            [],
+            backend,
+            store,
+            group_name=group_name,
+            **{pg_options_kw: pg_options},
+            timeout=timeout,
+        )
+    finally:
+        if saved_bound_device_id is not None:
+            default_pg.bound_device_id = saved_bound_device_id
 
     # Map identity ranks so collective ops can resolve member ranks for ``pg``.
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
