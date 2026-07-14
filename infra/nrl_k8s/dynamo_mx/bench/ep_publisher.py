@@ -135,9 +135,14 @@ print(
     flush=True,
 )
 
-sid = pub.publish(version=1)
+publish_version = int(os.environ.get("PUBLISH_VERSION", "1"))
+sid = pub.publish(version=publish_version)
 pub.mark_ready()
-print(f"[pub r{RANK}] published ep_rank={ep_rank} sid={sid} READY", flush=True)
+print(
+    f"[pub r{RANK}] published ep_rank={ep_rank} version={publish_version} "
+    f"sid={sid} READY",
+    flush=True,
+)
 # No post-publish barrier: each rank publishes independently and the receiver
 # discovers all EP ranks from the MX server, so a collective here only risks
 # tearing ranks down (NCCL comm can be perturbed by NIXL CUDA registration under
