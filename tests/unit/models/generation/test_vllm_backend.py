@@ -33,7 +33,7 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object())
+    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -99,6 +99,9 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
         process_calls.append((model, model_config, device))
 
     monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda cfg: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
         "vllm.model_executor.model_loader.utils.process_weights_after_loading",
         process_weights_after_loading,
     )
@@ -116,6 +119,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
         post_unpack_func([("model.weight", "weight-value")])
 
     ext._load_weights = load_weights
+    ext._reset_moe_weights_for_refit = lambda model: None
     ext._maybe_process_fp8_kv_cache = lambda: call_order.append("kv")
     monkeypatch.setattr(
         vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
