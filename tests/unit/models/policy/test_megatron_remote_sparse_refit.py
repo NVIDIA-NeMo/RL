@@ -71,11 +71,13 @@ def _install_mapping_types(monkeypatch, remote_refit_type):
         staticmethod(
             lambda: (
                 _AutoMapping,
-                _ColumnMapping,
-                _DirectMapping,
-                _GatedMapping,
-                _ReplicatedMapping,
-                _RowMapping,
+                {
+                    _ColumnMapping: megatron_remote_sparse_refit._COLUMN,
+                    _DirectMapping: megatron_remote_sparse_refit._DIRECT,
+                    _GatedMapping: megatron_remote_sparse_refit._GATED,
+                    _ReplicatedMapping: megatron_remote_sparse_refit._REPLICATED,
+                    _RowMapping: megatron_remote_sparse_refit._ROW,
+                },
             )
         ),
     )
@@ -86,19 +88,29 @@ def _install_mapping_types(monkeypatch, remote_refit_type):
     )
 
 
-def test_remote_sparse_stream_drains_cuda_before_return(monkeypatch):
-    class Worker:
-        cfg = {}
-        fp8_cfg = None
-        model = object()
-        megatron_bridge = SimpleNamespace(get_conversion_tasks=lambda _models: [])
+def _worker(tasks=(), *, fp8_cfg=None, export=None):
+    if export is None:
 
-        @staticmethod
-        def _iter_params_with_optional_kv_scales(*, conversion_tasks=None):
-            assert conversion_tasks == []
+        def export(*, conversion_tasks=None):
             return iter(())
 
-    worker = Worker()
+    return SimpleNamespace(
+        cfg={},
+        fp8_cfg=fp8_cfg,
+        model=object(),
+        megatron_bridge=SimpleNamespace(
+            get_conversion_tasks=lambda _models: list(tasks)
+        ),
+        _iter_params_with_optional_kv_scales=export,
+    )
+
+
+def test_remote_sparse_stream_drains_cuda_before_return(monkeypatch):
+    def export(*, conversion_tasks=None):
+        assert conversion_tasks == []
+        return iter(())
+
+    worker = _worker(export=export)
     remote_refit = MegatronRemoteSparseRefit(worker, _DELTA_CONFIG)
     result = {"payloads": 1, "changed_elements": 2, "total_elements": 3}
     events = []
@@ -132,17 +144,10 @@ def test_remote_sparse_stream_drains_cuda_before_return(monkeypatch):
 
 
 def test_remote_sparse_stream_combines_local_and_misc_paths(monkeypatch):
-    class Worker:
-        @staticmethod
-        def _iter_params_with_optional_kv_scales(*, conversion_tasks=None):
-            assert conversion_tasks == []
-            return iter(())
-
-    remote_refit = MegatronRemoteSparseRefit(Worker(), _DELTA_CONFIG)
-    remote_refit._local_tracker = object()
+    remote_refit = MegatronRemoteSparseRefit(_worker(), _DELTA_CONFIG)
+    remote_refit._policy_tracker = object()
     remote_refit._local_tensors = [("local", torch.ones(1))]
     remote_refit._misc_conversion_tasks = []
-    remote_refit._uses_policy_local_path = True
     monkeypatch.setattr(remote_refit, "_changed_misc_tasks", lambda: ([], 5, 6))
     calls = []
 
@@ -288,28 +293,22 @@ def test_remote_sparse_uses_local_baseline_to_gate_transformed_tasks(
         global_param_name="decoder.linear_qkv.weight",
     )
 
-    class Worker:
-        cfg = {}
-        fp8_cfg = None
-        model = object()
-        megatron_bridge = SimpleNamespace(get_conversion_tasks=lambda _models: [task])
-
     _install_mapping_types(monkeypatch, MegatronRemoteSparseRefit)
     monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
-    remote_refit = MegatronRemoteSparseRefit(Worker(), _DELTA_CONFIG)
+    remote_refit = MegatronRemoteSparseRefit(_worker([task]), _DELTA_CONFIG)
     remote_refit._prepare_paths()
 
     assert remote_refit._misc_conversion_tasks == [task]
     assert remote_refit._misc_local_tensors == [("0:decoder.linear_qkv.weight", tensor)]
-    assert remote_refit._change_tracker is not None
-    remote_refit._change_tracker.snapshot_baseline(remote_refit._misc_local_tensors)
+    assert remote_refit._policy_tracker is not None
+    remote_refit._policy_tracker.snapshot_baseline(remote_refit._misc_local_tensors)
 
     tensor[1] = 5
     changed_tasks, changed, total = remote_refit._changed_misc_tasks()
     assert changed_tasks == [task]
     assert (changed, total) == (1, 3)
 
-    remote_refit._change_tracker.on_sync_succeeded()
+    remote_refit._policy_tracker.on_sync_succeeded()
     assert remote_refit._changed_misc_tasks() == ([], 0, 3)
 
 
@@ -334,24 +333,18 @@ def test_remote_sparse_uses_xor_only_for_direct_bitwise_path(monkeypatch):
         ),
     ]
 
-    class Worker:
-        cfg = {}
-        fp8_cfg = None
-        model = object()
-        megatron_bridge = SimpleNamespace(get_conversion_tasks=lambda _models: tasks)
-
     _install_mapping_types(monkeypatch, MegatronRemoteSparseRefit)
     monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
-    remote_refit = MegatronRemoteSparseRefit(Worker(), _XOR_CONFIG)
+    remote_refit = MegatronRemoteSparseRefit(_worker(tasks), _XOR_CONFIG)
     remote_refit._prepare_paths()
 
-    assert remote_refit._local_tracker is not None
-    assert remote_refit._local_tracker.encoding == "xor"
+    assert remote_refit._policy_tracker is not None
+    assert remote_refit._policy_tracker.encoding == "xor"
     assert remote_refit._tracker.encoding == "overwrite"
 
-    remote_refit._local_tracker.snapshot_baseline(remote_refit._local_tensors)
+    remote_refit._policy_tracker.snapshot_baseline(remote_refit._local_tensors)
     direct[0, 0] = 5
-    direct_metadata = remote_refit._local_tracker.prepare_sparse_delta_payload(
+    direct_metadata = remote_refit._policy_tracker.prepare_sparse_delta_payload(
         remote_refit._local_tensors
     )[0][2]
     assert [item["operation"] for item in direct_metadata] == ["xor"]
@@ -452,18 +445,13 @@ def test_remote_sparse_balances_tasks_across_equivalent_replicas(monkeypatch):
 def test_remote_sparse_fp8_policy_keeps_full_export_path(monkeypatch):
     task = object()
 
-    class Worker:
-        cfg = {}
-        fp8_cfg = {"fp8_param": True}
-        model = object()
-        megatron_bridge = SimpleNamespace(get_conversion_tasks=lambda _models: [task])
+    def export(*, conversion_tasks):
+        assert conversion_tasks == [task]
+        return iter(())
 
-        @staticmethod
-        def _iter_params_with_optional_kv_scales(*, conversion_tasks):
-            assert conversion_tasks == [task]
-            return iter(())
-
-    remote_refit = MegatronRemoteSparseRefit(Worker(), _DELTA_CONFIG)
+    remote_refit = MegatronRemoteSparseRefit(
+        _worker([task], fp8_cfg={"fp8_param": True}, export=export), _DELTA_CONFIG
+    )
     snapshots = []
     monkeypatch.setattr(
         "nemo_rl.models.policy.workers.megatron_remote_sparse_refit."
@@ -475,4 +463,4 @@ def test_remote_sparse_fp8_policy_keeps_full_export_path(monkeypatch):
 
     assert snapshots == [[]]
     assert remote_refit._misc_conversion_tasks == [task]
-    assert not remote_refit._uses_policy_local_path
+    assert remote_refit._policy_tracker is None

@@ -1106,14 +1106,12 @@ def setup(
                 validate_vllm_remote_sparse_refit,
             )
 
-            remote_transport = cast(
-                str,
-                validate_vllm_remote_sparse_refit(
-                    generation_config,
-                    colocated=colocated_inference,
-                    megatron_enabled=policy_config["megatron_cfg"]["enabled"],
-                ),
+            remote_transport = validate_vllm_remote_sparse_refit(
+                generation_config,
+                colocated=colocated_inference,
+                megatron_enabled=policy_config["megatron_cfg"]["enabled"],
             )
+            assert remote_transport is not None
 
             def init_policy_for_generation():
                 policy, policy_time = init_policy()

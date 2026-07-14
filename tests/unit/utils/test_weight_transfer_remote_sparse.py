@@ -65,6 +65,16 @@ class _SparsePipelineTracker:
         return payload, count, count
 
 
+class _BaselineNamesTracker:
+    sparse_bucket_size_bytes = 4
+
+    def __init__(self) -> None:
+        self.names = []
+
+    def snapshot_baseline(self, chunk) -> None:
+        self.names.extend(name for name, _tensor in chunk)
+
+
 def _stream_sparse_test_payloads(tensors, send_payload):
     return weight_transfer_remote_sparse.stream_sparse_delta_payloads(
         tensors,
@@ -113,7 +123,7 @@ def test_delta_tracker_change_summary_is_transactional(monkeypatch) -> None:
     assert tracker.prepare_change_summary(tensors) == (set(), 0, 4)
 
 
-def test_delta_tracker_emits_bounded_delta_samples(monkeypatch) -> None:
+def test_delta_tracker_emits_bounded_verification_budget(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
     monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
     tracker = _delta_tracker()
@@ -125,11 +135,7 @@ def test_delta_tracker_emits_bounded_delta_samples(monkeypatch) -> None:
         [("weight", tensor)]
     )
 
-    assert metadata[0]["verification_locations"] == [1, 3]
-    assert metadata[0]["verification_values"] == [
-        int(tensor.view(torch.int32)[1]),
-        int(tensor.view(torch.int32)[3]),
-    ]
+    assert metadata[0]["verification_samples"] == 2
     assert metadata[0]["operation"] == "overwrite"
     assert (changed, total) == (2, 4)
 
@@ -205,7 +211,7 @@ def test_delta_tracker_projects_local_shards_to_hf_locations(
     assert (changed, total) == (2, 4)
     assert metadata[0]["name"] == "hf.weight"
     assert metadata[0]["shape"] == projection.global_shape
-    assert metadata[0]["verification_locations"] == expected_locations
+    assert metadata[0]["verification_samples"] == 2
     assert (
         sparse_locations_for_item(metadata[0], locations, device="cpu").tolist()
         == expected_locations
@@ -253,8 +259,6 @@ def test_delta_tracker_encodes_fp8_weight_and_scale_bits(
         torch.float8_e4m3fn
     )
     scale = torch.tensor([1.0, 2.0], dtype=torch.float32)
-    baseline_weight = weight.clone()
-    baseline_scale = scale.clone()
     tracker.snapshot_baseline([("weight", weight), ("weight_scale_inv", scale)])
     weight.view(torch.uint8)[1] = 0x41
     scale[0] = 1.5
@@ -269,15 +273,7 @@ def test_delta_tracker_encodes_fp8_weight_and_scale_bits(
     assert len(value_groups) == 2
     assert [item["operation"] for item in metadata] == [encoding, encoding]
     assert [item["dtype"] for item in metadata] == ["float8_e4m3fn", "float32"]
-    expected_weight = int(weight.view(torch.uint8)[1])
-    expected_scale = int(scale.view(torch.int32)[0])
-    if encoding == "xor":
-        expected_weight ^= int(baseline_weight.view(torch.uint8)[1])
-        expected_scale ^= int(baseline_scale.view(torch.int32)[0])
-    assert [item["verification_values"] for item in metadata] == [
-        [expected_weight],
-        [expected_scale],
-    ]
+    assert [item["verification_samples"] for item in metadata] == [1, 1]
     assert [
         sparse_locations_for_item(item, locations, device="cpu").tolist()
         for item in metadata
@@ -457,17 +453,7 @@ def test_sparse_baseline_snapshots_only_owned_export_chunks(
     monkeypatch, capsys
 ) -> None:
     monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
-
-    class Tracker:
-        sparse_bucket_size_bytes = 4
-
-        def __init__(self) -> None:
-            self.names = []
-
-        def snapshot_baseline(self, chunk) -> None:
-            self.names.extend(name for name, _tensor in chunk)
-
-    tracker = Tracker()
+    tracker = _BaselineNamesTracker()
     weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
         [(f"weight-{index}", torch.tensor([float(index)])) for index in range(4)],
         delta_tracker=tracker,
@@ -479,7 +465,7 @@ def test_sparse_baseline_snapshots_only_owned_export_chunks(
     assert tracker.names == ["weight-1", "weight-3"]
     assert "chunks=4" in capsys.readouterr().out
 
-    tracker = Tracker()
+    tracker = _BaselineNamesTracker()
     weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
         [(f"weight-{index}", torch.tensor([float(index)])) for index in range(4)],
         delta_tracker=tracker,
@@ -494,19 +480,10 @@ def test_sparse_baseline_snapshots_only_owned_export_chunks(
 def test_sparse_name_partition_is_stable_for_filtered_exports(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
 
-    class Tracker:
-        sparse_bucket_size_bytes = 4
-
-        def __init__(self) -> None:
-            self.names = []
-
-        def snapshot_baseline(self, chunk) -> None:
-            self.names.extend(name for name, _tensor in chunk)
-
     tensors = [(f"weight-{index}", torch.tensor([float(index)])) for index in range(8)]
     owners = []
     for rank in range(2):
-        tracker = Tracker()
+        tracker = _BaselineNamesTracker()
         weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
             tensors,
             delta_tracker=tracker,
@@ -522,7 +499,7 @@ def test_sparse_name_partition_is_stable_for_filtered_exports(monkeypatch) -> No
 
     filtered = tensors[::2]
     for rank in range(2):
-        tracker = Tracker()
+        tracker = _BaselineNamesTracker()
         weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
             filtered,
             delta_tracker=tracker,

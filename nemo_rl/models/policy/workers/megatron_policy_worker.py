@@ -1915,14 +1915,12 @@ class MegatronPolicyWorkerImpl(
             get_vllm_qkv_scale_names,
         )
 
+        if conversion_tasks is None:
+            conversion_tasks = self.refit_conversion_tasks
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=(
-                self.refit_conversion_tasks
-                if conversion_tasks is None
-                else conversion_tasks
-            ),
+            conversion_tasks=conversion_tasks,
         )
 
         # Yield the original parameters first.

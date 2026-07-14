@@ -91,10 +91,7 @@ def _serialized_sparse_payload() -> bytes:
             )
         ]
     )
-    payload[2][0].update(
-        verification_locations=[1, 7],
-        verification_values=[1, 4],
-    )
+    payload[2][0]["verification_samples"] = 2
     buffer = io.BytesIO()
     torch.save(payload, buffer)
     return buffer.getvalue()

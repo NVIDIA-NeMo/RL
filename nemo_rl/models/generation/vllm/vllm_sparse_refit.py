@@ -65,7 +65,7 @@ def _decode_staged_payload(
     )
     return (
         sparse_codec.decode_sparse_tensor_payload_for_staging(payload),
-        sum(len(item.get("verification_locations", ())) for item in payload[2]),
+        sum(int(item.get("verification_samples", 0)) for item in payload[2]),
     )
 
 
@@ -205,16 +205,12 @@ class VllmSparseRefitReceiver:
     def _submit_pending_sparse_payloads(self) -> Future[dict[str, Any]]:
         payloads = tuple(self._refit_apply_pending_payloads)
         self._refit_apply_pending_payloads.clear()
-        if self._refit_workers_share_node:
-            future = self._refit_apply_executor.submit(
-                self.update_weights_from_staged_sparse_payloads,
-                cast(tuple[Future[_StagedSparsePayload], ...], payloads),
-            )
-        else:
-            future = self._refit_apply_executor.submit(
-                self.update_weights_from_serialized_sparse_payloads,
-                cast(tuple[bytes, ...], payloads),
-            )
+        apply = (
+            self.update_weights_from_staged_sparse_payloads
+            if self._refit_workers_share_node
+            else self.update_weights_from_serialized_sparse_payloads
+        )
+        future = self._refit_apply_executor.submit(cast(Any, apply), payloads)
         self._refit_apply_futures.append(future)
         future.add_done_callback(self._notify_refit_apply_waiters)
         return future
@@ -228,12 +224,10 @@ class VllmSparseRefitReceiver:
         futures: list[Future[dict[str, Any]]],
     ) -> dict[str, Any]:
         results = [future.result() for future in futures]
-        timing: dict[str, float] = {}
-        merge_vllm_refit_metrics(timing, results, maximum=False)
         return {
             "ok": True,
             "payloads": sum(int(result.get("payloads", 0)) for result in results),
-            **timing,
+            **merge_vllm_refit_metrics({}, results, maximum=False),
         }
 
     @staticmethod

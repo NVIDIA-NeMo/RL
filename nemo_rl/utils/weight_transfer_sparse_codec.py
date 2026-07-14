@@ -124,24 +124,6 @@ class SparseShardProjection:
         return mapped
 
 
-@dataclass(frozen=True)
-class SparseSourceRoute:
-    """Canonical source view consumed by one vLLM worker."""
-
-    offset: int
-    strides: tuple[int, ...]
-    shape: tuple[int, ...]
-    linear: bool
-
-
-@dataclass(frozen=True)
-class SparseSourcePlan:
-    """Source views needed by one worker for a canonical HF tensor."""
-
-    routes: tuple[SparseSourceRoute, ...] = ()
-    identity: bool = False
-
-
 def integer_dtype_for_element_size(element_size: int) -> torch.dtype:
     try:
         return _INTEGER_DTYPE_BY_SIZE[element_size]
@@ -320,106 +302,6 @@ def iter_decoded_sparse_payload(
         )
 
 
-def map_sparse_locations(
-    locations: torch.Tensor,
-    source_offset: int,
-    source_strides: tuple[int, ...],
-    shape: tuple[int, ...],
-    linear: bool,
-    target_offset: int = 0,
-    target_strides: tuple[int, ...] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if linear:
-        end = source_offset + prod(shape)
-        keep = (locations >= source_offset) & (locations < end)
-        return locations + target_offset - source_offset, keep
-    mapped = torch.full_like(locations, target_offset)
-    reconstructed = torch.full_like(locations, source_offset)
-    relative = locations - source_offset
-    for size, source_stride, target_stride in zip(
-        shape, source_strides, target_strides or source_strides, strict=True
-    ):
-        coordinate = (
-            torch.div(relative, source_stride, rounding_mode="floor").remainder(size)
-            if size > 1
-            else torch.zeros_like(locations)
-        )
-        reconstructed.add_(coordinate * source_stride)
-        mapped.add_(coordinate * target_stride)
-    return mapped, reconstructed == locations
-
-
-def select_sparse_source_entries(
-    locations: torch.Tensor,
-    values: torch.Tensor,
-    plan: SparseSourcePlan,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if plan.identity:
-        return locations, values
-    if not plan.routes:
-        return locations[:0], values[:0]
-    if all(route.linear for route in plan.routes):
-        ranges = sorted(
-            (route.offset, route.offset + prod(route.shape)) for route in plan.routes
-        )
-        merged = []
-        for start, end in ranges:
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-            else:
-                merged.append((start, end))
-        bounds = torch.tensor(
-            [bound for interval in merged for bound in interval],
-            dtype=locations.dtype,
-        )
-        offsets = torch.searchsorted(locations, bounds).tolist()
-        location_parts = [
-            locations[start:end] for start, end in zip(offsets[::2], offsets[1::2])
-        ]
-        value_parts = [
-            values[start:end] for start, end in zip(offsets[::2], offsets[1::2])
-        ]
-        if len(location_parts) == 1:
-            return location_parts[0], value_parts[0]
-        return torch.cat(location_parts), torch.cat(value_parts)
-    keep = torch.zeros(locations.shape, dtype=torch.bool)
-    for route in plan.routes:
-        _, route_keep = map_sparse_locations(
-            locations, route.offset, route.strides, route.shape, route.linear
-        )
-        keep.logical_or_(route_keep)
-    return locations[keep], values[keep]
-
-
-def partition_decoded_sparse_entries(
-    decoded: Iterable[DecodedSparseItem],
-    plans: Mapping[str, SparseSourcePlan],
-) -> list[DecodedSparseItem]:
-    """Select the canonical entries consumed by one colocated worker."""
-    selected_items = []
-    for item, locations, values in decoded:
-        plan = plans[str(item["name"])]
-        selected_locations, selected_values = select_sparse_source_entries(
-            locations, values, plan
-        )
-        if not selected_locations.numel():
-            continue
-        selected_item = dict(item)
-        sample_location_tensor = torch.tensor(
-            item.get("verification_locations", ()), dtype=locations.dtype
-        )
-        sample_value_tensor = torch.tensor(
-            item.get("verification_values", ()), dtype=values.dtype
-        )
-        samples, sample_bits = select_sparse_source_entries(
-            sample_location_tensor, sample_value_tensor, plan
-        )
-        selected_item["verification_locations"] = samples.tolist()
-        selected_item["verification_values"] = sample_bits.tolist()
-        selected_items.append((selected_item, selected_locations, selected_values))
-    return selected_items
-
-
 def _encode_explicit_locations(
     locations: torch.Tensor,
 ) -> torch.Tensor:
@@ -471,7 +353,6 @@ class DeltaCompressionTracker:
     ) -> PreparedTensorPayload:
         self._wait_for_baseline_commits()
         sparse_infos = []
-        verification_sources = []
         pending_updates = {}
         changed_elements = total_elements = 0
         for name, tensor in tensors:
@@ -509,14 +390,12 @@ class DeltaCompressionTracker:
                         self.encoding,
                     )
                 )
-                if self.verification_samples:
-                    verification_sources.append((payload_locations, values))
                 pending_updates[name] = (locations, current_values)
         with self._pending_updates_lock:
             self._pending_updates.update(pending_updates)
         payload = encode_sparse_infos(sparse_infos)
-        if verification_sources:
-            self._add_verification_samples(payload[2], verification_sources)
+        if self.verification_samples:
+            self._add_verification_samples(payload[2])
         return payload, changed_elements, total_elements
 
     def prepare_change_summary(
@@ -552,24 +431,22 @@ class DeltaCompressionTracker:
     def _add_verification_samples(
         self,
         metadata: list[dict[str, Any]],
-        sources: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
-        total = sum(int(locations.numel()) for locations, _ in sources)
+        sizes = [int(item["value_end"]) - int(item["value_start"]) for item in metadata]
+        total = sum(sizes)
         count = min(self.verification_samples, total)
         sample_ranks = [
             ((2 * index + 1) * total) // (2 * count) for index in range(count)
         ]
         sample_index = offset = 0
-        for item, (locations, values) in zip(metadata, sources, strict=True):
-            end = offset + locations.numel()
+        for item, size in zip(metadata, sizes, strict=True):
+            end = offset + size
+            samples = 0
             while sample_index < count and sample_ranks[sample_index] < end:
-                local_index = sample_ranks[sample_index] - offset
-                location = int(locations[local_index])
-                item.setdefault("verification_locations", []).append(location)
-                item.setdefault("verification_values", []).append(
-                    int(values[local_index])
-                )
+                samples += 1
                 sample_index += 1
+            if samples:
+                item["verification_samples"] = samples
             offset = end
 
     def on_sync_succeeded(self) -> None:

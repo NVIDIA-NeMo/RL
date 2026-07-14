@@ -18,7 +18,7 @@ import re
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from functools import cache, partial
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -58,17 +58,15 @@ class MegatronRemoteSparseRefit:
         if residual_config["encoding"] == "xor":
             residual_config["encoding"] = "overwrite"
         self._tracker = DeltaCompressionTracker(residual_config)
-        self._local_tracker: DeltaCompressionTracker | None = None
-        self._change_tracker: DeltaCompressionTracker | None = None
+        self._policy_tracker: DeltaCompressionTracker | None = None
         self._local_tensors: list[tuple[str, torch.Tensor]] = []
         self._misc_local_tensors: list[tuple[str, torch.Tensor]] = []
         self._misc_conversion_tasks: list[Any] | None = None
         self._filter_misc_tasks = False
-        self._uses_policy_local_path = False
 
     @staticmethod
     @cache
-    def _bridge_mapping_types() -> tuple[Any, Any, Any, Any, Any, Any]:
+    def _bridge_mapping_types() -> tuple[Any, dict[Any, int]]:
         # Bridge is optional outside Megatron workers, so keep these imports local.
         from megatron.bridge.models.conversion.param_mapping import (
             AutoMapping,
@@ -79,14 +77,13 @@ class MegatronRemoteSparseRefit:
             RowParallelMapping,
         )
 
-        return (
-            AutoMapping,
-            ColumnParallelMapping,
-            DirectMapping,
-            GatedMLPMapping,
-            ReplicatedMapping,
-            RowParallelMapping,
-        )
+        return AutoMapping, {
+            ColumnParallelMapping: _COLUMN,
+            DirectMapping: _DIRECT,
+            GatedMLPMapping: _GATED,
+            ReplicatedMapping: _REPLICATED,
+            RowParallelMapping: _ROW,
+        }
 
     @staticmethod
     def _all_reduce_max(values: list[int]) -> list[int]:
@@ -104,18 +101,10 @@ class MegatronRemoteSparseRefit:
 
     @classmethod
     def _local_mapping_kind(cls, task: Any) -> int:
-        (
-            AutoMapping,
-            *mapping_types,
-        ) = cls._bridge_mapping_types()
+        AutoMapping, mapping_kinds = cls._bridge_mapping_types()
         mapping = task.mapping
-        for mapping_type, kind in zip(
-            mapping_types,
-            (_COLUMN, _DIRECT, _GATED, _REPLICATED, _ROW),
-            strict=True,
-        ):
-            if type(mapping) is mapping_type:
-                return kind
+        if kind := mapping_kinds.get(type(mapping)):
+            return kind
         if (
             type(mapping) is AutoMapping
             and mapping.permute_dims is None
@@ -157,24 +146,6 @@ class MegatronRemoteSparseRefit:
         )
 
     @staticmethod
-    def _can_project_task(task: Any, kind: int, *, identity_export: bool) -> bool:
-        if kind == _UNSUPPORTED or not identity_export:
-            return False
-        mapping = task.mapping
-        if getattr(mapping, "is_grouped_export", False) or getattr(
-            mapping, "is_adapter", False
-        ):
-            return False
-        if MegatronRemoteSparseRefit._is_padded_or_tied_weight(task):
-            return False
-        if kind == _GATED:
-            return isinstance(mapping.hf_param, dict) and set(mapping.hf_param) == {
-                "gate",
-                "up",
-            }
-        return isinstance(mapping.hf_param, str)
-
-    @staticmethod
     def _owns_policy_local_task(task: Any, *, replicated: bool = False) -> bool:
         if not torch.distributed.is_initialized():
             return True
@@ -198,17 +169,31 @@ class MegatronRemoteSparseRefit:
                 replica_count *= task.mapping.tp_size
         return replica_rank == sparse_name_shard(task.global_param_name, replica_count)
 
+    @classmethod
+    def _task_ownership(cls, task: Any, kind: int) -> tuple[torch.Tensor | None, bool]:
+        tensor = task.param_weight
+        replicated = kind in (_DIRECT, _REPLICATED) or (
+            kind == _ROW and tensor is not None and tensor.ndim == 1
+        )
+        return (
+            tensor
+            if tensor is not None
+            and cls._owns_policy_local_task(task, replicated=replicated)
+            else None,
+            replicated,
+        )
+
     def _policy_local_path_is_safe(self) -> bool:
         config = getattr(self._worker, "cfg", {})
-        if config.get("quant_cfg") is not None:
-            return False
         ddp_config = config.get("megatron_cfg", {}).get(
             "distributed_data_parallel_config", {}
         )
-        if ddp_config.get("use_custom_fsdp", False):
-            return False
         fp8_cfg = getattr(self._worker, "fp8_cfg", None)
-        return not fp8_cfg or not fp8_cfg.get("fp8_param", False)
+        return (
+            config.get("quant_cfg") is None
+            and not ddp_config.get("use_custom_fsdp", False)
+            and (not fp8_cfg or not fp8_cfg.get("fp8_param", False))
+        )
 
     @staticmethod
     def _canonical_hf_name(task: Any, name: str) -> str:
@@ -216,7 +201,7 @@ class MegatronRemoteSparseRefit:
         if not mapping.is_expert or mapping.ep_size == 1:
             return name
 
-        match = re.search(r"(\.experts\.)(\d+)(\.)", name)
+        match = re.search(r"(?<=\.experts\.)\d+(?=\.)", name)
         config = getattr(task.megatron_module, "config", None)
         num_experts = getattr(config, "num_moe_experts", None)
         if match is None or not isinstance(num_experts, int):
@@ -227,9 +212,9 @@ class MegatronRemoteSparseRefit:
                 f"{mapping.ep_size}."
             )
         experts_per_rank = num_experts // mapping.ep_size
-        expert = int(match.group(2)) % experts_per_rank
+        expert = int(match.group()) % experts_per_rank
         expert += experts_per_rank * mapping.ep_rank
-        return f"{name[: match.start(2)]}{expert}{name[match.end(2) :]}"
+        return f"{name[: match.start()]}{expert}{name[match.end() :]}"
 
     @staticmethod
     def _projection(
@@ -250,17 +235,28 @@ class MegatronRemoteSparseRefit:
 
     @classmethod
     def _task_local_tensors(
-        cls, task: Any, kind: int
-    ) -> list[tuple[str, torch.Tensor, SparseShardProjection]]:
-        if task.param_weight is None:
-            return []
-
+        cls, task: Any, kind: int, *, identity_export: bool = True
+    ) -> list[tuple[str, torch.Tensor, SparseShardProjection]] | None:
         mapping = task.mapping
-        tensor = task.param_weight
-        replicated = kind in (_DIRECT, _REPLICATED) or (
-            kind == _ROW and tensor.ndim == 1
-        )
-        if not cls._owns_policy_local_task(task, replicated=replicated):
+        hf_param = mapping.hf_param
+        if (
+            kind == _UNSUPPORTED
+            or not identity_export
+            or getattr(mapping, "is_grouped_export", False)
+            or getattr(mapping, "is_adapter", False)
+            or cls._is_padded_or_tied_weight(task)
+        ):
+            return None
+        if kind == _GATED:
+            if not isinstance(hf_param, dict) or set(hf_param) != {
+                "gate",
+                "up",
+            }:
+                return None
+        elif not isinstance(hf_param, str):
+            return None
+        tensor, replicated = cls._task_ownership(task, kind)
+        if tensor is None:
             return []
         if kind == _GATED:
             gate, up = torch.chunk(tensor, 2, dim=0)
@@ -269,7 +265,9 @@ class MegatronRemoteSparseRefit:
                     f"{task.global_param_name}:{role}",
                     value,
                     cls._projection(
-                        cls._canonical_hf_name(task, str(mapping.hf_param[role])),
+                        cls._canonical_hf_name(
+                            task, str(cast(dict[str, Any], hf_param)[role])
+                        ),
                         value,
                         shard_dim=0,
                         shard_rank=mapping.tp_rank,
@@ -279,7 +277,7 @@ class MegatronRemoteSparseRefit:
                 for role, value in (("gate", gate), ("up", up))
             ]
 
-        name = cls._canonical_hf_name(task, str(mapping.hf_param))
+        name = cls._canonical_hf_name(task, cast(str, hf_param))
         projection = (
             SparseShardProjection(name, tuple(tensor.shape), (0,) * tensor.ndim)
             if replicated
@@ -308,14 +306,16 @@ class MegatronRemoteSparseRefit:
         if not tasks or not self._policy_local_path_is_safe():
             misc_tasks.extend(tasks)
             return
-        self._uses_policy_local_path = True
         kinds = self._all_reduce_max([self._local_mapping_kind(task) for task in tasks])
         identity_export = self._bridge_exports_are_identity()
         self._filter_misc_tasks = identity_export
         projections = {}
         for task, kind in zip(tasks, kinds, strict=True):
-            if self._can_project_task(task, kind, identity_export=identity_export):
-                for key, tensor, projection in self._task_local_tensors(task, kind):
+            local_tensors = self._task_local_tensors(
+                task, kind, identity_export=identity_export
+            )
+            if local_tensors is not None:
+                for key, tensor, projection in local_tensors:
                     if key in projections:
                         raise ValueError(
                             f"Duplicate policy-local sparse shard {key!r}."
@@ -326,76 +326,62 @@ class MegatronRemoteSparseRefit:
 
             task_index = len(misc_tasks)
             misc_tasks.append(task)
-            if task.param_weight is None:
-                continue
-            replicated = kind in (_DIRECT, _REPLICATED) or (
-                kind == _ROW and task.param_weight.ndim == 1
-            )
-            if not self._owns_policy_local_task(task, replicated=replicated):
-                continue
-            key = f"{task_index}:{task.global_param_name}"
-            self._misc_local_tensors.append((key, task.param_weight))
+            tensor, _ = self._task_ownership(task, kind)
+            if tensor is not None:
+                key = f"{task_index}:{task.global_param_name}"
+                self._misc_local_tensors.append((key, tensor))
 
-        if projections:
-            self._local_tracker = DeltaCompressionTracker(
-                self._delta_config, projections=projections
-            )
-        if self._misc_local_tensors:
-            self._change_tracker = DeltaCompressionTracker(self._delta_config)
+        self._policy_tracker = DeltaCompressionTracker(
+            self._delta_config, projections=projections
+        )
 
     def _iter_misc_params(
         self, conversion_tasks: list[Any] | None = None
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        return self._worker._iter_params_with_optional_kv_scales(
-            conversion_tasks=(
-                self._misc_conversion_tasks
-                if conversion_tasks is None
-                else conversion_tasks
-            )
+        tasks = (
+            self._misc_conversion_tasks
+            if conversion_tasks is None
+            else conversion_tasks
         )
+        return self._worker._iter_params_with_optional_kv_scales(conversion_tasks=tasks)
 
     def _changed_misc_tasks(self) -> tuple[list[Any], int, int]:
         assert self._misc_conversion_tasks is not None
         changed_keys: set[str] = set()
         changed = total = 0
-        if self._change_tracker is not None:
-            changed_keys, changed, total = self._change_tracker.prepare_change_summary(
+        if self._misc_local_tensors:
+            assert self._policy_tracker is not None
+            changed_keys, changed, total = self._policy_tracker.prepare_change_summary(
                 self._misc_local_tensors
             )
         flags = [0] * len(self._misc_conversion_tasks)
         for key in changed_keys:
             flags[int(key.partition(":")[0])] = 1
         flags = self._all_reduce_max(flags)
-        if any(flags) and not self._filter_misc_tasks:
-            flags = [1] * len(flags)
-        grouped_keys = {
-            task.mapping.group_key
-            for task, task_changed in zip(
-                self._misc_conversion_tasks, flags, strict=True
-            )
-            if task_changed and getattr(task.mapping, "is_grouped_export", False)
-        }
-        flags = [
-            task_changed
-            or (
-                getattr(task.mapping, "is_grouped_export", False)
-                and task.mapping.group_key in grouped_keys
-            )
-            for task, task_changed in zip(
-                self._misc_conversion_tasks, flags, strict=True
-            )
-        ]
-        return (
-            [
+        if not any(flags):
+            tasks = []
+        elif not self._filter_misc_tasks:
+            tasks = self._misc_conversion_tasks
+        else:
+            grouped_keys = {
+                task.mapping.group_key
+                for task, task_changed in zip(
+                    self._misc_conversion_tasks, flags, strict=True
+                )
+                if task_changed and getattr(task.mapping, "is_grouped_export", False)
+            }
+            tasks = [
                 task
                 for task, task_changed in zip(
                     self._misc_conversion_tasks, flags, strict=True
                 )
                 if task_changed
-            ],
-            changed,
-            total,
-        )
+                or (
+                    getattr(task.mapping, "is_grouped_export", False)
+                    and task.mapping.group_key in grouped_keys
+                )
+            ]
+        return tasks, changed, total
 
     def initialize_baseline(
         self,
@@ -411,22 +397,20 @@ class MegatronRemoteSparseRefit:
             shard_count=shard_count,
             transport=transport,
         )
-        if not self._uses_policy_local_path:
+        policy_tracker = self._policy_tracker
+        if policy_tracker is None:
             snapshot(self._iter_misc_params(), delta_tracker=self._tracker)
             return self.refit_info()
-
-        def snapshot_local_baselines() -> None:
-            for tracker, tensors in (
-                (self._local_tracker, self._local_tensors),
-                (self._change_tracker, self._misc_local_tensors),
-            ):
-                if tracker is not None:
-                    snapshot(tensors, delta_tracker=tracker, partition="none")
 
         with ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="nrl-refit-policy-local"
         ) as executor:
-            local_future = executor.submit(snapshot_local_baselines)
+            local_future = executor.submit(
+                snapshot,
+                self._local_tensors + self._misc_local_tensors,
+                delta_tracker=policy_tracker,
+                partition="none",
+            )
             snapshot(
                 self._iter_misc_params(),
                 delta_tracker=self._tracker,
@@ -440,9 +424,9 @@ class MegatronRemoteSparseRefit:
             name: (tuple(tensor.shape), tensor.dtype)
             for name, tensor in self._tracker.baseline.items()
         }
-        if self._local_tracker is not None:
+        if self._policy_tracker is not None:
             for name, tensor in self._local_tensors:
-                projection = self._local_tracker.projections[name]
+                projection = self._policy_tracker.projections[name]
                 info[projection.name] = (projection.global_shape, tensor.dtype)
         return info
 
@@ -470,7 +454,8 @@ class MegatronRemoteSparseRefit:
             shard_rank=shard_rank,
             shard_count=shard_count,
         )
-        if not self._uses_policy_local_path:
+        policy_tracker = self._policy_tracker
+        if policy_tracker is None:
             result = send(
                 self._iter_misc_params(),
                 delta_tracker=self._tracker,
@@ -481,11 +466,11 @@ class MegatronRemoteSparseRefit:
                 max_workers=1, thread_name_prefix="nrl-refit-policy-local"
             ) as executor:
                 local_future = None
-                if self._local_tracker is not None:
+                if self._local_tensors:
                     local_future = executor.submit(
                         send,
                         self._local_tensors,
-                        delta_tracker=self._local_tracker,
+                        delta_tracker=policy_tracker,
                         transfer_id=f"{transfer_id}-local",
                         partition="none",
                     )
@@ -511,7 +496,7 @@ class MegatronRemoteSparseRefit:
         return result
 
     def finish(self, succeeded: bool) -> None:
-        for tracker in (self._tracker, self._local_tracker, self._change_tracker):
+        for tracker in (self._tracker, self._policy_tracker):
             if tracker is None:
                 continue
             if succeeded:

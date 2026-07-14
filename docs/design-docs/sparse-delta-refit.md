@@ -5,12 +5,12 @@ full checkpoint after every optimizer step. Megatron workers compare every
 uniquely owned MCore tensor against a policy-local CPU baseline. Exact affine
 mappings emit sparse Hugging Face (HF) coordinates directly; only changed tasks
 whose conversion is not affine traverse Megatron Bridge. S3 or ZeroMQ carries
-the resulting payloads, and vLLM maps the HF coordinates into its local TP and
-EP layout before applying them in place.
+the resulting payloads, and each native vLLM weight loader applies its canonical
+HF update to the local TP or EP destination.
 
 The feature is opt-in. Its synchronizer, codec, transports, receiver queue, and
-placement engine are separate from existing NCCL, CUDA IPC, and packed refit
-paths.
+native-loader apply engine are separate from existing NCCL, CUDA IPC, and
+packed refit paths.
 
 ## Supported scope
 
@@ -51,7 +51,7 @@ flowchart LR
   subgraph G["vLLM generation cluster"]
     H["HTTP receiver"]
     Q["Eager node staging and bounded FIFO apply queue"]
-    A["Sparse placement and apply"]
+    A["Dense scratch and native-loader apply"]
     H --> Q --> A
   end
 
@@ -59,8 +59,8 @@ flowchart LR
   E -->|ZeroMQ| Z --> H
 ```
 
-*Figure 1. S3 and ZeroMQ share the exporter, codec, receiver, placement engine,
-and commit protocol.*
+*Figure 1. S3 and ZeroMQ share the exporter, codec, receiver, native-loader
+apply engine, and commit protocol.*
 
 | Responsibility | Implementation |
 |---|---|
@@ -70,7 +70,7 @@ and commit protocol.*
 | Run the shared pipeline and S3 transport | [`weight_transfer_remote_sparse.py`](../../nemo_rl/utils/weight_transfer_remote_sparse.py) |
 | Run the ZeroMQ transport and relay | [`weight_transfer_zmq.py`](../../nemo_rl/utils/weight_transfer_zmq.py) |
 | Queue receiver work and expose endpoints | [`vllm_sparse_refit.py`](../../nemo_rl/models/generation/vllm/vllm_sparse_refit.py) |
-| Map HF coordinates into vLLM tensors | [`vllm_sparse_delta.py`](../../nemo_rl/models/generation/vllm/vllm_sparse_delta.py) |
+| Apply canonical updates through native loaders | [`vllm_sparse_delta.py`](../../nemo_rl/models/generation/vllm/vllm_sparse_delta.py) |
 
 ## Refit protocol
 
@@ -106,9 +106,9 @@ residual Bridge export run concurrently.
 
 Baseline initialization also returns each canonical tensor's name, shape, and
 dtype. The synchronizer merges that metadata and asks every vLLM worker to
-compile its native weight-loader placement plan before the first transfer.
-This does not export HF values or mutate vLLM weights; it moves loader tracing
-and plan validation out of the first timed refit.
+reserve one reusable GPU byte buffer large enough for the largest canonical
+tensor. This does not export HF values or mutate vLLM weights, and it removes
+scratch allocation from the first timed refit.
 
 On a fresh run, vLLM already holds the shared checkpoint. Baseline construction
 starts early and can overlap initial generation, so the redundant initial full
@@ -204,19 +204,26 @@ window at 256 payloads.
 Locations use `int32` unless a single canonical tensor exceeds the signed
 32-bit index range; values remain grouped by dtype. The collective RPC passes
 only file paths, and workers use `torch.load(..., mmap=True)`. The mmap is not
-a second baseline: it lets eight colocated ranks share the staged file's page
-cache instead of materializing eight independent CPU copies, while each rank
-copies only its selected entries to its GPU.
+a second baseline: it lets colocated ranks share the staged file's page cache
+instead of materializing independent CPU copies. The staged format flattens
+locations into one `int32` and one `int64` tensor; it does not serialize one
+tensor object per model parameter. If ranks do not share a node, the receiver
+still decodes once and sends that flat representation through one collective
+RPC.
 
-Each worker selects the canonical entries consumed by its TP/EP placement plan
-on CPU, converts only those selected locations to CUDA `int64`, and then copies
-the selected locations and values to its GPU. Thus transport bytes are not
-duplicated within a node and irrelevant canonical entries do not cross H2D.
-The staged format flattens locations into one `int32` and one `int64` tensor;
-it does not serialize one tensor object per model parameter. If ranks do not
-share a node, the receiver still decodes once and sends that flat
-representation through one collective RPC. Every worker derives and caches its
-source plan from the native loader before CPU partitioning.
+There is deliberately no TP/EP source plan. Every worker sees the canonical
+sparse entries, scatters them into its reusable dense source buffer, and lets
+the native loader select the local destination. This removes persistent vLLM
+placement knowledge from NeMo RL, at the cost of canonical-tensor GPU
+initialization and duplicated sparse H2D across ranks. Measure that cost on the
+target TP/EP topology; H2D no longer scales only with the worker-local sparse
+subset.
+
+During the existing untimed metadata prewarm, one no-op native-loader pass
+records names that issue no model-storage copy on that fixed rank. Later refits
+skip scratch construction for those explicit pipeline/expert/MTP skips. The
+cache contains names only; it stores no placement offsets, tensor routes, or
+model-family rules.
 
 The final `/nemo-rl/refit/flush` drains the queue, synchronizes CUDA, and checks
 optional delta samples. Only then does the source commit pending baseline
@@ -228,7 +235,7 @@ updates in background CPU threads.
 > version before retrying. This is mandatory for `xor`, because replaying an
 > already-applied XOR reverts those bits. Replaying `overwrite` is safe.
 
-## Payload and placement
+## Payload and native apply
 
 Each serialized payload is:
 
@@ -239,31 +246,34 @@ Each serialized payload is:
 Contiguous locations use a range encoding. Other sorted locations are
 delta-encoded into the smallest lossless unsigned width among 16, 32, and 64
 bits. Metadata carries the HF name and shape, value offsets, location encoding,
-the `xor` or `overwrite` operation, and optional verification samples.
+the `xor` or `overwrite` operation, and an optional verification sample budget.
 
-HF coordinates are the canonical wire format because Megatron Bridge already
-defines the training-to-HF mapping while vLLM owns a different packed and
-sharded layout. On first use, the receiver runs vLLM's native `load_weights()`
-against metadata-only tensors while a PyTorch dispatch mode records the source
-and destination views of each `copy_`. It caches those mappings and applies
-later sparse values directly with bitwise XOR or `index_copy_`, without
-materializing a dense HF tensor or duplicating QKV, MoE, Mamba, or TP placement
-rules.
+HF coordinates are the canonical wire format because Megatron Bridge defines
+the training-to-HF mapping while vLLM owns the packed and sharded destination.
+For each item, the receiver resets the resident largest-tensor scratch buffer,
+scatters the sparse values, and calls the model's native `load_weights()`.
+A storage-scoped PyTorch dispatch mode changes only copies into model parameter
+or buffer storage; it never encodes QKV, MoE, Mamba, TP, or EP geometry.
 
-The same recorded copies define a source plan for node-local partitioning. A
-source plan contains the canonical offset, shape, and strides consumed by one
-worker. Linear routes use sorted-range lookup; strided routes use affine source
-coordinates. Verification samples are partitioned by the same plan. An unknown
-or transformed loader fails while compiling the plan, before the receiver
-stages or applies that tensor.
+For XOR, unchanged scratch bits are zero and target copies become bitwise XOR.
+The source must remain a view of the scratch storage, dtypes must match, and
+overlapping destination copies fail closed. For overwrite, unchanged entries
+are NaN sentinels. The dispatch mode propagates the first sparse mask through
+subsequent native copies and writes only selected destination entries. It keeps
+only those entries for per-item rollback rather than cloning the full target.
+This supports native pointwise transforms and dtype casts without model-specific
+formulas. One-byte FP8 overwrite uses an exact bit sentinel and therefore
+requires a non-transforming native loader; end-to-end quantized rollout refit
+remains out of scope.
 
-The tracer accepts affine tensor views. Absolute overwrite also supports the
-Mamba `A_log` transform and source-to-target dtype casts. Bridge residuals use
-overwrite even when `encoding: xor` is configured because their target bits may
-not match the HF source representation. XOR also rejects overlapping target
-mappings. An element-expanding copy, unknown transform, or unplaced non-expert
-tensor fails before any payload update. There is no dense fallback for an
-unknown layout.
+Native-loader return values distinguish an explicit skip from an unsupported
+apply. An empty loaded set is accepted, matching vLLM's existing handling of
+pipeline/expert ownership and checkpoint-only parameters such as inactive MTP
+weights. Loader exceptions propagate. A loader that reports a weight loaded but
+does not issue a supported target copy fails closed. There is no layout fallback
+and no cached loader trace or route model. NeMo RL does not patch vLLM or encode
+any vLLM layout: its only integration point is the model's public
+`load_weights()` behavior.
 
 ## Configuration
 
@@ -319,7 +329,7 @@ receiver apply.
 | Signal | Meaning |
 |---|---|
 | `REFIT_BASELINE_INIT` | Baseline export and snapshot time |
-| `REFIT_RECEIVER_PREWARM` | Native vLLM placement plans compiled during initialization |
+| `REFIT_RECEIVER_PREWARM` | GPU scratch reservation and rank-local native skip discovery |
 | `REFIT_{S3,ZMQ}_TIMING` | Producer wall time, stage service time, payloads, bytes, and changed density |
 | `REFIT_{S3,ZMQ}_DELTA_CHANGE` | Global changed and total element counts |
 | `REFIT_RECEIVER_TIMING` | Receiver staging span/wait, batches, apply time, and verification counts |
@@ -329,7 +339,8 @@ receiver apply.
 `total_s` is producer wall time. Stage fields such as `encode_s`, `s3_put_s`,
 and `zmq_send_s` are sums across concurrent tasks and can exceed `total_s`; do
 not add them as serial phases. Receiver responses additionally expose node
-decode/staging, worker deserialization, CPU partition, and sparse apply time.
+decode/staging, worker deserialization, scratch preparation, and native-loader
+apply time.
 These are also concurrent sums; compare them with receiver wall time rather
 than adding them. The `partition` field is `none` for uniquely owned
 policy-local shards, `names` for stable name-sharded residual exports, and
@@ -353,18 +364,17 @@ sparse-apply NVTX ranges. Producer and receiver thread names begin with
 
 Keep transport changes behind the shared `stream_sparse_delta_payloads()`
 pipeline. A transport should provide payload delivery and timing only; it must
-not duplicate the baseline tracker, codec, receiver queue, or placement logic.
+not duplicate the baseline tracker, codec, receiver queue, or apply logic.
 Retries must preserve payload identity and bytes, fan out to every required
 replica, and require a successful global flush before baseline commit. Never
 retry XOR after an uncertain or partial receiver apply.
 
-Do not add model-specific placement math. New layouts should work through their
-native vLLM weight loader; extend the tracer only for a general loader operation
-and fail closed for transformed or broadcasting copies. Tests must invoke the
-real vLLM loader at nonzero TP ranks and cover replicated KV heads, packed
-columns, local and remote experts, segmented views, contiguous ranges, and
-explicit locations. Incorrect in-range XOR or overwrite locations silently
-corrupt weights, so assert exact mapped indices and values.
+Do not add model-specific placement math or a persistent placement cache. New
+layouts must work through their native vLLM weight loader and the generic
+storage-scoped operation context. Tests should cover packed QKV/MLP columns,
+local and remote experts, segmented Mamba views, native transforms, dtype casts,
+FP8 bit overwrite, contiguous ranges, and explicit locations. Unknown names,
+transformed XOR, and overlapping XOR copies must fail closed.
 
 Codec changes must update encoder and decoder together, preserve 64-bit-safe
 locations, and commit exact source bits only after global success. Receiver
@@ -412,41 +422,27 @@ the receiver before retrying.
 ## Refit bandwidth calculator
 
 [`refit_bandwidth_calculator.py`](../../tools/refit_bandwidth_calculator.py) is a
-benchmark-specific estimator for the current S3 and ZeroMQ implementation. It
-is not a general fabric or topology model.
+calibrated comparison of the checked-in S3 and ZeroMQ measurements against a
+measured H100 NCCL envelope. It is not a general fabric or topology simulator.
 
-The zstd side embeds the July 12, 2026 end-to-end latency fits from 8 GB300
-sender GPUs in `us-east-2` to 64 H100 receiver GPUs in `us-east-1` shown above.
-Measurements cover 63.2-1121.0 GB of indexed BF16 weights, S3 and ZeroMQ, and
-3% and 5% changed density. The raw rows retain historical uncompressed
-benchmark coefficients and are not a current production arm. Any positive
-`--changed-pct` is accepted; values outside 3-5% use an extrapolated power
-curve through the two measured-density fits. Estimated wire bytes use the
-measured raw or zstd payload ratio. The coefficients in
-`_SPARSE_LATENCY_FITS` implement
-`fixed_seconds + seconds_per_1000_GB * model_size_GB / 1000`; they are latency
-regressions, not bandwidth measurements.
+The sparse side evaluates the latency fits in `_SPARSE_LATENCY_FITS` for the
+requested model size, transport, compression, and any positive
+`--changed-pct`. The 3% and 5% fits are measured calibration points; other
+densities are explicit extrapolations. The coefficients model end-to-end
+latency, not transport bandwidth, so `--candidate-ethernet-gbps` does not
+rescale S3 or ZeroMQ.
 
-The NCCL side uses these measured generation-EP H100 refit envelopes on 400
-Gbps/rank InfiniBand:
-
-| Indexed BF16 | NCCL refit envelope |
-|---:|---:|
-| 63.2 GB | 0.84-1.60 s |
-| 247.2 GB | 1.46-1.74 s |
-| 470.2 GB | 2.31-2.73 s |
-| 1342.0 GB | 3.27-3.46 s |
-
-The calculator interpolates these anchors in log model-size space, then
-projects the full measured NCCL latency onto the candidate Ethernet rate:
+The NCCL side interpolates `_NCCL_ANCHORS` in log model-size space. Those
+anchors were measured at 400 Gbps per rank and are projected onto the requested
+Ethernet rate as:
 
 ```text
 T_ethernet = T_H100_IB * 400 / candidate_ethernet_gbps
 ```
 
-`--candidate-ethernet-gbps` is raw bandwidth per rank. It changes only the NCCL
-projection; it does not rescale the measured S3 or ZeroMQ fit. Do not pass
-aggregate node or cluster bandwidth.
+`--candidate-ethernet-gbps` is raw bandwidth per rank, not aggregate node or
+cluster bandwidth. This makes NCCL and the candidate Ethernet refer to the same
+per-rank link while leaving the independently measured sparse path unchanged.
 
 ```bash
 uv run python tools/refit_bandwidth_calculator.py \
@@ -456,17 +452,19 @@ uv run python tools/refit_bandwidth_calculator.py \
   --candidate-ethernet-gbps 25
 ```
 
-The output reports the original H100 IB envelope, projected NCCL latency,
-estimated sparse latency and wire bytes, and an Ethernet crossover range. Below
-the lower crossover, sparse refit beats the complete NCCL envelope; above the
-upper crossover, NCCL wins; between them, the measured NCCL range does not give
-one winner. `--json` emits the same data for scripts.
+The output reports the reference and projected NCCL envelopes, sparse latency,
+estimated wire bytes, and the per-rank Ethernet crossover. Below the lower
+crossover sparse refit beats the complete NCCL envelope; above the upper
+crossover NCCL wins; between them the measured range has no single winner.
+`--json` emits the same fields for scripts.
 
 The production transport currently applies zstd level 1 to every payload.
-`--compression raw` selects a historical uncompressed benchmark fit for
-analysis; it is not a runtime switch for the current transport. Treat model
-sizes outside the measured range, changed densities outside 3-5%, and different
-parallel mappings as experiment targets rather than performance claims.
+`--compression raw` selects the checked-in uncompressed calibration for
+analysis; it is not a runtime switch. Production payloads use zstd level 1.
+Treat values outside the calibration range, or a different topology and
+parallel mapping, as experiment inputs rather than performance claims. Update
+the constants only from a balanced profile matrix and keep the source artifact
+under `profiles/`.
 
 ## Failure guide
 
@@ -474,7 +472,7 @@ parallel mappings as experiment targets rather than performance claims.
 |---|---|
 | Baseline is missing a tensor | Check baseline completion, checkpoint equality, and Bridge name mappings. |
 | No refit endpoint is found | Check worker startup, fixed ports, routing, and network policy. |
-| No direct target plan exists | Add and unit-test the layout; do not silently fall back to dense loading. |
+| Every worker reports a tensor unloaded | Verify the canonical HF name and native loader; do not add model-specific placement math. |
 | A payload ID is reused with different bytes | Start a new transfer or resend the original payload unchanged. |
 | Changed percentage rises unexpectedly | Correlate `DELTA_CHANGE` with `GLOBAL_COMMIT` and baseline commit completion. |
 | Apply queue stalls | Inspect receiver timing and reduce source or relay concurrency. |

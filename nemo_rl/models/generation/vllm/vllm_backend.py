@@ -176,8 +176,10 @@ class VllmInternalWorkerExtension:
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
     ) -> None:
-        """Compile sparse placement plans before the first timed refit."""
-        self._get_sparse_delta_applier().prewarm(state_dict_info)
+        """Reserve the reusable sparse-refit scratch buffer."""
+        applier = self._get_sparse_delta_applier()
+        applier.prewarm(state_dict_info)
+        applier.discover_native_skips(state_dict_info)
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -370,7 +372,7 @@ class VllmInternalWorkerExtension:
 
     def _get_sparse_delta_applier(self) -> Any:
         if self._sparse_delta_applier is None:
-            # Avoid importing sparse placement code for existing refit transports.
+            # Avoid importing sparse-refit code for existing refit transports.
             from nemo_rl.models.generation.vllm.vllm_sparse_delta import (
                 VllmSparseDeltaApplier,
             )
@@ -514,19 +516,15 @@ class VllmInternalWorkerExtension:
         self,
         *serialized_payloads: bytes,
     ) -> dict[str, Any]:
-        return (
-            self._get_sparse_delta_applier().update_weights_from_decoded_sparse_payload(
-                *serialized_payloads
-            )
-        )
+        applier = self._get_sparse_delta_applier()
+        return applier.update_weights_from_decoded_sparse_payload(*serialized_payloads)
 
     def update_weights_from_decoded_sparse_payload_files(
         self,
         *payload_paths: str,
     ) -> dict[str, Any]:
-        return self._get_sparse_delta_applier().update_weights_from_decoded_sparse_payload_files(
-            *payload_paths
-        )
+        applier = self._get_sparse_delta_applier()
+        return applier.update_weights_from_decoded_sparse_payload_files(*payload_paths)
 
     def synchronize_device(self) -> None:
         self._get_sparse_delta_applier().synchronize_device()
