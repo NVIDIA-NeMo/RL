@@ -565,6 +565,41 @@ class TestProcessMicrobatch:
         assert torch.equal(result.input_ids_cp_sharded, mock_cp_sharded)
         assert torch.equal(result.cu_seqlens_padded, mock_cu_seqlens_padded)
 
+    def test_process_microbatch_delegate_pack_rejects_mtp_loss_mask(self):
+        """delegate_pack_to_model must reject a pre-computed mtp_loss_mask.
+
+        The VLM self-packing path does not pack/propagate mtp_loss_mask, so MTP
+        training would be silently dropped. process_microbatch must fail loudly
+        rather than produce wrong results. Regression guard for issue #2869: the
+        worker now only creates mtp_loss_mask when MTP is enabled, but if a mask
+        ever reaches this path it must raise instead of being silently ignored.
+        """
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        seq_lengths = torch.tensor([3, 2])
+        data_dict = MagicMock()
+        data_dict.__getitem__ = MagicMock(
+            side_effect=lambda k: input_ids if k == "input_ids" else seq_lengths
+        )
+        data_dict.__contains__ = MagicMock(
+            side_effect=lambda k: k in {"input_ids", "input_lengths", "mtp_loss_mask"}
+        )
+
+        with pytest.raises(AssertionError) as exc_info:
+            process_microbatch(
+                data_dict,
+                seq_length_key="input_lengths",
+                pack_sequences=True,
+                delegate_pack_to_model=True,
+                pad_full_seq_to=8,
+                straggler_timer=MagicMock(),
+            )
+
+        assert "MTP training is not supported with VLM sequence packing" in str(
+            exc_info.value
+        )
+
 
 @pytest.mark.mcore
 class TestPrepareVlmBatchForMegatron:

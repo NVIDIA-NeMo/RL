@@ -525,8 +525,8 @@ def mock_2gpu_distributed_env():
 
     # Create the 2D mesh that acts like a dictionary (this is so we can test DTensorPolicyWorker with TP > 1)
     mesh_2d = unittest.mock.MagicMock()
-    mesh_2d.__getitem__.side_effect = (
-        lambda key: dp_mesh if key == "dp" else tp_mesh if key == "tp" else None
+    mesh_2d.__getitem__.side_effect = lambda key: (
+        dp_mesh if key == "dp" else tp_mesh if key == "tp" else None
     )
     mesh_2d.device_type = "cuda"
 

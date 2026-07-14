@@ -46,7 +46,10 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
-from nemo_rl.models.policy.utils import resolve_policy_worker_cls
+from nemo_rl.models.policy.utils import (
+    aggregate_per_sample_handles,
+    resolve_policy_worker_cls,
+)
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
@@ -56,6 +59,28 @@ from nemo_rl.utils.flops_tracker import (
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
+
+
+def _aggregate_megatron_flops_metrics(
+    results: list[dict],
+    world_size: int,
+) -> dict:
+    """Aggregate FLOPS metrics from Megatron worker results.
+
+    Called when the Megatron worker returns total_flops directly (no FLOPTracker).
+    """
+    aggregated: dict = {}
+    aggregated["total_flops"] = results[0]["total_flops"]
+    aggregated["num_ranks"] = results[0].get("num_ranks", world_size)
+    if "train_elapsed_seconds" in results[0]:
+        aggregated["train_elapsed_seconds"] = results[0]["train_elapsed_seconds"]
+    try:
+        aggregated["theoretical_tflops"] = aggregated[
+            "num_ranks"
+        ] * get_theoretical_tflops(results[0]["gpu_name"], results[0]["model_dtype"])
+    except Exception as e:
+        warnings.warn(f"Error getting theoretical flops: {e}")
+    return aggregated
 
 
 class Policy(ColocatablePolicyInterface, GenerationInterface):
@@ -321,6 +346,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
 
+    @property
+    def data_parallel_size(self) -> int:
+        """Data-parallel degree, read from the policy's sharding annotations."""
+        return self.sharding_annotations.get_axis_size("data_parallel")
+
     def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
         """Run a method on all workers in parallel with the same data.
 
@@ -420,7 +450,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         is the inverse permutation needed to undo seqpack/dynbatch reorder
         (``None`` when neither is enabled).
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -461,7 +491,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -641,16 +671,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> list[dict[str, Any]]:
         """Ship the teacher's full-vocab logits to the student via CUDA IPC.
 
-        Used by cross-tokenizer distillation. Returns a flat ``list[B]`` of
-        per-sample IPC handle dicts; each entry's ``logits_ipc``
-        reconstructs a ``[T_t, V_t]`` CUDA tensor on the consumer device.
-        The loss fn then either (a) derives a microbatch-global top-k
-        subset internally to match the PT non-gold path, or (b) uses the
-        full vocab end-to-end to match the PT gold path.
+        Used by cross-tokenizer distillation; supports heterogeneous teacher
+        TP/CP. Gathers each worker's ``{"dp_rank", "per_sample_handles"}`` and
+        returns the global-batch-ordered list produced by
+        :func:`aggregate_per_sample_handles`: a length-``gbs`` list where
+        element ``i`` is ``{"teacher_shards": [shard, ...]}`` holding every
+        TP×CP shard of global sample ``i``. Each shard carries the IPC payload
+        plus the ``buf_idx`` / ``sample_index_in_buf`` slot index and the TP/CP
+        shard metadata; the loss consumer reassembles the full ``[T_t, V_t]``
+        teacher logits (or its CP-local window) from these shards.
 
-        Caller must invoke :meth:`release_ipc_buffer` after the student
-        finishes consuming the handles — otherwise the producer-side
-        CUDA tensors leak.
+        The producer-side IPC storage is persistent and reused across calls
+        (via ``copy_``); the caller releases it once via
+        :meth:`release_ipc_buffer` at the end of training / validation (and on
+        error), not per call.
 
         v0 limitation: no dynamic batching, no sequence packing.
         """
@@ -659,7 +693,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "get_full_logits_ipc does not support dynamic batching "
                 "or sequence packing in v0."
             )
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         with timer.time("get_full_logits_ipc/shard_data") if timer else nullcontext():
             sharded_data = data.shard_by_batch_size(  # type: ignore
                 dp_size,
@@ -675,18 +709,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
+                # Keep every TP × CP output; consumer routes via overlap.
+                output_is_replicated=["pipeline_parallel"],
                 common_kwargs={"micro_batch_size": micro_batch_size},
             )
         worker_results = self.worker_group.get_all_worker_results(futures)
-        all_handles: list[dict[str, Any]] = []
-        for wr in worker_results:
-            all_handles.extend(wr["per_sample_handles"])
-        return all_handles
+        return aggregate_per_sample_handles(worker_results)
 
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""
@@ -776,6 +804,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
             except Exception as e:
                 warnings.warn(f"Error getting theoretical flops: {e}")
+        elif results and "total_flops" in results[0]:
+            aggregated_results.update(
+                _aggregate_megatron_flops_metrics(
+                    results, self.worker_group.cluster.world_size()
+                )
+            )
 
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)
@@ -798,7 +832,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
         futures = self.worker_group.run_all_workers_sharded_data(
             "generate",
@@ -839,7 +873,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "Missing required input fields"
         )
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
         futures = self.worker_group.run_all_workers_sharded_data(
             "score",
@@ -929,7 +963,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         distributed reduction, returning results merged across ranks. Therefore, we shard the
         input by DP and call in parallel, then take the result from the first worker.
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -997,18 +1031,37 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
+        self,
+        rollout_engine_urls: list[str],
+        buffer_size_bytes: int,
     ) -> list[ray.ObjectRef]:
-        """Send the weights to SGLang servers via HTTP API.
+        """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The caller
+                resolves these once (via ``engine.get_base_url``) and passes
+                them in, so every FSDP rank doesn't redo the Ray RPC.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        The rollout TP size is captured once via
+        ``set_rollout_num_gpus_per_engine`` and reused by each worker.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            rollout_engine_urls=rollout_engine_urls,
+            buffer_size_bytes=buffer_size_bytes,
         )
         return futures
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Broadcast the rollout engine TP size to every policy worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "set_rollout_num_gpus_per_engine",
+                num_gpus_per_engine=num_gpus_per_engine,
+            )
+        )
 
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
@@ -1031,6 +1084,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
         ray.get(futures)
 
+    def offload_to_cpu(self) -> None:
+        """Offload to CPU to free GPU memory; currently only used by PPO."""
+        self.offload_after_refit()
+
     def save_checkpoint(
         self,
         weights_path: str,
@@ -1038,7 +1095,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tokenizer_path: Optional[str] = None,
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
-        """Save a checkpoint of the model."""
+        """Save a checkpoint of the model.
+
+        With Megatron async_save=True, this returns after D2H staging. The caller
+        must call finalize_async_save() before renaming the checkpoint directory.
+        """
         # Only pass checkpointing_cfg for DTensor v2
         use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
 
@@ -1064,6 +1125,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
             )
+        ray.get(futures)
+
+    def finalize_async_save(self) -> None:
+        """Block until all workers' in-flight async checkpoint writes complete.
+
+        No-op when async_save is disabled. Must be called before the checkpoint
+        directory is renamed from tmp_step_N/ to step_N/.
+        """
+        futures = self.worker_group.run_all_workers_single_data("finalize_async_save")
         ray.get(futures)
 
     def shutdown(self) -> bool:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import json
 import os
 import time
 import warnings
@@ -22,16 +23,22 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cas
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
+    OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
+)
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -39,6 +46,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -47,6 +55,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
+    print_efficiency_summary,
     print_performance_metrics,
     set_seed,
 )
@@ -64,8 +73,11 @@ from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
+    TOPO_RANK_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
+    get_ray_cluster_topology,
+    prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -76,13 +88,15 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
@@ -148,6 +162,46 @@ class AdvEstimatorConfig(TypedDict):
     use_leave_one_out_baseline: NotRequired[bool]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
+
+
+class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
+    """Optional token IDs for reward penalties."""
+
+    unwanted: list[int] | None = None
+    think_open: int | None = None
+    think_close: int | None = None
+
+
+class RewardPenaltyConfig(BaseModel, extra="allow"):
+    """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
+
+    penalize_duplicated_reasoning: bool = False
+    penalize_empty_final_answer: bool = False
+    penalize_unwanted_tokens: bool = False
+    penalize_malformed_think_tag: bool = False
+    # Optional token IDs. token_ids.unwanted is required when
+    # penalize_unwanted_tokens is true;
+    # think-tag IDs are inferred from configured tag strings when possible.
+    token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
+
+    @model_validator(mode="after")
+    def _require_unwanted_token_ids_when_penalized(self) -> "RewardPenaltyConfig":
+        if self.penalize_unwanted_tokens and (
+            self.token_ids is None or not self.token_ids.unwanted
+        ):
+            raise ValueError(
+                "reward_penalties.token_ids.unwanted must be set when "
+                "reward_penalties.penalize_unwanted_tokens is true"
+            )
+        return self
+
+
+_REWARD_PENALTY_FLAGS = (
+    "penalize_duplicated_reasoning",
+    "penalize_empty_final_answer",
+    "penalize_unwanted_tokens",
+    "penalize_malformed_think_tag",
+)
 
 
 class GRPOConfig(TypedDict):
@@ -235,7 +289,9 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
+    on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
 
 # ===============================================================================
@@ -262,14 +318,17 @@ def setup(
     CheckpointManager,
     GRPOSaveState,
     MasterConfig,
+    dict[str, Any],
+    dict[str, str],
 ]:
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        An 11-tuple, in order:
+        A 13-tuple, in order:
             policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
             when not enabled), cluster, dataloader, val_dataloader, loss_fn,
-            logger, checkpointer, grpo_save_state, master_config.
+            logger, checkpointer, grpo_save_state, master_config,
+            teacher_worker_groups, alias_to_group_alias.
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -412,7 +471,47 @@ def setup(
     # ==========================
     #        Loss Function
     # ==========================
-    loss_fn = ClippedPGLossFn(loss_config)
+    # Fused linear logprobs compute next-token logprobs directly from hidden states
+    # (chunked over the sequence) and never materialize the full
+    # [batch, seq_len, vocab_size] logit tensor, which significantly reduces peak
+    # memory. It is only available on the Megatron backend.
+    # Both megatron_cfg and use_fused_linear_logprobs are NotRequired, and many
+    # configs (e.g. nemo_gym, modelopt, non-megatron) omit them -- use .get() with
+    # a {} fallback to avoid a KeyError.
+    megatron_cfg = policy_config.get("megatron_cfg", {})
+    use_fused_linear_logprobs = bool(
+        megatron_cfg.get("enabled") and megatron_cfg.get("use_fused_linear_logprobs")
+    )
+    if use_fused_linear_logprobs:
+        # Sequence packing is not yet validated with the fused path: the fused
+        # forward rolls labels over the whole (packed) sequence and would mix
+        # tokens across packed-sequence boundaries.
+        assert not policy_config["sequence_packing"]["enabled"], (
+            "Linear CE fusion loss is not supported with sequence packing for GRPO. "
+            "The fused path has not been validated with cu_seqlens-based logprob "
+            "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
+            "or policy.sequence_packing.enabled=false."
+        )
+        # The fused forward gathers the logprob of the realized token from the raw
+        # (unfiltered) logits, so top-k/top-p training-time filtering cannot be
+        # applied. This also keeps prev/reference logprobs (computed via the fused
+        # get_logprobs path) consistent with the actor logprobs.
+        assert not need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(
+                top_k=generation_config["top_k"],
+                top_p=generation_config["top_p"],
+            )
+        ), (
+            "Linear CE fusion loss is not supported with top-k/top-p training-time "
+            "filtering for GRPO. The fused path computes logprobs from unfiltered "
+            "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
+            "disable filtering (policy.generation.top_k=null, "
+            "policy.generation.top_p=1.0)."
+        )
+
+    loss_fn = ClippedPGLossFn(
+        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
+    )
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -448,6 +547,9 @@ def setup(
     # NeMo Gym is initialized inside setup() (rather than by the caller) so its
     # spinup can overlap with vLLM model loading via deferred model load.
     enable_nemo_gym = _should_use_nemo_gym(master_config)
+    _raise_if_reward_penalties_enabled_without_nemo_gym(
+        master_config, enable_nemo_gym=enable_nemo_gym
+    )
     nemo_gym_actor = None
     if enable_nemo_gym:
         nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
@@ -465,7 +567,7 @@ def setup(
             nemo_gym_py_exec = create_local_venv_on_each_node(
                 nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
             )
-        nemo_gym_dict = env_configs["nemo_gym"]
+        nemo_gym_dict = dict(env_configs["nemo_gym"])
         # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
         # (where the detector reads them), not part of Gym's global config.
         invalid_tool_call_patterns = nemo_gym_dict.pop(
@@ -485,6 +587,7 @@ def setup(
             base_urls=base_urls,
             invalid_tool_call_patterns=invalid_tool_call_patterns,
             thinking_tags=thinking_tags,
+            require_routed_experts=router_replay_enabled(policy_config),
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}
@@ -506,6 +609,10 @@ def setup(
         return actor, time.perf_counter() - t0
 
     total_nodes = cluster_config["num_nodes"]
+    segment_size = cluster_config.get("segment_size")
+    # Topology of nodes left over after policy/inference placement; non-colocated
+    # OPD teachers are placed within it so their collectives stay on NVLink.
+    teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None
     if rm_env_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
         rm_nodes = rm_resource["num_nodes"]
@@ -523,6 +630,31 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
+    # Reserve nodes for non-colocated OPD teachers so training doesn't claim them.
+    opd_teacher_nodes = 0
+    enable_opd_teachers = opd_module.is_non_colocated_teachers_enabled(master_config)
+    if enable_opd_teachers:
+        assert _should_use_async_rollouts(master_config), (
+            "Non-colocated OPD teachers require async GRPO (vLLM backend with async_engine enabled)."
+        )
+        from nemo_rl.models.policy.teacher_worker_group import (
+            create_teacher_configs_from_opd_config,
+        )
+
+        opd_cfg = opd_module._opd_cfg(master_config)
+        teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+        for tcfg in teacher_configs:
+            opd_teacher_nodes += tcfg.num_nodes
+        policy_nodes -= opd_teacher_nodes
+        assert policy_nodes > 0, (
+            "policy_nodes must be > 0 after reserving OPD teacher nodes, but got "
+            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} + opd_teacher_nodes:{opd_teacher_nodes} = total_nodes:{total_nodes}"
+        )
+        print(
+            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} + opd_teacher_nodes:{opd_teacher_nodes} = total_nodes:{total_nodes}",
+            flush=True,
+        )
+
     if colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
@@ -534,6 +666,13 @@ def setup(
         else:
             policy_gpus_per_node = cluster_config["gpus_per_node"]
 
+        node_resource_constraints, policy_remaining_ids, policy_topology = (
+            prepare_segment_topology(segment_size, policy_nodes)
+        )
+        if segment_size is not None:
+            teacher_segment_topology = {
+                nid: policy_topology[nid] for nid in policy_remaining_ids
+            }
         cluster = RayVirtualCluster(
             name="grpo_policy_cluster",
             bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
@@ -544,6 +683,8 @@ def setup(
             else 2,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
         train_cluster = cluster
         inference_cluster = cluster
@@ -609,6 +750,103 @@ def setup(
             )
             train_nodes -= inference_nodes
 
+        assert train_nodes > 0 and inference_nodes > 0, (
+            f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
+            f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
+        )
+
+        # Build topology-aware domain constraints for placement groups.
+        # Each selected node's bundles are pinned to a specific NVLink domain so
+        # that EP groups stay within high-bandwidth switch fabrics.
+        #
+        # NOTE: segment_size is also passed to RayVirtualCluster and used later
+        # by _sort_bundle_indices_by_topology to trim incomplete domain segments
+        # when ordering ranks. When constraints successfully pin nodes to
+        # complete segments, that post-placement trimming is a no-op. It serves
+        # as defense-in-depth for the fallback path where constraints are absent.
+        node_resource_constraints = None
+        inference_node_resource_constraints = None
+        inference_segment_size = None
+        if segment_size is not None:
+            topology = get_ray_cluster_topology()
+            num_alive_nodes = len(topology)
+            required_nodes = train_nodes + inference_nodes
+            assert num_alive_nodes >= required_nodes, (
+                f"Not enough alive Ray nodes for all roles: "
+                f"need {required_nodes} (train={train_nodes} + inference={inference_nodes}), "
+                f"but only {num_alive_nodes} alive nodes found"
+            )
+            node_resource_constraints, remaining_node_ids, topology = (
+                prepare_segment_topology(
+                    segment_size, train_nodes, topology=topology, role="training"
+                )
+            )
+            # Teachers default to the nodes left after training; narrowed further
+            # below if a non-colocated inference cluster is also pinned.
+            teacher_segment_topology = {
+                nid: topology[nid] for nid in remaining_node_ids
+            }
+            # Warn if any selected training node lacks topo_rank — domain pinning
+            # still works but intra-domain rank ordering will be arbitrary.
+            if node_resource_constraints is not None:
+                training_node_ids = set(topology) - set(remaining_node_ids)
+                nodes_missing_topo_rank = [
+                    nid
+                    for nid in training_node_ids
+                    if topology[nid][1] == TOPO_RANK_UNKNOWN
+                ]
+                if nodes_missing_topo_rank:
+                    print(
+                        f"  ⚠ {len(nodes_missing_topo_rank)} selected training nodes have NVLink domain "
+                        f"info but no topo_rank; intra-domain rank ordering may be suboptimal",
+                        flush=True,
+                    )
+
+                # Inference topology: each vLLM/SGLang instance spans
+                # nodes_per_instance nodes; keep those within one domain
+                # so cross-node all-reduce uses NVLink, not InfiniBand.
+                #
+                # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
+                # For SGLang: gpus_per_server already includes all parallelism
+                #   dimensions (TP, DP-attention, PP are internal subdivisions),
+                #   so we use it directly without multiplying by pp_size.
+                if generation_config["backend"] == "vllm":
+                    vllm_cfg = generation_config.get("vllm_cfg", {})
+                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                        "pipeline_parallel_size", 1
+                    )
+                else:
+                    sglang_cfg = generation_config.get("sglang_cfg", {})
+                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+                nodes_per_instance = (
+                    gpus_per_instance + inference_gpus_per_node - 1
+                ) // inference_gpus_per_node
+                if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+                    remaining_topology = {
+                        nid: topology[nid] for nid in remaining_node_ids
+                    }
+                    (
+                        inference_node_resource_constraints,
+                        inference_remaining_ids,
+                        _,
+                    ) = prepare_segment_topology(
+                        nodes_per_instance,
+                        inference_nodes,
+                        topology=remaining_topology,
+                        role="inference",
+                    )
+                    inference_segment_size = nodes_per_instance
+                    teacher_segment_topology = {
+                        nid: topology[nid] for nid in inference_remaining_ids
+                    }
+                elif nodes_per_instance > 1:
+                    print(
+                        f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                        f"nodes_per_instance={nodes_per_instance} (gpus_per_instance={gpus_per_instance}); "
+                        f"skipping inference topology constraints",
+                        flush=True,
+                    )
+
         # initialize train cluster
         train_cluster = RayVirtualCluster(
             name="grpo_train_cluster",
@@ -618,13 +856,21 @@ def setup(
             max_colocated_worker_groups=1,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
+        # When domain constraints are set, eagerly create placement groups
+        # so training claims the constrained nodes before inference can grab them.
+        if node_resource_constraints is not None:
+            train_cluster.get_placement_groups()
         print(
             f"  ✓ Ray train cluster initialized with {train_nodes} nodes with {train_gpus_per_node} GPUs per node",
             flush=True,
         )
 
-        # initialize inference cluster
+        # Create inference cluster with topology constraints so TP groups
+        # stay within NVLink domains. Eagerly initialize PGs when constraints
+        # are set so inference claims domain-aligned nodes first.
         inference_cluster = RayVirtualCluster(
             name="grpo_inference_cluster",
             bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
@@ -633,7 +879,13 @@ def setup(
             max_colocated_worker_groups=1,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=inference_segment_size,
+            node_resource_constraints=inference_node_resource_constraints,
         )
+        if inference_node_resource_constraints is not None:
+            VllmGeneration.init_cluster_placement_groups(
+                inference_cluster, generation_config
+            )
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
             flush=True,
@@ -719,7 +971,10 @@ def setup(
     def init_sglang():
         """Initialize SGLang generation workers."""
         t0 = time.perf_counter()
-        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg = SGLangGeneration(
+            cluster=inference_cluster,
+            sglang_cfg=generation_config,
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -954,6 +1209,9 @@ def setup(
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
+        # Capture rollout TP size on the policy once; refit calls no longer need it.
+        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
+
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -1009,6 +1267,25 @@ def setup(
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
 
+    # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
+    # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
+    # cache (shared key when student == teacher) — both workers write to the
+    # same iter_0000000/ path and the second reader gets a truncated file.
+    teacher_worker_groups: dict[str, Any] = {}
+    alias_to_group_alias: dict[str, str] = {}
+    if enable_opd_teachers:
+        t0 = time.perf_counter()
+        teacher_worker_groups, alias_to_group_alias = (
+            opd_module.create_teacher_worker_groups(
+                master_config,
+                policy_config,
+                tokenizer,
+                segment_size=segment_size,
+                teacher_segment_topology=teacher_segment_topology,
+            )
+        )
+        worker_init_timing_metrics["teacher_init_time_s"] = time.perf_counter() - t0
+
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
     worker_init_timing_metrics["total_setup_time_s"] = total_setup_time
@@ -1026,6 +1303,10 @@ def setup(
 
         if policy_time:
             print(f"  Policy init: {policy_time:.1f}s")
+
+        teacher_time = worker_init_timing_metrics.get("teacher_init_time_s", 0)
+        if teacher_time:
+            print(f"  Teacher init: {teacher_time:.1f}s")
 
         # Calculate "other" time (time after worker init completes)
         other_time = total_setup - worker_init_complete_time
@@ -1054,6 +1335,8 @@ def setup(
         checkpointer,
         grpo_save_state,
         master_config,
+        teacher_worker_groups,
+        alias_to_group_alias,
     )
 
 
@@ -1315,12 +1598,34 @@ def _resolve_message_level_advantage_penalties(
     # The is_invalid_tool_call / has_malformed_thinking flags these penalties rely on
     # are only populated by the NeMo-Gym environment. Without that path the penalties
     # would silently no-op, so fail loudly instead.
-    assert _should_use_nemo_gym(master_config), (
-        "grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage require "
-        "the NeMo-Gym path (env.should_use_nemo_gym=true); they are not supported with "
-        "the native generation path."
-    )
+    if not _should_use_nemo_gym(master_config):
+        raise ValueError(
+            "grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage require "
+            "the NeMo-Gym path (env.should_use_nemo_gym=true); they are not supported with "
+            "the native generation path."
+        )
     return invalid_tool_call_advantage, malformed_thinking_advantage
+
+
+def _raise_if_reward_penalties_enabled_without_nemo_gym(
+    master_config: MasterConfig,
+    *,
+    enable_nemo_gym: bool,
+) -> None:
+    """Validate reward-zeroing penalties are only used with NeMo-Gym."""
+    if enable_nemo_gym:
+        return
+
+    if not any(
+        getattr(master_config.reward_penalties, flag) for flag in _REWARD_PENALTY_FLAGS
+    ):
+        return
+
+    raise ValueError(
+        "reward_penalties require the NeMo-Gym path "
+        "(env.should_use_nemo_gym=true); they are not supported with the native "
+        "generation path."
+    )
 
 
 def _apply_message_level_advantage_penalties(
@@ -1329,7 +1634,7 @@ def _apply_message_level_advantage_penalties(
     invalid_tool_call_advantage: float | None,
     malformed_thinking_advantage: float | None,
     log_config: bool = False,
-) -> None:
+) -> Optional[dict[str, float]]:
     """Overwrite advantages for flagged assistant-message token spans.
 
     For each assistant message flagged by the NeMo-Gym detector as an invalid
@@ -1344,11 +1649,15 @@ def _apply_message_level_advantage_penalties(
         invalid_tool_call_advantage: Advantage value assigned to invalid tool calls.
         malformed_thinking_advantage: Advantage value assigned to malformed thinking.
         log_config: If True, print the configured penalty values once.
+
+    Returns:
+        Dictionary of penalty metrics if penalties are applied, otherwise None.
     """
+    penalty_metrics = {}
     invalid_neg_adv = invalid_tool_call_advantage
     malformed_neg_adv = malformed_thinking_advantage
     if invalid_neg_adv is None and malformed_neg_adv is None:
-        return
+        return penalty_metrics
 
     if log_config:
         print(
@@ -1362,6 +1671,10 @@ def _apply_message_level_advantage_penalties(
 
     advantages = train_data["advantages"]
     materialized_advantages = False
+    num_invalid_tool_calls = 0
+    num_malformed_thinking = 0
+    num_assistant_messages = 0
+
     for i, message_log in enumerate(message_logs):
         token_offset = 0
         for j, message in enumerate(message_log):
@@ -1370,6 +1683,8 @@ def _apply_message_level_advantage_penalties(
             is_assistant = (
                 message["role"] == "assistant" and "generation_logprobs" in message
             )
+            if is_assistant:
+                num_assistant_messages += 1
             is_invalid = (
                 is_assistant
                 and invalid_neg_adv is not None
@@ -1388,12 +1703,14 @@ def _apply_message_level_advantage_penalties(
                 materialized_advantages = True
 
             if is_invalid:
+                num_invalid_tool_calls += 1
                 print(
                     f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
                     flush=True,
                 )
                 advantages[i, token_offset : token_offset + msg_len] = invalid_neg_adv
             elif is_malformed_thinking:
+                num_malformed_thinking += 1
                 print(
                     f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
                     flush=True,
@@ -1401,19 +1718,36 @@ def _apply_message_level_advantage_penalties(
                 advantages[i, token_offset : token_offset + msg_len] = malformed_neg_adv
             token_offset += msg_len
 
+    invalid_tool_call_rate = num_invalid_tool_calls / max(num_assistant_messages, 1)
+    malformed_thinking_rate = num_malformed_thinking / max(num_assistant_messages, 1)
+    print(
+        f"Invalid tool call rate: {invalid_tool_call_rate:.4f} ({num_invalid_tool_calls}/{num_assistant_messages})",
+        flush=True,
+    )
+    print(
+        f"Malformed thinking rate: {malformed_thinking_rate:.4f} ({num_malformed_thinking}/{num_assistant_messages})",
+        flush=True,
+    )
+    penalty_metrics["invalid_tool_call_rate"] = invalid_tool_call_rate
+    penalty_metrics["malformed_thinking_rate"] = malformed_thinking_rate
+    penalty_metrics["num_invalid_tool_calls"] = num_invalid_tool_calls
+    penalty_metrics["num_malformed_thinking"] = num_malformed_thinking
+    penalty_metrics["num_assistant_messages"] = num_assistant_messages
+    return penalty_metrics
+
 
 def _apply_configured_message_level_advantage_penalties(
     train_data: BatchedDataDict[ClippedPGLossDataDict],
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
     master_config: MasterConfig,
     log_config: bool = False,
-) -> None:
+) -> Optional[dict[str, float]]:
     """Resolve config and apply message-level advantage penalties."""
     (
         invalid_tool_call_advantage,
         malformed_thinking_advantage,
     ) = _resolve_message_level_advantage_penalties(master_config)
-    _apply_message_level_advantage_penalties(
+    return _apply_message_level_advantage_penalties(
         train_data=train_data,
         message_logs=message_logs,
         invalid_tool_call_advantage=invalid_tool_call_advantage,
@@ -1425,21 +1759,74 @@ def _apply_configured_message_level_advantage_penalties(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    Returns True if async_engine is enabled.
+    SGLang only uses async rollouts when explicitly configured with
+    ``policy.generation.use_async_rollouts``. vLLM and Megatron use async
+    rollouts when their respective ``async_engine`` config is enabled.
     """
     generation_config = master_config.policy["generation"]
     if generation_config is None:
         return False
     backend = generation_config.get("backend", "")
 
+    if backend == "sglang":
+        return bool(generation_config.get("use_async_rollouts", False))
+
     if backend == "vllm":
-        vllm_cfg = generation_config.get("vllm_cfg", {})
-        return vllm_cfg.get("async_engine", False)
-    elif backend == "megatron":
+        return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
+
+    if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
         return mcore_cfg.get("async_engine", False)
-    else:
-        return False
+
+    return False
+
+
+def _preserve_router_replay_routed_experts(
+    target: BatchedDataDict,
+    flat_messages: BatchedDataDict,
+    policy_config: PolicyConfig,
+) -> None:
+    """Carry rollout-recorded routes into policy worker inputs when R3 is enabled."""
+    if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
+        target["routed_experts"] = flat_messages["routed_experts"]
+
+
+def _build_async_grpo_train_data(
+    flat_messages: BatchedDataDict,
+    input_lengths: torch.Tensor,
+    repeated_batch: BatchedDataDict,
+    policy_config: PolicyConfig,
+) -> BatchedDataDict[ClippedPGLossDataDict]:
+    """Build the async no-TQ policy train batch from flattened rollout messages."""
+    train_data = BatchedDataDict[ClippedPGLossDataDict](
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+            "generation_logprobs": flat_messages["generation_logprobs"],
+            "token_mask": flat_messages["token_loss_mask"],
+            "sample_mask": repeated_batch["loss_multiplier"],
+        }
+    )
+    _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    return train_data
+
+
+def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
+    """Zero loss_multiplier where mask_sample is True and return the count."""
+    if "mask_sample" not in repeated_batch:
+        return 0
+
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    mask_sample = repeated_batch["mask_sample"]
+
+    if isinstance(mask_sample, list):
+        mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+    mask_sample_bool = mask_sample.bool()
+
+    num_masked = int(mask_sample_bool.sum().item())
+    loss_multiplier[mask_sample_bool] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return num_masked
 
 
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
@@ -1474,12 +1861,49 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
+    """Whether NeMo Gym is responsible for full response logging (wandb/metrics paths).
+
+    When **True**, we **skip** the expensive per-step ``train_data_step*.jsonl`` dump and
+    **keep** ``full_result``-style keys in rollout metrics (large payloads).
+
+    When **False** (default if unset), we **strip** ``full_result`` from rollout metrics and
+    **write** the ``train_data_step*.jsonl`` file (can be very large for Gym).
+
+    Set via ``env.should_log_nemo_gym_responses`` in the master config.
+    """
     env_config = master_config.env
     should_log_nemo_gym_responses = bool(
         env_config.get("should_log_nemo_gym_responses")
     )
 
     return should_log_nemo_gym_responses
+
+
+def _write_latest_checkpoint_status(
+    checkpointer: CheckpointManager, last_checkpoint_step: int
+) -> None:
+    """Write a lightweight, top-level ``latest_checkpoint_status.json`` for monitoring.
+
+    Records the wall-clock time and step of the most recent successful checkpoint
+    save so an out-of-band watchdog can poll checkpoint progress on long runs.
+
+    Intentionally distinct from ``CheckpointManager``'s per-step
+    ``step_{N}/training_info.json`` (the resume state): different schema, written
+    at the checkpoint-dir root. There is no in-repo consumer yet. The read is
+    deliberately unguarded so a corrupt file surfaces loudly (signalling
+    corruption) instead of being silently masked.
+    """
+    status_path = os.path.join(
+        str(checkpointer.checkpoint_dir), "latest_checkpoint_status.json"
+    )
+    status: dict[str, Any] = {}
+    if os.path.exists(status_path):
+        with open(status_path) as f:
+            status = json.load(f)
+    status["last_successful_ckpt_save_completion"] = time.time()
+    status["last_checkpoint_step"] = last_checkpoint_step
+    with open(status_path, "w") as f:
+        json.dump(status, f)
 
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
@@ -1490,6 +1914,28 @@ def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConf
     if effort_dict is None:
         return None
     return EffortLevelsConfig.model_validate(effort_dict)
+
+
+def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
+    """Right-zero-pad teacher logprobs ``[B, teacher_S]`` to ``train_S``.
+
+    ``from_batches`` pads teacher logprobs to ``max(S_i)``; ``train_data`` may be
+    longer due to ``make_sequence_length_divisible_by``. Zero-pad is safe because
+    the mask zeros padding in advantage computation. ``teacher_S > train_S`` is
+    unexpected (teacher pads to a finer grid than the student) and raises.
+    """
+    teacher_S = teacher_logprobs.shape[1]
+    if teacher_S > train_S:
+        raise ValueError(
+            f"Teacher logprobs seq length ({teacher_S}) > train_data seq length ({train_S}). "
+            "Teacher logprobs are padded to max(S_i) by from_batches, "
+            "and train_data is padded to roundup(max(S_i), make_sequence_length_divisible_by)."
+        )
+    if teacher_S < train_S:
+        teacher_logprobs = torch.nn.functional.pad(
+            teacher_logprobs, (0, train_S - teacher_S), value=0.0
+        )
+    return teacher_logprobs
 
 
 def _create_advantage_estimator(master_config: MasterConfig):
@@ -1529,6 +1975,24 @@ def _create_advantage_estimator(master_config: MasterConfig):
     elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "opd":
+        opd_module.assert_prev_logprobs_available(master_config)
+        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
+        print("  ✓ Using OPD advantage estimator")
+        # Warn if loss_fn is not configured per MOPD paper recommendations.
+        if not loss_config.disable_ppo_ratio:
+            warnings.warn(
+                "OPD recommends loss_fn.disable_ppo_ratio: true (REINFORCE-style, MOPD Eq. 7)"
+            )
+        if not loss_config.use_importance_sampling_correction:
+            warnings.warn(
+                "OPD recommends loss_fn.use_importance_sampling_correction: true (MOPD Eq. 8 w_t)"
+            )
+        if loss_config.truncated_importance_sampling_type != "icepop":
+            warnings.warn(
+                "OPD recommends loss_fn.truncated_importance_sampling_type: 'icepop' "
+                "(hard gate, MOPD Eq. 8)"
+            )
     elif adv_estimator_name == "reinforce_plus_plus":
         adv_estimator = ReinforcePlusPlusAdvantageEstimator(
             adv_estimator_config, loss_config
@@ -1558,7 +2022,7 @@ def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
     colocated_inference: bool,
-    _refit_buffer_size_gb: Optional[int] = None,
+    _refit_buffer_size_gb: Optional[float] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
 ) -> None:
@@ -1567,9 +2031,8 @@ def refit_policy_generation(
     Args:
         policy: The policy to provide weights to the inference engine.
         policy_generation: The inference engine to refit.
-        _refit_buffer_size_gb: The size of the buffer to use for refitting.
-            If it is None, the buffer size will be computed by the remaining memory.
-            This parameter is primarily used for testing.
+        _refit_buffer_size_gb: Fixed refit buffer size in GiB. If it is None,
+            the buffer size is computed from remaining memory.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
@@ -1606,7 +2069,7 @@ def refit_policy_generation(
         if colocated_inference:
             # get model param keys, which is grouped by size
             if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
+                buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
             else:
                 # Empirically sets ratio as 30% to maximize efficiency.
                 # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
@@ -1616,15 +2079,10 @@ def refit_policy_generation(
                 )
 
             if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = (
-                    policy_generation.get_sglang_url_to_gpu_uuids()
-                )
-                # Stream weights via HTTP
-                flush_success = policy_generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
+                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
                 futures_train = policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+                    rollout_engine_urls=policy_generation.get_rollout_engine_urls(),
+                    buffer_size_bytes=buffer_size_bytes,
                 )
                 # Wait for all workers to complete
                 ray.get(futures_train)
@@ -1649,7 +2107,6 @@ def refit_policy_generation(
             if isinstance(policy_generation, MegatronGeneration):
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
             else:
-                policy.offload_before_refit()
                 futures_train = policy.broadcast_weights_for_collective(
                     kv_scales=kv_scales
                 )
@@ -1658,7 +2115,6 @@ def refit_policy_generation(
             ray.get(futures_train)
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
-            policy.prepare_for_training()
 
         # check if update is successful
         if not update_success:
@@ -1855,7 +2311,7 @@ def grpo_train(
     master_config: MasterConfig,
 ) -> None:
     """Run GRPO training algorithm."""
-    timer = Timer()
+    timer = Timer(context={"worker": "driver"})
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -1896,6 +2352,7 @@ def grpo_train(
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -1907,7 +2364,12 @@ def grpo_train(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
+            )
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -2021,6 +2483,7 @@ def grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
@@ -2041,7 +2504,15 @@ def grpo_train(
                         policy_generation.clear_logger_metrics()
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if _should_use_nemo_gym(master_config):
-                        generation_config = master_config.policy["generation"]
+                        # configure_generation_config auto-fills stop_token_ids from the EOS
+                        # token, but run_async_nemo_gym_rollout asserts these are unset because
+                        # NeMo-Gym manages its own stop criteria. Clear them here so the
+                        # assertion reflects user intent (null in YAML) rather than the auto-fill.
+                        generation_config = {
+                            **master_config.policy["generation"],
+                            "stop_token_ids": None,
+                            "stop_strings": None,
+                        }
                         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
@@ -2054,6 +2525,8 @@ def grpo_train(
                             max_rollout_turns=None,
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
+                            reward_penalty_config=master_config.reward_penalties,
+                            thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2066,7 +2539,7 @@ def grpo_train(
                                 if "full_result" in key:
                                     rollout_metrics.pop(key)
 
-                    # Use async rollouts if vLLM async engine is enabled
+                    # Use async rollouts when enabled by config/backend defaults.
                     elif _should_use_async_rollouts(master_config):
                         (
                             repeated_batch,
@@ -2229,6 +2702,10 @@ def grpo_train(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
+                    metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
+
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -2266,11 +2743,9 @@ def grpo_train(
                     # but the train_data whitelist above drops it. Copy it back so
                     # the Megatron worker's train-stage router-replay guard finds
                     # it. Mirrors the TQ producer (sync_rollout_actor.py).
-                    if (
-                        router_replay_enabled(master_config.policy)
-                        and "routed_experts" in flat_messages
-                    ):
-                        train_data["routed_experts"] = flat_messages["routed_experts"]
+                    _preserve_router_replay_routed_experts(
+                        train_data, flat_messages, master_config.policy
+                    )
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -2282,9 +2757,7 @@ def grpo_train(
                     "seq_logprob_error_threshold", None
                 )
                 force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = (
-                    force_on_policy_ratio and seq_logprob_error_threshold is None
-                )
+                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
                 # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
                 if force_on_policy_ratio and seq_logprob_error_threshold is not None:
                     warnings.warn(
@@ -2321,11 +2794,9 @@ def grpo_train(
                     # intentionally ignores routed_experts (require_router_replay
                     # =False short-circuits before the field is read), so a
                     # present-but-unused field here is safe.
-                    if (
-                        router_replay_enabled(master_config.policy)
-                        and "routed_experts" in flat_messages
-                    ):
-                        logprob_data["routed_experts"] = flat_messages["routed_experts"]
+                    _preserve_router_replay_routed_experts(
+                        logprob_data, flat_messages, master_config.policy
+                    )
 
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
@@ -2412,8 +2883,10 @@ def grpo_train(
                     )
                     del baseline_for_log
 
-                    _apply_configured_message_level_advantage_penalties(
-                        train_data, repeated_batch["message_log"], master_config
+                    penalty_metrics = (
+                        _apply_configured_message_level_advantage_penalties(
+                            train_data, repeated_batch["message_log"], master_config
+                        )
                     )
 
                     # Clip advantages to prevent extreme values from small std normalization
@@ -2465,6 +2938,7 @@ def grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
@@ -2532,6 +3006,7 @@ def grpo_train(
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
+                metrics.update(penalty_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
@@ -2625,6 +3100,10 @@ def grpo_train(
                             ]
 
                     with timer.time("checkpointing"):
+                        # Finalize the previous (possibly async) checkpoint before
+                        # starting a new one. No-op with sync save / nothing pending.
+                        checkpointer.finalize_pending()
+
                         print(
                             f"Saving checkpoint for step {total_steps + 1}...",
                             flush=True,
@@ -2663,7 +3142,22 @@ def grpo_train(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
                             )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # Finalize in the background. The directory rename is
+                        # deferred until any async write completes (via wait_fn);
+                        # with sync save it renames immediately. Finalization is
+                        # flushed at the next save (finalize_pending) or on exit
+                        # (shutdown).
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
+
+                        # Record last-successful-checkpoint time/step for external
+                        # monitoring (parity with async_grpo_train; see
+                        # _write_latest_checkpoint_status).
+                        _write_latest_checkpoint_status(
+                            checkpointer, last_checkpoint_step=total_steps + 1
+                        )
 
             # Logging
             # Log training data
@@ -2820,10 +3314,12 @@ def grpo_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -2833,6 +3329,13 @@ def grpo_train(
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread would be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
 
 
 def validate(
@@ -2852,7 +3355,7 @@ def validate(
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
-    timer = Timer()
+    timer = Timer(context={"worker": "validator"})
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
@@ -2870,7 +3373,7 @@ def validate(
 
             additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
+            # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
@@ -2884,6 +3387,8 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
+                    reward_penalty_config=master_config.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -3016,6 +3521,14 @@ def aggregate_rollout_metrics(
             aggregated[k] = max(v)
         elif k == "total_turns":
             aggregated[k] = sum(v)
+        elif k == "trajectory_duration_s":
+            sorted_v = sorted(v)
+            p95_idx = min(int(len(sorted_v) * 0.95), len(sorted_v) - 1)
+            aggregated[k] = sum(v) / len(v)
+            aggregated["trajectory_duration_s/max"] = max(v)
+            aggregated["trajectory_duration_s/p95"] = (
+                sorted_v[p95_idx] if sorted_v else 0
+            )
         else:
             aggregated[k] = sum(v) / len(v)
     return aggregated
@@ -3035,6 +3548,8 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    teacher_worker_groups: Optional[dict[str, Any]] = None,
+    alias_to_group_alias: Optional[dict[str, str]] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -3053,15 +3568,29 @@ def async_grpo_train(
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
-    # Ensure we are running with a compatible async generation backend
-    assert _should_use_async_rollouts(master_config), (
-        "Async GRPO requires an async generation engine. "
+    # Ensure we are running with a compatible async generation backend.
+    # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
+    # SGLang async rollouts do not support the async GRPO replay path.
+    generation_config = master_config.policy["generation"]
+    backend = generation_config.get("backend", "") if generation_config else ""
+    assert backend in ("vllm", "megatron") and _should_use_async_rollouts(
+        master_config
+    ), (
+        "Async GRPO requires an async vLLM or Megatron generation engine. "
         "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
         "policy.generation.mcore_generation_config.async_engine=true (Megatron)."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
+    if router_replay_enabled(master_config.policy) and (
+        master_config.data_plane or {}
+    ).get("enabled", False):
+        raise NotImplementedError(
+            "policy.router_replay.enabled=true with async GRPO is currently "
+            "supported only when data_plane.enabled=false. Async + TQ support "
+            "has not been merged yet."
+        )
 
     if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config.grpo["async_grpo"].get("in_flight_weight_updates", False):
@@ -3073,7 +3602,8 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
-    timer = Timer()
+    timer = Timer(context={"worker": "driver"})
+    training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -3212,6 +3742,9 @@ def async_grpo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        teacher_worker_groups=teacher_worker_groups,
+        alias_to_group_alias=alias_to_group_alias,
+        on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
     )
 
     # Start trajectory collection in background
@@ -3292,6 +3825,7 @@ def async_grpo_train(
     print(
         f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
+    timer.start("init/total")
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -3320,9 +3854,26 @@ def async_grpo_train(
                 f"trajectories for step {step}"
             )
 
+        collector_status = ray.get(trajectory_collector.get_status.remote())
+        if (
+            (
+                collector_status["data_exhausted"]
+                or collector_status.get("errored", False)
+            )
+            and not collector_status["running"]
+            and collector_status["inflight_workers"] == 0
+        ):
+            raise RuntimeError(
+                f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
+                f"The dataset ran out of data before training could start. "
+                f"Collector status: {collector_status}. "
+                f"Increase data.train.max_num_epochs or use a larger dataset."
+            )
+
         wait_iterations += 1
         time.sleep(1.0)
 
+    timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     # Main training loop
@@ -3336,6 +3887,8 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with timer.time("total_step_time"):
+                num_mask_sample_filtered = 0
+
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
                 with timer.time("exposed_generation"):
@@ -3378,8 +3931,52 @@ def async_grpo_train(
                             print(
                                 f"   Trajectory versions in buffer: {buffer_debug['trajectory_versions']}"
                             )
+                            diag = buffer_debug.get("starvation_diagnostics")
+                            if diag:
+                                print(
+                                    "   📊 Buffer starvation diagnostics (long-tail root cause):"
+                                )
+                                print(
+                                    f"      trajectory_duration_s: mean={diag['trajectory_duration_s']['mean']:.1f}s, "
+                                    f"median={diag['trajectory_duration_s']['median']:.1f}s, "
+                                    f"max={diag['trajectory_duration_s']['max']:.1f}s, "
+                                    f"p95={diag['trajectory_duration_s']['p95']:.1f}s"
+                                )
+                                print(
+                                    f"      max_gen_tokens_per_turn: mean={diag['max_gen_tokens_per_turn_in_buffer']['mean']:.0f}, "
+                                    f"median={diag['max_gen_tokens_per_turn_in_buffer']['median']:.0f}, "
+                                    f"max={diag['max_gen_tokens_per_turn_in_buffer']['max']:.0f}, "
+                                    f"p95={diag['max_gen_tokens_per_turn_in_buffer']['p95']:.0f} "
+                                    "(high = long single generations per turn)"
+                                )
+                                print(
+                                    f"      turns_per_sample: mean={diag['turns_per_sample_in_buffer']['mean']:.1f}, "
+                                    f"median={diag['turns_per_sample_in_buffer']['median']:.1f}, "
+                                    f"max={diag['turns_per_sample_in_buffer']['max']:.0f}, "
+                                    f"p95={diag['turns_per_sample_in_buffer']['p95']:.1f} "
+                                    "(high = many turns per trajectory)"
+                                )
 
-                        time.sleep(0.5)
+                        collector_status = ray.get(
+                            trajectory_collector.get_status.remote()
+                        )
+                        if (
+                            (
+                                collector_status["data_exhausted"]
+                                or collector_status.get("errored", False)
+                            )
+                            and not collector_status["running"]
+                            and collector_status["inflight_workers"] == 0
+                        ):
+                            raise RuntimeError(
+                                f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
+                                f"The dataset ran out of data before training could complete. "
+                                f"Collector status: {collector_status}. "
+                                f"Increase data.train.max_num_epochs or use a larger dataset."
+                            )
+
+                        with timer.time("idle/buffer_starvation"):
+                            time.sleep(0.5)
                         continue
 
                     # Extract trajectories and metadata from sample result
@@ -3393,6 +3990,16 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+
+                    # Teacher logprobs are stored in batch dict by collection-time
+                    # computation and padded by from_batches. Extract here.
+                    trajectory_teacher_logprobs = None
+                    if opd_module.is_opd_enabled(master_config):
+                        if "teacher_reference_logprobs" in repeated_batch:
+                            trajectory_teacher_logprobs = repeated_batch[
+                                "teacher_reference_logprobs"
+                            ]
+
                     # Aggregate rollout metrics across groups with proper aggregation per metric type
                     per_group_metrics = {}
                     for t in trajectories:
@@ -3461,6 +4068,11 @@ def async_grpo_train(
                             loss_multiplier[truncated] = 0
                             repeated_batch["loss_multiplier"] = loss_multiplier
 
+                    with timer.time("mask_sample_filter"):
+                        num_mask_sample_filtered = _apply_mask_sample_filter(
+                            repeated_batch
+                        )
+
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
                     # not assistant messages that were part of the prompt history
@@ -3477,16 +4089,12 @@ def async_grpo_train(
                         ],
                     )
 
-                    # Create training data
-                    # Note: advantages will be computed and added after logprobs are available
-                    train_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "generation_logprobs": flat_messages["generation_logprobs"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        }
+                    # Create training data. Advantages are added after logprobs.
+                    train_data = _build_async_grpo_train_data(
+                        flat_messages,
+                        input_lengths,
+                        repeated_batch,
+                        master_config.policy,
                     )
                     train_data.to("cpu")
 
@@ -3497,9 +4105,7 @@ def async_grpo_train(
                     "seq_logprob_error_threshold", None
                 )
                 force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = (
-                    force_on_policy_ratio and seq_logprob_error_threshold is None
-                )
+                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
 
                 # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
                 if force_on_policy_ratio and seq_logprob_error_threshold is not None:
@@ -3570,6 +4176,12 @@ def async_grpo_train(
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
+                # Pad teacher logprobs to match train_data sequence length.
+                if trajectory_teacher_logprobs is not None:
+                    trajectory_teacher_logprobs = _pad_teacher_logprobs(
+                        trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
+                    )
+
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -3585,7 +4197,21 @@ def async_grpo_train(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
+                        # OPD kwargs (ignored by non-OPD estimators via **kwargs)
+                        teacher_logprobs=trajectory_teacher_logprobs.to(
+                            train_data["prev_logprobs"].device
+                        )
+                        if trajectory_teacher_logprobs is not None
+                        else None,
+                        prev_logprobs=train_data["prev_logprobs"],
+                        generation_logprobs=train_data["generation_logprobs"],
+                        sample_mask=train_data["sample_mask"],
                     )
+                    if (
+                        hasattr(adv_estimator, "last_metrics")
+                        and adv_estimator.last_metrics
+                    ):
+                        rollout_metrics.update(adv_estimator.last_metrics)
                     del prompt_ids_for_adv
 
                     # Log advantages stats
@@ -3598,11 +4224,13 @@ def async_grpo_train(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                     )
 
-                    _apply_configured_message_level_advantage_penalties(
-                        train_data,
-                        repeated_batch["message_log"],
-                        master_config,
-                        log_config=True,
+                    penalty_metrics = (
+                        _apply_configured_message_level_advantage_penalties(
+                            train_data,
+                            repeated_batch["message_log"],
+                            master_config,
+                            log_config=True,
+                        )
                     )
 
                     # Clip advantages to prevent extreme values from small std normalization
@@ -3626,6 +4254,8 @@ def async_grpo_train(
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
                 if NEED_REFIT:
+                    timer.start("idle/refit_bubble")
+
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
@@ -3653,6 +4283,8 @@ def async_grpo_train(
                         trajectory_collector.set_weight_version.remote(weight_version)
                         trajectory_collector.resume_after_refit.remote()
 
+                    timer.stop("idle/refit_bubble")
+
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
                     policy_generation.clear_logger_metrics()
@@ -3665,39 +4297,40 @@ def async_grpo_train(
                 if (val_period > 0 and (step + 1) % val_period == 0) or (
                     val_at_end and is_last_step
                 ):
-                    # Pause trajectory collection during validation to reduce memory pressure
-                    trajectory_collector.pause.remote()
+                    with timer.time("idle/validation"):
+                        # Pause trajectory collection during validation to reduce memory pressure
+                        trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                policy, policy_generation, colocated_inference
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            policy_generation.prepare_for_generation()
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=step + 1,
+                            master_config=master_config,
+                            logger=logger,
                         )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=step + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
-                    policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, step + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        policy_generation.finish_generation()
+                        logger.log_metrics(
+                            validation_timings, step + 1, prefix="timing/validation"
+                        )
+                        logger.log_metrics(val_metrics, step + 1, prefix="validation")
 
-                    # Explicit GPU memory cleanup after validation in async mode
-                    import gc
+                        # Explicit GPU memory cleanup after validation in async mode
+                        import gc
 
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
-                    # Resume trajectory collection after validation
-                    trajectory_collector.resume.remote()
+                        # Resume trajectory collection after validation
+                        trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -3713,6 +4346,7 @@ def async_grpo_train(
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
+                    "num_mask_sample_filtered": num_mask_sample_filtered,
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
@@ -3736,6 +4370,7 @@ def async_grpo_train(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
                 metrics.update(train_results["all_mb_metrics"])
+                metrics.update(penalty_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
@@ -3819,6 +4454,10 @@ def async_grpo_train(
                             ]
 
                     with timer.time("checkpointing"):
+                        # Finalize the previous (possibly async) checkpoint before
+                        # starting a new one. No-op with sync save / nothing pending.
+                        checkpointer.finalize_pending()
+
                         print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             step + 1, grpo_save_state, master_config
@@ -3855,29 +4494,47 @@ def async_grpo_train(
                             "✅ Saved replay buffer with "
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        # Defer the directory rename until any async write
+                        # completes; flushed at the next save or on training exit.
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
+
+                        # Record last-successful-checkpoint time/step for external
+                        # monitoring (see _write_latest_checkpoint_status).
+                        _write_latest_checkpoint_status(
+                            checkpointer, last_checkpoint_step=step + 1
+                        )
 
             # Logging
-            # Log training data (match sync GRPO logging payload for parity)
-            log_data = {}
-            if "agent_ref" in repeated_batch:
-                log_data["agent_ref"] = repeated_batch["agent_ref"]
-            log_data["content"] = flat_messages_content
-            log_data["rewards"] = rewards.tolist()
-            if master_config.grpo["use_dynamic_sampling"]:
-                # In dynamic sampling, `rewards` corresponds to filtered rewards
-                log_data["filtered_rewards"] = rewards.tolist()
-                log_data["rewards"] = repeated_batch["total_reward"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
-            log_data["token_ids"] = train_data["input_ids"].tolist()
-            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-            log_data["advantages"] = train_data["advantages"].tolist()
-            log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
-            log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
+            # Log training data (match sync GRPO logging payload for parity).
+            # NeMo Gym responses can be very large and expensive to log; when
+            # env.should_log_nemo_gym_responses is true, skip this jsonl (see
+            # _should_log_nemo_gym_responses).
+            if not _should_log_nemo_gym_responses(master_config):
+                log_data = {}
+                if "agent_ref" in repeated_batch:
+                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = flat_messages_content
+                log_data["rewards"] = rewards.tolist()
+                if master_config.grpo["use_dynamic_sampling"]:
+                    # In dynamic sampling, `rewards` corresponds to filtered rewards
+                    log_data["filtered_rewards"] = rewards.tolist()
+                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
+                log_data["input_lengths"] = input_lengths.tolist()
+                log_data["token_ids"] = train_data["input_ids"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["advantages"] = train_data["advantages"].tolist()
+                log_data["generation_logprobs"] = train_data[
+                    "generation_logprobs"
+                ].tolist()
+                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
+                del log_data
             del train_data
             del flat_messages_content
 
@@ -3949,16 +4606,47 @@ def async_grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
+            collector_efficiency = ray.get(
+                trajectory_collector.get_efficiency_metrics.remote()
+            )
+            driver_efficiency = {
+                cat: timer.reduce(cat, "sum")
+                for cat in [
+                    "init/total",
+                    "idle/buffer_starvation",
+                    "idle/refit_bubble",
+                    "idle/validation",
+                ]
+                if cat in timer._timers
+            }
+            merged_efficiency = {**driver_efficiency}
+            for cat, dur in collector_efficiency.items():
+                merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur
+
+            total_wall_time = time.perf_counter() - training_wall_start
+            efficiency_loggable = print_efficiency_summary(
+                merged_efficiency, total_wall_time, step + 1
+            )
+
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
-            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            logger.log_metrics(efficiency_loggable, step + 1, prefix="")
+            # step_finished=True here since this is the final log of our current step.
+            logger.log_metrics(
+                timing_metrics,
+                step + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             step += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if step >= master_config.grpo["max_num_steps"]:
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -3972,6 +4660,12 @@ def async_grpo_train(
         traceback.print_exc()
 
     finally:
+        # Finalize any pending async checkpoint before tearing down workers.
+        try:
+            checkpointer.shutdown()
+        except Exception as e:
+            print(f"Error finalizing pending checkpoint: {e}")
+
         # Clean up
         print("🛑 Stopping trajectory collection...")
         try:
@@ -3983,5 +4677,34 @@ def async_grpo_train(
             ray.kill(replay_buffer)
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
+
+        # Environments must be shut down before generation workers because
+        # they may have in-flight HTTP requests to vLLM HTTP endpoints.
+        # Killing generation first leaves environments retrying dead connections.
+        for env_dict in (task_to_env, val_task_to_env):
+            if env_dict is None:
+                continue
+            for task_name, env in env_dict.items():
+                print(f"🛑 Shutting down environment {task_name}...")
+                try:
+                    ray.get(env.shutdown.remote(), timeout=10)
+                except Exception:
+                    try:
+                        ray.kill(env)
+                    except Exception as e:
+                        print(f"Error shutting down environment {task_name}: {e}")
+
+        print("🛑 Shutting down generation workers...")
+        try:
+            policy_generation.shutdown()
+        except Exception as e:
+            print(f"Error shutting down generation workers: {e}")
+
+        if policy is not policy_generation:
+            print("🛑 Shutting down policy workers...")
+            try:
+                policy.shutdown()
+            except Exception as e:
+                print(f"Error shutting down policy workers: {e}")
 
         print("Async GRPO training complete!")

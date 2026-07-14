@@ -20,9 +20,12 @@ import torch
 
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.utils import (
+    EFFICIENCY_CATEGORIES,
+    WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
     maybe_pad_last_batch,
+    print_efficiency_summary,
     print_performance_metrics,
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
@@ -311,6 +314,42 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     assert "Floating Point Utilization" in out
 
 
+def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
+    """train_elapsed_seconds in train_results overrides policy_training timing for TFLOPS."""
+    master_config = _base_master_config(colocated=True)
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,  # should be ignored when train_elapsed_seconds present
+        "total_step_time": 10.0,
+        "generation": 5.0,
+        "weight_sync": 1.0,
+    }
+
+    metrics = {
+        "total_num_tokens": 8000.0,
+        "per_worker_token_counts": {0: 2000, 1: 2000, 2: 2000, 3: 2000},
+    }
+
+    # total_tflops = total_flops / train_elapsed_seconds / 1e12 = 1e15 / 2.0 / 1e12 = 500
+    # (NOT 1e15 / 4.0 / 1e12 = 250, which would use policy_training)
+    train_results = {
+        "total_flops": 1.0e15,
+        "num_ranks": 8,
+        "train_elapsed_seconds": 2.0,
+        "theoretical_tflops": 500.0,
+    }
+
+    perf = print_performance_metrics(
+        train_results, metrics, timing_metrics, master_config
+    )
+
+    assert math.isclose(perf["train_flops_per_gpu"], 500.0 / 8, rel_tol=1e-6)
+
+    out = capsys.readouterr().out
+    assert "500.00 TFLOPS" in out
+
+
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
     master_config.grpo["async_grpo"] = {"enabled": True}
@@ -397,6 +436,31 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
         assert k in perf
 
     out = capsys.readouterr().out
+    assert "Throughputs (per GPU)" in out
+
+
+def test_empty_per_worker_token_counts_skips_imbalance(capsys):
+    master_config = _base_master_config(colocated=True)
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 1.0,
+        "policy_training": 3.0,
+        "total_step_time": 8.0,
+        "generation": 2.0,
+        "prepare_for_generation/total": 0.5,
+    }
+
+    metrics = {
+        "total_num_tokens": 1600.0,
+        "per_worker_token_counts": {},
+    }
+
+    perf = print_performance_metrics({}, metrics, timing_metrics, master_config)
+
+    assert "average_token_imbalance" not in perf
+
+    out = capsys.readouterr().out
+    assert "No per-worker generation load data available." in out
     assert "Throughputs (per GPU)" in out
 
 
@@ -597,3 +661,79 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     # Std values should be finite and not NaN
     assert torch.isfinite(std).all()
     assert not torch.isnan(std).any()
+
+
+class TestPrintEfficiencySummary:
+    def test_basic_efficiency_calculation(self, capsys):
+        """Test that efficiency is computed correctly from metrics."""
+        metrics = {
+            "init/total": 10.0,
+            "idle/buffer_starvation": 5.0,
+            "idle/refit_bubble": 3.0,
+            "idle/validation": 2.0,
+        }
+        total_wall = 100.0
+
+        result = print_efficiency_summary(metrics, total_wall, step=1)
+
+        assert result["efficiency/total_waste_s"] == 20.0
+        assert result["efficiency/productive_time_s"] == 80.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(80.0)
+        assert result["efficiency/total_wall_time_s"] == 100.0
+
+        assert result["efficiency/init/total_s"] == 10.0
+        assert result["efficiency/init/total_pct"] == pytest.approx(10.0)
+        assert result["efficiency/idle/buffer_starvation_s"] == 5.0
+
+        assert result["efficiency/idle/buffer_full_backoff_s"] == 0.0
+        assert result["efficiency/wasted/failed_trajectory_s"] == 0.0
+
+        captured = capsys.readouterr()
+        assert "Efficiency Summary (Step 1)" in captured.out
+        assert "80.00%" in captured.out
+
+    def test_zero_wall_time(self):
+        """Test that zero wall time produces 100% efficiency."""
+        result = print_efficiency_summary({}, total_wall_time_s=0.0, step=0)
+        assert result["efficiency/efficiency_pct"] == 100.0
+        assert result["efficiency/total_waste_s"] == 0.0
+
+    def test_all_categories_present(self):
+        """Test that all EFFICIENCY_CATEGORIES appear in the output."""
+        metrics = {cat: 1.0 for cat in EFFICIENCY_CATEGORIES}
+        result = print_efficiency_summary(metrics, total_wall_time_s=100.0, step=5)
+
+        for cat in EFFICIENCY_CATEGORIES:
+            assert f"efficiency/{cat}_s" in result
+            assert result[f"efficiency/{cat}_s"] == 1.0
+            if cat in WALL_CLOCK_EFFICIENCY_CATEGORIES:
+                assert f"efficiency/{cat}_pct" in result
+
+        # total_waste_s reflects wall-clock categories only (4 x 1.0); collector
+        # thread-seconds are reported separately, not folded into wall waste.
+        assert result["efficiency/total_waste_s"] == 4.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(96.0)
+
+    def test_efficiency_with_collector_metrics_merge(self):
+        """Test merging driver and collector metrics before computing efficiency."""
+        driver = {"init/total": 5.0, "idle/refit_bubble": 3.0}
+        collector = {"idle/buffer_full_backoff": 2.0, "wasted/failed_trajectory": 1.0}
+
+        merged = {**driver}
+        for cat, dur in collector.items():
+            merged[cat] = merged.get(cat, 0.0) + dur
+
+        result = print_efficiency_summary(merged, total_wall_time_s=50.0, step=3)
+
+        assert result["efficiency/total_waste_s"] == 8.0
+        assert result["efficiency/thread_seconds_total_s"] == 3.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(84.0)
+
+    def test_wall_waste_clamped_to_wall_time(self):
+        """Wall-clock waste is capped so efficiency stays in [0, 100]."""
+        metrics = {cat: 30.0 for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES}
+        result = print_efficiency_summary(metrics, total_wall_time_s=60.0, step=2)
+
+        assert result["efficiency/total_waste_s"] == 60.0
+        assert result["efficiency/productive_time_s"] == 0.0
+        assert result["efficiency/efficiency_pct"] == 0.0
