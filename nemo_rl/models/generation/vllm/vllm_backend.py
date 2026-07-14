@@ -131,6 +131,10 @@ class VllmInternalWorkerExtension:
         )
         self.model_update_group.init_nccl_communicator(device=self.device)
 
+    def adjust_refit_comm_group(self, exclude_ranks: list[int]) -> tuple[int, int, int]:
+        """Remove failed generation ranks from the refit communicator."""
+        return self.model_update_group.shrink(exclude_ranks)
+
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
         from nemo_rl.utils.nvml import get_device_uuid

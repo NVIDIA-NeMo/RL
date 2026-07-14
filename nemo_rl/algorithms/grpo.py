@@ -2119,6 +2119,48 @@ def refit_policy_generation(
         policy_generation.resume_after_refit()
 
 
+def adjust_refit_comm_group(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    faulty_instance_id: int,
+) -> None:
+    """Shrink a non-colocated vLLM refit group around one failed instance."""
+    if not isinstance(policy_generation, VllmGeneration):
+        raise NotImplementedError(
+            "Refit communicator shrink is implemented only for vLLM generation"
+        )
+    if policy_generation.cfg["colocated"]["enabled"]:
+        raise ValueError("Refit communicator shrink requires non-colocated generation")
+
+    (
+        exclude_ranks,
+        expected_world_size,
+        futures_inference,
+    ) = policy_generation.adjust_refit_comm_group(faulty_instance_id)
+    futures_train = policy.adjust_refit_comm_group(exclude_ranks)
+    results = ray.get(futures_train + futures_inference)
+
+    rank_updates = []
+    for result in results:
+        if isinstance(result, list):
+            rank_updates.extend(result)
+        else:
+            rank_updates.append(result)
+    actual_world_sizes = {world_size for _, _, world_size in rank_updates}
+    if actual_world_sizes != {expected_world_size}:
+        raise RuntimeError(
+            "Inconsistent refit communicator sizes after shrink: "
+            f"expected={expected_world_size}, actual={sorted(actual_world_sizes)}"
+        )
+
+    print(
+        "[FAULTY STEP] Shrunk refit communicator: "
+        f"faulty_instance_id={faulty_instance_id}, "
+        f"excluded_ranks={exclude_ranks}, new_world_size={expected_world_size}",
+        flush=True,
+    )
+
+
 def _log_mixed_rewards_and_advantages_information(
     logger: Logger,
     total_steps: int,
@@ -3546,6 +3588,9 @@ def async_grpo_train(
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
+    faulty_step = 5
+    faulty_instance_id = 3
+
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
     # SGLang async rollouts do not support the async GRPO replay path.
@@ -3865,6 +3910,22 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with timer.time("total_step_time"):
+                # Fault handling demo
+                with timer.time("fault_handling_time"):
+                    if step == faulty_step:
+                        print(
+                            "[FAULTY STEP] Assuming we detect a fault from the "
+                            f"generation instance {faulty_instance_id} at step "
+                            f"{faulty_step}",
+                            flush=True,
+                        )
+                        adjust_refit_comm_group(
+                            policy,
+                            policy_generation,
+                            faulty_instance_id,
+                        )
+                        print("[FAULTY STEP] Fault handling completed", flush=True)
+
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
                 with timer.time("exposed_generation"):
@@ -4556,6 +4617,8 @@ def async_grpo_train(
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")
 
             print("\n⏱️  Timing:")
+            fault_handling_time = timing_metrics.get("fault_handling_time", 0)
+            print(f"  • Fault Handling Time: {fault_handling_time:.2f}s")
             total_time = timing_metrics.get("total_step_time", 0)
             print(f"  • Total step time: {total_time:.2f}s")
             for k, v in sorted(

@@ -44,6 +44,10 @@ class AbstractPolicyWorker:
         device = torch.cuda.current_device()
         self.model_update_group.init_nccl_communicator(device=device)
 
+    def adjust_refit_comm_group(self, exclude_ranks: list[int]) -> tuple[int, int, int]:
+        """Remove failed generation ranks from the refit communicator."""
+        return self.model_update_group.shrink(exclude_ranks)
+
     def is_alive(self) -> bool:
         """Check if the worker is alive."""
         return True
