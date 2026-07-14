@@ -15,6 +15,8 @@
 import os
 import socket
 
+import ray
+
 from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
 
 # Env vars Ray uses to gate its visible-device manipulation. Setting any of
@@ -30,6 +32,28 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
     "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
     "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
 ]
+
+
+@ray.remote
+class Lock:
+    def __init__(self):
+        self._locked = False  # False: unlocked, True: locked
+
+    def acquire(self):
+        """Try to acquire the lock.
+
+        Returns True if acquired, False otherwise. Caller should retry until
+        it returns True.
+        """
+        if not self._locked:
+            self._locked = True
+            return True
+        return False
+
+    def release(self):
+        """Release the lock, allowing others to acquire."""
+        assert self._locked, "Lock is not acquired, cannot release."
+        self._locked = False
 
 
 def get_host_info():
