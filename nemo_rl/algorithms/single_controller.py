@@ -38,7 +38,7 @@ import asyncio
 import os
 import time
 import warnings
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import ray
 import torch
@@ -59,12 +59,14 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.logger import Logger
+from nemo_rl.utils.logger import Logger, print_message_log_samples
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
@@ -106,11 +108,13 @@ class SingleControllerActor:
         self._gen: Generation = bundle.gen_handle
         self._trainer: TQPolicy = bundle.trainer_handle
         self._dataloader = bundle.dataloader
+        self._val_dataloader = bundle.val_dataloader
         self._weight_synchronizer = bundle.weight_synchronizer
         self._advantage_estimator = bundle.advantage_estimator
         self._loss_fn = bundle.loss_fn
         self._buffer = bundle.tq_buffer
         self._rollout_manager = bundle.rollout_manager
+        self._validation_rollout_manager = bundle.validation_rollout_manager
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -253,6 +257,9 @@ class SingleControllerActor:
         # Synchronize weights before starting the pumps
         await self._sync_weights()
 
+        if self._master_config.grpo["val_at_start"] and self._train_steps == 0:
+            await self._run_validation(step=0)
+
         # Restore committed rollout groups from the previous run. Only when
         # over_sampling=True — with the strict quota the restored window can
         # never be completed (see the checkpointing plan's design note).
@@ -341,6 +348,107 @@ class SingleControllerActor:
         if asyncio.iscoroutine(result):
             return await result
         return result
+
+    async def _run_validation(self, *, step: int) -> dict[str, Any]:
+        """Run one native validation pass against the synchronized generator."""
+        if self._val_dataloader is None or self._validation_rollout_manager is None:
+            raise RuntimeError(
+                "SingleController validation resources were not initialized."
+            )
+
+        max_val_samples = cast(int, self._master_config.grpo["max_val_samples"])
+
+        timer = Timer()
+        rewards: list[float] = []
+        lengths: list[float] = []
+        message_logs: list[Any] = []
+
+        print(f"▶ Starting validation at step {step}...", flush=True)
+        with timer.time("total_validation_time"):
+            for val_batch in self._val_dataloader:
+                remaining = max_val_samples - len(rewards)
+                if remaining <= 0:
+                    break
+
+                selected_rows = min(val_batch.size, remaining)
+                prompts: list[DatumSpec] = []
+                for row_idx in range(selected_rows):
+                    prompt: DatumSpec = {  # type: ignore
+                        key: value[row_idx] for key, value in val_batch.items()
+                    }
+                    prompts.append(prompt)
+                results = await asyncio.gather(
+                    *(
+                        self._validation_rollout_manager.run_rollout(prompt)
+                        for prompt in prompts
+                    ),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+
+                records = cast(list[PromptGroupRecord], results)
+                for record in records:
+                    if len(record.completions) != 1:
+                        raise ValueError(
+                            "Validation rollouts must return exactly one completion "
+                            "per prompt."
+                        )
+                    completion = record.completions[0]
+                    rewards.append(float(completion.reward))
+                    lengths.append(
+                        float(
+                            record.rollout_metrics["mean_gen_tokens_per_sample"]
+                        )
+                    )
+                    message_logs.append(
+                        get_keys_from_message_log(
+                            completion.message_log,
+                            ["role", "content"],
+                        )
+                    )
+
+        num_samples = len(rewards)
+        metrics: dict[str, Any] = {
+            "accuracy": sum(rewards) / num_samples if num_samples else 0.0,
+            "avg_length": sum(lengths) / num_samples if num_samples else 0.0,
+            "num_samples": num_samples,
+        }
+        timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+        validation_time = float(timing_metrics.get("total_validation_time", 0.0))
+
+        print("\n📊 Validation Results:")
+        print(f"    • Accuracy: {metrics['accuracy']:.4f}")
+        print(f"    • Average response length: {metrics['avg_length']:.1f} tokens")
+        print(f"    • Samples processed: {num_samples}")
+        print(f"    • Total validation time: {validation_time:.2f}s", flush=True)
+
+        try:
+            print_message_log_samples(
+                message_logs,
+                rewards,
+                num_samples=min(
+                    self._master_config.logger["num_val_samples_to_print"],
+                    num_samples,
+                ),
+                step=step,
+            )
+        except Exception as e:
+            print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
+            print("  ⚠️ Continuing validation without displaying samples...", flush=True)
+
+        self._logger.log_batched_dict_as_jsonl(
+            {"content": message_logs, "rewards": rewards},
+            f"val_data_step{step}.jsonl",
+        )
+        self._logger.log_metrics(metrics, step=step, prefix="validation")
+        self._logger.log_metrics(
+            timing_metrics,
+            step=step,
+            prefix="timing/validation",
+        )
+        return metrics
 
     # ── the three pumps + the inline advantage stage ───────────────────────
 
