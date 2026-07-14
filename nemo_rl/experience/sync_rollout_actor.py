@@ -64,6 +64,7 @@ from nemo_rl.experience.rollout_writer import (
     assemble_staged_batch,
     compare_shadow_candidate,
     mint_rollout_context,
+    mint_rollout_id,
     persist_rollout_manifest,
     persist_rollout_perf_metrics,
 )
@@ -184,20 +185,26 @@ def _flatten_rollout_message_log_for_tq(
 def _attach_rollout_contexts(
     input_batch: BatchedDataDict[Any],
     *,
-    sample_ids: list[str],
+    rollout_ids: list[str],
     group_ids: list[str],
     weight_version: int,
     secret: bytes,
     ttl_s: float,
 ) -> BatchedDataDict[Any]:
-    """Return a batch copy with signed contexts in Gym request metadata."""
+    """Return a batch copy with signed contexts in Gym request metadata.
+
+    Each row carries the canonical ``rollout_id`` twice during migration: as
+    the signed context's ``sample_id`` (legacy alias) and as the bare
+    ``nemo_rl_rollout_id`` field. Consumers that see both must reject the
+    request unless they are equal.
+    """
     rows = deepcopy(input_batch["extra_env_info"])
-    if len(rows) != len(sample_ids) or len(rows) != len(group_ids):
+    if len(rows) != len(rollout_ids) or len(rows) != len(group_ids):
         raise ValueError(
-            "extra_env_info, sample_ids, and group_ids must have equal lengths; "
-            f"got {len(rows)}, {len(sample_ids)}, and {len(group_ids)}"
+            "extra_env_info, rollout_ids, and group_ids must have equal lengths; "
+            f"got {len(rows)}, {len(rollout_ids)}, and {len(group_ids)}"
         )
-    for row, sample_id, group_id in zip(rows, sample_ids, group_ids):
+    for row, rollout_id, group_id in zip(rows, rollout_ids, group_ids):
         params = row["responses_create_params"]
         metadata = dict(params.get("metadata") or {})
         extra_body_raw = metadata.get("extra_body", "{}")
@@ -206,13 +213,14 @@ def _attach_rollout_contexts(
         except (TypeError, json.JSONDecodeError) as error:
             raise ValueError("responses metadata.extra_body must be JSON") from error
         context = mint_rollout_context(
-            sample_id=sample_id,
+            sample_id=rollout_id,
             group_id=group_id,
             weight_version=weight_version,
             secret=secret,
             ttl_s=ttl_s,
         )
         extra_body["nemo_rl_rollout_context"] = context.to_dict()
+        extra_body["nemo_rl_rollout_id"] = rollout_id
         metadata["extra_body"] = json.dumps(extra_body, separators=(",", ":"))
         params["metadata"] = metadata
     copied = BatchedDataDict(dict(input_batch))
@@ -360,7 +368,7 @@ class SyncRolloutActor:
 
         cfg = self.master_config
         writer_cfg = self.dp_cfg.rollout_writer
-        writer_sample_ids: list[str] | None = None
+        writer_rollout_ids: list[str] | None = None
         writer_group_ids: list[str] | None = None
         if writer_cfg.enabled:
             if self.rollout_cursor is None or self.rollout_secret is None:
@@ -373,17 +381,16 @@ class SyncRolloutActor:
             group_ids = [
                 str(uuid.uuid4()) for _ in range(input_batch.size // group_size)
             ]
+            # One canonical rollout_id per generation attempt; the parallel
+            # writer_group_ids list is the retained rollout_id -> group_id
+            # mapping. group_id never travels in requests or storage keys.
             writer_group_ids = [
                 group_id for group_id in group_ids for _ in range(group_size)
             ]
-            writer_sample_ids = [
-                f"{group_id}_g{generation_index}"
-                for group_id in group_ids
-                for generation_index in range(group_size)
-            ]
+            writer_rollout_ids = [mint_rollout_id() for _ in range(input_batch.size)]
             input_batch = _attach_rollout_contexts(
                 input_batch,
-                sample_ids=writer_sample_ids,
+                rollout_ids=writer_rollout_ids,
                 group_ids=writer_group_ids,
                 weight_version=weight_version,
                 secret=self.rollout_secret,
@@ -576,13 +583,13 @@ class SyncRolloutActor:
         finalized = None
         finalizer_perf: dict[str, float] = {}
         if writer_cfg.enabled:
-            assert writer_sample_ids is not None and writer_group_ids is not None
+            assert writer_rollout_ids is not None and writer_group_ids is not None
             finalize_started = time.perf_counter()
             finalized = assemble_staged_batch(
                 dp_client=self._dp_client,
                 cursor=self.rollout_cursor,
                 staging_partition=writer_cfg.staging_partition,
-                sample_ids=writer_sample_ids,
+                sample_ids=writer_rollout_ids,
                 group_ids=writer_group_ids,
                 weight_version=weight_version,
                 legacy_bulk=bulk_batch,
@@ -655,11 +662,11 @@ class SyncRolloutActor:
                 f"bulk_batch has {n_samples} samples; not divisible by n_prompts={n_prompts}"
             )
         n_per_prompt = n_samples // n_prompts
-        if writer_sample_ids is None:
+        if writer_rollout_ids is None:
             uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
             sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
         else:
-            sample_ids = writer_sample_ids
+            sample_ids = writer_rollout_ids
         trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         canonical_put_started = time.perf_counter()
         meta = kv_first_write(

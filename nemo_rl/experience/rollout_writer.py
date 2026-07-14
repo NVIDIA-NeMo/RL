@@ -154,6 +154,19 @@ def derive_request_nonce(sample_id: str, prompt_token_ids: list[int]) -> str:
     return hashlib.sha256(b"nemo-rl-request" + payload).hexdigest()
 
 
+def mint_rollout_id() -> str:
+    """Mint the canonical identity for one generation attempt.
+
+    One ``rollout_id`` names one Gym execution, its staging rows, and its
+    canonical train row. It is opaque, URL-safe, carries 128 random bits, and
+    stays valid under Gym's rollout-id charset so the same string can ride a
+    ``/ng-rollout/{rid}/v1`` base URL. ``group_id`` is deliberately not
+    embedded: sibling grouping stays a driver-side mapping and never travels
+    through model requests or storage keys.
+    """
+    return secrets.token_hex(16)
+
+
 def build_staging_delta(
     *,
     prompt_token_ids: list[int],
@@ -209,7 +222,13 @@ def extract_generation_token_info(
 
 @dataclass(frozen=True)
 class RolloutContext:
-    """Signed identity forwarded opaquely through NeMo Gym."""
+    """Signed identity forwarded opaquely through NeMo Gym.
+
+    ``sample_id`` is a migration alias for the canonical ``rollout_id``: the
+    value carried here is always the id minted by :func:`mint_rollout_id`, and
+    any request that carries both this context and a bare ``nemo_rl_rollout_id``
+    field is accepted only when the two agree.
+    """
 
     sample_id: str
     group_id: str

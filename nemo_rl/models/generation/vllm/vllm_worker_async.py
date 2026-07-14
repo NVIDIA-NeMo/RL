@@ -407,6 +407,18 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         except RolloutContextError:
             LOGGER.exception("Invalid rollout context; serving request uncollected")
             return
+        # Migration alias pair: the signed context's sample_id carries the
+        # canonical rollout_id. A request presenting both identities is
+        # accepted only when they agree.
+        bare_rollout_id = getattr(request, "nemo_rl_rollout_id", None)
+        if bare_rollout_id is not None and bare_rollout_id != context.sample_id:
+            LOGGER.error(
+                "nemo_rl_rollout_id %s does not match signed context identity %s; "
+                "serving request uncollected",
+                bare_rollout_id,
+                context.sample_id,
+            )
+            return
         request_nonce = derive_request_nonce(context.sample_id, prompt_token_ids)
         reserve_started = time.perf_counter()
         try:
@@ -1053,6 +1065,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ):
             required_prefix_token_ids: Optional[List[int]] = None
             nemo_rl_rollout_context: Optional[dict[str, Any]] = None
+            # Canonical rollout identity (migration alias pair: when both this
+            # and the signed context arrive, they must agree).
+            nemo_rl_rollout_id: Optional[str] = None
+            # Per-call identity minted by a trusted Gym gateway; never derived
+            # from the prompt.
+            nemo_rl_call_id: Optional[str] = None
 
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
