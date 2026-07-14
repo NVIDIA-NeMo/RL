@@ -34,7 +34,8 @@ _MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
 
 
 def router_replay_enabled(config: PolicyConfig) -> bool:
-    return bool((config.get("router_replay") or {}).get("enabled", False))
+    router_replay_config = config.get("router_replay")
+    return router_replay_config is not None and router_replay_config.enabled
 
 
 def configure_vllm_for_router_replay(config: PolicyConfig) -> None:

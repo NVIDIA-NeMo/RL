@@ -14,6 +14,8 @@
 
 from typing import Any, Literal, NotRequired, TypedDict, Union
 
+from pydantic import BaseModel
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
@@ -205,19 +207,20 @@ class DTensorConfig(TypedDict):
     clear_cache_every_n_steps: NotRequired[int | None]
 
 
-class SequencePackingConfigDisabled(TypedDict):
-    enabled: Literal[False]
+class SequencePackingConfigDisabled(BaseModel, extra="allow"):
+    enabled: Literal[False] = False
 
 
-class SequencePackingConfig(TypedDict):
-    enabled: Literal[True]
+class SequencePackingConfig(BaseModel, extra="allow"):
+    enabled: Literal[True] = True
     train_mb_tokens: int
     # Not required because some algorithms like SFT don't calculate log probs
-    logprob_mb_tokens: NotRequired[int]
+    logprob_mb_tokens: int | None = None
     algorithm: str
+    fuse_loss: bool = False
 
 
-class RewardModelConfig(TypedDict):
+class RewardModelConfig(BaseModel, extra="allow"):
     enabled: bool
     reward_model_type: str
 
@@ -443,72 +446,71 @@ class MegatronConfig(TypedDict):
     fp8_cfg: NotRequired[Fp8Config]
 
 
-class DraftConfigDisabled(TypedDict):
+class DraftConfigDisabled(BaseModel, extra="allow"):
     """Configuration shape for the disabled draft-model training path."""
 
-    enabled: Literal[False]
+    enabled: Literal[False] = False
 
 
-class DraftConfig(TypedDict):
+class DraftConfig(BaseModel, extra="allow"):
     """Configuration for Eagle draft-model training alongside the policy model."""
 
-    enabled: Literal[True]
-    model_name: NotRequired[str | None]
-    loss_weight: NotRequired[float]
-    num_layers: NotRequired[int | None]
-    aux_layer_indices: NotRequired[list[int] | None]
+    enabled: Literal[True] = True
+    model_name: str | None = None
+    loss_weight: float = 0.1
+    num_layers: int | None = None
+    aux_layer_indices: list[int] | None = None
 
 
-class TokenizerConfig(TypedDict):
+class TokenizerConfig(BaseModel, extra="allow"):
     name: str
-    chat_template: NotRequired[str]
+    chat_template: str | None = None
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
-    chat_template_kwargs: NotRequired[dict[str, Any] | None]
+    chat_template_kwargs: dict[str, Any] | None = None
     # Multimodal configs
-    audio: NotRequired[dict[str, Any]]
-    video: NotRequired[dict[str, Any]]
-    use_processor: NotRequired[bool]
+    audio: dict[str, Any] | None = None
+    video: dict[str, Any] | None = None
 
 
-class PytorchOptimizerConfig(TypedDict):
+class PytorchOptimizerConfig(BaseModel, extra="allow"):
     name: str
     kwargs: dict[str, Any]
 
 
-class SinglePytorchSchedulerConfig(TypedDict):
+class SinglePytorchSchedulerConfig(BaseModel, extra="allow"):
     name: str
     kwargs: dict[str, Any]
 
 
-class SinglePytorchMilestonesConfig(TypedDict):
+class SinglePytorchMilestonesConfig(BaseModel, extra="allow"):
     milestones: list[int]  # Used in SequentialLR configuration
 
 
 SchedulerMilestones = dict[str, list[int]]
 
 
-class DynamicBatchingConfigDisabled(TypedDict):
-    enabled: Literal[False]
+class DynamicBatchingConfigDisabled(BaseModel, extra="allow"):
+    enabled: Literal[False] = False
 
 
-class DynamicBatchingConfig(TypedDict):
+class DynamicBatchingConfig(BaseModel, extra="allow"):
     # dynamic_batching improves performance by ensuring logprob and training microbatches
     # have a sufficent number of tokens to maximize GPU utilization. Specifically, variable length
     # responses are sorted by sequence length and bucketed into microbatches with a total
     # amount of tokens is approximately close to 'train_mb_tokens' and 'logprob_mb_tokens' for the
     # training and logprob stages respectively.
-    enabled: Literal[True]
+    enabled: Literal[True] = True
     train_mb_tokens: int
-    logprob_mb_tokens: NotRequired[int]  # Only used for some algorithms
+    logprob_mb_tokens: int | None = None  # Only used for some algorithms
     sequence_length_round: int
 
 
-class RouterReplayConfigDisabled(TypedDict):
-    enabled: Literal[False]
+class RouterReplayConfigDisabled(BaseModel, extra="allow"):
+    enabled: Literal[False] = False
 
 
-class RouterReplayConfig(TypedDict):
-    enabled: Literal[True]
+class RouterReplayConfig(BaseModel, extra="allow"):
+    enabled: Literal[True] = True
 
 
 class PolicyConfig(TypedDict):
@@ -542,7 +544,8 @@ class PolicyConfig(TypedDict):
     refit_buffer_size_gb: NotRequired[float]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
-        list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
+        SinglePytorchSchedulerConfig
+        | list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
         | SchedulerMilestones
         | None
     ]

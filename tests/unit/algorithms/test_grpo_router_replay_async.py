@@ -25,6 +25,7 @@ from nemo_rl.algorithms.grpo import (
     async_grpo_train,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import RouterReplayConfig, RouterReplayConfigDisabled
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -53,7 +54,7 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
     return MasterConfig.model_construct(
         **{
             "policy": {
-                "router_replay": {"enabled": True},
+                "router_replay": RouterReplayConfig(),
                 "generation": {
                     "backend": "vllm",
                     "vllm_cfg": {"async_engine": True},
@@ -69,8 +70,8 @@ def _make_async_master_config(data_plane=None) -> MasterConfig:
 @pytest.mark.parametrize(
     ("policy_config", "expect_routed_experts"),
     [
-        ({"router_replay": {"enabled": True}}, True),
-        ({"router_replay": {"enabled": False}}, False),
+        ({"router_replay": RouterReplayConfig()}, True),
+        ({"router_replay": RouterReplayConfigDisabled()}, False),
     ],
 )
 def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(

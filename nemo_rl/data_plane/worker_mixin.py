@@ -292,18 +292,18 @@ class TQWorkerMixin:
         cfg = getattr(self, "cfg", None)
         if not isinstance(cfg, dict):
             return data
-        seqpack = cfg.get("sequence_packing", {}) or {}
-        dynbatch = cfg.get("dynamic_batching", {}) or {}
+        seqpack = cfg.get("sequence_packing")
+        dynbatch = cfg.get("dynamic_batching")
 
-        if seqpack.get("enabled", False):
+        if seqpack is not None and seqpack.enabled:
             spa = {
-                "algorithm": seqpack["algorithm"],
+                "algorithm": seqpack.algorithm,
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": cfg[
                     "make_sequence_length_divisible_by"
                 ],
-                "max_tokens_per_microbatch": seqpack["train_mb_tokens"],
+                "max_tokens_per_microbatch": seqpack.train_mb_tokens,
             }
             packed, _ = data.shard_by_batch_size(
                 shards=1,
@@ -313,12 +313,12 @@ class TQWorkerMixin:
             )
             return packed[0]
 
-        if dynbatch.get("enabled", False):
+        if dynbatch is not None and dynbatch.enabled:
             dba = {
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
-                "sequence_length_round": dynbatch["sequence_length_round"],
-                "max_tokens_per_microbatch": dynbatch["train_mb_tokens"],
+                "sequence_length_round": dynbatch.sequence_length_round,
+                "max_tokens_per_microbatch": dynbatch.train_mb_tokens,
             }
             sharded, _ = data.shard_by_batch_size(
                 shards=1,

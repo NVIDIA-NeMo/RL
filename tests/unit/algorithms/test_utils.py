@@ -14,6 +14,7 @@
 
 import math
 from datetime import datetime
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -87,6 +88,36 @@ def get_format_with_simple_role_header(messages):
             + "<|eot_id|>"
         )
     return message
+
+
+@pytest.mark.parametrize(
+    "config,expected_chat_template",
+    [
+        ({"name": "model"}, "tokenizer-default"),
+        (
+            {"name": "model", "chat_template": "default"},
+            "tokenizer-default",
+        ),
+        (
+            {"name": "model", "chat_template": None},
+            COMMON_CHAT_TEMPLATES.passthrough_prompt_response,
+        ),
+    ],
+)
+@patch("nemo_rl.algorithms.utils.AutoTokenizer.from_pretrained")
+def test_get_tokenizer_chat_template_semantics_without_hub(
+    from_pretrained, config, expected_chat_template
+):
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.chat_template = "tokenizer-default"
+    from_pretrained.return_value = tokenizer
+
+    result = get_tokenizer(config)
+
+    assert result is tokenizer
+    assert result.chat_template == expected_chat_template
 
 
 @pytest.mark.hf_gated

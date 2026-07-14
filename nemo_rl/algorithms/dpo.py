@@ -144,18 +144,18 @@ def setup(
 
     # Make sure we are not using dynamic batching or sequence packing.
     # Anything that changes the order of data within a batch is currently incompatible with DPO.
-    assert not policy_config["dynamic_batching"]["enabled"], (
+    assert not policy_config["dynamic_batching"].enabled, (
         "Dynamic batching is currently not supported with DPO. "
         "See https://github.com/NVIDIA-NeMo/RL/issues/719"
     )
-    assert not policy_config["sequence_packing"]["enabled"], (
+    assert not policy_config["sequence_packing"].enabled, (
         "Sequence packing is currently not supported with DPO. "
         "See https://github.com/NVIDIA-NeMo/RL/issues/719"
     )
 
     # Add a guardrail for linear CE fusion loss: if sequence packing is enabled for DPO in the future,
     # we need to validate the fusion path with cu_seqlens-based logprob aggregation first and then remove this guardrail.
-    if policy_config["sequence_packing"]["enabled"]:
+    if policy_config["sequence_packing"].enabled:
         assert not (
             policy_config["megatron_cfg"]["enabled"]
             and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]

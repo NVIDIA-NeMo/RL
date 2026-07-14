@@ -29,6 +29,7 @@ from nemo_rl.algorithms.dpo import (
 from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.models.policy import RewardModelConfig
 
 
 class MockPolicy:
@@ -193,10 +194,10 @@ def mock_dpo_components():
             "policy": {
                 "train_global_batch_size": 2,
                 "make_sequence_length_divisible_by": 1,
-                "reward_model_cfg": {
-                    "enabled": True,
-                    "reward_model_type": "bradley_terry",
-                },
+                "reward_model_cfg": RewardModelConfig(
+                    enabled=True,
+                    reward_model_type="bradley_terry",
+                ),
                 "train_micro_batch_size": 1,
             },
             "checkpointing": {

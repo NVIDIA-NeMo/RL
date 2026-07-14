@@ -282,7 +282,7 @@ def set_seed(seed: int) -> None:
 
 
 def get_tokenizer(
-    tokenizer_config: TokenizerConfig, get_processor: bool = False
+    tokenizer_config: TokenizerConfig | dict[str, Any], get_processor: bool = False
 ) -> PreTrainedTokenizerBase:
     """Get the tokenizer and set pad token to eos token if it is not already set.
 
@@ -290,7 +290,7 @@ def get_tokenizer(
     and configures it with appropriate chat templates and padding tokens.
 
     Args:
-        tokenizer_config: A dictionary containing tokenizer configuration.
+        tokenizer_config: Tokenizer configuration.
             Required keys:
                 - name: The name or path of the pretrained tokenizer
             Optional keys:
@@ -355,48 +355,48 @@ def get_tokenizer(
         >>>
         ```
     """
+    if isinstance(tokenizer_config, dict):
+        tokenizer_config = TokenizerConfig(**tokenizer_config)
+
     processor = None
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config.name, trust_remote_code=True, use_fast=True
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config.name, trust_remote_code=True
         )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
-        if tokenizer_config["chat_template"] is None:
+    if "chat_template" in tokenizer_config.model_fields_set:
+        if tokenizer_config.chat_template is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
-        elif tokenizer_config["chat_template"].lower() == "default":
+        elif tokenizer_config.chat_template.lower() == "default":
             print("Using tokenizer's default chat template")
-        elif tokenizer_config["chat_template"].endswith(".jinja"):
+        elif tokenizer_config.chat_template.endswith(".jinja"):
             # Load template from file
-            template_path = tokenizer_config["chat_template"]
+            template_path = tokenizer_config.chat_template
             print(f"Loading chat template from file: {template_path}")
             with open(template_path, "r") as f:
                 tokenizer.chat_template = f.read()
         else:
             print("Using custom chat template")
-            tokenizer.chat_template = tokenizer_config["chat_template"]
+            tokenizer.chat_template = tokenizer_config.chat_template
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if (
-        "chat_template_kwargs" in tokenizer_config
-        and tokenizer_config["chat_template_kwargs"] is not None
-    ):
-        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
+    if tokenizer_config.chat_template_kwargs is not None:
+        assert isinstance(tokenizer_config.chat_template_kwargs, dict), (
             "chat_template_kwargs should be a dictionary"
         )
         tokenizer.apply_chat_template = partial(
-            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+            tokenizer.apply_chat_template, **tokenizer_config.chat_template_kwargs
         )
 
     # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
@@ -417,35 +417,38 @@ def get_tokenizer(
             tokenizer, "chat_template", None
         ):
             processor.chat_template = tokenizer.chat_template
-        if hasattr(processor, "feature_extractor") and "audio" in tokenizer_config:
+        if (
+            hasattr(processor, "feature_extractor")
+            and tokenizer_config.audio is not None
+        ):
             if (
-                "sampling_rate" in tokenizer_config["audio"]
-                and tokenizer_config["audio"]["sampling_rate"]
+                "sampling_rate" in tokenizer_config.audio
+                and tokenizer_config.audio["sampling_rate"]
                 != processor.feature_extractor.sampling_rate
             ):
-                new_sampling_rate = tokenizer_config["audio"]["sampling_rate"]
+                new_sampling_rate = tokenizer_config.audio["sampling_rate"]
                 warnings.warn(
                     f"Overriding audio sampling rate from {processor.feature_extractor.sampling_rate} to {new_sampling_rate}"
                 )
                 processor.feature_extractor.sampling_rate = new_sampling_rate
-        if hasattr(processor, "video_processor") and "video" in tokenizer_config:
+        if hasattr(processor, "video_processor") and tokenizer_config.video is not None:
             if (
-                "fps" in tokenizer_config["video"]
-                and tokenizer_config["video"]["fps"] != processor.video_processor.fps
+                "fps" in tokenizer_config.video
+                and tokenizer_config.video["fps"] != processor.video_processor.fps
             ):
                 # override the video loading fps
-                new_fps = tokenizer_config["video"]["fps"]
+                new_fps = tokenizer_config.video["fps"]
                 warnings.warn(
                     f"Overriding video fps from {processor.video_processor.fps} to {new_fps}"
                 )
                 processor.video_processor.fps = new_fps
             # fps and num_frames cannot co-exist, but let it crash later
             if (
-                "num_frames" in tokenizer_config["video"]
-                and tokenizer_config["video"]["num_frames"]
+                "num_frames" in tokenizer_config.video
+                and tokenizer_config.video["num_frames"]
                 != processor.video_processor.num_frames
             ):
-                new_num_frames = tokenizer_config["video"]["num_frames"]
+                new_num_frames = tokenizer_config.video["num_frames"]
                 warnings.warn(
                     f"Overriding video num_frames from {processor.video_processor.num_frames} to {new_num_frames}"
                 )
@@ -857,8 +860,9 @@ def print_performance_metrics(
     # FLOPS
     # =====================================================
 
-    packing_enabled = master_config.policy.get("sequence_packing", {}).get(
-        "enabled", False
+    sequence_packing_config = master_config.policy.get("sequence_packing")
+    packing_enabled = (
+        sequence_packing_config is not None and sequence_packing_config.enabled
     )
     if "total_flops" in train_results and not packing_enabled:
         # Prefer the CUDA-synchronized elapsed time recorded inside the Megatron worker

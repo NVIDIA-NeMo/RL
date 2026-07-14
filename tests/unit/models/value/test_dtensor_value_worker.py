@@ -42,6 +42,15 @@ from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueL
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.policy import (
+    DynamicBatchingConfig,
+    DynamicBatchingConfigDisabled,
+    PytorchOptimizerConfig,
+    RewardModelConfig,
+    SequencePackingConfigDisabled,
+    SinglePytorchSchedulerConfig,
+    TokenizerConfig,
+)
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.lm_value import Value
 
@@ -123,15 +132,15 @@ def _create_value_test_config(
     """Build a minimal valid `ValueConfig` for DTensor V2 tests."""
     return {
         "model_name": model_name,
-        "tokenizer": {"name": model_name},
+        "tokenizer": TokenizerConfig(name=model_name),
         "train_global_batch_size": 8,
         "train_micro_batch_size": 2,
         "logprob_batch_size": 2,
         "precision": precision,
-        "reward_model_cfg": {
-            "enabled": True,
-            "reward_model_type": "regression",
-        },
+        "reward_model_cfg": RewardModelConfig(
+            enabled=True,
+            reward_model_type="regression",
+        ),
         "megatron_cfg": {"enabled": False},
         "dtensor_cfg": {
             "enabled": True,
@@ -142,14 +151,14 @@ def _create_value_test_config(
             "activation_checkpointing": False,
             "cpu_offload": False,
         },
-        "dynamic_batching": {"enabled": False},
-        "sequence_packing": {"enabled": False},
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+        "sequence_packing": SequencePackingConfigDisabled(),
         "make_sequence_length_divisible_by": tp,
         "max_total_sequence_length": 128,
         "max_grad_norm": 1.0,
-        "optimizer": {
-            "name": "torch.optim.AdamW",
-            "kwargs": {
+        "optimizer": PytorchOptimizerConfig(
+            name="torch.optim.AdamW",
+            kwargs={
                 "lr": 5.0e-6,
                 "weight_decay": 0.01,
                 "betas": [0.9, 0.999],
@@ -157,11 +166,11 @@ def _create_value_test_config(
                 "foreach": False,
                 "fused": False,
             },
-        },
-        "scheduler": {
-            "name": "torch.optim.lr_scheduler.ConstantLR",
-            "kwargs": {"factor": 1.0, "total_iters": 1_000_000},
-        },
+        ),
+        "scheduler": SinglePytorchSchedulerConfig(
+            name="torch.optim.lr_scheduler.ConstantLR",
+            kwargs={"factor": 1.0, "total_iters": 1_000_000},
+        ),
     }
 
 
@@ -189,12 +198,15 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
         elif k == "dynamic_batching":
             mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
             lbt = config["max_total_sequence_length"] * config["logprob_batch_size"]
-            config["dynamic_batching"] = {
-                "enabled": v,
-                "train_mb_tokens": mbt,
-                "logprob_mb_tokens": lbt,
-                "sequence_length_round": 64,
-            }
+            config["dynamic_batching"] = (
+                DynamicBatchingConfig(
+                    train_mb_tokens=mbt,
+                    logprob_mb_tokens=lbt,
+                    sequence_length_round=64,
+                )
+                if v
+                else DynamicBatchingConfigDisabled()
+            )
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
 

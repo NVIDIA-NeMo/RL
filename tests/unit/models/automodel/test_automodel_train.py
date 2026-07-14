@@ -45,6 +45,10 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     model_forward,
 )
+from nemo_rl.models.policy import (
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+)
 
 
 @pytest.fixture
@@ -96,7 +100,10 @@ def mock_tp_mesh():
 def base_cfg():
     return {
         "dtensor_cfg": {"sequence_parallel": False},
-        "sequence_packing": {"train_mb_tokens": 256},
+        "sequence_packing": SequencePackingConfig(
+            train_mb_tokens=256,
+            algorithm="modified_first_fit_decreasing",
+        ),
         "generation": {"temperature": 1.0, "top_p": 1.0, "top_k": None},
     }
 
@@ -695,7 +702,7 @@ class TestMakeProcessedMicrobatchIterator:
 
         cfg = {
             "dtensor_cfg": {"sequence_parallel": False},
-            "sequence_packing": {"enabled": False},
+            "sequence_packing": SequencePackingConfigDisabled(),
         }
 
         processed_iterator = make_processed_microbatch_iterator(

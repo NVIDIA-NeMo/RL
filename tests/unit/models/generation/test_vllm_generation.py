@@ -43,7 +43,16 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _replace_prefix_tokens,
 )
-from nemo_rl.models.policy import LoRAConfig, PolicyConfig
+from nemo_rl.models.policy import (
+    DraftConfigDisabled,
+    DynamicBatchingConfig,
+    DynamicBatchingConfigDisabled,
+    LoRAConfig,
+    PolicyConfig,
+    PytorchOptimizerConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
@@ -92,9 +101,9 @@ basic_vllm_test_config: VllmConfig = {
 
 basic_dtensor_test_config: PolicyConfig = {
     "model_name": basic_vllm_test_config["model_name"],
-    "tokenizer": {
-        "name": basic_vllm_test_config["tokenizer"]["name"],
-    },
+    "tokenizer": TokenizerConfig(
+        name=basic_vllm_test_config["tokenizer"]["name"],
+    ),
     # Required training parameters
     "train_global_batch_size": 1,
     "train_micro_batch_size": 1,
@@ -104,15 +113,15 @@ basic_dtensor_test_config: PolicyConfig = {
     "do_sample": False,
     "precision": "float32",
     "offload_optimizer_for_logprob": False,
-    "optimizer": {
-        "name": "torch.optim.AdamW",
-        "kwargs": {
+    "optimizer": PytorchOptimizerConfig(
+        name="torch.optim.AdamW",
+        kwargs={
             "lr": 5e-6,
             "weight_decay": 0.01,
             "betas": [0.9, 0.999],
             "eps": 1e-8,
         },
-    },
+    ),
     "dtensor_cfg": {
         "_v2": False,
         "enabled": True,
@@ -123,15 +132,12 @@ basic_dtensor_test_config: PolicyConfig = {
         "context_parallel_size": 1,
         "custom_parallel_plan": None,
     },
-    "dynamic_batching": {
-        "enabled": True,
-        "train_mb_tokens": 40,
-        "logprob_mb_tokens": 40,
-        "sequence_length_round": 4,
-    },
-    "sequence_packing": {
-        "enabled": False,
-    },
+    "dynamic_batching": DynamicBatchingConfig(
+        train_mb_tokens=40,
+        logprob_mb_tokens=40,
+        sequence_length_round=4,
+    ),
+    "sequence_packing": SequencePackingConfigDisabled(),
     "max_grad_norm": 1.0,
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
@@ -510,7 +516,7 @@ def get_basic_megatron_test_config(
 
     return {
         "model_name": model_name,
-        "tokenizer": {"name": model_name},
+        "tokenizer": TokenizerConfig(name=model_name),
         "generation_batch_size": 2,  # Small batch size for testing
         "train_global_batch_size": 4,
         "train_micro_batch_size": 2,
@@ -521,12 +527,8 @@ def get_basic_megatron_test_config(
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
-        "dynamic_batching": {
-            "enabled": False,  # Start with simple batching
-        },
-        "sequence_packing": {
-            "enabled": False,
-        },
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+        "sequence_packing": SequencePackingConfigDisabled(),
         "megatron_cfg": {
             "enabled": True,
             "empty_unused_memory_level": empty_unused_memory_level,
@@ -587,7 +589,7 @@ def get_basic_megatron_test_config(
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
-        "draft": {"enabled": False},
+        "draft": DraftConfigDisabled(),
         "optimizer": None,  # Remove default FSDP optimizer
         "scheduler": None,  # Remove default scheduler
         "max_grad_norm": 1.0,

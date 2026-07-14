@@ -244,7 +244,7 @@ def setup(
         # Therefore, we disable SP + packing for distillation.
         dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
         sequence_packing_enabled = (
-            "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
+            "sequence_packing" in cfg and cfg["sequence_packing"].enabled
         )
         sequence_parallel_enabled = (
             "sequence_parallel" in cfg["dtensor_cfg"]

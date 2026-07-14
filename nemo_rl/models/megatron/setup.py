@@ -143,7 +143,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import PolicyConfig, SequencePackingConfigDisabled
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
@@ -256,7 +256,7 @@ def validate_and_set_config(
     offload_optimizer_for_logprob = config["offload_optimizer_for_logprob"]
 
     # Reward models are not yet supported with Megatron.
-    if "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]:
+    if "reward_model_cfg" in config and config["reward_model_cfg"].enabled:
         raise NotImplementedError(
             "Reward models are not yet supported with the Megatron backend, this issue is "
             "tracked in https://github.com/NVIDIA-NeMo/RL/issues/720"
@@ -633,7 +633,7 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         # GPTModel path) OR the model does it internally (mbridge VLM wrappers
         # like Qwen3VL, auto-detected at model build). Both paths require
         # cu_seqlens to flow via PackedSeqParams, so sequence_packing must be on.
-        assert config["sequence_packing"]["enabled"], (
+        assert config["sequence_packing"].enabled, (
             "Sequence Packing must be enabled to use Context Parallelism with MCore."
         )
         assert not config["megatron_cfg"].get("use_fused_linear_logprobs", False), (
@@ -1120,7 +1120,7 @@ def _create_draft_pre_wrap_hook(
 
     def draft_pre_wrap_hook(model: list[MegatronModule]) -> list[MegatronModule]:
         """Optionally preload the base policy, then attach the draft module to the owner chunk."""
-        if not draft_cfg["enabled"]:
+        if not draft_cfg.enabled:
             return model
 
         # Base pretrained checkpoints do not contain draft weights, so load the
@@ -1270,7 +1270,7 @@ def setup_model_and_optimizer(
     pre_wrap_hook = []
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
-    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
+    draft_enabled = "draft" in policy_cfg and policy_cfg["draft"].enabled
     resume_checkpoint_exists = (
         megatron_cfg.checkpoint.load is not None
         and checkpoint_exists(megatron_cfg.checkpoint.load)
@@ -1787,7 +1787,9 @@ def make_policy_like_config(config: ValueConfig) -> dict:
         "precision": config["precision"],
         "megatron_cfg": megatron_cfg,
         "dynamic_batching": config["dynamic_batching"],
-        "sequence_packing": config.get("sequence_packing", {"enabled": False}),
+        "sequence_packing": config.get(
+            "sequence_packing", SequencePackingConfigDisabled()
+        ),
         "make_sequence_length_divisible_by": config[
             "make_sequence_length_divisible_by"
         ],

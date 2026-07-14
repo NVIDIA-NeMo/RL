@@ -42,6 +42,14 @@ from nemo_rl.algorithms.loss.loss_functions import (
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.policy import (
+    DynamicBatchingConfig,
+    DynamicBatchingConfigDisabled,
+    RewardModelConfig,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.lm_value import Value
 
@@ -59,18 +67,18 @@ def _create_value_test_config(
     """Build a minimal valid `ValueConfig` for tests."""
     return {
         "model_name": model_name,
-        "tokenizer": {"name": model_name},
+        "tokenizer": TokenizerConfig(name=model_name),
         "train_global_batch_size": 8,
         "train_micro_batch_size": 2,
         "logprob_batch_size": 2,
         "precision": precision,
-        "reward_model_cfg": {
-            "enabled": False,
-            "reward_model_type": "regression",
-        },
+        "reward_model_cfg": RewardModelConfig(
+            enabled=False,
+            reward_model_type="regression",
+        ),
         "dtensor_cfg": {"enabled": False},
-        "dynamic_batching": {"enabled": False},
-        "sequence_packing": {"enabled": False},
+        "dynamic_batching": DynamicBatchingConfigDisabled(),
+        "sequence_packing": SequencePackingConfigDisabled(),
         "megatron_cfg": {
             "enabled": True,
             "empty_unused_memory_level": 0,
@@ -162,20 +170,26 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
         elif k == "dynamic_batching":
             mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
             lbt = config["max_total_sequence_length"] * config["logprob_batch_size"]
-            config["dynamic_batching"] = {
-                "enabled": v,
-                "train_mb_tokens": mbt,
-                "logprob_mb_tokens": lbt,
-                "sequence_length_round": 64,
-            }
+            config["dynamic_batching"] = (
+                DynamicBatchingConfig(
+                    train_mb_tokens=mbt,
+                    logprob_mb_tokens=lbt,
+                    sequence_length_round=64,
+                )
+                if v
+                else DynamicBatchingConfigDisabled()
+            )
         elif k == "sequence_packing":
             mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
-            config["sequence_packing"] = {
-                "enabled": v,
-                "train_mb_tokens": mbt,
-                "logprob_mb_tokens": mbt,
-                "algorithm": "modified_first_fit_decreasing",
-            }
+            config["sequence_packing"] = (
+                SequencePackingConfig(
+                    train_mb_tokens=mbt,
+                    logprob_mb_tokens=mbt,
+                    algorithm="modified_first_fit_decreasing",
+                )
+                if v
+                else SequencePackingConfigDisabled()
+            )
         elif k == "context_parallel_size":
             config["megatron_cfg"]["context_parallel_size"] = v
             # CP splits each packed sequence into 2*CP load-balanced chunks, so
@@ -624,7 +638,13 @@ def test_loss_post_processor_rejects_fuse_loss_with_custom_prepare_fn():
 
     loss_post_processor = LossPostProcessor(
         loss_fn=lambda *args, **kwargs: None,
-        cfg={"sequence_packing": {"enabled": True, "fuse_loss": True}},
+        cfg={
+            "sequence_packing": SequencePackingConfig(
+                train_mb_tokens=128,
+                algorithm="modified_first_fit_decreasing",
+                fuse_loss=True,
+            )
+        },
         num_microbatches=1,
         prepare_fn=_value_loss_prepare_fn,
     )

@@ -681,7 +681,7 @@ class MegatronPolicyWorkerImpl(
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                    draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
                     use_router_replay = _should_use_router_replay(
                         enabled=self._router_replay_enabled,
                         data=batch,
@@ -852,7 +852,8 @@ class MegatronPolicyWorkerImpl(
         # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
         # samples but each packed sequence spans max_total_sequence_length tokens,
         # so flops_per_sample * gbs would overcount by the packing factor.
-        if not self.cfg.get("sequence_packing", {}).get("enabled", False):
+        sequence_packing_config = self.cfg.get("sequence_packing")
+        if sequence_packing_config is None or not sequence_packing_config.enabled:
             try:  # pragma: no cover
                 from megatron.bridge.training.utils import flop_utils as _mb_flop_utils
 
@@ -1141,7 +1142,7 @@ class MegatronPolicyWorkerImpl(
         # hooks. The 1/N rescale happens once at finish.
         placeholder_n = torch.tensor(1.0, device="cuda")
 
-        draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+        draft_enabled = "draft" in self.cfg and self.cfg["draft"].enabled
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
             data=data,

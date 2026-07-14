@@ -20,7 +20,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from typing import Any, Generator, Iterable, Optional, Set, Union, cast
+from typing import Any, Generator, Iterable, Optional, Set, Union
 
 import ray
 import torch
@@ -75,7 +75,11 @@ from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
     pack_sequences,
 )
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import (
+    PolicyConfig,
+    SinglePytorchMilestonesConfig,
+    SinglePytorchSchedulerConfig,
+)
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
@@ -260,7 +264,7 @@ class DTensorPolicyWorkerImpl(
             raise ValueError(f"Unknown precision: {self.cfg['precision']}")
 
         print(f"[Rank {self.rank}] Loading model {model_name} on CPU...")
-        self.enable_seq_packing = self.cfg["sequence_packing"]["enabled"]
+        self.enable_seq_packing = self.cfg["sequence_packing"].enabled
         if self.enable_seq_packing:
             assert not self.is_vlm, (
                 "Sequence packing is not supported for VLM models. Please set policy.sequence_packing.enabled = False to train VLM models."
@@ -286,7 +290,7 @@ class DTensorPolicyWorkerImpl(
 
         # reward model
         self._is_reward_model = (
-            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"]["enabled"]
+            "reward_model_cfg" in self.cfg and self.cfg["reward_model_cfg"].enabled
         )
         if self._is_reward_model:
             # Ensure sequence packing is disabled.
@@ -295,7 +299,7 @@ class DTensorPolicyWorkerImpl(
                     "Sequence packing is not supported for reward models"
                 )
             # Load model as a Reward Model.
-            rm_type = self.cfg["reward_model_cfg"]["reward_model_type"]
+            rm_type = self.cfg["reward_model_cfg"].reward_model_type
             if rm_type == "bradley_terry":
                 model_class = AutoModelForSequenceClassification
                 if model_config.num_labels != 1:
@@ -463,34 +467,36 @@ class DTensorPolicyWorkerImpl(
             )
 
         if init_optimizer:
-            optimizer_cls = get_class(self.cfg["optimizer"]["name"])
+            optimizer_cls = get_class(self.cfg["optimizer"].name)
             self.optimizer = optimizer_cls(
-                self.model.parameters(), **self.cfg["optimizer"]["kwargs"]
+                self.model.parameters(), **self.cfg["optimizer"].kwargs
             )
         else:
             self.optimizer = None
 
         if "scheduler" in self.cfg and self.optimizer is not None:
-            if isinstance(self.cfg["scheduler"], dict):
-                scheduler_cls = get_class(cast(str, self.cfg["scheduler"]["name"]))
+            if isinstance(self.cfg["scheduler"], SinglePytorchSchedulerConfig):
+                scheduler_cls = get_class(self.cfg["scheduler"].name)
                 self.scheduler = scheduler_cls(
-                    self.optimizer, **self.cfg["scheduler"]["kwargs"]
+                    self.optimizer, **self.cfg["scheduler"].kwargs
                 )
             else:
                 schedulers = []
                 for scheduler_cfg in self.cfg["scheduler"]:
-                    if "name" in scheduler_cfg:
+                    if isinstance(scheduler_cfg, SinglePytorchSchedulerConfig):
                         schedulers.append(
-                            get_class(scheduler_cfg["name"])(
-                                self.optimizer, **scheduler_cfg["kwargs"]
+                            get_class(scheduler_cfg.name)(
+                                self.optimizer, **scheduler_cfg.kwargs
                             )
                         )
                     else:
-                        assert "milestones" in scheduler_cfg, (
+                        assert isinstance(
+                            scheduler_cfg, SinglePytorchMilestonesConfig
+                        ), (
                             "unknown scheduler config: ",
                             scheduler_cfg,
                         )
-                        milestones: list[int] = scheduler_cfg["milestones"]
+                        milestones: list[int] = scheduler_cfg.milestones
 
                 self.scheduler = torch.optim.lr_scheduler.SequentialLR(
                     self.optimizer, schedulers, milestones
@@ -671,7 +677,7 @@ class DTensorPolicyWorkerImpl(
                 # make_microbatch_iterator assumes that the batch size is a multiple of the microbatch size
                 # so its safe to not check for the case where the last data slice is smaller than mbs
                 dummy_iterator = iter([])
-                if self.cfg["dynamic_batching"]["enabled"]:
+                if self.cfg["dynamic_batching"].enabled:
                     mb_iterator = batch.make_microbatch_iterator_with_dynamic_shapes()
                     iterator_len = batch.get_microbatch_iterator_dynamic_shapes_len()
                 elif self.enable_seq_packing:
@@ -725,9 +731,9 @@ class DTensorPolicyWorkerImpl(
                                 ],  # flash attention 2 expects flattened input
                                 padding_value=self.tokenizer.eos_token_id,
                                 return_attention_mask=False,
-                                min_seq_len=self.cfg["sequence_packing"][
-                                    "train_mb_tokens"
-                                ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
+                                min_seq_len=self.cfg[
+                                    "sequence_packing"
+                                ].train_mb_tokens,  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
                             )
                             seq_len = input_ids.shape[1]
                             attention_mask = None
@@ -1035,7 +1041,7 @@ class DTensorPolicyWorkerImpl(
         with unshard_fsdp2_model(self.model), torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
+            if self.cfg["dynamic_batching"].enabled:
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
@@ -1335,7 +1341,7 @@ class DTensorPolicyWorkerImpl(
         with unshard_fsdp2_model(self.model), torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
+            if self.cfg["dynamic_batching"].enabled:
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
             elif self.enable_seq_packing:
@@ -1480,7 +1486,7 @@ class DTensorPolicyWorkerImpl(
         with torch.no_grad():
             data.to("cuda")
             dummy_iterator = iter([])
-            if self.cfg["dynamic_batching"]["enabled"]:
+            if self.cfg["dynamic_batching"].enabled:
                 # dynamic batching support (no CP/packed)
                 mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
                 iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()

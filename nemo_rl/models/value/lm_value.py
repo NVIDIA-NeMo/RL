@@ -192,7 +192,7 @@ class Value(ValueInterface):
             )
 
         # Configure dynamic batching
-        if config["dynamic_batching"]["enabled"]:
+        if config["dynamic_batching"].enabled:
             assert pp_size == 1, (
                 "Dynamic batching is only supported for single pipeline parallel stage"
             )
@@ -200,30 +200,30 @@ class Value(ValueInterface):
             self.dynamic_batching_args: DynamicBatchingArgs = {
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
-                "sequence_length_round": config["dynamic_batching"][
-                    "sequence_length_round"
-                ],
+                "sequence_length_round": config[
+                    "dynamic_batching"
+                ].sequence_length_round,
                 "max_tokens_per_microbatch": 0,  # Override in each call
             }
-            assert not config["sequence_packing"]["enabled"], (
+            assert not config["sequence_packing"].enabled, (
                 "Dynamic Batching is exclusive of Sequence Packing. Please disable Sequence Packing to use Dynamic Batching"
             )
         else:
             self.use_dynamic_batches = False
 
         # Configure sequence packing
-        if config["sequence_packing"]["enabled"]:
+        if config["sequence_packing"].enabled:
             self.use_sequence_packing = True
             sequence_length_pad_multiple = (
                 cp_size * 2 * tp_size if cp_size > 1 else tp_size
             )
             self.sequence_packing_args: SequencePackingArgs = {
-                "algorithm": config["sequence_packing"]["algorithm"],
+                "algorithm": config["sequence_packing"].algorithm,
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": sequence_length_pad_multiple,
             }
-            assert not config["dynamic_batching"]["enabled"], (
+            assert not config["dynamic_batching"].enabled, (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
             )
         else:
@@ -251,18 +251,26 @@ class Value(ValueInterface):
 
         with timer.time("get_values/shard_data") if timer else nullcontext():
             if self.use_dynamic_batches:
-                self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
-                    "dynamic_batching"
-                ]["logprob_mb_tokens"]
+                logprob_mb_tokens = self.cfg["dynamic_batching"].logprob_mb_tokens
+                assert logprob_mb_tokens is not None, (
+                    "dynamic_batching.logprob_mb_tokens must be configured for value inference"
+                )
+                self.dynamic_batching_args["max_tokens_per_microbatch"] = (
+                    logprob_mb_tokens
+                )
                 sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
                     dp_size,
                     batch_size=None,
                     dynamic_batching_args=self.dynamic_batching_args,
                 )
             elif self.use_sequence_packing:
-                self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                    "sequence_packing"
-                ]["logprob_mb_tokens"]
+                logprob_mb_tokens = self.cfg["sequence_packing"].logprob_mb_tokens
+                assert logprob_mb_tokens is not None, (
+                    "sequence_packing.logprob_mb_tokens must be configured for value inference"
+                )
+                self.sequence_packing_args["max_tokens_per_microbatch"] = (
+                    logprob_mb_tokens
+                )
                 sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                     dp_size,
                     batch_size=None,
@@ -332,7 +340,7 @@ class Value(ValueInterface):
             if self.use_dynamic_batches:
                 self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                     "dynamic_batching"
-                ]["train_mb_tokens"]
+                ].train_mb_tokens
                 sharded_data, _ = data.shard_by_batch_size(
                     dp_size,
                     batch_size=batch_size,
@@ -341,7 +349,7 @@ class Value(ValueInterface):
             elif self.use_sequence_packing:
                 self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
                     "sequence_packing"
-                ]["train_mb_tokens"]
+                ].train_mb_tokens
                 sharded_data, _ = data.shard_by_batch_size(
                     dp_size,
                     batch_size=batch_size,
