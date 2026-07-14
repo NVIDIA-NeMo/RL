@@ -25,7 +25,7 @@ from nemo_rl.algorithms.distillation import (
     DistillationConfig,
     MasterConfig,
     _initial_distillation_save_state,
-    _load_distillation_save_state,
+    _get_distillation_save_state,
     check_vocab_equality,
     distillation_train,
     validate,
@@ -203,7 +203,7 @@ def mock_components():
     }
 
 
-def test_load_distillation_save_state_handles_legacy_checkpoint_and_filters_metrics():
+def test_get_distillation_save_state_handles_legacy_checkpoint_and_filters_metrics():
     loaded_state = {
         "total_steps": 13,
         "current_epoch": 1,
@@ -212,7 +212,7 @@ def test_load_distillation_save_state_handles_legacy_checkpoint_and_filters_metr
         "val:accuracy": 0.75,
     }
 
-    save_state = _load_distillation_save_state(loaded_state)
+    save_state = _get_distillation_save_state(loaded_state)
 
     assert vars(save_state) == {
         "total_steps": 13,
@@ -234,7 +234,7 @@ def test_distillation_save_state_checkpoint_round_trip():
     save_state.val_reward = 0.8
     setattr(save_state, "val:accuracy", 0.8)
 
-    restored_state = _load_distillation_save_state(vars(save_state))
+    restored_state = _get_distillation_save_state(vars(save_state))
 
     assert restored_state.current_step == 4
     assert restored_state.total_steps == 4
