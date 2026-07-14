@@ -304,6 +304,88 @@ class SGLangGenerationWorker:
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
 
+    def init_weights_update_group(
+        self, master_address, master_port, rank_offset, world_size, group_name, backend
+    ):
+        return self._make_request(
+            "init_weights_update_group",
+            {
+                "master_address": master_address,
+                "master_port": master_port,
+                "rank_offset": rank_offset,
+                "world_size": world_size,
+                "group_name": group_name,
+                "backend": backend,
+            },
+        )
+
+    def destroy_weights_update_group(self, group_name):
+        try:
+            return self._make_request(
+                "destroy_weights_update_group",
+                {
+                    "group_name": group_name,
+                },
+            )
+        except requests.exceptions.RequestException:
+            # catch the case where the engine is just created and does not have the group.
+            pass
+
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        flush_cache=False,
+        weight_version: str | None = None,
+    ):
+        payload = {
+            "names": names,
+            "dtypes": [str(dtype).replace("torch.", "") for dtype in dtypes],
+            "shapes": shapes,
+            "group_name": group_name,
+            "flush_cache": flush_cache,
+        }
+        if weight_version is not None:
+            payload["weight_version"] = weight_version
+        return self._make_request(
+            "update_weights_from_distributed",
+            payload,
+        )
+
+    def pause_generation(self, mode: str = "retract"):
+        response = requests.post(
+            f"{self.server_base_url}/pause_generation",
+            json={"mode": mode},
+        )
+        response.raise_for_status()
+        return response
+
+    def continue_generation(self):
+        response = requests.post(f"{self.server_base_url}/continue_generation", json={})
+        response.raise_for_status()
+        return response
+
+    def begin_weight_update(self):
+        """Open one engine-side session before the first refit bucket."""
+        return self._make_request("begin_weight_update", {})
+
+    def end_weight_update(self):
+        """Finalize quantized layouts after the last refit bucket."""
+        return self._make_request("end_weight_update", {})
+
+    def _simulate_crash(self):
+        """Test-only: tear the engine down to simulate a crash.
+
+        Underscore-prefixed to signal this is **not** part of the public
+        worker API; production code should never call it.
+        """
+        logger.info(
+            f"Simulating crash on engine {self.server_host}:{self.server_port}..."
+        )
+        self.shutdown()
+
     def start_profile(
         self,
         # The output directory
