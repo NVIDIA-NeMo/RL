@@ -388,6 +388,12 @@ class SyncRolloutActor:
                 group_id for group_id in group_ids for _ in range(group_size)
             ]
             writer_rollout_ids = [mint_rollout_id() for _ in range(input_batch.size)]
+            if writer_cfg.accept_gateway_identity and hasattr(
+                self.policy_generation, "set_rollout_weight_version"
+            ):
+                # Gateway-identified requests carry no signed context, so the
+                # step's weight version is declared to the workers up front.
+                self.policy_generation.set_rollout_weight_version(weight_version)
             input_batch = _attach_rollout_contexts(
                 input_batch,
                 rollout_ids=writer_rollout_ids,

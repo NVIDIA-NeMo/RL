@@ -368,10 +368,29 @@ class TurnReservation:
 
 
 @dataclass(frozen=True)
+class RolloutIdentity:
+    """The verified write identity for one inference request.
+
+    Two provenances produce it: the native path validates a signed
+    ``RolloutContext`` (``rollout_id`` = the context's ``sample_id`` alias,
+    ``group_id`` from the context, ``call_id`` absent), and the gateway path
+    accepts ``nemo_rl_rollout_id``/``nemo_rl_call_id`` forwarded by a trusted
+    Gym gate (``group_id`` stays empty — sibling grouping never travels
+    through model requests; ``weight_version`` is the worker's configured
+    step version).
+    """
+
+    rollout_id: str
+    group_id: str
+    weight_version: int
+    call_id: str | None = None
+
+
+@dataclass(frozen=True)
 class RolloutRequestState:
     """Request-scoped state shared by vLLM preprocessing and serialization."""
 
-    context: RolloutContext
+    identity: RolloutIdentity
     reservation: TurnReservation
     prompt_token_ids: list[int]
 
@@ -684,7 +703,12 @@ def assemble_staged_batch(
             for expected_turn, turn in enumerate(manifest.turns):
                 if turn.turn != expected_turn or turn.state != "committed":
                     raise CursorError("non_contiguous_turns")
-                if turn.group_id != group_id or turn.weight_version != weight_version:
+                # Gateway-identified turns commit group_id="" — sibling
+                # grouping never travels through model requests; identity is
+                # instead reconciled against the sealed call manifest.
+                if turn.group_id not in ("", group_id):
+                    raise CursorError("identity_or_weight_version_mismatch")
+                if turn.weight_version != weight_version:
                     raise CursorError("identity_or_weight_version_mismatch")
                 if (
                     turn.prev_len != expected_prev_len

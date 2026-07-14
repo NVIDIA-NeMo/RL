@@ -67,6 +67,10 @@ class RolloutWriterConfig(BaseModel, extra="allow"):
         max_pending_writes_per_worker: Reserved bound for the deferred async
             writer; synchronous mode does not enqueue writes.
         require_signed_context: Reject unsigned rollout contexts.
+        accept_gateway_identity: Accept ``nemo_rl_rollout_id``/``nemo_rl_call_id``
+            stamped by a trusted Gym gateway on requests without a signed
+            context (black-box harness mode). Requires the vLLM endpoint to be
+            network-isolated or the gateway-to-worker hop authenticated.
     """
 
     enabled: bool = False
@@ -76,6 +80,7 @@ class RolloutWriterConfig(BaseModel, extra="allow"):
     cursor_ttl_s: Annotated[float, Field(gt=0)] = 3600.0
     max_pending_writes_per_worker: Annotated[int, Field(gt=0)] = 64
     require_signed_context: bool = True
+    accept_gateway_identity: bool = False
 
 
 class DataPlaneConfig(BaseModel, extra="allow"):

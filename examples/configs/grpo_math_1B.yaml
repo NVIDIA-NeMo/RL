@@ -489,6 +489,7 @@ data_plane:
     cursor_ttl_s: 3600
     max_pending_writes_per_worker: 64 # reserved for the deferred async writer
     require_signed_context: true
+    accept_gateway_identity: false    # trust gate-stamped rollout/call ids (black-box harnesses)
 
 # Multi-Teacher On-Policy Distillation (MOPD): distills from one or more teacher
 # models into the policy via token-level teacher-minus-student logprob advantages,

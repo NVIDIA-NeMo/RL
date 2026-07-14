@@ -453,6 +453,142 @@ async def test_worker_rejects_mismatched_rollout_id_alias_pair() -> None:
         ray.get(cursor.get_finalization_manifest.remote("sample"))
 
 
+def _gateway_worker(cursor, *, accept_gateway_identity=True, weight_version=5):
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._rollout_writer_cfg = SimpleNamespace(
+        enabled=True,
+        accept_gateway_identity=accept_gateway_identity,
+        staging_partition="staging",
+    )
+    worker._rollout_writer_secret = None
+    worker._rollout_cursor = cursor
+    worker._rollout_requests = {}
+    worker._rollout_prompt_tokens = {}
+    worker._rollout_response_tokens = {}
+    worker._rollout_weight_version = weight_version
+    return worker
+
+
+def _chat_response(generated_ids, generated_logprobs):
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "hi",
+                    "generation_token_ids": list(generated_ids),
+                    "generation_log_probs": list(generated_logprobs),
+                }
+            }
+        ]
+    }
+    return SimpleNamespace(model_dump=lambda: payload)
+
+
+@pytest.mark.asyncio
+async def test_worker_stages_gateway_identified_call_without_token_echo() -> None:
+    """A trusted-gateway call carries {rollout_id, call_id}, no signed context
+    and no prefix echo: the worker verifies the committed prefix by hash,
+    stages under <rollout_id>/<call_id>, and never echoes tokens back."""
+    cursor = RolloutCursorRegistry.remote(lease_ttl_s=10, cursor_ttl_s=100)
+    worker = _gateway_worker(cursor)
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        "staging", list(ROLLOUT_STAGING_FIELDS), 10, consumer_tasks=[]
+    )
+    worker._rollout_dp_client = client
+
+    # Turn 0: prompt [1,2,3], generates [4,5].
+    first = SimpleNamespace(
+        nemo_rl_rollout_context=None,
+        nemo_rl_rollout_id="rid",
+        nemo_rl_call_id="c1",
+        required_prefix_token_ids=None,
+        stream=False,
+    )
+    await worker._prepare_rollout_request(first, prompt_token_ids=[1, 2, 3])
+    assert id(first) in worker._rollout_requests
+    await worker._stage_rollout_response(first, _chat_response([4, 5], [-0.1, -0.2]))
+    # No token echo for gateway-identified calls.
+    assert id(first) not in worker._rollout_response_tokens
+
+    # Turn 1: rendered prompt extends the committed sequence; no echo needed.
+    second = SimpleNamespace(
+        nemo_rl_rollout_context=None,
+        nemo_rl_rollout_id="rid",
+        nemo_rl_call_id="c2",
+        required_prefix_token_ids=None,
+        stream=False,
+    )
+    await worker._prepare_rollout_request(second, prompt_token_ids=[1, 2, 3, 4, 5, 6])
+    await worker._stage_rollout_response(second, _chat_response([7], [-0.3]))
+
+    manifest = ray.get(cursor.get_finalization_manifest.remote("rid"))
+    assert manifest.failure_reason is None
+    assert [t.staging_key for t in manifest.turns] == ["rid/c1", "rid/c2"]
+    assert all(t.weight_version == 5 for t in manifest.turns)
+    assert all(t.group_id == "" for t in manifest.turns)
+    assert manifest.committed_length == 7
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_gateway_identity_when_not_accepted() -> None:
+    cursor = RolloutCursorRegistry.remote(lease_ttl_s=10, cursor_ttl_s=100)
+    worker = _gateway_worker(cursor, accept_gateway_identity=False)
+    request = SimpleNamespace(
+        nemo_rl_rollout_id="rid",
+        nemo_rl_call_id="c1",
+        nemo_rl_rollout_context=None,
+        required_prefix_token_ids=None,
+        stream=False,
+    )
+    await worker._prepare_rollout_request(request, prompt_token_ids=[1, 2])
+    assert id(request) not in worker._rollout_requests
+    with pytest.raises(ray.exceptions.RayTaskError, match="unknown rollout sample"):
+        ray.get(cursor.get_finalization_manifest.remote("rid"))
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_gateway_call_when_rendered_prompt_diverges() -> None:
+    """Rendering that no longer reproduces the committed prefix (harness
+    compaction / history rewrite) fails the linear cursor by hash."""
+    cursor = RolloutCursorRegistry.remote(lease_ttl_s=10, cursor_ttl_s=100)
+    committed = [1, 2, 3]
+    first = ray.get(cursor.reserve_turn.remote("rid", "call:c1"))
+    ray.get(
+        cursor.commit_turn.remote(
+            "rid",
+            first.lease,
+            staging_key="rid/c1",
+            new_len=len(committed),
+            new_hash=hash_token_ids(committed),
+            group_id="",
+            weight_version=5,
+        )
+    )
+    worker = _gateway_worker(cursor)
+    request = SimpleNamespace(
+        nemo_rl_rollout_context=None,
+        nemo_rl_rollout_id="rid",
+        nemo_rl_call_id="c2",
+        required_prefix_token_ids=None,
+        stream=False,
+    )
+
+    class _Tokenizer:
+        @staticmethod
+        def decode(token_ids):
+            return " ".join(map(str, token_ids))
+
+    await worker._prepare_rollout_request(
+        request, prompt_token_ids=[1, 9, 9, 9], tokenizer=_Tokenizer()
+    )
+    assert id(request) not in worker._rollout_requests
+    manifest = ray.get(cursor.get_finalization_manifest.remote("rid"))
+    assert manifest.failure_reason is not None
+    assert "prefix_mismatch" in manifest.failure_reason
+
+
 def test_finalizer_assembles_valid_row_and_masks_missing_row() -> None:
     client = NoOpDataPlaneClient()
     client.register_partition(

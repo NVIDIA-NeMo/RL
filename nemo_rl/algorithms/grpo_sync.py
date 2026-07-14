@@ -517,8 +517,15 @@ def grpo_train_sync(
             raise ValueError(
                 "data_plane.rollout_writer does not yet support router replay"
             )
-        if not writer_cfg.require_signed_context and writer_cfg.mode == "direct":
-            raise ValueError("direct rollout writes require signed contexts")
+        if (
+            not writer_cfg.require_signed_context
+            and not writer_cfg.accept_gateway_identity
+            and writer_cfg.mode == "direct"
+        ):
+            raise ValueError(
+                "direct rollout writes require signed contexts or a trusted "
+                "gateway identity (accept_gateway_identity)"
+            )
         policy.prepare_rollout_writer()
         rollout_secret = secrets.token_bytes(32)
         rollout_cursor = RolloutCursorRegistry.remote(

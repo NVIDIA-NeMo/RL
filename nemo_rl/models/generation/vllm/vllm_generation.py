@@ -525,6 +525,15 @@ class VllmGeneration(GenerationInterface):
         )
         ray.get(futures)
 
+    def set_rollout_weight_version(self, weight_version: int) -> None:
+        """Ship the step's policy weight version to every model-owner worker."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version",
+            weight_version=weight_version,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
     def configure_rollout_metrics(self, enabled: bool) -> None:
         """Enable identical transport measurements for legacy and direct modes."""
         self._rollout_metrics_enabled = enabled

@@ -221,6 +221,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._rollout_metrics_lock = threading.Lock()
         self._rollout_transport_metrics: dict[str, Any] = {}
         self._rollout_metrics_cpu_start_s = time.process_time()
+        # The step's policy weight version, shipped by the driver before each
+        # rollout phase. Gateway-identified requests stamp this on staged rows
+        # (the signed-context path carries its own version instead).
+        self._rollout_weight_version = 0
 
         super().__init__(
             config,
@@ -259,6 +263,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._rollout_writer_secret = secret
         self._rollout_cursor = cursor
         self._rollout_dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+
+    def set_rollout_weight_version(self, weight_version: int) -> None:
+        """Declare the policy weight version staged rows must carry this step."""
+        self._rollout_weight_version = int(weight_version)
 
     def configure_rollout_metrics(self, enabled: bool) -> None:
         """Enable lightweight in-memory transport metrics for A/B benchmarks."""
@@ -387,48 +395,83 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from nemo_rl.experience.rollout_writer import (
             RolloutContext,
             RolloutContextError,
+            RolloutIdentity,
             RolloutRequestState,
             derive_request_nonce,
             hash_token_ids,
             validate_rollout_context,
         )
 
-        payload = getattr(request, "nemo_rl_rollout_context", None)
-        if payload is None:
-            LOGGER.error("Rollout request has no signed context; serving uncollected")
-            return
         if getattr(request, "stream", False):
             raise RolloutContextError("rollout writer does not support streaming")
-        try:
-            context = RolloutContext.from_dict(payload)
-            if self._rollout_writer_secret is None:
-                raise RuntimeError("rollout writer secret was not configured")
-            validate_rollout_context(context, secret=self._rollout_writer_secret)
-        except RolloutContextError:
-            LOGGER.exception("Invalid rollout context; serving request uncollected")
-            return
-        # Migration alias pair: the signed context's sample_id carries the
-        # canonical rollout_id. A request presenting both identities is
-        # accepted only when they agree.
         bare_rollout_id = getattr(request, "nemo_rl_rollout_id", None)
-        if bare_rollout_id is not None and bare_rollout_id != context.sample_id:
+        call_id = getattr(request, "nemo_rl_call_id", None)
+        payload = getattr(request, "nemo_rl_rollout_context", None)
+        if payload is not None:
+            # Native path: validate the signed context.
+            try:
+                context = RolloutContext.from_dict(payload)
+                if self._rollout_writer_secret is None:
+                    raise RuntimeError("rollout writer secret was not configured")
+                validate_rollout_context(context, secret=self._rollout_writer_secret)
+            except RolloutContextError:
+                LOGGER.exception("Invalid rollout context; serving request uncollected")
+                return
+            # Migration alias pair: the signed context's sample_id carries the
+            # canonical rollout_id. A request presenting both identities is
+            # accepted only when they agree.
+            if bare_rollout_id is not None and bare_rollout_id != context.sample_id:
+                LOGGER.error(
+                    "nemo_rl_rollout_id %s does not match signed context identity "
+                    "%s; serving request uncollected",
+                    bare_rollout_id,
+                    context.sample_id,
+                )
+                return
+            identity = RolloutIdentity(
+                rollout_id=context.sample_id,
+                group_id=context.group_id,
+                weight_version=context.weight_version,
+                call_id=call_id,
+            )
+            # Idempotency key: (rollout, prompt) — the native agent loop is
+            # sequential and append-only, so one prompt is one turn.
+            request_nonce = derive_request_nonce(identity.rollout_id, prompt_token_ids)
+        elif (
+            self._rollout_writer_cfg.accept_gateway_identity
+            and bare_rollout_id is not None
+            and call_id is not None
+        ):
+            # Gateway path: the identity pair was stamped by a trusted Gym
+            # gate after dialect conversion (the vLLM endpoint must be
+            # network-isolated or the gateway-to-worker hop authenticated).
+            # group_id never travels through model requests; the finalizer
+            # joins it back driver-side. Idempotency key: the gate-minted
+            # call_id — an internal retry reuses it, while a separately
+            # admitted call with an identical prompt gets a fresh one.
+            # Prompt hashes are never identity.
+            identity = RolloutIdentity(
+                rollout_id=str(bare_rollout_id),
+                group_id="",
+                weight_version=self._rollout_weight_version,
+                call_id=str(call_id),
+            )
+            request_nonce = f"call:{call_id}"
+        else:
             LOGGER.error(
-                "nemo_rl_rollout_id %s does not match signed context identity %s; "
-                "serving request uncollected",
-                bare_rollout_id,
-                context.sample_id,
+                "Rollout request has no signed context and no accepted gateway "
+                "identity; serving uncollected"
             )
             return
-        request_nonce = derive_request_nonce(context.sample_id, prompt_token_ids)
         reserve_started = time.perf_counter()
         try:
             reservation = await self._rollout_cursor.reserve_turn.remote(
-                context.sample_id, request_nonce
+                identity.rollout_id, request_nonce
             )
         except ray.exceptions.RayError:
             LOGGER.exception(
                 "Could not reserve a rollout turn for %s; serving uncollected",
-                context.sample_id,
+                identity.rollout_id,
             )
             return
         finally:
@@ -436,12 +479,22 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "cursor_reserve_ms", (time.perf_counter() - reserve_started) * 1000
             )
 
-        echoed_prefix = getattr(request, "required_prefix_token_ids", None) or []
-        prefix_matches = (
-            len(echoed_prefix) == reservation.prev_len
-            and hash_token_ids(echoed_prefix) == reservation.prev_hash
-            and prompt_token_ids[: reservation.prev_len] == echoed_prefix
-        )
+        echoed_prefix = getattr(request, "required_prefix_token_ids", None)
+        if echoed_prefix is None:
+            # No token echo (black-box harnesses speak text): verify that the
+            # rendered prompt still begins with the committed prefix by hash.
+            prefix_matches = (
+                len(prompt_token_ids) >= reservation.prev_len
+                and hash_token_ids(prompt_token_ids[: reservation.prev_len])
+                == reservation.prev_hash
+            )
+            echoed_prefix = prompt_token_ids[: reservation.prev_len]
+        else:
+            prefix_matches = (
+                len(echoed_prefix) == reservation.prev_len
+                and hash_token_ids(echoed_prefix) == reservation.prev_hash
+                and prompt_token_ids[: reservation.prev_len] == echoed_prefix
+            )
         if not prefix_matches:
             divergent = 0
             shared = min(len(echoed_prefix), reservation.prev_len)
@@ -466,13 +519,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 f"expected_text={expected_text}:actual_text={actual_text}"
             )
             await self._rollout_cursor.fail_turn.remote(
-                context.sample_id, reservation.lease, reason=reason
+                identity.rollout_id, reservation.lease, reason=reason
             )
             LOGGER.error("%s; serving request uncollected", reason)
             return
 
         self._rollout_requests[id(request)] = RolloutRequestState(
-            context=context,
+            identity=identity,
             reservation=reservation,
             prompt_token_ids=list(prompt_token_ids),
         )
@@ -498,6 +551,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         generated_ids, generated_logprobs = extract_generation_token_info(choice)
         prompt_ids = request_state.prompt_token_ids
         reservation = request_state.reservation
+        identity = request_state.identity
         full_ids = prompt_ids + generated_ids
         try:
             token_ids_delta, token_mask_delta, logprobs_delta = build_staging_delta(
@@ -509,13 +563,19 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         except ValueError:
             reason = "invalid_staging_delta"
             await self._rollout_cursor.fail_turn.remote(
-                request_state.context.sample_id,
+                identity.rollout_id,
                 reservation.lease,
                 reason=reason,
             )
             raise
 
-        staging_key = f"{request_state.context.sample_id}/t{reservation.turn}"
+        # Staging keys: the gate-minted call_id when the gateway supplied one
+        # (unique per admitted call, retry-idempotent), else the linear turn
+        # index of the native sequential path.
+        if identity.call_id is not None:
+            staging_key = f"{identity.rollout_id}/{identity.call_id}"
+        else:
+            staging_key = f"{identity.rollout_id}/t{reservation.turn}"
         fields = TensorDict(
             {
                 "token_ids_delta": torch.tensor([token_ids_delta], dtype=torch.int64),
@@ -530,10 +590,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
         tags = [
             {
-                "sample_id": request_state.context.sample_id,
-                "group_id": request_state.context.group_id,
+                "sample_id": identity.rollout_id,
+                "group_id": identity.group_id,
+                "call_id": identity.call_id,
                 "turn": reservation.turn,
-                "weight_version": request_state.context.weight_version,
+                "weight_version": identity.weight_version,
                 "request_nonce": reservation.request_nonce,
                 "prev_len": reservation.prev_len,
                 "new_len": len(full_ids),
@@ -553,7 +614,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             )
         except Exception as error:
             await self._rollout_cursor.fail_turn.remote(
-                request_state.context.sample_id,
+                identity.rollout_id,
                 reservation.lease,
                 reason=f"staging_write_failed:{type(error).__name__}",
             )
@@ -570,37 +631,42 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         commit_started = time.perf_counter()
         try:
             await self._rollout_cursor.commit_turn.remote(
-                request_state.context.sample_id,
+                identity.rollout_id,
                 reservation.lease,
                 staging_key=staging_key,
                 new_len=len(full_ids),
                 new_hash=hash_token_ids(full_ids),
-                group_id=request_state.context.group_id,
-                weight_version=request_state.context.weight_version,
+                group_id=identity.group_id,
+                weight_version=identity.weight_version,
             )
         except Exception:
             try:
                 await self._rollout_cursor.fail_turn.remote(
-                    request_state.context.sample_id,
+                    identity.rollout_id,
                     reservation.lease,
                     reason="cursor_commit_failed",
                 )
             except Exception:
                 LOGGER.exception(
                     "Failed to mark rollout %s after cursor commit failure",
-                    request_state.context.sample_id,
+                    identity.rollout_id,
                 )
             raise
         finally:
             self._record_rollout_transport(
                 "cursor_commit_ms", (time.perf_counter() - commit_started) * 1000
             )
-        self._record_rollout_transport("sample_ids", request_state.context.sample_id)
-        self._rollout_response_tokens[id(request)] = (
-            list(prompt_ids),
-            generated_ids,
-            generated_logprobs,
-        )
+        self._record_rollout_transport("sample_ids", identity.rollout_id)
+        # Gateway-identified (black-box) calls never echo tokens over HTTP:
+        # the staged delta is the only token store, and the response is served
+        # with neither token ids nor logprobs. The native path re-attaches
+        # them for exact next-turn prefix echo.
+        if identity.call_id is None:
+            self._rollout_response_tokens[id(request)] = (
+                list(prompt_ids),
+                generated_ids,
+                generated_logprobs,
+            )
 
     def _reserve_port(self) -> None:
         """Bind and listen on a TCP socket to reserve a free port from the OS.
