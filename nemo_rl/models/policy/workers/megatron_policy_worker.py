@@ -2168,20 +2168,44 @@ class MegatronPolicyWorkerImpl(
     # ------------------------------------------------------------------
     # SGLang weight update (colocate IPC + disaggregate broadcast)
     # ------------------------------------------------------------------
-    def _build_sglang_hf_iterator(self):
+    def _build_sglang_hf_iterator(
+        self,
+        *,
+        target_precision: str,
+        sglang_quantization_cfg: Optional[dict] = None,
+    ):
         from nemo_rl.models.policy.workers.megatron_sglang_weight_iterator import (
             MegatronSGLangHfWeightIterator,
         )
+        from nemo_rl.models.generation.sglang.quantization_utils import (
+            get_sglang_quantization_scheme,
+        )
+
+        configured_precision = get_sglang_quantization_scheme(sglang_quantization_cfg)
+        if target_precision != configured_precision:
+            raise ValueError(
+                "SGLang refit target precision does not match its quantization "
+                f"config: target={target_precision!r}, "
+                f"configured={configured_precision!r}."
+            )
 
         if self.refit_conversion_tasks is None:
             self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
                 [self.model]
             )
 
+        num_hidden_layers = 0
+        if target_precision == "mxfp8":
+            num_hidden_layers = int(
+                getattr(self.megatron_bridge.transformer_config, "num_layers", 0)
+            )
+
         return MegatronSGLangHfWeightIterator(
             megatron_bridge=self.megatron_bridge,
             models=[self.model],
             conversion_tasks=self.refit_conversion_tasks,
+            quantization_config=dict(sglang_quantization_cfg or {}),
+            num_hidden_layers=num_hidden_layers,
         )
 
     @torch.no_grad()
@@ -2225,8 +2249,12 @@ class MegatronPolicyWorkerImpl(
         Raises ``RuntimeError`` on any chunk failure.
         """
         self._sglang_weight_version += 1
-        iterator = self._build_sglang_hf_iterator()
+        iterator = self._build_sglang_hf_iterator(
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+        )
         bucket_iter = iterator.iter_hf_weight_buckets(
+            target_precision=cast(Any, target_precision),
             buffer_size_bytes=buffer_size_bytes,
         )
         send_hf_buckets_via_ipc_actor_impl(
@@ -2294,8 +2322,12 @@ class MegatronPolicyWorkerImpl(
         rank 0 as the only source" decision.
         """
         self._sglang_weight_version += 1
-        iterator = self._build_sglang_hf_iterator()
+        iterator = self._build_sglang_hf_iterator(
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+        )
         bucket_iter = iterator.iter_hf_weight_buckets(
+            target_precision=cast(Any, target_precision),
             buffer_size_bytes=buffer_size_bytes,
         )
 
@@ -3374,4 +3406,3 @@ class MegatronPolicyWorkerImpl(
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass
-
