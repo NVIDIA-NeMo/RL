@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -45,6 +45,7 @@ from nemo_rl.models.generation.sglang.utils.ip_port_utils import (
 )
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
+    Lock,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.venvs import make_actor_runtime_env
@@ -103,6 +104,12 @@ class SGLangGeneration(GenerationInterface):
         self.needs_offload: bool = sglang_server_cfg["needs_offload"]
         self.model_path: str | None = sglang_cfg["sglang_cfg"]["model_path"]
 
+        # --- Weight-refit state ------------------------------------------
+        # Number of engines created by the most recent ``_start_engines``
+        # call that the refit dispatch has not connected yet.
+        self.num_new_engines: int = 0
+        self.pause_generation_mode: str = sglang_server_cfg["pause_generation_mode"]
+
         # --- Router bootstrap --------------------------------------------
         # Resolved router endpoint is held only on the instance; we don't
         # mutate the caller's config dict. Workers receive these as explicit
@@ -121,6 +128,9 @@ class SGLangGeneration(GenerationInterface):
         init_handles, _ = self._start_engines({})
         if init_handles:
             ray.get(init_handles)
+
+        # Serializes weight refits against concurrent engine operations.
+        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
 
     # ------------------------------------------------------------------
     # Engine topology properties (formerly ``ServerGroup``)
@@ -209,6 +219,10 @@ class SGLangGeneration(GenerationInterface):
                 }.items()
             }
 
+            # Trainer and engine must agree on the NCCL transport; sglang's
+            # scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0.
+            env_vars["NCCL_CUMEM_ENABLE"] = "0"
+
             # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
             # all engines see the same global value (Ray would otherwise remap it
             # because we set the NOSET_* flags above).
@@ -247,7 +261,9 @@ class SGLangGeneration(GenerationInterface):
             local_all_engines.append((global_rank, engine))
             self.all_engines[i] = engine
 
-        if len(local_all_engines) == 0:
+        self.num_new_engines = len(local_all_engines)
+
+        if self.num_new_engines == 0:
             return [], port_cursors
 
         # SGLang engine server/NCCL/dist_init ports come from the reserved
@@ -291,6 +307,61 @@ class SGLangGeneration(GenerationInterface):
                 if engine is not None
             ]
         )
+
+
+    def get_updatable_engines_and_lock(self):
+        """Return engines eligible for weight updates."""
+        return (
+            self.engines,
+            self.rollout_engine_lock,
+            self.num_new_engines,
+            self.engine_gpu_counts,
+            self.engine_gpu_offsets,
+        )
+
+
+    def clear_updatable_num_new_engines(self):
+        # Called by the refit dispatch once it has connected the new engines, so
+        # the next refit does not treat them as new again.
+        self.num_new_engines = 0
+
+    def pause_generation(self, mode: Optional[str] = None) -> None:
+        """Pause generation on every node-0 engine.
+
+        Args:
+            mode: Pause mode override. When ``None`` (default), the mode
+                configured in ``sglang_server_config.pause_generation_mode``
+                is used. Callers (e.g. the SGLang refit dispatch helpers)
+                pass an explicit mode when they also need to gate follow-up
+                steps such as ``invalidate_kv_cache`` on the same value.
+        """
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        if mode is None:
+            mode = self.pause_generation_mode
+        ray.get([e.pause_generation.remote(mode=mode) for e in engines])
+
+    def continue_generation(self) -> None:
+        """Resume generation on every node-0 engine."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.continue_generation.remote() for e in engines])
+
+    def begin_weight_update(self) -> None:
+        """Open a weight-update session on every node-0 engine."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.begin_weight_update.remote() for e in engines])
+
+    def end_weight_update(self) -> None:
+        """Close a weight-update session and rebuild quantized kernel layouts."""
+        engines = [e for e in self.engines if e is not None]
+        if not engines:
+            return
+        ray.get([e.end_weight_update.remote() for e in engines])
 
     def shutdown(self) -> bool:
         ok = True
