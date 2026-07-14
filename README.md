@@ -164,6 +164,7 @@ For detailed information on backend selection, configuration, and examples, see 
 > **Recommended:** Use the pre-built NGC container to skip manual system dependency setup. The container ships with CUDA, cuDNN, vLLM, and SGLang already installed.
 >
 > ```sh
+> docker pull nvcr.io/nvidia/nemo-rl:v0.6.0
 > git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 > cd nemo-rl
 > # export HF_TOKEN=hf_...                        # required for gated models (e.g. Llama)
