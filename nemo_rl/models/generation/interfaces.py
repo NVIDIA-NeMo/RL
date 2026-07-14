@@ -418,6 +418,14 @@ class GenerationInterface(ABC):
         """Shut down generation resources; repeated calls must be safe."""
         pass
 
+    def pause_generation(self) -> None:
+        """Pause in-flight generation on the backend."""
+        raise NotImplementedError
+
+    def continue_generation(self) -> None:
+        """Resume previously paused generation on the backend."""
+        raise NotImplementedError
+
     @property
     def requires_kv_scale_sync(self) -> bool:
         """Whether the generation backend requires KV cache scales synchronization."""
