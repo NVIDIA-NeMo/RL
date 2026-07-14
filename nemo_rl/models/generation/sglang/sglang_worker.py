@@ -21,12 +21,14 @@ from collections.abc import Callable
 import ray
 import requests
 
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _get_free_consecutive_ports_local,
+)
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _format_v6_uri
 from nemo_rl.models.generation.sglang.utils.patches import _apply_sglang_compat_patches
-from nemo_rl.models.generation.sglang.utils.ray_utils import (
-    get_current_node_ip,
-    get_free_port,
-)
+from nemo_rl.models.generation.sglang.utils.ray_utils import get_current_node_ip
 
 logger = logging.getLogger(__name__)
 
@@ -162,10 +164,22 @@ class SGLangGenerationWorker:
         return response.json()
 
     @staticmethod
-    def _get_current_node_ip_and_free_port(start_port=7000, consecutive=1):
-        return get_current_node_ip(), get_free_port(
-            start_port=start_port, consecutive=consecutive
+    def _get_current_free_port(
+        port_range_low=DEFAULT_GENERATION_PORT_RANGE_LOW,
+        port_range_high=DEFAULT_GENERATION_PORT_RANGE_HIGH,
+        consecutive=1,
+        start_port=None,
+    ):
+        return _get_free_consecutive_ports_local(
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+            consecutive=consecutive,
+            start_port=start_port,
         )
+
+    @staticmethod
+    def _get_current_node_ip():
+        return get_current_node_ip()
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         """Run /health_generate on the underlying SGLang HTTP server.
@@ -289,6 +303,17 @@ class SGLangGenerationWorker:
 
     def check_weights(self, action: str):
         return self._make_request("weights_checker", {"action": action})
+
+    def _simulate_crash(self):
+        """Test-only: tear the engine down to simulate a crash.
+
+        Underscore-prefixed to signal this is **not** part of the public
+        worker API; production code should never call it.
+        """
+        logger.info(
+            f"Simulating crash on engine {self.server_host}:{self.server_port}..."
+        )
+        self.shutdown()
 
     def start_profile(
         self,
