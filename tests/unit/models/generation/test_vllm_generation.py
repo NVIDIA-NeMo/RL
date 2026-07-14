@@ -1850,24 +1850,83 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
     assert result == template_token_ids
 
 
-def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
+def test_replace_prefix_tokens_non_growing_template_returns_retokenized_prompt():
     class _T:
         eos_token_id = 2
 
-        def decode(self, *args, **kwargs):
-            pass
+    tokenizer = _T()
+    template_prefix_token_ids = [11, 12, 13, 2]
+    template_token_ids = [11, 12, 2]
+    model_prefix_token_ids = [11, 12, 14, 2]
+
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+
+    assert result == template_token_ids
+
+
+def test_replace_prefix_tokens_missing_eos_uses_exact_template_boundary():
+    class _T:
+        eos_token_id = 2
 
     tokenizer = _T()
     model_prefix_token_ids = [7, 2]
     template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
     template_token_ids = [9, 9, 9, 2, 10]
-    with pytest.raises(AssertionError):
-        _replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=model_prefix_token_ids,
-            template_prefix_token_ids=template_prefix_token_ids,
-            template_token_ids=template_token_ids,
-        )
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+
+    assert result == [7, 2, 2, 10]
+
+
+def test_replace_prefix_tokens_uses_exact_nemotron_tool_boundary_without_eos():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    # The Nemotron assistant/tool boundary is model-specific and the rendered
+    # prefix has no tokenizer EOS. Gym preserved exact model tokens containing
+    # an empty reasoning span; structured reconstruction canonicalized the same
+    # turn into a TOOLCALL representation.
+    model_prefix_token_ids = [101, 201, 202, 203, 204]
+    template_prefix_token_ids = [101, 201, 202, 301, 302]
+    new_tool_and_generation_suffix = [401, 402, 403]
+    template_token_ids = template_prefix_token_ids + new_tool_and_generation_suffix
+
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+
+    assert result == model_prefix_token_ids + new_tool_and_generation_suffix
+
+
+def test_replace_prefix_tokens_missing_eos_ambiguous_boundary_retokenizes():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [7, 8]
+    template_prefix_token_ids = [9, 9, 9]
+    template_token_ids = [9, 9, 8, 2, 10]
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+
+    assert result == template_token_ids
 
 
 def test_replace_prefix_tokens_tokenizer_without_eos_raises():

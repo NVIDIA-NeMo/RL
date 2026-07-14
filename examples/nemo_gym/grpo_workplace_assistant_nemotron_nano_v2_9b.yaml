@@ -363,3 +363,11 @@ data_plane:
     cursor_ttl_s: 3600
     max_pending_writes_per_worker: 64
     require_signed_context: true
+    # Trust nemo_rl_rollout_id/nemo_rl_call_id stamped by Gym's ingress gate on
+    # requests without a signed context (black-box / forest mode). Requires the
+    # vLLM endpoint to be reachable only from the gateway.
+    accept_gateway_identity: false
+    # linear: strictly sequential turns keyed by driver-signed contexts.
+    # forest: black-box mode — nodes keyed by the gate-minted call_id, chains
+    # rebuilt post-seal; requires accept_gateway_identity=true and mode=direct.
+    cursor: linear

@@ -1844,6 +1844,11 @@ def run_async_nemo_gym_rollout(
             else:
                 tensorize_results()
 
+    # Black-box receipts: lift the env-attached token-free receipt off each
+    # full_result before full_result is logged/aggregated. Row order matches
+    # the input batch (and therefore the driver's rollout_id list).
+    receipts = [r["full_result"].pop("ng_rollout_receipt", None) for r in results]
+
     # Length-based reward shaping for low-effort prompts
     if direct_mode:
         assert direct_postprocess is not None
@@ -2060,6 +2065,10 @@ def run_async_nemo_gym_rollout(
                 ),
             }
         )
+        if any(receipt is not None for receipt in receipts):
+            final_batch_data["ng_rollout_receipts"] = np.asarray(
+                receipts, dtype=object
+            )
     else:
         final_batch_data["message_log"] = [r["message_log"] for r in results]
     final_batch = BatchedDataDict[DatumSpec](final_batch_data)

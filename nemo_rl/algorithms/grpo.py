@@ -588,6 +588,20 @@ def setup(
             require_routed_experts=router_replay_enabled(policy_config),
             initial_global_config_dict=nemo_gym_dict,
         )
+        # Black-box (forest cursor) mode: the env installs the model server's
+        # ingress gate and owns rollout register/seal, so per-call identity is
+        # minted by the gate rather than a driver-signed linear context.
+        dp_cfg = master_config.data_plane
+        if (
+            dp_cfg is not None
+            and dp_cfg.enabled
+            and dp_cfg.rollout_writer.enabled
+            and dp_cfg.rollout_writer.cursor == "forest"
+        ):
+            nemo_gym_cfg["blackbox_rollouts"] = True
+            nemo_gym_cfg["blackbox_registration_ttl_s"] = (
+                dp_cfg.rollout_writer.cursor_ttl_s
+            )
         nemo_gym_opts = {}
         if nemo_gym_num_nodes:
             nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(

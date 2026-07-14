@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import json
 import logging
 import os
 import resource
@@ -116,6 +118,13 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    # Black-box (forest cursor) mode, derived by the driver from
+    # data_plane.rollout_writer: the env enables the model server's ingress
+    # gate, registers each training rollout before dispatch, and seals it into
+    # a token-free receipt afterwards.
+    blackbox_rollouts: NotRequired[bool]
+    # Registration lifetime; the driver passes rollout_writer.cursor_ttl_s.
+    blackbox_registration_ttl_s: NotRequired[float]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -238,6 +247,38 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict["port_range_low"] = _gym_port_low
         initial_global_config_dict["port_range_high"] = _gym_port_high
 
+        # Black-box mode: install Gym's ingress gate on the policy model server
+        # so every correlated model call is admitted against a registered
+        # rollout and stamped with a gate-minted call identity (the forest
+        # cursor's staging key). The control token guards the register/seal
+        # API and never reaches agents or task rows.
+        self._blackbox = bool(self.cfg.get("blackbox_rollouts"))
+        self._blackbox_control_token: str | None = None
+        if self._blackbox:
+            import secrets
+
+            from omegaconf import OmegaConf
+
+            self._blackbox_control_token = secrets.token_urlsafe(32)
+            capture_dir = f"/tmp/nemo_rl_blackbox_captures/{os.getpid()}_{self.head_server_port}"
+            policy_model_cfg = OmegaConf.to_container(
+                DictConfig(initial_global_config_dict.get("policy_model") or {}),
+                resolve=False,
+            )
+            model_server_cfg = policy_model_cfg.setdefault(
+                "responses_api_models", {}
+            ).setdefault("vllm_model", {})
+            model_server_cfg["observability"] = {
+                "enabled": True,
+                "capture_dir": capture_dir,
+                "fsync_per_record": False,
+                # Token tensors ride TQ staging, not Gym's capture store.
+                "return_token_ids": False,
+                "control_token": self._blackbox_control_token,
+                "require_registration": True,
+            }
+            initial_global_config_dict["policy_model"] = policy_model_cfg
+
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
         )
@@ -270,6 +311,13 @@ Depending on your data shape, you may want to change these values."""
         assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
             "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
         )
+        if self._blackbox and self.rollout_max_attempts_to_avoid_lp_nan != 1:
+            raise ValueError(
+                "black-box rollouts cannot retry a batch: registration is "
+                "create-only and sealing is terminal, so a re-run of the same "
+                "rollout_id would be rejected at admission. Set "
+                "rollout_max_attempts_to_avoid_lp_nan=1."
+            )
 
         self.rh = RunHelper()
         self.rh.start(
@@ -287,6 +335,86 @@ Depending on your data shape, you may want to change these values."""
             port=self.head_server_port,
         )
         self.rch = RolloutCollectionHelper()
+
+    @staticmethod
+    def _blackbox_rollout_id(row: dict) -> str | None:
+        """Read the driver-minted rollout id from a task row, if present."""
+        params = row.get("responses_create_params") or {}
+        metadata = params.get("metadata") or {}
+        extra_body_raw = metadata.get("extra_body")
+        if not isinstance(extra_body_raw, str):
+            return None
+        try:
+            extra_body = json.loads(extra_body_raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(extra_body, dict):
+            return None
+        rollout_id = extra_body.get("nemo_rl_rollout_id")
+        if not isinstance(rollout_id, str) or not rollout_id:
+            return None
+        return rollout_id
+
+    async def _blackbox_control_request(
+        self, url_path: str, method: str, json_body: dict | None = None
+    ) -> dict:
+        """Call the model server's rollout control API with the minted token."""
+        kwargs: dict[str, Any] = {
+            "headers": {"Authorization": f"Bearer {self._blackbox_control_token}"}
+        }
+        if json_body is not None:
+            kwargs["json"] = json_body
+        response = await self.rh._server_client.request(
+            "policy_model", url_path, method, **kwargs
+        )
+        body = await response.json()
+        if response.status != 200:
+            raise RuntimeError(
+                f"{method} {url_path} failed with HTTP {response.status}: {body}"
+            )
+        return body
+
+    async def _register_blackbox_rollouts(self, rollout_ids: list[str]) -> None:
+        """Register every rollout before dispatch.
+
+        The gate admits model calls only for registered rollouts
+        (``require_registration=true``), so registration must complete before
+        the first agent model call.
+        """
+        expires_at = time.time() + float(self.cfg["blackbox_registration_ttl_s"])
+
+        async def _register(rollout_id: str) -> None:
+            await self._blackbox_control_request(
+                f"/ng-control/rollouts/{rollout_id}",
+                "PUT",
+                {"rollout_id": rollout_id, "expires_at": expires_at},
+            )
+
+        await asyncio.gather(*(_register(rid) for rid in rollout_ids))
+
+    async def _seal_blackbox_rollout(self, rollout_id: str) -> dict:
+        """Seal one finished rollout and return its token-free receipt dict.
+
+        Fail-closed: any seal failure yields a ``seal_failed`` receipt, which
+        the trainer's finalizer turns into a masked placeholder row — a broken
+        rollout must never fail the batch.
+        """
+        try:
+            manifest = await self._blackbox_control_request(
+                f"/ng-control/rollouts/{rollout_id}/seal", "POST"
+            )
+            return {
+                "rollout_id": rollout_id,
+                "manifest": manifest,
+                "status": "completed",
+            }
+        except Exception:
+            LOGGER.exception("Failed to seal black-box rollout %s", rollout_id)
+            return {
+                "rollout_id": rollout_id,
+                "manifest": {"rollout_id": rollout_id, "entries": []},
+                "status": "seal_failed",
+            }
 
     async def run_rollouts(
         self,
@@ -306,9 +434,24 @@ Depending on your data shape, you may want to change these values."""
         process_cpu_started = time.process_time()
 
         timer.start("_run_rollouts_total")
+        blackbox_active = self._blackbox and direct_mode
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
+            if blackbox_active:
+                row_rollout_ids = [
+                    self._blackbox_rollout_id(row) for row in nemo_gym_examples
+                ]
+                missing = [
+                    index for index, rid in enumerate(row_rollout_ids) if rid is None
+                ]
+                if missing:
+                    raise ValueError(
+                        "black-box mode requires a nemo_rl_rollout_id on every "
+                        f"task row; missing on rows {missing}"
+                    )
+                with timer.time(label=f"{timer_prefix}/blackbox_register"):
+                    await self._register_blackbox_rollouts(row_rollout_ids)
             nemo_gym_result_iterator = self.rch.run_examples(
                 examples=nemo_gym_examples, head_server_config=self.head_server_config
             )
@@ -318,6 +461,17 @@ Depending on your data shape, you may want to change these values."""
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
                     nemo_gym_row, nemo_gym_result = await task
+
+                if blackbox_active:
+                    # Seal after /run returned: the agent loop (and verify)
+                    # finished, so the manifest is complete. Reward rides the
+                    # receipt as driver-carry; it is never staged.
+                    with timer.time(label=f"{timer_prefix}/blackbox_seal"):
+                        receipt = await self._seal_blackbox_rollout(
+                            self._blackbox_rollout_id(nemo_gym_row)
+                        )
+                    receipt["reward"] = float(nemo_gym_result.get("reward") or 0.0)
+                    nemo_gym_result["ng_rollout_receipt"] = receipt
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(

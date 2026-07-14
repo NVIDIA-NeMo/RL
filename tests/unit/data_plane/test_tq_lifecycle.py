@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import ray
 import torch
 from tensordict import TensorDict
 
@@ -31,8 +32,13 @@ transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
-from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, ROLLOUT_STAGING_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.rollout_writer import (
+    RolloutCursorRegistry,
+    assemble_staged_batch,
+    hash_token_ids,
+)
 
 
 def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
@@ -118,6 +124,131 @@ def test_smoke_round_trip(tq_client) -> None:
     assert tq_client.check_consumption_status("smoke", ["read"])
 
     tq_client.clear_samples(sample_ids=None, partition_id="smoke")
+
+
+def test_rollout_writer_multiturn_finalize_backends(tq_client_backends) -> None:
+    """Stage two turns and publish only the canonical key to train metadata."""
+    tq_client = tq_client_backends
+    staging_partition = "rollout-writer-staging"
+    train_partition = "rollout-writer-train"
+    tq_client.register_partition(
+        staging_partition,
+        list(ROLLOUT_STAGING_FIELDS),
+        num_samples=4,
+        consumer_tasks=[],
+    )
+    tq_client.register_partition(
+        train_partition,
+        [
+            "input_ids",
+            "input_lengths",
+            "generation_logprobs",
+            "token_mask",
+            "sample_mask",
+        ],
+        num_samples=1,
+        consumer_tasks=[],
+    )
+    cursor = RolloutCursorRegistry.remote(lease_ttl_s=10, cursor_ttl_s=100)
+
+    first = ray.get(cursor.reserve_turn.remote("sample", "nonce-0"))
+    first_fields = TensorDict(
+        {
+            "token_ids_delta": torch.tensor([[10, 11, 12]]),
+            "token_mask_delta": torch.tensor([[0.0, 0.0, 1.0]]),
+            "generation_logprobs_delta": torch.tensor([[0.0, 0.0, -0.1]]),
+        },
+        batch_size=[1],
+    )
+    for _ in range(2):
+        # A byte-identical uncertain retry is safe on the simple backend.
+        tq_client.put_samples(["sample/t0"], staging_partition, fields=first_fields)
+    ray.get(
+        cursor.commit_turn.remote(
+            "sample",
+            first.lease,
+            staging_key="sample/t0",
+            new_len=3,
+            new_hash=hash_token_ids([10, 11, 12]),
+            group_id="group",
+            weight_version=4,
+        )
+    )
+
+    second = ray.get(cursor.reserve_turn.remote("sample", "nonce-1"))
+    tq_client.put_samples(
+        ["sample/t1"],
+        staging_partition,
+        fields=TensorDict(
+            {
+                "token_ids_delta": torch.tensor([[13, 14]]),
+                "token_mask_delta": torch.tensor([[0.0, 1.0]]),
+                "generation_logprobs_delta": torch.tensor([[0.0, -0.2]]),
+            },
+            batch_size=[1],
+        ),
+    )
+    ray.get(
+        cursor.commit_turn.remote(
+            "sample",
+            second.lease,
+            staging_key="sample/t1",
+            new_len=5,
+            new_hash=hash_token_ids([10, 11, 12, 13, 14]),
+            group_id="group",
+            weight_version=4,
+        )
+    )
+
+    legacy_bulk = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((1, 8), dtype=torch.int64),
+            "input_lengths": torch.tensor([5]),
+            "generation_logprobs": torch.zeros((1, 8)),
+            "token_mask": torch.zeros((1, 8)),
+            "sample_mask": torch.ones(1),
+        }
+    )
+    legacy_carry = BatchedDataDict(
+        {
+            "total_reward": torch.tensor([1.0]),
+            "loss_multiplier": torch.ones(1),
+            "trajectory_valid_mask": torch.ones(1),
+            "input_lengths": torch.tensor([5]),
+            "response_token_lengths": torch.tensor([1]),
+        }
+    )
+    finalized = assemble_staged_batch(
+        dp_client=tq_client,
+        cursor=cursor,
+        staging_partition=staging_partition,
+        sample_ids=["sample"],
+        group_ids=["group"],
+        weight_version=4,
+        legacy_bulk=legacy_bulk,
+        legacy_carry=legacy_carry,
+        pad_token_id=0,
+    )
+    meta = kv_first_write(
+        finalized.bulk_batch,
+        sample_ids=["sample"],
+        dp_client=tq_client,
+        partition_id=train_partition,
+    )
+    assert meta.sample_ids == ["sample"]
+    assert all("/t" not in sample_id for sample_id in meta.sample_ids)
+    fetched = tq_client.get_samples(
+        meta.sample_ids,
+        train_partition,
+        select_fields=["input_ids", "token_mask", "generation_logprobs"],
+    )
+    assert fetched["input_ids"][0, :5].tolist() == [10, 11, 12, 13, 14]
+    assert fetched["token_mask"][0, :5].tolist() == [0.0, 0.0, 1.0, 0.0, 1.0]
+    assert fetched["generation_logprobs"][0, 4].item() == pytest.approx(-0.2)
+
+    tq_client.clear_samples(list(finalized.staging_keys), staging_partition)
+    tq_client.clear_samples(meta.sample_ids, train_partition)
+    ray.get(cursor.clear_sample.remote("sample"))
 
 
 def test_smoke_round_trip_backends(tq_client_backends) -> None:

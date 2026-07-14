@@ -13,15 +13,21 @@
 # limitations under the License.
 
 import pytest
+import ray
 import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.schema import ROLLOUT_STAGING_FIELDS
-from nemo_rl.experience.blackbox_finalizer import finalize_blackbox_rollout
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.blackbox_finalizer import (
+    assemble_blackbox_batch,
+    finalize_blackbox_rollout,
+)
 from nemo_rl.experience.rollout_writer import (
     EMPTY_PREFIX_HASH,
     ForestCursorStateMachine,
+    RolloutForestRegistry,
     build_staging_delta,
     compute_staging_digest,
     hash_token_ids,
@@ -33,10 +39,12 @@ RID = "8f93c10ac6a347a99c9b6b8d5f21e402"
 WV = 41
 
 
-def _stage_call(machine, client, call_id, *, prompt, generated, logprobs, wv=WV):
+def _stage_call(
+    machine, client, call_id, *, prompt, generated, logprobs, wv=WV, rid=RID
+):
     """Mirror the worker's forest write path exactly."""
     parent, prev_len, prev_hash = None, 0, EMPTY_PREFIX_HASH
-    for candidate in machine.get_candidates(RID):
+    for candidate in machine.get_candidates(rid):
         if candidate.length <= len(prompt) and (
             hash_token_ids(prompt[: candidate.length]) == candidate.sequence_hash
         ):
@@ -44,7 +52,7 @@ def _stage_call(machine, client, call_id, *, prompt, generated, logprobs, wv=WV)
             prev_len, prev_hash = candidate.length, candidate.sequence_hash
             break
     reservation = machine.reserve_call(
-        RID, call_id, parent_call_id=parent, prev_len=prev_len, prev_hash=prev_hash
+        rid, call_id, parent_call_id=parent, prev_len=prev_len, prev_hash=prev_hash
     )
     ids, mask, lps = build_staging_delta(
         prompt_token_ids=prompt,
@@ -53,14 +61,14 @@ def _stage_call(machine, client, call_id, *, prompt, generated, logprobs, wv=WV)
         prev_len=prev_len,
     )
     digest = compute_staging_digest(
-        rollout_id=RID,
+        rollout_id=rid,
         call_id=call_id,
         prev_len=prev_len,
         token_ids_delta=ids,
         token_mask_delta=mask,
         logprobs_delta=lps,
     )
-    key = f"{RID}/{call_id}"
+    key = f"{rid}/{call_id}"
     client.put_samples(
         sample_ids=[key],
         partition_id="staging",
@@ -76,7 +84,7 @@ def _stage_call(machine, client, call_id, *, prompt, generated, logprobs, wv=WV)
     )
     full = prompt + generated
     machine.commit_call(
-        RID,
+        rid,
         call_id,
         reservation.lease,
         staging_key=key,
@@ -89,7 +97,7 @@ def _stage_call(machine, client, call_id, *, prompt, generated, logprobs, wv=WV)
     )
 
 
-def _receipt(call_ids, *, reward=1.0, status="completed"):
+def _receipt(call_ids, *, reward=1.0, status="completed", rid=RID):
     from nemo_gym.observability.integration import (
         CallManifestEntry,
         RolloutCallManifest,
@@ -98,13 +106,13 @@ def _receipt(call_ids, *, reward=1.0, status="completed"):
 
     entries = [
         CallManifestEntry(
-            rollout_id=RID, call_id=c, admission_index=i, stage_disposition="staged"
+            rollout_id=rid, call_id=c, admission_index=i, stage_disposition="staged"
         )
         for i, c in enumerate(call_ids)
     ]
     return RolloutReceipt(
-        rollout_id=RID,
-        manifest=RolloutCallManifest(rollout_id=RID, entries=entries),
+        rollout_id=rid,
+        manifest=RolloutCallManifest(rollout_id=rid, entries=entries),
         reward=reward,
         status=status,
     ).model_dump()
@@ -242,3 +250,125 @@ def test_failure_injection_invalidates_rollout(mutation, reason_prefix) -> None:
     )
     assert not row.valid
     assert row.rejection_reason.startswith(reason_prefix), row.rejection_reason
+
+
+class _ActorBackedMachine:
+    """Sync facade over the Ray forest registry so _stage_call can drive it."""
+
+    def __init__(self, actor):
+        self.actor = actor
+
+    def get_candidates(self, rid):
+        return ray.get(self.actor.get_candidates.remote(rid))
+
+    def reserve_call(self, *args, **kwargs):
+        return ray.get(self.actor.reserve_call.remote(*args, **kwargs))
+
+    def commit_call(self, *args, **kwargs):
+        return ray.get(self.actor.commit_call.remote(*args, **kwargs))
+
+
+def test_assemble_blackbox_batch_mixes_valid_rows_and_placeholders() -> None:
+    actor = RolloutForestRegistry.remote(lease_ttl_s=10, cursor_ttl_s=100)
+    machine = _ActorBackedMachine(actor)
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        "staging", list(ROLLOUT_STAGING_FIELDS), 16, consumer_tasks=[]
+    )
+
+    rid_valid, rid_no_receipt, rid_no_manifest = RID, "b" * 32, "c" * 32
+    _stage_call(
+        machine,
+        client,
+        "c1",
+        rid=rid_valid,
+        prompt=[1, 2],
+        generated=[3, 4],
+        logprobs=[-0.1, -0.2],
+    )
+    _stage_call(
+        machine,
+        client,
+        "c2",
+        rid=rid_valid,
+        prompt=[1, 2, 3, 4, 7],
+        generated=[8],
+        logprobs=[-0.3],
+    )
+    _stage_call(
+        machine,
+        client,
+        "c1",
+        rid=rid_no_receipt,
+        prompt=[1, 2],
+        generated=[3],
+        logprobs=[-0.1],
+    )
+
+    width = 8
+    legacy_bulk = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((3, width), dtype=torch.int64),
+            "input_lengths": torch.tensor([width] * 3, dtype=torch.int64),
+            "token_mask": torch.zeros((3, width), dtype=torch.float32),
+            "generation_logprobs": torch.zeros((3, width), dtype=torch.float32),
+            "sample_mask": torch.ones(3, dtype=torch.float32),
+        }
+    )
+    legacy_carry = BatchedDataDict(
+        {
+            "loss_multiplier": torch.ones(3, dtype=torch.float32),
+            "total_reward": torch.tensor([1.0, 2.0, 3.0]),
+            "trajectory_valid_mask": torch.ones(3, dtype=torch.float32),
+            "length": torch.tensor([2, 2, 2]),
+            "input_lengths": torch.tensor([width] * 3, dtype=torch.int64),
+            "response_token_lengths": torch.zeros(3, dtype=torch.int64),
+            "reward/component": torch.tensor([1.0, 1.0, 1.0]),
+        }
+    )
+
+    finalized = assemble_blackbox_batch(
+        dp_client=client,
+        cursor=actor,
+        staging_partition="staging",
+        rollout_ids=[rid_valid, rid_no_receipt, rid_no_manifest],
+        group_ids=["g0", "g0", "g1"],
+        receipts=[
+            _receipt(["c1", "c2"], rid=rid_valid),
+            None,
+            _receipt(["c1"], rid=rid_no_manifest),
+        ],
+        weight_version=WV,
+        legacy_bulk=legacy_bulk,
+        legacy_carry=legacy_carry,
+        pad_token_id=0,
+        finalize_timeout_s=0.2,
+        poll_interval_s=0.01,
+    )
+
+    bulk, carry = finalized.bulk_batch, finalized.driver_carry
+    # Row 0: the verified chain replaces the legacy tensors.
+    assert bulk["input_ids"][0, :6].tolist() == [1, 2, 3, 4, 7, 8]
+    assert bulk["token_mask"][0, :6].tolist() == [0.0, 0.0, 1.0, 1.0, 0.0, 1.0]
+    assert bulk["input_lengths"].tolist() == [6, 1, 1]
+    # Rows 1-2: masked placeholders; every reward channel is zeroed.
+    assert carry["trajectory_valid_mask"].tolist() == [1.0, 0.0, 0.0]
+    assert bulk["sample_mask"].tolist() == [1.0, 0.0, 0.0]
+    assert carry["total_reward"].tolist() == [1.0, 0.0, 0.0]
+    assert carry["reward/component"].tolist() == [1.0, 0.0, 0.0]
+    # First generation segment of the selected chain.
+    assert carry["response_token_lengths"].tolist() == [2, 0, 0]
+
+    assert [row["status"] for row in finalized.manifest_rows] == [
+        "finalized",
+        "rejected",
+        "rejected",
+    ]
+    reasons = [row["rejection_reason"] for row in finalized.manifest_rows]
+    assert reasons[0] is None
+    assert reasons[1] == "missing_receipt"
+    assert reasons[2].startswith("missing_forest_manifest")
+    # Staging keys are collected for cleanup even from rejected rollouts.
+    assert f"{rid_valid}/c1" in finalized.staging_keys
+    assert f"{rid_valid}/c2" in finalized.staging_keys
+    assert f"{rid_no_receipt}/c1" in finalized.staging_keys

@@ -15,6 +15,7 @@ import json
 import time
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import ray
@@ -28,6 +29,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _patch_nemotron_nano_v2_chat_template,
     setup_nemo_gym_config,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -37,6 +39,75 @@ from tests.unit.models.generation.test_vllm_generation import (
     basic_vllm_test_config,
     cluster,  # noqa: F401
 )
+
+
+_NEMOTRON_NANO_V2_ASSISTANT_TEMPLATE = (
+    "{%- elif message['role'] == 'assistant' -%}"
+    "{%- if '</think>' in content -%}"
+    "{%- set content = content.split('</think>')[1].strip() %}"
+    "{%- endif -%}"
+    "{{- '<SPECIAL_11>Assistant\n' + content.strip() }}"
+)
+
+
+def test_nemotron_nano_v2_chat_template_workaround_is_model_specific():
+    original_template = f"before{_NEMOTRON_NANO_V2_ASSISTANT_TEMPLATE}after"
+    tokenizer = SimpleNamespace(chat_template=original_template)
+    generation_config = deepcopy(basic_vllm_test_config)
+    master_config = MasterConfig.model_construct(
+        policy={
+            "model_name": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+            "generation": generation_config,
+        }
+    )
+
+    setup_nemo_gym_config(master_config, tokenizer)
+
+    patched_template = tokenizer.chat_template
+    assert _NEMOTRON_NANO_V2_ASSISTANT_TEMPLATE not in patched_template
+    assert "ns.enable_thinking is defined and ns.enable_thinking is false" in (
+        patched_template
+    )
+    assert "{{- '<think></think>' -}}" in patched_template
+    assert (
+        generation_config["vllm_cfg"]["http_server_serving_chat_kwargs"][
+            "chat_template"
+        ]
+        == patched_template
+    )
+
+
+def test_nemotron_nano_v2_chat_template_workaround_ignores_other_models():
+    original_template = f"before{_NEMOTRON_NANO_V2_ASSISTANT_TEMPLATE}after"
+    tokenizer = SimpleNamespace(chat_template=original_template)
+    generation_config = deepcopy(basic_vllm_test_config)
+    master_config = MasterConfig.model_construct(
+        policy={
+            "model_name": "Qwen/Qwen3-0.6B",
+            "generation": generation_config,
+        }
+    )
+
+    setup_nemo_gym_config(master_config, tokenizer)
+
+    assert tokenizer.chat_template == original_template
+    assert "chat_template" not in generation_config["vllm_cfg"].get(
+        "http_server_serving_chat_kwargs", {}
+    )
+
+
+def test_nemotron_nano_v2_chat_template_workaround_is_idempotent():
+    original_template = f"before{_NEMOTRON_NANO_V2_ASSISTANT_TEMPLATE}after"
+    patched_template = _patch_nemotron_nano_v2_chat_template(original_template)
+
+    assert _patch_nemotron_nano_v2_chat_template(patched_template) == patched_template
+
+
+def test_nemotron_nano_v2_chat_template_workaround_rejects_upstream_drift():
+    with pytest.raises(ValueError, match="no longer matches"):
+        _patch_nemotron_nano_v2_chat_template("changed upstream template")
+
+
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
@@ -197,7 +268,17 @@ def test_nemo_gym_postprocess_uses_batch_decode():
                 },
             ]
         },
-        "responses_create_params": {"input": []},
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "assistant",
+                    "content": "prior",
+                    "prompt_token_ids": [99],
+                    "generation_token_ids": [100],
+                    "generation_log_probs": [-1.0],
+                }
+            ]
+        },
     }
 
     class _MockSelf:
@@ -221,6 +302,91 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+def test_nemo_gym_postprocess_resets_non_contiguous_history():
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [8, 9],
+                    "generation_token_ids": [10],
+                    "generation_log_probs": [-0.2],
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assert len(result["message_log"]) == 2
+    assert result["message_log"][0]["token_ids"].tolist() == [8, 9]
+    assert result["message_log"][1]["token_ids"].tolist() == [10]
+    assert result["message_log"][1]["generation_logprobs"].tolist() == pytest.approx(
+        [-0.2]
+    )
+
+
+def test_nemo_gym_token_only_response_compacts_terminal_result():
+    class _Tokenizer:
+        def batch_decode(self, batch):
+            return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+        def apply_chat_template(self, messages, tokenize=True):
+            return [1]
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3, 4],
+                }
+            ]
+        },
+        "responses_create_params": {"input": []},
+        "reward": 1.0,
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+    assert result["message_log"][1]["generation_logprobs"].tolist() == [0.0, 0.0]
+
+    compact = NemoGym.__ray_metadata__.modified_class._compact_direct_result(result)
+    assert "message_log" not in compact
+    assert "input_message_log" not in compact
+    assert compact["total_tokens"] == 4
+    assert compact["assistant_tokens"] == 2
+    assert compact["full_result"]["reward"] == 1.0
+    serialized = json.dumps(compact)
+    assert "generation_token_ids" not in serialized
+    assert "prompt_token_ids" not in serialized
+    assert "generation_log_probs" not in serialized
 
 
 @pytest.mark.nemo_gym
@@ -288,3 +454,38 @@ def test_nemo_gym_sanity(
         return list(map(_standardize_single_result, l))
 
     assert _standardize(expected_result) == _standardize(actual_result)
+
+
+class TestBlackboxRolloutHelpers:
+    """Row-level identity extraction for black-box register/seal."""
+
+    def test_extracts_driver_minted_rollout_id(self):
+        row = {
+            "responses_create_params": {
+                "metadata": {
+                    "extra_body": json.dumps({"nemo_rl_rollout_id": "a" * 32})
+                }
+            }
+        }
+        assert NemoGym._blackbox_rollout_id(row) == "a" * 32
+
+    @pytest.mark.parametrize(
+        "row",
+        [
+            {},
+            {"responses_create_params": {}},
+            {"responses_create_params": {"metadata": {}}},
+            {"responses_create_params": {"metadata": {"extra_body": "not json"}}},
+            {"responses_create_params": {"metadata": {"extra_body": "[1]"}}},
+            {"responses_create_params": {"metadata": {"extra_body": "{}"}}},
+            {
+                "responses_create_params": {
+                    "metadata": {
+                        "extra_body": json.dumps({"nemo_rl_rollout_id": ""})
+                    }
+                }
+            },
+        ],
+    )
+    def test_returns_none_without_a_valid_id(self, row):
+        assert NemoGym._blackbox_rollout_id(row) is None

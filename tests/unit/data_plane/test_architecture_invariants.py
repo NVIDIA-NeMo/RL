@@ -40,11 +40,12 @@ def test_run_grpo_dispatches_both_trainers():
         sys.path.pop(0)
     from nemo_rl.algorithms.grpo import MasterConfig, grpo_train
     from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
     cfg_legacy = MasterConfig.model_construct(data_plane=None)
     assert _select_trainer(cfg_legacy) is grpo_train
 
-    cfg_sync = MasterConfig.model_construct(data_plane={"enabled": True})
+    cfg_sync = MasterConfig.model_construct(data_plane=DataPlaneConfig(enabled=True))
     assert _select_trainer(cfg_sync) is grpo_train_sync
 
 
@@ -68,6 +69,38 @@ def test_sync_trainer_rejects_message_level_advantage_penalties():
         match="grpo.invalid_tool_call_advantage",
     ):
         _raise_if_message_level_advantage_penalties_enabled(cfg_enabled)
+
+
+def test_rollout_writer_rejects_estimators_without_invalid_trajectory_support():
+    from nemo_rl.algorithms.advantage_estimator import (
+        GDPOAdvantageEstimator,
+        GRPOAdvantageEstimator,
+        ReinforcePlusPlusAdvantageEstimator,
+    )
+    from nemo_rl.algorithms.grpo_sync import (
+        _raise_if_rollout_writer_advantage_estimator_unsupported,
+    )
+    from nemo_rl.algorithms.loss import ClippedPGLossConfig
+
+    loss_config = ClippedPGLossConfig()
+    supported = (
+        GRPOAdvantageEstimator(
+            {"use_leave_one_out_baseline": False, "normalize_rewards": True},
+            loss_config,
+        ),
+        GDPOAdvantageEstimator(
+            {"use_leave_one_out_baseline": False, "normalize_rewards": True},
+            loss_config,
+        ),
+    )
+    for estimator in supported:
+        _raise_if_rollout_writer_advantage_estimator_unsupported(estimator)
+
+    unsupported = ReinforcePlusPlusAdvantageEstimator(
+        {"minus_baseline": True}, loss_config
+    )
+    with pytest.raises(ValueError, match="only the GRPO and GDPO"):
+        _raise_if_rollout_writer_advantage_estimator_unsupported(unsupported)
 
 
 @pytest.mark.parametrize(

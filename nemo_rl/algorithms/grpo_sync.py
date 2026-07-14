@@ -534,6 +534,12 @@ def grpo_train_sync(
                 "the forest cursor keys staging rows by the gateway call_id; "
                 "set rollout_writer.accept_gateway_identity=true"
             )
+        if writer_cfg.cursor == "forest" and writer_cfg.mode != "direct":
+            raise ValueError(
+                "the forest cursor finalizes from sealed receipts, which the "
+                "environment only produces on the direct path; set "
+                "rollout_writer.mode=direct"
+            )
         policy.prepare_rollout_writer()
         rollout_secret = secrets.token_bytes(32)
         cursor_registry_cls = (

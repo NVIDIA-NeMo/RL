@@ -60,6 +60,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.experience.blackbox_finalizer import assemble_blackbox_batch
 from nemo_rl.experience.rollout_writer import (
     assemble_staged_batch,
     compare_shadow_candidate,
@@ -190,6 +191,7 @@ def _attach_rollout_contexts(
     weight_version: int,
     secret: bytes,
     ttl_s: float,
+    attach_signed_context: bool = True,
 ) -> BatchedDataDict[Any]:
     """Return a batch copy with signed contexts in Gym request metadata.
 
@@ -197,6 +199,11 @@ def _attach_rollout_contexts(
     the signed context's ``sample_id`` (legacy alias) and as the bare
     ``nemo_rl_rollout_id`` field. Consumers that see both must reject the
     request unless they are equal.
+
+    With ``attach_signed_context=False`` (forest cursor / black-box mode) only
+    the bare ``nemo_rl_rollout_id`` is attached: per-call identity is minted
+    by the trusted Gym ingress gate at admission, so a driver-signed linear
+    context would put the worker on the wrong (signed-context) staging path.
     """
     rows = deepcopy(input_batch["extra_env_info"])
     if len(rows) != len(rollout_ids) or len(rows) != len(group_ids):
@@ -212,14 +219,15 @@ def _attach_rollout_contexts(
             extra_body = json.loads(extra_body_raw)
         except (TypeError, json.JSONDecodeError) as error:
             raise ValueError("responses metadata.extra_body must be JSON") from error
-        context = mint_rollout_context(
-            sample_id=rollout_id,
-            group_id=group_id,
-            weight_version=weight_version,
-            secret=secret,
-            ttl_s=ttl_s,
-        )
-        extra_body["nemo_rl_rollout_context"] = context.to_dict()
+        if attach_signed_context:
+            context = mint_rollout_context(
+                sample_id=rollout_id,
+                group_id=group_id,
+                weight_version=weight_version,
+                secret=secret,
+                ttl_s=ttl_s,
+            )
+            extra_body["nemo_rl_rollout_context"] = context.to_dict()
         extra_body["nemo_rl_rollout_id"] = rollout_id
         metadata["extra_body"] = json.dumps(extra_body, separators=(",", ":"))
         params["metadata"] = metadata
@@ -401,6 +409,7 @@ class SyncRolloutActor:
                 weight_version=weight_version,
                 secret=self.rollout_secret,
                 ttl_s=writer_cfg.cursor_ttl_s,
+                attach_signed_context=writer_cfg.cursor != "forest",
             )
         task_to_env = (
             task_to_env_override
@@ -448,6 +457,13 @@ class SyncRolloutActor:
         rollout_returned = time.perf_counter()
         fb = final_batch.to("cpu")
         del final_batch
+
+        # Black-box receipts are driver-carry inputs to the forest finalizer;
+        # pop them before fb's non-tensor passthrough copies keys into the TQ
+        # bulk payload (a receipt must never be staged).
+        blackbox_receipts: list[Any] | None = None
+        if "ng_rollout_receipts" in fb:
+            blackbox_receipts = list(fb.pop("ng_rollout_receipts"))
 
         direct_authoritative = writer_cfg.enabled and writer_cfg.mode == "direct"
         legacy_flatten_s = 0.0
@@ -591,19 +607,40 @@ class SyncRolloutActor:
         if writer_cfg.enabled:
             assert writer_rollout_ids is not None and writer_group_ids is not None
             finalize_started = time.perf_counter()
-            finalized = assemble_staged_batch(
-                dp_client=self._dp_client,
-                cursor=self.rollout_cursor,
-                staging_partition=writer_cfg.staging_partition,
-                sample_ids=writer_rollout_ids,
-                group_ids=writer_group_ids,
-                weight_version=weight_version,
-                legacy_bulk=bulk_batch,
-                legacy_carry=BatchedDataDict(driver_carry),
-                pad_token_id=self.tokenizer.pad_token_id,
-                finalize_timeout_s=writer_cfg.finalize_timeout_s,
-                perf_metrics=finalizer_perf,
-            )
+            if writer_cfg.cursor == "forest":
+                finalized = assemble_blackbox_batch(
+                    dp_client=self._dp_client,
+                    cursor=self.rollout_cursor,
+                    staging_partition=writer_cfg.staging_partition,
+                    rollout_ids=writer_rollout_ids,
+                    group_ids=writer_group_ids,
+                    receipts=(
+                        blackbox_receipts
+                        if blackbox_receipts is not None
+                        else [None] * len(writer_rollout_ids)
+                    ),
+                    weight_version=weight_version,
+                    legacy_bulk=bulk_batch,
+                    legacy_carry=BatchedDataDict(driver_carry),
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    policy_model=cfg.policy["model_name"],
+                    finalize_timeout_s=writer_cfg.finalize_timeout_s,
+                    perf_metrics=finalizer_perf,
+                )
+            else:
+                finalized = assemble_staged_batch(
+                    dp_client=self._dp_client,
+                    cursor=self.rollout_cursor,
+                    staging_partition=writer_cfg.staging_partition,
+                    sample_ids=writer_rollout_ids,
+                    group_ids=writer_group_ids,
+                    weight_version=weight_version,
+                    legacy_bulk=bulk_batch,
+                    legacy_carry=BatchedDataDict(driver_carry),
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    finalize_timeout_s=writer_cfg.finalize_timeout_s,
+                    perf_metrics=finalizer_perf,
+                )
             persist_rollout_manifest(
                 finalized.manifest_rows, log_dir=cfg.logger["log_dir"]
             )
@@ -694,11 +731,13 @@ class SyncRolloutActor:
                 sample_ids=list(finalized.staging_keys),
                 partition_id=writer_cfg.staging_partition,
             )
+            clear_cursor = (
+                self.rollout_cursor.clear_rollout
+                if writer_cfg.cursor == "forest"
+                else self.rollout_cursor.clear_sample
+            )
             ray.get(
-                [
-                    self.rollout_cursor.clear_sample.remote(sample_id)
-                    for sample_id in sample_ids
-                ]
+                [clear_cursor.remote(sample_id) for sample_id in sample_ids]
             )
 
         rollout_transport_metrics: dict[str, Any] = {}

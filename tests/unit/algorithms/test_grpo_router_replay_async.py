@@ -24,6 +24,7 @@ from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
     async_grpo_train,
 )
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -50,6 +51,8 @@ def session_data(_unit_test_data):
 
 
 def _make_async_master_config(data_plane=None) -> MasterConfig:
+    if isinstance(data_plane, dict):
+        data_plane = DataPlaneConfig.model_validate(data_plane)
     return MasterConfig.model_construct(
         **{
             "policy": {

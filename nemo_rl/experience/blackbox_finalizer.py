@@ -35,14 +35,20 @@ group semantics are designed.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
+import ray
+import torch
+
 from nemo_rl.experience.rollout_writer import (
+    FinalizedRolloutBatch,
     ForestManifest,
     ForestNodeRecord,
     compute_staging_digest,
     hash_token_ids,
+    pad_finalized_candidate_batch,
 )
 from nemo_rl.experience.staged_token_source import (
     StagedCallSnapshot,
@@ -283,4 +289,190 @@ def finalize_blackbox_rollout(
         generation_logprobs=[0.0 if lp is None else float(lp) for lp in main.logprobs],
         reward=parsed.reward,
         staging_keys=staging_keys,
+    )
+
+
+def _first_generation_length(token_mask: list[float]) -> int:
+    """Length of the first generation segment (leading run of mask 1)."""
+    start = next(
+        (index for index, mask in enumerate(token_mask) if mask == 1.0), None
+    )
+    if start is None:
+        return 0
+    length = 0
+    for mask in token_mask[start:]:
+        if mask != 1.0:
+            break
+        length += 1
+    return length
+
+
+def assemble_blackbox_batch(
+    *,
+    dp_client: Any,
+    cursor: Any,
+    staging_partition: str,
+    rollout_ids: list[str],
+    group_ids: list[str],
+    receipts: list[dict[str, Any] | None],
+    weight_version: int,
+    legacy_bulk: Any,
+    legacy_carry: Any,
+    pad_token_id: int,
+    builder: str = "prefix_merging",
+    policy_model: str = "",
+    finalize_timeout_s: float = 30.0,
+    poll_interval_s: float = 0.05,
+    perf_metrics: dict[str, float] | None = None,
+) -> FinalizedRolloutBatch:
+    """Finalize a batch of black-box rollouts into a canonical padded batch.
+
+    Sibling of :func:`nemo_rl.experience.rollout_writer.assemble_staged_batch`
+    with the forest cursor + receipt contract: per rollout, the sealed receipt
+    is reconciled against the forest manifest and the verified chain becomes
+    the training row; any failure becomes a masked placeholder, never a failed
+    batch. Rewards stay legacy-carry (the env applies shaping there); the
+    receipt's raw verifier reward is used only inside chain construction.
+    """
+    if finalize_timeout_s <= 0 or poll_interval_s <= 0:
+        raise ValueError("finalization timeout and poll interval must be positive")
+    batch_size = int(legacy_bulk["input_ids"].shape[0])
+    if len(rollout_ids) != batch_size or len(group_ids) != batch_size:
+        raise ValueError(
+            "rollout_ids and group_ids must match the legacy batch size; "
+            f"got {len(rollout_ids)}, {len(group_ids)}, and {batch_size}"
+        )
+    if len(receipts) != batch_size:
+        raise ValueError(
+            f"receipts must match the legacy batch size; got {len(receipts)} "
+            f"and {batch_size}"
+        )
+
+    def record(name: str, elapsed_s: float) -> None:
+        if perf_metrics is not None:
+            perf_metrics[name] = perf_metrics.get(name, 0.0) + elapsed_s
+
+    deadline = time.monotonic() + finalize_timeout_s
+    rows: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+    staging_keys: list[str] = []
+    for index, (rollout_id, group_id, receipt) in enumerate(
+        zip(rollout_ids, group_ids, receipts)
+    ):
+        forest_manifest = None
+        row: BlackboxRolloutRow | None = None
+        try:
+            operation_started = time.perf_counter()
+            forest_manifest = ray.get(cursor.get_forest_manifest.remote(rollout_id))
+            record("manifest_s", time.perf_counter() - operation_started)
+        except (KeyError, ray.exceptions.RayError) as error:
+            row = BlackboxRolloutRow(
+                rollout_id=rollout_id,
+                valid=False,
+                rejection_reason=f"missing_forest_manifest:{error}",
+                input_ids=[],
+                token_mask=[],
+                generation_logprobs=[],
+                reward=0.0,
+                staging_keys=(),
+            )
+        if row is None and receipt is None:
+            row = BlackboxRolloutRow(
+                rollout_id=rollout_id,
+                valid=False,
+                rejection_reason="missing_receipt",
+                input_ids=[],
+                token_mask=[],
+                generation_logprobs=[],
+                reward=0.0,
+                staging_keys=tuple(
+                    node.staging_key
+                    for node in forest_manifest.nodes
+                    if node.staging_key is not None
+                ),
+            )
+        if row is None:
+            finalize_started = time.perf_counter()
+            row = finalize_blackbox_rollout(
+                dp_client=dp_client,
+                staging_partition=staging_partition,
+                receipt=receipt,
+                forest_manifest=forest_manifest,
+                expected_weight_version=weight_version,
+                builder=builder,
+                policy_model=policy_model,
+            )
+            # A staging row can trail its cursor commit on asynchronous
+            # data-plane backends; retry only that rejection until the
+            # deadline, mirroring the linear assembler's poll loop.
+            while (
+                not row.valid
+                and (row.rejection_reason or "").startswith("missing_staging_row")
+                and time.monotonic() < deadline
+            ):
+                time.sleep(min(poll_interval_s, deadline - time.monotonic()))
+                row = finalize_blackbox_rollout(
+                    dp_client=dp_client,
+                    staging_partition=staging_partition,
+                    receipt=receipt,
+                    forest_manifest=forest_manifest,
+                    expected_weight_version=weight_version,
+                    builder=builder,
+                    policy_model=policy_model,
+                )
+            record("finalize_s", time.perf_counter() - finalize_started)
+
+        if row.valid:
+            tokens = row.input_ids
+            token_mask = row.token_mask
+            generation_logprobs = row.generation_logprobs
+        else:
+            tokens = [pad_token_id]
+            token_mask = [0.0]
+            generation_logprobs = [0.0]
+        validity = 1.0 if row.valid else 0.0
+        rows.append(
+            {
+                "input_ids": torch.tensor(tokens, dtype=torch.int64),
+                "input_length": len(tokens),
+                "token_mask": torch.tensor(token_mask, dtype=torch.float32),
+                "generation_logprobs": torch.tensor(
+                    generation_logprobs, dtype=torch.float32
+                ),
+                "sample_mask": float(legacy_carry["loss_multiplier"][index])
+                * validity,
+                "trajectory_valid_mask": validity,
+                "response_token_length": (
+                    _first_generation_length(token_mask) if row.valid else 0
+                ),
+            }
+        )
+        staging_keys.extend(row.staging_keys)
+        committed_nodes = (
+            sum(node.state == "committed" for node in forest_manifest.nodes)
+            if forest_manifest is not None
+            else 0
+        )
+        manifest_rows.append(
+            {
+                "sample_id": rollout_id,
+                "group_id": group_id,
+                "status": "finalized" if row.valid else "rejected",
+                "rejection_reason": row.rejection_reason,
+                "expected_turns": committed_nodes,
+                "written_turns": committed_nodes if row.valid else 0,
+                "length": len(tokens) if row.valid else 0,
+                "terminal_hash": hash_token_ids(tokens) if row.valid else "",
+                "weight_version": weight_version,
+            }
+        )
+
+    return pad_finalized_candidate_batch(
+        rows=rows,
+        staging_keys=staging_keys,
+        manifest_rows=manifest_rows,
+        legacy_bulk=legacy_bulk,
+        legacy_carry=legacy_carry,
+        pad_token_id=pad_token_id,
+        perf_metrics=perf_metrics,
     )

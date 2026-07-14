@@ -666,7 +666,6 @@ def assemble_staged_batch(
             f"got {legacy_carry['loss_multiplier'].shape[0]} and {batch_size}"
         )
     deadline = time.monotonic() + finalize_timeout_s
-    target_width = int(legacy_bulk["input_ids"].shape[1])
     rows: list[dict[str, torch.Tensor | int | float]] = []
     manifest_rows: list[dict[str, Any]] = []
     staging_keys: list[str] = []
@@ -819,7 +818,35 @@ def assemble_staged_batch(
             }
         )
 
+    return pad_finalized_candidate_batch(
+        rows=rows,
+        staging_keys=staging_keys,
+        manifest_rows=manifest_rows,
+        legacy_bulk=legacy_bulk,
+        legacy_carry=legacy_carry,
+        pad_token_id=pad_token_id,
+        perf_metrics=perf_metrics,
+    )
+
+
+def pad_finalized_candidate_batch(
+    *,
+    rows: list[dict[str, Any]],
+    staging_keys: list[str],
+    manifest_rows: list[dict[str, Any]],
+    legacy_bulk: BatchedDataDict,
+    legacy_carry: BatchedDataDict,
+    pad_token_id: int,
+    perf_metrics: dict[str, float] | None = None,
+) -> FinalizedRolloutBatch:
+    """Pad verified per-sample candidate rows into a canonical batch.
+
+    Shared tail of the linear and black-box assemblers: token-aligned tensors
+    come from the verified rows; everything else is copied from the legacy
+    payload with rewards masked by per-row validity.
+    """
     assembly_started = time.perf_counter()
+    target_width = int(legacy_bulk["input_ids"].shape[1])
     if any(int(row["input_length"]) > target_width for row in rows):
         raise ValueError("direct candidate exceeds legacy padded sequence width")
     input_ids = torch.full((len(rows), target_width), pad_token_id, dtype=torch.int64)
@@ -856,7 +883,10 @@ def assemble_staged_batch(
     for field_name in tuple(carry.keys()):
         if field_name.startswith("reward/"):
             carry[field_name] = carry[field_name] * validity
-    record("assembly_s", time.perf_counter() - assembly_started)
+    if perf_metrics is not None:
+        perf_metrics["assembly_s"] = perf_metrics.get("assembly_s", 0.0) + (
+            time.perf_counter() - assembly_started
+        )
 
     return FinalizedRolloutBatch(
         bulk_batch=bulk,
@@ -992,7 +1022,8 @@ def compute_staging_digest(
 ) -> str:
     """Digest one staged row: token ids, mask values, logprob bit patterns,
     and the identifying metadata. The finalizer recomputes it over the fetched
-    row, so any storage-layer corruption or substitution is detected."""
+    row, so any storage-layer corruption or substitution is detected.
+    """
     payload = bytearray(struct.pack(">B", HASH_VERSION))
     payload.extend(_encode_text(rollout_id))
     payload.extend(_encode_text(call_id))
@@ -1112,7 +1143,8 @@ class ForestCursorStateMachine:
         self, rollout_id: str, *, now: float | None = None
     ) -> list[ForestCandidate]:
         """Committed cumulative sequences the next prompt may extend,
-        longest first (the parent rule picks the first hash match)."""
+        longest first (the parent rule picks the first hash match).
+        """
         timestamp = time.time() if now is None else now
         forest = self._forest(rollout_id, timestamp)
         if forest.failure_reason is not None:
@@ -1239,7 +1271,8 @@ class ForestCursorStateMachine:
         now: float | None = None,
     ) -> None:
         """A failed call fails its node only; the rollout survives (the
-        finalizer decides validity from the manifest reconciliation)."""
+        finalizer decides validity from the manifest reconciliation).
+        """
         timestamp = time.time() if now is None else now
         record = self._leased_record(rollout_id, call_id, lease)
         record.state = "failed"

@@ -114,6 +114,21 @@ def test_snapshot_accumulates_successful_ops(wrapped_client):
     assert snap["total_bytes"] >= 4  # 1 float = 4 bytes
 
 
+def test_events_snapshot_and_clear(wrapped_client):
+    client, _ = wrapped_client
+    client.register_partition(
+        partition_id="p", fields=["x"], num_samples=1, consumer_tasks=["r"]
+    )
+    snapshot = client.events_snapshot()
+    assert [event["op"] for event in snapshot] == ["register"]
+
+    snapshot[0]["op"] = "mutated"
+    assert client.events_snapshot()[0]["op"] == "register"
+
+    client.clear_events()
+    assert client.events_snapshot() == []
+
+
 def test_default_callback_is_noop():
     """Omitting on_event must not raise; the wrapper just forwards."""
     inner = NoOpDataPlaneClient()

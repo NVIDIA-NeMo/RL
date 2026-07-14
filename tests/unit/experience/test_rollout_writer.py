@@ -123,6 +123,35 @@ def test_rollout_context_attachment_preserves_existing_metadata() -> None:
     )
 
 
+def test_forest_attachment_carries_bare_rollout_id_without_signed_context() -> None:
+    original = BatchedDataDict(
+        {
+            "extra_env_info": [
+                {"responses_create_params": {"metadata": {"extra_body": '{"seed":7}'}}},
+            ]
+        }
+    )
+    attached = _attach_rollout_contexts(
+        original,
+        rollout_ids=["forest-sample"],
+        group_ids=["group"],
+        weight_version=3,
+        secret=b"context-secret",
+        ttl_s=60,
+        attach_signed_context=False,
+    )
+    extra_body = json.loads(
+        attached["extra_env_info"][0]["responses_create_params"]["metadata"][
+            "extra_body"
+        ]
+    )
+    # Gate-minted identity replaces the driver-signed linear context: a signed
+    # context would put the worker on the wrong (signed) staging path.
+    assert "nemo_rl_rollout_context" not in extra_body
+    assert extra_body["nemo_rl_rollout_id"] == "forest-sample"
+    assert extra_body["seed"] == 7
+
+
 def test_mint_rollout_id_is_opaque_url_safe_and_unique() -> None:
     minted = {mint_rollout_id() for _ in range(64)}
     assert len(minted) == 64

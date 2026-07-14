@@ -52,8 +52,10 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     # bundled into the VLLM venv (and the policy training venvs), and the
     # actor writes flattened tensors to TQ via dp_client.put_samples;
     # (2) same-node colocation with VllmGenerationWorker avoids duplicate
-    # venv caches.
-    "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
+    # venv caches. The nemo_gym extra rides along because the black-box
+    # finalizer delegates chain assembly to Gym's prefix_merging builder
+    # (blackbox_finalizer.py imports nemo_gym at finalize time).
+    "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM_NEMO_GYM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
 }

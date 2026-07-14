@@ -2543,6 +2543,27 @@ def test_grpo_advantage_estimator_small_nonzero_std():
     assert result[0, 0] * result[1, 0] < 0
 
 
+def test_grpo_advantage_estimator_excludes_rejected_trajectory():
+    estimator = GRPOAdvantageEstimator(
+        {"use_leave_one_out_baseline": False, "normalize_rewards": True},
+        ClippedPGLossConfig(),
+    )
+    mask = torch.ones(3, 2)
+    result = estimator.compute_advantage(
+        prompt_ids=torch.tensor([[0], [0], [0]]),
+        rewards=torch.tensor([1.0, 3.0, 999.0]),
+        mask=mask,
+        validity_mask=torch.tensor([1.0, 1.0, 0.0]),
+    )
+    valid_only = estimator.compute_advantage(
+        prompt_ids=torch.tensor([[0], [0]]),
+        rewards=torch.tensor([1.0, 3.0]),
+        mask=mask[:2],
+    )
+    assert torch.allclose(result[:2], valid_only)
+    assert torch.equal(result[2], torch.zeros(2))
+
+
 # ============================================================================
 # Tests for ReinforcePlusPlusAdvantageEstimator class
 # ============================================================================
@@ -2586,6 +2607,32 @@ def test_gdpo_advantage_estimator_single_reward():
 
     with pytest.raises(ValueError):
         estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
+
+
+def test_gdpo_advantage_estimator_excludes_rejected_trajectory():
+    estimator = GDPOAdvantageEstimator(
+        {"use_leave_one_out_baseline": False, "normalize_rewards": True},
+        ClippedPGLossConfig(),
+    )
+    repeated_batch = {
+        "reward/correctness": torch.tensor([1.0, 3.0, 999.0]),
+        "reward/format": torch.tensor([0.0, 1.0, -999.0]),
+    }
+    result = estimator.compute_advantage(
+        prompt_ids=torch.tensor([[0], [0], [0]]),
+        rewards=None,
+        mask=torch.ones(3, 2),
+        repeated_batch=repeated_batch,
+        validity_mask=torch.tensor([1.0, 1.0, 0.0]),
+    )
+    valid_only = estimator.compute_advantage(
+        prompt_ids=torch.tensor([[0], [0]]),
+        rewards=None,
+        mask=torch.ones(2, 2),
+        repeated_batch={key: value[:2] for key, value in repeated_batch.items()},
+    )
+    assert torch.allclose(result[:2], valid_only)
+    assert torch.equal(result[2], torch.zeros(2))
 
 
 # ============================================================================

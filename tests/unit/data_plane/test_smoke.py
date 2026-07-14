@@ -163,3 +163,58 @@ def test_sync_rollout_actor_prompt_extraction_and_masks_match_grpo() -> None:
         flat["generation_logprobs"],
         torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.2]]),
     )
+
+
+def test_direct_prompt_ids_use_verified_group_sibling_for_rejection() -> None:
+    """Direct carry keeps exact prompt grouping without terminal Gym tokens."""
+    import torch
+
+    from nemo_rl.experience.sync_rollout_actor import (
+        _prompt_ids_from_finalized_batch,
+    )
+
+    prompt_ids = _prompt_ids_from_finalized_batch(
+        input_ids=torch.tensor(
+            [
+                [11, 12, 21, 0],
+                [0, 0, 0, 0],
+                [31, 32, 33, 41],
+                [31, 32, 33, 42],
+            ]
+        ),
+        prompt_lengths=torch.tensor([2, 2, 3, 3]),
+        group_ids=["a", "a", "b", "b"],
+        validity_mask=torch.tensor([1.0, 0.0, 1.0, 1.0]),
+        pad_token_id=0,
+    )
+
+    assert torch.equal(
+        prompt_ids,
+        torch.tensor(
+            [
+                [11, 12, 0],
+                [11, 12, 0],
+                [31, 32, 33],
+                [31, 32, 33],
+            ]
+        ),
+    )
+
+
+def test_direct_prompt_ids_keep_fully_rejected_group_nonempty() -> None:
+    """All-rejected groups remain safe inputs to torch.unique."""
+    import torch
+
+    from nemo_rl.experience.sync_rollout_actor import (
+        _prompt_ids_from_finalized_batch,
+    )
+
+    prompt_ids = _prompt_ids_from_finalized_batch(
+        input_ids=torch.zeros((2, 1), dtype=torch.long),
+        prompt_lengths=torch.tensor([10, 10]),
+        group_ids=["rejected", "rejected"],
+        validity_mask=torch.zeros(2),
+        pad_token_id=7,
+    )
+
+    assert torch.equal(prompt_ids, torch.full((2, 1), 7))
