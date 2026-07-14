@@ -51,6 +51,7 @@ import torch
 from pydantic import BaseModel, Field
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.grpo import GRPOLoggerConfig
 from nemo_rl.algorithms.staleness_sampler import (
     StalenessSampler,
     count_groups,
@@ -58,6 +59,7 @@ from nemo_rl.algorithms.staleness_sampler import (
     min_weight_version,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import Timer
 
 # TQ partition schema field names — cross-component protocol with the rollout
@@ -163,6 +165,9 @@ class SingleControllerConfig(BaseModel, extra="allow"):
         default_factory=StubRefitConfig, discriminator="impl"
     )
 
+    # Logger
+    logger: GRPOLoggerConfig
+
 
 def warn_if_staleness_window_below_minibatches(
     cfg: SingleControllerConfig,
@@ -239,7 +244,6 @@ class SingleControllerActor:
         weight_synchronizer: Any,
         loss_fn: Any,
         advantage_estimator: Any | None = None,
-        logger: Any | None = None,
     ) -> None:
         self._cfg = cfg
         self._prompts = prompts
@@ -249,11 +253,11 @@ class SingleControllerActor:
         self._weight_synchronizer = weight_synchronizer
         self._loss_fn = loss_fn
         self._advantage_estimator = advantage_estimator
-        # Logger + timer for W&B / TB / jsonl. Mirrors grpo_sync's
-        # observability surface — same logger.log_metrics calls per opt.step.
-        # None in dryrun tests; production passes a nemo_rl.utils.logger.Logger.
-        self._logger = logger
-        self._timer: Timer | None = Timer() if logger is not None else None
+
+        # Built here, not on the driver: Logger backends (wandb/tb/...) hold
+        # _thread.lock that Ray can't cloudpickle into the actor.
+        self._logger = Logger(cfg.logger)  # type: ignore
+        self._timer = Timer()
 
         if cfg.advantage_enabled and self._advantage_estimator is None:
             raise ValueError(
@@ -660,33 +664,17 @@ class SingleControllerActor:
                     flush=True,
                 )
 
-                # Per-opt.step observability: mirror grpo_sync's W&B logging
-                # surface (train metrics + timing under the same step
-                # counter). No-op if no logger was attached.
-                if self._logger is not None:
-                    try:
-                        self._logger.log_metrics(
-                            train_results,
-                            step=self._trainer_version,
-                            prefix="train",
-                        )
-                        if self._timer is not None:
-                            self._logger.log_metrics(
-                                self._timer.get_timing_metrics(),
-                                step=self._trainer_version,
-                                prefix="timing/train",
-                                step_finished=True,
-                            )
-                            self._timer.reset()
-                    except Exception as e:
-                        print(
-                            f"logger.log_metrics raised at step "
-                            f"{self._train_steps + 1} / mb {mb_idx}: {e}",
-                            flush=True,
-                        )
-                        import traceback
-
-                        traceback.print_exc()
+                # Log metrics
+                self._logger.log_metrics(
+                    train_results, step=self._trainer_version, prefix="train"
+                )
+                self._logger.log_metrics(
+                    self._timer.get_timing_metrics(),
+                    step=self._trainer_version,
+                    prefix="timing/train",
+                    step_finished=True,
+                )
+                self._timer.reset()
 
                 if rollout_exhausted:
                     # Inner loop terminated early due to rollout exhaustion;
