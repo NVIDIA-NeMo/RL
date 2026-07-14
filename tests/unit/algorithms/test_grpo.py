@@ -30,6 +30,7 @@ from nemo_rl.algorithms.grpo import (
     MasterConfig,
     RewardPenaltyConfig,
     _apply_configured_message_level_advantage_penalties,
+    _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
@@ -68,6 +69,50 @@ def _mock_policy_generation() -> MagicMock:
     policy_generation.requires_kv_scale_sync = False
     policy_generation.get_logger_metrics.return_value = {}
     return policy_generation
+
+
+class TestMaskSampleFilter:
+    def test_masks_env_flagged_samples(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "mask_sample": torch.tensor([False, True, True]),
+            }
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
+        )
+
+    def test_masks_list_valued_mask_sample(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "mask_sample": [True, False, True],
+            }
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([0.0, 0.5, 0.0])
+        )
+
+    def test_missing_mask_sample_is_noop(self):
+        repeated_batch = BatchedDataDict(
+            {"loss_multiplier": torch.tensor([1.0, 0.5, 1.0])}
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 0
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
+        )
 
 
 @pytest.fixture
@@ -1265,6 +1310,50 @@ def test_dapo_dynamic_sampling_filters_zero_std(mock_grpo_components):
         ]
     )
     assert torch.allclose(result_batch["filtered_reward"], expected_filtered_rewards)
+
+
+def test_dapo_dynamic_sampling_preserves_mask_sample_alignment(mock_grpo_components):
+    """mask_sample should follow rows through dynamic-sampling filter and slice."""
+    batch_size = 9
+    message_logs = [
+        [
+            {"role": "user", "content": f"prompt_{i // 3}"},
+            {"role": "assistant", "content": f"response_{i}"},
+        ]
+        for i in range(batch_size)
+    ]
+    repeated_batch = create_mock_batch(batch_size, ["math"] * batch_size, message_logs)
+    repeated_batch["total_reward"] = torch.tensor(
+        [1.0, 0.0, 1.0, 0.5, 0.0, 0.5, 0.2, 0.6, 0.9]
+    )
+    repeated_batch["mask_sample"] = torch.tensor(
+        [False, True, False, True, False, True, False, False, True]
+    )
+
+    std = torch.tensor([0.5, 0.5, 0.5, 0.25, 0.25, 0.25, 0.35, 0.35, 0.35])
+    baseline = torch.tensor([0.67, 0.67, 0.67, 0.33, 0.33, 0.33, 0.57, 0.57, 0.57])
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["use_dynamic_sampling"] = True
+    master_config.grpo["num_prompts_per_step"] = 2
+    master_config.grpo["num_generations_per_prompt"] = 3
+    master_config.grpo["dynamic_sampling_max_gen_batches"] = 5
+
+    result_batch, is_batch_complete, _, _ = dynamic_sampling(
+        repeated_batch,
+        std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=Timer(),
+    )
+
+    assert is_batch_complete is True
+    assert result_batch.size == 6
+    assert torch.equal(
+        result_batch["mask_sample"],
+        torch.tensor([False, True, False, True, False, True]),
+    )
 
 
 def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
