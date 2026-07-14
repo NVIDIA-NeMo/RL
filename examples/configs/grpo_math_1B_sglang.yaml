@@ -30,6 +30,11 @@ policy:
       rollout_health_check_interval: 60
       rollout_health_check_timeout: 60
       rollout_health_check_first_wait: 60
+      # Weight precision for rollout/refit. scheme=bf16 (default) sends BF16
+      # HF tensors; scheme=mxfp8 boots SGLang from an MXFP8 HF checkpoint and
+      # quantizes refit tensors online (see SglangQuantizationConfig).
+      quantization:
+        scheme: bf16
       sglang_server_config:
         needs_offload: true
         cpu_weight_backup: true
