@@ -393,6 +393,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             return
         self._rollout_prompt_tokens[id(request)] = list(prompt_token_ids)
         from nemo_rl.experience.rollout_writer import (
+            EMPTY_PREFIX_HASH,
             RolloutContext,
             RolloutContextError,
             RolloutIdentity,
@@ -463,6 +464,60 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "identity; serving uncollected"
             )
             return
+
+        if self._rollout_writer_cfg.cursor == "forest":
+            # Forest semantics: pick the longest committed prefix of this
+            # prompt as the storage parent (prefix_merging's parent rule,
+            # executed online). No match is a new_root full-prompt row, not a
+            # rollout failure; a second child of one prefix is a branch.
+            if identity.call_id is None:
+                LOGGER.error(
+                    "Forest cursor requires a gateway call identity; serving "
+                    "uncollected"
+                )
+                return
+            reserve_started = time.perf_counter()
+            try:
+                candidates = await self._rollout_cursor.get_candidates.remote(
+                    identity.rollout_id
+                )
+                parent_call_id = None
+                prev_len, prev_hash = 0, EMPTY_PREFIX_HASH
+                for candidate in candidates:  # sorted longest first
+                    if candidate.length <= len(prompt_token_ids) and (
+                        hash_token_ids(prompt_token_ids[: candidate.length])
+                        == candidate.sequence_hash
+                    ):
+                        parent_call_id = candidate.call_id
+                        prev_len = candidate.length
+                        prev_hash = candidate.sequence_hash
+                        break
+                reservation = await self._rollout_cursor.reserve_call.remote(
+                    identity.rollout_id,
+                    identity.call_id,
+                    parent_call_id=parent_call_id,
+                    prev_len=prev_len,
+                    prev_hash=prev_hash,
+                )
+            except ray.exceptions.RayError:
+                LOGGER.exception(
+                    "Could not reserve rollout call %s/%s; serving uncollected",
+                    identity.rollout_id,
+                    identity.call_id,
+                )
+                return
+            finally:
+                self._record_rollout_transport(
+                    "cursor_reserve_ms",
+                    (time.perf_counter() - reserve_started) * 1000,
+                )
+            self._rollout_requests[id(request)] = RolloutRequestState(
+                identity=identity,
+                reservation=reservation,
+                prompt_token_ids=list(prompt_token_ids),
+            )
+            return
+
         reserve_started = time.perf_counter()
         try:
             reservation = await self._rollout_cursor.reserve_turn.remote(
@@ -537,6 +592,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             return
         from nemo_rl.experience.rollout_writer import (
             build_staging_delta,
+            compute_staging_digest,
             extract_generation_token_info,
             hash_token_ids,
         )
@@ -552,6 +608,24 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         prompt_ids = request_state.prompt_token_ids
         reservation = request_state.reservation
         identity = request_state.identity
+        # Forest reservations carry no linear turn index.
+        forest = not hasattr(reservation, "turn")
+
+        async def _fail(reason: str) -> None:
+            if forest:
+                await self._rollout_cursor.fail_call.remote(
+                    identity.rollout_id,
+                    identity.call_id,
+                    reservation.lease,
+                    reason=reason,
+                )
+            else:
+                await self._rollout_cursor.fail_turn.remote(
+                    identity.rollout_id,
+                    reservation.lease,
+                    reason=reason,
+                )
+
         full_ids = prompt_ids + generated_ids
         try:
             token_ids_delta, token_mask_delta, logprobs_delta = build_staging_delta(
@@ -561,14 +635,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 prev_len=reservation.prev_len,
             )
         except ValueError:
-            reason = "invalid_staging_delta"
-            await self._rollout_cursor.fail_turn.remote(
-                identity.rollout_id,
-                reservation.lease,
-                reason=reason,
-            )
+            await _fail("invalid_staging_delta")
             raise
 
+        digest = compute_staging_digest(
+            rollout_id=identity.rollout_id,
+            call_id=identity.call_id or "",
+            prev_len=reservation.prev_len,
+            token_ids_delta=token_ids_delta,
+            token_mask_delta=token_mask_delta,
+            logprobs_delta=logprobs_delta,
+        )
         # Staging keys: the gate-minted call_id when the gateway supplied one
         # (unique per admitted call, retry-idempotent), else the linear turn
         # index of the native sequential path.
@@ -593,15 +670,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "sample_id": identity.rollout_id,
                 "group_id": identity.group_id,
                 "call_id": identity.call_id,
-                "turn": reservation.turn,
+                "turn": None if forest else reservation.turn,
+                "parent_call_id": reservation.parent_call_id if forest else None,
                 "weight_version": identity.weight_version,
-                "request_nonce": reservation.request_nonce,
+                "request_nonce": None if forest else reservation.request_nonce,
                 "prev_len": reservation.prev_len,
                 "new_len": len(full_ids),
                 "prev_hash": reservation.prev_hash,
                 "new_hash": hash_token_ids(full_ids),
+                "digest": digest,
                 "lease_state": "written",
-                "full_snapshot": False,
+                "full_snapshot": bool(forest and reservation.is_new_root),
             }
         ]
         try:
@@ -613,11 +692,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 tags=tags,
             )
         except Exception as error:
-            await self._rollout_cursor.fail_turn.remote(
-                identity.rollout_id,
-                reservation.lease,
-                reason=f"staging_write_failed:{type(error).__name__}",
-            )
+            await _fail(f"staging_write_failed:{type(error).__name__}")
             raise
         finally:
             self._record_rollout_transport(
@@ -630,22 +705,32 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         commit_started = time.perf_counter()
         try:
-            await self._rollout_cursor.commit_turn.remote(
-                identity.rollout_id,
-                reservation.lease,
-                staging_key=staging_key,
-                new_len=len(full_ids),
-                new_hash=hash_token_ids(full_ids),
-                group_id=identity.group_id,
-                weight_version=identity.weight_version,
-            )
-        except Exception:
-            try:
-                await self._rollout_cursor.fail_turn.remote(
+            if forest:
+                await self._rollout_cursor.commit_call.remote(
+                    identity.rollout_id,
+                    identity.call_id,
+                    reservation.lease,
+                    staging_key=staging_key,
+                    new_len=len(full_ids),
+                    new_hash=hash_token_ids(full_ids),
+                    prompt_len=len(prompt_ids),
+                    gen_len=len(generated_ids),
+                    digest=digest,
+                    weight_version=identity.weight_version,
+                )
+            else:
+                await self._rollout_cursor.commit_turn.remote(
                     identity.rollout_id,
                     reservation.lease,
-                    reason="cursor_commit_failed",
+                    staging_key=staging_key,
+                    new_len=len(full_ids),
+                    new_hash=hash_token_ids(full_ids),
+                    group_id=identity.group_id,
+                    weight_version=identity.weight_version,
                 )
+        except Exception:
+            try:
+                await _fail("cursor_commit_failed")
             except Exception:
                 LOGGER.exception(
                     "Failed to mark rollout %s after cursor commit failure",

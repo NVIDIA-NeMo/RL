@@ -71,6 +71,13 @@ class RolloutWriterConfig(BaseModel, extra="allow"):
             stamped by a trusted Gym gateway on requests without a signed
             context (black-box harness mode). Requires the vLLM endpoint to be
             network-isolated or the gateway-to-worker hop authenticated.
+        cursor: ``linear`` reserves strictly sequential turns and terminally
+            fails a rollout on concurrency or a non-reproducible prefix;
+            ``forest`` (black-box harnesses; requires
+            ``accept_gateway_identity``) keys nodes by the gate call_id,
+            reserves against the longest committed prefix, and treats
+            compaction (``new_root``) and sub-agents (branches) as recoverable
+            structure for the assembler.
     """
 
     enabled: bool = False
@@ -81,6 +88,7 @@ class RolloutWriterConfig(BaseModel, extra="allow"):
     max_pending_writes_per_worker: Annotated[int, Field(gt=0)] = 64
     require_signed_context: bool = True
     accept_gateway_identity: bool = False
+    cursor: Literal["linear", "forest"] = "linear"
 
 
 class DataPlaneConfig(BaseModel, extra="allow"):

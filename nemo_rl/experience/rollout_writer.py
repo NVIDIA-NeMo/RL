@@ -972,3 +972,404 @@ class RolloutCursorRegistry:
 
     def expire_stale(self, now: float | None = None) -> list[str]:
         return self.state.expire_stale(now=now)
+
+
+# ---------------------------------------------------------------------------
+# Forest-mode cursor (black-box harness semantics)
+# ---------------------------------------------------------------------------
+
+ROLLOUT_NODE_SCHEMA_VERSION = 1
+
+
+def compute_staging_digest(
+    *,
+    rollout_id: str,
+    call_id: str,
+    prev_len: int,
+    token_ids_delta: list[int],
+    token_mask_delta: list[float],
+    logprobs_delta: list[float],
+) -> str:
+    """Digest one staged row: token ids, mask values, logprob bit patterns,
+    and the identifying metadata. The finalizer recomputes it over the fetched
+    row, so any storage-layer corruption or substitution is detected."""
+    payload = bytearray(struct.pack(">B", HASH_VERSION))
+    payload.extend(_encode_text(rollout_id))
+    payload.extend(_encode_text(call_id))
+    payload.extend(struct.pack(">Q", prev_len))
+    payload.extend(_encode_bytes(encode_token_ids(token_ids_delta)))
+    payload.extend(struct.pack(f">{len(token_mask_delta)}d", *token_mask_delta))
+    # Bit patterns, not values: -0.0 vs 0.0 and NaN payloads must not alias.
+    for logprob in logprobs_delta:
+        payload.extend(
+            struct.pack(">Q", struct.unpack(">Q", struct.pack(">d", logprob))[0])
+        )
+    return hashlib.sha256(b"nemo-rl-staging-digest" + bytes(payload)).hexdigest()
+
+
+NodeState = Literal["reserved", "committed", "failed"]
+
+
+@dataclass
+class ForestNodeRecord:
+    """Registry record for one admitted model call (one staged row)."""
+
+    call_id: str
+    parent_call_id: str | None
+    lease: str
+    prev_len: int
+    prev_hash: str
+    state: NodeState
+    updated_at: float
+    is_new_root: bool = False
+    staging_key: str | None = None
+    prompt_len: int | None = None
+    gen_len: int | None = None
+    new_len: int | None = None
+    new_hash: str | None = None
+    digest: str | None = None
+    weight_version: int | None = None
+    schema_version: int = ROLLOUT_NODE_SCHEMA_VERSION
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ForestCandidate:
+    """One committed node's cumulative sequence, offered as a parent."""
+
+    call_id: str
+    length: int
+    sequence_hash: str
+
+
+@dataclass(frozen=True)
+class ForestReservation:
+    """Reservation returned to a vLLM worker in forest mode."""
+
+    call_id: str
+    parent_call_id: str | None
+    lease: str
+    prev_len: int
+    prev_hash: str
+    is_new_root: bool
+
+
+@dataclass(frozen=True)
+class ForestManifest:
+    """Immutable forest view consumed by the trusted finalizer."""
+
+    rollout_id: str
+    nodes: tuple[ForestNodeRecord, ...]
+    failure_reason: str | None
+
+
+@dataclass
+class _RolloutForest:
+    updated_at: float
+    nodes: dict[str, ForestNodeRecord] = field(default_factory=dict)
+    order: list[str] = field(default_factory=list)
+    failure_reason: str | None = None
+
+
+class ForestCursorStateMachine:
+    """Cursor semantics for untrusted, possibly concurrent, possibly
+    context-compacting loops (black-box harnesses).
+
+    Differences from the linear machine, per the integration design:
+
+    - Nodes are keyed by the gate-minted ``call_id``; prompt hashes are
+      integrity metadata, never identity, and two admitted calls with
+      identical prompts are two nodes.
+    - Reservation is "longest committed prefix of this prompt": the worker
+      fetches committed candidates, hashes its rendered prompt at each
+      candidate length, and reserves against the longest match. The registry
+      only validates the claimed parent; it never sees token ids.
+    - A prompt extending no committed prefix reserves a ``new_root``
+      full-prompt row (harness compaction / history rewrite) instead of
+      failing the rollout; a second child of one prefix is a branch. The
+      registry retains node multiplicity for the finalizer's assembler.
+    - Concurrent reservations are legal; each node carries its own lease.
+    """
+
+    def __init__(self, *, lease_ttl_s: float, cursor_ttl_s: float) -> None:
+        if lease_ttl_s <= 0 or cursor_ttl_s <= 0:
+            raise ValueError("cursor and lease TTLs must be positive")
+        self.lease_ttl_s = lease_ttl_s
+        self.cursor_ttl_s = cursor_ttl_s
+        self.rollouts: dict[str, _RolloutForest] = {}
+
+    def _forest(self, rollout_id: str, timestamp: float) -> _RolloutForest:
+        forest = self.rollouts.get(rollout_id)
+        if forest is None:
+            forest = _RolloutForest(updated_at=timestamp)
+            self.rollouts[rollout_id] = forest
+        return forest
+
+    def get_candidates(
+        self, rollout_id: str, *, now: float | None = None
+    ) -> list[ForestCandidate]:
+        """Committed cumulative sequences the next prompt may extend,
+        longest first (the parent rule picks the first hash match)."""
+        timestamp = time.time() if now is None else now
+        forest = self._forest(rollout_id, timestamp)
+        if forest.failure_reason is not None:
+            raise CursorFailedError(forest.failure_reason)
+        candidates = [
+            ForestCandidate(
+                call_id=node.call_id,
+                length=node.new_len or 0,
+                sequence_hash=node.new_hash or EMPTY_PREFIX_HASH,
+            )
+            for node in forest.nodes.values()
+            if node.state == "committed"
+        ]
+        candidates.sort(key=lambda c: c.length, reverse=True)
+        return candidates
+
+    def reserve_call(
+        self,
+        rollout_id: str,
+        call_id: str,
+        *,
+        parent_call_id: str | None,
+        prev_len: int,
+        prev_hash: str,
+        now: float | None = None,
+    ) -> ForestReservation:
+        timestamp = time.time() if now is None else now
+        forest = self._forest(rollout_id, timestamp)
+        if forest.failure_reason is not None:
+            raise CursorFailedError(forest.failure_reason)
+
+        existing = forest.nodes.get(call_id)
+        if existing is not None:
+            # Idempotent internal retry: the gateway preserves call_id.
+            if existing.state == "committed":
+                raise DuplicateRequestError(
+                    f"committed call {call_id} retried for rollout {rollout_id}"
+                )
+            if existing.state == "failed":
+                raise CursorFailedError(existing.failure_reason or "call_failed")
+            if timestamp - existing.updated_at > self.lease_ttl_s:
+                existing.lease = uuid.uuid4().hex
+            existing.updated_at = timestamp
+            forest.updated_at = timestamp
+            return self._reservation(existing)
+
+        if parent_call_id is None:
+            if prev_len != 0 or prev_hash != EMPTY_PREFIX_HASH:
+                raise CursorConflictError(
+                    f"rootless reservation for {call_id} must start at length 0"
+                )
+            is_new_root = any(
+                node.state == "committed" for node in forest.nodes.values()
+            )
+        else:
+            parent = forest.nodes.get(parent_call_id)
+            if parent is None or parent.state != "committed":
+                raise CursorConflictError(
+                    f"parent {parent_call_id} of call {call_id} is not committed"
+                )
+            if parent.new_len != prev_len or parent.new_hash != prev_hash:
+                raise CursorConflictError(
+                    f"parent {parent_call_id} does not match claimed prefix "
+                    f"(len {prev_len})"
+                )
+            is_new_root = False
+
+        record = ForestNodeRecord(
+            call_id=call_id,
+            parent_call_id=parent_call_id,
+            lease=uuid.uuid4().hex,
+            prev_len=prev_len,
+            prev_hash=prev_hash,
+            state="reserved",
+            updated_at=timestamp,
+            is_new_root=is_new_root,
+        )
+        forest.nodes[call_id] = record
+        forest.order.append(call_id)
+        forest.updated_at = timestamp
+        return self._reservation(record)
+
+    def commit_call(
+        self,
+        rollout_id: str,
+        call_id: str,
+        lease: str,
+        *,
+        staging_key: str,
+        new_len: int,
+        new_hash: str,
+        prompt_len: int,
+        gen_len: int,
+        digest: str,
+        weight_version: int,
+        now: float | None = None,
+    ) -> None:
+        timestamp = time.time() if now is None else now
+        record = self._leased_record(rollout_id, call_id, lease)
+        if new_len <= record.prev_len:
+            self.fail_call(rollout_id, call_id, lease, reason="non_growing_node")
+            raise CursorConflictError(
+                f"call {call_id} committed length {new_len} does not extend "
+                f"prefix length {record.prev_len}"
+            )
+        record.state = "committed"
+        record.staging_key = staging_key
+        record.new_len = new_len
+        record.new_hash = new_hash
+        record.prompt_len = prompt_len
+        record.gen_len = gen_len
+        record.digest = digest
+        record.weight_version = weight_version
+        record.updated_at = timestamp
+        self.rollouts[rollout_id].updated_at = timestamp
+
+    def fail_call(
+        self,
+        rollout_id: str,
+        call_id: str,
+        lease: str,
+        *,
+        reason: str,
+        now: float | None = None,
+    ) -> None:
+        """A failed call fails its node only; the rollout survives (the
+        finalizer decides validity from the manifest reconciliation)."""
+        timestamp = time.time() if now is None else now
+        record = self._leased_record(rollout_id, call_id, lease)
+        record.state = "failed"
+        record.failure_reason = reason
+        record.updated_at = timestamp
+        self.rollouts[rollout_id].updated_at = timestamp
+
+    def fail_rollout(
+        self, rollout_id: str, *, reason: str, now: float | None = None
+    ) -> None:
+        timestamp = time.time() if now is None else now
+        forest = self._forest(rollout_id, timestamp)
+        forest.failure_reason = reason
+        forest.updated_at = timestamp
+
+    def get_forest_manifest(self, rollout_id: str) -> ForestManifest:
+        forest = self.rollouts.get(rollout_id)
+        if forest is None:
+            raise KeyError(f"unknown rollout {rollout_id}")
+        return ForestManifest(
+            rollout_id=rollout_id,
+            nodes=tuple(forest.nodes[call_id] for call_id in forest.order),
+            failure_reason=forest.failure_reason,
+        )
+
+    def clear_rollout(self, rollout_id: str) -> None:
+        self.rollouts.pop(rollout_id, None)
+
+    def expire_stale(self, now: float | None = None) -> list[str]:
+        timestamp = time.time() if now is None else now
+        stale = [
+            rollout_id
+            for rollout_id, forest in self.rollouts.items()
+            if timestamp - forest.updated_at > self.cursor_ttl_s
+        ]
+        for rollout_id in stale:
+            del self.rollouts[rollout_id]
+        return stale
+
+    def _leased_record(
+        self, rollout_id: str, call_id: str, lease: str
+    ) -> ForestNodeRecord:
+        forest = self.rollouts.get(rollout_id)
+        record = forest.nodes.get(call_id) if forest is not None else None
+        if record is None:
+            raise CursorConflictError(f"unknown call {call_id} for {rollout_id}")
+        if record.state != "reserved":
+            raise CursorConflictError(f"call {call_id} is {record.state}, not reserved")
+        if not hmac.compare_digest(record.lease, lease):
+            raise CursorConflictError(f"stale lease for call {call_id}")
+        return record
+
+    @staticmethod
+    def _reservation(record: ForestNodeRecord) -> ForestReservation:
+        return ForestReservation(
+            call_id=record.call_id,
+            parent_call_id=record.parent_call_id,
+            lease=record.lease,
+            prev_len=record.prev_len,
+            prev_hash=record.prev_hash,
+            is_new_root=record.is_new_root,
+        )
+
+
+@ray.remote  # pragma: no cover
+class RolloutForestRegistry:
+    """Ray-facing wrapper around the forest cursor state machine."""
+
+    def __init__(self, *, lease_ttl_s: float, cursor_ttl_s: float) -> None:
+        self.state = ForestCursorStateMachine(
+            lease_ttl_s=lease_ttl_s, cursor_ttl_s=cursor_ttl_s
+        )
+
+    def get_candidates(self, rollout_id: str) -> list[ForestCandidate]:
+        return self.state.get_candidates(rollout_id)
+
+    def reserve_call(
+        self,
+        rollout_id: str,
+        call_id: str,
+        *,
+        parent_call_id: str | None,
+        prev_len: int,
+        prev_hash: str,
+    ) -> ForestReservation:
+        return self.state.reserve_call(
+            rollout_id,
+            call_id,
+            parent_call_id=parent_call_id,
+            prev_len=prev_len,
+            prev_hash=prev_hash,
+        )
+
+    def commit_call(
+        self,
+        rollout_id: str,
+        call_id: str,
+        lease: str,
+        *,
+        staging_key: str,
+        new_len: int,
+        new_hash: str,
+        prompt_len: int,
+        gen_len: int,
+        digest: str,
+        weight_version: int,
+    ) -> None:
+        self.state.commit_call(
+            rollout_id,
+            call_id,
+            lease,
+            staging_key=staging_key,
+            new_len=new_len,
+            new_hash=new_hash,
+            prompt_len=prompt_len,
+            gen_len=gen_len,
+            digest=digest,
+            weight_version=weight_version,
+        )
+
+    def fail_call(
+        self, rollout_id: str, call_id: str, lease: str, *, reason: str
+    ) -> None:
+        self.state.fail_call(rollout_id, call_id, lease, reason=reason)
+
+    def fail_rollout(self, rollout_id: str, *, reason: str) -> None:
+        self.state.fail_rollout(rollout_id, reason=reason)
+
+    def get_forest_manifest(self, rollout_id: str) -> ForestManifest:
+        return self.state.get_forest_manifest(rollout_id)
+
+    def clear_rollout(self, rollout_id: str) -> None:
+        self.state.clear_rollout(rollout_id)
+
+    def expire_stale(self, now: float | None = None) -> list[str]:
+        return self.state.expire_stale(now=now)

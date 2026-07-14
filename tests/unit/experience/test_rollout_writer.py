@@ -392,7 +392,7 @@ async def test_worker_rejects_echoed_prefix_that_differs_from_committed_cursor()
         ttl_s=60,
     )
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._rollout_writer_cfg = SimpleNamespace(enabled=True)
+    worker._rollout_writer_cfg = SimpleNamespace(enabled=True, cursor="linear")
     worker._rollout_writer_secret = secret
     worker._rollout_cursor = cursor
     worker._rollout_requests = {}
@@ -432,7 +432,7 @@ async def test_worker_rejects_mismatched_rollout_id_alias_pair() -> None:
         ttl_s=60,
     )
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._rollout_writer_cfg = SimpleNamespace(enabled=True)
+    worker._rollout_writer_cfg = SimpleNamespace(enabled=True, cursor="linear")
     worker._rollout_writer_secret = secret
     worker._rollout_cursor = cursor
     worker._rollout_requests = {}
@@ -453,12 +453,15 @@ async def test_worker_rejects_mismatched_rollout_id_alias_pair() -> None:
         ray.get(cursor.get_finalization_manifest.remote("sample"))
 
 
-def _gateway_worker(cursor, *, accept_gateway_identity=True, weight_version=5):
+def _gateway_worker(
+    cursor, *, accept_gateway_identity=True, weight_version=5, cursor_mode="linear"
+):
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._rollout_writer_cfg = SimpleNamespace(
         enabled=True,
         accept_gateway_identity=accept_gateway_identity,
         staging_partition="staging",
+        cursor=cursor_mode,
     )
     worker._rollout_writer_secret = None
     worker._rollout_cursor = cursor
@@ -587,6 +590,216 @@ async def test_worker_fails_gateway_call_when_rendered_prompt_diverges() -> None
     manifest = ray.get(cursor.get_finalization_manifest.remote("rid"))
     assert manifest.failure_reason is not None
     assert "prefix_mismatch" in manifest.failure_reason
+
+
+def _commit_forest_call(
+    machine, rid, call_id, *, parent, prev_len, prev_hash, new_len, new_hash
+):
+    reservation = machine.reserve_call(
+        rid, call_id, parent_call_id=parent, prev_len=prev_len, prev_hash=prev_hash
+    )
+    machine.commit_call(
+        rid,
+        call_id,
+        reservation.lease,
+        staging_key=f"{rid}/{call_id}",
+        new_len=new_len,
+        new_hash=new_hash,
+        prompt_len=new_len - 1,
+        gen_len=1,
+        digest="d",
+        weight_version=5,
+    )
+    return reservation
+
+
+def test_forest_cursor_allows_concurrency_branches_and_new_roots() -> None:
+    from nemo_rl.experience.rollout_writer import (
+        EMPTY_PREFIX_HASH,
+        ForestCursorStateMachine,
+    )
+
+    machine = ForestCursorStateMachine(lease_ttl_s=10, cursor_ttl_s=100)
+    rid = "rid"
+    seq_a = [1, 2, 3]
+
+    # Two concurrent rootless reservations are both legal (no active_turn).
+    first = machine.reserve_call(
+        rid, "c1", parent_call_id=None, prev_len=0, prev_hash=EMPTY_PREFIX_HASH
+    )
+    second = machine.reserve_call(
+        rid, "c2", parent_call_id=None, prev_len=0, prev_hash=EMPTY_PREFIX_HASH
+    )
+    assert not first.is_new_root and not second.is_new_root
+
+    machine.commit_call(
+        rid,
+        "c1",
+        first.lease,
+        staging_key="rid/c1",
+        new_len=3,
+        new_hash=hash_token_ids(seq_a),
+        prompt_len=1,
+        gen_len=2,
+        digest="d1",
+        weight_version=5,
+    )
+    machine.commit_call(
+        rid,
+        "c2",
+        second.lease,
+        staging_key="rid/c2",
+        new_len=2,
+        new_hash=hash_token_ids([9, 9]),
+        prompt_len=1,
+        gen_len=1,
+        digest="d2",
+        weight_version=5,
+    )
+
+    # Candidates are committed sequences, longest first.
+    candidates = machine.get_candidates(rid)
+    assert [(c.call_id, c.length) for c in candidates] == [("c1", 3), ("c2", 2)]
+
+    # Two children of c1's prefix: a branch, both accepted.
+    _commit_forest_call(
+        machine,
+        rid,
+        "c3",
+        parent="c1",
+        prev_len=3,
+        prev_hash=hash_token_ids(seq_a),
+        new_len=5,
+        new_hash=hash_token_ids(seq_a + [4, 5]),
+    )
+    _commit_forest_call(
+        machine,
+        rid,
+        "c4",
+        parent="c1",
+        prev_len=3,
+        prev_hash=hash_token_ids(seq_a),
+        new_len=6,
+        new_hash=hash_token_ids(seq_a + [6, 7, 8]),
+    )
+
+    # A rootless reservation after commits = compaction -> flagged new_root.
+    compacted = machine.reserve_call(
+        rid, "c5", parent_call_id=None, prev_len=0, prev_hash=EMPTY_PREFIX_HASH
+    )
+    assert compacted.is_new_root
+
+    manifest = machine.get_forest_manifest(rid)
+    assert manifest.failure_reason is None
+    assert [n.call_id for n in manifest.nodes] == ["c1", "c2", "c3", "c4", "c5"]
+    assert manifest.nodes[2].parent_call_id == "c1"
+    assert manifest.nodes[4].state == "reserved"
+    assert all(n.schema_version == 1 for n in manifest.nodes)
+
+
+def test_forest_cursor_rejects_stale_parents_and_duplicate_commits() -> None:
+    from nemo_rl.experience.rollout_writer import (
+        EMPTY_PREFIX_HASH,
+        ForestCursorStateMachine,
+    )
+
+    machine = ForestCursorStateMachine(lease_ttl_s=10, cursor_ttl_s=100)
+    rid = "rid"
+    _commit_forest_call(
+        machine,
+        rid,
+        "c1",
+        parent=None,
+        prev_len=0,
+        prev_hash=EMPTY_PREFIX_HASH,
+        new_len=3,
+        new_hash=hash_token_ids([1, 2, 3]),
+    )
+    # Claimed parent hash must match the committed node exactly.
+    with pytest.raises(CursorConflictError, match="does not match claimed prefix"):
+        machine.reserve_call(
+            rid, "c2", parent_call_id="c1", prev_len=3, prev_hash="bogus"
+        )
+    # Unknown parent.
+    with pytest.raises(CursorConflictError, match="not committed"):
+        machine.reserve_call(
+            rid, "cx", parent_call_id="ghost", prev_len=1, prev_hash="h"
+        )
+    # A committed call retried (same call_id) is a duplicate, not a new node.
+    with pytest.raises(DuplicateRequestError):
+        machine.reserve_call(
+            rid, "c1", parent_call_id=None, prev_len=0, prev_hash=EMPTY_PREFIX_HASH
+        )
+    # An in-flight reservation retried reissues idempotently.
+    pending = machine.reserve_call(
+        rid,
+        "c3",
+        parent_call_id="c1",
+        prev_len=3,
+        prev_hash=hash_token_ids([1, 2, 3]),
+        now=1,
+    )
+    retry = machine.reserve_call(
+        rid,
+        "c3",
+        parent_call_id="c1",
+        prev_len=3,
+        prev_hash=hash_token_ids([1, 2, 3]),
+        now=2,
+    )
+    assert retry.lease == pending.lease
+    # A failed call fails its node only; the rollout survives.
+    machine.fail_call(rid, "c3", pending.lease, reason="staging_write_failed")
+    candidates = machine.get_candidates(rid)
+    assert [c.call_id for c in candidates] == ["c1"]
+
+
+@pytest.mark.asyncio
+async def test_worker_forest_flow_stages_compaction_and_branch() -> None:
+    """End-to-end forest write path: sequential turn, branch (sub-agent), and
+    context compaction (new_root) all stage rows instead of failing."""
+    from nemo_rl.experience.rollout_writer import RolloutForestRegistry
+
+    registry = RolloutForestRegistry.remote(lease_ttl_s=10, cursor_ttl_s=100)
+    worker = _gateway_worker(registry, cursor_mode="forest")
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        "staging", list(ROLLOUT_STAGING_FIELDS), 10, consumer_tasks=[]
+    )
+    worker._rollout_dp_client = client
+
+    async def run_call(call_id, prompt, generated, logprobs):
+        request = SimpleNamespace(
+            nemo_rl_rollout_context=None,
+            nemo_rl_rollout_id="rid",
+            nemo_rl_call_id=call_id,
+            required_prefix_token_ids=None,
+            stream=False,
+        )
+        await worker._prepare_rollout_request(request, prompt_token_ids=prompt)
+        assert id(request) in worker._rollout_requests
+        await worker._stage_rollout_response(
+            request, _chat_response(generated, logprobs)
+        )
+
+    # Turn 0 and its sequential continuation.
+    await run_call("c1", [1, 2, 3], [4, 5], [-0.1, -0.2])
+    await run_call("c2", [1, 2, 3, 4, 5, 6], [7], [-0.3])
+    # A concurrent sub-agent branching from c1's committed sequence.
+    await run_call("c3", [1, 2, 3, 4, 5, 8], [9], [-0.4])
+    # Context compaction: extends no committed prefix -> new_root, not failure.
+    await run_call("c4", [99, 98], [97], [-0.5])
+
+    manifest = ray.get(registry.get_forest_manifest.remote("rid"))
+    assert manifest.failure_reason is None
+    nodes = {n.call_id: n for n in manifest.nodes}
+    assert nodes["c1"].parent_call_id is None and not nodes["c1"].is_new_root
+    assert nodes["c2"].parent_call_id == "c1" and nodes["c2"].prev_len == 5
+    assert nodes["c3"].parent_call_id == "c1" and nodes["c3"].prev_len == 5
+    assert nodes["c4"].parent_call_id is None and nodes["c4"].is_new_root
+    assert all(n.state == "committed" for n in nodes.values())
+    assert nodes["c4"].staging_key == "rid/c4"
+    assert nodes["c2"].digest is not None and len(nodes["c2"].digest) == 64
 
 
 def test_finalizer_assembles_valid_row_and_masks_missing_row() -> None:

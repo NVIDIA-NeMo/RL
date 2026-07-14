@@ -81,7 +81,10 @@ from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.sync_rollout_actor import SyncRolloutActor
-from nemo_rl.experience.rollout_writer import RolloutCursorRegistry
+from nemo_rl.experience.rollout_writer import (
+    RolloutCursorRegistry,
+    RolloutForestRegistry,
+)
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -526,9 +529,19 @@ def grpo_train_sync(
                 "direct rollout writes require signed contexts or a trusted "
                 "gateway identity (accept_gateway_identity)"
             )
+        if writer_cfg.cursor == "forest" and not writer_cfg.accept_gateway_identity:
+            raise ValueError(
+                "the forest cursor keys staging rows by the gateway call_id; "
+                "set rollout_writer.accept_gateway_identity=true"
+            )
         policy.prepare_rollout_writer()
         rollout_secret = secrets.token_bytes(32)
-        rollout_cursor = RolloutCursorRegistry.remote(
+        cursor_registry_cls = (
+            RolloutForestRegistry
+            if writer_cfg.cursor == "forest"
+            else RolloutCursorRegistry
+        )
+        rollout_cursor = cursor_registry_cls.remote(
             lease_ttl_s=writer_cfg.finalize_timeout_s,
             cursor_ttl_s=writer_cfg.cursor_ttl_s,
         )
