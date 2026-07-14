@@ -24,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.grpo import _default_grpo_save_state
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -156,6 +157,7 @@ class _SyncDPAdapter:
 def test_rollout_pump_writes_expected_tq_data(
     multi_step_setup_vllm_async,  # noqa: F811
     single_multi_step_calculator_input_sample,  # noqa: F811
+    tmp_path,
 ):
     """SC._rollout_pump writes max_rollout_prompts * num_generations rows to TQ with the expected fields and tags."""
     vllm_generation, tokenizer, env_handles, _, _ = multi_step_setup_vllm_async
@@ -177,10 +179,35 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     mc = MasterConfig.model_construct(
+        policy={
+            # __init__'s one-optimizer-step check: prompts * generations == gbs.
+            "train_global_batch_size": max_rollout_prompts * num_generations,
+        },
         grpo={
             "max_num_steps": 1,
             "max_num_epochs": None,
+            # strict_on_policy (over_sampling=False, staleness 0) requires
+            # max_buffered_rollouts == num_prompts_per_step.
+            "num_prompts_per_step": max_rollout_prompts,
             "num_generations_per_prompt": num_generations,
+        },
+        logger={
+            "log_dir": str(tmp_path / "logs"),
+            "wandb_enabled": False,
+            "swanlab_enabled": False,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "monitor_gpus": False,
+        },
+        checkpointing={
+            "enabled": False,
+            "checkpoint_dir": str(tmp_path / "checkpoints"),
+            "metric_name": None,
+            "higher_is_better": False,
+            "keep_top_k": None,
+            "save_period": 10_000,
+            "save_optimizer": False,
+            "checkpoint_must_save_by": None,
         },
         async_rl=AsyncRLConfig(
             batch_selection_strategy="strict_on_policy",
@@ -223,6 +250,8 @@ def test_rollout_pump_writes_expected_tq_data(
         rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=_PARTITION_ID,
+        save_state=_default_grpo_save_state(),
+        last_checkpoint_path=None,
     )
     ctrl = SingleControllerActor.remote(master_config=mc, bundle=bundle)
 
