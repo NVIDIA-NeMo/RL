@@ -204,7 +204,8 @@ class SingleControllerActor:
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
-        # Gate: cleared during _sync_weights, set when generation may proceed
+        # Gate: cleared during weight sync or validation-only rollout draining,
+        # set when generation may proceed.
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
 
@@ -353,7 +354,7 @@ class SingleControllerActor:
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
           2. Acquire sem (cap concurrent in-flight rollouts)
-          3. Wait for _rollout_permitted (paused during weight sync)
+          3. Wait for _rollout_permitted (paused during weight sync or validation)
           4. Call rollout_manager.generate_and_push(prompt) — local async
              RolloutManager reserves a slot, runs the rollout, then commits the
              group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
@@ -723,7 +724,24 @@ class SingleControllerActor:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
 
-    async def _sync_weights(self) -> None:
+    async def _pause_and_drain_rollouts(self) -> None:
+        """Pause admission and wait for all already-dispatched rollouts.
+
+        All tasks in the snapshot are allowed to settle before the first task
+        error is propagated. The admission gate remains closed on return and
+        on error so the caller can safely proceed to validation or abort.
+        """
+        self._rollout_permitted.clear()
+        dispatched_rollouts = tuple(self._dispatched_rollouts)
+        results = await asyncio.gather(
+            *dispatched_rollouts,
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _sync_weights(self, *, reopen_rollouts: bool = True) -> None:
         """Drain in-flight rollouts then synchronize weights.
 
         SC owns the drain gate (when to sync); WeightSynchronizer owns how.
@@ -733,6 +751,9 @@ class SingleControllerActor:
           2. drain _inflight_rollouts → 0  (5ms poll)
           3. weight_synchronizer.sync_weights(trainer_version)
           4. _rollout_permitted.set()   — resume
+          
+        pass ``reopen_rollouts=False`` to keep the admission gate closed 
+        through validation.
         """
         self._rollout_permitted.clear()
 
@@ -757,7 +778,8 @@ class SingleControllerActor:
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_manager.set_weight_version(self._trainer_version)
-        self._rollout_permitted.set()
+        if reopen_rollouts:
+            self._rollout_permitted.set()
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.
