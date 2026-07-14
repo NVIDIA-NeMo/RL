@@ -42,7 +42,6 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from contextlib import nullcontext
 from typing import Any, Literal, Optional
@@ -60,9 +59,6 @@ from nemo_rl.algorithms.staleness_sampler import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.utils.timer import Timer
-
-log = logging.getLogger(__name__)
-
 
 # TQ partition schema field names — cross-component protocol with the rollout
 # actor. These are not user-tunable: changing them in SC would also need to
@@ -204,21 +200,19 @@ def warn_if_staleness_window_below_minibatches(
         return
     num_minibatches = target_groups // groups_per_minibatch
     if num_minibatches > 1 and effective_window < num_minibatches - 1:
-        log.warning(
-            "max_weight_staleness_versions (effective window %d) is smaller "
-            "than num_minibatches - 1 (%d): each outer step runs %d optimizer "
-            "steps but syncs generation weights only once, at the end, so "
-            "groups produced at the version the step began on age by up to %d "
-            "versions before the next sync and become unselectable "
-            "(skipped, then evicted as stale) mid-step — the train pump may "
-            "spin or thrash. Remedy: raise max_weight_staleness_versions to "
-            "at least %d, or lower target_groups_per_step * group_size / "
-            "train_global_batch_size to reduce num_minibatches.",
-            effective_window,
-            num_minibatches - 1,
-            num_minibatches,
-            num_minibatches - 1,
-            num_minibatches - 1,
+        print(
+            f"WARNING: max_weight_staleness_versions (effective window "
+            f"{effective_window}) is smaller than num_minibatches - 1 "
+            f"({num_minibatches - 1}): each outer step runs {num_minibatches} "
+            f"optimizer steps but syncs generation weights only once, at the "
+            f"end, so groups produced at the version the step began on age by "
+            f"up to {num_minibatches - 1} versions before the next sync and "
+            f"become unselectable (skipped, then evicted as stale) mid-step "
+            f"— the train pump may spin or thrash. Remedy: raise "
+            f"max_weight_staleness_versions to at least {num_minibatches - 1}, "
+            f"or lower target_groups_per_step * group_size / "
+            f"train_global_batch_size to reduce num_minibatches.",
+            flush=True,
         )
 
 
@@ -247,20 +241,6 @@ class SingleControllerActor:
         advantage_estimator: Any | None = None,
         logger: Any | None = None,
     ) -> None:
-        # Configure the module logger only — basicConfig here would
-        # reconfigure the root logger globally for the whole Ray worker
-        # process. Skip if a handler is already attached so an embedding
-        # application's logging setup is respected.
-        if not log.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(
-                logging.Formatter(
-                    "[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s"
-                )
-            )
-            log.addHandler(handler)
-            log.setLevel(logging.INFO)
-
         self._cfg = cfg
         self._prompts = prompts
         self._dp_client = dp_client_handle
@@ -284,9 +264,10 @@ class SingleControllerActor:
         # values at config construction, so no runtime assert is needed here.
         if cfg.batch_selection_strategy == "strict_on_policy":
             cfg.max_weight_staleness_versions = 0
-            log.info(
+            print(
                 "Using strict_on_policy, auto setting "
-                "max_weight_staleness_versions to 0."
+                "max_weight_staleness_versions to 0.",
+                flush=True,
             )
         if cfg.target_groups_per_step is None:
             cfg.target_groups_per_step = cfg.min_groups_per_batch
@@ -352,12 +333,13 @@ class SingleControllerActor:
         self._claimed_meta: KVBatchMeta | None = None
         self._step_consumed_sample_ids: list[str] = []
 
-        log.info(
-            "SingleControllerActor: staleness_cap=%d buffer=%d inflight=%d transport=%s",
-            cfg.max_weight_staleness_versions,
-            cfg.max_buffered_rollouts,
-            cfg.max_inflight_prompts,
-            cfg.refit_cfg.impl,
+        print(
+            f"SingleControllerActor: staleness_cap="
+            f"{cfg.max_weight_staleness_versions} "
+            f"buffer={cfg.max_buffered_rollouts} "
+            f"inflight={cfg.max_inflight_prompts} "
+            f"transport={cfg.refit_cfg.impl}",
+            flush=True,
         )
 
     def _timed(self, label: str) -> Any:
@@ -434,7 +416,7 @@ class SingleControllerActor:
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
 
         start = time.monotonic()
-        log.info("rollout_pump: dispatching %d prompts", n)
+        print(f"rollout_pump: dispatching {n} prompts", flush=True)
 
         async def _one_group(prompt: str) -> None:
             await self._buffer_capacity.acquire()
@@ -446,7 +428,10 @@ class SingleControllerActor:
                         self._gen.generate_and_push.remote(prompt, self._dp_client)
                     )
                     if self._cfg.diagnostics:
-                        log.info("  rollout done for prompt='%s...'", prompt[:20])
+                        print(
+                            f"  rollout done for prompt='{prompt[:20]}...'",
+                            flush=True,
+                        )
                 finally:
                     self._inflight_rollouts -= 1
 
@@ -473,19 +458,17 @@ class SingleControllerActor:
                 await asyncio.gather(*tasks)
                 dispatched += k
                 self._current_epoch += 1
-                log.info(
-                    "rollout_pump: epoch %d/%d complete (%d/%d prompts)",
-                    self._current_epoch,
-                    max_epochs,
-                    dispatched,
-                    n,
+                print(
+                    f"rollout_pump: epoch {self._current_epoch}/{max_epochs} "
+                    f"complete ({dispatched}/{n} prompts)",
+                    flush=True,
                 )
 
         self._rollout_done = True
-        log.info(
-            "rollout_pump: finished %d prompts in %.2fs",
-            dispatched,
-            time.monotonic() - start,
+        print(
+            f"rollout_pump: finished {dispatched} prompts in "
+            f"{time.monotonic() - start:.2f}s",
+            flush=True,
         )
 
     async def _train_pump(self) -> None:
@@ -631,10 +614,10 @@ class SingleControllerActor:
                     # No groups consumed this mini-batch — either rollouts
                     # exhausted before any group arrived, or the outer
                     # loop broke without dispatching. Skip finish/cleanup.
-                    log.info(
-                        "train_pump: rollout exhausted at mb %d "
-                        "(no groups for this opt.step)",
-                        mb_idx,
+                    print(
+                        f"train_pump: rollout exhausted at mb {mb_idx} "
+                        f"(no groups for this opt.step)",
+                        flush=True,
                     )
                     break
 
@@ -668,15 +651,13 @@ class SingleControllerActor:
                     if step_min_weight_version is not None
                     else 0
                 )
-                log.info(
-                    "train step %d/%d  mb %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
-                    self._train_steps + 1,
-                    self._cfg.max_train_steps,
-                    mb_idx + 1,
-                    num_minibatches,
-                    self._trainer_version,
-                    lag,
-                    len(consumed_ids),
+                print(
+                    f"train step {self._train_steps + 1}/"
+                    f"{self._cfg.max_train_steps}  "
+                    f"mb {mb_idx + 1}/{num_minibatches}  "
+                    f"trainer_v={self._trainer_version}  lag={lag}  "
+                    f"batch_size={len(consumed_ids)}",
+                    flush=True,
                 )
 
                 # Per-opt.step observability: mirror grpo_sync's W&B logging
@@ -697,12 +678,15 @@ class SingleControllerActor:
                                 step_finished=True,
                             )
                             self._timer.reset()
-                    except Exception:
-                        log.exception(
-                            "logger.log_metrics raised at step %d / mb %d",
-                            self._train_steps + 1,
-                            mb_idx,
+                    except Exception as e:
+                        print(
+                            f"logger.log_metrics raised at step "
+                            f"{self._train_steps + 1} / mb {mb_idx}: {e}",
+                            flush=True,
                         )
+                        import traceback
+
+                        traceback.print_exc()
 
                 if rollout_exhausted:
                     # Inner loop terminated early due to rollout exhaustion;
@@ -742,17 +726,17 @@ class SingleControllerActor:
             await asyncio.sleep(0.005)
 
         drain_elapsed = time.monotonic() - drain_start
-        log.info(
-            "  _sync_weights: drained in %.3fs, syncing weights v%d",
-            drain_elapsed,
-            self._trainer_version,
+        print(
+            f"  _sync_weights: drained in {drain_elapsed:.3f}s, "
+            f"syncing weights v{self._trainer_version}",
+            flush=True,
         )
 
         t0 = time.monotonic()
         await self._weight_synchronizer.sync_weights(self._trainer_version)
         elapsed = time.monotonic() - t0
 
-        log.info("  _sync_weights: sync done in %.3fs", elapsed)
+        print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_permitted.set()
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
@@ -879,13 +863,11 @@ class SingleControllerActor:
         if not indices:
             return None
         evicted_meta = self._claimed_meta.subset(indices)
-        log.info(
-            "  evicting %d stale samples from %d prompt group(s)",
-            evicted_meta.size,
-            count_groups(
-                evicted_meta,
-                group_size=self._cfg.group_size,
-            ),
+        print(
+            f"  evicting {evicted_meta.size} stale samples from "
+            f"{count_groups(evicted_meta, group_size=self._cfg.group_size)} "
+            f"prompt group(s)",
+            flush=True,
         )
         await self._call_dp(
             "clear_samples",
@@ -921,10 +903,10 @@ class SingleControllerActor:
         if not indices:
             return
         dropped = self._claimed_meta.subset(indices)
-        log.warning(
-            "rollout done: dropping %d sample(s) from incomplete prompt "
-            "group(s) that can no longer complete",
-            dropped.size,
+        print(
+            f"WARNING: rollout done: dropping {dropped.size} sample(s) from "
+            f"incomplete prompt group(s) that can no longer complete",
+            flush=True,
         )
         await self._call_dp(
             "clear_samples",
