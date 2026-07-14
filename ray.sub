@@ -399,7 +399,7 @@ ip_head=$head_node_ip:$PORT
 # TOPO_RANK: Topology-aware infrastructure rank.
 #   Fallback chain:
 #   1. SLURM_TOPOLOGY_ADDR (block.node format) -> block_num * 10^10 + node_num
-#   2. SLURM_PROCID (SLURM without topology plugin)
+#   2. SLURM_PROCID + 2 on workers, head pinned to 1 (SLURM without topology plugin)
 #   3. Hostname digits (non-SLURM fallback)
 #
 # TODO(ansubramania): Harden the SLURM_TOPOLOGY_ADDR digit-extraction logic for open source.
