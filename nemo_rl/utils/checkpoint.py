@@ -166,19 +166,24 @@ class CheckpointManager:
     @staticmethod
     def get_resume_paths(
         last_checkpoint_path: Optional[PathLike],
+        *,
+        model_component: Literal["policy", "value"] = "policy",
     ) -> tuple[Optional[Path], Optional[Path]]:
         """Get weights and optimizer paths for resuming from a checkpoint.
 
         Args:
             last_checkpoint_path: Path to the last checkpoint, or None if starting fresh.
+            model_component: Model subtree to resolve. Policy is the default for
+                backward compatibility with algorithms that only checkpoint a policy.
 
         Returns:
             Tuple of (weights_path, optimizer_path). Both are None if no checkpoint.
             optimizer_path is None if checkpoint exists but optimizer state was not saved.
         """
         if last_checkpoint_path:
-            weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-            optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+            component_path = Path(last_checkpoint_path) / model_component
+            weights_path = component_path / "weights"
+            optimizer_path = component_path / "optimizer"
 
             # DTensor path
             if optimizer_path.exists():
