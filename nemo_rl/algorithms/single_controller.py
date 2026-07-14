@@ -673,15 +673,28 @@ class SingleControllerActor:
 
                 self._trainer_version += 1
                 self._train_steps += 1
-                with self._timer.time("weight_sync"):
-                    await self._sync_weights()
+                val_metrics: Optional[dict[str, Any]] = None
+                is_last_step = self._train_steps >= grpo_cfg["max_num_steps"]
+                should_validate = (
+                    grpo_cfg["val_period"] > 0
+                    and self._train_steps % grpo_cfg["val_period"] == 0
+                ) or (grpo_cfg["val_at_end"] and is_last_step)
+
+                if should_validate:
+                    await self._pause_and_drain_rollouts()
+                    with self._timer.time("weight_sync"):
+                        await self._sync_weights(reopen_rollouts=False)
+                    val_metrics = await self._run_validation(step=self._train_steps)
+                    self._rollout_permitted.set()
+                else:
+                    with self._timer.time("weight_sync"):
+                        await self._sync_weights()
 
                 # Checkpointing (ported from the legacy async loop).
                 self._consumed_samples += grpo_cfg["num_prompts_per_step"]
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
-                is_last_step = self._train_steps >= grpo_cfg["max_num_steps"]
                 save_period = self._master_config.checkpointing["save_period"]
                 # _train_steps was already incremented above, so it equals the
                 # legacy loop's 1-indexed `step + 1`.
@@ -705,9 +718,6 @@ class SingleControllerActor:
                     # single-threading makes the snapshot race-free); the
                     # slow torch.save happens off-loop below.
                     dataloader_state = self._dataloader.state_dict()
-                    # SC has no validation loop yet; keep the legacy shape so
-                    # wiring it in later only replaces this None.
-                    val_metrics: Optional[dict[str, Any]] = None
                     if val_metrics is not None:
                         save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in save_state:
