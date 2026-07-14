@@ -17,6 +17,25 @@ from typing import Any, NotRequired, TypedDict
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
+class SglangQuantizationConfig(TypedDict, total=False):
+    """SGLang weight-precision config.
+
+    ``scheme="bf16"`` (or omitting the block) means BF16 rollout/refit. Set
+    ``scheme="mxfp8"`` to boot SGLang from an MXFP8 HF checkpoint and to send
+    MXFP8 HF tensors during online refit.
+    """
+
+    scheme: str  # "bf16" | "mxfp8"
+    weight_block_size: list[int]
+    scale_fmt: str
+    modules_to_not_convert: list[str]
+    extra_high_precision_layers_hf: list[str]
+    num_layers_at_start_in_bf16: int
+    num_layers_at_end_in_bf16: int
+    converted_model_path: str
+    cache_root: str
+
+
 class SGLangServerConfig(TypedDict):
     # When True, sets SGLang `enable_memory_saver=True` so weights/KV can be released
     # during training and re-acquired before generation.
@@ -78,6 +97,8 @@ class SglangSpecificArgs(TypedDict):
     rollout_health_check_interval: NotRequired[int]
     rollout_health_check_timeout: NotRequired[int]
     rollout_health_check_first_wait: NotRequired[int]
+    # Weight precision and (when scheme=mxfp8) offline-conversion knobs.
+    quantization: NotRequired[SglangQuantizationConfig]
     sglang_router_config: SGLangRouterConfig
 
     # Path to model weights (local folder or HF repo id).
