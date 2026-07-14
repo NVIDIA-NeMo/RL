@@ -299,7 +299,7 @@ ip_head=$head_node_ip:$PORT
 # TOPO_RANK: Topology-aware infrastructure rank.
 #   Fallback chain:
 #   1. SLURM_TOPOLOGY_ADDR (block.node format) -> block_num * 10^10 + node_num
-#   2. SLURM_PROCID (SLURM without topology plugin)
+#   2. SLURM_PROCID + 2 on workers, head pinned to 1 (SLURM without topology plugin)
 #   3. Hostname digits (non-SLURM fallback)
 #
 # TODO(ansubramania): Harden the SLURM_TOPOLOGY_ADDR digit-extraction logic for open source.
@@ -326,7 +326,14 @@ if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "
     TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
   fi
 elif [[ -n "\${SLURM_PROCID:-}" ]]; then
-  TOPO_RANK=\$(( 10#\$SLURM_PROCID ))
+  # Head srun and worker srun each start their own SLURM_PROCID counter at 0.
+  # Head hardcoded to 1; workers get +2 so worker[0]=2, worker[62]=64 -- keeps
+  # all nodes at unique values >=1 (Ray drops value-0 custom resources).
+  if [[ "\$SLURMD_NODENAME" == "$head_node" ]]; then
+    TOPO_RANK=1
+  else
+    TOPO_RANK=\$(( 10#\$SLURM_PROCID + 2 ))
+  fi
 else
   _hostname_digits=\$(hostname | tr -dc '0-9')
   if [[ -n "\$_hostname_digits" ]]; then
