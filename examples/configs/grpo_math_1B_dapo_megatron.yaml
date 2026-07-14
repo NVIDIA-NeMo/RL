@@ -1,0 +1,35 @@
+# GRPO (Megatron-Core) on DAPO-Math-17K — async baseline for the PPO async run
+# (repro_ppo_mcore_7b_math_async.sh / ppo_math_1B.yaml).
+#
+# Inherits grpo_math_1B_megatron.yaml and swaps the `data:` and `env:` blocks so
+# the data setup AND the reward scorer are byte-for-byte the same as
+# ppo_math_1B.yaml (apple-to-apple):
+#   - full DAPOMath17K train set. DAPOMath17KDataset takes **kwargs and ignores
+#     the inherited split_validation_size, so NO 5% train-side split happens —
+#     the whole training set is used, exactly like PPO.
+#   - explicit DAPOMathAIME2024 validation (overrides the parent's
+#     `validation: null`, which would otherwise fall back to a train split).
+#   - prompt_file: null (no CoT template) to match PPO; the parent grpo config
+#     uses examples/prompts/cot.txt.
+#   - math_verify_impl: dapo_math_verify to match PPO. The grpo default is the
+#     more lenient hf_math_verify, which scores the SAME completions higher and
+#     was inflating GRPO's reward/accuracy vs PPO (~0.45 vs ~0.29 val at step 0).
+# Everything else (loss_fn, policy/megatron, cluster, grpo sizes, async_grpo) is
+# inherited and overridden on the command line by the launch script.
+defaults: "grpo_math_1B_megatron.yaml"
+
+data:
+  train:
+    dataset_name: DAPOMath17K
+    split_validation_size: null   # no train-side split; use the explicit validation set below (matches PPO)
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
+
+env:
+  math:
+    math_verify_impl: "dapo_math_verify"   # match PPO's stricter verifier (grpo default is hf_math_verify)

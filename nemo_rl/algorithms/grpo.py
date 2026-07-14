@@ -151,6 +151,19 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # On resume, how to treat an INCOMPLETE (partially-generated) restored target
+    # step in the replay-buffer checkpoint:
+    #   * false (default): keep the partial survivors and let the collector gap-fill
+    #     only the missing groups. Fast resume, but the partial batch is
+    #     SURVIVORSHIP-BIASED toward SHORT rollouts (only the fast-completing ones
+    #     were saved), so the first step after each resume trains on a shorter +
+    #     higher-reward batch — visible as a dip in mean_gen_tokens_per_sample and a
+    #     reward spike right after every resume.
+    #   * true: drop the incomplete target and regenerate it fresh (unbiased batch),
+    #     at the cost of a one-target generation bubble at resume. Recommended when
+    #     resuming frequently. Complete banked targets are unbiased and always kept.
+    # Absent/null => false. Read with a None-safe default, so allow null.
+    drop_incomplete_targets_on_restore: NotRequired[bool | None]
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -3691,7 +3704,14 @@ def async_grpo_train(
     )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+        max_size=optimal_buffer_size,
+        # Default False => historical gap-fill behavior; True drops the
+        # survivorship-biased incomplete frontier target on resume (regenerate
+        # fresh). None (absent) is coerced to False by the buffer constructor.
+        drop_incomplete_targets_on_restore=master_config.grpo["async_grpo"].get(
+            "drop_incomplete_targets_on_restore"
+        )
+        or False,
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
