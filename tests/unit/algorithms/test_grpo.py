@@ -361,6 +361,50 @@ def _logged_train_metrics_with_key(logger, key: str):
     raise AssertionError(f"No train metrics payload contained {key}")
 
 
+class TestMaskSampleFilter:
+    def test_masks_env_flagged_samples(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "mask_sample": torch.tensor([False, True, True]),
+            }
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.0, 0.0])
+        )
+
+    def test_masks_list_valued_mask_sample(self):
+        repeated_batch = BatchedDataDict(
+            {
+                "loss_multiplier": torch.tensor([1.0, 0.5, 1.0]),
+                "mask_sample": [True, False, True],
+            }
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 2
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([0.0, 0.5, 0.0])
+        )
+
+    def test_missing_mask_sample_is_noop(self):
+        repeated_batch = BatchedDataDict(
+            {"loss_multiplier": torch.tensor([1.0, 0.5, 1.0])}
+        )
+
+        num_masked = _apply_mask_sample_filter(repeated_batch)
+
+        assert num_masked == 0
+        assert torch.equal(
+            repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
+        )
+
+
 def test_get_prompt_ids_for_advantage_prefers_group_hash():
     repeated_batch = BatchedDataDict(
         {"group_hash": ["same-problem", "same-problem", "other-problem"]}

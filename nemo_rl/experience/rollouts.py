@@ -86,7 +86,6 @@ def _add_r3_fallback_metrics(
         float(missing_routes / expected_routes) if expected_routes > 0 else 0.0
     )
 
-
 def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
     """Return True for samples the environment asks GRPO to mask from loss."""
     return torch.tensor(
@@ -244,7 +243,6 @@ def _apply_effort_shaping(
     return _EffortShapingMetrics(
         length_rewards_low, rewards_low, low_lengths, high_lengths
     )
-
 
 def generate_responses(
     policy_generation: GenerationInterface,
@@ -2136,7 +2134,7 @@ def _calculate_refine_metrics(
     return metrics
 
 
-def run_async_nemo_gym_rollout(
+async def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,

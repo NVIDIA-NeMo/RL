@@ -42,6 +42,7 @@ from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
 from nemo_rl.experience.rollouts import (
     _calculate_refine_metrics,
+    _extract_mask_sample_flags,
     generate_responses_async,
     run_async_multi_turn_rollout,
     run_async_multi_turn_rollout_groups,
@@ -301,6 +302,23 @@ def test_calculate_refine_metrics_ignores_non_refine_results():
             [{"full_result": {"reward": 1.0}, "message_log": []}], 100
         )
         == {}
+)
+
+
+def test_extract_mask_sample_flags():
+    results = [
+        {"full_result": {"instance_config": {"mask_sample": True}}},
+        {"full_result": {"instance_config": {"mask_sample": False}}},
+        {"full_result": {"instance_config": {}}},
+        {"full_result": {}},
+        {"full_result": {"instance_config": None}},
+    ]
+
+    mask_sample = _extract_mask_sample_flags(results)
+
+    assert mask_sample.dtype == torch.bool
+    assert torch.equal(
+        mask_sample, torch.tensor([True, False, False, False, False])
     )
 
 @pytest.fixture(scope="function")
