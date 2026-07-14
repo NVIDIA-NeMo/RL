@@ -136,7 +136,7 @@ def _initial_distillation_save_state() -> DistillationSaveState:
     )
 
 
-def _load_distillation_save_state(
+def _get_distillation_save_state(
     loaded_state: Optional[dict[str, Any]],
 ) -> DistillationSaveState:
     if loaded_state is None:
@@ -292,7 +292,7 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    distillation_save_state = _load_distillation_save_state(loaded_state)
+    distillation_save_state = _get_distillation_save_state(loaded_state)
 
     # ==========================
     #           Data
