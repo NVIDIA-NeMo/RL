@@ -50,6 +50,11 @@ class StagedCallSnapshot:
     logprobs_delta: list[float]
     weight_version: int | None = None
     model: str = ""
+    # Forest rows carry an explicit storage parent; a rootless row (first call
+    # or new_root compaction) has none and is self-contained (prev_len == 0).
+    # Parentless rows with prev_len > 0 are legacy linear turns and extend the
+    # running sequential sequence.
+    parent_call_id: str | None = None
 
 
 def fetch_staged_snapshots(
@@ -117,11 +122,28 @@ class StagedSnapshotTokenSource:
             )
         entries: list[Any] = []
         cumulative: list[int] = []
+        cumulative_by_call: dict[str, list[int]] = {}
         for seq, snapshot in enumerate(self.snapshots):
-            if snapshot.prev_len > len(cumulative):
+            if snapshot.parent_call_id is not None:
+                # Forest row: the base is the storage parent's cumulative
+                # sequence, which the registry committed at exactly prev_len.
+                if snapshot.parent_call_id not in cumulative_by_call:
+                    raise ValueError(
+                        f"call {snapshot.call_id}: parent "
+                        f"{snapshot.parent_call_id} precedes it in no snapshot"
+                    )
+                base = cumulative_by_call[snapshot.parent_call_id]
+                if len(base) != snapshot.prev_len:
+                    raise ValueError(
+                        f"call {snapshot.call_id}: prev_len={snapshot.prev_len} "
+                        f"does not equal parent length {len(base)}"
+                    )
+            else:
+                base = cumulative
+            if snapshot.prev_len > len(base):
                 raise ValueError(
                     f"call {snapshot.call_id}: prev_len={snapshot.prev_len} exceeds "
-                    f"committed sequence length {len(cumulative)}"
+                    f"committed sequence length {len(base)}"
                 )
             if not (
                 len(snapshot.token_ids_delta)
@@ -143,7 +165,7 @@ class StagedSnapshotTokenSource:
                     "prompt-carry prefix followed by generated tokens"
                 )
             prompt_token_ids = (
-                cumulative[: snapshot.prev_len] + snapshot.token_ids_delta[:boundary]
+                base[: snapshot.prev_len] + snapshot.token_ids_delta[:boundary]
             )
             generation_token_ids = snapshot.token_ids_delta[boundary:]
             generation_log_probs = snapshot.logprobs_delta[boundary:]
@@ -159,5 +181,9 @@ class StagedSnapshotTokenSource:
                     seq=seq,
                 )
             )
-            cumulative = prompt_token_ids + generation_token_ids
+            cumulative_by_call[snapshot.call_id] = (
+                prompt_token_ids + generation_token_ids
+            )
+            if snapshot.parent_call_id is None:
+                cumulative = cumulative_by_call[snapshot.call_id]
         return entries

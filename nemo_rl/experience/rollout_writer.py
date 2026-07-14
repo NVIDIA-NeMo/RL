@@ -998,12 +998,15 @@ def compute_staging_digest(
     payload.extend(_encode_text(call_id))
     payload.extend(struct.pack(">Q", prev_len))
     payload.extend(_encode_bytes(encode_token_ids(token_ids_delta)))
-    payload.extend(struct.pack(f">{len(token_mask_delta)}d", *token_mask_delta))
-    # Bit patterns, not values: -0.0 vs 0.0 and NaN payloads must not alias.
+    # Masks and logprobs are digested as float32 BIT PATTERNS — the staging
+    # columns are float32, so quantizing here makes the worker's digest (over
+    # pre-tensorized python floats) and the finalizer's recomputation (over
+    # fetched storage values) byte-identical, while -0.0 vs 0.0 and NaN
+    # payloads still cannot alias.
+    for mask_value in token_mask_delta:
+        payload.extend(struct.pack(">f", mask_value))
     for logprob in logprobs_delta:
-        payload.extend(
-            struct.pack(">Q", struct.unpack(">Q", struct.pack(">d", logprob))[0])
-        )
+        payload.extend(struct.pack(">f", logprob))
     return hashlib.sha256(b"nemo-rl-staging-digest" + bytes(payload)).hexdigest()
 
 
