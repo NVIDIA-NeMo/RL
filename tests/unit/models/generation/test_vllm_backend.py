@@ -113,9 +113,7 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
         finally:
             call_order.append("config_exit")
 
-    monkeypatch.setattr(
-        "vllm.config.set_current_vllm_config", set_current_vllm_config
-    )
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
 
     def load_weights(weights):
         call_order.append("load")

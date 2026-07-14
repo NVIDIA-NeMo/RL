@@ -461,11 +461,10 @@ class VllmInternalWorkerExtension:
             )
 
             # Process weights after loading
+            from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.utils import (
                 process_weights_after_loading,
             )
-
-            from vllm.config import set_current_vllm_config
 
             with set_current_vllm_config(self.model_runner.vllm_config):
                 process_weights_after_loading(
