@@ -978,6 +978,11 @@ class RayVirtualCluster:
 
         This method is idempotent and can be safely called multiple times.
         """
+        # Skip if Ray is already gone (typically from __del__ during _Py_Finalize
+        # after Ray's atexit teardown). Any Ray API call would trigger a fatal
+        # core_worker_process.cc:88 CHECK. Placement groups die with Ray.
+        if not ray.is_initialized():
+            return True
         if self._node_placement_groups is not None:
             # Remove all placement groups
             for pg in self._node_placement_groups:
