@@ -2173,9 +2173,6 @@ def test_setup_auto_enables_skip_reference_logprobs_with_legacy_policy_factory(
         def prepare_refit_info(self):
             return {}
 
-        def set_rollout_num_gpus_per_engine(self, _num_gpus_per_engine):
-            pass
-
     def legacy_policy_factory(
         *,
         cluster,
