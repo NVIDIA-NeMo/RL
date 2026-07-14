@@ -86,6 +86,21 @@ def _add_r3_fallback_metrics(
     )
 
 
+def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+    """Return True for samples the environment asks GRPO to mask from loss."""
+    return torch.tensor(
+        [
+            bool(
+                (result["full_result"].get("instance_config") or {}).get(
+                    "mask_sample", False
+                )
+            )
+            for result in results
+        ],
+        dtype=torch.bool,
+    )
+
+
 def _attach_routed_experts_to_message_log_prefix(
     message_log: list[dict],
     routed_experts: torch.Tensor,
@@ -2026,6 +2041,9 @@ def run_async_nemo_gym_rollout(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
+            # Agent/env-driven mask flag — True means this sample should be masked
+            # from the GRPO gradient (kept for advantage computation).
+            "mask_sample": _extract_mask_sample_flags(results),
         }
     )
 
