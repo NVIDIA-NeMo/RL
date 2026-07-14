@@ -255,7 +255,7 @@ NEMO_CONTAINER=/path/to/nemo-rl.squashfs \
 ./examples/tau_bench/run_tau_local.sh
 ```
 
-See `examples/tau_bench/run_tau_local.sh` for the full list of environment-variable overrides (model names, ports, node counts, partitions, etc.) and `examples/configs/recipes/llm/grpo_tau_bench_local.yaml` for the corresponding training config.
+See `examples/tau_bench/run_tau_local.sh` for the full list of environment-variable overrides (model names, ports, node counts, partitions, etc.) and `examples/configs/recipes/llm/grpo-qwen2.5-7b-instruct-16n8g-tau-bench-local.yaml` for the corresponding training config.
 
 ## Registering Custom Environments
 

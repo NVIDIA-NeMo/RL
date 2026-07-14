@@ -81,7 +81,7 @@ USER_COORD_FILE="${USER_COORD_FILE:-$WORKDIR/.vllm_user_host}"
 JUDGE_COORD_FILE="${JUDGE_COORD_FILE:-$WORKDIR/.vllm_judge_host}"
 
 # Training config
-CONFIG=${CONFIG:-"examples/configs/recipes/llm/grpo_tau_bench_local.yaml"}
+CONFIG=${CONFIG:-"examples/configs/recipes/llm/grpo-qwen2.5-7b-instruct-16n8g-tau-bench-local.yaml"}
 ########################################################
 
 MOUNTS="$WORKDIR:$WORKDIR,$WORKDIR:/opt/nemo-rl,$HF_HOME:/mnt/cache"
