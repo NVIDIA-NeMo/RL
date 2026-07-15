@@ -80,6 +80,14 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    # When true, an episode whose turn breaks token-prefix contiguity (e.g. a
+    # rare tokenization/re-render edge case in a long multi-turn rollout) is
+    # truncated at the last contiguous turn: the corrupted tail is dropped and
+    # the valid prefix stays trainable (same philosophy as overlong filtering).
+    # When absent/false (default), such an episode raises the contiguity
+    # assertion below, which kills the rollout task; under async GRPO a single
+    # such episode can then stall the training step indefinitely.
+    truncate_noncontiguous_episodes: NotRequired[bool]
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -335,10 +343,23 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
+            is_contiguous = (
                 seen_token_ids
                 == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+            )
+            if not is_contiguous and self.cfg.get("truncate_noncontiguous_episodes"):
+                # Opt-in resilience: keep the contiguous prefix trainable and
+                # drop the corrupted tail (same philosophy as overlong
+                # filtering) instead of killing the rollout task — under async
+                # GRPO a single asserting episode can stall the step
+                # indefinitely.
+                print(
+                    "[nemo_gym] WARNING: non-contiguous turn; truncating episode "
+                    f"at {len(nemo_rl_message_log)} messages "
+                    f"(seen={len(seen_token_ids)} tokens); dropping corrupted tail."
+                )
+                break
+            assert is_contiguous, f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """

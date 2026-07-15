@@ -574,6 +574,9 @@ def setup(
             "invalid_tool_call_patterns", None
         )
         thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+        truncate_noncontiguous_episodes = nemo_gym_dict.pop(
+            "truncate_noncontiguous_episodes", False
+        )
         # Pass prebuilt cache + venv dirs through the global config so the gym reuses
         # image-baked venvs instead of rebuilding them.
         uv_cache_dir = get_nemo_gym_uv_cache_dir()
@@ -588,6 +591,7 @@ def setup(
             invalid_tool_call_patterns=invalid_tool_call_patterns,
             thinking_tags=thinking_tags,
             require_routed_experts=router_replay_enabled(policy_config),
+            truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}
