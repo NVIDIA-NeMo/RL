@@ -38,7 +38,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.metric_utils import calculate_single_metric
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
     generate_responses_async,
@@ -100,6 +100,40 @@ class TestCalculateSingleMetric:
         result = calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+class TestPct:
+    """Unit tests for pct percentile helper."""
+
+    def test_empty_returns_zero(self):
+        """Test that an empty input short-circuits to 0.0."""
+        assert pct([], 95) == 0.0
+
+    def test_returns_float_for_int_input(self):
+        """Test that integer input is coerced to float on return."""
+        result = pct([3, 1, 2], 50)
+        assert isinstance(result, float)
+        assert result == 2.0
+
+    def test_sorts_unsorted_input(self):
+        """Test that pct sorts before indexing."""
+        assert pct([5, 1, 3], 95) == 5.0
+
+    def test_p95_small_list_clamps_to_max(self):
+        """Test that p95 on a 5-element list clamps to the last index."""
+        assert pct([1, 2, 3, 4, 5], 95) == 5.0
+
+    def test_p99_clamps_to_last_index(self):
+        """Test that p99 on a 5-element list clamps to the last index."""
+        assert pct([1, 2, 3, 4, 5], 99) == 5.0
+
+    def test_single_value(self):
+        """Test that a single-element input returns that element."""
+        assert pct([42], 95) == 42.0
+
+    def test_median_like_p50(self):
+        """Test that p50 lands on the upper-mid element (int truncation, no interpolation)."""
+        assert pct([10, 20, 30, 40], 50) == 30.0
 
 
 class _DummyTokenizer:

@@ -24,6 +24,16 @@ from wandb import Histogram
 def calculate_single_metric(
     values: Sequence[float | int], batch_size: int, key_name: str
 ) -> dict:
+    """Compute summary statistics for a metric as slash-prefixed keys.
+
+    Args:
+        values: Per-sample metric values to aggregate.
+        batch_size: Denominator for the mean (sum(values) / batch_size, not len(values)); stddev still uses len(values).
+        key_name: Prefix for the returned metric keys (e.g. "total_reward").
+
+    Returns:
+        Dict mapping "{key_name}/{stat}" to its value for stat in mean, max, min, median, stddev (nan for a single value), and histogram (a wandb.Histogram).
+    """
     return {
         f"{key_name}/mean": sum(values) / batch_size,
         f"{key_name}/max": max(values),
