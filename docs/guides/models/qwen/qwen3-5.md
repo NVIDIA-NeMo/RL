@@ -35,17 +35,20 @@ convergence.
 | --- | --- | --- | --- | --- |
 | `Qwen/Qwen3.5-9B-Base` | LLM (dense) | Megatron | TP | vLLM |
 | `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | Megatron | EP + TP + CP | vLLM |
-| `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | AutoModel (DTensor) | EP | vLLM |
-| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | Megatron / AutoModel | EP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | AutoModel (DTensor) | EP + CP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | Megatron | EP + CP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | AutoModel (DTensor) | EP | vLLM |
 | `Qwen/Qwen3.5-397B-A17B` | LLM (MoE) | Megatron | TP + PP + EP | vLLM |
 
 Notes on backends and parallelism:
 
 - **Megatron (MCore)** supports the widest parallelism for Qwen3.5 MoE, including
-  Context Parallel (CP) for longer sequences (see [#2312](https://github.com/NVIDIA-NeMo/RL/pull/2312)).
-- **AutoModel (DTensor)** supports Expert Parallel (EP). For Qwen3.5 MoE and Context Parallel on
-  AutoModel, the TE backend and `flash-linear-attention` are required; **dense
-  Qwen3.5 does not support Context Parallel on AutoModel** (set `cp_size = 1`). See
+  Context Parallel (CP) for longer sequences on both the LLM and the VLM (see
+  [#2312](https://github.com/NVIDIA-NeMo/RL/pull/2312)).
+- **AutoModel (DTensor)** supports Expert Parallel (EP), and Context Parallel for
+  the MoE **LLM** only; CP on AutoModel requires the TE backend and
+  `flash-linear-attention`. **Dense Qwen3.5 and the VLM do not support Context
+  Parallel on AutoModel** (set `cp_size = 1`). See
   [`flash-linear-attention` Performance](#flash-linear-attention-performance).
 
 ## Example Recipes
@@ -86,8 +89,8 @@ uv run examples/run_grpo.py \
 
 ### 35B-A3B GRPO (Megatron or AutoModel)
 
-Select the backend you want to validate. Megatron supports the widest parallelism
-(including CP); AutoModel uses Expert Parallel on the DTensor backend.
+Select the backend you want to validate. Both backends support Context Parallel for
+the 35B-A3B LLM; Megatron additionally supports Tensor Parallel.
 
 ```sh
 # Megatron (EP16 TP2 CP2)
@@ -183,9 +186,10 @@ full speed. There are two distinct cases:
 - **Hard requirement for AutoModel Qwen3.5 MoE and Context Parallel.** When
   `context_parallel_size > 1` for a Qwen3.5 MoE model on the AutoModel backend,
   NeMo RL requires FLA and raises `ImportError` if it is missing (see the `import
-  fla` guard in the `nemo_rl/models/automodel/setup.py` file). Context Parallel for Qwen3.5 MoE on
-  AutoModel also requires the TE backend; **dense Qwen3.5 does not support Context Parallel on
-  AutoModel** (set `cp_size = 1`).
+  fla` guard in the `nemo_rl/models/automodel/setup.py` file). Context Parallel on
+  AutoModel applies to the MoE **LLM** only and also requires the TE backend;
+  **neither dense Qwen3.5 nor the VLM supports Context Parallel on AutoModel**
+  (set `cp_size = 1`).
 
 > [!NOTE]
 > Starting with the v0.7.0 release container, FLA is installed in the AutoModel
