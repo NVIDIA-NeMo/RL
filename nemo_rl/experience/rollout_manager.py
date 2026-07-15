@@ -21,7 +21,8 @@ import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
@@ -47,7 +48,7 @@ class AsyncRolloutImpl:
     def __init__(
         self,
         tokenizer: TokenizerType,
-        task_to_env: dict[str, EnvironmentInterface],
+        env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         policy_generation: GenerationInterface,
@@ -55,7 +56,7 @@ class AsyncRolloutImpl:
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
-        self._task_to_env = task_to_env
+        self._env_handles = env_handles
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
@@ -188,7 +189,7 @@ class AsyncRolloutImpl:
             # step. In this case, need to wrap with asyncio.to_thread to make
             # this function yieldable.
             env_output = await asyncio.to_thread(
-                calculate_rewards, sample_batch, self._task_to_env
+                calculate_rewards, sample_batch, self._env_handles
             )
 
             # Update reward and termination statistics
@@ -399,15 +400,15 @@ class AsyncNemoGymRolloutImpl:
     def __init__(
         self,
         tokenizer: TokenizerType,
-        task_to_env: dict[str, EnvironmentInterface],
+        env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         generation_config: GenerationConfig,
-        max_rollout_turns: Optional[int] = None,
+        max_rollout_turns: int,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
-        self._task_to_env = task_to_env
+        self._env_handles = env_handles
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
@@ -429,7 +430,7 @@ class AsyncNemoGymRolloutImpl:
         timer.start(f"{timer_prefix}/total")
 
         rollout_inputs = self._build_inputs(input_sample)
-        completions, rollout_metrics = await self._run_rollouts(
+        completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
 
@@ -438,7 +439,7 @@ class AsyncNemoGymRolloutImpl:
 
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
-            prompt=input_sample["message_log"],
+            prompt=prompt_message_log,
             extra_env_info=input_sample["extra_env_info"],
             metadata={"task_name": "nemo_gym"},
             completions=completions,
@@ -454,8 +455,9 @@ class AsyncNemoGymRolloutImpl:
             )
 
         # Validate max_rollout_turns.
-        assert self._max_rollout_turns is None, (
-            "`max_rollout_turns` is not supported in NeMo-Gym path!"
+        assert self._max_rollout_turns == 1, (
+            "`max_rollout_turns` is not supported in NeMo-Gym path! "
+            "Please set `max_rollout_turns` to 1."
         )
 
     def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
@@ -488,15 +490,18 @@ class AsyncNemoGymRolloutImpl:
 
     async def _run_rollouts(
         self, inputs: list[dict], timer: Timer, timer_prefix: str
-    ) -> tuple[list[Completion], dict[str, Any]]:
-        """Dispatch rows to NeMo-Gym and return completions + metrics."""
-        nemo_gym_env = self._task_to_env["nemo_gym"]
+    ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
+        """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
+        nemo_gym_env = self._env_handles["nemo_gym"]
 
         # Run generation.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results, env_timing_metrics = await nemo_gym_env.run_rollouts.remote(
                 inputs, self._tokenizer, timer_prefix
             )
+            # All N rollouts share the same input prompt; tensorize one copy.
+            prompt_message_log = results[0]["input_message_log"]
+            _tensorize_by_key(prompt_message_log, "token_ids")
             # Convert results to completions.
             completions = [self._result_to_completion(r) for r in results]
 
@@ -508,12 +513,11 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_metrics.update(env_timing_metrics)
 
-        return completions, rollout_metrics
+        return completions, prompt_message_log, rollout_metrics
 
     def _result_to_completion(self, result: dict) -> Completion:
         """Convert one run_rollouts result dict into a Completion."""
         # Tensorize token fields.
-        _tensorize_by_key(result["input_message_log"], "token_ids")
         _tensorize_by_key(result["message_log"], "token_ids")
         _tensorize_by_key(
             [m for m in result["message_log"] if m["role"] == "assistant"],
@@ -611,18 +615,19 @@ class AsyncNemoGymRolloutImpl:
 
 
 class RolloutManager:
-    """Factory that routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym)."""
+    """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
     def __init__(
         self,
         tokenizer: TokenizerType,
-        task_to_env: dict[str, EnvironmentInterface],
+        env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         max_rollout_turns: Optional[int] = None,
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
+        tq_buffer: Optional[TQReplayBuffer] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -643,13 +648,52 @@ class RolloutManager:
 
         self._impl: AsyncRolloutImpl | AsyncNemoGymRolloutImpl = rollout_cls(
             tokenizer=tokenizer,
-            task_to_env=task_to_env,
+            env_handles=env_handles,
             num_generations_per_prompt=num_generations_per_prompt,
             max_seq_len=max_seq_len,
             max_rollout_turns=max_rollout_turns,  # type: ignore
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
         )
+        self._tokenizer = tokenizer
+        self._num_generations_per_prompt = num_generations_per_prompt
+        self._tq_buffer = tq_buffer
+        self._weight_version: int = 0
+
+    def set_weight_version(self, version: int) -> None:
+        """Set the weight_version used for rollout tags.
+
+        Args:
+            version: Trainer weight version to stamp on future rollout tags.
+        """
+        self._weight_version = int(version)
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         return await self._impl.run_rollout(input_sample)
+
+    async def generate_and_push(
+        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+    ) -> None:
+        """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
+
+        Args:
+            input_sample: A single prompt (one DatumSpec entry).
+            target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
+        """
+        assert self._tq_buffer is not None, (
+            "generate_and_push requires tq_buffer to be set at __init__"
+        )
+        start_version = self._weight_version
+        group_id = self._tq_buffer.reserve(
+            weight_version=start_version, target_step=target_step
+        )
+
+        record = await self.run_rollout(input_sample)
+        end_version = self._weight_version
+
+        await self._tq_buffer.commit(
+            group_id,
+            record,
+            start_weight_version=start_version,
+            end_weight_version=end_version,
+        )
