@@ -83,9 +83,14 @@ class PY_EXECUTABLES:
 # the full layout including Ray's own GCS / worker gRPC ports.
 #
 #   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
-#   3000-4999    NeMo RL generation HTTP servers (policy.generation.port_range_low/high)
+#   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
+#                                                 (policy.generation.port_range_low/high)
 #   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
-#   7000-8999    vLLM / SGLang engine rendezvous (VLLM_PORT env var / SGLang base_port)
+#   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
+#   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
+#                                                 carved out of the vLLM band — only one rollout
+#                                                 backend runs at a time)
+#   8800-8999    SGLang Prometheus metrics       (DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_*, hard-coded)
 DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
 DEFAULT_GYM_PORT_RANGE_LOW = 5000
@@ -95,6 +100,14 @@ DEFAULT_GYM_PORT_RANGE_HIGH = 5999
 # 7000 + 8*100 = 7800, still below the 9000 ephemeral floor.
 DEFAULT_VLLM_PORT_RANGE_LOW = 7000
 DEFAULT_VLLM_PORTS_PER_ENGINE = 100
+# SGLang control-plane ports, carved out of the top of the vLLM rendezvous band —
+# safe because only one rollout backend runs at a time, and a vLLM run only
+# climbs past 8600 with >=16 engines on a single node.  Both bands also steer
+# clear of the Ray dashboard carve-out at 8265 (see ray.sub).
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 8600
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 8799
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 8800
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 8999
 # Master address / TCPStore range, tucked below the Ray worker-gRPC band (2000+).
 DEFAULT_MASTER_PORT_RANGE_LOW = 1400
 DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
@@ -122,7 +135,9 @@ Nodes sharing the same key belong to the same NVLink switch fabric (e.g. one GB2
 TOPO_RANK_KEY = "topo_rank"
 """Ray resource key for the SLURM topological rank.
 Derived from ``SLURM_TOPOLOGY_ADDR`` (when ``SLURM_TOPOLOGY_ADDR_PATTERN=block.node``),
-falling back to ``SLURM_PROCID`` or hostname digits.
+falling back to ``SLURM_PROCID + 2`` on worker nodes (head node is pinned to ``1``),
+then to hostname digits when SLURM is unavailable. Values are always ``>= 1`` so that
+Ray does not drop the custom resource (Ray drops value-0 custom resources).
 Used to sort nodes within and across NVLink domains so rank assignment follows physical topology."""
 
 NVLINK_DOMAIN_UNKNOWN = "unknown"
@@ -181,6 +196,40 @@ def _get_free_port_local(
         s.listen(1)
 
     return port
+
+
+def _get_free_consecutive_ports_local(
+    port_range_low: int,
+    port_range_high: int,
+    consecutive: int = 1,
+    start_port: Optional[int] = None,
+) -> int:
+    """Find ``consecutive`` contiguous bindable ports and return the base.
+
+    Scans upward from *start_port* within [port_range_low, port_range_high).
+    *start_port* lets a caller thread a per-node cursor so successive blocks do
+    not overlap. Raises ``RuntimeError`` if no such block exists in the range.
+    """
+    assert consecutive >= 1, f"consecutive must be >= 1, got {consecutive}"
+    base = port_range_low if start_port is None else max(start_port, port_range_low)
+    while base + consecutive - 1 < port_range_high:
+        socks: list[socket.socket] = []
+        try:
+            for offset in range(consecutive):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                s.listen(1)
+                socks.append(s)
+            return base
+        except OSError:
+            base += 1
+        finally:
+            for s in socks:
+                s.close()
+    raise RuntimeError(
+        f"Could not find {consecutive} consecutive free ports in "
+        f"[{port_range_low}, {port_range_high})."
+    )
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:
@@ -1018,6 +1067,11 @@ class RayVirtualCluster:
 
         This method is idempotent and can be safely called multiple times.
         """
+        # Skip if Ray is already gone (typically from __del__ during _Py_Finalize
+        # after Ray's atexit teardown). Any Ray API call would trigger a fatal
+        # core_worker_process.cc:88 CHECK. Placement groups die with Ray.
+        if not ray.is_initialized():
+            return True
         if self._node_placement_groups is not None:
             # Remove all placement groups
             for pg in self._node_placement_groups:

@@ -293,6 +293,7 @@ def test_build_in_dataset(dataset_name, tokenizer):
     [
         ("OpenMathInstruct-2", "expected_answer"),
         ("OpenMathInstruct-2", "generated_solution"),
+        ("OpenR1-Math-220k", None),
         ("tulu3_sft_mixture", None),
     ],
 )

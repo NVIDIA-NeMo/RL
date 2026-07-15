@@ -465,8 +465,8 @@ class TQPolicy(Policy):
 
     # ── split-API fanout (SC async path) ───────────────────────────────────
     #
-    # Counterpart to :meth:`train_from_meta`, exposed to ``PolicyTrainerActor``
-    # so :class:`SingleControllerActor` can stream microbatches without
+    # Counterpart to :meth:`train_from_meta`, consumed directly by
+    # :class:`SingleControllerActor` so it can stream microbatches without
     # forcing a full-step optimizer.step on every dispatch.
     #
     # Lifecycle (one step open at a time — workers raise on a second

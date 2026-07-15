@@ -1807,6 +1807,24 @@ def _build_async_grpo_train_data(
     return train_data
 
 
+def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
+    """Zero loss_multiplier where mask_sample is True and return the count."""
+    if "mask_sample" not in repeated_batch:
+        return 0
+
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    mask_sample = repeated_batch["mask_sample"]
+
+    if isinstance(mask_sample, list):
+        mask_sample = torch.tensor(mask_sample, dtype=torch.bool)
+    mask_sample_bool = mask_sample.bool()
+
+    num_masked = int(mask_sample_bool.sum().item())
+    loss_multiplier[mask_sample_bool] = 0
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return num_masked
+
+
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     """Determine if NeMo-Gym should be used for rollouts and validation based on the configuration."""
     env_config = master_config.env
@@ -2367,6 +2385,8 @@ def grpo_train(
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -2672,6 +2692,10 @@ def grpo_train(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
+                    metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
+
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -3010,12 +3034,16 @@ def grpo_train(
                 consumed_samples += master_config.grpo.num_prompts_per_step
                 timeout.mark_iteration()
 
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
-                # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
@@ -3850,6 +3878,8 @@ def async_grpo_train(
     timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     # Main training loop
     try:
         while step < master_config.grpo.max_num_steps:
@@ -3861,6 +3891,8 @@ def async_grpo_train(
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
             with timer.time("total_step_time"):
+                num_mask_sample_filtered = 0
+
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
                 with timer.time("exposed_generation"):
@@ -4035,6 +4067,11 @@ def async_grpo_train(
 
                             loss_multiplier[truncated] = 0
                             repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    with timer.time("mask_sample_filter"):
+                        num_mask_sample_filtered = _apply_mask_sample_filter(
+                            repeated_batch
+                        )
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -4309,6 +4346,7 @@ def async_grpo_train(
                 metrics = {
                     "loss": train_results["loss"].numpy(),
                     "reward": rewards.numpy(),
+                    "num_mask_sample_filtered": num_mask_sample_filtered,
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
@@ -4367,11 +4405,12 @@ def async_grpo_train(
                 consumed_samples += master_config.grpo.num_prompts_per_step
                 timeout.mark_iteration()
 
+                # +1 because step is 0-indexed
                 should_save_by_step = (
                     is_last_step
                     or (step + 1) % master_config.checkpointing["save_period"] == 0
+                    or (ft_save_period is not None and (step + 1) % ft_save_period == 0)
                 )
-                # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 

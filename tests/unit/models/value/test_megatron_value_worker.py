@@ -52,6 +52,7 @@ from nemo_rl.models.policy import (
 )
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.lm_value import Value
+from nemo_rl.utils.checkpoint import CheckpointManager
 
 pytestmark = pytest.mark.mcore
 
@@ -695,25 +696,17 @@ def test_value_worker_train_decreases_loss(value_setup):
     ids=["2gpu_dp2"],
 )
 def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
-    """Full save → shutdown → restore round-trip with state correctness checks.
+    """Round-trip model, optimizer, and scheduler state through an MCore checkpoint.
 
-    Captures `get_values` outputs at three model states and cross-checks them
-    to prove the checkpoint round-trip actually persists trained weights:
+    MCore embeds optimizer and scheduler state in the weights distributed
+    checkpoint; it does not create the logical ``value/optimizer`` path. This
+    test verifies that the resume-path resolver still enables optimizer loading,
+    then re-saves the restored worker and compares the logical checkpoint state.
 
-      * **fresh** — Value just constructed, no training done
-      * **saved** — same Value after one train step (right before save)
-      * **resumed** — fresh Value constructed with `weights_path=<ckpt>` after
-        the original is shut down
-
-    Hard assertion: ``resumed != fresh`` — proves the load did something
-    non-trivial (it did NOT silently fall back to a fresh init).
-
-    Soft check (warning only): ``resumed ≈ saved`` — proves the load restored
-    the exact trained state. Mirrors `test_megatron_checkpoint_save_kill_and_restore`
-    in not hard-failing on mismatch because Megatron distributed checkpoints
-    have known numerical non-determinism across sharded reduce/allgather paths.
-
-    Also exercises T12's `.exists()` guard on the resume path.
+    The restored output differing from fresh initialization proves that model
+    weights were loaded. Comparing the plain distributed tensors covers model
+    and optimizer tensors, while comparing the common state covers optimizer
+    metadata and the parameter scheduler.
     """
     value, cluster, data, loss_fn = value_setup
 
@@ -725,7 +718,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     value.train(data, loss_fn)
     value.finish_training()
 
-    # State 2: saved — capture get_values output after training, before save.
+    # Put the trained model in inference state before saving.
     # Keep the model on GPU (no `finish_inference` here) because the next
     # `save_checkpoint` call below expects live GPU storage for the sharded
     # dist_checkpoint write — offloading first triggers
@@ -734,7 +727,10 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     # `test_megatron_checkpoint_save_kill_and_restore` policy-worker test,
     # which also saves while still in inference mode.
     value.prepare_for_inference()
-    values_saved = value.get_values(data)["values"].detach().cpu()
+    values_trained = value.get_values(data)["values"].detach().cpu()
+    assert not torch.allclose(values_trained, values_fresh, atol=1e-4), (
+        "Training should change value predictions before checkpointing"
+    )
 
     # Save weights + optimizer alongside the way `ppo.setup()` does:
     #   <ckpt_root>/value/weights/  ,  <ckpt_root>/value/optimizer/
@@ -756,15 +752,15 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     saved_model_name = value.cfg["model_name"]
     value.shutdown()
 
-    # Mirror the T12 resume path in `ppo.setup()` — directly probe value
-    # subdir paths with .exists() rather than going through
-    # `CheckpointManager.get_resume_paths` (that helper is hardcoded to look
-    # under `<root>/policy/...` and only resolves the policy checkpoint).
-    _value_weights = Path(ckpt_root) / "value" / "weights"
-    _value_optim = Path(ckpt_root) / "value" / "optimizer"
-    assert _value_weights.exists(), f"saved value weights missing at {_value_weights}"
-    resume_weights_path = _value_weights
-    resume_optimizer_path = _value_optim if _value_optim.exists() else None
+    # MCore embeds optimizer state under weights; the nonexistent optimizer
+    # path is a non-None sentinel that enables loading in Megatron Bridge.
+    assert not Path(optimizer_path).exists()
+    resume_weights_path, resume_optimizer_path = CheckpointManager.get_resume_paths(
+        ckpt_root,
+        model_component="value",
+    )
+    assert resume_weights_path == Path(weights_path)
+    assert resume_optimizer_path == Path(optimizer_path)
 
     # Reconstruct the value worker pointed at the saved checkpoint.
     config = _create_value_test_config(model_name=saved_model_name)
@@ -793,28 +789,80 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
             "Resumed worker get_values should not produce Infs"
         )
 
-        # HARD: resumed should differ from fresh — proves the load actually
-        # restored the trained weights (not a silent fallback to fresh init).
-        assert not torch.allclose(values_resumed, values_fresh, atol=1e-4), (
-            "Resumed get_values should differ from fresh-init values. "
-            "If equal, the checkpoint load silently fell back to a fresh "
-            "initialization instead of loading the trained weights."
+        # The restored model must exactly reproduce the state that was saved,
+        # rather than merely differ from fresh initialization.
+        torch.testing.assert_close(
+            values_resumed,
+            values_trained,
+            msg="Resumed value predictions should match the saved trained model",
         )
+        # Re-save without another update. Comparing the two logical distributed
+        # checkpoints proves that optimizer tensors and scheduler state were
+        # loaded, rather than merely proving that they were present on disk.
+        resaved_weights_path = str(
+            tmp_path / "value_ckpt_resaved" / "value" / "weights"
+        )
+        resaved_optimizer_path = str(
+            tmp_path / "value_ckpt_resaved" / "value" / "optimizer"
+        )
+        resumed.save_checkpoint(
+            weights_path=resaved_weights_path,
+            optimizer_path=resaved_optimizer_path,
+        )
+        assert not Path(resaved_optimizer_path).exists()
 
-        # SOFT: resumed should match saved within tolerance. Warning only,
-        # mirroring `test_megatron_checkpoint_save_kill_and_restore`: Megatron
-        # distributed ckpts have small reproducibility deltas from sharded
-        # reduce/allgather ordering and we don't want CI flakiness here. The
-        # hard `resumed != fresh` check above already proves the load worked.
-        if torch.allclose(values_resumed, values_saved, atol=1e-4):
-            print("✓ Resumed values match saved values within tolerance")
-        else:
-            max_diff = (values_resumed - values_saved).abs().max().item()
-            mean_diff = (values_resumed - values_saved).abs().mean().item()
-            print(
-                f"⚠ Resumed values differ from saved (max={max_diff:.4g}, "
-                f"mean={mean_diff:.4g}) — likely Megatron numerical "
-                "non-determinism, not a load bug (resumed != fresh asserted above)."
-            )
+        saved_iteration_dirs = sorted(Path(weights_path).glob("iter_*"))
+        resaved_iteration_dirs = sorted(Path(resaved_weights_path).glob("iter_*"))
+        assert len(saved_iteration_dirs) == 1
+        assert len(resaved_iteration_dirs) == 1
+
+        # Megatron is optional outside the MCore test environment, so defer
+        # these imports until this MCore-only test executes.
+        from megatron.core.dist_checkpointing import (
+            load_common_state_dict,
+            load_plain_tensors,
+        )
+        from megatron.core.dist_checkpointing.dict_utils import diff
+
+        saved_iteration = str(saved_iteration_dirs[0])
+        resaved_iteration = str(resaved_iteration_dirs[0])
+        # MCore's plain-tensor reader calls torch.distributed.get_rank() even
+        # though the underlying DCP load uses no_dist=True. The pytest driver is
+        # not part of the workers' process groups, so give this comparison a
+        # temporary, isolated single-rank group. This satisfies MCore's caller
+        # contract while following the test-local PG lifecycle used elsewhere.
+        created_process_group = False
+        try:
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(
+                    backend="gloo",
+                    init_method=f"file://{tmp_path / 'checkpoint_compare_pg'}",
+                    rank=0,
+                    world_size=1,
+                )
+                created_process_group = True
+
+            saved_tensors = load_plain_tensors(saved_iteration)
+            resaved_tensors = load_plain_tensors(resaved_iteration)
+            tensor_keys = {str(key) for key in saved_tensors}
+            for optimizer_state in ("exp_avg", "exp_avg_sq"):
+                assert any(
+                    key.startswith("optimizer.") and optimizer_state in key.split(".")
+                    for key in tensor_keys
+                ), f"Saved checkpoint should contain Adam {optimizer_state} tensors"
+            tensor_diffs = diff(saved_tensors, resaved_tensors)
+            assert not any(map(bool, tensor_diffs)), tensor_diffs
+
+            saved_common = load_common_state_dict(saved_iteration)
+            resaved_common = load_common_state_dict(resaved_iteration)
+            for state_key in ("optimizer", "opt_param_scheduler"):
+                assert state_key in saved_common
+                assert state_key in resaved_common
+                state_diffs = diff(saved_common[state_key], resaved_common[state_key])
+                assert not any(map(bool, state_diffs)), state_diffs
+            assert saved_common["opt_param_scheduler"]["num_steps"] > 0
+        finally:
+            if created_process_group and torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
     finally:
         resumed.shutdown()

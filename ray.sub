@@ -140,12 +140,15 @@ fi
 #   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
 #   1400-1999    Master address / TCPStore (cluster.master_port_range_low/high)
 #   2000-2999    Ray worker gRPC (min/max-worker-port)
-#   3000-4999    NeMo RL generation HTTP servers (policy.generation.port_range_low/high)
+#   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
+#                (policy.generation.port_range_low/high)
 #   5000-5999    NeMo Gym HTTP servers (Gym global config port_range_low/high)
 #   6000         Sandbox Nginx (NEMO_SKILLS_SANDBOX_PORT)
 #   6001-6999    Sandbox uWSGI workers (SANDBOX_BASE_PORT)
-#   7000-8999    vLLM / SGLang engine rendezvous (VLLM_PORT in vllm_worker.py / SGLang base_port)
+#   7000-8999    vLLM engine rendezvous (VLLM_PORT in vllm_worker.py)
 #   8265         Ray Dashboard (DASHBOARD_PORT; reserved carve-out inside the 7000-8999 band)
+#   8600-8799    SGLang router (carve-out inside the 7000-8999 band; only one rollout backend runs)
+#   8800-8999    SGLang Prometheus metrics (carve-out inside the 7000-8999 band)
 MIN_WORKER_PORT=${MIN_WORKER_PORT:-2000}
 MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
 ########################################################
@@ -399,7 +402,7 @@ ip_head=$head_node_ip:$PORT
 # TOPO_RANK: Topology-aware infrastructure rank.
 #   Fallback chain:
 #   1. SLURM_TOPOLOGY_ADDR (block.node format) -> block_num * 10^10 + node_num
-#   2. SLURM_PROCID (SLURM without topology plugin)
+#   2. SLURM_PROCID + 2 on workers, head pinned to 1 (SLURM without topology plugin)
 #   3. Hostname digits (non-SLURM fallback)
 #
 # TODO(ansubramania): Harden the SLURM_TOPOLOGY_ADDR digit-extraction logic for open source.
@@ -426,7 +429,14 @@ if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "
     TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
   fi
 elif [[ -n "\${SLURM_PROCID:-}" ]]; then
-  TOPO_RANK=\$(( 10#\$SLURM_PROCID ))
+  # Head srun and worker srun each start their own SLURM_PROCID counter at 0.
+  # Head hardcoded to 1; workers get +2 so worker[0]=2, worker[62]=64 -- keeps
+  # all nodes at unique values >=1 (Ray drops value-0 custom resources).
+  if [[ "\$SLURMD_NODENAME" == "$head_node" ]]; then
+    TOPO_RANK=1
+  else
+    TOPO_RANK=\$(( 10#\$SLURM_PROCID + 2 ))
+  fi
 else
   _hostname_digits=\$(hostname | tr -dc '0-9')
   if [[ -n "\$_hostname_digits" ]]; then
