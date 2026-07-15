@@ -34,12 +34,16 @@ os.environ.setdefault("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "false")
 
 import ray
 
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _get_free_port_local,
+)
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
-    find_available_port,
     get_host_info,
 )
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -120,10 +124,17 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
         router_port=router_info["port"],
     )
 
+    # Materialize the sglang venv so the actor doesn't inherit the driver's
+    # base venv (e.g. /opt/nemo_rl_venv in CI containers).
+    runtime_env = make_actor_runtime_env(
+        "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
+    )
+    runtime_env["env_vars"].update(make_actor_env_vars())
+
     worker = SGLangGenerationWorker.options(
         num_cpus=0.2,
         num_gpus=0.2,
-        runtime_env={"env_vars": make_actor_env_vars()},
+        runtime_env=runtime_env,
     ).remote(
         gpus_per_node,
         sglang_cfg,
@@ -133,9 +144,10 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
     )
 
     host_ip = get_host_info()[1]
-    port = find_available_port(30000 + rank * 1000)
-    nccl_port = find_available_port(40000 + rank * 1000)
-    dist_init_port = find_available_port(50000 + rank * 1000)
+    band_low = DEFAULT_GENERATION_PORT_RANGE_LOW + rank * 1000
+    port = _get_free_port_local(band_low, band_low + 300)
+    nccl_port = _get_free_port_local(band_low + 300, band_low + 600)
+    dist_init_port = _get_free_port_local(band_low + 600, band_low + 1000)
 
     ray.get(
         worker.init.remote(

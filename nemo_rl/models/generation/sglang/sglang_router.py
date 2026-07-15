@@ -14,18 +14,21 @@
 
 import logging
 import multiprocessing
-import random
 import time
 
 import ray
 
-from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH,
+    DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW,
+    DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW,
+    _get_free_port_local,
+)
 from nemo_rl.models.generation.sglang.config import SGLangRouterConfig
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
-from nemo_rl.models.generation.sglang.utils.ray_utils import (
-    find_available_port,
-    get_host_info,
-)
+from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +54,20 @@ class RouterActor:
         router_ip = _wrap_ipv6(get_host_info()[1])
         router_port = router_cfg.get("sglang_router_port")
         if router_port is None:
-            router_port = find_available_port(random.randint(3000, 4000))
+            router_port = _get_free_port_local(
+                DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW,
+                DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH,
+            )
 
         router_args = RouterArgs()
         router_args.host = router_ip
         router_args.port = router_port
         if router_cfg.get("router_policy") is not None:
             router_args.router_policy = router_cfg["router_policy"]
-        router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+        router_args.prometheus_port = _get_free_port_local(
+            DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW,
+            DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH,
+        )
         router_args.log_level = "warn"
         request_timeout_secs = router_cfg.get("sglang_router_request_timeout_secs")
         if request_timeout_secs is not None:
@@ -112,7 +121,9 @@ def _start_router(
         return router_cfg["sglang_router_ip"], router_cfg["sglang_router_port"], None
 
     router_actor = RouterActor.options(
-        runtime_env={"py_executable": SGLANG_EXECUTABLE},
+        runtime_env=make_actor_runtime_env(
+            "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
+        ),
     ).remote()
     router_ip, router_port = ray.get(router_actor.init.remote(dict(router_cfg)))
     logger.info(f"Router launched at {router_ip}:{router_port}")

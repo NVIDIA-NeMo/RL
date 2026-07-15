@@ -44,6 +44,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.lm_value import Value
+from nemo_rl.utils.checkpoint import CheckpointManager
 
 pytestmark = pytest.mark.mcore
 
@@ -98,6 +99,7 @@ def _create_value_test_config(
             "moe_shared_expert_overlap": False,
             "defer_fp32_logits": None,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "train_iters": 100,
             "optimizer": {
                 "optimizer": "adam",
@@ -147,7 +149,7 @@ def _create_value_test_config(
 
 
 def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
-    """Apply test config overrides in place (precision / SP / PP / dynamic batching)."""
+    """Apply test config overrides in place (precision / SP / PP / CP / dynamic batching / sequence packing)."""
     for k, v in config_updates.items():
         if k == "precision":
             config["precision"] = v
@@ -167,6 +169,21 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
                 "logprob_mb_tokens": lbt,
                 "sequence_length_round": 64,
             }
+        elif k == "sequence_packing":
+            mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
+            config["sequence_packing"] = {
+                "enabled": v,
+                "train_mb_tokens": mbt,
+                "logprob_mb_tokens": mbt,
+                "algorithm": "modified_first_fit_decreasing",
+            }
+        elif k == "context_parallel_size":
+            config["megatron_cfg"]["context_parallel_size"] = v
+            # CP splits each packed sequence into 2*CP load-balanced chunks, so
+            # the padded sequence length must be divisible by 2*CP*TP.
+            config["make_sequence_length_divisible_by"] = (
+                2 * v * config["megatron_cfg"]["tensor_model_parallel_size"]
+            )
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
 
@@ -307,9 +324,30 @@ def test_value_worker_init_and_get_values(value_setup):
         (2, 2, 1, 1, {}),
         (2, 2, 1, 1, {"sequence_parallel": True}),
         (2, 1, 1, 1, {"dynamic_batching": True}),
+        (2, 1, 1, 1, {"sequence_packing": True}),
+        (2, 1, 2, 1, {"sequence_packing": True}),
+        (
+            2,
+            1,
+            1,
+            2,
+            {
+                "sequence_packing": True,
+                "context_parallel_size": 2,
+                "precision": "bfloat16",
+            },
+        ),
     ],
     indirect=True,
-    ids=["2gpu_dp2", "2gpu_tp2", "2gpu_tp2sp", "2gpu_dp2_dynbatch"],
+    ids=[
+        "2gpu_dp2",
+        "2gpu_tp2",
+        "2gpu_tp2sp",
+        "2gpu_dp2_dynbatch",
+        "2gpu_dp2_seqpack",
+        "2gpu_pp2_seqpack",
+        "2gpu_cp2_seqpack",
+    ],
 )
 def test_value_worker_train_step(value_setup):
     """One `train()` call should produce a finite, non-negative MSE value loss."""
@@ -341,8 +379,14 @@ def test_value_worker_train_step(value_setup):
         (2, {"sequence_parallel": True}),
         (1, {"dynamic_batching": True}),
         (1, {"pipeline_model_parallel_size": 2}),
+        (1, {"sequence_packing": True}),
     ],
-    ids=["sequence_parallel", "dynamic_batching", "pipeline_parallel"],
+    ids=[
+        "sequence_parallel",
+        "dynamic_batching",
+        "pipeline_parallel",
+        "sequence_packing",
+    ],
 )
 def test_value_worker_parallelism_equivalence(
     tiny_qwen2_model_path, tmp_path, tp, feature_updates
@@ -361,6 +405,8 @@ def test_value_worker_parallelism_equivalence(
       * pipeline parallelism — guards the head output broadcasts from the last
         pipeline stage to all ranks, and the value head reshards across a
         save@pp1 / load@pp2 checkpoint.
+      * sequence packing — guards the packed [1, T] -> [B, S] unpack + per-sequence
+        shift round-trips back to the unpacked layout.
     """
     cluster = None
     ref = None
@@ -375,14 +421,20 @@ def test_value_worker_parallelism_equivalence(
             max_colocated_worker_groups=1,
         )
 
-        # Deterministic batch (get_values only needs input_ids + input_lengths).
         torch.manual_seed(42)
-        batch, seq_len = 8, 64
+        batch, max_seq_len = 8, 64
+        # Non-uniform input_lengths so dynamic batching actually reorders samples.
+        input_lengths = torch.randint(
+            max_seq_len // 2, max_seq_len + 1, (batch,), dtype=torch.int32
+        )
+        attention_mask = (
+            torch.arange(max_seq_len)[None, :] < input_lengths[:, None]
+        ).to(torch.float32)
         data = BatchedDataDict(
             {
-                "input_ids": torch.randint(0, 151000, (batch, seq_len)),
-                "input_lengths": torch.full((batch,), seq_len, dtype=torch.int32),
-                "attention_mask": torch.ones(batch, seq_len),
+                "input_ids": torch.randint(0, 151000, (batch, max_seq_len)),
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
             }
         )
 
@@ -410,7 +462,12 @@ def test_value_worker_parallelism_equivalence(
         )
         values_feat = feat.get_values(data)["values"].detach().cpu()
 
-        torch.testing.assert_close(values_feat, values_ref, rtol=1e-3, atol=1e-3)
+        # Padded positions can differ legitimately (the packed-path unpack
+        # zero-fills them; the unpacked path runs the model on padding).
+        mask = attention_mask.bool()
+        torch.testing.assert_close(
+            values_feat[mask], values_ref[mask], rtol=1e-3, atol=1e-3
+        )
     finally:
         if ref is not None:
             ref.shutdown()
@@ -418,6 +475,164 @@ def test_value_worker_parallelism_equivalence(
             feat.shutdown()
         if cluster is not None:
             cluster.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(420)
+def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_path):
+    """Context parallelism must not change values.
+
+    CP needs bf16 (TransformerEngine has no fp32 CP + THD attention backend) and
+    sequence packing, so compare ``get_values`` between CP=1 and CP=2 — both
+    bf16 + packed — with the value head pinned via save/reload. Guards the
+    packed-sequence CP all-gather, which de-interleaves the 2*CP load-balanced
+    shards and reassembles per-token values (a wrong gather still yields finite
+    values, so finiteness alone would not catch it).
+    """
+    cluster = None
+    ref = None
+    feat = None
+    try:
+        cluster = RayVirtualCluster(
+            name="test-megatron-value-equiv-context_parallel",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+
+        torch.manual_seed(42)
+        batch, seq_len = 8, 64
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 151000, (batch, seq_len)),
+                "input_lengths": torch.full((batch,), seq_len, dtype=torch.int32),
+                "attention_mask": torch.ones(batch, seq_len),
+            }
+        )
+
+        # Reference: CP=1, bf16, packed.
+        ref_config = _create_value_test_config(
+            model_name=tiny_qwen2_model_path, tp=1, precision="bfloat16"
+        )
+        _apply_config_updates(ref_config, {"sequence_packing": True})
+        tokenizer = get_tokenizer(ref_config["tokenizer"])
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        values_ref = ref.get_values(data)["values"].detach().cpu()
+
+        # Save weights, then reload into the CP=2 worker (same weights).
+        weights_path = os.path.join(str(tmp_path), "value", "weights")
+        ref.prepare_for_inference()
+        ref.save_checkpoint(weights_path=weights_path)
+        ref.shutdown()
+        ref = None
+
+        # Feature: CP=2, bf16, packed.
+        feat_config = _create_value_test_config(
+            model_name=tiny_qwen2_model_path, tp=1, precision="bfloat16"
+        )
+        _apply_config_updates(
+            feat_config, {"context_parallel_size": 2, "sequence_packing": True}
+        )
+        feat = Value(
+            cluster=cluster,
+            config=feat_config,
+            tokenizer=tokenizer,
+            weights_path=Path(weights_path),
+            name_prefix="lm_value_feat",
+        )
+        values_feat = feat.get_values(data)["values"].detach().cpu()
+
+        # bf16 tolerance, matching the policy CP equivalence test.
+        torch.testing.assert_close(values_feat, values_ref, rtol=1e-3, atol=1e-2)
+    finally:
+        if ref is not None:
+            ref.shutdown()
+        if feat is not None:
+            feat.shutdown()
+        if cluster is not None:
+            cluster.shutdown()
+
+
+@pytest.mark.mcore
+def test_unpack_value_sequences_variable_lengths():
+    """`_unpack_value_sequences` unpacks packed [1, T] values to [B, S] with a
+    per-sequence right-shift. Runs CPU-only (cp_group=None) and uses variable
+    lengths to cover what the uniform-length GPU equivalence test does not.
+    """
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _unpack_value_sequences,
+    )
+
+    seqs = [
+        torch.tensor([1.0, 2.0, 3.0]),
+        torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0]),
+        torch.tensor([7.0, 8.0]),
+    ]
+    packed = torch.cat(seqs).unsqueeze(0)  # [1, 10]
+    cu_seqlens_padded = torch.tensor([0, 3, 8, 10], dtype=torch.int32)
+    unpacked_seqlen = 5
+
+    out = _unpack_value_sequences(
+        packed, cu_seqlens_padded, unpacked_seqlen, cp_group=None
+    )
+
+    assert out.shape == (3, unpacked_seqlen)
+    expected = torch.zeros(3, unpacked_seqlen)
+    for i, v in enumerate(seqs):
+        # values[t] = V(state before token t): prepend 0, drop last.
+        expected[i, : v.shape[0]] = torch.cat([torch.zeros(1), v[:-1]])
+    torch.testing.assert_close(out, expected)
+
+
+def test_value_loss_prepare_fn_shift_and_truncate():
+    """`_value_loss_prepare_fn` (the value-model LossPostProcessor prepare_fn)
+    right-shifts the value-head output (values[t] = V(state before token t)),
+    drops a trailing singleton, and truncates to the returns length. CPU-only
+    (cp_group=None, so the CP all-gather is a no-op).
+    """
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_loss_prepare_fn,
+    )
+
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+    data = BatchedDataDict({"returns": torch.zeros(2, 3)})
+    # Right-shift by one, then truncate to the returns length (3).
+    expected = torch.tensor([[0.0, 1.0, 2.0], [0.0, 5.0, 6.0]])
+
+    out, _ = _value_loss_prepare_fn(logits, data, context_parallel_group=None)
+    torch.testing.assert_close(out["logits"], expected)
+
+    # The value head's trailing singleton [B, S, 1] is squeezed first.
+    out_3d, _ = _value_loss_prepare_fn(
+        logits.unsqueeze(-1), data, context_parallel_group=None
+    )
+    torch.testing.assert_close(out_3d["logits"], expected)
+
+
+def test_loss_post_processor_rejects_fuse_loss_with_custom_prepare_fn():
+    """The fused sequence-packing path prepares loss via
+    ``prepare_packed_loss_input`` and cannot honor a custom ``prepare_fn``. The
+    value model passes ``_value_loss_prepare_fn``, so ``fuse_loss=true`` together
+    with a custom ``prepare_fn`` must fail fast rather than silently bypass the
+    value-specific prep. CPU-only: the guard fires before any Megatron
+    parallel-state call.
+    """
+    from nemo_rl.models.megatron.train import LossPostProcessor
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_loss_prepare_fn,
+    )
+
+    loss_post_processor = LossPostProcessor(
+        loss_fn=lambda *args, **kwargs: None,
+        cfg={"sequence_packing": {"enabled": True, "fuse_loss": True}},
+        num_microbatches=1,
+        prepare_fn=_value_loss_prepare_fn,
+    )
+    # packed_seq_params only needs to be non-None; its attributes are read after
+    # the guard, so a bare sentinel suffices.
+    with pytest.raises(AssertionError, match="fuse_loss"):
+        loss_post_processor(BatchedDataDict({}), packed_seq_params=object())
 
 
 @pytest.mark.hf_gated
@@ -461,25 +676,17 @@ def test_value_worker_train_decreases_loss(value_setup):
     ids=["2gpu_dp2"],
 )
 def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
-    """Full save → shutdown → restore round-trip with state correctness checks.
+    """Round-trip model, optimizer, and scheduler state through an MCore checkpoint.
 
-    Captures `get_values` outputs at three model states and cross-checks them
-    to prove the checkpoint round-trip actually persists trained weights:
+    MCore embeds optimizer and scheduler state in the weights distributed
+    checkpoint; it does not create the logical ``value/optimizer`` path. This
+    test verifies that the resume-path resolver still enables optimizer loading,
+    then re-saves the restored worker and compares the logical checkpoint state.
 
-      * **fresh** — Value just constructed, no training done
-      * **saved** — same Value after one train step (right before save)
-      * **resumed** — fresh Value constructed with `weights_path=<ckpt>` after
-        the original is shut down
-
-    Hard assertion: ``resumed != fresh`` — proves the load did something
-    non-trivial (it did NOT silently fall back to a fresh init).
-
-    Soft check (warning only): ``resumed ≈ saved`` — proves the load restored
-    the exact trained state. Mirrors `test_megatron_checkpoint_save_kill_and_restore`
-    in not hard-failing on mismatch because Megatron distributed checkpoints
-    have known numerical non-determinism across sharded reduce/allgather paths.
-
-    Also exercises T12's `.exists()` guard on the resume path.
+    The restored output differing from fresh initialization proves that model
+    weights were loaded. Comparing the plain distributed tensors covers model
+    and optimizer tensors, while comparing the common state covers optimizer
+    metadata and the parameter scheduler.
     """
     value, cluster, data, loss_fn = value_setup
 
@@ -491,7 +698,7 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     value.train(data, loss_fn)
     value.finish_training()
 
-    # State 2: saved — capture get_values output after training, before save.
+    # Put the trained model in inference state before saving.
     # Keep the model on GPU (no `finish_inference` here) because the next
     # `save_checkpoint` call below expects live GPU storage for the sharded
     # dist_checkpoint write — offloading first triggers
@@ -500,7 +707,10 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     # `test_megatron_checkpoint_save_kill_and_restore` policy-worker test,
     # which also saves while still in inference mode.
     value.prepare_for_inference()
-    values_saved = value.get_values(data)["values"].detach().cpu()
+    values_trained = value.get_values(data)["values"].detach().cpu()
+    assert not torch.allclose(values_trained, values_fresh, atol=1e-4), (
+        "Training should change value predictions before checkpointing"
+    )
 
     # Save weights + optimizer alongside the way `ppo.setup()` does:
     #   <ckpt_root>/value/weights/  ,  <ckpt_root>/value/optimizer/
@@ -522,15 +732,15 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
     saved_model_name = value.cfg["model_name"]
     value.shutdown()
 
-    # Mirror the T12 resume path in `ppo.setup()` — directly probe value
-    # subdir paths with .exists() rather than going through
-    # `CheckpointManager.get_resume_paths` (that helper is hardcoded to look
-    # under `<root>/policy/...` and only resolves the policy checkpoint).
-    _value_weights = Path(ckpt_root) / "value" / "weights"
-    _value_optim = Path(ckpt_root) / "value" / "optimizer"
-    assert _value_weights.exists(), f"saved value weights missing at {_value_weights}"
-    resume_weights_path = _value_weights
-    resume_optimizer_path = _value_optim if _value_optim.exists() else None
+    # MCore embeds optimizer state under weights; the nonexistent optimizer
+    # path is a non-None sentinel that enables loading in Megatron Bridge.
+    assert not Path(optimizer_path).exists()
+    resume_weights_path, resume_optimizer_path = CheckpointManager.get_resume_paths(
+        ckpt_root,
+        model_component="value",
+    )
+    assert resume_weights_path == Path(weights_path)
+    assert resume_optimizer_path == Path(optimizer_path)
 
     # Reconstruct the value worker pointed at the saved checkpoint.
     config = _create_value_test_config(model_name=saved_model_name)
@@ -559,28 +769,80 @@ def test_value_worker_checkpoint_save_and_load(value_setup, tmp_path):
             "Resumed worker get_values should not produce Infs"
         )
 
-        # HARD: resumed should differ from fresh — proves the load actually
-        # restored the trained weights (not a silent fallback to fresh init).
-        assert not torch.allclose(values_resumed, values_fresh, atol=1e-4), (
-            "Resumed get_values should differ from fresh-init values. "
-            "If equal, the checkpoint load silently fell back to a fresh "
-            "initialization instead of loading the trained weights."
+        # The restored model must exactly reproduce the state that was saved,
+        # rather than merely differ from fresh initialization.
+        torch.testing.assert_close(
+            values_resumed,
+            values_trained,
+            msg="Resumed value predictions should match the saved trained model",
         )
+        # Re-save without another update. Comparing the two logical distributed
+        # checkpoints proves that optimizer tensors and scheduler state were
+        # loaded, rather than merely proving that they were present on disk.
+        resaved_weights_path = str(
+            tmp_path / "value_ckpt_resaved" / "value" / "weights"
+        )
+        resaved_optimizer_path = str(
+            tmp_path / "value_ckpt_resaved" / "value" / "optimizer"
+        )
+        resumed.save_checkpoint(
+            weights_path=resaved_weights_path,
+            optimizer_path=resaved_optimizer_path,
+        )
+        assert not Path(resaved_optimizer_path).exists()
 
-        # SOFT: resumed should match saved within tolerance. Warning only,
-        # mirroring `test_megatron_checkpoint_save_kill_and_restore`: Megatron
-        # distributed ckpts have small reproducibility deltas from sharded
-        # reduce/allgather ordering and we don't want CI flakiness here. The
-        # hard `resumed != fresh` check above already proves the load worked.
-        if torch.allclose(values_resumed, values_saved, atol=1e-4):
-            print("✓ Resumed values match saved values within tolerance")
-        else:
-            max_diff = (values_resumed - values_saved).abs().max().item()
-            mean_diff = (values_resumed - values_saved).abs().mean().item()
-            print(
-                f"⚠ Resumed values differ from saved (max={max_diff:.4g}, "
-                f"mean={mean_diff:.4g}) — likely Megatron numerical "
-                "non-determinism, not a load bug (resumed != fresh asserted above)."
-            )
+        saved_iteration_dirs = sorted(Path(weights_path).glob("iter_*"))
+        resaved_iteration_dirs = sorted(Path(resaved_weights_path).glob("iter_*"))
+        assert len(saved_iteration_dirs) == 1
+        assert len(resaved_iteration_dirs) == 1
+
+        # Megatron is optional outside the MCore test environment, so defer
+        # these imports until this MCore-only test executes.
+        from megatron.core.dist_checkpointing import (
+            load_common_state_dict,
+            load_plain_tensors,
+        )
+        from megatron.core.dist_checkpointing.dict_utils import diff
+
+        saved_iteration = str(saved_iteration_dirs[0])
+        resaved_iteration = str(resaved_iteration_dirs[0])
+        # MCore's plain-tensor reader calls torch.distributed.get_rank() even
+        # though the underlying DCP load uses no_dist=True. The pytest driver is
+        # not part of the workers' process groups, so give this comparison a
+        # temporary, isolated single-rank group. This satisfies MCore's caller
+        # contract while following the test-local PG lifecycle used elsewhere.
+        created_process_group = False
+        try:
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(
+                    backend="gloo",
+                    init_method=f"file://{tmp_path / 'checkpoint_compare_pg'}",
+                    rank=0,
+                    world_size=1,
+                )
+                created_process_group = True
+
+            saved_tensors = load_plain_tensors(saved_iteration)
+            resaved_tensors = load_plain_tensors(resaved_iteration)
+            tensor_keys = {str(key) for key in saved_tensors}
+            for optimizer_state in ("exp_avg", "exp_avg_sq"):
+                assert any(
+                    key.startswith("optimizer.") and optimizer_state in key.split(".")
+                    for key in tensor_keys
+                ), f"Saved checkpoint should contain Adam {optimizer_state} tensors"
+            tensor_diffs = diff(saved_tensors, resaved_tensors)
+            assert not any(map(bool, tensor_diffs)), tensor_diffs
+
+            saved_common = load_common_state_dict(saved_iteration)
+            resaved_common = load_common_state_dict(resaved_iteration)
+            for state_key in ("optimizer", "opt_param_scheduler"):
+                assert state_key in saved_common
+                assert state_key in resaved_common
+                state_diffs = diff(saved_common[state_key], resaved_common[state_key])
+                assert not any(map(bool, state_diffs)), state_diffs
+            assert saved_common["opt_param_scheduler"]["num_steps"] > 0
+        finally:
+            if created_process_group and torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
     finally:
         resumed.shutdown()

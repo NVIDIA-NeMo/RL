@@ -55,6 +55,23 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     return enable_prefix_caching
 
 
+def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
+    """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
+
+    ``init_fp8`` returns a nested ``hf_overrides`` (holding ``quantization_config``),
+    so a blanket ``vllm_kwargs.update(fp8_kwargs)`` would wholesale-replace any
+    user-supplied ``hf_overrides``. We pop ``hf_overrides`` before the shallow
+    update and merge it separately so that fp8's ``quantization_config`` is the
+    base while user overrides (e.g. ``max_position_embeddings``) survive and take
+    precedence. This regression was reintroduced once already; see #1413/#2904.
+    """
+    fp8_kwargs = dict(fp8_kwargs)
+    fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
+    vllm_kwargs.update(fp8_kwargs)
+    existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
+    vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -182,6 +199,19 @@ class BaseVllmGenerationWorker:
                 _load_model() later to perform the heavy model loading. This
                 enables overlapping vLLM model loading with NeMo Gym init.
         """
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Only bind single-GPU workers to their GPU's NUMA node.
+        # For TP>1 workers, the parent process spans multiple NUMA nodes;
+        # binding it would incorrectly constrain the EngineCore subprocess
+        # (which inherits sched_setaffinity + numa_set_membind via fork).
+        # Individual TP workers get their own NUMA binding via collective_rpc
+        # in post_init / post_init_async.
+        # ray.get_gpu_ids()[0] is this worker's physical GPU index, which keys
+        # the affinity file.
+        if bundle_indices is not None and len(bundle_indices) == 1:
+            bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
@@ -304,6 +334,19 @@ class BaseVllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
+        # MTP speculative decoding with load_format="dummy" gets its policy
+        # weights via refit, but the MTP draft layer is not covered by refit, so
+        # those layers are loaded directly from the checkpoint after engine init
+        # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
+        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config")
+        mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_load_from_disk: bool = (
+            load_format == "dummy"
+            and spec_cfg is not None
+            and spec_cfg.get("method") in ("deepseek_mtp", "mtp")
+            and not mtp_weights_from_refit
+        )
+
         if (
             len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0
             and vllm_kwargs["distributed_executor_backend"] == "ray"
@@ -326,7 +369,9 @@ class BaseVllmGenerationWorker:
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
             )
 
-            vllm_kwargs.update(fp8_kwargs)
+            # Merge (rather than replace) so fp8's quantization_config coexists
+            # with user-supplied hf_overrides, which take precedence.
+            _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
@@ -348,6 +393,7 @@ class BaseVllmGenerationWorker:
             for arch in (
                 "Gemma3ForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
             )
@@ -359,6 +405,7 @@ class BaseVllmGenerationWorker:
                 in (
                     "Gemma3ForConditionalGeneration",
                     "Gemma4ForConditionalGeneration",
+                    "Mistral3ForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
                 )
@@ -370,6 +417,39 @@ class BaseVllmGenerationWorker:
                     "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
+
+        # Mistral 3.5 (Mistral3ForConditionalGeneration) integration.
+        if "Mistral3ForConditionalGeneration" in getattr(
+            hf_config, "architectures", []
+        ):
+            # Mistral 3.5 ships FP8 on disk, but NeMo-RL refits bf16 weights via
+            # ZMQ (load_format='dummy'). Clear the auto-detected quantization_config
+            # so vLLM allocates bf16 buffers instead of building Fp8Config.
+            if hasattr(hf_config, "quantization_config"):
+                assert load_format == "dummy", (
+                    "Loading FP8-quantized Mistral3 in vLLM is only supported "
+                    "with load_format='dummy' (NeMo-RL refits bf16 weights via "
+                    "ZMQ). Got load_format=%r." % load_format
+                )
+                # NeMo-RL refits bf16 weights, so we intentionally clear any fp8
+                # quantization here -- including the quantization="fp8" that
+                # init_fp8 set above when precision == "fp8". Warn so a
+                # precision: fp8 Mistral3 config isn't silently downgraded to bf16.
+                if self.cfg["vllm_cfg"]["precision"] == "fp8":
+                    print(
+                        "Mistral3 refits bf16 weights via ZMQ; ignoring "
+                        "precision='fp8' and running vLLM generation in bf16."
+                    )
+                vllm_kwargs["quantization"] = None
+                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+
+            # Force the HF config parser. Auto-detect picks Mistral-native format
+            # and remaps architectures to Pixtral, whose weight loader is
+            # incompatible with NeMo-RL's HF-format ZMQ refit keys.
+            vllm_kwargs["config_format"] = "hf"
+
+            # Text-only runs additionally set generation.vllm_kwargs.language_model_only
+            # in the recipe YAML to skip vLLM's multimodal preflight.
 
         llm_kwargs = dict(
             model=self.model_name,
@@ -541,7 +621,13 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.llm = vllm.LLM(**llm_kwargs)
 
     def post_init(self):
+        if self.llm is not None:
+            self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
+        if self._mtp_load_from_disk:
+            self.llm.collective_rpc(
+                "load_mtp_weights_from_disk", args=(self.model_name,)
+            )
 
     def init_collective(
         self,

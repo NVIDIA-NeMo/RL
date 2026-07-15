@@ -27,11 +27,7 @@ from . import (
 pytestmark = pytest.mark.sglang
 
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
-from nemo_rl.models.generation.sglang.utils.ray_utils import (
-    find_available_port,
-    get_host_info,
-    is_port_available,
-)
+from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
 from nemo_rl.models.generation.sglang.utils.train_utils import (
     MultiprocessingSerializer,
 )
@@ -40,14 +36,6 @@ from nemo_rl.models.generation.sglang.utils.train_utils import (
 # ---------------------------------------------------------------------------
 # ray_utils
 # ---------------------------------------------------------------------------
-def test_find_available_port():
-    """find_available_port returns a port that passes is_port_available."""
-    port = find_available_port(20000)
-    assert isinstance(port, int)
-    assert port > 0
-    assert is_port_available(port)
-
-
 def test_wrap_ipv6_noop_for_ipv4():
     """IPv4 addresses are returned unchanged by _wrap_ipv6."""
     assert _wrap_ipv6("192.168.1.1") == "192.168.1.1"

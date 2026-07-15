@@ -47,6 +47,7 @@ from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
+    cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -803,47 +804,56 @@ class LogprobsPostProcessor:
 
         Returns:
             Token log probabilities
+
+        When ``logprob_chunk_size`` is set, log-softmax and gather run per
+        sequence chunk to bound peak memory for long-context runs.
         """
-        if self.logprob_chunk_size is not None:
-            logits_seq_len = int(logits.shape[1])
-            num_chunks = (
-                logits_seq_len + self.logprob_chunk_size - 1
-            ) // self.logprob_chunk_size
-            chunked_log_probs = []
-            for chunk_idx in range(num_chunks):
-                chunk_start = chunk_idx * self.logprob_chunk_size
-                chunk_end = min(
-                    logits_seq_len,
-                    (chunk_idx + 1) * self.logprob_chunk_size,
-                )
-                chunk_logits = logits[:, chunk_start:chunk_end, :].to(torch.float32)
-                chunk_logits = apply_top_k_top_p_filtering_for_local_logits(
-                    chunk_logits, self.sampling_params
-                )
-                log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
-                chunked_log_probs.append(log_probs)
-            log_probs = torch.cat(chunked_log_probs, dim=1)
-            del chunked_log_probs
-        else:
-            logits = logits.to(torch.float32)
+        # Extract logprobs for each token in the sequence by gathering the logprob
+        # corresponding to the next token at each position
+        # Input shapes:
+        #   logits: [batch_size, sequence_length, vocab_size] - logits for each position
+        #   token_ids: [batch_size, sequence_length] - actual tokens
+        next_tokens = input_ids[:, 1:].to(logits.device)
+        target_seq_len = int(next_tokens.shape[1])
+
+        if target_seq_len == 0:
+            return logits.new_empty(
+                (input_ids.shape[0], 0),
+                dtype=torch.float32,
+            )
+
+        logits = logits[:, :target_seq_len, :]
+
+        if self.logprob_chunk_size is None:
+            logits = logits.to(torch.float32).contiguous()
             logits = apply_top_k_top_p_filtering_for_local_logits(
                 logits, self.sampling_params
             )
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            token_logprobs = log_probs.gather(
+                dim=-1, index=next_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+            del log_probs
+            return token_logprobs
 
-        # Extract logprobs for each token in the sequence by gathering the logprob
-        # corresponding to the next token at each position
-        # Input shapes:
-        #   log_probs: [batch_size, sequence_length, vocab_size] - logits for each position
-        #   token_ids: [batch_size, sequence_length] - actual tokens
-        # Output shape: [batch_size, sequence_length] - logprob of each token given previous
-        # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
-        next_tokens = input_ids[:, 1:]
-        log_probs = log_probs[:, :-1]
-        token_logprobs = log_probs.gather(
-            dim=-1, index=next_tokens.unsqueeze(-1)
-        ).squeeze(-1)
-        del log_probs
+        chunked_token_logprobs = []
+        for chunk_start in range(0, target_seq_len, self.logprob_chunk_size):
+            chunk_end = min(chunk_start + self.logprob_chunk_size, target_seq_len)
+            chunk_logits = logits[:, chunk_start:chunk_end, :].to(torch.float32)
+            chunk_logits = chunk_logits.contiguous()
+            chunk_logits = apply_top_k_top_p_filtering_for_local_logits(
+                chunk_logits, self.sampling_params
+            )
+            chunk_log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
+            chunk_token_logprobs = chunk_log_probs.gather(
+                dim=-1,
+                index=next_tokens[:, chunk_start:chunk_end].unsqueeze(-1),
+            ).squeeze(-1)
+            chunked_token_logprobs.append(chunk_token_logprobs)
+            del chunk_log_probs, chunk_logits
+
+        token_logprobs = torch.cat(chunked_token_logprobs, dim=1)
+        del chunked_token_logprobs
 
         return token_logprobs
 
@@ -988,22 +998,15 @@ class TopkLogitsPostProcessor:
 
 
 class FullLogitsPostProcessor:
-    """Post-processor that returns the full teacher vocab logits unchanged.
+    """Export this rank's raw teacher logits (full vocab, no reduction at the worker).
 
-    Used by cross-tokenizer distillation: the loss fn needs the entire
-    ``[B, S, V_t]`` teacher logits tensor — no vocab reduction is done at
-    the worker. The loss fn either (a) derives a microbatch-global top-k
-    subset internally (``gold_loss=False`` path, matching PT
-    ``global_top_indices`` math) or (b) operates on full vocab directly
-    (``gold_loss=True`` path, matching PT gold). Doing the reduction in
-    the loss fn (not here) keeps transport faithful to the PT reference.
-
-    Output:
-        logits: ``[B, S, V_t]`` raw teacher logits cast to ``float32``.
-
-    v0 limitation: only the no-TP, no-CP, no-seq-packing path is
-    implemented. Asserts on the unsupported configurations — distributed
-    full-vocab gather requires TP-aware reduction not on the smoke path.
+    Used by cross-tokenizer distillation; the loss fn does all vocab
+    reduction (none at the worker) so the distributed result matches the
+    single-GPU PyTorch reference. Teacher TP/CP
+    are supported and may differ from the student's: under TP each rank emits
+    its vocab shard, under CP it allgathers and re-emits its contiguous seq
+    slice; the IPC consumer reassembles the global ``[B, T_t, V_t]``.
+    Sequence packing raises ``NotImplementedError``.
     """
 
     def __init__(
@@ -1031,34 +1034,26 @@ class FullLogitsPostProcessor:
         original_seq_len: int,
         sequence_dim: int = 1,
     ) -> torch.Tensor:
-        if self.cp_size > 1:
-            raise NotImplementedError(
-                "FullLogitsPostProcessor: context_parallel_size > 1 is "
-                "not supported in v0."
-            )
         if self.enable_seq_packing:
             raise NotImplementedError(
                 "FullLogitsPostProcessor: sequence packing is not supported in v0."
             )
         if isinstance(logits, DTensor):
-            tp_group = self.tp_mesh.get_group() if self.tp_mesh is not None else None
-            tp_size = (
-                torch.distributed.get_world_size(tp_group)
-                if tp_group is not None
-                else 1
-            )
-            if tp_size > 1:
-                raise NotImplementedError(
-                    "FullLogitsPostProcessor: tensor_parallel_size > 1 "
-                    "is not supported in v0."
-                )
             logits = logits.to_local()
+        # fp32 for the consumer's precision-sensitive log_softmax / top-k /
+        # projection (KL math), and a dtype-consistent IPC buffer producer<->consumer.
+        logits = logits.to(torch.float32)
 
-        # Teacher is frozen (init_optimizer=False) and the consumer does not
-        # backprop into these logits; downstream log_softmax/KL kernels upcast
-        # to fp32 internally where they need it. Ship native compute dtype
-        # (bf16 under autocast) to halve the IPC buffer footprint.
-        return logits  # [B, S, V_t]
+        # context_parallel shards the seq dim load-balanced (interleaved), but the
+        # IPC consumer routes by contiguous ``global_seq_start`` over the teacher CP
+        # group. Restore global order and emit this rank's contiguous slice, else
+        # heterogeneous teacher_cp != student_cp lands teacher data at the wrong
+        # seq positions in the consumer's dest tensor.
+        if self.cp_size > 1 and self.cp_mesh is not None:
+            logits = cp_load_balanced_to_contiguous(
+                logits, cp_group=self.cp_mesh.get_group(), seq_dim=sequence_dim
+            )
+        return logits  # [B, S_local_contiguous, V_t]
 
 
 class ScorePostProcessor:
