@@ -40,7 +40,7 @@ from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -67,6 +67,9 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+
+_POLICY_CONFIG_ADAPTER = TypeAdapter(PolicyConfig)
 
 
 # Keys packed into the student-side `train_data` BatchedDataDict whose dim 1
@@ -187,12 +190,11 @@ class TeacherConfig(BaseModel, extra="allow"):
     xtoken_loss: Optional[bool] = None
 
     def policy_config(self) -> PolicyConfig:
-        """Recover the plain ``PolicyConfig`` dict (cross-tokenizer knobs stripped)."""
-        return cast(
-            PolicyConfig,
+        """Validate the policy config after stripping cross-tokenizer knobs."""
+        return _POLICY_CONFIG_ADAPTER.validate_python(
             self.model_dump(
                 exclude={"projection_matrix_path", "weight", "gold_loss", "xtoken_loss"}
-            ),
+            )
         )
 
 
