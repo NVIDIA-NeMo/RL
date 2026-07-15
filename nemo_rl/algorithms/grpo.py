@@ -1830,6 +1830,23 @@ def grpo_train(
                         logprob_data, timer=timer
                     )
                     train_data["prev_logprobs"] = prev_logprobs_out["logprobs"]
+
+                    dump_lp_path = os.environ.get("NRL_DUMP_PREV_LOGPROBS")
+                    if dump_lp_path:
+                        torch.save(
+                            {
+                                "input_ids": logprob_data["input_ids"].cpu(),
+                                "input_lengths": logprob_data["input_lengths"].cpu(),
+                                "token_mask": logprob_data["token_mask"].cpu(),
+                                "prev_logprobs": train_data["prev_logprobs"].cpu(),
+                                "generation_logprobs": train_data[
+                                    "generation_logprobs"
+                                ].cpu(),
+                            },
+                            dump_lp_path,
+                        )
+                        print(f"[NRL_DUMP_PREV_LOGPROBS] saved {dump_lp_path}", flush=True)
+
                     # Coupled/ESPO K > 1: also carry pairs 1..K-1 prev logprobs (no-op else).
                     _maybe_capture_coupled_pair_logprobs(
                         train_data=train_data,
