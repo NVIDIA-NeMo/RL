@@ -544,6 +544,15 @@ if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
   exit 1
 fi
 
+# Diagnostic phase markers inside the head container. Reuse the job-start epoch
+# propagated from the submit host so the elapsed counter lines up with the
+# submit-side [NRL_PHASE] markers -- together they form one end-to-end timeline.
+# This first marker fires once the container is actually executing, so the gap
+# from the submit-side "launching Ray head + worker sruns" marker to here is the
+# enroot image import time.
+log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
+log_phase "head container started on \$(hostname) (enroot image import complete)"
+
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true
@@ -624,6 +633,7 @@ source $LOG_DIR/topology_probe.sh
 # GCS is listening, so we touch STARTED_RAY_HEAD only after the head is actually up.
 # Workers gate on that file, so they only try to connect once the GCS is accepting
 # connections.
+log_phase "head: starting Ray head (ray start --head)"
 count=0
 while [[ \$count -lt $num_retries ]]; do
   # Clean up stale Ray state before every attempt. A timed-out attempt leaves a
@@ -671,6 +681,7 @@ fi
 
 # Signal workers and the submit host that the Ray head GCS is now listening.
 touch $LOG_DIR/STARTED_RAY_HEAD
+log_phase "head: Ray GCS listening (STARTED_RAY_HEAD written)"
 
 if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   # Non-interactive: wait for all workers to connect and, if a sandbox is
@@ -721,6 +732,7 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   # and training process can measure post-ready initialization timing.
   export NRL_RAY_READY_EPOCH=\$(date +%s.%N)
 
+  log_phase "head: cluster ready, launching driver command"
   set +e
   bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
   exit_code=\$?
@@ -749,6 +761,13 @@ if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
   echo "[ERROR] Worker \$SLURM_PROCID: $LOG_DIR/.shared_fs_canary not visible; LOG_DIR must be on a shared filesystem." >&2
   exit 1
 fi
+
+# Diagnostic phase markers inside the worker container (see the head container for
+# the rationale). Reuses the propagated job-start epoch so the elapsed counter is
+# comparable to the submit-side and head-side [NRL_PHASE] markers. The gap from the
+# submit-side srun-launch marker to here is this worker's enroot image import time.
+log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
+log_phase "worker \$SLURM_PROCID container started on \$(hostname) (enroot image import complete)"
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -811,7 +830,7 @@ source $LOG_DIR/topology_probe.sh
 echo "[INFO] Worker \$SLURM_PROCID: waiting for Ray head GCS to be ready..."
 while true; do
   if [[ -f "$LOG_DIR/STARTED_RAY_HEAD" ]]; then
-    echo "[INFO] Worker \$SLURM_PROCID: Ray head GCS is ready, connecting."
+    log_phase "worker \$SLURM_PROCID: head GCS ready (STARTED_RAY_HEAD observed), connecting"
     break
   fi
   if [[ -f "$LOG_DIR/ENDED" ]]; then
