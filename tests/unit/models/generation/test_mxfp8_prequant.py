@@ -79,3 +79,59 @@ def test_refit_quantize_matches_receiver_path():
     assert got_scale.dtype == ref_scale.dtype
     assert got_scale.shape == ref_scale.shape
     assert torch.equal(got_scale.reshape(-1), ref_scale.reshape(-1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "is_gated,intermediate_size,hidden_size",
+    [
+        # Aligned: both scale K dims (hidden/32=8, intermediate/32=4) are %4.
+        (True, 128, 256),
+        # w2 scale K = 192/32 = 6, so pad_flashinfer_scale_k pads it to 8.
+        (True, 192, 128),
+        # Non-gated (single w13 shard), aligned.
+        (False, 128, 256),
+    ],
+)
+def test_batched_moe_shuffle_matches_per_expert(
+    is_gated, intermediate_size, hidden_size
+):
+    """Bitwise parity of the batched TRTLLM MoE shuffle with the per-expert loop."""
+    pytest.importorskip("flashinfer")
+    fp8 = pytest.importorskip("nemo_rl.models.generation.vllm.quantization.fp8")
+
+    from types import SimpleNamespace
+
+    torch.manual_seed(0)
+    num_experts = 4
+    w13_rows = (2 if is_gated else 1) * intermediate_size
+
+    def rand_bytes(*shape):
+        return torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda")
+
+    w13_weight = rand_bytes(num_experts, w13_rows, hidden_size).view(
+        torch.float8_e4m3fn
+    )
+    w2_weight = rand_bytes(num_experts, hidden_size, intermediate_size).view(
+        torch.float8_e4m3fn
+    )
+    w13_scale = rand_bytes(num_experts, w13_rows, hidden_size // MXFP8_BLOCK_SIZE)
+    w2_scale = rand_bytes(
+        num_experts, hidden_size, intermediate_size // MXFP8_BLOCK_SIZE
+    )
+
+    layer = SimpleNamespace()  # holds the cached row permutations
+    epilogue_tile_m = 128
+    batched = fp8._shuffle_mxfp8_moe_batched(
+        layer, w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
+    )
+    reference = fp8._shuffle_mxfp8_moe_per_expert(
+        w13_weight, w2_weight, w13_scale, w2_scale, is_gated, epilogue_tile_m
+    )
+
+    for got, want, name in zip(
+        batched, reference, ("w13_weight", "w2_weight", "w13_scale", "w2_scale")
+    ):
+        assert got.shape == want.shape, name
+        assert got.dtype == want.dtype, name
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8)), name
