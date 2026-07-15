@@ -16,6 +16,8 @@ import asyncio
 import copy
 import gc
 import logging
+import math
+import os as _os
 import threading
 import time
 import uuid
@@ -49,6 +51,50 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 LOGGER = logging.getLogger(__name__)
+
+_NAN_GUARD_FILL = -1e4  # finite replacement for non-finite logprobs
+
+# Counter for non-monotonic-trajectory fallbacks in _replace_prefix_tokens (the dominant
+# rollout-killer for tool-heavy multi-turn SWE agents). Dict so it is mutable from the
+# module-level function without a `global` statement.
+_NON_MONOTONIC_TRAJECTORY_COUNTER = {"count": 0}
+
+
+def _sanitize_chat_logprobs(response) -> int:
+    """NaN-GUARD: replace non-finite logprobs in a ChatCompletionResponse in place.
+
+    A single nan/inf logprob makes JSONResponse(model_dump()) raise "Out of range float
+    values are not JSON compliant: nan" -> HTTP 500 -> stalled rollout. Walk the choices'
+    logprobs (content + top_logprobs) and replace any non-finite value with a large-
+    negative finite number so the response serializes and training continues. Returns the
+    count of values fixed (>0 signals a NaN was suppressed here).
+    """
+    fixed = 0
+
+    def _fix(obj):
+        nonlocal fixed
+        lp = getattr(obj, "logprob", None)
+        if lp is not None and not math.isfinite(lp):
+            obj.logprob = _NAN_GUARD_FILL
+            fixed += 1
+
+    try:
+        for choice in getattr(response, "choices", []) or []:
+            lp_container = getattr(choice, "logprobs", None)
+            if lp_container is None:
+                continue
+            for entry in getattr(lp_container, "content", []) or []:
+                _fix(entry)
+                for top in getattr(entry, "top_logprobs", []) or []:
+                    _fix(top)
+        if fixed:
+            print(
+                f"[NAN-GUARD] sanitized {fixed} non-finite logprob(s) -> {_NAN_GUARD_FILL}",
+                flush=True,
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[NAN-GUARD] sanitize failed: {type(e).__name__}: {e}", flush=True)
+    return fixed
 
 
 def _replace_prefix_tokens(
@@ -120,18 +166,30 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
-    # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
+    # Graceful degradation for the non-monotonic case (the DOMINANT rollout-killer
+    # for tool-heavy multi-turn SWE agents): when the chat template re-tokenizes the
+    # prior turns to a DIFFERENT (often longer) id sequence than the model produced —
+    # typically inconsistent whitespace around tool-call special tokens — the invariant
+    # len(template_token_ids) > len(template_prefix_token_ids) can break. Previously this
+    # raised AssertionError -> HTTP 500 on /v1/chat/completions -> the rollout retried 3x
+    # then died. Instead, fall back to the plain template tokenization for this turn (skip
+    # the prefix-replacement), log a warning + counter, and return 200 so the rollout
+    # continues. Off-policy caveat: this turn's prefix is the template tokens rather than
+    # the exact prior model tokens, but a slightly-off-policy 200 beats a rollout-killing 500.
+    if len(template_token_ids) <= len(template_prefix_token_ids):
+        _NON_MONOTONIC_TRAJECTORY_COUNTER["count"] += 1
+        LOGGER.warning(
+            "[monotonicity] non-monotonic trajectory (len(template)=%d <= "
+            "len(template_prefix)=%d) — falling back to template tokenization for this "
+            "turn (skipping prefix-replacement). Occurrence #%d. Likely tool-call "
+            "retokenization. Template prefix repr: %r ; Template repr: %r",
+            len(template_token_ids),
+            len(template_prefix_token_ids),
+            _NON_MONOTONIC_TRAJECTORY_COUNTER["count"],
+            repr(tokenizer.decode(template_prefix_token_ids))[:200],
+            repr(tokenizer.decode(template_token_ids))[:200],
+        )
+        return template_token_ids
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -295,6 +353,16 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
+
+        # Auto-arm the capture-on-first-NaN hooks + clamp guard on the engine-core
+        # workers when NRL_NAN_CAPTURE=1 (used to instrument the real teacher run).
+        # No-op / zero overhead when unset.
+        if _os.environ.get("NRL_NAN_CAPTURE", "0") == "1":
+            try:
+                self.llm.collective_rpc("register_nan_hooks")
+                LOGGER.info("[NAN-CAPTURE] armed forward hooks on async engine workers")
+            except Exception as e:  # noqa: BLE001
+                LOGGER.warning(f"[NAN-CAPTURE] failed to arm hooks: {e}")
 
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             # Must run after AsyncLLM.from_engine_args and before
@@ -803,6 +871,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
+                # NaN-GUARD (NRL_NAN_GUARD=1): a single non-finite logprob makes
+                # JSONResponse raise "Out of range float values ... nan" -> HTTP 500 ->
+                # rollout stall. NaN is fixed at source (moe_backend: triton); this is a
+                # cheap env-gated defensive fallback. (Kept main's routed-experts dump.)
+                if _os.environ.get("NRL_NAN_GUARD", "0") == "1":
+                    _sanitize_chat_logprobs(generator)
                 return JSONResponse(
                     content=model_dump_chat_response_with_routed_experts(generator)
                 )
