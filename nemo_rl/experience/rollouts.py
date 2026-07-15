@@ -18,11 +18,9 @@
 import asyncio
 import copy
 import json
-import math
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -30,7 +28,7 @@ import ray
 import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
-from wandb import Histogram, Table
+from wandb import Table
 
 from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
@@ -48,6 +46,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -1263,14 +1262,6 @@ def run_async_multi_turn_rollout(
             if key not in final_batch:
                 final_batch[key] = input_batch[key]
 
-        # Helper for percentile (buffer starvation diagnostics)
-        def _pct(values: Sequence[float | int], p: float) -> float:
-            if not values:
-                return 0.0
-            sorted_v = sorted(values)
-            idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
-            return float(sorted_v[idx])
-
         turn_counts = [m["turn_count"] for m in all_sample_metrics]
         max_gen_tokens_per_turn_values = [
             m["max_gen_tokens_per_turn"] for m in all_sample_metrics
@@ -1282,8 +1273,8 @@ def run_async_multi_turn_rollout(
             "total_turns": sum(turn_counts),
             "avg_turns_per_sample": sum(turn_counts) / batch_size,
             "max_turns_per_sample": max(turn_counts),
-            "turns_per_sample/p95": _pct(turn_counts, 95),
-            "turns_per_sample/p99": _pct(turn_counts, 99),
+            "turns_per_sample/p95": pct(turn_counts, 95),
+            "turns_per_sample/p99": pct(turn_counts, 99),
             "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
             / batch_size,
             "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
@@ -1312,7 +1303,7 @@ def run_async_multi_turn_rollout(
             "max_gen_tokens_per_turn/max": max(max_gen_tokens_per_turn_values),
             "max_gen_tokens_per_turn/mean": sum(max_gen_tokens_per_turn_values)
             / batch_size,
-            "max_gen_tokens_per_turn/p95": _pct(max_gen_tokens_per_turn_values, 95),
+            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn_values, 95),
             # Reward metrics
             "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
             / batch_size,
@@ -1357,19 +1348,6 @@ class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
-
-
-def _calculate_single_metric(
-    values: Sequence[float | int], batch_size: int, key_name: str
-) -> dict:
-    return {
-        f"{key_name}/mean": sum(values) / batch_size,
-        f"{key_name}/max": max(values),
-        f"{key_name}/min": min(values),
-        f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
-        f"{key_name}/histogram": Histogram(values),
-    }
 
 
 def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
@@ -1918,39 +1896,32 @@ def run_async_nemo_gym_rollout(
             m["max_gen_tokens_per_turn"] for m in all_sample_metrics
         ]
 
-        def _pct(values: Sequence[float | int], p: float) -> float:
-            if not values:
-                return 0.0
-            sorted_v = sorted(values)
-            idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
-            return float(sorted_v[idx])
-
         rollout_metrics = {
             **rollout_loop_timing_metrics,
-            **_calculate_single_metric(
+            **calculate_single_metric(
                 turn_counts,
                 batch_size,
                 "turns_per_sample",
             ),
-            "turns_per_sample/p95": _pct(turn_counts, 95),
-            "turns_per_sample/p99": _pct(turn_counts, 99),
-            **_calculate_single_metric(
+            "turns_per_sample/p95": pct(turn_counts, 95),
+            "turns_per_sample/p99": pct(turn_counts, 99),
+            **calculate_single_metric(
                 [m["total_tokens"] for m in all_sample_metrics],
                 batch_size,
                 "total_tokens_per_sample",
             ),
-            **_calculate_single_metric(
+            **calculate_single_metric(
                 [m["assistant_tokens"] for m in all_sample_metrics],
                 batch_size,
                 "gen_tokens_per_sample",
             ),
-            **_calculate_single_metric(
+            **calculate_single_metric(
                 max_gen_tokens_per_turn_values,
                 batch_size,
                 "max_gen_tokens_per_turn",
             ),
-            "max_gen_tokens_per_turn/p95": _pct(max_gen_tokens_per_turn_values, 95),
-            **_calculate_single_metric(
+            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn_values, 95),
+            **calculate_single_metric(
                 [m["total_reward"] for m in all_sample_metrics],
                 batch_size,
                 "total_reward",
@@ -1989,7 +1960,7 @@ def run_async_nemo_gym_rollout(
                 ]
                 if values:
                     per_agent_metrics.update(
-                        _calculate_single_metric(
+                        calculate_single_metric(
                             values, len(agent_results), f"{agent_name}/{key}"
                         )
                     )
