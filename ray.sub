@@ -27,34 +27,13 @@ set -eoux pipefail
 # Record job-start epoch so Python can measure pre-Python overhead
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 
-########################################################
-# Diagnostic phase logging
-#
-# ray.sub makes several blocking calls that reach the SLURM controller
-# (sinfo/scontrol/srun) and imports a multi-GB container image before Ray is up.
-# When any of those stall -- e.g. an overloaded/DDoS'd controller, a slow prolog,
-# or contended shared storage -- a bare `set -x` trace has no timestamps, so it is
-# impossible to tell from the logs *where* the wall-clock actually went.
-#
-# `log_phase` stamps an ISO wall-clock time plus seconds-since-job-start at each
-# phase boundary so a slowdown can be localized after the fact. Subtract the
-# elapsed counters of two adjacent markers to get that phase's duration. Keep
-# these coarse (phase boundaries, not per-command) so the trace stays readable.
-########################################################
+# Log a timestamped, seconds-since-job-start marker at each phase boundary.
 log_phase() {
   echo "[NRL_PHASE][$(date '+%Y-%m-%dT%H:%M:%S%z')][+$(( $(date +%s) - ${NRL_JOB_START_EPOCH%.*} ))s] $*"
 }
-# The gap between the job's SLURM StartTime (from `sacct`/`scontrol show job`) and
-# this first marker is time spent in prolog/allocation/node-prep *before* the
-# script ran -- i.e. not attributable to anything in ray.sub itself.
 log_phase "ray.sub started (job=${SLURM_JOB_ID:-?} nodes=${SLURM_JOB_NUM_NODES:-?} partition=${SLURM_JOB_PARTITION:-?} node=$(hostname))"
 
-# Bookend the script so post-script teardown (SLURM epilog, enroot container
-# cleanup, GPU reset) is measurable: (job SLURM EndTime - this final marker) is
-# the epilog/teardown overhead, symmetric to (first marker - StartTime) = prolog.
-# Trap TERM/HUP/INT as well as EXIT so a time-limit kill or `scancel` is stamped
-# too -- a bare EXIT trap does NOT fire on an uncaught signal. `trap - EXIT`
-# inside prevents a double log when the handler's own `exit` re-triggers EXIT.
+# Log a final marker on exit; trap TERM/HUP/INT too so a scancel/time-limit kill is still stamped.
 _nrl_log_exit() { local rc=$?; trap - EXIT; log_phase "ray.sub exiting (exit_code=$rc)"; exit $rc; }
 trap _nrl_log_exit EXIT TERM HUP INT
 
@@ -554,12 +533,8 @@ if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
   exit 1
 fi
 
-# Diagnostic phase markers inside the head container. Reuse the job-start epoch
-# propagated from the submit host so the elapsed counter lines up with the
-# submit-side [NRL_PHASE] markers -- together they form one end-to-end timeline.
-# This first marker fires once the container is actually executing, so the gap
-# from the submit-side "launching Ray head + worker sruns" marker to here is the
-# enroot image import time.
+# Phase markers inside the container; reuse the propagated job-start epoch so the
+# elapsed counter shares the submit-side timeline.
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "head container started on \$(hostname)"
 
@@ -772,10 +747,7 @@ if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
   exit 1
 fi
 
-# Diagnostic phase markers inside the worker container (see the head container for
-# the rationale). Reuses the propagated job-start epoch so the elapsed counter is
-# comparable to the submit-side and head-side [NRL_PHASE] markers. The gap from the
-# submit-side srun-launch marker to here is this worker's enroot image import time.
+# Phase markers inside the container (see head container).
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "worker \$SLURM_PROCID container started on \$(hostname)"
 
