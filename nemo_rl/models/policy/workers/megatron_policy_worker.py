@@ -50,7 +50,11 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+    GenerationOutputSpec,
+)
+from nemo_rl.models.megatron.moe_routing_record import build_routed_experts_batch
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
@@ -400,6 +404,7 @@ class MegatronPolicyWorkerImpl(
                 pre_load_checkpoint_hook=getattr(
                     self, "_pre_load_checkpoint_hook", None
                 ),
+                policy_model=self.model,
             )
             self.model = self.move_model(self.model, "cuda")
             log_gpu_memory_diagnostics(
@@ -1567,6 +1572,48 @@ class MegatronPolicyWorkerImpl(
             ## re-enable overlap param gather after weight swap
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
+
+    def _parse_result_to_batched_data_dict(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        result: list,
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Pack inference results, additionally recording MoE routing for R3 replay.
+
+        Extends the mixin's packing with the Megatron-inference router-replay recorder.
+        The dynamic-inference engine exposes per-sample ``routing_indices`` (numpy
+        ``[tokens, layers, topk]``); we convert it into the ``routed_experts``
+        ``[batch, seq, layers, topk]`` tensor that the train/logprob forward replays
+        (same key/shape the vLLM path already produces). No-op for dense models or when
+        router replay is disabled / the engine recorded no routing.
+        """
+        out = super()._parse_result_to_batched_data_dict(data, result)
+        if router_replay_enabled(self.cfg):
+            routing_per_sample = [
+                getattr(result[i], "routing_indices", None)
+                for i in range(len(result))
+            ]
+            routed_experts = build_routed_experts_batch(
+                [
+                    torch.from_numpy(r) if r is not None else None
+                    for r in routing_per_sample
+                ],
+                out["unpadded_sequence_lengths"],
+                out["output_ids"].shape[1],
+            )
+            if routed_experts is None:
+                missing = sum(r is None for r in routing_per_sample)
+                raise RuntimeError(
+                    "policy.router_replay.enabled=true requires Megatron "
+                    "inference to return routing_indices for every generated "
+                    f"sample, but {missing}/{len(routing_per_sample)} samples "
+                    "were missing that field. This usually means "
+                    "moe_enable_routing_replay was not enabled on the model "
+                    "config before the inference engine was initialized."
+                )
+            # Set after super()'s from_batches: it flattens 4D tensors into 1D rows.
+            out["routed_experts"] = routed_experts
+        return out
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
     def get_topk_logits(

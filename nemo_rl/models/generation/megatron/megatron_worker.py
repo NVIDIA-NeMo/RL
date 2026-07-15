@@ -94,6 +94,14 @@ class MegatronGenerationMixin:
         )
         from megatron.core.utils import get_attr_wrapped_model
 
+        from nemo_rl.models.megatron.router_replay import (
+            assert_megatron_inference_router_replay_ready,
+            rebuild_global_router_replay_registry,
+            reset_moe_routing_metadata_buffer,
+            router_replay_enabled,
+            sync_model_config_for_router_replay,
+        )
+
         pg_collection = get_attr_wrapped_model(self.model, "pg_collection")
 
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
@@ -107,7 +115,10 @@ class MegatronGenerationMixin:
 
         # The value may be overwritten by `recompute_kv_cache_after_weight_updates`.
         kv_cache_management_mode = mcore_generation_config["kv_cache_management_mode"]
-        needs_static_kv_pointers = kv_cache_management_mode != "persist"
+        static_kv_memory_pointers = mcore_generation_config.get(
+            "static_kv_memory_pointers",
+            kv_cache_management_mode != "persist",
+        )
 
         materialize_only_last_token_logits = mcore_generation_config[
             "materialize_only_last_token_logits"
@@ -117,6 +128,14 @@ class MegatronGenerationMixin:
 
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model)
         is_hybrid_model = mamba_inference_state_config is not None
+        if is_hybrid_model and self.cfg.get("megatron_cfg", {}).get(
+            "zero_train_gen_mismatch"
+        ):
+            # Match the train scan's fp32 boundary-state precision so gen SSM cache
+            # doesn't diverge from train (gen defaults to bf16 otherwise).
+            mcore_generation_config.setdefault(
+                "mamba_inference_ssm_states_dtype", "float32"
+            )
         if is_hybrid_model:
             if (
                 mcore_generation_config.get("mamba_inference_ssm_states_dtype")
@@ -139,6 +158,10 @@ class MegatronGenerationMixin:
         if logging_step_interval is None:
             logging_step_interval = 0
 
+        if router_replay_enabled(self.cfg):
+            rebuild_global_router_replay_registry(self.model)
+        sync_model_config_for_router_replay(self.model, self.cfg)
+
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
         use_flashinfer_fused_rope = self.model.config.params_dtype in (
             torch.float16,
@@ -152,7 +175,7 @@ class MegatronGenerationMixin:
             max_tokens=max_tokens,
             max_sequence_length=mcore_generation_config["max_model_len"],
             kv_cache_management_mode=KVCacheManagementMode(kv_cache_management_mode),
-            static_kv_memory_pointers=needs_static_kv_pointers,
+            static_kv_memory_pointers=static_kv_memory_pointers,
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=use_flashinfer_fused_rope,
             sampling_backend="flashinfer",
@@ -181,6 +204,11 @@ class MegatronGenerationMixin:
 
         self.inference_context = DynamicInferenceContext(
             self.model.config, inference_config
+        )
+        if router_replay_enabled(self.cfg):
+            reset_moe_routing_metadata_buffer(self.inference_context)
+        assert_megatron_inference_router_replay_ready(
+            self.model, self.inference_context, self.cfg
         )
         self.inference_wrapped_model = GPTInferenceWrapper(
             self.model, self.inference_context

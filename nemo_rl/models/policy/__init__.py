@@ -354,6 +354,16 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # Use batch-invariant kernels (cuBLAS workspace shrink, FA num_splits=1, TE GEMM pin)
+    # for deterministic execution regardless of batch size. Required for zero-KL.
+    batch_invariant_mode: NotRequired[bool]
+    # Disable the memory-efficient Mamba SSM path so training and generation kernels match.
+    # Required for zero-KL on hybrid Mamba models.
+    use_mamba_mem_eff_path: NotRequired[bool]
+    # Master switch: when True, forces batch_invariant_mode=True and
+    # use_mamba_mem_eff_path=False to eliminate train/gen KL mismatch sources.
+    # Router replay and moe_grouped_gemm must be configured explicitly.
+    zero_train_gen_mismatch: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):
