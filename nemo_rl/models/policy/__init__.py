@@ -328,6 +328,10 @@ class MegatronConfig(TypedDict):
     # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation.
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
+    # When True, offload_after_refit skips rerunning the full offload_before_refit
+    # pass (grad-buffer moves, cache clears, and a second gc.collect/empty_cache)
+    # and only re-offloads the optimizer with a single allocator cleanup.
+    refit_slim_offload_after: NotRequired[bool]
     activation_checkpointing: bool
     # Recompute granularity: "full" recomputes all activations, "selective" recomputes
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB

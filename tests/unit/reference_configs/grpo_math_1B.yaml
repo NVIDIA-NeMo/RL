@@ -157,6 +157,7 @@ policy:
 
   megatron_cfg:
     enabled: false
+    refit_slim_offload_after: false
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
