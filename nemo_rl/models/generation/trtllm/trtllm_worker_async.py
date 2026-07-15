@@ -222,6 +222,17 @@ class TrtllmAsyncGenerationWorkerImpl:
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
 
+        # Propagate the nsight runtime_env down to TRT-LLM's internal Ray GPU
+        # workers.  The outer actor's @ray.remote nsight config does NOT inherit
+        # into TRT-LLM's RayExecutor workers (ray_executor.py sets an explicit
+        # runtime_env); passing ray_worker_nsight_options is the sanctioned hook
+        # (ray_executor.py:120,147). Returns {} when profiling is off → no-op.
+        _nsight = get_nsight_config_if_pattern_matches(
+            "trtllm_async_generation_worker"
+        ).get("nsight")
+        if _nsight and "ray_worker_nsight_options" not in llm_kwargs:
+            llm_kwargs["ray_worker_nsight_options"] = _nsight
+
         # Defer __await__ (which fires setup_async) to post_init_async so
         # AsyncLLM setup runs on the Ray actor's asyncio loop.
         self.llm = AsyncLLM(**llm_kwargs)
@@ -441,6 +452,19 @@ class TrtllmAsyncGenerationWorkerImpl:
             return True
         await self.llm.collective_rpc("reset_prefix_cache")
         return True
+
+    # ------------------------------------------------------------------ #
+    #  GPU profiling (nsys capture-range trigger)
+    # ------------------------------------------------------------------ #
+
+    async def start_gpu_profiling_async(self) -> None:
+        # Outer actor is CPU-only; broadcast to the internal GPU workers.
+        if self.llm is not None:
+            await self.llm.collective_rpc("start_gpu_profiling")
+
+    async def stop_gpu_profiling_async(self) -> None:
+        if self.llm is not None:
+            await self.llm.collective_rpc("stop_gpu_profiling")
 
     # ------------------------------------------------------------------ #
     #  Generation
