@@ -953,6 +953,8 @@ def ppo_train(
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while current_epoch < max_num_epochs and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
@@ -1478,6 +1480,10 @@ def ppo_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = timeout.check_save()
 
@@ -1664,10 +1670,12 @@ def ppo_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
+                checkpointer.shutdown()
                 memory_tracker.snapshot_start_of_stage("", dir())
                 print(
                     "Max number of steps has been reached, stopping training early",
@@ -1677,6 +1685,13 @@ def ppo_train(
 
         current_epoch += 1
         current_step = 0
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
 
 
 def validate(
