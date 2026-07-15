@@ -33,7 +33,8 @@ set -euo pipefail
 #
 # Optional knobs:
 #   WALLTIME=4:00:00                       Slurm --time
-#   SLURM_QOS=normal                       Slurm --qos
+#   SLURM_QOS=                             Slurm --qos; defaults to short when
+#                                          WALLTIME is under two hours
 #   SLURM_RESERVATION=                     Slurm --reservation
 #   SLURM_DEPENDENCY=                      Extra Slurm dependency, merged with
 #                                          singleton (e.g. afterany:<jobid>)
@@ -144,6 +145,54 @@ WALLTIME="${WALLTIME:-4:00:00}"
 SLURM_QOS="${SLURM_QOS:-}"
 SLURM_RESERVATION="${SLURM_RESERVATION:-}"
 EXCLUDE_NODES="${EXCLUDE_NODES:-}"
+
+slurm_walltime_seconds() {
+  local value="$1"
+  local days=0
+  local -a fields
+
+  if [[ "${value}" == *-* ]]; then
+    days="${value%%-*}"
+    value="${value#*-}"
+  fi
+  [[ "${days}" =~ ^[0-9]+$ ]] || return 1
+
+  IFS=: read -r -a fields <<< "${value}"
+  for field in "${fields[@]}"; do
+    [[ "${field}" =~ ^[0-9]+$ ]] || return 1
+  done
+
+  case "${#fields[@]}" in
+    1)
+      if (( days > 0 )); then
+        echo $((10#${days} * 86400 + 10#${fields[0]} * 3600))
+      else
+        echo $((10#${fields[0]} * 60))
+      fi
+      ;;
+    2)
+      if (( days > 0 )); then
+        echo $((10#${days} * 86400 + 10#${fields[0]} * 3600 + 10#${fields[1]} * 60))
+      else
+        echo $((10#${fields[0]} * 60 + 10#${fields[1]}))
+      fi
+      ;;
+    3)
+      echo $((10#${days} * 86400 + 10#${fields[0]} * 3600 + 10#${fields[1]} * 60 + 10#${fields[2]}))
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+if [[ -z "${SLURM_QOS}" ]]; then
+  if WALLTIME_SECONDS="$(slurm_walltime_seconds "${WALLTIME}")"; then
+    if (( WALLTIME_SECONDS < 2 * 60 * 60 )); then
+      SLURM_QOS=short
+    fi
+  else
+    echo "[WARN] Could not parse WALLTIME=${WALLTIME}; leaving SLURM_QOS unset." >&2
+  fi
+fi
 # INTERACTIVE=1 brings up the Ray cluster and idles for attachment (no training
 # driver), so you can run/debug the recipe by hand. INTERACTIVE_WAIT=1 (default)
 # blocks until Ray is ready; INTERACTIVE_WALLTIME overrides WALLTIME for the alloc.
@@ -160,8 +209,9 @@ CHECKPOINTING_SAVE_BY="${CHECKPOINTING_SAVE_BY:-}"
 export CONTAINER
 MOUNTS="${MOUNTS:-}"
 
-# GB200 NVL72: fixed at 4 GPUs/node.
-export GPUS_PER_NODE=4
+# GB200 NVL72 defaults to 4 GPUs/node. Allow H100 smoke configs to request
+# their native 8-GPU node shape through the launch environment.
+export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 export CPUS_PER_WORKER="${CPUS_PER_WORKER:-144}"
 
 # =============================================================================
@@ -582,7 +632,8 @@ NRL_VLLM_CACHE_SEED_DIR=${NRL_VLLM_CACHE_SEED_DIR} \
 DG_JIT_CACHE_DIR=${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
 TORCHINDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
 TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
-UV_CACHE_DIR=${PERSISTENT_CACHE}/uv \
+UV_CACHE_DIR=/tmp/nemo-gym-uv-cache-\${SLURM_JOB_ID:-default} \
+UV_LOCK_TIMEOUT=1800 \
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
 UV_HTTP_TIMEOUT=10 \
 VLLM_USE_FLASHINFER_MOE_FP8=1 \
@@ -597,6 +648,7 @@ uv run ./examples/nemo_gym/run_grpo_nemo_gym.py \
 policy.model_name=${MODEL_PATH} \
 cluster.num_nodes=${NUM_ACTOR_NODES} \
 policy.generation.colocated.resources.num_nodes=${NUM_GEN_NODES} \
+env.nemo_gym.num_gpu_nodes=${NUM_GYM_NODES} \
 checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
 ${CHECKPOINTING_SAVE_BY:+checkpointing.checkpoint_must_save_by=${CHECKPOINTING_SAVE_BY}} \
 data.train.data_path=${TRAIN_PATH} \
@@ -719,6 +771,7 @@ if [[ "${INTERACTIVE}" == "1" ]]; then
     ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
     ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
     ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+    --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"interactive","description":"interactive debugging"}}' \
     "${RAY_SUB}")
   echo "${SBATCH_OUTPUT}"
   JOB_ID=$(echo "${SBATCH_OUTPUT}" | grep -oP '\d+$')
@@ -781,6 +834,7 @@ SBATCH_OUTPUT=$(sbatch \
   ${SLURM_QOS:+--qos="${SLURM_QOS}"} \
   ${EXCLUDE_NODES:+--exclude="${EXCLUDE_NODES}"} \
   ${SLURM_RESERVATION:+--reservation="${SLURM_RESERVATION}"} \
+  --comment='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"interactive","description":"interactive debugging"}}' \
   "${RAY_SUB}")
 
 echo "${SBATCH_OUTPUT}"

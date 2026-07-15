@@ -334,8 +334,13 @@ policy:
     vllm_kwargs:
       attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
+      # Hybrid Mamba: one state slot per running seq; the vLLM default (1024) can
+      # exceed available slots. 256 matches the Ultra GB200 serving reference
+      # (Gym nemotron_3_ultra_dev_nemorl_gb200.yaml).
+      max_num_seqs: 256
       compilation_config:
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        cudagraph_mode: PIECEWISE
         pass_config:
           fuse_allreduce_rms: false
 
@@ -431,10 +436,14 @@ env:
           debug: true
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
-            VLLM_ATTENTION_BACKEND: FLASH_ATTN
             NCCL_MNNVL_ENABLE: "0"
+            VLLM_USE_FLASHINFER_MOE_FP16: "0"
+            VLLM_USE_FLASHINFER_MOE_FP8: "0"
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
 
           vllm_serve_kwargs:
+            attention_backend: TRITON_ATTN
             tensor_parallel_size: 4
             data_parallel_size: 4
             data_parallel_size_local: 1
