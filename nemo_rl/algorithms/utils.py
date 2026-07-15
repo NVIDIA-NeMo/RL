@@ -1029,3 +1029,30 @@ def print_efficiency_summary(
     loggable["efficiency/total_wall_time_s"] = total_wall_time_s
 
     return loggable
+
+
+def maybe_enable_refit_prequantize(
+    policy: Any,
+    policy_generation: Any,
+    state_dict_info: Optional[dict[str, Any]],
+    policy_config: dict[str, Any],
+) -> None:
+    """Complete the trainer-side pre-quantized refit handshake if requested.
+
+    The generation backend's prepare_refit_info returns the fp8-eligible
+    parameter names when vllm_cfg.refit_prequantize is enabled; the trainer
+    then quantizes exactly those during refit and the receiver's unpack
+    metadata is refreshed to the quantized dtypes plus scale entries.
+    """
+    prequant_names = policy_generation.prepare_refit_info(state_dict_info)
+    if not prequant_names:
+        return
+    megatron_cfg = policy_config.get("megatron_cfg")
+    if not (megatron_cfg and megatron_cfg["enabled"]):
+        raise ValueError(
+            "vllm_cfg.refit_prequantize requires the Megatron policy backend "
+            "(policy.megatron_cfg.enabled=true); the DTensor workers do not "
+            "implement trainer-side pre-quantized refit."
+        )
+    updated_info = policy.enable_refit_prequantize(prequant_names)
+    policy_generation.prepare_refit_info(updated_info)

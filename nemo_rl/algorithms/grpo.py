@@ -93,6 +93,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.algorithms.utils import maybe_enable_refit_prequantize
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     resolve_routed_experts_dtype_name_for_model,
@@ -1320,7 +1321,9 @@ def setup(
     else:
         state_dict_info = policy.prepare_refit_info()
         if policy_generation is not None:
-            policy_generation.prepare_refit_info(state_dict_info)
+            maybe_enable_refit_prequantize(
+                policy, policy_generation, state_dict_info, master_config.policy
+            )
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore

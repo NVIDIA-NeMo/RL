@@ -34,6 +34,11 @@ class VllmSpecificArgs(TypedDict):
     precision: NotRequired[str]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
+    # With is_mx, quantize weights to MXFP8 on the trainer during refit and
+    # stream E4M3 data plus scales (~47% smaller payload) instead of BF16;
+    # the vLLM worker then skips its per-refit re-quantization. Requires the
+    # Megatron policy backend.
+    refit_prequantize: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]

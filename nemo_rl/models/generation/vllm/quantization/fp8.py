@@ -53,6 +53,9 @@ class FP8Config:
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
     is_mx: bool = False
+    # Weights arrive from the trainer already MXFP8-quantized (E4M3 data plus
+    # *_scale_from_checkpoint entries), so load_weights skips re-quantization.
+    refit_prequantize: bool = False
 
 
 @dataclass()
@@ -215,6 +218,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
+        fp8_config_kwargs["refit_prequantize"] = bool(vllm_cfg.get("refit_prequantize"))
         if vllm_cfg.get("pow2_weight_scaling_factors") is False:
             raise ValueError("only pow2 weight scaling factors are supported for MXFP8")
         if vllm_cfg.get("pow2_activation_scaling_factors") is False:
@@ -435,6 +439,11 @@ def load_weights(weights, model_runner):
     for k, v in weights:
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
+            continue
+        if v.dtype == torch.float8_e4m3fn:
+            # Already quantized on the trainer (vllm_cfg.refit_prequantize); the
+            # matching *_scale_from_checkpoint entry arrives as its own weight.
+            weights_quantized.append([k, v])
             continue
         # Cast the weight into fp8 and its scale factor
         if global_fp8_config.is_mx:

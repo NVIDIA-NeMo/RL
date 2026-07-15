@@ -65,6 +65,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.algorithms.utils import maybe_enable_refit_prequantize
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
@@ -596,7 +597,9 @@ def setup(
 
     if student_generation is not None:
         state_dict_info = student_policy.prepare_refit_info()
-        student_generation.prepare_refit_info(state_dict_info)
+        maybe_enable_refit_prequantize(
+            student_policy, student_generation, state_dict_info, master_config.policy
+        )
 
     # if it is not colocated inference, initialize collective communication for update weights
     if not colocated_inference:

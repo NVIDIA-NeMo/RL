@@ -297,6 +297,9 @@ class MegatronPolicyWorkerImpl(
         # Staging-buffer cache for refit weight streaming; only populated when
         # cfg["refit_persistent_ipc_buffers"] is enabled.
         self._refit_ipc_buffer_cache: dict[str, Any] = {}
+        # HF param names to MXFP8-quantize on the trainer during refit; set via
+        # enable_refit_prequantize() when vllm_cfg.refit_prequantize is on.
+        self._refit_prequant_names: set[str] = set()
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -1748,6 +1751,42 @@ class MegatronPolicyWorkerImpl(
 
         return refit_param_info_hf
 
+    def enable_refit_prequantize(self, param_names: list[str]) -> dict[str, Any]:
+        """Quantize the listed HF params to MXFP8 on the trainer during refit.
+
+        Args:
+            param_names: fp8-eligible parameter names reported by the vLLM
+                workers (see VllmInternalWorkerExtension.prepare_refit_info).
+
+        Returns:
+            Updated refit metadata: the listed params become float8_e4m3fn and
+            each gains a *_scale_from_checkpoint uint8 entry.
+        """
+        self._refit_prequant_names = set(param_names)
+
+        refit_param_info_hf = {}
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+        return refit_param_info_hf
+
+    def _maybe_prequantize_param(
+        self, name: str, tensor: torch.Tensor
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        if (
+            name not in self._refit_prequant_names
+            or tensor.dtype == torch.float8_e4m3fn
+        ):
+            yield name, tensor
+            return
+
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            mxfp8_e4m3_quantize_for_refit,
+        )
+
+        param_lp, param_scale = mxfp8_e4m3_quantize_for_refit(tensor)
+        yield name, param_lp
+        yield name + "_scale_from_checkpoint", param_scale
+
     def _collect_mtp_metrics(
         self,
         metrics: dict[str, Any],
@@ -1929,9 +1968,10 @@ class MegatronPolicyWorkerImpl(
             conversion_tasks=self.refit_conversion_tasks,
         )
 
-        # Yield the original parameters first.
+        # Yield the original parameters first, MXFP8-quantizing on the trainer
+        # when pre-quantized refit is enabled for the parameter.
         for name, tensor in base_iter:
-            yield name, tensor
+            yield from self._maybe_prequantize_param(name, tensor)
 
         if self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf

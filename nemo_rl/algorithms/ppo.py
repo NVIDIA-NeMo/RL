@@ -66,6 +66,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.algorithms.utils import maybe_enable_refit_prequantize
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -641,7 +642,9 @@ def setup(
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+        maybe_enable_refit_prequantize(
+            policy, policy_generation, state_dict_info, master_config.policy
+        )
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
