@@ -23,6 +23,21 @@ Then **immediately register the GPU-idle exemption** (see below) or the reaper k
   `uv run --extra mcore` (compiles transformer-engine — the ~5-min setup cost).
 - Model / data / SIFs are all under `$Z` (see the launcher's `MODEL_PATH`, `TRAIN_PATH`, `swe_sifs`).
 
+## Running as a different user (within HSG)
+Read paths (model, data, container, SIFs, sdevare symlink targets) are world-readable under
+`.../users/zhiyul`, so **you do not need to copy them** — the launcher keeps them as defaults.
+Only **write** targets are scoped per-user via `WRITE_ROOT`, which defaults to
+`/lustre/fsw/portfolios/llmservice/users/$USER` (HF cache, compile/uv caches, per-agent venvs,
+results/checkpoints/logs). So a teammate typically only needs to:
+- have access to Slurm account `nemotron_sw_post` (or override `SLURM_ACCOUNT`);
+- optionally `export WRITE_ROOT=<your writable dir>` if you don't want the `users/$USER` default;
+- provide your own creds for the `source .../secrets.sh` line — though the model is local, so
+  `HF_TOKEN` is usually unnecessary. Do **not** rely on zhiyul's `secrets.sh`.
+
+Leave `NRL_NCCL_FLIGHT_RECORDER` unset unless you also set `TORCH_NCCL_DEBUG_INFO_TEMP_FILE` to a
+writable dump-dir prefix. Note `checkpointing.save_period=1` (in the launcher) writes a 550B
+checkpoint **every step** — drop it for anything but short debugging.
+
 ## GPU-idle reaper exemption (REQUIRED)
 The 550B dist-ckpt load sits at SM≈0 for ~30 min and the auto-reaper (`svc-hwinf-cs-sched`) cancels
 idle jobs after 30 min. Set the exemption comment on the job **while PENDING or right after RUNNING**:

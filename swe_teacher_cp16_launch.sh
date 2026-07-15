@@ -7,8 +7,14 @@
 set -uo pipefail
 Z=/lustre/fsw/portfolios/llmservice/users/zhiyul
 
+# READ paths (model, data, container, SIFs) stay under $Z — they are world-readable within HSG, so
+# any HSG user can repro without copying them. Only WRITE targets (caches, per-agent venvs, results)
+# are scoped per-user via WRITE_ROOT, which defaults to your own users/<you> dir. For zhiyul it
+# resolves back to $Z, so this launcher is byte-identical for the original author.
+WRITE_ROOT="${WRITE_ROOT:-/lustre/fsw/portfolios/llmservice/users/${USER:-$(whoami)}}"
+
 source /lustre/fs1/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/zhiyul/secrets.sh > >(grep -v HF_TOKEN) 2>&1 || true
-export HF_HOME="$Z/hf_cache"
+export HF_HOME="$WRITE_ROOT/hf_cache"   # WRITE: HF cache (model itself is local at MODEL_PATH)
 
 export EXP_NAME="ultra-swe-teacher-cp16"   # was ...-nancap (leftover from the NaN investigation, now fixed via moe_backend: triton)
 export CONFIG_PATH="examples/configs/ultra/swe_teacher_cp16.yaml"
@@ -18,7 +24,7 @@ export VAL_PATH="$Z/RL/ultra_data/swe.val.jsonl"
 export CONTAINER="$Z/enroot-images/nvcr.io+nvidian+nemo-rl+nightly.2026-06-22.squashfs"
 export SANDBOX_CONTAINER="$Z/containers/nemo-skills-sandbox.sqsh"
 export SIF_DIR="$Z/swe_sifs"
-export PERSISTENT_CACHE="$Z/persistent_cache"
+export PERSISTENT_CACHE="$WRITE_ROOT/persistent_cache"   # WRITE: compile/uv caches
 export SLURM_PARTITION="batch"
 export SLURM_ACCOUNT="nemotron_sw_post"
 export SLURM_QOS="short"    # QOS 'short' = priority 200 (2x 'normal'=100), NO reservation needed.
@@ -51,7 +57,7 @@ export USE_SNAPSHOT=0
 #   $Z/swe_sifs     - SIF_DIR; its swegym/swerebench are SYMLINKS into sdevare/images, so the
 #   .../sdevare/images - symlink TARGETS must be mounted too or the .sif paths dangle.
 #   $Z/RL/nemo_rl overlay - capture+guard edits live there.
-export EXTRA_MOUNTS="$Z/RL:$Z/RL,$Z/hf_home:$Z/hf_home,$Z/hf_cache:$Z/hf_cache,$Z/gym_venvs:$Z/gym_venvs,$Z/swe_sifs:$Z/swe_sifs,/lustre/fsw/portfolios/llmservice/users/sdevare/images:/lustre/fsw/portfolios/llmservice/users/sdevare/images,$Z/RL/nemo_rl:/opt/nemo-rl/nemo_rl"
+export EXTRA_MOUNTS="$Z/RL:$Z/RL,$Z/hf_home:$Z/hf_home,$WRITE_ROOT/hf_cache:$WRITE_ROOT/hf_cache,$WRITE_ROOT/gym_venvs:$WRITE_ROOT/gym_venvs,$Z/swe_sifs:$Z/swe_sifs,/lustre/fsw/portfolios/llmservice/users/sdevare/images:/lustre/fsw/portfolios/llmservice/users/sdevare/images,$Z/RL/nemo_rl:/opt/nemo-rl/nemo_rl"
 
 # NaN is fixed at the source (moe_backend: triton). NRL_NAN_CAPTURE (debug hooks, adds overhead) is
 # dropped; keep NRL_NAN_GUARD as cheap defensive safety (turns any residual NaN logprob into a 200,
@@ -62,5 +68,14 @@ export RAY_DEDUP_LOGS=0
 # ray.sub defaults the dump dir for USER=zhiyul, else set TORCH_NCCL_DEBUG_INFO_TEMP_FILE yourself.
 export NRL_NCCL_FLIGHT_RECORDER=1
 
+# Ensure per-user WRITE dirs exist so pyxis can bind-mount them (the $Z read paths already exist).
+mkdir -p "$WRITE_ROOT/hf_cache" "$WRITE_ROOT/persistent_cache" "$WRITE_ROOT/gym_venvs"
+
+# Results/checkpoints/logs are WRITE targets: pin them under WRITE_ROOT. For zhiyul this equals
+# $Z/RL/results/$EXP_NAME (unchanged); ultra_launch derives CHECKPOINT_DIR/BASE_LOG_DIR from it.
+export RESULTS_DIR="${RESULTS_DIR:-$WRITE_ROOT/RL/results/$EXP_NAME}"
+
 cd "$Z/RL"
-bash ultra_launch.sh checkpointing.save_period=1
+# uv_venv_dir is the recipe's per-agent venv WRITE dir (set to ??? in the YAML); scope it per-user
+# here — same Hydra-override mechanism as checkpointing.save_period.
+bash ultra_launch.sh checkpointing.save_period=1 env.nemo_gym.uv_venv_dir="$WRITE_ROOT/gym_venvs"
