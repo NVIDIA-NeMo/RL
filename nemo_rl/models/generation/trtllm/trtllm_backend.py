@@ -85,6 +85,18 @@ class NcclExtension(WorkerExtension):
         self.model_update_group = pg
 
     # ------------------------------------------------------------------ #
+    #  GPU profiling (runs inside each nsys-wrapped GPU worker)
+    # ------------------------------------------------------------------ #
+
+    def start_gpu_profiling(self) -> None:
+        """Start CUDA profiler on this GPU worker (nsys capture-range trigger)."""
+        torch.cuda.profiler.start()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop CUDA profiler on this GPU worker."""
+        torch.cuda.profiler.stop()
+
+    # ------------------------------------------------------------------ #
     #  Refit metadata (weight name → (shape, dtype) mapping)
     # ------------------------------------------------------------------ #
 

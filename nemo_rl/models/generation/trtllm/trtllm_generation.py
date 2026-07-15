@@ -439,6 +439,26 @@ class TrtllmGeneration(GenerationInterface):
         )
         ray.get(futures)
 
+    def start_gpu_profiling(self) -> None:
+        """grpo profiling protocol: start nsys capture on the GPU workers."""
+        if not self.worker_group or not self.worker_group.workers:
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "start_gpu_profiling_async" if self.async_engine else "start_gpu_profiling",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        ray.get(futures)
+
+    def stop_gpu_profiling(self) -> None:
+        """grpo profiling protocol: stop nsys capture on the GPU workers."""
+        if not self.worker_group or not self.worker_group.workers:
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "stop_gpu_profiling_async" if self.async_engine else "stop_gpu_profiling",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        ray.get(futures)
+
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
