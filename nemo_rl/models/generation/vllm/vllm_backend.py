@@ -458,9 +458,8 @@ class VllmInternalWorkerExtension:
                 )
 
         yield finalize
-        # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
-        # this optional second pass, just as it was before lifecycle hooks.
-        self._maybe_process_fp8_kv_cache()
+        # KV-cache scales are covered by the full process_weights_after_loading
+        # pass in finalize(); no second pass is needed.
 
     def _weight_update_errors_are_fatal(self) -> bool:
         """Whether transport errors should propagate instead of returning False."""
