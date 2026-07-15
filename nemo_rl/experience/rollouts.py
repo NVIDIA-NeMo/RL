@@ -363,7 +363,7 @@ async def generate_responses_async(
             generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
     elif backend == "trtllm":
-        assert generation_config["trtllm_cfg"]["async_engine"], (
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
             "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
             "synchronous engine path (async_engine=false) is no longer supported."
         )
@@ -2279,7 +2279,9 @@ def _postprocess_single_nemo_gym_group(
                 "max_model_len"
             ]
         elif "trtllm_cfg" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"]["max_model_len"]
+            max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"][
+                "max_model_len"
+            ]
         elif "mcore_generation_config" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg[
                 "mcore_generation_config"

@@ -1,5 +1,18 @@
-"""
-Custom PEP 517 build backend for TensorRT-LLM.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Custom PEP 517 build backend for TensorRT-LLM.
 
 Two hooks implement the two-phase build:
 
@@ -18,6 +31,7 @@ to torch, ninja, cmake, and the CUDA toolkit.
 Build coordinates (git URL / ref) are read from environment variables;
 see 3rdparty/TensorRT-LLM-workspace/pyproject.toml for the full list.
 """
+
 from __future__ import annotations
 
 import glob
@@ -40,9 +54,10 @@ with _PYPROJECT.open("rb") as _f:
     _META = tomllib.load(_f)
 
 VERSION: str = _META["project"]["version"]
-NAME: str = _META["project"]["name"].replace("-", "_")   # tensorrt_llm
-DIST_NAME: str = _META["project"]["name"]                # tensorrt-llm
+NAME: str = _META["project"]["name"].replace("-", "_")  # tensorrt_llm
+DIST_NAME: str = _META["project"]["name"]  # tensorrt-llm
 REQUIRES: list[str] = _META["project"].get("dependencies", [])
+
 
 def _wheel_platform_tag() -> str:
     """Return the real wheel tag for the current interpreter, e.g. cp313-cp313-linux_aarch64.
@@ -53,6 +68,7 @@ def _wheel_platform_tag() -> str:
     py = f"cp{sys.version_info.major}{sys.version_info.minor}"
     machine = platform.machine()  # aarch64 | x86_64
     return f"{py}-{py}-linux_{machine}"
+
 
 # py3-none-any is intentional: prepare_metadata_for_build_wheel is called by
 # uv lock, which resolves for both x86_64 and aarch64. A platform-specific tag
@@ -78,6 +94,7 @@ def _wheel_cache_dir(base: str, git_url: str, git_ref: str) -> Path:
 # ---------------------------------------------------------------------------
 # PEP 517 hooks
 # ---------------------------------------------------------------------------
+
 
 def get_requires_for_build_wheel(config_settings=None):
     """No isolated-build requirements; deps come from the main venv (no-build-isolation)."""
@@ -128,7 +145,9 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         "BUILD_CUSTOM_TRTLLM_URL",
         "https://github.com/NVIDIA/TensorRT-LLM.git",
     )
-    git_ref = env.get("BUILD_CUSTOM_TRTLLM_REF", "bf2ef86f9a2652132b11773d4041e292c553c142")
+    git_ref = env.get(
+        "BUILD_CUSTOM_TRTLLM_REF", "bf2ef86f9a2652132b11773d4041e292c553c142"
+    )
 
     # Our own cache keyed by (git_url, git_ref, version, platform_tag).
     # uv's built-in build cache misses across venvs for no-build-isolation

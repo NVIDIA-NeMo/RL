@@ -1,5 +1,4 @@
 defaults: ../../grpo_math_1B_trtllm.yaml
-
 grpo:
   num_prompts_per_step: 4
   num_generations_per_prompt: 4
@@ -7,25 +6,19 @@ grpo:
   val_period: 50
   max_val_samples: 64
   val_batch_size: 64
-
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-qwen3-1.7b-1n4g-megatron-trtllm-colocated
   save_period: 25
-
 policy:
   model_name: Qwen/Qwen3-1.7B
-  tokenizer:
-    name: ${policy.model_name}
   max_total_sequence_length: 2048
   train_global_batch_size: 16
   generation_batch_size: 4
   logprob_batch_size: 4
   make_sequence_length_divisible_by: 1
-
   dtensor_cfg:
     enabled: false
-
   megatron_cfg:
     enabled: true
     converter_type: Qwen3ForCausalLM
@@ -39,34 +32,24 @@ policy:
     fp8_cfg:
       fp8: hybrid
       fp8_recipe: tensorwise
-
   optimizer: null
   scheduler:
-    - name: torch.optim.lr_scheduler.LinearLR
-      kwargs:
-        start_factor: 0.1
-        end_factor: 1.0
-        total_iters: 20
-    - name: torch.optim.lr_scheduler.ConstantLR
-      kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones: [20]
-
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 20
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 20
   generation:
-    backend: trtllm
     trtllm_cfg:
       tensor_parallel_size: 2
-      max_model_len: ${policy.max_total_sequence_length}
       max_batch_size: 16
       max_num_tokens: 4096
-      gpu_memory_utilization: 0.6
-    colocated:
-      enabled: true
-      resources:
-        gpus_per_node: null
-        num_nodes: null
-
 logger:
   log_dir: logs/grpo-qwen3-1.7b-1n4g-megatron-trtllm-colocated
   monitor_gpus: false
@@ -74,7 +57,5 @@ logger:
   wandb:
     project: grpo-trtllm-v2
     name: grpo-qwen3-1.7b-1n4g-megatron-trtllm-colocated
-
 cluster:
   gpus_per_node: 4
-  num_nodes: 1

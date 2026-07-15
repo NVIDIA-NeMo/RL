@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -101,16 +101,17 @@ class TrtllmAsyncGenerationWorkerImpl:
         if not self.is_model_owner:
             return
 
-        from tensorrt_llm import AsyncLLM, SamplingParams as TrtSamplingParams
+        from ray.util.placement_group import get_current_placement_group
+        from tensorrt_llm import AsyncLLM
+        from tensorrt_llm import SamplingParams as TrtSamplingParams
         from tensorrt_llm.llmapi.llm_args import (
             CapacitySchedulerPolicy,
             CudaGraphConfig,
+            ExecutorMemoryType,
             KvCacheConfig,
             SchedulerConfig,
             SleepConfig,
-            ExecutorMemoryType,
         )
-        from ray.util.placement_group import get_current_placement_group
 
         self.TrtSamplingParams = TrtSamplingParams
 
@@ -288,6 +289,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         except Exception as e:
             print(f"Exception during TRT-LLM async collective weight update: {e}")
             import traceback
+
             traceback.print_exc()
             return False
 
@@ -305,6 +307,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         except Exception as e:
             print(f"Exception during TRT-LLM async IPC weight update: {e}")
             import traceback
+
             traceback.print_exc()
             return False
 
@@ -317,7 +320,8 @@ class TrtllmAsyncGenerationWorkerImpl:
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         return [
-            t.value for t in ExecutorMemoryType
+            t.value
+            for t in ExecutorMemoryType
             if t is not ExecutorMemoryType.KV_CACHE and not t.value.startswith("_")
         ]
 
@@ -336,6 +340,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                 out.extend(self._weights_tags())
             elif t == "kv_cache":
                 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
                 out.append(ExecutorMemoryType.KV_CACHE.value)
             else:
                 out.append(t)
@@ -376,12 +381,14 @@ class TrtllmAsyncGenerationWorkerImpl:
         greedy: bool = False,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         if len(data["input_ids"]) == 0:
-            return BatchedDataDict[GenerationOutputSpec]({
-                "output_ids": torch.zeros((0, 0), dtype=torch.long),
-                "logprobs": torch.zeros((0, 0), dtype=torch.float),
-                "generation_lengths": torch.zeros(0, dtype=torch.long),
-                "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
-            })
+            return BatchedDataDict[GenerationOutputSpec](
+                {
+                    "output_ids": torch.zeros((0, 0), dtype=torch.long),
+                    "logprobs": torch.zeros((0, 0), dtype=torch.float),
+                    "generation_lengths": torch.zeros(0, dtype=torch.long),
+                    "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
+                }
+            )
 
         assert self.llm is not None
         input_ids = data["input_ids"]
@@ -421,7 +428,9 @@ class TrtllmAsyncGenerationWorkerImpl:
             total_length = padded_input_length + max_gen_len
 
             full_output = torch.full(
-                (total_length,), self.cfg["_pad_token_id"], dtype=input_ids.dtype,
+                (total_length,),
+                self.cfg["_pad_token_id"],
+                dtype=input_ids.dtype,
             )
             full_output[:seq_len] = input_ids[i][:seq_len]
             full_output[seq_len : seq_len + len(gen_tokens)] = torch.tensor(gen_tokens)
@@ -444,14 +453,18 @@ class TrtllmAsyncGenerationWorkerImpl:
             generation_lengths.append(len(gen_tokens))
             unpadded_sequence_lengths.append(resp_len)
 
-        return BatchedDataDict[GenerationOutputSpec]({
-            "output_ids": torch.stack(output_ids_list),
-            "logprobs": torch.stack(logprobs_list),
-            "generation_lengths": torch.tensor(generation_lengths, dtype=torch.long),
-            "unpadded_sequence_lengths": torch.tensor(
-                unpadded_sequence_lengths, dtype=torch.long
-            ),
-        })
+        return BatchedDataDict[GenerationOutputSpec](
+            {
+                "output_ids": torch.stack(output_ids_list),
+                "logprobs": torch.stack(logprobs_list),
+                "generation_lengths": torch.tensor(
+                    generation_lengths, dtype=torch.long
+                ),
+                "unpadded_sequence_lengths": torch.tensor(
+                    unpadded_sequence_lengths, dtype=torch.long
+                ),
+            }
+        )
 
     # ------------------------------------------------------------------ #
     #  Helpers
@@ -468,7 +481,10 @@ class TrtllmAsyncGenerationWorkerImpl:
         end_id: Optional[int] = None
         try:
             from transformers import AutoConfig
-            hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+
+            hf_config = AutoConfig.from_pretrained(
+                self.model_name, trust_remote_code=True
+            )
             eos_id = getattr(hf_config, "eos_token_id", None)
             if eos_id is not None:
                 end_id = eos_id[0] if isinstance(eos_id, list) else eos_id
@@ -502,7 +518,9 @@ class TrtllmAsyncGenerationWorkerImpl:
 
 @ray.remote(
     num_cpus=0,
-    runtime_env={**get_nsight_config_if_pattern_matches("trtllm_async_generation_worker")},
+    runtime_env={
+        **get_nsight_config_if_pattern_matches("trtllm_async_generation_worker")
+    },
 )  # pragma: no cover
 class TrtllmAsyncGenerationWorker(TrtllmAsyncGenerationWorkerImpl):
     """Ray actor wrapper around :class:`TrtllmAsyncGenerationWorkerImpl`."""

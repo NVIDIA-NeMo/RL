@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ from typing import Any
 
 import torch
 import zmq
-
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
@@ -70,12 +69,17 @@ class NcclExtension(WorkerExtension):
     ) -> None:
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        assert torch.distributed.is_initialized(), "TRT-LLM backend requires torch.distributed to be initialized before init_collective"
+        assert torch.distributed.is_initialized(), (
+            "TRT-LLM backend requires torch.distributed to be initialized before init_collective"
+        )
         local_rank = torch.distributed.get_rank()
         rank = train_world_size + rank_prefix + local_rank
 
         pg = StatelessProcessGroup(
-            master_address=ip, port=port, rank=rank, world_size=world_size,
+            master_address=ip,
+            port=port,
+            rank=rank,
+            world_size=world_size,
         )
         pg.init_nccl_communicator(device=self.device_id)
         self.model_update_group = pg
@@ -121,7 +125,9 @@ class NcclExtension(WorkerExtension):
 
         def load_model_weight_func(weight_list):
             model_engine.model_loader.reload(
-                model, dict(weight_list), allow_partial_loading=True,
+                model,
+                dict(weight_list),
+                allow_partial_loading=True,
             )
 
         with self.engine.control_action(drain=drain):
@@ -132,7 +138,9 @@ class NcclExtension(WorkerExtension):
                 # Block here so we don't overwrite weights mid-forward
                 torch.cuda.synchronize()
                 for module in model.modules():
-                    if hasattr(module, "pre_reload_weights") and not getattr(module, "_weights_removed", False):
+                    if hasattr(module, "pre_reload_weights") and not getattr(
+                        module, "_weights_removed", False
+                    ):
                         module.pre_reload_weights()
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
@@ -145,16 +153,16 @@ class NcclExtension(WorkerExtension):
                         module, "_weights_removed", False
                     ):
                         module.process_weights_after_loading()
-                    if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
+                    if hasattr(module, "post_load_weights") and not getattr(
+                        module, "_weights_removed", False
+                    ):
                         module.post_load_weights()
                 torch.cuda.current_stream().synchronize()
 
                 if not drain and recompute_kv:
                     self.engine.reset_prefix_cache()
             except Exception as e:
-                print(
-                    f"Error in NcclExtension.update_weights_from_collective: {e}"
-                )
+                print(f"Error in NcclExtension.update_weights_from_collective: {e}")
                 return False
 
         return True
@@ -231,7 +239,9 @@ class NcclExtension(WorkerExtension):
                 )
 
                 model_engine.model_loader.reload(
-                    model, weights, allow_partial_loading=True,
+                    model,
+                    weights,
+                    allow_partial_loading=True,
                 )
                 torch.cuda.current_stream().synchronize()
 
@@ -247,7 +257,9 @@ class NcclExtension(WorkerExtension):
                     module, "_weights_removed", False
                 ):
                     module.process_weights_after_loading()
-                if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
+                if hasattr(module, "post_load_weights") and not getattr(
+                    module, "_weights_removed", False
+                ):
                     module.post_load_weights()
             torch.cuda.current_stream().synchronize()
             gc.collect()
@@ -275,4 +287,5 @@ class NcclExtension(WorkerExtension):
 
     def report_device_id(self) -> str:
         from tensorrt_llm._torch.utils import get_device_uuid
+
         return get_device_uuid(self.device_id)

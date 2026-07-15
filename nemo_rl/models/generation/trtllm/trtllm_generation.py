@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -76,13 +76,12 @@ class TrtllmGeneration(GenerationInterface):
         missing_keys = [k for k in TrtllmConfig.__required_keys__ if k not in self.cfg]
         if "model_name" not in self.cfg:
             missing_keys.append("model_name")
-        assert not missing_keys, (
-            f"TrtllmConfig missing keys: {missing_keys}"
-        )
+        assert not missing_keys, f"TrtllmConfig missing keys: {missing_keys}"
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
-                self.dp_size, self.tp_size,
+                self.dp_size,
+                self.tp_size,
             ),
             names=["data_parallel", "tensor_parallel"],
         )
@@ -170,7 +169,8 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
 
     def _get_tied_worker_bundle_indices(
-        self, cluster: RayVirtualCluster,
+        self,
+        cluster: RayVirtualCluster,
     ) -> list[tuple[int, list[int]]]:
         """Calculate bundle indices for tensor-parallel worker groups.
 
@@ -209,9 +209,7 @@ class TrtllmGeneration(GenerationInterface):
                 raise ValueError("Placement group contains no bundles")
 
             counts = [len(b) for b in node_bundles.values()]
-            assert len(set(counts)) == 1, (
-                "All nodes must have identical bundle counts"
-            )
+            assert len(set(counts)) == 1, "All nodes must have identical bundle counts"
 
             total = sum(counts)
             num_groups = total // model_parallel_size
@@ -229,9 +227,7 @@ class TrtllmGeneration(GenerationInterface):
 
             tied_groups: list[tuple[int, list[int]]] = []
             for i in range(num_groups):
-                slice_ = flat[
-                    i * model_parallel_size : (i + 1) * model_parallel_size
-                ]
+                slice_ = flat[i * model_parallel_size : (i + 1) * model_parallel_size]
                 first_node = bundle_to_node[slice_[0]]
                 tied_groups.append((node_idx[first_node], slice_))
         else:
@@ -264,7 +260,12 @@ class TrtllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------ #
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int,
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
     ) -> list[ray.ObjectRef]:
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
@@ -286,14 +287,17 @@ class TrtllmGeneration(GenerationInterface):
         )
 
     def generate(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False,
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        greedy: bool = False,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         assert isinstance(data, BatchedDataDict)
         assert "input_ids" in data and "input_lengths" in data
 
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
-            dp_size, allow_uneven_shards=True,
+            dp_size,
+            allow_uneven_shards=True,
         )
         future_bundle = self.worker_group.run_all_workers_sharded_data(
             "generate_async",
@@ -306,10 +310,16 @@ class TrtllmGeneration(GenerationInterface):
         results = self.worker_group.get_all_worker_results(future_bundle)
 
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
-            results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]},
+            results,
+            pad_value_dict={"output_ids": self.cfg["_pad_token_id"]},
         )
 
-        required = ["output_ids", "generation_lengths", "unpadded_sequence_lengths", "logprobs"]
+        required = [
+            "output_ids",
+            "generation_lengths",
+            "unpadded_sequence_lengths",
+            "logprobs",
+        ]
         missing = [k for k in required if k not in combined]
         if missing:
             raise ValueError(f"Missing generation output keys: {missing}")
@@ -354,9 +364,7 @@ class TrtllmGeneration(GenerationInterface):
             os.environ.get("NRL_TRTLLM_ASYNC_TIMEOUT_SECONDS", "900")
         )
         try:
-            result = await asyncio.wait_for(
-                worker_result_ref, timeout=timeout_seconds
-            )
+            result = await asyncio.wait_for(worker_result_ref, timeout=timeout_seconds)
         except asyncio.TimeoutError:
             raise RuntimeError(
                 f"TRT-LLM async generation timed out after {timeout_seconds}s. "
@@ -414,9 +422,7 @@ class TrtllmGeneration(GenerationInterface):
             raise RuntimeError("Worker group not initialised")
         trtllm_cfg = self.cfg["trtllm_cfg"]
         in_flight = bool(trtllm_cfg.get("in_flight_weight_updates"))
-        recompute_kv = bool(
-            trtllm_cfg.get("recompute_kv_cache_after_weight_updates")
-        )
+        recompute_kv = bool(trtllm_cfg.get("recompute_kv_cache_after_weight_updates"))
         return self.worker_group.run_all_workers_single_data(
             "update_weights_from_collective_async",
             run_rank_0_only_axes=["tensor_parallel"],
@@ -434,8 +440,7 @@ class TrtllmGeneration(GenerationInterface):
         )
 
     def invalidate_kv_cache(self) -> bool:
-        """No-op for TRT-LLM: KV cache invalidation is performed atomically
-        inside the refit path.
+        """No-op for TRT-LLM: KV-cache invalidation happens inside the refit path.
 
         For async RL correctness, KV/prefix-cache invalidation must happen in
         the same engine step boundary as the weight update — otherwise
@@ -446,7 +451,6 @@ class TrtllmGeneration(GenerationInterface):
         function itself, under the same ``control_action`` context:
           * ``NcclExtension.update_weights_from_collective`` (NCCL path)
           * ``NcclExtension.update_weights_via_ipc_zmq`` (IPC-ZMQ path)
-
         """
         return True
 
