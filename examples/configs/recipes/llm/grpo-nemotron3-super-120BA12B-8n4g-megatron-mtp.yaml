@@ -1,0 +1,27 @@
+# GRPO Nemotron-3-Super 120B-A12B, 8x4 GPUs (Megatron), MTP speculative decoding.
+# Inherits the non-colocated base recipe and (a) co-trains the MTP layer
+# (mtp_num_layers, matching the 16n8g recipe) so the MTP weights are refit, and
+# (b) turns on MTP speculative decoding for vLLM inference. This exercises the
+# refit-into-drafter path over the collective (non-colocated) weight transport.
+defaults: ./grpo-nemotron3-super-120BA12B-8n4g-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-8n4g-megatron-mtp
+policy:
+  megatron_cfg:
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+    mtp_use_repeated_layer: true
+    mtp_loss_scaling_factor: 0.3
+  generation:
+    vllm_cfg:
+      enable_prefix_caching: true
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8480
+      mamba_cache_mode: align
+      speculative_config:
+        num_speculative_tokens: 5
+        method: mtp
+logger:
+  wandb:
+    name: grpo-nemotron3-super-120BA12B-8n4g-megatron-mtp

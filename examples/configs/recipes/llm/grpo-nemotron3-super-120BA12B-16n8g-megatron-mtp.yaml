@@ -1,0 +1,23 @@
+# GRPO Nemotron-3-Super 120B-A12B, 16x8 GPUs (Megatron), MTP speculative decoding.
+# Inherits the base recipe (which already co-trains the MTP layer via
+# mtp_num_layers) and turns on MTP speculative decoding for vLLM inference. The
+# MTP weights are part of the model and arrive via refit, so no separate draft
+# checkpoint is needed (load_format stays "dummy"). This colocated recipe
+# exercises the refit-into-drafter path over the IPC weight transport.
+defaults: ./grpo-nemotron3-super-120BA12B-16n8g-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-16n8g-megatron-mtp
+policy:
+  generation:
+    vllm_cfg:
+      enable_prefix_caching: true
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8480
+      mamba_cache_mode: align
+      speculative_config:
+        num_speculative_tokens: 5
+        method: mtp
+logger:
+  wandb:
+    name: grpo-nemotron3-super-120BA12B-16n8g-megatron-mtp
