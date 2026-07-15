@@ -272,8 +272,8 @@ def test_distillation_train_max_steps(mock_components):
 def test_ft_save_period_triggers_periodic_saves(mock_components):
     """ft_save_period triggers checkpoint saves independent of save_period."""
     cfg = mock_components["master_config"]
-    cfg.distillation["max_num_steps"] = 5
-    cfg.distillation["val_period"] = 0
+    cfg.distillation.max_num_steps = 5
+    cfg.distillation.val_period = 0
     cfg.checkpointing["enabled"] = True
     cfg.checkpointing["save_period"] = 100  # only the final step would save
     cfg.checkpointing["ft_save_period"] = 2

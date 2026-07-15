@@ -1397,10 +1397,10 @@ def test_dapo_dynamic_sampling_preserves_mask_sample_alignment(mock_grpo_compone
     baseline = torch.tensor([0.67, 0.67, 0.67, 0.33, 0.33, 0.33, 0.57, 0.57, 0.57])
 
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["use_dynamic_sampling"] = True
-    master_config.grpo["num_prompts_per_step"] = 2
-    master_config.grpo["num_generations_per_prompt"] = 3
-    master_config.grpo["dynamic_sampling_max_gen_batches"] = 5
+    master_config.grpo.use_dynamic_sampling = True
+    master_config.grpo.num_prompts_per_step = 2
+    master_config.grpo.num_generations_per_prompt = 3
+    master_config.grpo.dynamic_sampling_max_gen_batches = 5
 
     result_batch, is_batch_complete, _, _ = dynamic_sampling(
         repeated_batch,
@@ -2056,12 +2056,12 @@ def test_grpo_ft_save_period_triggers_periodic_saves(
     checkpointer = mock_grpo_components["checkpointer"]
 
     master_config = mock_grpo_components["master_config"]
-    master_config.grpo["max_num_steps"] = 5
-    master_config.grpo["max_num_epochs"] = 1
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["val_at_start"] = False
-    master_config.grpo["val_at_end"] = False
-    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = False
+    master_config.grpo.use_dynamic_sampling = False
     master_config.checkpointing["enabled"] = True
     master_config.checkpointing["save_period"] = 100  # only the final step saves
     master_config.checkpointing["ft_save_period"] = 2

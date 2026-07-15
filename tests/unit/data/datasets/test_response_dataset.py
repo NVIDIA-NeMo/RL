@@ -340,9 +340,9 @@ def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokeni
     for i in range(2):
         assert combined_message[i] == (
             " Question: "
-            + messages[i][0]["content"]
+            + messages[i][0]["content"].strip()
             + " Answer: "
-            + messages[i][1]["content"]
+            + messages[i][1]["content"].strip()
         )
 
 
