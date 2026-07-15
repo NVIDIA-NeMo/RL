@@ -479,213 +479,193 @@ class SingleControllerActor:
         """Per-prompt-group streaming train loop.
 
         Per step:
-          - Lazy ``begin_train_step`` on first ready group.
-          - Per ready group: optional logprob refresh
-            (``get_logprobs_from_meta`` / ``get_reference_policy_logprobs_from_meta``) →
-            ``_advantage_stage`` → ``train_microbatches_from_meta``.
-          - End-of-step: ``finish_train_step`` →
-            single ``clear_samples`` → ``_sync_weights``.
-
-        **Concurrency contract:**
-        ``self._trainer`` is a driver-side ``TQPolicy`` object, not a Ray
-        actor. Trainer calls run via
-        ``asyncio.to_thread`` and are awaited sequentially, so the worker's
-        ``_train_step_state`` accumulators (``local_valid_seqs +=``,
-        ``mb_losses.append``, ``all_mb_metrics.append``), which are not
-        concurrency-safe, see exactly one call at a time. ``to_thread``
-        keeps the fan-out + internal ``ray.get`` off the event loop so the
-        rollout pump makes progress during trainer calls; exceptions
-        surface at the corresponding ``await``.
+          1. sampler.evict drops stale groups from the buffer and clears their TQ rows.
+          2. sampler.select returns K prompt groups (or None) and drops them from the
+             buffer; DP rows survive so the trainer can read them. Already trainable —
+             buffer wrote training-shaped rows at rollout time.
+          3. _advantage_pump(train_meta).
+          4. trainer.train_microbatch_from_meta + finish_train_step.
+          5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
+             per dropped group, then sync.
         """
+        adv_cfg = self._advantage_cfg
+        grpo_cfg = self._master_config.grpo
+
         # TODO: fix the prev_logprobs_required and reference_logprobs_required logic
-        prev_logprobs_required = self._cfg.advantage_policy_logprobs_field is not None
-        reference_logprobs_required = (
-            self._cfg.advantage_reference_logprobs_field is not None
-        )
+        prev_logprobs_required = adv_cfg.policy_logprobs_field is not None
+        reference_logprobs_required = adv_cfg.reference_logprobs_field is not None
 
-        while self._train_steps < self._cfg.max_train_steps:
-            # __init__ coerces None → min_groups_per_batch (int);
-            # the assert narrows the Optional[int] type for pyrefly.
-            assert self._cfg.target_groups_per_step is not None
-            assert self._cfg.train_global_batch_size is not None
-            target_groups: int = self._cfg.target_groups_per_step
-            # Mini-batch aggregation: K groups per begin/finish cycle, where
-            # K * group_size == train_global_batch_size. Each
-            # cycle is one opt.step. Mirrors sync's gb_idx loop in the worker.
-            groups_per_minibatch = (
-                self._cfg.train_global_batch_size // self._cfg.group_size
-            )
-            num_minibatches = target_groups // groups_per_minibatch
-            rollout_exhausted = False
+        while self._train_steps < grpo_cfg["max_num_steps"]:
+            groups_dispatched = 0
+            min_sample_version = None
+            step_open = False
 
-            for mb_idx in range(num_minibatches):
-                groups_dispatched = 0
-                step_open = False
-                step_min_weight_version: int | None = None
+            with self._timer.time("total_step_time"):
+                while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
+                    # Wait for a selectable batch
+                    with self._timer.time("exposed_generation"):
+                        await asyncio.sleep(0)
 
-                # No SC-side error handling: a mid-cycle worker failure
-                # propagates out of run(). The worker restores its own hooks
-                # on failure (see megatron_policy_worker); abort_train_step
-                # + a retry policy return with fault-tolerance support.
-                while groups_dispatched < groups_per_minibatch:
-                    await asyncio.sleep(0)
-                    await self._claim_available_meta()
-                    evicted_meta = await self._evict_stale_claimed()
-                    if evicted_meta is not None:
-                        evicted_groups = count_groups(
-                            evicted_meta,
-                            group_size=self._cfg.group_size,
+                        # Evict stale groups
+                        evicted = await self._sampler.evict(
+                            current_train_weight=self._trainer_version,
                         )
-                        for _ in range(evicted_groups):
+                        if evicted:
+                            print(
+                                f"  evicted {evicted} stale prompt group(s)",
+                                flush=True,
+                            )
+                            for _ in range(evicted):
+                                self._buffer_capacity.release()
+
+                        # Select a batch
+                        max_prompt_groups = (
+                            grpo_cfg["num_prompts_per_step"] - groups_dispatched
+                        )
+                        min_prompt_groups = min(
+                            self._async_cfg.min_prompt_groups_per_batch,
+                            max_prompt_groups,
+                        )
+                        train_meta, num_groups = await self._sampler.select(
+                            current_train_weight=self._trainer_version,
+                            min_prompt_groups=min_prompt_groups,
+                            max_prompt_groups=max_prompt_groups,
+                        )
+
+                        # If no batch is selectable, sleep and retry
+                        if train_meta is None:
+                            await asyncio.sleep(0.05)
+                            continue
+
+                        # Release buffer capacity
+                        for _ in range(num_groups):
                             self._buffer_capacity.release()
 
-                    group_indices = None
-                    if self._claimed_meta is not None and self._claimed_meta.size > 0:
-                        group_indices = self._sampler.select_one_group(
-                            self._claimed_meta,
-                            trainer_version=self._trainer_version,
-                            group_size=self._cfg.group_size,
-                        )
+                    # Compute prev_logprobs / ref_logprobs
+                    with self._timer.time("logprob_inference_prep"):
+                        await asyncio.to_thread(self._trainer.prepare_for_lp_inference)
+                    with self._timer.time("policy_and_reference_logprobs"):
+                        if prev_logprobs_required:
+                            await asyncio.to_thread(
+                                self._trainer.get_logprobs_from_meta, train_meta
+                            )
+                        if reference_logprobs_required:
+                            await asyncio.to_thread(
+                                self._trainer.get_reference_policy_logprobs_from_meta,
+                                train_meta,
+                            )
 
-                    if group_indices is None:
-                        if self._rollout_done:
-                            # No group is selectable and no more samples
-                            # will arrive: flush groups that can never
-                            # complete so the emptiness check fires
-                            # instead of spinning forever.
-                            await self._flush_incomplete_groups()
-                            if (
-                                self._claimed_meta is None
-                                or self._claimed_meta.size == 0
-                            ):
-                                rollout_exhausted = True
-                                break
-                        await asyncio.sleep(0.005)
-                        continue
+                    # Compute advantages
+                    with self._timer.time("advantage_calculation"):
+                        train_meta = await self._advantage_stage(train_meta)
 
-                    group_meta = self._claimed_meta.subset(group_indices)
-                    self._claimed_meta = self._claimed_meta.drop(group_indices)
-
-                    if prev_logprobs_required or reference_logprobs_required:
-                        with self._timed("policy_and_reference_logprobs"):
-                            if prev_logprobs_required:
-                                await asyncio.to_thread(
-                                    self._trainer.get_logprobs_from_meta,
-                                    group_meta,
-                                )
-                            if reference_logprobs_required:
-                                await asyncio.to_thread(
-                                    self._trainer.get_reference_policy_logprobs_from_meta,
-                                    group_meta,
-                                )
-
-                    # Advantage stage — inline in the train pump, not a
-                    # standalone pump task.
-                    with self._timed("advantage_stage"):
-                        group_meta = await self._advantage_stage(group_meta)
-
-                    if not step_open:
-                        # gbs/mbs default to worker-side cfg when None; SC
-                        # owns only loss_fn (stable across the whole run).
+                    # Train
+                    with self._timer.time("training_prep"):
+                        await asyncio.to_thread(self._trainer.prepare_for_training)
+                    with self._timer.time("policy_training"):
+                        if not step_open:
+                            await asyncio.to_thread(
+                                self._trainer.begin_train_step,
+                                self._loss_fn,
+                            )
+                            step_open = True
                         await asyncio.to_thread(
-                            self._trainer.begin_train_step,
-                            self._loss_fn,
+                            self._trainer.train_microbatches_from_meta,
+                            train_meta,
                         )
-                        step_open = True
 
-                    await asyncio.to_thread(
-                        self._trainer.train_microbatches_from_meta,
-                        group_meta,
-                    )
-                    groups_dispatched += 1
-                    self._buffer_capacity.release()
-                    self._step_consumed_sample_ids.extend(group_meta.sample_ids)
-                    group_min_v = min_weight_version(group_meta)
-                    if group_min_v is not None:
-                        step_min_weight_version = (
-                            group_min_v
-                            if step_min_weight_version is None
-                            else min(step_min_weight_version, group_min_v)
+                    if train_meta.sequence_lengths:
+                        self._step_log_dict["sequence_lengths"].extend(
+                            int(s) for s in train_meta.sequence_lengths
                         )
+
+                    # Refresh min_sample_version
+                    curr_min_sample_version = min(
+                        t["weight_version"]
+                        for t in train_meta.tags  # type: ignore
+                    )
+                    if min_sample_version is not None:
+                        min_sample_version = min(
+                            min_sample_version, curr_min_sample_version
+                        )
+                    else:
+                        min_sample_version = curr_min_sample_version
+
+                    # Remove consumed sample_ids from the buffer
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=list(train_meta.sample_ids),
+                        partition_id=self._partition_id,
+                    )
+
+                    groups_dispatched += num_groups
 
                 if not step_open:
-                    # No groups consumed this mini-batch — either rollouts
-                    # exhausted before any group arrived, or the outer
-                    # loop broke without dispatching. Skip finish/cleanup.
                     print(
-                        f"train_pump: rollout exhausted at mb {mb_idx} "
-                        f"(no groups for this opt.step)",
+                        "train_pump: rollout exhausted before any group ready",
                         flush=True,
                     )
                     break
 
-                # finish_train_step returns step metrics. trainer_version
-                # is driver-owned (workers don't emit it) and bumps after
-                # this call succeeds. The new value propagates to rollouts
-                # via _sync_weights at end of the outer step. Capture
-                # train_results for the logger emit below.
-                with self._timed("policy_training"):
-                    train_results = await asyncio.to_thread(
-                        self._trainer.finish_train_step
-                    )
+                with self._timer.time("policy_training"):
+                    result = await asyncio.to_thread(self._trainer.finish_train_step)
 
-                # finish_train_step succeeded → opt.step ran on the worker,
-                # model weights are advanced. Bump the version immediately so
-                # SC's counter reflects worker state even if clear_samples
-                # below raises.
-                prev_trainer_version = self._trainer_version
+                step_metrics = aggregate_step_metrics(result)
+                step_metrics.update(
+                    reduce_advantage_pump_metrics(**self._step_log_dict)
+                )
+                self._step_log_dict = {k: [] for k in self._step_log_dict}
+
                 self._trainer_version += 1
+                self._train_steps += 1
+                with self._timer.time("weight_sync"):
+                    await self._sync_weights()
 
-                consumed_ids = list(self._step_consumed_sample_ids)
-                self._step_consumed_sample_ids = []
-                with self._timed("clear_samples"):
-                    await self._call_dp(
-                        "clear_samples",
-                        sample_ids=consumed_ids,
-                        partition_id=self._cfg.partition_id,
-                    )
-                lag = (
-                    prev_trainer_version - step_min_weight_version
-                    if step_min_weight_version is not None
-                    else 0
-                )
-                print(
-                    f"train step {self._train_steps + 1}/"
-                    f"{self._cfg.max_train_steps}  "
-                    f"mb {mb_idx + 1}/{num_minibatches}  "
-                    f"trainer_v={self._trainer_version}  lag={lag}  "
-                    f"batch_size={len(consumed_ids)}",
-                    flush=True,
+            timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
+                reduction_op="sum"
+            )  # type: ignore
+
+            total_time = timing_metrics.get("total_step_time", 0.0)
+            cluster_cfg = self._master_config.cluster
+            total_num_gpus = cluster_cfg["num_nodes"] * cluster_cfg["gpus_per_node"]
+            if total_time > 0 and "global_valid_toks" in step_metrics:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    step_metrics["global_valid_toks"] / total_time / total_num_gpus
                 )
 
-                # Log metrics
-                self._logger.log_metrics(
-                    train_results, step=self._trainer_version, prefix="train"
-                )
-                self._logger.log_metrics(
-                    self._timer.get_timing_metrics(),
-                    step=self._trainer_version,
-                    prefix="timing/train",
-                    step_finished=True,
-                )
-                self._timer.reset()
+            print("\n⏱️  Timing:")
+            print(f"  • Total step time: {total_time:.2f}s")
+            for k, v in sorted(
+                timing_metrics.items(), key=lambda item: item[1], reverse=True
+            ):
+                if k == "total_step_time":
+                    continue
+                percent = (v / total_time * 100) if total_time > 0 else 0.0
+                print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
-                if rollout_exhausted:
-                    # Inner loop terminated early due to rollout exhaustion;
-                    # the cycle still completed (step_open was True), so we
-                    # finished and logged above. Exit the mini-batch loop now
-                    # — no more groups are coming.
-                    break
+            # TODO: checkpointing (save_period/top-k metric_name,
+            #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
+            # TODO: per-step train_data jsonl dump, vllm metrics logger,
+            #   histogram log, rollout_metrics, seq_logprob_error_metrics,
+            #   pretty-print "Training Results" block, print_performance_metrics.
+            print(f"step_metrics={step_metrics}", flush=True)
+            self._logger.log_metrics(
+                step_metrics, step=self._train_steps, prefix="train"
+            )
+            self._logger.log_metrics(
+                timing_metrics, step=self._train_steps, prefix="timing/train"
+            )
+            self._timer.reset()
 
-            if rollout_exhausted:
-                # No more rollouts; stop the outer training loop entirely
-                # rather than running empty mini-batches.
-                break
-
-            # One sync per outer step covers all opt.steps in this iteration.
-            with self._timed("sync_weights"):
-                await self._sync_weights()
-            self._train_steps += 1
+            # min sample version refers to the version each consumed sample was
+            # generated with; lag = current trainer version - oldest sample version.
+            lag = self._trainer_version - min_sample_version  # type: ignore
+            print(
+                f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
+                f"trainer_v={self._trainer_version}  "
+                f"lag={lag}  ",
+                flush=True,
+            )
 
     async def _sync_weights(self) -> None:
         """Drain in-flight rollouts then synchronize weights.
@@ -790,36 +770,6 @@ class SingleControllerActor:
 
     # ── utility helpers ────────────────────────────────────────────────────
 
-    async def _claim_available_meta(self) -> None:
-        """Claim currently-ready rows and append them to the local scheduler cache.
-
-        TODO: replace this with a non-consuming metadata listing API.
-        ``claim_meta`` advances TQ's per-task cursor, so SC must keep a
-        local cache of claimed-but-not-yet-trained samples for now.
-        """
-        batch_size = self._cfg.max_claim_groups * self._cfg.group_size
-        meta = await self._call_dp(
-            "claim_meta",
-            partition_id=self._cfg.partition_id,
-            task_name=self._cfg.consumer_task_name,
-            required_fields=self._claim_required_fields(),
-            batch_size=batch_size,
-            blocking=False,
-            timeout_s=0.0,
-        )
-        if meta.size == 0:
-            return
-        if self._claimed_meta is None or self._claimed_meta.size == 0:
-            self._claimed_meta = meta
-        else:
-            self._claimed_meta = self._claimed_meta.concat(meta)
-
-    def _claim_required_fields(self) -> list[str]:
-        fields = list(self._cfg.claim_required_fields)
-        if self._cfg.advantage_enabled:
-            fields.extend(self._advantage_input_fields())
-        return list(dict.fromkeys(fields))
-
     def _advantage_input_fields(self) -> list[str]:
         fields = [
             PROMPT_IDS_FIELD,
@@ -834,70 +784,6 @@ class SingleControllerActor:
             fields.append(self._cfg.advantage_reference_logprobs_field)
         return list(dict.fromkeys(fields))
 
-    async def _evict_stale_claimed(self) -> KVBatchMeta | None:
-        if self._claimed_meta is None or self._claimed_meta.size == 0:
-            return None
-        indices = self._sampler.evictable_indices(
-            self._claimed_meta,
-            trainer_version=self._trainer_version,
-            group_size=self._cfg.group_size,
-        )
-        if not indices:
-            return None
-        evicted_meta = self._claimed_meta.subset(indices)
-        print(
-            f"  evicting {evicted_meta.size} stale samples from "
-            f"{count_groups(evicted_meta, group_size=self._cfg.group_size)} "
-            f"prompt group(s)",
-            flush=True,
-        )
-        await self._call_dp(
-            "clear_samples",
-            sample_ids=evicted_meta.sample_ids,
-            partition_id=evicted_meta.partition_id,
-        )
-        self._claimed_meta = self._claimed_meta.drop(indices)
-        return evicted_meta
-
-    async def _flush_incomplete_groups(self) -> None:
-        """Drop groups that can never become selectable after rollout shutdown.
-
-        With ``_rollout_done`` set, a group that is uncommitted or short of
-        ``expected_num_samples`` will never receive more rows, yet the sampler
-        neither selects nor evicts it — without this flush the train pump
-        spins forever and ``run()`` hangs. Drain rows still unclaimed at
-        DataPlane first: a group can straddle a ``claim_meta`` batch boundary,
-        so incomplete-in-``_claimed_meta`` does not yet prove
-        incomplete-in-partition.
-        """
-        while True:
-            before = self._claimed_meta.size if self._claimed_meta is not None else 0
-            await self._claim_available_meta()
-            after = self._claimed_meta.size if self._claimed_meta is not None else 0
-            if after == before:
-                break
-        if self._claimed_meta is None or self._claimed_meta.size == 0:
-            return
-        indices = incomplete_group_indices(
-            self._claimed_meta,
-            group_size=self._cfg.group_size,
-        )
-        if not indices:
-            return
-        dropped = self._claimed_meta.subset(indices)
-        print(
-            f"WARNING: rollout done: dropping {dropped.size} sample(s) from "
-            f"incomplete prompt group(s) that can no longer complete",
-            flush=True,
-        )
-        await self._call_dp(
-            "clear_samples",
-            sample_ids=dropped.sample_ids,
-            partition_id=dropped.partition_id,
-        )
-        self._claimed_meta = self._claimed_meta.drop(indices)
-        # No _buffer_capacity release: the rollout pump has exited, so no
-        # dispatcher will acquire again this run.
 
 
 def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
