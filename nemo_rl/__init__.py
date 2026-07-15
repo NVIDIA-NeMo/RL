@@ -23,9 +23,13 @@ logging.basicConfig(
 
 """
 This is a work around to ensure whenever NeMo RL is imported, that we
-add Megatron-LM to the python path. This is because the only sub-package
-that's officially installed is megatron.core. So we add the whole repo into
-the path so we can access megatron.{training,legacy,inference,...}
+add Megatron-LM to the python path. The editable install of megatron-core
+only exposes the packages declared in Megatron-LM's pyproject.toml
+(megatron.core and megatron.training), but megatron.training lazily imports
+megatron.{legacy,post_training} in some code paths (e.g., loading old fp16
+checkpoints, detecting modelopt state for quantization-aware flows). Adding
+the whole repo to the path makes megatron.{legacy,inference,post_training,...}
+importable too.
 
 Since users may pip install NeMo RL, this is a convenience so they do not
 have to manually run with PYTHONPATH=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM.
