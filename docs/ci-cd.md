@@ -93,7 +93,6 @@ All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
 | `claude-review.yml` | `/claude-review` comment | AI code review |
 | `healthcheck_vms.yml` | schedule (07:00 UTC), dispatch | GPU runner health |
 | `automodel-submodule-checks.yml` | PR | Submodule validation |
-| `mbridge-deps-sync.yml` | PR (specific paths) | Dependency sync check |
 | `merge-queue-retry.yml` | PR dequeued (timeout) | Auto-retry merge queue |
 | `cherry-pick-release-commit.yml` | push main | Release cherry-picks |
 | `close-inactive-issue-pr.yml` | schedule (01:30 UTC) | Stale issue/PR cleanup |
