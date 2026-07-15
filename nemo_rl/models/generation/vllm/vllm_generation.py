@@ -483,10 +483,6 @@ class VllmGeneration(GenerationInterface):
                 results.append(None)
         return results
 
-    def get_dp_urls(self) -> list[str]:
-        """Return the OpenAI base URLs for all DP shards."""
-        return [url for url in self.dp_openai_server_base_urls if url is not None]
-
     def add_dp_worker(
         self,
         pre_append_hook: Optional[Callable[[], None]] = None,

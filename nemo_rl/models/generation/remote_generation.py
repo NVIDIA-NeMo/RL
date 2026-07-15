@@ -229,13 +229,6 @@ class RemoteGeneration(GenerationInterface):
 
         # Per-step cache for the consolidated /step_metrics_snapshot fetch.
         # Train side calls get_step_metrics_snapshot() multiple times around
-        # a wandb log (once for spec decode, once for vllm logger, once for
-        # router); we don't want to cross the cluster boundary three times.
-        # Caller passes ``step`` to invalidate; if None, the cache is
-        # bypassed (always re-fetch).
-        self._step_snapshot_cache: Optional[dict[str, Any]] = None
-        self._step_snapshot_cache_step: Optional[int] = None
-
         if self._http_mode:
             self.cfg = self._fetch_remote_config(config)
         else:
@@ -403,72 +396,6 @@ class RemoteGeneration(GenerationInterface):
             "    ⏱ quiesce-wait hit max; proceeding with rendezvous anyway",
             flush=True,
         )
-
-    def _evict_gen_stragglers(self, gen_idxs: list[int]) -> None:
-        """Tell the router to remove gen-side shards whose init_collective
-        future didn't complete in the rendezvous timeout window.
-
-        ``gen_idxs`` is the index into the futures list returned by
-        ``self.init_collective(...)`` — that list is in shard-rank order
-        as the gen worker_group dispatched, so we map index → shard_id
-        via ``GET /shards`` (the router orders shards by insertion).
-
-        Best-effort: a 5xx from the router or a network error is logged
-        and swallowed so the surrounding retry loop keeps going. The
-        worst case is the next attempt rendezvouses at the same broken
-        world, times out again, and exits via ``max_attempts``.
-        """
-        if not gen_idxs:
-            return
-        try:
-            resp = requests.get(f"{self.server_url}/shards", timeout=5)
-            resp.raise_for_status()
-            shards = resp.json()
-        except Exception as e:  # noqa: BLE001
-            print(
-                f"  ⚠ _evict_gen_stragglers: /shards lookup failed ({e}); "
-                f"skipping eviction",
-                flush=True,
-            )
-            return
-        # init_collective is dispatched on workers in the same order
-        # they appear in worker_group. Shards are listed in router
-        # insertion order; per-shard world size = 1 for the 4B/30B
-        # FT recipes, so idx-into-futures == idx-into-shards. If
-        # per_shard_world_size > 1 (TP>1) we'd need an idx → shard map
-        # via worker_metadata; left as a follow-up.
-        for idx in gen_idxs:
-            if idx >= len(shards):
-                continue
-            shard_id = shards[idx].get("shard_id")
-            if not shard_id:
-                continue
-            try:
-                resp = requests.post(
-                    f"{self.server_url}/admin/remove_shard",
-                    json={
-                        "shard_id": shard_id,
-                        "reason": "ensure_collective_synced: rendezvous straggler",
-                        # Skip the 30s drain — the shard is already
-                        # wedged in NCCL rendezvous, no real inflight
-                        # traffic to drain. Bound the call-side HTTP
-                        # timeout at 30s so a wedged router doesn't
-                        # pin this retry attempt.
-                        "drain_timeout_s": 0.0,
-                    },
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                print(
-                    f"  ✓ evicted straggler {shard_id} (idx {idx}): "
-                    f"{resp.json()}",
-                    flush=True,
-                )
-            except Exception as e:  # noqa: BLE001
-                print(
-                    f"  ⚠ failed to evict straggler {shard_id} (idx {idx}): {e}",
-                    flush=True,
-                )
 
     def ensure_collective_synced(
         self,
@@ -1143,76 +1070,3 @@ class RemoteGeneration(GenerationInterface):
         except requests.RequestException:
             return {}
 
-    def get_step_metrics_snapshot(
-        self, step: Optional[int] = None
-    ) -> dict[str, Any]:
-        """Consolidated per-step gen-side metrics for wandb logging.
-
-        Returns a dict with a stable shape so callers can index without
-        is-None checks:
-
-        ::
-
-            {
-              "vllm_logger_metrics": {...},   # same shape as get_logger_metrics()
-              "spec_decode_metrics": {},      # always empty, see note
-              "router_metrics": {...},        # only populated in disagg mode
-            }
-
-        Note: ``spec_decode_metrics`` is intentionally empty here. Spec
-        decode counters are a destructive delta-since-snapshot read; grpo
-        consumes them through the existing ``get_step_metrics()`` path so
-        we don't bake a second consumer that would race for the same
-        baseline. The key is preserved for shape stability.
-
-        In HTTP mode this is a single round-trip to
-        ``GET /step_metrics_snapshot`` on the gen server. The result is
-        cached per ``step``: callers in the same training step share one
-        fetch. Pass ``step=None`` (the default) to bypass the cache.
-
-        In co-located mode we synthesize the same dict locally with no
-        HTTP — the wrapped generation lives in the same Ray cluster.
-        Co-located runs don't have a router so ``router_metrics`` is
-        ``{}``.
-
-        On HTTP transport failure we return an empty-shape dict rather
-        than raising — wandb logging must never block training. This
-        matches the existing ``get_logger_metrics()`` failure semantics.
-        """
-        if step is not None and self._step_snapshot_cache_step == step:
-            cached = self._step_snapshot_cache
-            if cached is not None:
-                return cached
-
-        if not self._http_mode:
-            inner = self._generation
-            # Spec-decode metrics are NOT included — they're a destructive
-            # delta-since-snapshot read that grpo consumes through the
-            # existing get_step_metrics() pathway. Mirroring the HTTP
-            # endpoint's contract so callers don't accidentally double-
-            # consume the baseline.
-            payload: dict[str, Any] = {
-                "vllm_logger_metrics": (
-                    inner.get_logger_metrics() if inner is not None else {}
-                ),
-                "spec_decode_metrics": {},
-                "router_metrics": {},
-            }
-        else:
-            try:
-                resp = requests.get(
-                    f"{self.server_url}/step_metrics_snapshot", timeout=30
-                )
-                resp.raise_for_status()
-                payload = resp.json()
-            except requests.RequestException:
-                payload = {
-                    "vllm_logger_metrics": {},
-                    "spec_decode_metrics": {},
-                    "router_metrics": {},
-                }
-
-        if step is not None:
-            self._step_snapshot_cache = payload
-            self._step_snapshot_cache_step = step
-        return payload
