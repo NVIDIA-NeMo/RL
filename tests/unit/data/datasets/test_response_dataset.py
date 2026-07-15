@@ -293,6 +293,7 @@ def test_build_in_dataset(dataset_name, tokenizer):
     [
         ("OpenMathInstruct-2", "expected_answer"),
         ("OpenMathInstruct-2", "generated_solution"),
+        ("OpenR1-Math-220k", None),
         ("tulu3_sft_mixture", None),
     ],
 )
@@ -322,8 +323,14 @@ def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokeni
             assert (
                 first_example["messages"][1]["content"][:20] == "Let's denote the poi"
             )
+    elif dataset_name == "OpenR1-Math-220k":
+        assert first_example["messages"][1]["content"][:20] == " (n, k) = (5, 2) "
     elif dataset_name == "tulu3_sft_mixture":
         assert first_example["messages"][1]["content"][:20] == "I'm sorry, but I can"
+    else:
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. Please add a test for this dataset."
+        )
 
     # check the combined message
     messages = [first_example["messages"], first_val_example["messages"]]
@@ -339,9 +346,9 @@ def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokeni
     for i in range(2):
         assert combined_message[i] == (
             " Question: "
-            + messages[i][0]["content"]
+            + messages[i][0]["content"].strip()
             + " Answer: "
-            + messages[i][1]["content"]
+            + messages[i][1]["content"].strip()
         )
 
 
