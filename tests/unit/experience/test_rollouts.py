@@ -38,9 +38,9 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
-    _calculate_single_metric,
     generate_responses_async,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -69,13 +69,13 @@ MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 
 
 class TestCalculateSingleMetric:
-    """Unit tests for _calculate_single_metric function."""
+    """Unit tests for calculate_single_metric function."""
 
     def test_single_value_returns_nan_for_stddev(self):
         """Test that stddev returns nan when given a single value (GitHub issue #1411)."""
         import math
 
-        result = _calculate_single_metric([42.0], batch_size=1, key_name="test")
+        result = calculate_single_metric([42.0], batch_size=1, key_name="test")
 
         assert result["test/mean"] == 42.0
         assert result["test/max"] == 42.0
@@ -87,9 +87,7 @@ class TestCalculateSingleMetric:
 
     def test_multiple_values_computes_stddev(self):
         """Test that stddev is computed correctly for multiple values."""
-        result = _calculate_single_metric(
-            [1.0, 2.0, 3.0], batch_size=3, key_name="test"
-        )
+        result = calculate_single_metric([1.0, 2.0, 3.0], batch_size=3, key_name="test")
 
         assert result["test/mean"] == 2.0
         assert result["test/max"] == 3.0
@@ -99,9 +97,43 @@ class TestCalculateSingleMetric:
 
     def test_two_identical_values_returns_zero_stddev(self):
         """Test that stddev is 0 when all values are identical."""
-        result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
+        result = calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+class TestPct:
+    """Unit tests for pct percentile helper."""
+
+    def test_empty_returns_zero(self):
+        """Test that an empty input short-circuits to 0.0."""
+        assert pct([], 95) == 0.0
+
+    def test_returns_float_for_int_input(self):
+        """Test that integer input is coerced to float on return."""
+        result = pct([3, 1, 2], 50)
+        assert isinstance(result, float)
+        assert result == 2.0
+
+    def test_sorts_unsorted_input(self):
+        """Test that pct sorts before indexing."""
+        assert pct([5, 1, 3], 95) == 5.0
+
+    def test_p95_small_list_clamps_to_max(self):
+        """Test that p95 on a 5-element list clamps to the last index."""
+        assert pct([1, 2, 3, 4, 5], 95) == 5.0
+
+    def test_p99_clamps_to_last_index(self):
+        """Test that p99 on a 5-element list clamps to the last index."""
+        assert pct([1, 2, 3, 4, 5], 99) == 5.0
+
+    def test_single_value(self):
+        """Test that a single-element input returns that element."""
+        assert pct([42], 95) == 42.0
+
+    def test_median_like_p50(self):
+        """Test that p50 lands on the upper-mid element (int truncation, no interpolation)."""
+        assert pct([10, 20, 30, 40], 50) == 30.0
 
 
 class _DummyTokenizer:
@@ -928,6 +960,7 @@ def test_run_async_nemo_gym_rollout(
             ],
             "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "mask_sample": torch.tensor([False, False]),
             "total_reward": torch.tensor([0.0, 0.0]),
             "truncated": torch.tensor([False, False]),
         },
@@ -948,8 +981,8 @@ def test_run_async_nemo_gym_rollout(
             "turns_per_sample/median": 2.0,
             "turns_per_sample/stddev": 0.0,
             "turns_per_sample/histogram": None,
-            "turns_per_sample/p95": 2.0,
-            "turns_per_sample/p99": 2.0,
+            "turns_per_sample/p95": None,
+            "turns_per_sample/p99": None,
             "total_tokens_per_sample/mean": 3843.0,
             "total_tokens_per_sample/max": 3848,
             "total_tokens_per_sample/min": 3838,
@@ -1025,6 +1058,11 @@ def test_run_async_nemo_gym_rollout(
                 isinstance(v, (bool, int)) for v in final_batch["truncated"].tolist()
             )
             final_batch.pop("truncated")
+        if "mask_sample" in final_batch:
+            assert all(
+                isinstance(v, (bool, int)) for v in final_batch["mask_sample"].tolist()
+            )
+            final_batch.pop("mask_sample")
 
         for key in d["rollout_metrics"]:
             # We remove these fields from comparison since we cannot guarantee exact generation reproducibility
@@ -1320,12 +1358,16 @@ def test_async_rollout_manager_matches_original(
         )
 
     # 4. rollout_metrics numeric values match (timing and histogram fields are excluded).
-    # The new impl emits slash-style keys (X/mean, X/max, X/min) via _calculate_single_metric;
+    # The new impl emits slash-style keys (X/mean, X/max, X/min) via calculate_single_metric;
     # translate the legacy prefix-style keys before comparing.
     def _translate_legacy_key(key: str) -> str:
         if key == "avg_turns_per_sample":
             return "turns_per_sample/mean"
         if key == "max_turns_reached_rate":
+            return key
+        # Keys already in slash-style (e.g. turns_per_sample/p95, max_gen_tokens_per_turn/max)
+        # are new-style and should not be re-translated by the prefix-strip logic.
+        if "/" in key:
             return key
         for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
             if key.startswith(prefix) and "/" not in key:

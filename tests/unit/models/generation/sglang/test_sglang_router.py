@@ -22,8 +22,8 @@ import pytest
 import ray
 import requests
 
+from nemo_rl.distributed.virtual_cluster import _get_free_port_local
 from nemo_rl.models.generation.sglang.sglang_router import RouterActor, _start_router
-from nemo_rl.models.generation.sglang.utils.ray_utils import find_available_port
 
 from . import (
     helpers,  # noqa: F401  — installs env vars + module stubs before nemo_rl imports
@@ -68,7 +68,7 @@ def test_start_returns_ip_and_port(ray_cluster):
 
 def test_start_uses_configured_port(ray_cluster):
     """When sglang_router_port is set, the router uses that exact port."""
-    configured_port = find_available_port(9000)
+    configured_port = _get_free_port_local(9000, 10000)
     actor = RouterActor.remote()
     try:
         ip, port = _start_and_cleanup(actor, {"sglang_router_port": configured_port})

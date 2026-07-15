@@ -324,3 +324,37 @@ def test_exit_on_timeout(mock_dpo_components, capsys):
             assert "Epoch" not in line or "Epoch 1/10" in line, (
                 f"Training continued to next epoch after timeout: {line}"
             )
+
+
+def test_ft_save_period_triggers_periodic_saves(mock_dpo_components):
+    """ft_save_period triggers checkpoint saves independent of save_period."""
+    cfg = mock_dpo_components["master_config"]
+    cfg.dpo.val_period = 0
+    cfg.dpo.max_num_steps = 5
+    cfg.dpo.max_num_epochs = 1
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100  # only the final step would save
+    cfg.checkpointing["ft_save_period"] = 2
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_dpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
+
+    dpo_save_state = _initial_dpo_save_state()
+
+    with patch("nemo_rl.algorithms.dpo.torch.save"):
+        dpo_train(
+            mock_dpo_components["policy"],
+            mock_dpo_components["train_dataloader"],
+            mock_dpo_components["val_dataloader"],
+            mock_dpo_components["tokenizer"],
+            mock_dpo_components["loss_fn"],
+            cfg,
+            mock_dpo_components["logger"],
+            checkpointer,
+            dpo_save_state,
+        )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]
