@@ -28,6 +28,28 @@ set -eoux pipefail
 export NRL_JOB_START_EPOCH=$(date +%s.%N)
 
 ########################################################
+# Diagnostic phase logging
+#
+# ray.sub makes several blocking calls that reach the SLURM controller
+# (sinfo/scontrol/srun) and imports a multi-GB container image before Ray is up.
+# When any of those stall -- e.g. an overloaded/DDoS'd controller, a slow prolog,
+# or contended shared storage -- a bare `set -x` trace has no timestamps, so it is
+# impossible to tell from the logs *where* the wall-clock actually went.
+#
+# `log_phase` stamps an ISO wall-clock time plus seconds-since-job-start at each
+# phase boundary so a slowdown can be localized after the fact. Subtract the
+# elapsed counters of two adjacent markers to get that phase's duration. Keep
+# these coarse (phase boundaries, not per-command) so the trace stays readable.
+########################################################
+log_phase() {
+  echo "[NRL_PHASE][$(date '+%Y-%m-%dT%H:%M:%S%z')][+$(( $(date +%s) - ${NRL_JOB_START_EPOCH%.*} ))s] $*"
+}
+# The gap between the job's SLURM StartTime (from `sacct`/`scontrol show job`) and
+# this first marker is time spent in prolog/allocation/node-prep *before* the
+# script ran -- i.e. not attributable to anything in ray.sub itself.
+log_phase "ray.sub entry (job=${SLURM_JOB_ID:-?} nodes=${SLURM_JOB_NUM_NODES:-?} partition=${SLURM_JOB_PARTITION:-?} node=$(hostname)); compare to SLURM StartTime to measure pre-script prolog/allocation overhead"
+
+########################################################
 # Function to detect if SLURM cluster uses GRES
 ########################################################
 maybe_gres_arg() {
@@ -209,6 +231,7 @@ fi
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
 # Detect GRES support and set GRES_ARG
+log_phase "detecting GRES support (sinfo -> SLURM controller RPC; can stall if the controller is overloaded)"
 GRES_ARG=$(maybe_gres_arg)
 if [[ -n "$GRES_ARG" ]]; then
   echo "[INFO] GRES support detected. Using: $GRES_ARG"
@@ -233,6 +256,7 @@ COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 if [[ -n "${CPUS_PER_WORKER:-}" ]]; then
   echo "[INFO] Using user-provided CPUS_PER_WORKER=$CPUS_PER_WORKER."
 else
+  log_phase "auto-detecting CPUs per node (scontrol show node -> SLURM controller RPC)"
   CPUS_PER_WORKER=$(detect_cpus_per_node)
   echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of first allocated node)."
 fi
@@ -328,6 +352,7 @@ nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 nodes_array=($nodes)
 ip_addresses_array=()
 
+log_phase "resolving ${#nodes_array[@]} node hostname(s) to IPs (DNS: host/getent/nslookup/ping)"
 for node in $nodes; do
     # Try multiple methods to get IP address - ENHANCED VERSION v2.0
     echo "[DEBUG] Resolving hostname: $node using enhanced resolution methods"
@@ -662,10 +687,10 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   while true; do
     if [[ "\$workers_ready" -eq 0 ]]; then
       worker_units=\$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
-      echo "[INFO] Number of actors online: \$worker_units/$NUM_ACTORS"
+      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Number of actors online: \$worker_units/$NUM_ACTORS"
       if [[ "\$worker_units" -eq "$NUM_ACTORS" ]]; then
         workers_ready=1
-        echo "All workers connected!"
+        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] All workers connected!"
       fi
     fi
     if [[ "\$sandbox_ready" -eq 0 ]]; then
@@ -811,7 +836,7 @@ while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
     bash "$SETUP_COMMAND_FILE"
   fi
-  echo "[INFO] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
+  echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
   cat <<EOFINNER | bash
 ray start --address "$ip_head" \
           --disable-usage-stats \
@@ -904,6 +929,7 @@ else
 fi
 
 # Start the Ray head.
+log_phase "launching Ray head + worker sruns (first container use triggers the enroot image import on each node; a slow import shows up as a gap before the next marker / STARTED_RAY_HEAD)"
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
@@ -936,6 +962,7 @@ while check_srun_processes && ! test -f "$LOG_DIR/STARTED_RAY_HEAD"; do
   echo "[INFO][$(date)] Waiting for Ray head GCS to be ready..."
   sleep 2
 done
+log_phase "Ray head GCS is up (STARTED_RAY_HEAD observed); handing off to worker/driver wait"
 
 if [[ -n "$COMMAND" ]]; then
   # Non-interactive: the head container polls for workers, gates on sandbox
