@@ -227,6 +227,43 @@ def test_distillation_train_max_steps(mock_components):
     assert mock_components["student_policy"].train.call_count == 5
 
 
+def test_ft_save_period_triggers_periodic_saves(mock_components):
+    """ft_save_period triggers checkpoint saves independent of save_period."""
+    cfg = mock_components["master_config"]
+    cfg.distillation["max_num_steps"] = 5
+    cfg.distillation["val_period"] = 0
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100  # only the final step would save
+    cfg.checkpointing["ft_save_period"] = 2
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
+
+    distillation_save_state = _default_distillation_save_state()
+
+    with patch("nemo_rl.algorithms.distillation.torch.save"):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            checkpointer,
+            distillation_save_state,
+            cfg,
+        )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]
+
+
 def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     master_config = mock_components["master_config"]
     master_config.distillation["max_num_steps"] = 1
@@ -337,6 +374,86 @@ def test_exit_on_timeout(mock_components, capsys):
             assert not line.startswith("Step ") or "Step 8" in line, (
                 f"Training continued after timeout: {line}"
             )
+
+
+def test_non_colocated_offloads_student_optimizer_before_teacher_inference(
+    mock_components,
+):
+    """Student optimizer state must be offloaded before the teacher is onloaded.
+
+    In non-colocated mode the refit path no longer offloads the student
+    optimizer, so it stays on the train GPUs, and the training loop must
+    offload it (offload_before_refit) before each teacher prepare_for_lp_inference
+    call, otherwise the teacher top-k forward OOMs once optimizer state
+    materializes after the first training step.
+    """
+    mock_components["master_config"].distillation["max_num_steps"] = 2
+    assert not mock_components["master_config"].policy["generation"]["colocated"][
+        "enabled"
+    ]
+
+    # Reparent the relevant child mocks onto one manager to record global call order.
+    manager = MagicMock()
+    manager.attach_mock(
+        mock_components["student_policy"].offload_before_refit, "student_offload"
+    )
+    manager.attach_mock(
+        mock_components["teacher_policy"].prepare_for_lp_inference, "teacher_prep"
+    )
+
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _default_distillation_save_state(),
+        mock_components["master_config"],
+    )
+
+    # student_generation is None so refit never runs; every offload_before_refit
+    # call comes from the teacher-inference prep path, once per step, and must
+    # immediately precede the teacher onload.
+    call_names = [name for name, _, _ in manager.mock_calls]
+    assert call_names == [
+        "student_offload",
+        "teacher_prep",
+        "student_offload",
+        "teacher_prep",
+    ]
+
+
+def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
+    mock_components,
+):
+    """In colocated mode refit already offloads the student; the loop must not."""
+    mock_components["master_config"].distillation["max_num_steps"] = 2
+    mock_components["master_config"].policy["generation"]["colocated"]["enabled"] = True
+
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _default_distillation_save_state(),
+        mock_components["master_config"],
+    )
+
+    assert mock_components["teacher_policy"].prepare_for_lp_inference.call_count == 2
+    mock_components["student_policy"].offload_before_refit.assert_not_called()
 
 
 def test_validate_function(mock_components):

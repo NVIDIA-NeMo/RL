@@ -178,6 +178,9 @@ class ColocatablePolicyInterface(PolicyInterface):
     def offload_after_refit(self) -> None:
         pass
 
+    def offload_to_cpu(self) -> None:
+        pass
+
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass

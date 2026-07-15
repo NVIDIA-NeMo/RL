@@ -13,7 +13,7 @@
 
 ```sh
 uv run examples/run_ppo.py \
-  --config examples/configs/ppo_math_1B_megatron.yaml \
+  --config examples/configs/ppo_math_1B.yaml \
   policy.model_name="Qwen/Qwen2.5-1.5B" \
   cluster.gpus_per_node=8 \
   checkpointing.checkpoint_dir="results/ppo_math" \
@@ -21,17 +21,10 @@ uv run examples/run_ppo.py \
   logger.wandb.name="ppo-math"
 ```
 
-For Megatron-Core backend:
-
-```sh
-uv run examples/run_ppo.py \
-  --config examples/configs/ppo_math_1B_megatron.yaml \
-  policy.model_name="Qwen/Qwen2.5-1.5B" \
-  cluster.gpus_per_node=8 \
-  checkpointing.checkpoint_dir="results/ppo_megatron" \
-  logger.wandb_enabled=True \
-  logger.wandb.name="ppo-megatron"
-```
+> [!NOTE]
+> `ppo_math_1B.yaml` runs the DTensor backend because it sets
+> `policy.dtensor_cfg.enabled=true` (and `policy.megatron_cfg.enabled=false`).
+> To use the Megatron-Core backend, pass `--config examples/configs/ppo_math_1B_megatron.yaml` instead.
 
 ## PPO Multi-node
 
@@ -39,7 +32,7 @@ uv run examples/run_ppo.py \
 NUM_ACTOR_NODES=8
 
 COMMAND="uv run ./examples/run_ppo.py \
-  --config examples/configs/ppo_math_1B_megatron.yaml \
+  --config examples/configs/ppo_math_1B.yaml \
   cluster.num_nodes=8 \
   cluster.gpus_per_node=8 \
   checkpointing.checkpoint_dir='results/ppo_8nodes' \
@@ -64,8 +57,8 @@ sbatch \
 
 PPO uses two base configurations:
 
+- DTensor backend (default): [examples/configs/ppo_math_1B.yaml](../../../examples/configs/ppo_math_1B.yaml)
 - Megatron-Core backend: [examples/configs/ppo_math_1B_megatron.yaml](../../../examples/configs/ppo_math_1B_megatron.yaml)
-- DTensor backend is not yet supported for the value model.
 
 Key PPO-specific parameters:
 

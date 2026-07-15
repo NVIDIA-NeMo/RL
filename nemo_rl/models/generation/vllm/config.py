@@ -28,6 +28,8 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    # Use ModelOpt MXFP8 quantization when precision is fp8.
+    is_mx: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
@@ -56,3 +58,8 @@ class VllmConfig(GenerationConfig):
 
     # quantization config
     quant_cfg: NotRequired[str | None]
+    # When set with ``quant_cfg``, initialize rollout vLLM with real ModelOpt
+    # NVFP4 kernels and stream packed quantized weights instead of fake-quant
+    # modules. This is intended for ModelOpt NVFP4 rollout experiments.
+    real_quant: NotRequired[bool]
+    real_quant_ignore: NotRequired[list[str]]
