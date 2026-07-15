@@ -51,11 +51,6 @@ class TrtllmGeneration(GenerationInterface):
     ):
         self.cfg = config
         self.tp_size = self.cfg["trtllm_cfg"]["tensor_parallel_size"]
-        pp_size = self.cfg["trtllm_cfg"].get("pipeline_parallel_size", 1)
-        assert pp_size == 1, (
-            f"TRT-LLM backend does not support pipeline parallelism yet "
-            f"(pipeline_parallel_size={pp_size}, must be 1)."
-        )
         self.model_parallel_size = self.tp_size
 
         assert cluster.world_size() % self.model_parallel_size == 0, (
@@ -417,10 +412,6 @@ class TrtllmGeneration(GenerationInterface):
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
-        # Both fields are NotRequired in TrtllmSpecificArgs; bool(None) is
-        # False, so callers who omit them get the original drain-first
-        # behavior without us baking a hidden default into the .get() call
-        # (see skills/config-conventions/SKILL.md).
         trtllm_cfg = self.cfg["trtllm_cfg"]
         in_flight = bool(trtllm_cfg.get("in_flight_weight_updates"))
         recompute_kv = bool(

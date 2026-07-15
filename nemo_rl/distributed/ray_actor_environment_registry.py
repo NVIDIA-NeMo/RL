@@ -26,6 +26,9 @@ SGLANG_EXECUTABLE = (
 MCORE_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
 )
+TRTLLM_EXECUTABLE = (
+    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.TRTLLM
+)
 
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
@@ -36,7 +39,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2": PY_EXECUTABLES.AUTOMODEL,
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.models.value.workers.megatron_value_worker.MegatronValueWorker": MCORE_EXECUTABLE,
-    "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": PY_EXECUTABLES.TRTLLM,
+    "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker": TRTLLM_EXECUTABLE,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.math_environment.MathMultiRewardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.vlm_environment.VLMEnvironment": PY_EXECUTABLES.SYSTEM,
