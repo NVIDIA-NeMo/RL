@@ -3443,22 +3443,8 @@ def validate(
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []
-        total_gen_tokens = 0.0
-        total_truncation_rate = 0.0
-        total_natural_termination_rate = 0.0
-        max_gen_tokens_per_sample = 0.0
+        total_lengths = []
         all_message_logs = []  # Collect all message logs
-        additional_metrics_to_report = {}
-        core_rollout_metrics = {
-            "accuracy",
-            "avg_length",
-            "mean_gen_tokens_per_sample",
-            "gen_tokens_per_sample/mean",
-            "truncation_rate",
-            "natural_termination_rate",
-            "max_gen_tokens_per_sample",
-            "gen_tokens_per_sample/max",
-        }
 
         max_batches = (
             master_config.grpo["max_val_samples"]
@@ -3468,6 +3454,7 @@ def validate(
             if batch_idx >= max_batches:
                 break
 
+            additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
@@ -3488,13 +3475,7 @@ def validate(
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
-                additional_metrics_to_report.update(
-                    {
-                        key: value
-                        for key, value in gen_metrics.items()
-                        if key not in core_rollout_metrics
-                    }
-                )
+                additional_metrics_to_report = gen_metrics
             elif _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
@@ -3516,19 +3497,8 @@ def validate(
                     greedy=False,
                 )
 
-            batch_size = len(val_batch["total_reward"])
             total_rewards.extend(val_batch["total_reward"].tolist())
-            total_gen_tokens += gen_metrics["mean_gen_tokens_per_sample"] * batch_size
-            total_truncation_rate += gen_metrics["truncation_rate"] * batch_size
-            total_natural_termination_rate += (
-                gen_metrics["natural_termination_rate"] * batch_size
-            )
-            batch_max_gen_tokens = gen_metrics.get("max_gen_tokens_per_sample")
-            if batch_max_gen_tokens is None:
-                batch_max_gen_tokens = gen_metrics["gen_tokens_per_sample/max"]
-            max_gen_tokens_per_sample = max(
-                max_gen_tokens_per_sample, batch_max_gen_tokens
-            )
+            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
             to_env = [
@@ -3548,21 +3518,14 @@ def validate(
         else:
             accuracy = 0.0
 
-        avg_length = total_gen_tokens / num_samples if num_samples > 0 else 0.0
-        truncation_rate = (
-            total_truncation_rate / num_samples if num_samples > 0 else 0.0
-        )
-        natural_termination_rate = (
-            total_natural_termination_rate / num_samples if num_samples > 0 else 0.0
+        avg_length = (
+            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
         )
 
         val_metrics = {
-            **additional_metrics_to_report,
             "accuracy": accuracy,
             "avg_length": avg_length,
-            "truncation_rate": truncation_rate,
-            "natural_termination_rate": natural_termination_rate,
-            "max_gen_tokens_per_sample": max_gen_tokens_per_sample,
+            **additional_metrics_to_report,
         }
 
         # Print sample conversations only once at the end of validation

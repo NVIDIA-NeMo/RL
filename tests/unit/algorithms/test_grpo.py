@@ -3000,12 +3000,7 @@ class TestValidateFunction:
         mock_config.grpo["val_batch_size"] = 2
         mock_config.logger["num_val_samples_to_print"] = 2
 
-        mock_rollout_metrics = {
-            "mean_gen_tokens_per_sample": 10.0,
-            "truncation_rate": 0.0,
-            "natural_termination_rate": 1.0,
-            "max_gen_tokens_per_sample": 10.0,
-        }
+        mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
         with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
             mock_rollout.return_value = (mock_batch, mock_rollout_metrics)
@@ -3082,12 +3077,7 @@ class TestValidateFunction:
         mock_config = mock_grpo_components["master_config"]
         mock_config.logger["num_val_samples_to_print"] = 1
 
-        mock_rollout_metrics = {
-            "mean_gen_tokens_per_sample": 10.0,
-            "truncation_rate": 0.0,
-            "natural_termination_rate": 1.0,
-            "max_gen_tokens_per_sample": 10.0,
-        }
+        mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
 
         with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
             mock_rollout.return_value = (mock_batch, mock_rollout_metrics)
@@ -3113,84 +3103,6 @@ class TestValidateFunction:
         # Verify metrics are returned correctly
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
-
-    def test_validate_aggregates_rollout_metrics_by_sample(self, mock_grpo_components):
-        """Validation rollout metrics are aggregated across partial batches."""
-        batch_1 = BatchedDataDict[DatumSpec](
-            {
-                "message_log": [
-                    [{"role": "user", "content": "one"}],
-                    [{"role": "user", "content": "two"}],
-                ],
-                "total_reward": torch.tensor([1.0, 0.0]),
-            }
-        )
-        batch_2 = BatchedDataDict[DatumSpec](
-            {
-                "message_log": [[{"role": "user", "content": "three"}]],
-                "total_reward": torch.tensor([1.0]),
-            }
-        )
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([batch_1, batch_2]))
-
-        result_1 = MagicMock()
-        result_1.final_batch = batch_1
-        result_1.rollout_metrics = {
-            "mean_gen_tokens_per_sample": 6.0,
-            "gen_tokens_per_sample/mean": 6.0,
-            "truncation_rate": 0.0,
-            "natural_termination_rate": 1.0,
-            "max_gen_tokens_per_sample": 6.0,
-            "accuracy": -1.0,
-            "avg_length": -1.0,
-            "custom_metric": 1.0,
-        }
-        result_2 = MagicMock()
-        result_2.final_batch = batch_2
-        result_2.rollout_metrics = {
-            "mean_gen_tokens_per_sample": 12.0,
-            "gen_tokens_per_sample/mean": 12.0,
-            "truncation_rate": 1.0,
-            "natural_termination_rate": 0.0,
-            "gen_tokens_per_sample/max": 12.0,
-            "accuracy": -1.0,
-            "avg_length": -1.0,
-            "custom_metric": 2.0,
-        }
-
-        mock_config = mock_grpo_components["master_config"]
-        mock_config.grpo["val_batch_size"] = 2
-        mock_config.grpo["max_val_samples"] = 4
-        mock_config.logger["num_val_samples_to_print"] = 0
-
-        with (
-            patch(
-                "nemo_rl.algorithms.grpo.run_async_nemo_gym_rollout",
-                side_effect=[result_1, result_2],
-            ),
-            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=True),
-            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
-        ):
-            val_metrics, _ = validate(
-                MagicMock(),
-                mock_dataloader,
-                MagicMock(),
-                None,
-                step=5,
-                master_config=mock_config,
-                logger=None,
-            )
-
-        assert val_metrics["accuracy"] == pytest.approx(2 / 3)
-        assert val_metrics["avg_length"] == pytest.approx(8.0)
-        assert val_metrics["truncation_rate"] == pytest.approx(1 / 3)
-        assert val_metrics["natural_termination_rate"] == pytest.approx(2 / 3)
-        assert val_metrics["max_gen_tokens_per_sample"] == 12.0
-        assert val_metrics["custom_metric"] == 2.0
-        assert "mean_gen_tokens_per_sample" not in val_metrics
-        assert "gen_tokens_per_sample/mean" not in val_metrics
-        assert "gen_tokens_per_sample/max" not in val_metrics
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""
