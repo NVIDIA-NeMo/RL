@@ -160,6 +160,9 @@ policy:
     # When true, offload_after_refit skips rerunning the full offload_before_refit
     # pass and only re-offloads the optimizer with a single allocator cleanup.
     refit_slim_offload_after: false
+    # When true, stage the per-step reference-policy swap in persistent pinned
+    # CPU buffers instead of pageable copies (faster PCIe, more host RAM).
+    pinned_reference_swap: false
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true

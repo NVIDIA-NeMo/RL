@@ -1529,6 +1529,7 @@ class MegatronPolicyWorkerImpl(
         source_state_dict: dict,
         *,
         raise_if_key_missing: bool = False,
+        non_blocking: bool = False,
     ) -> None:
         """Apply a state dict to self.model in-place.
 
@@ -1540,6 +1541,8 @@ class MegatronPolicyWorkerImpl(
             source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
             raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
                 from source_state_dict; if False, skip such keys.
+            non_blocking: Passed to the in-place copies; callers staging from
+                pinned CPU memory must synchronize afterwards.
         """
         for state_dict_key, param_or_buf in self.model.state_dict().items():
             if (
@@ -1560,7 +1563,7 @@ class MegatronPolicyWorkerImpl(
                 isinstance(source_value, torch.Tensor)
                 and param_or_buf.shape == source_value.shape
             ):
-                param_or_buf.copy_(source_value)
+                param_or_buf.copy_(source_value, non_blocking=non_blocking)
                 continue
 
             # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
@@ -1591,12 +1594,45 @@ class MegatronPolicyWorkerImpl(
             self.disable_forward_pre_hook()
 
         with torch.no_grad():
+            use_pinned_swap = self.cfg["megatron_cfg"].get(
+                "pinned_reference_swap", False
+            )
+            if use_pinned_swap and not hasattr(self, "_pinned_swap_save_buffers"):
+                # Buffer contents are only live within a single
+                # use_reference_model call (every copy synchronizes before
+                # control leaves it) and each call re-reads model.state_dict(),
+                # so offload_before/after_refit moving or replacing param
+                # storages between calls cannot collide with these buffers.
+                self._pinned_swap_save_buffers: dict[str, torch.Tensor] = {}
+
             # Save original references
             model_state_dict = {}
             for name, item in self.model.state_dict().items():
                 if isinstance(item, torch.Tensor):
-                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+                    # extra_state tensors stay on fresh pageable copies:
+                    # set_extra_state() may retain the tensor it is given, and
+                    # a reused pinned buffer would mutate it on the next swap.
+                    if use_pinned_swap and "extra_state" not in name:
+                        buf = self._pinned_swap_save_buffers.get(name)
+                        if buf is None:
+                            buf = torch.empty(
+                                item.shape,
+                                dtype=item.dtype,
+                                device="cpu",
+                                pin_memory=True,
+                            )
+                            self._pinned_swap_save_buffers[name] = buf
+                        buf.copy_(item.detach(), non_blocking=True)
+                        item = buf
+                    else:
+                        item = item.detach().to(
+                            device="cpu", non_blocking=True, copy=True
+                        )
                 model_state_dict[name] = item
+            if use_pinned_swap:
+                # D2H saves must land before the reference apply overwrites
+                # the params they read from.
+                torch.cuda.synchronize()
 
             # Swap reference state into self.model. Use _apply_state_dict_to_model
             # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
@@ -1604,7 +1640,10 @@ class MegatronPolicyWorkerImpl(
             self._apply_state_dict_to_model(
                 self.reference_state_dict,
                 raise_if_key_missing=True,
+                non_blocking=use_pinned_swap,
             )
+            if use_pinned_swap:
+                torch.cuda.synchronize()
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                 gc.collect()
@@ -1636,7 +1675,10 @@ class MegatronPolicyWorkerImpl(
             self._apply_state_dict_to_model(
                 model_state_dict,
                 raise_if_key_missing=True,
+                non_blocking=use_pinned_swap,
             )
+            if use_pinned_swap:
+                torch.cuda.synchronize()
 
             if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                 gc.collect()

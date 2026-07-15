@@ -332,6 +332,13 @@ class MegatronConfig(TypedDict):
     # pass (grad-buffer moves, cache clears, and a second gc.collect/empty_cache)
     # and only re-offloads the optimizer with a single allocator cleanup.
     refit_slim_offload_after: NotRequired[bool]
+    # When True, the reference-policy swap in use_reference_model stages the
+    # active weights in persistent pinned CPU buffers and keeps the reference
+    # state dict pinned from setup, so the three per-step full-model PCIe
+    # transfers run as non-blocking pinned copies instead of pageable ones.
+    # Costs 2x model-size pinned host RAM per worker. Default False keeps the
+    # current pageable-copy behavior.
+    pinned_reference_swap: NotRequired[bool]
     activation_checkpointing: bool
     # Recompute granularity: "full" recomputes all activations, "selective" recomputes
     # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
