@@ -41,6 +41,7 @@ from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
+    _tokenize_env_observation,
     generate_responses_async,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -1580,3 +1581,135 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         assert orig_val == pytest.approx(new_val), (
             f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for _tokenize_env_observation
+# ---------------------------------------------------------------------------
+
+_REAL_TOKENIZER_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+class _MockTokenizerNoChatTemplate:
+    """Minimal mock tokenizer without a chat_template, for raw-tokenization tests."""
+
+    chat_template = None
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=True):
+        # Encode as ASCII byte values so each character gets a unique "token".
+        ids = [ord(c) for c in text]
+
+        class _Encoding:
+            def __init__(self, ids):
+                self.input_ids = torch.tensor([ids], dtype=torch.long)
+
+        return _Encoding(ids)
+
+
+class TestTokenizeEnvObservation:
+    """Unit tests for _tokenize_env_observation."""
+
+    def test_raw_tokenization_no_chat_template(self):
+        """use_chat_template=False: result matches plain tokenization of the content."""
+        tokenizer = _MockTokenizerNoChatTemplate()
+        content = "Hello from tool"
+        result = _tokenize_env_observation(
+            tokenizer, obs_role="tool", obs_content=content, use_chat_template=False
+        )
+        # Should be 1D tensor
+        assert result.dim() == 1
+        # Should match plain tokenization
+        expected = tokenizer(
+            content, return_tensors="pt", add_special_tokens=False
+        ).input_ids[0]
+        assert torch.equal(result, expected)
+
+    def test_missing_chat_template_raises(self):
+        """use_chat_template=True with no chat_template on tokenizer raises AssertionError."""
+        tokenizer = _MockTokenizerNoChatTemplate()
+        with pytest.raises(AssertionError):
+            _tokenize_env_observation(
+                tokenizer,
+                obs_role="user",
+                obs_content="some content",
+                use_chat_template=True,
+            )
+
+    @pytest.fixture(scope="class")
+    def real_tokenizer(self):
+        """Load a real tokenizer for chat-template tests."""
+        try:
+            from transformers import AutoTokenizer
+
+            tok = AutoTokenizer.from_pretrained(
+                _REAL_TOKENIZER_MODEL, trust_remote_code=True
+            )
+            return tok
+        except Exception:
+            pytest.skip(
+                f"Could not load tokenizer {_REAL_TOKENIZER_MODEL}; skipping real-tokenizer tests"
+            )
+
+    def test_chat_template_produces_1d_tensor(self, real_tokenizer):
+        """use_chat_template=True: result is a 1D tensor."""
+        result = _tokenize_env_observation(
+            real_tokenizer,
+            obs_role="user",
+            obs_content="Hello, I need help.",
+            use_chat_template=True,
+        )
+        assert isinstance(result, torch.Tensor)
+        assert result.dim() == 1
+
+    def test_chat_template_includes_role_markers(self, real_tokenizer):
+        """use_chat_template=True: decoded result includes role marker and generation prompt."""
+        content = "Hello, I need help."
+        result = _tokenize_env_observation(
+            real_tokenizer,
+            obs_role="user",
+            obs_content=content,
+            use_chat_template=True,
+        )
+        decoded = real_tokenizer.decode(result, skip_special_tokens=False)
+        # The decoded output should contain the observation content
+        assert content in decoded
+        # And should include the generation prompt (assistant role marker)
+        assert "assistant" in decoded
+
+    def test_chat_template_excludes_dummy_priming_tokens(self, real_tokenizer):
+        """use_chat_template=True: dummy priming message tokens ("x") are not in the output."""
+        content = "What is the status of my order?"
+        result = _tokenize_env_observation(
+            real_tokenizer,
+            obs_role="user",
+            obs_content=content,
+            use_chat_template=True,
+        )
+        # Encode the dummy priming content alone to get its token IDs
+        dummy_ids = real_tokenizer(
+            "x", return_tensors="pt", add_special_tokens=False
+        ).input_ids[0]
+        result_list = result.tolist()
+        dummy_list = dummy_ids.tolist()
+        # The result should not be a superset containing the full dummy sequence
+        # as a contiguous subsequence (the dummy message "x" should have been excluded)
+        assert dummy_list != result_list[: len(dummy_list)], (
+            "The dummy priming content tokens ('x') appear at the start of the output; "
+            "the function should have stripped the dummy message from the result."
+        )
+
+    def test_chat_template_tool_role(self, real_tokenizer):
+        """use_chat_template=True with obs_role='tool': content appears and generation prompt follows."""
+        content = '{"result": "Order O123 has been cancelled."}'
+        result = _tokenize_env_observation(
+            real_tokenizer,
+            obs_role="tool",
+            obs_content=content,
+            use_chat_template=True,
+        )
+        assert isinstance(result, torch.Tensor)
+        assert result.dim() == 1
+        decoded = real_tokenizer.decode(result, skip_special_tokens=False)
+        assert content in decoded
+        # Generation prompt should follow, prompting the model to respond as assistant.
+        assert "assistant" in decoded

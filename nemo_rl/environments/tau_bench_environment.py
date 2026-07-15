@@ -63,10 +63,10 @@ class TauBenchEnvConfig(TypedDict):
         user_api_key: API key for the user model server. Ignored when user_strategy is "mock".
         max_steps: Maximum tool-call steps per episode before forced termination.
         judge_model: LiteLLM model string for LLM-as-judge scoring (None disables judging).
-            Ignored when user_strategy is "mock".
+            Ignored when judge_model is "mock".
         judge_base_url: Optional base URL override for the judge model's API.
-            Ignored when user_strategy is "mock".
-        judge_api_key: API key for the judge model server. Ignored when user_strategy is "mock".
+            Ignored when judge_model is "mock".
+        judge_api_key: API key for the judge model server. Ignored when judge_model is "mock".
         judge_weight: Blend weight: 0.0 = pure tau-bench reward, 1.0 = pure judge score.
         mock_user_latency_s: Seconds to sleep per mock user simulator call.
         mock_judge_latency_s: Seconds to sleep per mock judge call.
@@ -101,7 +101,9 @@ class TauBenchEnvMetadata(TypedDict):
         episode_id: Unique ID assigned on the first step; None before that.
         step_count: Number of environment steps taken in this episode so far.
         tau_reward: tau-bench task-completion reward, set when the episode terminates.
-        judge_score: LLM-judge score, set when the episode terminates (None if judging is off).
+        judge_score: LLM-judge score, set when the episode terminates (None if judging is
+            off or if the judge failed after all retries).
+        judge_failed: True if the judge was attempted but failed after all retries.
     """
 
     task_index: int
@@ -109,6 +111,7 @@ class TauBenchEnvMetadata(TypedDict):
     step_count: int
     tau_reward: NotRequired[float | None]
     judge_score: NotRequired[float | None]
+    judge_failed: NotRequired[bool]
 
 
 @ray.remote  # pragma: no cover
@@ -126,11 +129,11 @@ class TauBenchWorker:
         user_strategy: str,
         user_model: str,
         user_base_url: Optional[str],
-        user_api_key: str,
+        user_api_key: Optional[str],
         max_steps: int,
         judge_model: Optional[str],
         judge_base_url: Optional[str],
-        judge_api_key: str,
+        judge_api_key: Optional[str],
         mock_user_latency_s: Optional[float] = None,
         mock_judge_latency_s: Optional[float] = None,
         mock_stop_prob: Optional[float] = None,
@@ -209,6 +212,12 @@ class TauBenchWorker:
                 return _Resp(content)
 
             self._mock_completion = _mock_completion
+            # Permanently patch litellm.completion for this worker process so that
+            # concurrent threads in _execute_one do not race on the global monkeypatch.
+            # Each Ray actor runs in its own process, so this is safe.
+            from unittest.mock import patch as _patch
+            self._litellm_patcher = _patch("litellm.completion", self._mock_completion)
+            self._litellm_patcher.start()
         else:
             # Configure LiteLLM (used by tau-bench's user simulator) once at startup.
             if user_base_url:
@@ -251,10 +260,7 @@ class TauBenchWorker:
             task_index=task_index,
         )
         if self._mock_user:
-            from unittest.mock import patch
-
-            with patch("litellm.completion", self._mock_completion):
-                reset_response = env.reset(task_index=task_index)
+            reset_response = env.reset(task_index=task_index)
         else:
             reset_response = env.reset(task_index=task_index)
         initial_obs = str(reset_response.observation)
@@ -299,11 +305,12 @@ class TauBenchWorker:
         conversation: List[Dict[str, str]],
         domain_rules: str,
         task_instruction: str,
-    ) -> float:
+    ) -> Optional[float]:
         """Score a completed episode using an LLM judge.
 
-        Returns a float in [0, 1].  Returns 0.0 on any error so that a judge
-        misconfiguration degrades gracefully rather than crashing training.
+        Returns a float in [0, 1] on success, or None if the judge failed after
+        all retries.  Callers must treat None as a judge outage and fall back to
+        tau_reward rather than blending with 0.0.
         """
         if self._mock_judge:
             time.sleep(self._mock_judge_latency_s)
@@ -319,23 +326,56 @@ class TauBenchWorker:
             f"CUSTOMER REQUEST:\n{task_instruction}\n\n"
             f"CONVERSATION:\n{convo_text}"
         )
-        try:
-            resp = litellm.completion(
-                model=self._judge_model,
-                messages=[
-                    {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-                timeout=60,
-                api_base=self._judge_base_url,
-                api_key=self._judge_api_key,
-            )
-            content = resp.choices[0].message.content
-            return float(json.loads(content).get("score", 0.0))
-        except Exception as e:
-            print(f"[TauBench] judge call failed: {e}")
-            return 0.0
+        last_exc: Exception = RuntimeError("unreachable")
+        for attempt in range(5):
+            # Separate the API call from response parsing so we can retry only
+            # transient network/rate-limit errors and never retry parse failures
+            # (a malformed JSON response is deterministic and won't improve on retry).
+            try:
+                resp = litellm.completion(
+                    model=self._judge_model,
+                    messages=[
+                        {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.0,
+                    timeout=60,
+                    api_base=self._judge_base_url,
+                    api_key=self._judge_api_key,
+                )
+            except litellm.BadRequestError:
+                # Deterministic failure (e.g. context too long); retrying won't help.
+                return None
+            except Exception as e:
+                last_exc = e
+                delay = 2**attempt + random.uniform(0, 1)
+                print(
+                    f"[TauBench] judge attempt {attempt + 1}/5 failed "
+                    f"({type(e).__name__}: {e}); retrying in {delay:.1f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+
+            # API call succeeded; parse the response. Parse failures are
+            # deterministic — log and return None immediately without retry.
+            try:
+                content = resp.choices[0].message.content
+                return float(json.loads(content).get("score", 0.0))
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                print(
+                    f"[TauBench] judge response parse failed "
+                    f"({type(e).__name__}: {e}); returning None",
+                    flush=True,
+                )
+                return None
+
+        print(
+            f"[TauBench] judge failed after 5 attempts "
+            f"({type(last_exc).__name__}); falling back to tau_reward",
+            flush=True,
+        )
+        return None
 
     def _execute_one(
         self,
@@ -400,13 +440,7 @@ class TauBenchWorker:
         env_response = None
         for attempt in range(5):
             try:
-                if self._mock_user:
-                    from unittest.mock import patch
-
-                    with patch("litellm.completion", self._mock_completion):
-                        env_response = tau_env.step(action)
-                else:
-                    env_response = tau_env.step(action)
+                env_response = tau_env.step(action)
                 break
             except Exception as e:
                 last_exc = e
@@ -449,6 +483,7 @@ class TauBenchWorker:
         reward = 0.0
         tau_reward: Optional[float] = None
         judge_score: Optional[float] = None
+        judge_failed = False
 
         if done:
             if env_response.done:
@@ -477,20 +512,15 @@ class TauBenchWorker:
                     if m.get("role") in ("user", "assistant")
                 ]
                 judge_score = self._call_judge(convo, rules, instruction)
-                reward = (1.0 - judge_weight) * tau_reward + judge_weight * judge_score
-                print(
-                    f"[TauBench] episode={episode_id} steps={step_count} "
-                    f"tau_reward={tau_reward:.4f} judge_score={judge_score:.4f} "
-                    f"combined={reward:.4f}",
-                    flush=True,
-                )
+                if judge_score is not None:
+                    reward = (1.0 - judge_weight) * tau_reward + judge_weight * judge_score
+                else:
+                    # Judge failed after retries; fall back to tau_reward so a
+                    # judge outage is never indistinguishable from a score of 0.
+                    reward = tau_reward
+                    judge_failed = True
             else:
                 reward = tau_reward
-                print(
-                    f"[TauBench] episode={episode_id} steps={step_count} "
-                    f"tau_reward={tau_reward:.4f} (no judge)",
-                    flush=True,
-                )
 
             with self._env_lock:
                 del self._active_envs[episode_id]
@@ -508,6 +538,7 @@ class TauBenchWorker:
                 "step_count": step_count,
                 "tau_reward": tau_reward,
                 "judge_score": judge_score,
+                "judge_failed": judge_failed,
             },
         )
 
@@ -594,11 +625,11 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
                 user_strategy=cfg["user_strategy"],
                 user_model=cfg["user_model"],
                 user_base_url=cfg.get("user_base_url"),
-                user_api_key=cfg.get("user_api_key") or "dummy",
+                user_api_key=cfg.get("user_api_key"),
                 max_steps=cfg["max_steps"],
                 judge_model=cfg.get("judge_model"),
                 judge_base_url=cfg.get("judge_base_url"),
-                judge_api_key=cfg.get("judge_api_key") or "dummy",
+                judge_api_key=cfg.get("judge_api_key"),
                 mock_user_latency_s=cfg.get("mock_user_latency_s"),
                 mock_judge_latency_s=cfg.get("mock_judge_latency_s"),
                 mock_stop_prob=cfg.get("mock_stop_prob"),
@@ -683,14 +714,17 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
 
         tau_rewards: List[float] = []
         judge_scores: List[float] = []
+        judge_failures: int = 0
         for meta in batch.get("extra_env_info", []):
             if meta and meta.get("tau_reward") is not None:
                 tau_rewards.append(float(meta["tau_reward"]))
             if meta and meta.get("judge_score") is not None:
                 judge_scores.append(float(meta["judge_score"]))
+            if meta and meta.get("judge_failed"):
+                judge_failures += 1
 
         metrics: Dict[str, Any] = {
-            "tau_bench/task_completion_rate": rewards.mean().item(),
+            "tau_bench/mean_reward": rewards.mean().item(),
             "tau_bench/pass_at_k": calculate_pass_rate_per_prompt(
                 batch["text"], rewards
             ),
@@ -702,5 +736,7 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
             metrics["tau_bench/mean_judge_score"] = sum(judge_scores) / len(
                 judge_scores
             )
+        if judge_failures:
+            metrics["tau_bench/judge_failures"] = judge_failures
 
         return batch, metrics
