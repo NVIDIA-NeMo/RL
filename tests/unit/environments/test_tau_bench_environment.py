@@ -250,17 +250,24 @@ class TestCallJudge:
         assert mock_completion.call_args.kwargs["api_base"] is None
         assert score == pytest.approx(0.7)
 
-    def test_litellm_exception_returns_zero(self, worker):
-        with mock.patch("litellm.completion", side_effect=Exception("API error")):
+    def test_litellm_exception_returns_none(self, worker):
+        # Transient errors exhaust all 5 retries and return None (caller falls
+        # back to tau_reward rather than blending with 0.0).  Mock time.sleep
+        # to avoid the exponential backoff delay in tests.
+        with mock.patch("litellm.completion", side_effect=Exception("API error")), mock.patch(
+            "nemo_rl.environments.tau_bench_environment.time.sleep"
+        ):
             score = worker._call_judge([], domain_rules="", task_instruction="")
-        assert score == 0.0
+        assert score is None
 
-    def test_invalid_json_in_response_returns_zero(self, worker):
+    def test_invalid_json_in_response_returns_none(self, worker):
+        # Parse failures are deterministic; _call_judge returns None immediately
+        # without retry so the caller can fall back to tau_reward.
         resp = mock.MagicMock()
         resp.choices[0].message.content = "not json at all"
         with mock.patch("litellm.completion", return_value=resp):
             score = worker._call_judge([], domain_rules="", task_instruction="")
-        assert score == 0.0
+        assert score is None
 
     def test_missing_score_key_returns_zero(self, worker):
         resp = mock.MagicMock()
@@ -324,11 +331,11 @@ class TestGlobalPostProcessAndMetrics:
             ],
         )
         _, metrics = env.global_post_process_and_metrics(batch)
-        assert "tau_bench/task_completion_rate" in metrics
+        assert "tau_bench/mean_reward" in metrics
         assert "tau_bench/pass_at_k" in metrics
         assert "tau_bench/fraction_properly_ended" in metrics
 
-    def test_task_completion_rate_is_reward_mean(self):
+    def test_mean_reward_is_reward_mean(self):
         env = _make_env()
         batch = self._batch(
             rewards=[1.0, 0.0, 1.0],
@@ -340,7 +347,7 @@ class TestGlobalPostProcessAndMetrics:
             ],
         )
         _, metrics = env.global_post_process_and_metrics(batch)
-        assert metrics["tau_bench/task_completion_rate"] == pytest.approx(2 / 3)
+        assert metrics["tau_bench/mean_reward"] == pytest.approx(2 / 3)
 
     def test_fraction_properly_ended(self):
         env = _make_env()
@@ -415,7 +422,7 @@ class TestGlobalPostProcessAndMetrics:
         )
         _, metrics = env.global_post_process_and_metrics(batch)
         # rewards * is_end = [1.0, 0.0] → mean = 0.5
-        assert metrics["tau_bench/task_completion_rate"] == pytest.approx(0.5)
+        assert metrics["tau_bench/mean_reward"] == pytest.approx(0.5)
 
     def test_original_batch_returned_unchanged(self):
         env = _make_env()
@@ -440,7 +447,7 @@ class TestGlobalPostProcessAndMetrics:
             }
         )
         _, metrics = env.global_post_process_and_metrics(batch)
-        assert metrics["tau_bench/task_completion_rate"] == pytest.approx(0.5)
+        assert metrics["tau_bench/mean_reward"] == pytest.approx(0.5)
 
     def test_empty_extra_env_info_skipped(self):
         env = _make_env()
