@@ -16,7 +16,7 @@ fi
 
 # Install system FFmpeg — torchcodec dlopens libavcodec.so.* at runtime.
 echo "[audio-deps] Installing system FFmpeg..."
-apt-get install -y --no-install-recommends ffmpeg
+apt-get update && apt-get install -y --no-install-recommends ffmpeg
 
 # torchaudio 2.11+ routes torchaudio.load through torchcodec, so both are needed.
 echo "[audio-deps] Installing torchaudio==2.11.0 and torchcodec..."
