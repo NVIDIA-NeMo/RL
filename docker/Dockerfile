@@ -152,6 +152,17 @@ ENV CUDA_HOME=/usr/local/cuda
 ## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
+# Point TE at the pip-installed cuDNN instead of the system one.
+# The container's system cuDNN may differ from what pip installed; TE prioritizes
+# system libraries by default, causing a version mismatch crash at runtime.
+# CUDNN_HOME makes TE's Python code find the pip version first; LD_LIBRARY_PATH
+# makes the dynamic linker resolve cuDNN sub-libraries from pip when loading
+# libtransformer_engine.so.
+# Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
+ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+ENV CUDNN_PATH=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
@@ -197,10 +208,6 @@ fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --locked --extra sglang --no-install-project
 fi
-uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
-uv sync --link-mode symlink --locked --extra modelopt --no-install-project
-uv sync --link-mode symlink --locked --all-groups --no-install-project
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py
     # invokes tools/build-custom-trtllm.sh during this sync (≈60 min).
@@ -208,6 +215,11 @@ if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     #   BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF
     uv sync --link-mode symlink --locked --extra trtllm --no-install-project
 fi
+
+uv sync --link-mode symlink --locked --extra mcore --no-install-project
+uv sync --link-mode symlink --locked --extra automodel --no-install-project
+uv sync --link-mode symlink --locked --extra modelopt --no-install-project
+uv sync --link-mode symlink --locked --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
@@ -218,15 +230,6 @@ EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
-# Point TE at the pip-installed cuDNN (nvidia-cudnn-cu12) instead of the system one.
-# The container's system cuDNN (/lib/x86_64-linux-gnu/libcudnn*.so.9) may be a different
-# version than what pip installed. TE prioritizes system libraries by default, causing a
-# version mismatch crash (e.g. system 9.10.1 vs pip 9.19.0). CUDNN_HOME makes TE's Python
-# code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
-# cuDNN sub-libraries from pip when loading libtransformer_engine.so.
-ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
-ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
-# Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
 # Custom setup layer (override with: --build-context custom-setup=<dir> --build-arg CUSTOM_SETUP_FNAME=<script>)
 # To skip: --build-arg CUSTOM_SETUP_FNAME=
