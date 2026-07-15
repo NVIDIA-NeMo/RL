@@ -465,7 +465,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             OpenAIServingRender,
         )
         from vllm.entrypoints.serve.tokenize.serving import (
-            OpenAIServingTokenization,
+            ServingTokenization,
         )
         from vllm.exceptions import VLLMValidationError
         from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
@@ -821,9 +821,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
 
-        # Tokenize path delegates to OpenAIServingRender.preprocess_chat in
-        # vLLM 0.20, where the prefix-token override lives.
-        class NeMoRLOpenAIServingTokenization(OpenAIServingTokenization):
+        # Tokenize path delegates to OpenAIServingRender.preprocess_chat,
+        # where the prefix-token override lives.
+        class NeMoRLOpenAIServingTokenization(ServingTokenization):
             pass
 
         serving_tokenization_kwargs = dict(
@@ -832,7 +832,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
-            engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
             openai_serving_render=openai_serving_render,
         )
