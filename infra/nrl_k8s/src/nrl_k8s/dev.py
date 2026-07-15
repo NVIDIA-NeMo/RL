@@ -98,7 +98,8 @@ def build_dev_pod_manifest(
                     "envFrom": [{"secretRef": {"name": secret_name, "optional": True}}],
                     "resources": {
                         "requests": {"cpu": "100m", "memory": "256Mi"},
-                        "limits": {"cpu": "5", "memory": "10Gi"},
+                        "limits": {"cpu": "5"}
+                    }memory": "10Gi"},
                     },
                     "volumeMounts": [
                         {"name": "rl-workspace", "mountPath": _MOUNT_PATH},
