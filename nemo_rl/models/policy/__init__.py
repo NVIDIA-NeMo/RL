@@ -544,6 +544,11 @@ class PolicyConfig(TypedDict):
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float]
+    # Keep the CUDA-IPC ping-pong staging buffers allocated across refits instead of
+    # reallocating and freeing them (plus a gc.collect/empty_cache pair) every refit.
+    # Works best with a fixed refit_buffer_size_gb; the buffers stay resident on the
+    # trainer GPU between refits (2x half-buffer bytes).
+    refit_persistent_ipc_buffers: NotRequired[bool]
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
         list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]

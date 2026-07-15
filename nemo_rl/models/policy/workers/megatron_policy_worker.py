@@ -294,6 +294,9 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        # Staging-buffer cache for refit weight streaming; only populated when
+        # cfg["refit_persistent_ipc_buffers"] is enabled.
+        self._refit_ipc_buffer_cache: dict[str, Any] = {}
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -1992,6 +1995,11 @@ class MegatronPolicyWorkerImpl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            buffer_cache=(
+                self._refit_ipc_buffer_cache
+                if self.cfg.get("refit_persistent_ipc_buffers")
+                else None
+            ),
         )
 
     @torch.no_grad()
