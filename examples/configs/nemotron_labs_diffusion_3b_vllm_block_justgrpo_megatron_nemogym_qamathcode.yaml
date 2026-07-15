@@ -1,0 +1,83 @@
+# NeMo-Gym GRPO for Nemotron-Labs-Diffusion-3B on the super-v3 qa/math/code
+# split, with the **vLLM diffusion backend** (leftmost rollouts + BlockJustGRPO
+# recompute) replacing SGLang. Inherits the proven gsm8k vLLM+block config and
+# swaps in: async vLLM engine + HTTP server (Gym routes the responses API to
+# it), the Gym env/reward servers, and the NemoGymDataset super-v3 data.
+#
+# Requires: NRL_VLLM_PY_EXECUTABLE=<venv-gen>/bin/python and the nemo_gym uv
+# extra (launch via run_interactive_nemogym.sh-style launcher).
+defaults: "gsm8k_nemotron_labs_diffusion_3b_vllm_block_justgrpo_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 8
+  max_num_steps: 5000
+  val_period: 100
+  val_at_start: false
+  val_at_end: true
+  max_val_samples: null        # REQUIRED null on the nemo_gym path
+  skip_reference_policy_logprobs_calculation: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-nd3b-vllm-block-justgrpo-nemogym-qamathcode"
+  save_period: 50
+  metric_name: "val:total_reward/mean"   # super-v3 parity (mean reward)
+  higher_is_better: true
+
+policy:
+  train_global_batch_size: 1024   # = num_prompts_per_step * num_generations_per_prompt
+  generation:
+    max_new_tokens: 2048
+    top_k: null                  # must be null on the nemo_gym path
+    # The NeMo-Gym path forbids NeMo-RL-level stop criteria (rollouts.py asserts
+    # both empty); turn termination is handled by the Gym agent harness via the
+    # model server's own EOS. MUST be an empty list, not null: null is
+    # auto-refilled to [eos_token_id] by configure_generation_config (which then
+    # trips the assertion); [] is skipped (not None) and satisfies `not [...]`.
+    stop_token_ids: []
+    stop_strings: []
+    vllm_cfg:
+      # Gym forwards the responses API to vLLM's OpenAI HTTP server, which the
+      # async worker (AsyncLLM) exposes. AsyncLLM drives the diffusion sampler
+      # correctly (verified: leftmost block-diffusion decode + logprobs).
+      async_engine: true
+      expose_http_server: true
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml   # policy server -> vLLM (NOT sglang)
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml          # judge OFF -> math_verify (local)
+      - resources_servers/mcqa/configs/mcqa.yaml
+      - resources_servers/instruction_following/configs/instruction_following.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+      - resources_servers/code_gen/configs/code_gen.yaml
+
+data:
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 1
+  train:
+    dataset_name: NemoGymDataset
+    data_path: "/linnanw/justGRPO/dataset/qamathcode_selfcontained/train.jsonl"
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: "/linnanw/justGRPO/dataset/qamathcode_selfcontained/val.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-block-justgrpo-nemogym-qamathcode"
+  wandb_enabled: true
+  tensorboard_enabled: false
+  wandb:
+    project: "diffusion_rl"
+    mode: "online"
+    name: "nd3b_vllm_block_nemogym_qamathcode"
