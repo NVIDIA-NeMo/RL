@@ -381,7 +381,7 @@ def load_media_from_message(
                     else {}
                 )
                 loaded_media["video"].append(
-                    load_video(vid, backend="torchvision", **load_video_kwargs)[0]
+                    load_video(vid, backend="torchcodec", **load_video_kwargs)[0]
                 )
             else:
                 loaded_media["video"].append(vid)

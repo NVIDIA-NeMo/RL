@@ -11,6 +11,7 @@ replace-imports-with-any = [
   "sympy.*",
   "torchdata.*",
   "torchaudio.*",
+  "torchcodec.*",
   "nemo.*",
   "megatron.*",
   "ray.*",

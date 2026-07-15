@@ -538,7 +538,7 @@ def vlm_hf_data_processor(
                 video_value = content["video"]
                 if isinstance(video_value, str):
                     video_value = load_video(
-                        video_value, backend="torchvision", **load_video_kwargs
+                        video_value, backend="torchcodec", **load_video_kwargs
                     )[0]
                 # Replace path with loaded frames so apply_chat_template can consume it
                 user_message["content"].append({"type": "video", "video": video_value})
