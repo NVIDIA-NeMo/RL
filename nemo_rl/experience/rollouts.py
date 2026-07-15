@@ -2055,7 +2055,10 @@ def run_async_nemo_gym_rollout(
     # Expose per-component rewards (reward1, reward2, ...) for multi-reward NeMo Gym
     # environments so GDPO can compute per-component advantages; single-reward envs are
     # unaffected. Mirrors the native rollout path's reward-component handling above.
-    from nemo_rl.environments.nemo_gym import extract_reward_components
+    from nemo_rl.environments.nemo_gym import (
+        extract_reward_components,
+        validate_reward_components_match_scalar,
+    )
 
     component_dicts = [extract_reward_components(r["full_result"]) for r in results]
     if any(c is not None for c in component_dicts):
@@ -2081,18 +2084,7 @@ def run_async_nemo_gym_rollout(
         # reward == sum(components), so overwriting would be a no-op in the correct case
         # and would only mask a misconfigured verifier when it isn't. Validate that
         # contract instead and fail fast on a real mismatch.
-        for idx, (components, r) in enumerate(zip(component_dicts, results)):
-            if components is None:
-                continue
-            scalar_reward = float(r["full_result"]["reward"])
-            component_sum = sum(components.values())
-            if not math.isclose(scalar_reward, component_sum, rel_tol=1e-5, abs_tol=1e-6):
-                raise ValueError(
-                    f"NeMo Gym verify result {idx} has reward={scalar_reward} but its "
-                    f"reward_components sum to {component_sum} ({components}). A multi-reward "
-                    "verifier must set reward = sum(reward_components.values()) so single-reward "
-                    "(GRPO) consumers and GDPO read the same aggregate."
-                )
+        validate_reward_components_match_scalar([r["full_result"] for r in results])
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,

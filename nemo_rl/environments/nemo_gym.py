@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -484,6 +485,33 @@ def extract_reward_components(nemo_gym_result: dict) -> Dict[str, float] | None:
     if not components:
         return None
     return {str(name): float(score) for name, score in components.items()}
+
+
+def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> None:
+    """Assert each multi-reward result sets ``reward == sum(reward_components)``.
+
+    A multi-reward verifier must set the scalar ``reward`` to the sum of its
+    ``reward_components`` so single-reward (GRPO) consumers and GDPO read the same
+    aggregate. We keep the verifier's scalar ``reward`` as ``total_reward`` rather than
+    silently overwriting it with the component sum, so a verifier that violates this
+    contract must be surfaced here instead of masked.
+
+    Raises ``ValueError`` on the first violating result. A no-op for single-reward
+    results (those without ``reward_components``).
+    """
+    for idx, result in enumerate(nemo_gym_results):
+        components = extract_reward_components(result)
+        if components is None:
+            continue
+        scalar_reward = float(result["reward"])
+        component_sum = sum(components.values())
+        if not math.isclose(scalar_reward, component_sum, rel_tol=1e-5, abs_tol=1e-6):
+            raise ValueError(
+                f"NeMo Gym verify result {idx} has reward={scalar_reward} but its "
+                f"reward_components sum to {component_sum} ({components}). A multi-reward "
+                "verifier must set reward = sum(reward_components.values()) so single-reward "
+                "(GRPO) consumers and GDPO read the same aggregate."
+            )
 
 
 ########################################
