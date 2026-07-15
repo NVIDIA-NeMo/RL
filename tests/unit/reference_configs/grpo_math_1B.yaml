@@ -39,6 +39,8 @@ grpo:
     source_max: 1.0
     target_min: 0.0
     target_max: 1.0
+  skip_reference_policy_logprobs_calculation: false
+  calculate_advantages_on_gpu: false
   seq_logprob_error_threshold: null
   # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
   invalid_tool_call_advantage: null

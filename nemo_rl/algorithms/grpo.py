@@ -18,7 +18,8 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
+from dataclasses import dataclass, fields
+from typing import Any, Callable, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -31,6 +32,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
+    AdvEstimatorConfig,
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
@@ -122,46 +124,32 @@ from nemo_rl.utils.venvs import create_local_venv_on_each_node
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-class RewardScalingConfig(TypedDict):
+class RewardScalingConfig(BaseModel, extra="allow"):
     """Configure linear reward scaling with clamping.
 
     When `enabled` is True, each reward is clamped to the source interval
     [source_min, source_max] and linearly mapped to the target interval
     [target_min, target_max]. Refer to the scale_rewards function for the implementation.
-
-    Defaults:
-        source_min=0.0, source_max=1.0, target_min=0.0, target_max=1.0
     """
 
-    enabled: bool
-    source_min: NotRequired[float]
-    source_max: NotRequired[float]
-    target_min: NotRequired[float]
-    target_max: NotRequired[float]
+    enabled: bool = False
+    source_min: float = 0.0
+    source_max: float = 1.0
+    target_min: float = 0.0
+    target_max: float = 1.0
 
 
-class AsyncGRPOConfig(TypedDict):
-    enabled: bool
+class AsyncGRPOConfig(BaseModel, extra="allow"):
+    enabled: bool = False
     # Maximum trajectory age in training steps for samples drawn from the
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
-    max_trajectory_age_steps: int
+    max_trajectory_age_steps: int = 1
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
-    in_flight_weight_updates: NotRequired[bool]
+    in_flight_weight_updates: bool = False
     # Recomputes the KV cache after the in-flight weight updates.
-    recompute_kv_cache_after_weight_updates: NotRequired[bool]
-
-
-class AdvEstimatorConfig(TypedDict):
-    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
-
-    name: str  # "grpo", "gdpo", or "reinforce_plus_plus"
-    # GRPO specific
-    normalize_rewards: NotRequired[bool]
-    use_leave_one_out_baseline: NotRequired[bool]
-    # Reinforce++ specific
-    minus_baseline: NotRequired[bool]
+    recompute_kv_cache_after_weight_updates: bool = False
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -204,76 +192,92 @@ _REWARD_PENALTY_FLAGS = (
 )
 
 
-class GRPOConfig(TypedDict):
-    num_prompts_per_step: int
-    num_generations_per_prompt: int
-    max_num_epochs: int
-    max_num_steps: int
-    max_rollout_turns: int
-    normalize_rewards: bool
+class GRPOConfig(BaseModel, extra="allow"):
+    num_prompts_per_step: int = 32
+    num_generations_per_prompt: int = 16
+    max_num_epochs: int = 1
+    max_num_steps: int = 1000000
+    max_rollout_turns: int = 1
+    normalize_rewards: bool = True
     # Clipping bounds for normalized advantages to prevent extreme values
     # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
     # Default: null (no clipping)
-    advantage_clip_low: NotRequired[float | None]
-    advantage_clip_high: NotRequired[float | None]
-    use_leave_one_out_baseline: bool
-    val_period: int
-    val_batch_size: int | None  # None for NeMo-Gym compatibility
-    val_at_start: bool
+    advantage_clip_low: float | None = None
+    advantage_clip_high: float | None = None
+    use_leave_one_out_baseline: bool = True
+    val_period: int = 10
+    val_batch_size: int | None = 256  # None for NeMo-Gym compatibility
+    val_at_start: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    max_val_samples: int | None  # None for NeMo-Gym compatibility
-    skip_reference_policy_logprobs_calculation: NotRequired[bool]
-    seed: int
-    async_grpo: NotRequired[AsyncGRPOConfig]
-    overlong_filtering: NotRequired[bool]
+    val_at_end: bool = False
+    max_val_samples: int | None = 256  # None for NeMo-Gym compatibility
+    skip_reference_policy_logprobs_calculation: bool = False
+    seed: int = 42
+    async_grpo: Optional[AsyncGRPOConfig] = None
+    overlong_filtering: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
-    use_dynamic_sampling: bool
+    use_dynamic_sampling: bool = False
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
-    dynamic_sampling_max_gen_batches: NotRequired[int]
+    dynamic_sampling_max_gen_batches: int = 10
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
-    batch_multiplier: NotRequired[float]
-    reward_shaping: RewardShapingConfig
-    reward_scaling: RewardScalingConfig
+    batch_multiplier: float = 1.0
+    reward_shaping: RewardShapingConfig = RewardShapingConfig()
+    reward_scaling: RewardScalingConfig = RewardScalingConfig()
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
-    calculate_advantages_on_gpu: NotRequired[bool]
+    calculate_advantages_on_gpu: bool = False
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
-    seq_logprob_error_threshold: float | None
+    seq_logprob_error_threshold: float | None = None
     # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
     # computed advantage for those tokens to penalize them; absent/None disables the penalty.
-    invalid_tool_call_advantage: NotRequired[float | None]
+    invalid_tool_call_advantage: float | None = None
     # Advantage value to assign to tokens with malformed <think>/</think> tags. When set (e.g. -5.0),
     # overwrites the computed advantage for those tokens; absent/None disables the penalty.
-    malformed_thinking_advantage: NotRequired[float | None]
+    malformed_thinking_advantage: float | None = None
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
-    adv_estimator: NotRequired[AdvEstimatorConfig]
+    adv_estimator: Optional[AdvEstimatorConfig] = None
 
 
-class GRPOSaveState(TypedDict):
+@dataclass
+class GRPOSaveState:
     consumed_samples: int
     current_step: int
     current_epoch: int
     total_steps: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
-    val_reward: NotRequired[
-        float
-    ]  # Optional field - may not be present during training
+    val_reward: float  # May be removed when no validation metrics are available
 
 
-def _default_grpo_save_state() -> GRPOSaveState:
-    return {
-        "consumed_samples": 0,
-        "current_step": 0,
-        "current_epoch": 0,
-        "total_steps": 0,
-        "total_valid_tokens": 0,
-        "val_reward": -99999999.0,
-    }
+def _initial_grpo_save_state() -> GRPOSaveState:
+    return GRPOSaveState(
+        consumed_samples=0,
+        current_step=0,
+        current_epoch=0,
+        total_steps=0,
+        total_valid_tokens=0,
+        val_reward=-99999999.0,
+    )
+
+
+def _load_grpo_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> GRPOSaveState:
+    if loaded_state is None:
+        return _initial_grpo_save_state()
+
+    # Backward compatibility: older checkpoints may not contain these fields.
+    loaded_state = loaded_state.copy()
+    loaded_state.setdefault("total_valid_tokens", 0)
+    loaded_state.setdefault("val_reward", -99999999.0)
+    # Checkpoints may carry dynamic validation metrics; regenerate them after resume.
+    known_fields = {field.name for field in fields(GRPOSaveState)}
+    return GRPOSaveState(
+        **{key: value for key, value in loaded_state.items() if key in known_fields}
+    )
 
 
 class GRPOLoggerConfig(LoggerConfig):
@@ -353,7 +357,7 @@ def setup(
     )
 
     # Set seed for all random number generators
-    set_seed(grpo_config["seed"])
+    set_seed(grpo_config.seed)
 
     # ==========================
     #         Logger
@@ -366,25 +370,22 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    grpo_save_state: Optional[GRPOSaveState] = cast(
-        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
-    )
-    if grpo_save_state is None:
-        grpo_save_state = _default_grpo_save_state()
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    grpo_save_state = _load_grpo_save_state(loaded_state)
 
     # ==========================
     #           Data
     # ==========================
     # num_prompts_per_step and dataloader_batch_size will be different when using multiple dataloaders
-    num_prompts_per_step = grpo_config["num_prompts_per_step"]
+    num_prompts_per_step = grpo_config.num_prompts_per_step
     if data_config["use_multiple_dataloader"]:
         dataloader_batch_size = data_config["num_prompts_per_dataloader"]
     else:
         dataloader_batch_size = num_prompts_per_step
 
     # Validate batch_multiplier
-    batch_multiplier = grpo_config["batch_multiplier"]
-    if grpo_config["use_dynamic_sampling"]:
+    batch_multiplier = grpo_config.batch_multiplier
+    if grpo_config.use_dynamic_sampling:
         num_prompts_per_step = int(num_prompts_per_step * batch_multiplier)
         dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
     else:
@@ -448,17 +449,13 @@ def setup(
     # Load validation dataset if provided
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
-    if (
-        grpo_config["val_period"] > 0
-        or grpo_config["val_at_start"]
-        or grpo_config["val_at_end"]
-    ):
+    if grpo_config.val_period > 0 or grpo_config.val_at_start or grpo_config.val_at_end:
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=grpo_config["val_batch_size"],
+            batch_size=grpo_config.val_batch_size,
             shuffle=False,
             collate_fn=rl_collate_fn,
             num_workers=data_config["num_workers"],
@@ -516,8 +513,7 @@ def setup(
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
         assert (
-            grpo_config["num_prompts_per_step"]
-            * grpo_config["num_generations_per_prompt"]
+            grpo_config.num_prompts_per_step * grpo_config.num_generations_per_prompt
             == policy_config["train_global_batch_size"]
         ), (
             "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
@@ -526,7 +522,7 @@ def setup(
         print("  ✓ force_on_policy_ratio enabled")
 
     # Validate skip_reference_policy_logprobs_calculation
-    if grpo_config.get("skip_reference_policy_logprobs_calculation"):
+    if grpo_config.skip_reference_policy_logprobs_calculation:
         assert loss_config.reference_policy_kl_penalty == 0, (
             "grpo.skip_reference_policy_logprobs_calculation=True requires "
             "loss_fn.reference_policy_kl_penalty == 0"
@@ -908,15 +904,16 @@ def setup(
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
-            grpo_config["max_num_steps"],
-            grpo_config["max_num_epochs"] * train_sample_count,
+            grpo_config.max_num_steps,
+            grpo_config.max_num_epochs * train_sample_count,
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
         # When the user opts into recompute-after-refit on the megatron side,
         # override mcore's kv_cache_management_mode to "recompute" directly.
-        if "async_grpo" in grpo_config and grpo_config["async_grpo"].get(
-            "recompute_kv_cache_after_weight_updates", False
+        if (
+            grpo_config.async_grpo is not None
+            and grpo_config.async_grpo.recompute_kv_cache_after_weight_updates
         ):
             mcore_cfg = policy_config["generation"]["mcore_generation_config"]
             prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
@@ -931,10 +928,11 @@ def setup(
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
 
     # Auto-enable skip_reference_policy_logprobs_calculation when the reference model is not loaded.
-    if not init_reference_model and not grpo_config.get(
-        "skip_reference_policy_logprobs_calculation"
+    if (
+        not init_reference_model
+        and not grpo_config.skip_reference_policy_logprobs_calculation
     ):
-        grpo_config["skip_reference_policy_logprobs_calculation"] = True
+        grpo_config.skip_reference_policy_logprobs_calculation = True
         print(
             "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
             "because `loss_fn.reference_policy_kl_penalty == 0` "
@@ -1385,8 +1383,8 @@ def dynamic_sampling(
 
     # Required batch size for training
     train_prompts_size = (
-        master_config.grpo["num_prompts_per_step"]
-        * master_config.grpo["num_generations_per_prompt"]
+        master_config.grpo.num_prompts_per_step
+        * master_config.grpo.num_generations_per_prompt
     )
     # Store the baseline, std and total_reward for the current unfiltered batch.
     repeated_batch["baseline"] = baseline
@@ -1397,7 +1395,7 @@ def dynamic_sampling(
     # Dynamic sampling algorithm (used in DAPO algorithm)
     # This block implements dynamic sampling by selecting prompt groups with non-zero std.
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until dynamic_sampling_max_gen_batches is reached.
-    if master_config.grpo["use_dynamic_sampling"]:
+    if master_config.grpo.use_dynamic_sampling:
         with timer.time("dynamic_sampling"):
             # Get the prompt indices with non-zero std
             non_zero_std_mask = std != 0.0
@@ -1440,9 +1438,9 @@ def dynamic_sampling(
 
             # If the generation samples size is smaller than a fixed threshold (train_prompts_size), keep generating by processing the next batch
             if filtered_prompts_size < train_prompts_size:
-                dynamic_sampling_max_gen_batches = master_config.grpo[
-                    "dynamic_sampling_max_gen_batches"
-                ]
+                dynamic_sampling_max_gen_batches = (
+                    master_config.grpo.dynamic_sampling_max_gen_batches
+                )
                 assert dynamic_sampling_max_gen_batches > 0, (
                     "When using grpo.use_dynamic_sampling, grpo.dynamic_sampling_max_gen_batches must be > 0"
                 )
@@ -1468,7 +1466,7 @@ def dynamic_sampling(
 
     batch_to_return = (
         filtered_repeated_batch
-        if master_config.grpo["use_dynamic_sampling"]
+        if master_config.grpo.use_dynamic_sampling
         else repeated_batch
     )
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
@@ -1489,12 +1487,12 @@ def scale_rewards(
         target_min = 0.0
         target_max = 1.0
     """
-    if reward_scaling_cfg["enabled"]:
+    if reward_scaling_cfg.enabled:
         rewards = repeated_batch["total_reward"]
-        source_min = float(reward_scaling_cfg["source_min"])
-        source_max = float(reward_scaling_cfg["source_max"])
-        target_min = float(reward_scaling_cfg["target_min"])
-        target_max = float(reward_scaling_cfg["target_max"])
+        source_min = float(reward_scaling_cfg.source_min)
+        source_max = float(reward_scaling_cfg.source_max)
+        target_min = float(reward_scaling_cfg.target_min)
+        target_max = float(reward_scaling_cfg.target_max)
 
         # Detect out-of-range values
         out_of_range_mask = (rewards < source_min) | (rewards > source_max)
@@ -1588,10 +1586,8 @@ def _resolve_message_level_advantage_penalties(
     master_config: MasterConfig,
 ) -> tuple[float | None, float | None]:
     """Return configured message-level penalties and validate feature support."""
-    invalid_tool_call_advantage = master_config.grpo.get("invalid_tool_call_advantage")
-    malformed_thinking_advantage = master_config.grpo.get(
-        "malformed_thinking_advantage"
-    )
+    invalid_tool_call_advantage = master_config.grpo.invalid_tool_call_advantage
+    malformed_thinking_advantage = master_config.grpo.malformed_thinking_advantage
     if invalid_tool_call_advantage is None and malformed_thinking_advantage is None:
         return invalid_tool_call_advantage, malformed_thinking_advantage
 
@@ -1956,19 +1952,17 @@ def _create_advantage_estimator(master_config: MasterConfig):
     # Provide backward-compatible defaults when adv_estimator is not in config.
     # Fall back to top-level grpo.normalize_rewards / grpo.use_leave_one_out_baseline
     # which older configs still use.
-    adv_estimator_config = grpo_config.get(
-        "adv_estimator",
-        {
-            "name": "grpo",
-            "normalize_rewards": grpo_config.get("normalize_rewards", True),
-            "use_leave_one_out_baseline": grpo_config.get(
-                "use_leave_one_out_baseline", False
-            ),
-            "minus_baseline": True,
-        },
-    )
+    if grpo_config.adv_estimator is not None:
+        adv_estimator_config = grpo_config.adv_estimator
+    else:
+        adv_estimator_config = AdvEstimatorConfig(
+            name="grpo",
+            normalize_rewards=grpo_config.normalize_rewards,
+            use_leave_one_out_baseline=grpo_config.use_leave_one_out_baseline,
+            minus_baseline=True,
+        )
 
-    adv_estimator_name = adv_estimator_config["name"]
+    adv_estimator_name = adv_estimator_config.name
     if adv_estimator_name == "gdpo":
         adv_estimator = GDPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GDPO advantage estimator (multi-reward)")
@@ -2006,11 +2000,11 @@ def _create_advantage_estimator(master_config: MasterConfig):
 
 def _clip_grpo_advantages(
     advantages: torch.Tensor,
-    grpo_config: dict[str, Any],
+    grpo_config: GRPOConfig,
 ) -> torch.Tensor:
     """Clamp normalized advantages when clip bounds are configured."""
-    clip_low = grpo_config.get("advantage_clip_low", None)
-    clip_high = grpo_config.get("advantage_clip_high", None)
+    clip_low = grpo_config.advantage_clip_low
+    clip_high = grpo_config.advantage_clip_high
     if clip_low is not None:
         advantages = advantages.clamp(min=clip_low)
     if clip_high is not None:
@@ -2333,24 +2327,22 @@ def grpo_train(
     sync_kv_scales = getattr(policy_generation, "requires_kv_scale_sync", False)
 
     # common config/state times
-    current_step = grpo_save_state["current_step"]  # current step within an epoch
-    total_steps = grpo_save_state["total_steps"]  # total steps across all epochs
-    max_num_steps = master_config.grpo[
-        "max_num_steps"
-    ]  # max number of steps to train for
-    current_epoch = grpo_save_state["current_epoch"]  # current epoch
-    max_num_epochs = master_config.grpo[
-        "max_num_epochs"
-    ]  # max number of epochs to train for
-    consumed_samples = grpo_save_state[
-        "consumed_samples"
-    ]  # total samples consumed across all epochs
-    total_valid_tokens = grpo_save_state.get(
-        "total_valid_tokens", 0
+    current_step = grpo_save_state.current_step  # current step within an epoch
+    total_steps = grpo_save_state.total_steps  # total steps across all epochs
+    max_num_steps = master_config.grpo.max_num_steps  # max number of steps to train for
+    current_epoch = grpo_save_state.current_epoch  # current epoch
+    max_num_epochs = (
+        master_config.grpo.max_num_epochs
+    )  # max number of epochs to train for
+    consumed_samples = (
+        grpo_save_state.consumed_samples
+    )  # total samples consumed across all epochs
+    total_valid_tokens = getattr(
+        grpo_save_state, "total_valid_tokens", 0
     )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
-    val_at_start = master_config.grpo["val_at_start"]
-    val_at_end = master_config.grpo["val_at_end"]
-    val_period = master_config.grpo["val_period"]
+    val_at_start = master_config.grpo.val_at_start
+    val_at_end = master_config.grpo.val_at_end
+    val_period = master_config.grpo.val_period
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
@@ -2432,7 +2424,7 @@ def grpo_train(
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
-                            master_config.grpo["num_generations_per_prompt"]
+                            master_config.grpo.num_generations_per_prompt
                         )
                     )
                     # Convert LLMMessageLogType to FlatMessagesType for generation
@@ -2554,7 +2546,7 @@ def grpo_train(
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config.grpo["max_rollout_turns"],
+                            max_rollout_turns=master_config.grpo.max_rollout_turns,
                             greedy=False,
                         )
                     else:
@@ -2566,7 +2558,7 @@ def grpo_train(
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config.grpo["max_rollout_turns"],
+                            max_rollout_turns=master_config.grpo.max_rollout_turns,
                             greedy=False,
                         )
                     policy_generation.finish_generation()
@@ -2583,12 +2575,12 @@ def grpo_train(
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
 
                 repeated_batch = scale_rewards(
-                    repeated_batch, master_config.grpo["reward_scaling"]
+                    repeated_batch, master_config.grpo.reward_scaling
                 )
                 # Process rewards with custom reward function
-                if master_config.grpo["reward_shaping"]["enabled"]:
+                if master_config.grpo.reward_shaping.enabled:
                     repeated_batch = apply_reward_shaping(
-                        repeated_batch, master_config.grpo["reward_shaping"]
+                        repeated_batch, master_config.grpo.reward_shaping
                     )
 
                 # Calculate rewards & advantages
@@ -2606,11 +2598,11 @@ def grpo_train(
                     # (which drives advantages) stays on the shaped reward.
                     std_rewards = (
                         repeated_batch["unshaped_total_reward"]
-                        if master_config.grpo["use_dynamic_sampling"]
+                        if master_config.grpo.use_dynamic_sampling
                         and "unshaped_total_reward" in repeated_batch
                         else None
                     )
-                    if master_config.grpo.get("calculate_advantages_on_gpu"):
+                    if master_config.grpo.calculate_advantages_on_gpu:
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
                         device_id = 0
@@ -2618,9 +2610,7 @@ def grpo_train(
                             input_ids.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
-                            leave_one_out_baseline=master_config.grpo[
-                                "use_leave_one_out_baseline"
-                            ],
+                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=(
                                 std_rewards.cuda(device_id)
                                 if std_rewards is not None
@@ -2634,9 +2624,7 @@ def grpo_train(
                             input_ids,
                             rewards,
                             torch.ones_like(rewards),
-                            leave_one_out_baseline=master_config.grpo[
-                                "use_leave_one_out_baseline"
-                            ],
+                            leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             std_rewards=std_rewards,
                         )
 
@@ -2659,7 +2647,7 @@ def grpo_train(
                     # Get the updated rewards and baselines. For DAPO, these rewards and baselines only correspond to the prompts with non-zero std.
                     rewards = (
                         repeated_batch["total_reward"]
-                        if not master_config.grpo["use_dynamic_sampling"]
+                        if not master_config.grpo.use_dynamic_sampling
                         else repeated_batch["filtered_reward"]
                     )
                     baseline = repeated_batch["baseline"]
@@ -2694,7 +2682,7 @@ def grpo_train(
                     del std
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config.grpo["overlong_filtering"]
+                    use_overlong_filtering = master_config.grpo.overlong_filtering
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
                         truncated = repeated_batch["truncated"]
@@ -2755,8 +2743,8 @@ def grpo_train(
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
                 # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
-                seq_logprob_error_threshold = master_config.grpo.get(
-                    "seq_logprob_error_threshold", None
+                seq_logprob_error_threshold = (
+                    master_config.grpo.seq_logprob_error_threshold
                 )
                 force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
                 skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
@@ -2768,8 +2756,8 @@ def grpo_train(
                     )
 
                 # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
-                skip_reference_logprobs = master_config.grpo.get(
-                    "skip_reference_policy_logprobs_calculation"
+                skip_reference_logprobs = (
+                    master_config.grpo.skip_reference_policy_logprobs_calculation
                 )
 
                 if not (skip_prev_logprobs and skip_reference_logprobs):
@@ -3002,7 +2990,7 @@ def grpo_train(
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
-                if master_config.grpo["use_dynamic_sampling"]:
+                if master_config.grpo.use_dynamic_sampling:
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
 
@@ -3043,7 +3031,7 @@ def grpo_train(
                 metrics.update(seq_logprob_error_metrics)
 
                 ## Checkpointing
-                consumed_samples += master_config.grpo["num_prompts_per_step"]
+                consumed_samples += master_config.grpo.num_prompts_per_step
                 timeout.mark_iteration()
 
                 # +1 because step is 0-indexed
@@ -3066,15 +3054,15 @@ def grpo_train(
                     policy.prepare_for_training()
 
                     # +1 because step is 0-indexed
-                    grpo_save_state["current_step"] = current_step + 1
-                    grpo_save_state["total_steps"] = total_steps + 1
-                    grpo_save_state["current_epoch"] = current_epoch
-                    grpo_save_state["total_valid_tokens"] = total_valid_tokens
+                    grpo_save_state.current_step = current_step + 1
+                    grpo_save_state.total_steps = total_steps + 1
+                    grpo_save_state.current_epoch = current_epoch
+                    grpo_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
-                        grpo_save_state["val_reward"] = val_metrics["accuracy"]
-                    elif "val_reward" in grpo_save_state:
-                        del grpo_save_state["val_reward"]
-                    grpo_save_state["consumed_samples"] = consumed_samples
+                        grpo_save_state.val_reward = val_metrics["accuracy"]
+                    elif hasattr(grpo_save_state, "val_reward"):
+                        delattr(grpo_save_state, "val_reward")
+                    grpo_save_state.consumed_samples = consumed_samples
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -3094,16 +3082,18 @@ def grpo_train(
                                 "This checkpoint will not be saved as top-k.",
                                 stacklevel=2,
                             )
-                            if full_metric_name in grpo_save_state:
-                                del grpo_save_state[full_metric_name]
+                            if hasattr(grpo_save_state, full_metric_name):
+                                delattr(grpo_save_state, full_metric_name)
                         elif metric_name not in metrics_source:
                             raise ValueError(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            grpo_save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
+                            setattr(
+                                grpo_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
 
                     with timer.time("checkpointing"):
                         # Finalize the previous (possibly async) checkpoint before
@@ -3115,7 +3105,7 @@ def grpo_train(
                             flush=True,
                         )
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, grpo_save_state, master_config
+                            total_steps + 1, vars(grpo_save_state), master_config
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -3174,7 +3164,7 @@ def grpo_train(
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
-                if master_config.grpo["use_dynamic_sampling"]:
+                if master_config.grpo.use_dynamic_sampling:
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
@@ -3246,7 +3236,7 @@ def grpo_train(
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
-            if master_config.grpo["use_dynamic_sampling"]:
+            if master_config.grpo.use_dynamic_sampling:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
                     f"  • Avg Total Reward: {np.mean(repeated_batch['total_reward'].numpy()):.4f}"
@@ -3263,8 +3253,8 @@ def grpo_train(
             total_time = timing_metrics.get("total_step_time", 0)
 
             number_of_samples_per_step = (
-                master_config.grpo["num_prompts_per_step"]
-                * master_config.grpo["num_generations_per_prompt"]
+                master_config.grpo.num_prompts_per_step
+                * master_config.grpo.num_generations_per_prompt
             )
             total_num_gpus = (
                 master_config.cluster["num_nodes"]
@@ -3355,7 +3345,7 @@ def validate(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config.grpo["val_period"] == 0, (
+        assert val_dataloader is not None or master_config.grpo.val_period == 0, (
             "val_dataloader is None, so grpo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
@@ -3369,10 +3359,13 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo["max_val_samples"]
-            // master_config.grpo["val_batch_size"]
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        if max_val_samples is None or val_batch_size is None:
+            raise ValueError(
+                "grpo.max_val_samples and grpo.val_batch_size must be set before validation"
+            )
+        max_batches = max_val_samples // val_batch_size
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
@@ -3406,7 +3399,7 @@ def validate(
                     tokenizer,
                     val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=master_config.grpo["max_rollout_turns"],
+                    max_rollout_turns=master_config.grpo.max_rollout_turns,
                     greedy=False,
                 )
             else:
@@ -3416,7 +3409,7 @@ def validate(
                     tokenizer,
                     val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=master_config.grpo["max_rollout_turns"],
+                    max_rollout_turns=master_config.grpo.max_rollout_turns,
                     greedy=False,
                 )
 
@@ -3598,8 +3591,11 @@ def async_grpo_train(
             "has not been merged yet."
         )
 
-    if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
-        if not master_config.grpo["async_grpo"].get("in_flight_weight_updates", False):
+    if (
+        master_config.grpo.async_grpo is not None
+        and master_config.grpo.async_grpo.max_trajectory_age_steps > 1
+    ):
+        if not master_config.grpo.async_grpo.in_flight_weight_updates:
             print(
                 "⚠️ WARNING: In-flight weight updates must be enabled for async GRPO with max_trajectory_age_steps > 1. "
                 "Without in-flight weight updates, having more max_trajectory_age_steps will not give any performance benefit."
@@ -3623,15 +3619,15 @@ def async_grpo_train(
     assert policy_generation is not None
 
     # Training state
-    step = grpo_save_state["current_step"]
+    step = grpo_save_state.current_step
     weight_version = step  # Tracks refitted weight versions
-    consumed_samples = grpo_save_state["consumed_samples"]
-    total_valid_tokens = grpo_save_state.get(
-        "total_valid_tokens", 0
+    consumed_samples = grpo_save_state.consumed_samples
+    total_valid_tokens = getattr(
+        grpo_save_state, "total_valid_tokens", 0
     )  # Default to 0 for backward compatibility with older checkpoints
-    val_period = master_config.grpo["val_period"]
-    val_at_start = master_config.grpo["val_at_start"]
-    val_at_end = master_config.grpo["val_at_end"]
+    val_period = master_config.grpo.val_period
+    val_at_start = master_config.grpo.val_at_start
+    val_at_end = master_config.grpo.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -3643,8 +3639,8 @@ def async_grpo_train(
 
     # Calculate minimum buffer size from training requirements
     # In per-prompt buffer mode, one buffer entry is 1 prompt * num_generations_per_prompt
-    num_prompts_per_step = master_config.grpo["num_prompts_per_step"]
-    samples_per_prompt_group = master_config.grpo["num_generations_per_prompt"]
+    num_prompts_per_step = master_config.grpo.num_prompts_per_step
+    samples_per_prompt_group = master_config.grpo.num_generations_per_prompt
     train_gbs = master_config.policy["train_global_batch_size"]
 
     # Ensure the buffer has at least one step worth of prompt-groups before training
@@ -3683,7 +3679,7 @@ def async_grpo_train(
     # Calculate optimal buffer size based on generation limits to prevent length bias
     # Each weight version generates exactly num_prompts_per_step trajectories
     # With max_age_steps, we keep trajectories from multiple weight versions
-    num_prompts_per_step = master_config.grpo["num_prompts_per_step"]
+    num_prompts_per_step = master_config.grpo.num_prompts_per_step
     late_arrival_slack = 2
     optimal_buffer_size = (
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
@@ -3886,9 +3882,9 @@ def async_grpo_train(
 
     # Main training loop
     try:
-        while step < master_config.grpo["max_num_steps"]:
+        while step < master_config.grpo.max_num_steps:
             print(
-                f"\n{'=' * 25} Step {step + 1}/{master_config.grpo['max_num_steps']} {'=' * 25}"
+                f"\n{'=' * 25} Step {step + 1}/{master_config.grpo.max_num_steps} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
@@ -3906,9 +3902,7 @@ def async_grpo_train(
                     )
 
                     # Sample the required number of per-prompt groups.
-                    num_prompt_groups_needed = master_config.grpo[
-                        "num_prompts_per_step"
-                    ]
+                    num_prompt_groups_needed = master_config.grpo.num_prompts_per_step
                     sample_result = ray.get(
                         replay_buffer.sample.remote(
                             num_prompt_groups=num_prompt_groups_needed,
@@ -4017,8 +4011,8 @@ def async_grpo_train(
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
-                    master_config.grpo["num_prompts_per_step"]
-                    * master_config.grpo["num_generations_per_prompt"]
+                    master_config.grpo.num_prompts_per_step
+                    * master_config.grpo.num_generations_per_prompt
                 )
                 if repeated_batch.size != expected_batch_size:
                     print(
@@ -4063,9 +4057,7 @@ def async_grpo_train(
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo[
-                            "overlong_filtering"
-                        ]
+                        use_overlong_filtering = master_config.grpo.overlong_filtering
                         if use_overlong_filtering:
                             loss_multiplier = repeated_batch["loss_multiplier"].clone()
                             truncated = repeated_batch["truncated"]
@@ -4109,8 +4101,8 @@ def async_grpo_train(
                 # Training phase (same as sync version)
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
                 # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
-                seq_logprob_error_threshold = master_config.grpo.get(
-                    "seq_logprob_error_threshold", None
+                seq_logprob_error_threshold = (
+                    master_config.grpo.seq_logprob_error_threshold
                 )
                 force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
                 skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
@@ -4123,8 +4115,8 @@ def async_grpo_train(
                     )
 
                 # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
-                skip_reference_logprobs = master_config.grpo.get(
-                    "skip_reference_policy_logprobs_calculation"
+                skip_reference_logprobs = (
+                    master_config.grpo.skip_reference_policy_logprobs_calculation
                 )
 
                 if not (skip_prev_logprobs and skip_reference_logprobs):
@@ -4299,7 +4291,7 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                is_last_step = step + 1 == master_config.grpo["max_num_steps"]
+                is_last_step = step + 1 == master_config.grpo.max_num_steps
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (step + 1) % val_period == 0) or (
@@ -4410,7 +4402,7 @@ def async_grpo_train(
                 metrics.update(seq_logprob_error_metrics)
 
                 # Checkpointing (same as sync version)
-                consumed_samples += master_config.grpo["num_prompts_per_step"]
+                consumed_samples += master_config.grpo.num_prompts_per_step
                 timeout.mark_iteration()
 
                 # +1 because step is 0-indexed
@@ -4425,13 +4417,13 @@ def async_grpo_train(
                 if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
-                    grpo_save_state["current_step"] = step + 1
-                    grpo_save_state["total_valid_tokens"] = total_valid_tokens
+                    grpo_save_state.current_step = step + 1
+                    grpo_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
-                        grpo_save_state["val_reward"] = val_metrics["accuracy"]
-                    elif "val_reward" in grpo_save_state:
-                        del grpo_save_state["val_reward"]
-                    grpo_save_state["consumed_samples"] = consumed_samples
+                        grpo_save_state.val_reward = val_metrics["accuracy"]
+                    elif hasattr(grpo_save_state, "val_reward"):
+                        delattr(grpo_save_state, "val_reward")
+                    grpo_save_state.consumed_samples = consumed_samples
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -4451,16 +4443,18 @@ def async_grpo_train(
                                 "This checkpoint will not be saved as top-k.",
                                 stacklevel=2,
                             )
-                            if full_metric_name in grpo_save_state:
-                                del grpo_save_state[full_metric_name]
+                            if hasattr(grpo_save_state, full_metric_name):
+                                delattr(grpo_save_state, full_metric_name)
                         elif metric_name not in metrics_source:
                             raise ValueError(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            grpo_save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
+                            setattr(
+                                grpo_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
 
                     with timer.time("checkpointing"):
                         # Finalize the previous (possibly async) checkpoint before
@@ -4469,7 +4463,7 @@ def async_grpo_train(
 
                         print(f"Saving checkpoint for step {step + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            step + 1, grpo_save_state, master_config
+                            step + 1, vars(grpo_save_state), master_config
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -4527,7 +4521,7 @@ def async_grpo_train(
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
-                if master_config.grpo["use_dynamic_sampling"]:
+                if master_config.grpo.use_dynamic_sampling:
                     # In dynamic sampling, `rewards` corresponds to filtered rewards
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
@@ -4654,7 +4648,7 @@ def async_grpo_train(
                 checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if step >= master_config.grpo["max_num_steps"]:
+            if step >= master_config.grpo.max_num_steps:
                 checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",

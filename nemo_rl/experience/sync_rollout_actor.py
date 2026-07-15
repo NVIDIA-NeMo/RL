@@ -265,7 +265,7 @@ class SyncRolloutActor:
             final_batch, rollout_metrics = runner(
                 **common,
                 max_seq_len=cfg.policy["max_total_sequence_length"],
-                max_rollout_turns=cfg.grpo["max_rollout_turns"],
+                max_rollout_turns=cfg.grpo.max_rollout_turns,
             )
         fb = final_batch.to("cpu")
         del final_batch

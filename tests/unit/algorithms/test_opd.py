@@ -415,8 +415,11 @@ def test_create_advantage_estimator_opd_branch():
     import warnings
     from types import SimpleNamespace
 
-    from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
-    from nemo_rl.algorithms.grpo import _create_advantage_estimator
+    from nemo_rl.algorithms.advantage_estimator import (
+        AdvEstimatorConfig,
+        OPDAdvantageEstimator,
+    )
+    from nemo_rl.algorithms.grpo import GRPOConfig, _create_advantage_estimator
 
     # loss_fn not MOPD-configured -> the 3 recommendation warnings fire.
     loss_fn = SimpleNamespace(
@@ -425,7 +428,8 @@ def test_create_advantage_estimator_opd_branch():
         truncated_importance_sampling_type="none",
     )
     master_config = SimpleNamespace(
-        grpo={"adv_estimator": {"name": "opd"}}, loss_fn=loss_fn
+        grpo=GRPOConfig(adv_estimator=AdvEstimatorConfig(name="opd")),
+        loss_fn=loss_fn,
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

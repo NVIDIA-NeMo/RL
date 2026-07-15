@@ -21,7 +21,7 @@ import torch
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _build_async_grpo_train_data,
-    _default_grpo_save_state,
+    _initial_grpo_save_state,
     async_grpo_train,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -124,6 +124,6 @@ def test_async_grpo_r3_rejects_data_plane_until_async_tq_exists():
             None,
             MagicMock(),
             MagicMock(),
-            _default_grpo_save_state(),
+            _initial_grpo_save_state(),
             master_config,
         )

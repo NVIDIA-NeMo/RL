@@ -1100,9 +1100,10 @@ def ppo_train(
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.ppo["reward_scaling"]
                 )
-                if master_config.ppo["reward_shaping"]["enabled"]:
+                reward_shaping_config = master_config.ppo["reward_shaping"]
+                if reward_shaping_config.enabled:
                     repeated_batch = apply_reward_shaping(
-                        repeated_batch, master_config.ppo["reward_shaping"]
+                        repeated_batch, reward_shaping_config
                     )
 
                 # Process rewards and build training data

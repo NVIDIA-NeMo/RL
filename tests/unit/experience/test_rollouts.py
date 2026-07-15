@@ -949,6 +949,8 @@ def test_run_async_nemo_gym_rollout(
             "turns_per_sample/median": 2.0,
             "turns_per_sample/stddev": 0.0,
             "turns_per_sample/histogram": None,
+            "turns_per_sample/p95": 2.0,
+            "turns_per_sample/p99": 2.0,
             "total_tokens_per_sample/mean": 3843.0,
             "total_tokens_per_sample/max": 3848,
             "total_tokens_per_sample/min": 3838,
@@ -961,6 +963,13 @@ def test_run_async_nemo_gym_rollout(
             "gen_tokens_per_sample/median": 732.5,
             "gen_tokens_per_sample/stddev": 21.920310216782973,
             "gen_tokens_per_sample/histogram": None,
+            "max_gen_tokens_per_turn/mean": None,
+            "max_gen_tokens_per_turn/max": None,
+            "max_gen_tokens_per_turn/min": None,
+            "max_gen_tokens_per_turn/median": None,
+            "max_gen_tokens_per_turn/stddev": None,
+            "max_gen_tokens_per_turn/histogram": None,
+            "max_gen_tokens_per_turn/p95": None,
             "total_reward/mean": 0.0,
             "total_reward/max": 0.0,
             "total_reward/min": 0.0,
@@ -1325,7 +1334,7 @@ def test_async_rollout_manager_matches_original(
         if key == "max_turns_reached_rate":
             return key
         for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
-            if key.startswith(prefix):
+            if key.startswith(prefix) and "/" not in key:
                 return f"{key[len(prefix) :]}{suffix}"
         return key
 

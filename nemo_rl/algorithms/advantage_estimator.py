@@ -29,6 +29,7 @@ Reference papers:
 """
 
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -40,15 +41,34 @@ from nemo_rl.algorithms.utils import (
 )
 
 
+class AdvEstimatorConfig(BaseModel, extra="allow"):
+    """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
+
+    name: str = "grpo"  # "grpo", "gdpo", or "reinforce_plus_plus"
+    # GRPO specific
+    normalize_rewards: bool | None = None
+    use_leave_one_out_baseline: bool | None = None
+    # Reinforce++ specific
+    minus_baseline: bool | None = None
+
+
 class GRPOAdvantageEstimator:
     """GRPO-style advantage estimator with leave-one-out baseline.
 
     Note: GRPO computes advantages over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
-        self.normalize_rewards = estimator_config["normalize_rewards"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        assert estimator_config.use_leave_one_out_baseline is not None, (
+            "use_leave_one_out_baseline must be configured for GRPO"
+        )
+        assert estimator_config.normalize_rewards is not None, (
+            "normalize_rewards must be configured for GRPO"
+        )
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.normalize_rewards = estimator_config.normalize_rewards
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute GRPO advantages.
@@ -88,9 +108,17 @@ class GDPOAdvantageEstimator:
     Note: GDPO computes advantages for each reward separately over all responses for each prompt.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
-        self.normalize_rewards = estimator_config["normalize_rewards"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        assert estimator_config.use_leave_one_out_baseline is not None, (
+            "use_leave_one_out_baseline must be configured for GDPO"
+        )
+        assert estimator_config.normalize_rewards is not None, (
+            "normalize_rewards must be configured for GDPO"
+        )
+        self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
+        self.normalize_rewards = estimator_config.normalize_rewards
 
     def compute_advantage(
         self,
@@ -163,8 +191,13 @@ class ReinforcePlusPlusAdvantageEstimator:
         use_kl_in_reward: If True, add KL penalty to reward instead of loss.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
-        self.minus_baseline = estimator_config["minus_baseline"]
+    def __init__(
+        self, estimator_config: AdvEstimatorConfig, loss_config: ClippedPGLossConfig
+    ):
+        assert estimator_config.minus_baseline is not None, (
+            "minus_baseline must be configured for Reinforce++"
+        )
+        self.minus_baseline = estimator_config.minus_baseline
         self.use_kl_in_reward = loss_config.use_kl_in_reward
         self.kl_coef = loss_config.reference_policy_kl_penalty
         self.kl_type = loss_config.reference_policy_kl_type

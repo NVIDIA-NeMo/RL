@@ -114,9 +114,7 @@ def _skip_prev_logprobs(master_config: Any) -> bool:
     ``seq_logprob_error_threshold`` skips the student logprob pass.
     """
     force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-    seq_logprob_error_threshold = master_config.grpo.get(
-        "seq_logprob_error_threshold", None
-    )
+    seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
     return bool(force_on_policy_ratio and seq_logprob_error_threshold is None)
 
 
