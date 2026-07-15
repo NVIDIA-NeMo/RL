@@ -24,6 +24,19 @@
 
 set -eoux pipefail
 
+# Record job-start epoch so Python can measure pre-Python overhead
+export NRL_JOB_START_EPOCH=$(date +%s.%N)
+
+# Log a timestamped, seconds-since-job-start marker at each phase boundary.
+log_phase() {
+  echo "[NRL_PHASE][$(date '+%Y-%m-%dT%H:%M:%S%z')][+$(( $(date +%s) - ${NRL_JOB_START_EPOCH%.*} ))s] $*"
+}
+log_phase "ray.sub started (job=${SLURM_JOB_ID:-?} nodes=${SLURM_JOB_NUM_NODES:-?} partition=${SLURM_JOB_PARTITION:-?} node=$(hostname))"
+
+# Log a final marker on exit; trap TERM/HUP/INT too so a scancel/time-limit kill is still stamped.
+_nrl_log_exit() { local rc=$?; trap - EXIT; log_phase "ray.sub exiting (exit_code=$rc)"; exit $rc; }
+trap _nrl_log_exit EXIT TERM HUP INT
+
 ########################################################
 # Function to detect if SLURM cluster uses GRES
 ########################################################
@@ -173,6 +186,7 @@ mkdir -p $LOG_DIR
 # containers check at startup: a node that can't see it isn't on the shared FS, so
 # we fail there immediately instead of hanging on signal files that never appear.
 echo "$SLURM_JOB_ID" > "$LOG_DIR/.shared_fs_canary"
+log_phase "shared-FS log dir ready ($LOG_DIR)"
 
 # Write setup commands to a file so they can be executed inside each container
 # without heredoc escaping surprises.
@@ -196,6 +210,7 @@ fi
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
 # Detect GRES support and set GRES_ARG
+log_phase "detecting GRES support (sinfo)"
 GRES_ARG=$(maybe_gres_arg)
 if [[ -n "$GRES_ARG" ]]; then
   echo "[INFO] GRES support detected. Using: $GRES_ARG"
@@ -220,6 +235,7 @@ COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 if [[ -n "${CPUS_PER_WORKER:-}" ]]; then
   echo "[INFO] Using user-provided CPUS_PER_WORKER=$CPUS_PER_WORKER."
 else
+  log_phase "auto-detecting CPUs per node (scontrol show node)"
   CPUS_PER_WORKER=$(detect_cpus_per_node)
   echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of first allocated node)."
 fi
@@ -254,6 +270,7 @@ nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 nodes_array=($nodes)
 ip_addresses_array=()
 
+log_phase "resolving ${#nodes_array[@]} node hostname(s) to IPs"
 for node in $nodes; do
     # Try multiple methods to get IP address - ENHANCED VERSION v2.0
     echo "[DEBUG] Resolving hostname: $node using enhanced resolution methods"
@@ -417,6 +434,11 @@ if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
   exit 1
 fi
 
+# Phase markers inside the container; reuse the propagated job-start epoch so the
+# elapsed counter shares the submit-side timeline.
+log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
+log_phase "head container started on \$(hostname)"
+
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true
@@ -497,6 +519,7 @@ source $LOG_DIR/topology_probe.sh
 # GCS is listening, so we touch STARTED_RAY_HEAD only after the head is actually up.
 # Workers gate on that file, so they only try to connect once the GCS is accepting
 # connections.
+log_phase "head: starting Ray head"
 count=0
 while [[ \$count -lt $num_retries ]]; do
   # Clean up stale Ray state before every attempt. A timed-out attempt leaves a
@@ -542,6 +565,7 @@ fi
 
 # Signal workers and the submit host that the Ray head GCS is now listening.
 touch $LOG_DIR/STARTED_RAY_HEAD
+log_phase "head: Ray GCS listening (STARTED_RAY_HEAD written)"
 
 if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   # Non-interactive: wait for all workers to connect and, if a sandbox is
@@ -558,18 +582,18 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
   while true; do
     if [[ "\$workers_ready" -eq 0 ]]; then
       worker_units=\$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print \$4}' || echo 0)
-      echo "[INFO] Number of actors online: \$worker_units/$NUM_ACTORS"
+      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Number of actors online: \$worker_units/$NUM_ACTORS"
       if [[ "\$worker_units" -eq "$NUM_ACTORS" ]]; then
         workers_ready=1
-        echo "All workers connected!"
+        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] All workers connected!"
       fi
     fi
     if [[ "\$sandbox_ready" -eq 0 ]]; then
       ready_count=\$(ls -1 "$SANDBOX_PORTS_DIR"/SANDBOX_READY_* 2>/dev/null | wc -l)
-      echo "[INFO] Sandbox ready on \$ready_count/$SLURM_JOB_NUM_NODES nodes..."
+      echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Sandbox ready on \$ready_count/$SLURM_JOB_NUM_NODES nodes..."
       if [[ "\$ready_count" -ge "$SLURM_JOB_NUM_NODES" ]]; then
         sandbox_ready=1
-        echo "[INFO] All $SLURM_JOB_NUM_NODES sandbox instances ready."
+        echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] All $SLURM_JOB_NUM_NODES sandbox instances ready."
       fi
     fi
     if [[ "\$workers_ready" -eq 1 ]] && [[ "\$sandbox_ready" -eq 1 ]]; then
@@ -588,6 +612,11 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
     sleep 5
   done
 
+  # Record the wall-clock epoch when the Ray cluster became ready so the driver
+  # and training process can measure post-ready initialization timing.
+  export NRL_RAY_READY_EPOCH=\$(date +%s.%N)
+
+  log_phase "head: cluster ready, launching driver"
   set +e
   bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
   exit_code=\$?
@@ -616,6 +645,10 @@ if [[ ! -f "$LOG_DIR/.shared_fs_canary" ]]; then
   echo "[ERROR] Worker \$SLURM_PROCID: $LOG_DIR/.shared_fs_canary not visible; LOG_DIR must be on a shared filesystem." >&2
   exit 1
 fi
+
+# Phase markers inside the container (see head container).
+log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
+log_phase "worker \$SLURM_PROCID container started on \$(hostname)"
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -678,7 +711,7 @@ source $LOG_DIR/topology_probe.sh
 echo "[INFO] Worker \$SLURM_PROCID: waiting for Ray head GCS to be ready..."
 while true; do
   if [[ -f "$LOG_DIR/STARTED_RAY_HEAD" ]]; then
-    echo "[INFO] Worker \$SLURM_PROCID: Ray head GCS is ready, connecting."
+    log_phase "worker \$SLURM_PROCID connecting to Ray head"
     break
   fi
   if [[ -f "$LOG_DIR/ENDED" ]]; then
@@ -703,7 +736,7 @@ while [[ \$count -lt $WORKER_NUM_RETRIES ]]; do
     echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
     bash "$SETUP_COMMAND_FILE"
   fi
-  echo "[INFO] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
+  echo "[INFO][\$(date '+%Y-%m-%dT%H:%M:%S%z')] Worker \$SLURM_PROCID: starting Ray worker (attempt \$((count+1))/$WORKER_NUM_RETRIES)..."
   cat <<EOFINNER | bash
 ray start --address "$ip_head" \
           --disable-usage-stats \
@@ -795,6 +828,7 @@ else
 fi
 
 # Start the Ray head.
+log_phase "launching Ray head + worker sruns"
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
 SRUN_PIDS["ray-head"]=$!
 
@@ -827,6 +861,7 @@ while check_srun_processes && ! test -f "$LOG_DIR/STARTED_RAY_HEAD"; do
   echo "[INFO][$(date)] Waiting for Ray head GCS to be ready..."
   sleep 2
 done
+log_phase "Ray head GCS up (STARTED_RAY_HEAD observed)"
 
 if [[ -n "$COMMAND" ]]; then
   # Non-interactive: the head container polls for workers, gates on sandbox
@@ -859,7 +894,7 @@ else
   RAY_STATUS_DEADLINE=$((SECONDS + 1800))
   while true; do
     worker_units=$(cat "$LOG_DIR/ray_worker_units" 2>/dev/null || echo -1)
-    echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
+    echo "[INFO][$(date '+%Y-%m-%dT%H:%M:%S%z')] Number of actors online: $worker_units/$NUM_ACTORS"
     if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
       break
     fi
@@ -872,8 +907,9 @@ else
     sleep 5
   done
 
-  echo "All workers connected!"
+  echo "[INFO][$(date '+%Y-%m-%dT%H:%M:%S%z')] All workers connected!"
 
+  log_phase "generating attach helper (scontrol show job)"
   CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
