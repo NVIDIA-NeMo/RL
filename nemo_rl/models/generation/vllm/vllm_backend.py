@@ -15,7 +15,7 @@ import gc
 import re
 import socket
 import traceback
-from typing import Any, cast
+from typing import Any
 
 import torch
 import zmq
@@ -175,11 +175,10 @@ class VllmInternalWorkerExtension:
 
     def prepare_sparse_delta_refit_info(
         self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
-    ) -> None:
-        """Reserve the reusable sparse-refit scratch buffer."""
+    ) -> list[str]:
+        """Reserve scratch space and report weights that require overwrite."""
         applier = self._get_sparse_delta_applier()
-        applier.prewarm(state_dict_info)
-        applier.discover_native_skips(state_dict_info)
+        return sorted(applier.discover_native_skips(state_dict_info))
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -310,12 +309,10 @@ class VllmInternalWorkerExtension:
             return False
 
         predictor = draft_model.model
-        mtp_start_layer_idx = cast(int, predictor.mtp_start_layer_idx)
-        num_mtp_layers = cast(int, predictor.num_mtp_layers)
         mtp_layer_indices = set(
             range(
-                mtp_start_layer_idx,
-                mtp_start_layer_idx + num_mtp_layers,
+                predictor.mtp_start_layer_idx,
+                predictor.mtp_start_layer_idx + predictor.num_mtp_layers,
             )
         )
         weights = _read_mtp_layer_weights_from_checkpoint(model_path, mtp_layer_indices)

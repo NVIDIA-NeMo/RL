@@ -31,24 +31,27 @@ from nemo_rl.models.generation.vllm.vllm_sparse_refit import (
     VllmSparseRefitReceiver,
     _stage_sparse_payload,
 )
+from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
-from nemo_rl.utils.weight_transfer_remote_sparse import (
+from nemo_rl.utils.weight_transfer_http import (
     G_VLLM_REFIT_API_KEY_HEADER,
     G_VLLM_REFIT_FLUSH_PATH,
     G_VLLM_REFIT_PREPARE_PATH,
     G_VLLM_REFIT_S3_MANIFEST_PATH,
+    G_VLLM_REFIT_ZMQ_FLUSH_PATH,
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     encode_sparse_infos,
-    iter_decoded_sparse_payload,
+    sparse_locations_for_item,
 )
 from nemo_rl.utils.weight_transfer_zmq import (
     G_VLLM_REFIT_CHECKSUM_HEADER,
     G_VLLM_REFIT_PAYLOAD_HEADER,
     G_VLLM_REFIT_PRODUCER_HEADER,
     G_VLLM_REFIT_TRANSFER_HEADER,
+    G_VLLM_REFIT_VERIFICATION_HEADER,
     G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
 )
 
@@ -95,6 +98,15 @@ def _serialized_sparse_payload() -> bytes:
     buffer = io.BytesIO()
     torch.save(payload, buffer)
     return buffer.getvalue()
+
+
+def _payload_locations(path: str) -> list[int]:
+    packed_locations, _, items = torch.load(path, weights_only=True, mmap=True)
+    return [
+        int(location)
+        for item in items
+        for location in sparse_locations_for_item(item, packed_locations, device="cpu")
+    ]
 
 
 def _stage_payloads(
@@ -172,14 +184,19 @@ def test_sparse_refit_queue_deduplicates_transactional_payloads() -> None:
         receiver.update_weights_from_serialized_sparse_payloads = MagicMock(
             return_value={"ok": True, "payloads": 1}
         )
-        assert receiver._enqueue_sparse_payload_apply(b"payload", key, "checksum")["ok"]
-        duplicate = receiver._enqueue_sparse_payload_apply(b"payload", key, "checksum")
+        assert receiver._enqueue_sparse_payload_apply(b"payload", key, "checksum", 4)[
+            "ok"
+        ]
+        duplicate = receiver._enqueue_sparse_payload_apply(
+            b"payload", key, "checksum", 4
+        )
         assert duplicate == {"ok": True, "payloads": 0, "duplicate": True}
         with pytest.raises(ValueError, match="reused with different data"):
             receiver._enqueue_sparse_payload_apply(b"other", key, "different")
         response = receiver._flush_queued_sparse_payloads()
 
     assert response["payloads"] == 1
+    assert response["verification_candidates"] == 4
     assert receiver._refit_seen_payloads == {}
 
 
@@ -255,7 +272,7 @@ def test_sparse_refit_queue_releases_condition_while_backpressured() -> None:
             assert pending_call.result(timeout=1.0)["ok"]
 
 
-def test_sparse_refit_batch_decodes_once_before_collective_apply(
+def test_sparse_refit_batch_stages_compact_payload_before_collective_apply(
     tmp_path: Path,
 ) -> None:
     with _sparse_refit_receiver() as receiver:
@@ -264,13 +281,7 @@ def test_sparse_refit_batch_decodes_once_before_collective_apply(
         def collective_rpc(method: str, args: tuple[Any, ...]) -> list[Any]:
             assert method == "update_weights_from_decoded_sparse_payload"
             for path in args:
-                staged_locations.extend(
-                    int(location)
-                    for _, locations, _ in iter_decoded_sparse_payload(
-                        torch.load(path, weights_only=True)
-                    )
-                    for location in locations
-                )
+                staged_locations.extend(_payload_locations(path))
             return [
                 {"ok": True, "receiver_total_s": 1.0},
                 {"ok": True, "receiver_total_s": 1.0},
@@ -298,7 +309,7 @@ def test_sparse_refit_batch_decodes_once_before_collective_apply(
         assert response["payloads"] == 1
         assert response["receiver_worker_total_s"] == 1.0
         assert response["receiver_total_s"] >= 0.0
-        assert receiver._refit_verification_candidates == 4
+        assert receiver._refit_verification_candidates == 0
 
 
 def test_sparse_refit_batch_drains_workers_before_error_cleanup(tmp_path: Path) -> None:
@@ -368,13 +379,7 @@ async def test_async_sparse_refit_batch_bridges_to_async_collective(
             ) -> list[Any]:
                 assert method == "update_weights_from_decoded_sparse_payload"
                 for path in args:
-                    staged_locations.extend(
-                        location
-                        for _, locations, _ in iter_decoded_sparse_payload(
-                            torch.load(path, weights_only=True)
-                        )
-                        for location in locations.tolist()
-                    )
+                    staged_locations.extend(_payload_locations(path))
                 return [{"ok": True, "receiver_total_s": 1.0}]
 
         receiver._worker.llm = AsyncLlm()
@@ -409,7 +414,11 @@ async def test_sparse_refit_payload_handlers_decode_and_enqueue(monkeypatch) -> 
         )
 
         s3_result = await receiver._apply_s3_manifest_payload(
-            {"key": "object-key", "checksum": "checksum"}
+            {
+                "key": "object-key",
+                "checksum": "checksum",
+                "verification_candidates": 4,
+            }
         )
         assert s3_result["ok"]
 
@@ -423,14 +432,15 @@ async def test_sparse_refit_payload_handlers_decode_and_enqueue(monkeypatch) -> 
                 G_VLLM_REFIT_PRODUCER_HEADER: "2",
                 G_VLLM_REFIT_PAYLOAD_HEADER: "3",
                 G_VLLM_REFIT_CHECKSUM_HEADER: "checksum",
+                G_VLLM_REFIT_VERIFICATION_HEADER: "5",
             },
             body=AsyncMock(return_value=b"compressed"),
         )
         zmq_result = await receiver._apply_zmq_payload(request)
         assert zmq_result["ok"]
         assert enqueue.call_args_list == [
-            call(b"s3-payload", ("object-key", -1, -1), "checksum"),
-            call(b"zmq-payload", ("transfer", 2, 3), "checksum"),
+            call(b"s3-payload", ("object-key", -1, -1), "checksum", 4),
+            call(b"zmq-payload", ("transfer", 2, 3), "checksum", 5),
         ]
 
 
@@ -455,6 +465,9 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
         receiver._flush_queued_sparse_payloads = MagicMock(
             return_value={"ok": True, "payloads": 2}
         )
+        receiver.flush_zmq_sparse_refit_relay = MagicMock(
+            return_value={"ok": True, "payloads": 3}
+        )
         receiver._refit_collective_rpc = MagicMock(return_value=[])
         app = FastAPI()
         receiver.setup_api_server(app)
@@ -468,6 +481,11 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
                 headers=headers,
             )
             flush_response = client.post(G_VLLM_REFIT_FLUSH_PATH, headers=headers)
+            zmq_flush_response = client.post(
+                G_VLLM_REFIT_ZMQ_FLUSH_PATH,
+                json={"transfer_id": "transfer"},
+                headers=headers,
+            )
             prepare_response = client.post(
                 G_VLLM_REFIT_PREPARE_PATH,
                 json={"tensors": {"weight": [[2, 3], "bfloat16"]}},
@@ -482,12 +500,14 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
         assert unauthorized.status_code == 403
         assert s3_response.status_code == 200
         assert flush_response.status_code == 200
+        assert zmq_flush_response.status_code == 200
         assert prepare_response.status_code == 200
         assert zmq_response.status_code == 500
         assert receiver._refit_async_loop is not None
         receiver._apply_s3_manifest_payload.assert_awaited_once_with({"key": "key"})
         receiver._apply_zmq_payload.assert_awaited_once()
         receiver._flush_queued_sparse_payloads.assert_called_once_with()
+        receiver.flush_zmq_sparse_refit_relay.assert_called_once_with("transfer", 0)
         receiver._refit_collective_rpc.assert_called_once_with(
             "prepare_sparse_delta_refit_info",
             ({"weight": ((2, 3), torch.bfloat16)},),
@@ -590,11 +610,38 @@ def test_async_sparse_refit_exposes_zmq_relay(monkeypatch) -> None:
     }
 
     with _sparse_refit_receiver(async_engine=True, config=config) as receiver:
+        receiver._worker.base_url = "http://10.0.0.1:8000/v1"
         assert receiver.start_zmq_sparse_refit_relay(["http://receiver"]) == (
             "tcp://10.0.0.1:12345"
         )
         server.start.assert_called_once_with()
+        receiver.configure_zmq_sparse_refit_relay(
+            ["tcp://10.0.0.1:12345", "tcp://10.0.0.2:12345"]
+        )
+        server.configure_tree.assert_called_once_with(
+            ["tcp://10.0.0.1:12345", "tcp://10.0.0.2:12345"],
+            own_address="tcp://10.0.0.1:12345",
+            local_refit_url="http://10.0.0.1:8000",
+        )
+        server.flush.return_value = {"ok": True, "payloads": 2}
+        assert receiver.flush_zmq_sparse_refit_relay("transfer") == {
+            "ok": True,
+            "payloads": 2,
+        }
+        server.flush.assert_called_once_with("transfer", 0)
 
         receiver.stop_zmq_sparse_refit_relay()
         server.close.assert_called_once_with()
         assert receiver._zmq_refit_server is None
+
+
+def test_vllm_worker_configures_zmq_relay() -> None:
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker._sparse_refit_receiver = MagicMock()
+    addresses = ["tcp://relay-0:19090", "tcp://relay-1:19090"]
+
+    worker.configure_zmq_sparse_refit_relay(addresses)
+
+    worker._sparse_refit_receiver.configure_zmq_sparse_refit_relay.assert_called_once_with(
+        addresses
+    )

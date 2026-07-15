@@ -26,9 +26,7 @@ from nemo_rl.models.generation.vllm.vllm_sparse_delta import (
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     SparseOperation,
-    decode_sparse_tensor_payload_for_staging,
     encode_sparse_infos,
-    iter_decoded_sparse_payload,
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     integer_view as _bits,
@@ -88,12 +86,6 @@ def _applier(model: Any) -> VllmSparseDeltaApplier:
     )
 
 
-def _decode_staged(payload: Any) -> list[Any]:
-    return list(
-        iter_decoded_sparse_payload(decode_sparse_tensor_payload_for_staging(payload))
-    )
-
-
 def _payload(
     name: str,
     tensor: torch.Tensor,
@@ -107,21 +99,22 @@ def _payload(
 
 
 def _apply_payload(applier: VllmSparseDeltaApplier, payload: Any) -> None:
-    applier._apply_decoded_items(_decode_staged(payload))
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    applier.update_weights_from_decoded_sparse_payload(buffer.getvalue())
 
 
-def test_sparse_prewarm_reserves_largest_source_without_loading_weights() -> None:
+def test_sparse_discovery_reserves_largest_source_without_loading_weights() -> None:
     target = torch.zeros(8)
     applier = _applier(_NativeLoaderModel(identity=target))
 
-    applier.prewarm({"weight": ((8,), torch.float32)})
+    applier.discover_native_skips({"weight": ((8,), torch.float32)})
 
     assert applier._scratch.numel() == target.numel() * target.element_size()
     assert torch.equal(target, torch.zeros_like(target))
 
 
-@pytest.mark.vllm
-def test_sparse_prewarm_caches_rank_local_native_loader_skips() -> None:
+def test_sparse_discovery_caches_rank_local_native_loader_skips() -> None:
     target = torch.zeros(2)
     model = _NativeLoaderModel(identity=target)
     applier = _applier(model)
@@ -130,13 +123,29 @@ def test_sparse_prewarm_caches_rank_local_native_loader_skips() -> None:
         "skipped": ((2,), torch.float32),
     }
 
-    applier.prewarm(info)
-    applier.discover_native_skips(info)
+    overwrite_names = applier.discover_native_skips(info)
     payload = _payload("skipped", target, [1], _bits(torch.tensor([3.0])))
     _apply_payload(applier, payload)
 
     assert model.loaded_names == ["weight", "skipped"]
+    assert overwrite_names == set()
     assert torch.equal(target, torch.zeros_like(target))
+
+
+def test_sparse_discovery_classifies_xor_unsafe_native_loads() -> None:
+    model = _NativeLoaderModel(
+        identity=torch.zeros(2),
+        exp_transform=torch.zeros(2),
+    )
+    applier = _applier(model)
+    info = {
+        "weight": ((2,), torch.bfloat16),
+        "exp_transform": ((2,), torch.float32),
+    }
+
+    assert applier.discover_native_skips(info) == {"weight", "exp_transform"}
+    assert torch.equal(model.targets["identity"], torch.zeros(2))
+    assert torch.equal(model.targets["exp_transform"], torch.zeros(2))
 
 
 @pytest.mark.vllm
@@ -147,10 +156,13 @@ def test_backend_applies_decoded_sparse_payload_sources() -> None:
 
     ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
     applier = MagicMock()
+    applier.discover_native_skips.return_value = {"weight"}
     applier.update_weights_from_decoded_sparse_payload.return_value = {"ok": True}
     ext._get_sparse_delta_applier = MagicMock(return_value=applier)
 
-    ext.prepare_sparse_delta_refit_info({"weight": ((8,), torch.float32)})
+    assert ext.prepare_sparse_delta_refit_info({"weight": ((8,), torch.float32)}) == [
+        "weight"
+    ]
 
     assert ext.update_weights_from_decoded_sparse_payload(b"payload") == {"ok": True}
     assert ext.update_weights_from_decoded_sparse_payload("first", "second") == {
@@ -160,38 +172,34 @@ def test_backend_applies_decoded_sparse_payload_sources() -> None:
         item.args
         for item in applier.update_weights_from_decoded_sparse_payload.call_args_list
     ] == [(b"payload",), ("first", "second")]
-    applier.prewarm.assert_called_once_with({"weight": ((8,), torch.float32)})
     applier.discover_native_skips.assert_called_once_with(
         {"weight": ((8,), torch.float32)}
     )
 
 
-@pytest.mark.vllm
 def test_sparse_payload_batches_preserve_order(tmp_path) -> None:
     applier = _applier(_NativeLoaderModel(identity=torch.zeros(1)))
-    decoded_paths = [tmp_path / f"decoded-{index}.pt" for index in range(3)]
-    decoded_payloads = [
-        decode_sparse_tensor_payload_for_staging(
-            _payload(
-                f"weight-{index}",
-                torch.empty(1),
-                [0],
-                _bits(torch.tensor([float(index)])),
-            )
+    payload_paths = [tmp_path / f"payload-{index}.pt" for index in range(3)]
+    payloads = [
+        _payload(
+            f"weight-{index}",
+            torch.empty(1),
+            [0],
+            _bits(torch.tensor([float(index)])),
         )
         for index in range(3)
     ]
-    for path, payload in zip(decoded_paths, decoded_payloads, strict=True):
+    for path, payload in zip(payload_paths, payloads, strict=True):
         torch.save(payload, path)
     decoded_applied: list[Any] = []
     applier._apply_decoded_items = lambda items: decoded_applied.extend(
         item for item, _, _ in items
     )
     result = applier.update_weights_from_decoded_sparse_payload(
-        *(path.read_bytes() for path in decoded_paths)
+        *(path.read_bytes() for path in payload_paths)
     )
     decoded_result = applier.update_weights_from_decoded_sparse_payload(
-        *(str(path) for path in reversed(decoded_paths))
+        *(str(path) for path in reversed(payload_paths))
     )
 
     assert [item["name"] for item in decoded_applied] == [
@@ -207,7 +215,6 @@ def test_sparse_payload_batches_preserve_order(tmp_path) -> None:
     assert decoded_result["receiver_deserialize_s"] >= 0.0
 
 
-@pytest.mark.vllm
 def test_sparse_payload_batch_uses_one_streaming_native_loader_call() -> None:
     identity = torch.zeros(2)
     scale = torch.zeros(2)
@@ -218,7 +225,7 @@ def test_sparse_payload_batch_uses_one_streaming_native_loader_call() -> None:
         _payload("weight_scale_inv", scale, [1], _bits(torch.tensor([3.0]))),
     ):
         buffer = io.BytesIO()
-        torch.save(decode_sparse_tensor_payload_for_staging(payload), buffer)
+        torch.save(payload, buffer)
         serialized.append(buffer.getvalue())
 
     _applier(model).update_weights_from_decoded_sparse_payload(*serialized)
@@ -228,14 +235,11 @@ def test_sparse_payload_batch_uses_one_streaming_native_loader_call() -> None:
     assert torch.equal(scale, torch.tensor([0.0, 3.0]))
 
 
-@pytest.mark.vllm
-def test_decoded_sparse_payload_converts_compact_locations_for_apply(tmp_path) -> None:
+def test_compact_sparse_payload_decodes_locations_for_apply(tmp_path) -> None:
     target = torch.zeros(8)
     payload = _payload("weight", target, [1, 5], _bits(torch.tensor([2.0, 6.0])))
-    decoded = decode_sparse_tensor_payload_for_staging(payload)
-    assert decoded[0][0].dtype == torch.int32
-    path = tmp_path / "decoded.pt"
-    torch.save(decoded, path)
+    path = tmp_path / "payload.pt"
+    torch.save(payload, path)
 
     result = _applier(
         _NativeLoaderModel(identity=target)
@@ -245,7 +249,6 @@ def test_decoded_sparse_payload_converts_compact_locations_for_apply(tmp_path) -
     assert result["receiver_sparse_apply_s"] >= 0.0
 
 
-@pytest.mark.vllm
 def test_native_loaders_apply_sparse_views_and_transforms() -> None:
     targets = {
         "identity": torch.zeros(4),
@@ -301,7 +304,6 @@ def test_native_loaders_apply_sparse_views_and_transforms() -> None:
     assert verification["verification_exact_mismatches"] == 0
 
 
-@pytest.mark.vllm
 def test_xor_applies_through_packed_native_loaders() -> None:
     targets = {
         "row_slice": torch.zeros(2, 2),
@@ -339,18 +341,15 @@ def test_xor_applies_through_packed_native_loaders() -> None:
     ]
 
 
-@pytest.mark.vllm
 def test_native_loader_explicit_skip_is_accepted() -> None:
     model = _NativeLoaderModel(identity=torch.zeros(1))
     payload = _payload("skipped", torch.empty(1), [0], _bits(torch.tensor([1.0])))
-    item, locations, values = _decode_staged(payload)[0]
 
-    _applier(model)._apply_decoded_items(((item, locations, values),))
+    _apply_payload(_applier(model), payload)
 
     assert torch.equal(model.targets["identity"], torch.zeros(1))
 
 
-@pytest.mark.vllm
 def test_native_loader_claim_without_copy_fails_closed() -> None:
     model = _NativeLoaderModel(identity=torch.zeros(1))
     model.load_weights = lambda weights: {name for name, _ in weights}
@@ -360,7 +359,6 @@ def test_native_loader_claim_without_copy_fails_closed() -> None:
         _apply_payload(_applier(model), payload)
 
 
-@pytest.mark.vllm
 def test_sparse_overwrite_preserves_unselected_transform_inputs() -> None:
     target = torch.tensor([-2.0, -4.0, -6.0, -8.0])
     payload = _payload(
@@ -375,7 +373,6 @@ def test_sparse_overwrite_preserves_unselected_transform_inputs() -> None:
     assert torch.allclose(target, torch.tensor([-2.0, -3.0, -6.0, -8.0]))
 
 
-@pytest.mark.vllm
 def test_unknown_sparse_operation_fails_closed() -> None:
     target = torch.zeros(1)
     payload = _payload("weight", target, [0], _bits(torch.tensor([1.0])))
@@ -385,7 +382,6 @@ def test_unknown_sparse_operation_fails_closed() -> None:
         _apply_payload(_applier(_NativeLoaderModel(identity=target)), payload)
 
 
-@pytest.mark.vllm
 @pytest.mark.parametrize(
     ("initial", "verified_value", "exact_mismatches", "mismatches"),
     [(200.0, 4.0, 0, 0), (2.0, 4.0000005, 1, 0), (2.0, 5.0, 1, 1)],
@@ -416,7 +412,6 @@ def test_sparse_delta_verification_compares_replacement(
     assert result["verification_mismatches"] == 2 * mismatches
 
 
-@pytest.mark.vllm
 def test_fp8_weight_and_scale_use_exact_bit_overwrite() -> None:
     target = torch.tensor([0x38, 0x40, 0x48], dtype=torch.uint8).view(
         torch.float8_e4m3fn
@@ -461,7 +456,6 @@ def test_fp8_weight_and_scale_use_exact_bit_overwrite() -> None:
     assert result["verification_abs_sum"] == 0.0
 
 
-@pytest.mark.vllm
 def test_xor_applies_exact_bits_and_replay_reverts() -> None:
     baseline = torch.tensor([1.0, 2.0, 3.0])
     target = baseline.clone()
@@ -483,7 +477,6 @@ def test_xor_applies_exact_bits_and_replay_reverts() -> None:
     assert torch.equal(_bits(target), _bits(baseline))
 
 
-@pytest.mark.vllm
 def test_overwrite_casts_absolute_source_values() -> None:
     target = torch.zeros(2, dtype=torch.float16)
     source = torch.tensor([1.25, -2.5], dtype=torch.float32)
@@ -494,7 +487,6 @@ def test_overwrite_casts_absolute_source_values() -> None:
     assert torch.equal(target, source.to(torch.float16))
 
 
-@pytest.mark.vllm
 @pytest.mark.parametrize(
     ("name", "source", "targets", "error"),
     [
@@ -502,13 +494,13 @@ def test_overwrite_casts_absolute_source_values() -> None:
             "exp_transform",
             torch.tensor([math.log(2.0)]),
             {"exp_transform": torch.tensor([-1.0])},
-            "transforms its input",
+            "without changing semantics",
         ),
         (
             "weight",
             torch.tensor([1.0], dtype=torch.float32),
             {"identity": torch.zeros(1, dtype=torch.float16)},
-            "dtypes must match",
+            "without changing semantics",
         ),
     ],
 )
@@ -524,7 +516,6 @@ def test_xor_rejects_non_bitwise_compatible_targets(
         _apply_payload(_applier(_NativeLoaderModel(**targets)), payload)
 
 
-@pytest.mark.vllm
 def test_xor_rejects_overlapping_native_loader_copies() -> None:
     class RepeatedCopyModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -545,5 +536,5 @@ def test_xor_rejects_overlapping_native_loader_copies() -> None:
         "xor",
     )
 
-    with pytest.raises(RuntimeError, match="overlapping target copies"):
+    with pytest.raises(RuntimeError, match="without changing semantics"):
         _apply_payload(_applier(RepeatedCopyModel()), payload)

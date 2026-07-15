@@ -15,7 +15,6 @@
 """Remote sparse-refit receiver lifecycle for vLLM generation workers."""
 
 import asyncio
-import io
 import os
 import tempfile
 import threading
@@ -23,7 +22,6 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Literal, NamedTuple, cast
 
-import torch
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -35,47 +33,36 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.utils import weight_transfer_sparse_codec as sparse_codec
-from nemo_rl.utils.weight_transfer_remote_sparse import (
+from nemo_rl.utils.weight_transfer_http import (
     G_VLLM_REFIT_API_KEY_HEADER,
     G_VLLM_REFIT_FLUSH_PATH,
     G_VLLM_REFIT_PREPARE_PATH,
     G_VLLM_REFIT_S3_MANIFEST_PATH,
+    G_VLLM_REFIT_ZMQ_FLUSH_PATH,
+    merge_vllm_refit_metrics,
+    vllm_refit_api_key,
+)
+from nemo_rl.utils.weight_transfer_stream import (
     decode_sparse_payload,
     download_s3_refit_payload,
-    merge_vllm_refit_metrics,
     refit_env_int,
-    vllm_refit_api_key,
 )
 from nemo_rl.utils.weight_transfer_zmq import (
     G_VLLM_REFIT_CHECKSUM_HEADER,
     G_VLLM_REFIT_PAYLOAD_HEADER,
     G_VLLM_REFIT_PRODUCER_HEADER,
     G_VLLM_REFIT_TRANSFER_HEADER,
+    G_VLLM_REFIT_VERIFICATION_HEADER,
     G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
     ZmqSparseRefitServer,
 )
-
-
-def _decode_staged_payload(
-    serialized: bytes,
-) -> tuple[sparse_codec.DecodedSparsePayload, int]:
-    payload = cast(
-        sparse_codec.TensorPayload,
-        torch.load(io.BytesIO(serialized), map_location="cpu", weights_only=True),
-    )
-    return (
-        sparse_codec.decode_sparse_tensor_payload_for_staging(payload),
-        sum(int(item.get("verification_samples", 0)) for item in payload[2]),
-    )
 
 
 class _StagedSparsePayload(NamedTuple):
     path: str
     started_at: float
     finished_at: float
-    deserialize_s: float
     save_s: float
-    candidates: int
 
 
 def _stage_sparse_payload(
@@ -83,15 +70,14 @@ def _stage_sparse_payload(
     staging_dir: str,
 ) -> _StagedSparsePayload:
     started_at = time.perf_counter()
-    decoded, candidates = _decode_staged_payload(serialized)
-    deserialize_s = time.perf_counter() - started_at
     descriptor, path = tempfile.mkstemp(
         prefix="nemo_rl_refit_", suffix=".pt", dir=staging_dir
     )
-    os.close(descriptor)
     started = time.perf_counter()
     try:
-        torch.save(decoded, path)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(serialized)
+        save_s = time.perf_counter() - started
     except Exception:
         os.unlink(path)
         raise
@@ -100,9 +86,7 @@ def _stage_sparse_payload(
         path,
         started_at,
         finished_at,
-        deserialize_s,
-        finished_at - started,
-        candidates,
+        save_s,
     )
 
 
@@ -171,6 +155,7 @@ class VllmSparseRefitReceiver:
         payload: bytes,
         payload_key: tuple[str, int, int],
         checksum: str,
+        verification_candidates: int = 0,
     ) -> dict[str, Any]:
         completed: list[Future[dict[str, Any]]] = []
         with self._refit_apply_queue_condition:
@@ -190,6 +175,7 @@ class VllmSparseRefitReceiver:
                 completed.append(self._refit_apply_futures.pop(0))
             response = self._collect_refit_apply_results(completed)
             self._refit_seen_payloads[payload_key] = checksum
+            self._refit_verification_candidates += verification_candidates
             pending: bytes | Future[_StagedSparsePayload] = payload
             if self._refit_workers_share_node:
                 pending = self._refit_partition_executor.submit(
@@ -261,23 +247,10 @@ class VllmSparseRefitReceiver:
         serialized_payloads: tuple[bytes, ...],
     ) -> dict[str, Any]:
         """Apply a FIFO batch of sparse deltas through one collective RPC."""
-
-        def decode_for_rpc(serialized: bytes) -> tuple[bytes, int]:
-            decoded, candidates = _decode_staged_payload(serialized)
-            buffer = io.BytesIO()
-            torch.save(decoded, buffer)
-            return buffer.getvalue(), candidates
-
-        decoded_payloads = list(
-            self._refit_partition_executor.map(decode_for_rpc, serialized_payloads)
-        )
-        self._refit_verification_candidates += sum(
-            candidates for _, candidates in decoded_payloads
-        )
         response = self._refit_collective_response(
             self._refit_collective_rpc(
                 "update_weights_from_decoded_sparse_payload",
-                tuple(payload for payload, _ in decoded_payloads),
+                serialized_payloads,
             )
         )
         response["payloads"] = len(serialized_payloads)
@@ -299,9 +272,6 @@ class VllmSparseRefitReceiver:
             if stage_error is not None:
                 raise stage_error
             stage_wait_s = time.perf_counter() - started
-            self._refit_verification_candidates += sum(
-                payload.candidates for payload in staged
-            )
             try:
                 response = self._refit_collective_response(
                     self._refit_collective_rpc(
@@ -318,9 +288,7 @@ class VllmSparseRefitReceiver:
                 os.unlink(payload.path)
         worker_total_s = float(response.get("receiver_total_s", 0.0))
         response.update(
-            receiver_node_deserialize_s=max(
-                (payload.deserialize_s for payload in staged), default=0.0
-            ),
+            receiver_node_deserialize_s=0.0,
             receiver_stage_s=(
                 max(payload.finished_at for payload in staged)
                 - min(payload.started_at for payload in staged)
@@ -390,16 +358,22 @@ class VllmSparseRefitReceiver:
             name: (tuple(shape), sparse_codec.dtype_from_name(dtype))
             for name, (shape, dtype) in request["tensors"].items()
         }
-        self._refit_collective_rpc(
+        worker_results = self._refit_collective_rpc(
             "prepare_sparse_delta_refit_info", (state_dict_info,)
         )
+        overwrite_names = sorted({name for names in worker_results for name in names})
         seconds = time.perf_counter() - started
         print(
             f"REFIT_RECEIVER_PREWARM tensors={len(state_dict_info)} "
-            f"seconds={seconds:.3f}",
+            f"overwrite_tensors={len(overwrite_names)} seconds={seconds:.3f}",
             flush=True,
         )
-        return {"ok": True, "tensors": len(state_dict_info), "seconds": seconds}
+        return {
+            "ok": True,
+            "tensors": len(state_dict_info),
+            "overwrite_names": overwrite_names,
+            "seconds": seconds,
+        }
 
     async def _apply_s3_manifest_payload(
         self,
@@ -415,6 +389,7 @@ class VllmSparseRefitReceiver:
             body,
             (key, -1, -1),
             checksum,
+            int(manifest["verification_candidates"]),
         )
         result["receiver_s3_download_s"] = download_s
         return result
@@ -425,7 +400,16 @@ class VllmSparseRefitReceiver:
         producer_id = int(headers.get(G_VLLM_REFIT_PRODUCER_HEADER, "-1"))
         payload_id = int(headers.get(G_VLLM_REFIT_PAYLOAD_HEADER, "-1"))
         checksum = headers.get(G_VLLM_REFIT_CHECKSUM_HEADER, "")
-        if not transfer_id or producer_id < 0 or payload_id < 0 or not checksum:
+        verification_candidates = int(
+            headers.get(G_VLLM_REFIT_VERIFICATION_HEADER, "-1")
+        )
+        if (
+            not transfer_id
+            or producer_id < 0
+            or payload_id < 0
+            or not checksum
+            or verification_candidates < 0
+        ):
             raise ValueError("Missing or invalid ZeroMQ sparse refit payload headers.")
         compressed = await raw_request.body()
         started = time.perf_counter()
@@ -440,6 +424,7 @@ class VllmSparseRefitReceiver:
             payload,
             (transfer_id, producer_id, payload_id),
             checksum,
+            verification_candidates,
         )
         result["receiver_zmq_decode_s"] = decode_s
         return result
@@ -450,7 +435,7 @@ class VllmSparseRefitReceiver:
 
         async def respond(
             raw_request: Request,
-            action: Literal["prepare", "s3", "flush", "zmq"],
+            action: Literal["prepare", "s3", "flush", "zmq", "zmq_flush"],
         ) -> JSONResponse:
             if cfg["vllm_cfg"]["async_engine"]:
                 self._refit_async_loop = asyncio.get_running_loop()
@@ -473,6 +458,13 @@ class VllmSparseRefitReceiver:
                     )
                 elif action == "zmq":
                     result = await self._apply_zmq_payload(raw_request)
+                elif action == "zmq_flush":
+                    body = await raw_request.json()
+                    result = await asyncio.to_thread(
+                        self.flush_zmq_sparse_refit_relay,
+                        str(body["transfer_id"]),
+                        int(body.get("expected_payloads", 0)),
+                    )
                 else:
                     result = await asyncio.to_thread(self._flush_queued_sparse_payloads)
             except Exception as exc:
@@ -482,7 +474,9 @@ class VllmSparseRefitReceiver:
                 status_code=200 if result.get("ok") is True else 500,
             )
 
-        def endpoint(action: Literal["prepare", "s3", "flush", "zmq"]):
+        def endpoint(
+            action: Literal["prepare", "s3", "flush", "zmq", "zmq_flush"],
+        ):
             async def handle(raw_request: Request) -> JSONResponse:
                 return await respond(raw_request, action)
 
@@ -493,6 +487,7 @@ class VllmSparseRefitReceiver:
             (G_VLLM_REFIT_PREPARE_PATH, "prepare"),
             (G_VLLM_REFIT_FLUSH_PATH, "flush"),
             (G_VLLM_REFIT_ZMQ_PAYLOAD_PATH, "zmq"),
+            (G_VLLM_REFIT_ZMQ_FLUSH_PATH, "zmq_flush"),
         ):
             app.add_api_route(path, endpoint(action), methods=["POST"])
 
@@ -522,10 +517,30 @@ class VllmSparseRefitReceiver:
         print(f"Starting vLLM ZeroMQ refit relay on {address}", flush=True)
         return address
 
+    def configure_zmq_sparse_refit_relay(self, relay_addresses: list[str]) -> None:
+        if self._zmq_refit_server is None:
+            raise RuntimeError("ZeroMQ sparse refit relay is not running.")
+        local_refit_url = self.report_refit_server_base_url()
+        if local_refit_url is None:
+            raise RuntimeError("Local vLLM sparse refit endpoint is unavailable.")
+        server, own_address = self._zmq_refit_server
+        server.configure_tree(
+            relay_addresses,
+            own_address=own_address,
+            local_refit_url=local_refit_url,
+        )
+
     def stop_zmq_sparse_refit_relay(self) -> None:
         if self._zmq_refit_server is not None:
             self._zmq_refit_server[0].close()
         self._zmq_refit_server = None
+
+    def flush_zmq_sparse_refit_relay(
+        self, transfer_id: str, expected_payloads: int = 0
+    ) -> dict[str, Any]:
+        if self._zmq_refit_server is None:
+            raise RuntimeError("ZeroMQ sparse refit relay is not running.")
+        return self._zmq_refit_server[0].flush(transfer_id, expected_payloads)
 
     def _setup_vllm_refit_server(self) -> None:
         app = FastAPI()

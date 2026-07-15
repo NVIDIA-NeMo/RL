@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compare measured zstd sparse refit with NCCL projected to Ethernet."""
+"""Project current zstd sparse refit against NCCL over candidate Ethernet."""
 
 import argparse
 import json
@@ -25,16 +25,16 @@ Transport = Literal["s3", "zmq"]
 
 _REFERENCE_IB_GBPS = 400.0
 _DENSITIES = (3.0, 5.0)
-_SPARSE_SIZE_RANGE_GB = (63.2, 1121.0)
-# Each pair is (fixed seconds, seconds per 1,000 GB) at 3% and 5% changed.
-_SPARSE_LATENCY_FITS: dict[
-    Transport, tuple[tuple[float, float], tuple[float, float]]
-] = {
-    "s3": ((2.271898, 90.539029), (9.132526, 164.284601)),
-    "zmq": ((5.290113, 78.016171), (10.586558, 124.416925)),
+_SPARSE_ANCHOR_SIZE_GB = 247.2
+_SPARSE_BUCKET_SIZE_BYTES = 512 * 1024**2
+_SPARSE_ANCHOR_LATENCY_S: dict[Transport, tuple[float, float]] = {
+    "s3": (20.233733, 25.790387),
+    "zmq": (24.095243, 33.7759615),
 }
-# Unique compressed wire GB per 1,000 GB of indexed BF16 weights at 3% and 5%.
-_SPARSE_WIRE_GB_PER_TB = (22.430807, 37.362273)
+_SPARSE_ANCHOR_WIRE_GB: dict[Transport, tuple[float, float]] = {
+    "s3": (5.858410822107136, 9.765203805732864),
+    "zmq": (5.608205511, 9.3456392505),
+}
 _NCCL_ANCHORS = (
     (63.2, 0.84, 1.60),
     (247.2, 1.46, 1.74),
@@ -48,6 +48,7 @@ class Estimate:
     transport: Transport
     model_size_gb: float
     changed_pct: float
+    sparse_bucket_size_bytes: int
     sparse_seconds: float
     approximate_wire_gb: float
     nccl_ib_low_s: float
@@ -60,29 +61,35 @@ class Estimate:
     candidate_winner: str | None
 
 
+def _project_density(anchors: tuple[float, float], changed_pct: float) -> float:
+    exponent = math.log(anchors[1] / anchors[0]) / math.log(5.0 / 3.0)
+    return anchors[0] * (changed_pct / 3.0) ** exponent
+
+
 def predict_sparse_seconds(
     model_size_gb: float,
     changed_pct: float,
     *,
     transport: Transport,
 ) -> float:
-    """Evaluate the campaign fit at any positive changed density."""
+    """Linearly project the latest 120B measurement by model size."""
     if model_size_gb <= 0 or changed_pct <= 0:
         raise ValueError("model_size_gb and changed_pct must be positive")
-    size_tb = model_size_gb / 1000.0
-    (a3, b3), (a5, b5) = _SPARSE_LATENCY_FITS[transport]
-    latency_3, latency_5 = a3 + b3 * size_tb, a5 + b5 * size_tb
-    exponent = math.log(latency_5 / latency_3) / math.log(5.0 / 3.0)
-    return latency_3 * (changed_pct / 3.0) ** exponent
+    anchor = _project_density(_SPARSE_ANCHOR_LATENCY_S[transport], changed_pct)
+    return anchor * model_size_gb / _SPARSE_ANCHOR_SIZE_GB
 
 
-def predict_sparse_wire_gb(model_size_gb: float, changed_pct: float) -> float:
-    """Scale the measured zstd wire fit to model size and changed density."""
+def predict_sparse_wire_gb(
+    model_size_gb: float,
+    changed_pct: float,
+    *,
+    transport: Transport,
+) -> float:
+    """Scale the latest measured zstd wire bytes by model size and density."""
     if model_size_gb <= 0 or changed_pct <= 0:
         raise ValueError("model_size_gb and changed_pct must be positive")
-    wire_3, wire_5 = _SPARSE_WIRE_GB_PER_TB
-    exponent = math.log(wire_5 / wire_3) / math.log(5.0 / 3.0)
-    return model_size_gb / 1000.0 * wire_3 * (changed_pct / 3.0) ** exponent
+    anchor = _project_density(_SPARSE_ANCHOR_WIRE_GB[transport], changed_pct)
+    return anchor * model_size_gb / _SPARSE_ANCHOR_SIZE_GB
 
 
 def _nccl_reference(model_size_gb: float) -> tuple[float, float]:
@@ -134,8 +141,13 @@ def estimate(
         transport,
         model_size_gb,
         changed_pct,
+        _SPARSE_BUCKET_SIZE_BYTES,
         sparse_seconds,
-        predict_sparse_wire_gb(model_size_gb, changed_pct),
+        predict_sparse_wire_gb(
+            model_size_gb,
+            changed_pct,
+            transport=transport,
+        ),
         nccl_low,
         nccl_high,
         candidate_ethernet_gbps,
@@ -162,7 +174,8 @@ def _print_results(results: list[Estimate]) -> None:
     first = results[0]
     print(
         f"Model: {first.model_size_gb:g} GB indexed BF16; "
-        f"changed: {first.changed_pct:g}%; compression: zstd"
+        f"changed: {first.changed_pct:g}%; compression: zstd; "
+        f"bucket: {first.sparse_bucket_size_bytes // 1024**2} MiB"
     )
     print(
         "Measured NCCL on 400 Gbps/rank H100 IB: "
@@ -193,8 +206,11 @@ def _print_results(results: list[Estimate]) -> None:
         "\nBelow the lower crossover sparse wins across the NCCL envelope; "
         "above the upper crossover NCCL wins."
     )
-    if not _SPARSE_SIZE_RANGE_GB[0] <= first.model_size_gb <= _SPARSE_SIZE_RANGE_GB[1]:
-        print("Note: model size is outside the measured sparse calibration range.")
+    if not math.isclose(first.model_size_gb, _SPARSE_ANCHOR_SIZE_GB):
+        print(
+            f"Note: sparse time is a linear model-size projection from the "
+            f"{_SPARSE_ANCHOR_SIZE_GB:g} GB measured anchor."
+        )
     if not _DENSITIES[0] <= first.changed_pct <= _DENSITIES[1]:
         print("Note: changed density is extrapolated from measured 3% and 5% arms.")
 

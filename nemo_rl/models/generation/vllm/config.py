@@ -14,6 +14,8 @@
 
 from typing import Any, Literal, NotRequired, TypedDict
 
+from pydantic import BaseModel, PositiveInt
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 
@@ -58,9 +60,9 @@ class VllmSpecificArgs(TypedDict):
     reasoning_parser_plugin: NotRequired[str]
 
 
-class VllmDeltaCompressionConfig(TypedDict):
-    encoding: Literal["xor", "overwrite"]
-    sparse_bucket_size_bytes: int
+class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
+    encoding: Literal["xor", "overwrite"] = "xor"
+    sparse_bucket_size_bytes: PositiveInt = 512 * 1024**2
 
 
 class VllmConfig(GenerationConfig):

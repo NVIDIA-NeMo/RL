@@ -22,10 +22,15 @@ from typing import Any
 
 import ray
 
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    VllmDeltaCompressionConfig,
+)
 from nemo_rl.utils.timer import Timer
-from nemo_rl.utils.weight_transfer_remote_sparse import (
+from nemo_rl.utils.weight_transfer_http import (
     G_VLLM_REFIT_FLUSH_PATH,
     G_VLLM_REFIT_PREPARE_PATH,
+    G_VLLM_REFIT_ZMQ_FLUSH_PATH,
     merge_vllm_refit_metrics,
     post_vllm_refit_endpoints,
     vllm_refit_api_key,
@@ -40,7 +45,7 @@ _REMOTE_SPARSE_TRANSPORTS = {
 
 
 def validate_vllm_remote_sparse_refit(
-    config: Any,
+    config: VllmConfig,
     *,
     colocated: bool,
     megatron_enabled: bool,
@@ -52,12 +57,13 @@ def validate_vllm_remote_sparse_refit(
     if transport not in _REMOTE_SPARSE_TRANSPORTS:
         raise ValueError(f"Unsupported vLLM refit transport {transport!r}.")
     vllm_cfg = config["vllm_cfg"]
+    delta_config = config.get("delta_compression")
     if (
         colocated
         or not megatron_enabled
         or vllm_cfg["precision"] == "fp8"
         or vllm_cfg["kv_cache_dtype"].startswith("fp8")
-        or not config.get("delta_compression")
+        or delta_config is None
         or config.get("quant_cfg")
         or config.get("real_quant")
     ):
@@ -65,6 +71,9 @@ def validate_vllm_remote_sparse_refit(
             f"{transport} requires a non-colocated Megatron policy, BF16/FP16 "
             "vLLM, delta compression, and an unquantized rollout."
         )
+    config["delta_compression"] = VllmDeltaCompressionConfig.model_validate(
+        delta_config
+    )
     return _REMOTE_SPARSE_TRANSPORTS[transport]
 
 
@@ -86,6 +95,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         self._request_timeout_s = request_timeout_s
         self._refit_urls: list[str] = []
         self._targets: list[str] = []
+        self._overwrite_names: list[str] = []
         self._baseline_init_refs = list(baseline_init_refs or ())
         self._baseline_commit_refs: list[Any] = []
         self._stale = True
@@ -115,8 +125,10 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                 self._baseline_init_refs.clear()
 
             succeeded = False
+            relay_flushed = False
+            relay_flush_s = 0.0
+            transfer_id = uuid.uuid4().hex
             try:
-                transfer_id = uuid.uuid4().hex
                 results = ray.get(
                     self._run_policy_workers(
                         "stream_remote_sparse_weights",
@@ -125,6 +137,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                         transfer_id=transfer_id,
                         api_key_env_var=self._api_key_env_var,
                         timeout_s=self._request_timeout_s,
+                        overwrite_names=self._overwrite_names,
                     )
                 )
                 payloads = sum(result["payloads"] for result in results)
@@ -141,6 +154,32 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                 verification: defaultdict[str, float] = defaultdict(float)
                 commit_s = 0.0
                 if payloads:
+                    if self._transport == "zmq":
+                        started = time.perf_counter()
+                        relay_results = self._request_receivers(
+                            G_VLLM_REFIT_ZMQ_FLUSH_PATH,
+                            {
+                                "transfer_id": transfer_id,
+                                "expected_payloads": payloads,
+                            },
+                        )
+                        relay_flush_s = time.perf_counter() - started
+                        relay_flushed = True
+                        if any(
+                            int(result.get("payloads", 0)) != payloads
+                            for result in relay_results
+                        ):
+                            raise RuntimeError(
+                                f"ZeroMQ relays did not all stage {payloads} payloads."
+                            )
+                        print(
+                            "REFIT_ZMQ_RELAY_FLUSH "
+                            f"transfer_id={transfer_id} payloads={payloads} "
+                            f"seconds={relay_flush_s:.3f} "
+                            "fanout_service_s="
+                            f"{sum(float(result.get('receiver_relay_fanout_s', 0.0)) for result in relay_results):.3f}",
+                            flush=True,
+                        )
                     started = time.perf_counter()
                     verification.update(
                         merge_vllm_refit_metrics(
@@ -180,6 +219,13 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                 succeeded = True
             finally:
                 if not succeeded:
+                    if self._transport == "zmq" and not relay_flushed:
+                        with suppress(Exception):
+                            self._request_receivers(
+                                G_VLLM_REFIT_ZMQ_FLUSH_PATH,
+                                {"transfer_id": transfer_id},
+                                timeout_s=min(self._request_timeout_s, 60.0),
+                            )
                     with suppress(Exception):
                         self._request_receivers(
                             G_VLLM_REFIT_FLUSH_PATH,
@@ -203,6 +249,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             "delta_verify/mean_abs": float(verification["verification_abs_sum"])
             / max(samples, 1),
             "transfer/payloads": float(payloads),
+            "transfer/relay_flush_s": relay_flush_s,
             "transfer/global_commit_s": commit_s,
         }
         metrics.update(
@@ -302,11 +349,15 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             raise ValueError(
                 f"vLLM {self._transport} sparse refit endpoints are missing."
             )
+        if self._transport == "zmq":
+            self._run_generation_workers(
+                "configure_zmq_sparse_refit_relay", relay_addresses=self._targets
+            )
         state_dict_info = self._merge_refit_info(
             ray.get(list(self._baseline_init_refs))
         )
         self._baseline_init_refs.clear()
-        self._request_receivers(
+        responses = self._request_receivers(
             G_VLLM_REFIT_PREPARE_PATH,
             {
                 "tensors": {
@@ -314,6 +365,13 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                     for name, (shape, dtype) in state_dict_info.items()
                 }
             },
+        )
+        self._overwrite_names = sorted(
+            {
+                name
+                for response in responses
+                for name in response.get("overwrite_names", ())
+            }
         )
         self._stale = False
 
@@ -326,4 +384,5 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         self._baseline_commit_refs.clear()
         self._refit_urls.clear()
         self._targets.clear()
+        self._overwrite_names.clear()
         self._stale = True

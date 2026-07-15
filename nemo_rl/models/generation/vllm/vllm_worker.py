@@ -668,6 +668,12 @@ class BaseVllmGenerationWorker:
             raise RuntimeError("Remote sparse refit is not enabled for this worker.")
         return receiver.start_zmq_sparse_refit_relay(refit_urls)
 
+    def configure_zmq_sparse_refit_relay(self, relay_addresses: list[str]) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        receiver.configure_zmq_sparse_refit_relay(relay_addresses)
+
     def stop_zmq_sparse_refit_relay(self) -> None:
         receiver = self._sparse_refit_receiver
         if receiver is not None:

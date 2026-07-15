@@ -28,6 +28,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 _TensorViewKey = tuple[int, int, tuple[int, ...], tuple[int, ...]]
 _LoaderWeight = tuple[str, torch.Tensor, sparse_codec.SparseOperation, int, int | None]
+_LoaderObservation = tuple[str, int, bool]
 
 
 def _storage_key(tensor: torch.Tensor) -> int:
@@ -64,6 +65,7 @@ class _SparseWeightLoadMode(TorchDispatchMode):
         ] = {}
         self._xor_spans: dict[int, list[tuple[int, int]]] = {}
         self.copies = 0
+        self.xor_compatible = True
 
     def start(
         self,
@@ -80,6 +82,34 @@ class _SparseWeightLoadMode(TorchDispatchMode):
         self._verification_masks.clear()
         self._xor_spans.clear()
         self.copies = 0
+        self.xor_compatible = True
+
+    def _observe_xor_copy(
+        self, destination: torch.Tensor, source: torch.Tensor
+    ) -> bool:
+        if (
+            _storage_key(source) != self._source_storage
+            or source.dtype != destination.dtype
+        ):
+            self.xor_compatible = False
+            return False
+        origin = int(destination.storage_offset())
+        extents = [
+            (int(size) - 1) * int(stride)
+            for size, stride in zip(
+                destination.shape, destination.stride(), strict=True
+            )
+        ]
+        span = (
+            origin + sum(min(0, extent) for extent in extents),
+            origin + sum(max(0, extent) for extent in extents),
+        )
+        spans = self._xor_spans.setdefault(_storage_key(destination), [])
+        if any(span[0] <= other[1] and other[0] <= span[1] for other in spans):
+            self.xor_compatible = False
+            return False
+        spans.append(span)
+        return True
 
     def _remember_changed(
         self, destination: torch.Tensor, changed: torch.Tensor
@@ -107,6 +137,7 @@ class _SparseWeightLoadMode(TorchDispatchMode):
             return func(*args, **(kwargs or {}))
 
         self.copies += 1
+        xor_compatible = self._observe_xor_copy(destination, source)
         if self._operation == "overwrite":
             if not source.dtype.is_floating_point:
                 raise RuntimeError("Sparse overwrite requires a floating-point loader.")
@@ -138,28 +169,11 @@ class _SparseWeightLoadMode(TorchDispatchMode):
             self._remember_changed(destination, changed)
             return destination
 
-        if _storage_key(source) != self._source_storage:
+        if not xor_compatible:
             raise RuntimeError(
-                "XOR cannot pass through a native loader that transforms its input."
+                "XOR cannot pass through this native loader without changing semantics."
             )
-        if source.dtype != destination.dtype:
-            raise RuntimeError("XOR source and target dtypes must match.")
         source = source.expand_as(destination)
-        origin = int(destination.storage_offset())
-        extents = [
-            (int(size) - 1) * int(stride)
-            for size, stride in zip(
-                destination.shape, destination.stride(), strict=True
-            )
-        ]
-        span = (
-            origin + sum(min(0, extent) for extent in extents),
-            origin + sum(max(0, extent) for extent in extents),
-        )
-        spans = self._xor_spans.setdefault(_storage_key(destination), [])
-        if any(span[0] <= other[1] and other[0] <= span[1] for other in spans):
-            raise RuntimeError("XOR native loader produced overlapping target copies.")
-        spans.append(span)
         destination_bits = sparse_codec.integer_view(destination)
         source_bits = sparse_codec.integer_view(source)
         changed = source_bits.ne(0)
@@ -202,10 +216,10 @@ class VllmSparseDeltaApplier:
         self._skipped_names: set[str] = set()
         self._verification: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    def prewarm(
+    def discover_native_skips(
         self, state_dict_info: Mapping[str, tuple[tuple[int, ...], torch.dtype]]
-    ) -> None:
-        """Reserve a reusable buffer for the largest canonical source tensor."""
+    ) -> set[str]:
+        """Reserve scratch and classify rank-local skips and overwrite weights."""
         required = max(
             (prod(shape) * dtype.itemsize for shape, dtype in state_dict_info.values()),
             default=0,
@@ -214,18 +228,13 @@ class VllmSparseDeltaApplier:
             self._scratch = torch.empty(
                 required, dtype=torch.uint8, device=self._scratch.device
             )
-
-    def discover_native_skips(
-        self, state_dict_info: Mapping[str, tuple[tuple[int, ...], torch.dtype]]
-    ) -> None:
-        """Cache weights that the native loader explicitly skips on this rank."""
         pending = [
             (name, shape, dtype)
             for name, (shape, dtype) in state_dict_info.items()
             if dtype.is_floating_point
         ]
         if not pending:
-            return
+            return set()
 
         def weights() -> Iterator[_LoaderWeight]:
             for name, shape, dtype in pending:
@@ -248,8 +257,13 @@ class VllmSparseDeltaApplier:
         self._validate_loader_report(loaded, observations, allow_unknown_skips=True)
         if loaded is not None:
             self._skipped_names.update(
-                name for name, copies in observations if copies == 0
+                name for name, copies, _ in observations if copies == 0
             )
+        return {
+            name
+            for name, copies, xor_compatible in observations
+            if copies and not xor_compatible
+        }
 
     def _source_tensor(self, item: dict[str, Any]) -> torch.Tensor:
         shape = tuple(int(dim) for dim in item["shape"])
@@ -327,24 +341,28 @@ class VllmSparseDeltaApplier:
         self,
         weights: Iterable[_LoaderWeight],
         verification: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    ) -> tuple[Any, list[tuple[str, int]]]:
+    ) -> tuple[Any, list[_LoaderObservation]]:
         mode = _SparseWeightLoadMode(self._target_storages, verification)
         yielded_names: list[str] = []
-        observations: list[tuple[str, int]] = []
+        observations: list[_LoaderObservation] = []
 
         def observed_weights() -> Iterator[tuple[str, torch.Tensor]]:
             active = False
             for name, source, operation, sample_limit, exact_sentinel in weights:
                 if active:
                     mode.finish()
-                    observations.append((yielded_names[-1], mode.copies))
+                    observations.append(
+                        (yielded_names[-1], mode.copies, mode.xor_compatible)
+                    )
                 mode.start(source, operation, sample_limit, exact_sentinel)
                 active = True
                 yielded_names.append(name)
                 yield name, source
             if active:
                 mode.finish()
-                observations.append((yielded_names[-1], mode.copies))
+                observations.append(
+                    (yielded_names[-1], mode.copies, mode.xor_compatible)
+                )
 
         with torch.no_grad(), mode:
             loaded = self.model_runner.model.load_weights(observed_weights())
@@ -355,11 +373,11 @@ class VllmSparseDeltaApplier:
     @staticmethod
     def _validate_loader_report(
         loaded: Any,
-        observations: list[tuple[str, int]],
+        observations: list[_LoaderObservation],
         *,
         allow_unknown_skips: bool,
     ) -> None:
-        copied = sum(copies > 0 for _, copies in observations)
+        copied = sum(copies > 0 for _, copies, _ in observations)
         if loaded is None:
             if not allow_unknown_skips and copied != len(observations):
                 raise RuntimeError(
@@ -378,12 +396,35 @@ class VllmSparseDeltaApplier:
     ) -> None:
         def weights() -> Iterator[_LoaderWeight]:
             for item, locations, values in items:
-                if str(item["name"]) in self._skipped_names:
-                    continue
                 yield self._prepare_loader_weight(item, locations, values)
 
         loaded, observations = self._load_weights(weights(), self._verification)
         self._validate_loader_report(loaded, observations, allow_unknown_skips=False)
+
+    def _iter_sparse_payload(
+        self, payload: sparse_codec.TensorPayload
+    ) -> Iterator[sparse_codec.SparseItem]:
+        packed_locations, value_groups, metadata = payload
+        for item in metadata:
+            if str(item["name"]) in self._skipped_names:
+                continue
+            value_start = int(item["value_start"])
+            value_end = int(item["value_end"])
+            location_dtype = (
+                torch.int32
+                if prod(item["shape"]) <= torch.iinfo(torch.int32).max
+                else torch.int64
+            )
+            yield (
+                item,
+                sparse_codec.sparse_locations_for_item(
+                    item,
+                    packed_locations,
+                    device="cpu",
+                    dtype=location_dtype,
+                ),
+                value_groups[int(item["value_group"])][value_start:value_end],
+            )
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_decoded_sparse_payload"
@@ -391,24 +432,24 @@ class VllmSparseDeltaApplier:
     def update_weights_from_decoded_sparse_payload(
         self, *payloads: bytes | str
     ) -> dict[str, Any]:
-        return self._load_decoded_sparse_payloads(
+        return self._load_sparse_payloads(
             tuple(
                 io.BytesIO(payload) if isinstance(payload, bytes) else payload
                 for payload in payloads
             )
         )
 
-    def _load_decoded_sparse_payloads(
+    def _load_sparse_payloads(
         self, sources: tuple[str | io.BytesIO, ...]
     ) -> dict[str, Any]:
         started = time.perf_counter()
         deserialize_s = [0.0]
 
-        def decoded_items() -> Iterator[sparse_codec.DecodedSparseItem]:
+        def sparse_items() -> Iterator[sparse_codec.SparseItem]:
             for source in sources:
                 item_started = time.perf_counter()
                 payload = cast(
-                    sparse_codec.DecodedSparsePayload,
+                    sparse_codec.TensorPayload,
                     torch.load(
                         source,
                         map_location="cpu",
@@ -417,10 +458,10 @@ class VllmSparseDeltaApplier:
                     ),
                 )
                 deserialize_s[0] += time.perf_counter() - item_started
-                yield from sparse_codec.iter_decoded_sparse_payload(payload)
+                yield from self._iter_sparse_payload(payload)
 
         item_started = time.perf_counter()
-        self._apply_decoded_items(decoded_items())
+        self._apply_decoded_items(sparse_items())
         sparse_apply_s = time.perf_counter() - item_started
         return {
             "ok": True,

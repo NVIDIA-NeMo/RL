@@ -12,27 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared sparse payload pipeline and control plane for remote vLLM refit."""
+"""Shared sparse payload pipeline and S3 transport for remote vLLM refit."""
 
 import hashlib
 import io
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, Literal
+from typing import Any, Protocol
 from urllib.parse import quote
 
-import requests
 import torch
 import zstandard
-from urllib3.util.retry import Retry
 
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
+from nemo_rl.utils.weight_transfer_http import (
+    G_VLLM_REFIT_S3_MANIFEST_PATH,
+    merge_vllm_refit_metrics,
+    post_vllm_refit_endpoints,
+    vllm_refit_api_key,
+    vllm_refit_endpoints,
+)
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     DeltaCompressionTracker,
     NamedTensor,
@@ -41,16 +46,24 @@ from nemo_rl.utils.weight_transfer_sparse_codec import (
     merge_sparse_payloads,
 )
 
-G_VLLM_REFIT_S3_MANIFEST_PATH = "/nemo-rl/refit/s3-manifest"
-G_VLLM_REFIT_PREPARE_PATH = "/nemo-rl/refit/prepare"
-G_VLLM_REFIT_FLUSH_PATH = "/nemo-rl/refit/flush"
-G_VLLM_REFIT_API_KEY_HEADER = "x-nemo-rl-refit-key"
-_CONTROL_SESSION_LOCAL = threading.local()
+_STREAM_LOCAL = threading.local()
 _S3_PART_SIZE = 64 * 1024**2
 _S3_MEMORY_LIMIT = 2 * 1024**3
 
 
-SparsePartitionMode = Literal["chunks", "names", "none"]
+class SparseRefitTransport(Protocol):
+    """Payload delivery owned by one generic stream invocation."""
+
+    name: str
+    transfer_workers: int
+
+    def send(
+        self, body: bytes, payload_id: int, verification_candidates: int
+    ) -> dict[str, Any]: ...
+
+    def cleanup(self) -> None:
+        """Release resources created on the current transfer worker."""
+        ...
 
 
 @dataclass
@@ -157,6 +170,75 @@ class _S3ObjectStore:
         )
 
 
+class _S3ManifestTransport:
+    name = "s3"
+
+    def __init__(
+        self,
+        *,
+        store: _S3ObjectStore,
+        endpoint_urls: Sequence[str],
+        run_prefix: str,
+        api_key: str | None,
+        timeout_s: float,
+        transfer_workers: int,
+    ) -> None:
+        self._store = store
+        self._endpoint_urls = endpoint_urls
+        self._run_prefix = run_prefix
+        self._api_key = api_key
+        self._timeout_s = timeout_s
+        self.transfer_workers = transfer_workers
+        self._keys = threading.local()
+
+    def send(
+        self, body: bytes, payload_id: int, verification_candidates: int
+    ) -> dict[str, Any]:
+        key = f"{self._run_prefix}/{payload_id:06d}.pt"
+        keys = getattr(self._keys, "values", None)
+        if keys is None:
+            keys = []
+            self._keys.values = keys
+        keys.append(key)
+
+        try:
+            started = time.perf_counter()
+            self._store.put(key, body)
+            s3_put_s = time.perf_counter() - started
+            started = time.perf_counter()
+            responses = post_vllm_refit_endpoints(
+                self._endpoint_urls,
+                {
+                    "bucket": self._store.bucket,
+                    "region": self._store.region,
+                    "key": key,
+                    "checksum": sparse_payload_checksum(body),
+                    "verification_candidates": verification_candidates,
+                },
+                api_key=self._api_key,
+                timeout_s=self._timeout_s,
+            )
+            result = {
+                "s3_put_s": s3_put_s,
+                "manifest_post_s": time.perf_counter() - started,
+                "receiver": merge_vllm_refit_metrics({}, responses, maximum=True),
+            }
+        finally:
+            try:
+                self._store.delete(key)
+            except Exception:
+                pass
+            else:
+                keys.remove(key)
+        return result
+
+    def cleanup(self) -> None:
+        for key in getattr(self._keys, "values", ()):
+            with suppress(Exception):
+                self._store.delete(key)
+        self._keys.values = []
+
+
 def refit_env_int(name: str, *, default: int, min_value: int = 1) -> int:
     value = int(os.getenv(name) or default)
     if value < min_value:
@@ -174,10 +256,10 @@ def decode_sparse_payload(body: bytes | bytearray, checksum: str) -> bytes:
         raise ValueError(
             f"Sparse refit payload checksum mismatch: expected={checksum}, actual={actual}."
         )
-    decompressor = getattr(_CONTROL_SESSION_LOCAL, "zstd_decompressor", None)
+    decompressor = getattr(_STREAM_LOCAL, "zstd_decompressor", None)
     if decompressor is None:
         decompressor = zstandard.ZstdDecompressor()
-        _CONTROL_SESSION_LOCAL.zstd_decompressor = decompressor
+        _STREAM_LOCAL.zstd_decompressor = decompressor
     return decompressor.decompress(body)
 
 
@@ -206,75 +288,19 @@ def iter_sparse_weight_chunks(
         yield chunk, export_pull_s
 
 
-def sparse_name_shard(name: str, shard_count: int) -> int:
-    return (
-        int.from_bytes(hashlib.blake2b(name.encode(), digest_size=8).digest())
-        % shard_count
-    )
-
-
-def vllm_refit_endpoints(base_urls: Sequence[str], path: str) -> list[str]:
-    return list(
-        dict.fromkeys(
-            f"{url.strip().rstrip('/')}{path}" for url in base_urls if url.strip()
-        )
-    )
-
-
-def _partition_sparse_weights_by_name(
-    tensors: Iterable[NamedTensor], shard_rank: int, shard_count: int
-) -> Iterator[NamedTensor]:
-    return (
-        (name, tensor)
-        for name, tensor in tensors
-        if sparse_name_shard(name, shard_count) == shard_rank
-    )
-
-
-def refit_http_session() -> requests.Session:
-    session = getattr(_CONTROL_SESSION_LOCAL, "session", None)
-    if session is None:
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=64,
-            pool_maxsize=64,
-            max_retries=Retry(
-                total=3,
-                backoff_factor=0.25,
-                status_forcelist=(502, 503, 504),
-                allowed_methods={"POST"},
-            ),
-        )
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        _CONTROL_SESSION_LOCAL.session = session
-    return session
-
-
 @cache
 def _get_manifest_s3_store(bucket: str, region: str) -> _S3ObjectStore:
     return _S3ObjectStore(bucket=bucket, region=region)
-
-
-def vllm_refit_api_key(api_key_env_var: str | None) -> str | None:
-    if not api_key_env_var:
-        return None
-    token = os.environ.get(api_key_env_var)
-    if not token:
-        raise RuntimeError(
-            "vLLM sparse refit API key env var "
-            f"{api_key_env_var!r} is configured but unset or empty."
-        )
-    return token
 
 
 def sparse_export_chunk_size(
     delta_tracker: DeltaCompressionTracker,
     transport: str,
 ) -> int:
+    default_mib = 64 if transport == "s3" else 256
     requested = refit_env_int(
         f"NRL_REFIT_{transport.upper()}_EXPORT_CHUNK_BYTES",
-        default=256 * 1024**2,
+        default=default_mib * 1024**2,
         min_value=1,
     )
     if torch.cuda.is_available():
@@ -294,10 +320,7 @@ def init_sparse_delta_baseline_from_iterator(
     shard_rank: int,
     shard_count: int,
     transport: str,
-    partition: SparsePartitionMode = "chunks",
 ) -> None:
-    if partition == "names":
-        iterator = _partition_sparse_weights_by_name(iterator, shard_rank, shard_count)
     start_s = time.perf_counter()
     export_chunk_size = sparse_export_chunk_size(delta_tracker, transport)
 
@@ -308,7 +331,7 @@ def init_sparse_delta_baseline_from_iterator(
     ):
         chunk_count = chunk_index + 1
         export_pull_s += pull_s
-        if partition == "chunks" and chunk_index % shard_count != shard_rank:
+        if chunk_index % shard_count != shard_rank:
             continue
         started = time.perf_counter()
         delta_tracker.snapshot_baseline(chunk)
@@ -326,25 +349,25 @@ def stream_sparse_delta_payloads(
     iterator: Iterable[NamedTensor],
     *,
     delta_tracker: DeltaCompressionTracker,
-    transport: str,
-    send_payload: Callable[[bytes, int], dict[str, Any]],
-    transfer_workers: int,
+    transport: SparseRefitTransport,
     shard_rank: int,
     shard_count: int,
-    partition: SparsePartitionMode = "chunks",
 ) -> dict[str, int]:
-    if partition == "names":
-        iterator = _partition_sparse_weights_by_name(iterator, shard_rank, shard_count)
-    prefix = transport.upper()
+    prefix = transport.name.upper()
     encode_workers = refit_env_int(
         f"NRL_REFIT_{prefix}_ENCODE_WORKERS",
         default=max(2, min(8, os.cpu_count() or 8)),
     )
-    encode_executor = _executor(f"refit-{transport}-encode", encode_workers)
+    encode_executor = _executor(f"refit-{transport.name}-encode", encode_workers)
     serialize_workers = min(4, encode_workers)
-    serialize_executor = _executor(f"refit-{transport}-serialize", serialize_workers)
-    transfer_executor = _executor(f"refit-{transport}-transfer", transfer_workers)
-    export_chunk_size = sparse_export_chunk_size(delta_tracker, transport)
+    serialize_executor = _executor(
+        f"refit-{transport.name}-serialize", serialize_workers
+    )
+    transfer_executor = ThreadPoolExecutor(
+        max_workers=transport.transfer_workers,
+        thread_name_prefix=f"nrl-refit-{transport.name}-transfer",
+    )
+    export_chunk_size = sparse_export_chunk_size(delta_tracker, transport.name)
 
     def encode_chunk(
         chunk: TensorBatch,
@@ -365,10 +388,11 @@ def stream_sparse_delta_payloads(
 
     def serialize_payloads(
         payloads: tuple[TensorPayload, ...], encode_s: float
-    ) -> tuple[bytes, dict[str, float]]:
+    ) -> tuple[bytes, int, dict[str, float]]:
         started = time.perf_counter()
         buffer = io.BytesIO()
-        torch.save(merge_sparse_payloads(payloads), buffer)
+        merged = merge_sparse_payloads(payloads)
+        torch.save(merged, buffer)
         raw_body = buffer.getvalue()
         serialize_s = time.perf_counter() - started
         started = time.perf_counter()
@@ -376,6 +400,7 @@ def stream_sparse_delta_payloads(
         compress_s = time.perf_counter() - started
         return (
             body,
+            sum(int(item.get("verification_samples", 0)) for item in merged[2]),
             {
                 "encode_s": encode_s,
                 "serialize_s": serialize_s,
@@ -384,10 +409,10 @@ def stream_sparse_delta_payloads(
         )
 
     def transfer_payload(
-        encoded: tuple[bytes, dict[str, float]], payload_index: int
+        encoded: tuple[bytes, int, dict[str, float]], payload_index: int
     ) -> dict[str, Any]:
-        body, encode_timing = encoded
-        result = send_payload(body, payload_index)
+        body, verification_candidates, encode_timing = encoded
+        result = transport.send(body, payload_index, verification_candidates)
         result.update(
             body_size=len(body),
             **encode_timing,
@@ -407,9 +432,10 @@ def stream_sparse_delta_payloads(
     encode_inflight: dict[Any, None] = {}
     serialize_inflight: dict[Any, int] = {}
     transfer_inflight: dict[Any, None] = {}
+    transfer_submitted = False
     max_encode_inflight = encode_workers * 2
     max_serialize_inflight = serialize_workers * 2
-    max_transfer_inflight = transfer_workers * 2
+    max_transfer_inflight = transport.transfer_workers * 2
     bucket = _SparsePayloadBucket([])
 
     def resolved(inflight: dict[Any, Any], *, block: bool) -> Iterator[tuple[Any, Any]]:
@@ -436,9 +462,11 @@ def stream_sparse_delta_payloads(
             )
 
     def collect_serialized(*, block: bool) -> None:
+        nonlocal transfer_submitted
         for index, encoded in resolved(serialize_inflight, block=block):
             while len(transfer_inflight) >= max_transfer_inflight:
                 collect_transfers(block=True)
+            transfer_submitted = True
             transfer_inflight[
                 transfer_executor.submit(transfer_payload, encoded, index)
             ] = None
@@ -489,7 +517,7 @@ def stream_sparse_delta_payloads(
         ):
             chunk_count = chunk_index + 1
             export_pull_s += pull_s
-            if partition == "chunks" and chunk_index % shard_count != shard_rank:
+            if chunk_index % shard_count != shard_rank:
                 continue
             while len(encode_inflight) >= max_encode_inflight:
                 drain_encodes()
@@ -509,6 +537,22 @@ def stream_sparse_delta_payloads(
             if futures:
                 wait(futures)
         raise
+    finally:
+        try:
+            if transfer_submitted:
+                barrier = threading.Barrier(transport.transfer_workers)
+
+                def cleanup_transport(_index: int) -> None:
+                    barrier.wait()
+                    transport.cleanup()
+
+                list(
+                    transfer_executor.map(
+                        cleanup_transport, range(transport.transfer_workers)
+                    )
+                )
+        finally:
+            transfer_executor.shutdown(wait=True, cancel_futures=True)
 
     report = {
         "total_s": time.perf_counter() - stream_start,
@@ -521,7 +565,6 @@ def stream_sparse_delta_payloads(
         "export_chunk_mb": export_chunk_size / 1e6,
         "shard_rank": shard_rank,
         "shard_count": shard_count,
-        "partition": partition,
         "changed_elements": counts["changed_elements"],
         "total_elements": counts["total_elements"],
         "changed_pct": 100.0
@@ -551,10 +594,9 @@ def stream_sparse_delta_payloads_via_s3_manifest(
     timeout_s: float,
     shard_rank: int,
     shard_count: int,
-    partition: SparsePartitionMode = "chunks",
 ) -> dict[str, int]:
-    urls = [url.strip().rstrip("/") for url in refit_targets if url.strip()]
-    if not urls:
+    endpoint_urls = vllm_refit_endpoints(refit_targets, G_VLLM_REFIT_S3_MANIFEST_PATH)
+    if not endpoint_urls:
         raise ValueError("At least one vLLM S3 refit URL is required.")
     bucket = os.getenv("NRL_REFIT_S3_BUCKET", "").strip()
     if not bucket:
@@ -563,88 +605,29 @@ def stream_sparse_delta_payloads_via_s3_manifest(
         bucket,
         os.getenv("NRL_REFIT_S3_REGION", "us-east-1").strip() or "us-east-1",
     )
-    endpoint_urls = vllm_refit_endpoints(urls, G_VLLM_REFIT_S3_MANIFEST_PATH)
     object_prefix = os.getenv("NRL_REFIT_S3_PREFIX", "nemo-rl-refit").strip("/")
     run_prefix = (
         f"{object_prefix}/{transfer_id}/{shard_rank:06d}"
         if object_prefix
         else f"{transfer_id}/{shard_rank:06d}"
     )
-    api_key = vllm_refit_api_key(api_key_env_var)
-
-    def send_payload(body: bytes, payload_index: int) -> dict[str, Any]:
-        key = f"{run_prefix}/{payload_index:06d}.pt"
-        started = time.perf_counter()
-        store.put(key, body)
-        s3_put_s = time.perf_counter() - started
-        try:
-            started = time.perf_counter()
-            responses = post_vllm_refit_endpoints(
-                endpoint_urls,
-                {
-                    "bucket": store.bucket,
-                    "region": store.region,
-                    "key": key,
-                    "checksum": sparse_payload_checksum(body),
-                },
-                api_key=api_key,
-                timeout_s=timeout_s,
-            )
-            manifest_post_s = time.perf_counter() - started
-        finally:
-            with suppress(Exception):
-                store.delete(key)
-        return {
-            "s3_put_s": s3_put_s,
-            "manifest_post_s": manifest_post_s,
-            "receiver": merge_vllm_refit_metrics({}, responses, maximum=True),
-        }
-
     return stream_sparse_delta_payloads(
         iterator,
         delta_tracker=delta_tracker,
-        transport="s3",
-        send_payload=send_payload,
-        transfer_workers=refit_env_int(
-            "NRL_REFIT_S3_UPLOAD_WORKERS",
-            default=max(4, min(32, os.cpu_count() or 32)),
+        transport=_S3ManifestTransport(
+            store=store,
+            endpoint_urls=endpoint_urls,
+            run_prefix=run_prefix,
+            api_key=vllm_refit_api_key(api_key_env_var),
+            timeout_s=timeout_s,
+            transfer_workers=refit_env_int(
+                "NRL_REFIT_S3_UPLOAD_WORKERS",
+                default=max(4, min(32, os.cpu_count() or 32)),
+            ),
         ),
         shard_rank=shard_rank,
         shard_count=shard_count,
-        partition=partition,
     )
-
-
-def post_vllm_refit_endpoints(
-    endpoint_urls: Sequence[str],
-    body: Mapping[str, Any] | bytes,
-    *,
-    api_key: str | None,
-    timeout_s: float,
-    headers: Mapping[str, str] | None = None,
-    executor: ThreadPoolExecutor | None = None,
-) -> list[dict[str, Any]]:
-    request_headers = dict(headers or {})
-    if api_key:
-        request_headers[G_VLLM_REFIT_API_KEY_HEADER] = api_key
-    request_kwargs: dict[str, Any] = (
-        {"data": body} if isinstance(body, bytes) else {"json": body}
-    )
-
-    def post(url: str) -> dict[str, Any]:
-        response = refit_http_session().post(
-            url,
-            **request_kwargs,
-            headers=request_headers,
-            timeout=timeout_s,
-        )
-        result: dict[str, Any] = response.json() if response.content else {}
-        if response.status_code >= 400 or result.get("ok") is not True:
-            raise RuntimeError(f"vLLM refit failed for {url}: {result}")
-        return result
-
-    pool = executor or _executor("refit-fanout", len(endpoint_urls))
-    return list(pool.map(post, endpoint_urls))
 
 
 def download_s3_refit_payload(
@@ -656,38 +639,12 @@ def download_s3_refit_payload(
     return decode_sparse_payload(body, str(manifest["checksum"]))
 
 
-def merge_vllm_refit_metrics(
-    result: dict[str, Any],
-    metrics: Iterable[Mapping[str, Any]],
-    *,
-    maximum: bool,
-    candidate_maximum: bool | None = None,
-) -> dict[str, Any]:
-    for metric in metrics:
-        for key, value in metric.items():
-            if key.startswith("receiver_") and key.endswith("_s"):
-                number, use_maximum = float(value), maximum
-            elif candidate_maximum is not None and key.startswith("verification_"):
-                number = value
-                use_maximum = key == "verification_max_abs" or (
-                    key == "verification_candidates" and candidate_maximum
-                )
-            else:
-                continue
-            if key in result:
-                number = (
-                    max(result[key], number) if use_maximum else result[key] + number
-                )
-            result[key] = number
-    return result
-
-
 def zstd_compress(raw: bytes, threads_env: str) -> bytes:
-    compressor = getattr(_CONTROL_SESSION_LOCAL, "zstd_compressor", None)
+    compressor = getattr(_STREAM_LOCAL, "zstd_compressor", None)
     if compressor is None:
         compressor = zstandard.ZstdCompressor(
             level=1,
             threads=refit_env_int(threads_env, default=0, min_value=0),
         )
-        _CONTROL_SESSION_LOCAL.zstd_compressor = compressor
+        _STREAM_LOCAL.zstd_compressor = compressor
     return compressor.compress(raw)

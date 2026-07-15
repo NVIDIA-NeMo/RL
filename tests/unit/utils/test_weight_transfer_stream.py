@@ -15,29 +15,36 @@
 import io
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
+import requests
 import torch
 import zstandard
 
-from nemo_rl.utils import weight_transfer_remote_sparse, weight_transfer_zmq
-from nemo_rl.utils.weight_transfer_remote_sparse import (
-    download_s3_refit_payload,
-    sparse_payload_checksum,
+from nemo_rl.utils import (
+    weight_transfer_http,
+    weight_transfer_stream,
+    weight_transfer_zmq,
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     DeltaCompressionTracker,
-    SparseShardProjection,
     encode_sparse_infos,
     sparse_locations_for_item,
+)
+from nemo_rl.utils.weight_transfer_stream import (
+    download_s3_refit_payload,
+    sparse_export_chunk_size,
+    sparse_payload_checksum,
 )
 from nemo_rl.utils.weight_transfer_zmq import (
     G_VLLM_REFIT_CHECKSUM_HEADER,
     G_VLLM_REFIT_PAYLOAD_HEADER,
     G_VLLM_REFIT_PRODUCER_HEADER,
     G_VLLM_REFIT_TRANSFER_HEADER,
+    G_VLLM_REFIT_VERIFICATION_HEADER,
     ZmqSparseRefitClient,
     ZmqSparseRefitServer,
 )
@@ -74,16 +81,33 @@ class _BaselineNamesTracker:
         self.names.extend(name for name, _tensor in chunk)
 
 
+class _SparseTestTransport:
+    name = "zmq"
+    transfer_workers = 1
+
+    def __init__(self, send_payload) -> None:
+        self._send_payload = send_payload
+        self.cleaned = False
+
+    def send(self, body, payload_id, _verification_candidates):
+        return self._send_payload(body, payload_id)
+
+    def cleanup(self) -> None:
+        self.cleaned = True
+
+
 def _stream_sparse_test_payloads(tensors, send_payload):
-    return weight_transfer_remote_sparse.stream_sparse_delta_payloads(
-        tensors,
-        delta_tracker=_SparsePipelineTracker(),
-        transport="zmq",
-        send_payload=send_payload,
-        transfer_workers=1,
-        shard_rank=0,
-        shard_count=1,
-    )
+    transport = _SparseTestTransport(send_payload)
+    try:
+        return weight_transfer_stream.stream_sparse_delta_payloads(
+            tensors,
+            delta_tracker=_SparsePipelineTracker(),
+            transport=transport,
+            shard_rank=0,
+            shard_count=1,
+        )
+    finally:
+        assert transport.cleaned
 
 
 def _delta_tracker(encoding: str = "overwrite") -> DeltaCompressionTracker:
@@ -92,15 +116,14 @@ def _delta_tracker(encoding: str = "overwrite") -> DeltaCompressionTracker:
     )
 
 
-def _baseline_names(tensors, *, rank: int, partition: str = "chunks"):
+def _baseline_names(tensors, *, rank: int):
     tracker = _BaselineNamesTracker()
-    weight_transfer_remote_sparse.init_sparse_delta_baseline_from_iterator(
+    weight_transfer_stream.init_sparse_delta_baseline_from_iterator(
         tensors,
         delta_tracker=tracker,
         shard_rank=rank,
         shard_count=2,
         transport="zmq",
-        partition=partition,
     )
     return tracker.names
 
@@ -121,21 +144,6 @@ def test_delta_tracker_commits_only_successful_syncs() -> None:
     assert tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
     tracker.on_sync_succeeded()
     assert not tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
-
-
-def test_delta_tracker_change_summary_is_transactional() -> None:
-    tracker = _delta_tracker()
-    first = torch.tensor([1.0, 2.0])
-    second = torch.tensor([3.0, 4.0])
-    tensors = [("first", first), ("second", second)]
-    tracker.snapshot_baseline(tensors)
-    second[0] = 5
-
-    assert tracker.prepare_change_summary(tensors) == ({"second"}, 1, 4)
-    tracker.on_sync_failed()
-    assert tracker.prepare_change_summary(tensors) == ({"second"}, 1, 4)
-    tracker.on_sync_succeeded()
-    assert tracker.prepare_change_summary(tensors) == (set(), 0, 4)
 
 
 def test_delta_tracker_emits_bounded_verification_budget(monkeypatch) -> None:
@@ -193,42 +201,20 @@ def test_delta_tracker_xor_encodes_against_baseline() -> None:
     assert torch.equal(tracker.baseline["weight"], tensor)
 
 
-@pytest.mark.parametrize(
-    ("projection", "expected_locations"),
-    [
-        (SparseShardProjection("hf.weight", (2, 4), 1, 2), [2, 7]),
-        (SparseShardProjection("hf.weight", (4, 2), 0, 2), [4, 7]),
-    ],
-)
-def test_delta_tracker_projects_local_shards_to_hf_locations(
-    monkeypatch,
-    projection: SparseShardProjection,
-    expected_locations: list[int],
-) -> None:
-    monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
-    tracker = DeltaCompressionTracker(
-        {"encoding": "overwrite", "sparse_bucket_size_bytes": 1024},
-        projections={"local.weight": projection},
-    )
-    tensor = torch.zeros(2, 2)
-    tracker.snapshot_baseline([("local.weight", tensor)])
-    tensor[0, 0] = 1
-    tensor[1, 1] = 2
+def test_delta_tracker_uses_overwrite_for_receiver_incompatible_weights() -> None:
+    tracker = _delta_tracker("xor")
+    weight = torch.tensor([1.0])
+    scale = torch.tensor([2.0])
+    tracker.snapshot_baseline([("weight", weight), ("scale", scale)])
+    tracker.overwrite_names = frozenset({"scale"})
+    weight.add_(1)
+    scale.add_(1)
 
-    (locations, _, metadata), changed, total = tracker.prepare_sparse_delta_payload(
-        [("local.weight", tensor)]
+    (_, _, metadata), _, _ = tracker.prepare_sparse_delta_payload(
+        [("weight", weight), ("scale", scale)]
     )
 
-    assert (changed, total) == (2, 4)
-    assert metadata[0]["name"] == "hf.weight"
-    assert metadata[0]["shape"] == projection.global_shape
-    assert metadata[0]["verification_samples"] == 2
-    assert (
-        sparse_locations_for_item(metadata[0], locations, device="cpu").tolist()
-        == expected_locations
-    )
-    tracker.on_sync_succeeded()
-    assert not tracker.prepare_sparse_delta_payload([("local.weight", tensor)])[0][2]
+    assert [item["operation"] for item in metadata] == ["xor", "overwrite"]
 
 
 def test_sparse_index_encoding_preserves_uint64_locations() -> None:
@@ -296,7 +282,7 @@ def test_delta_tracker_rejects_arithmetic_encoding() -> None:
 def test_s3_download_verifies_checksum(monkeypatch) -> None:
     compressed = zstandard.ZstdCompressor().compress(b"payload")
     monkeypatch.setattr(
-        weight_transfer_remote_sparse,
+        weight_transfer_stream,
         "_get_manifest_s3_store",
         lambda *_args: SimpleNamespace(get=lambda _key: bytearray(compressed)),
     )
@@ -314,14 +300,36 @@ def test_s3_download_verifies_checksum(monkeypatch) -> None:
 
 
 def test_refit_http_session_does_not_retry_application_errors() -> None:
-    retry = (
-        weight_transfer_remote_sparse.refit_http_session()
-        .get_adapter("http://")
-        .max_retries
-    )
+    retry = weight_transfer_http.refit_http_session().get_adapter("http://").max_retries
 
     assert 500 not in retry.status_forcelist
     assert {502, 503, 504} <= set(retry.status_forcelist)
+
+
+def test_refit_http_sessions_share_connection_pool_across_threads() -> None:
+    barrier = threading.Barrier(4)
+
+    def adapter(_):
+        barrier.wait()
+        return weight_transfer_http.refit_http_session().get_adapter("http://")
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        adapters = list(executor.map(adapter, range(4)))
+
+    assert all(adapter is adapters[0] for adapter in adapters)
+
+
+def test_refit_http_error_preserves_non_json_status_and_body(monkeypatch) -> None:
+    response = requests.Response()
+    response.status_code = 500
+    response._content = b"<html>gateway failure</html>"
+    session = SimpleNamespace(post=lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(weight_transfer_http, "refit_http_session", lambda: session)
+
+    with pytest.raises(RuntimeError, match="HTTP 500: <html>gateway failure"):
+        weight_transfer_http.post_vllm_refit_endpoints(
+            ["http://receiver/refit"], {}, api_key=None, timeout_s=1.0
+        )
 
 
 def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
@@ -374,6 +382,40 @@ def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
     assert exported == list(range(4))
 
 
+def test_sparse_transport_cleanup_runs_on_transfer_workers(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "1")
+    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
+
+    class Transport:
+        name = "zmq"
+        transfer_workers = 2
+
+        def __init__(self) -> None:
+            self.barrier = threading.Barrier(2)
+            self.send_threads = set()
+            self.cleanup_threads = set()
+
+        def send(self, _body, _payload_id, _verification_candidates):
+            self.send_threads.add(threading.get_ident())
+            self.barrier.wait(timeout=5.0)
+            return {"receiver": {}}
+
+        def cleanup(self) -> None:
+            self.cleanup_threads.add(threading.get_ident())
+
+    transport = Transport()
+    result = weight_transfer_stream.stream_sparse_delta_payloads(
+        [(f"weight-{index}", torch.ones(1)) for index in range(2)],
+        delta_tracker=_SparsePipelineTracker(),
+        transport=transport,
+        shard_rank=0,
+        shard_count=1,
+    )
+
+    assert result["payloads"] == 2
+    assert transport.send_threads == transport.cleanup_threads
+
+
 def test_sparse_stream_coalesces_export_chunks(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "2")
     monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
@@ -392,17 +434,16 @@ def test_sparse_stream_coalesces_export_chunks(monkeypatch) -> None:
         )
         return {"receiver": {}}
 
-    result = weight_transfer_remote_sparse.stream_sparse_delta_payloads(
+    transport = _SparseTestTransport(send)
+    result = weight_transfer_stream.stream_sparse_delta_payloads(
         tensors,
         delta_tracker=tracker,
-        transport="zmq",
-        send_payload=send,
-        transfer_workers=1,
+        transport=transport,
         shard_rank=0,
         shard_count=1,
-        partition="none",
     )
 
+    assert transport.cleaned
     assert result == {"payloads": 2, "changed_elements": 4, "total_elements": 4}
     payload_names = [
         [item["name"] for item in payloads[index][2]] for index in sorted(payloads)
@@ -421,6 +462,16 @@ def test_sparse_stream_coalesces_export_chunks(monkeypatch) -> None:
             ].tolist() == [1065353216]
 
 
+def test_sparse_export_chunk_defaults_are_transport_specific(monkeypatch) -> None:
+    monkeypatch.delenv("NRL_REFIT_S3_EXPORT_CHUNK_BYTES", raising=False)
+    monkeypatch.delenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", raising=False)
+    tracker = _delta_tracker()
+    tracker.sparse_bucket_size_bytes = 1024**3
+
+    assert sparse_export_chunk_size(tracker, "s3") == 64 * 1024**2
+    assert sparse_export_chunk_size(tracker, "zmq") == 256 * 1024**2
+
+
 def test_sparse_baseline_snapshots_only_owned_export_chunks(
     monkeypatch, capsys
 ) -> None:
@@ -429,27 +480,25 @@ def test_sparse_baseline_snapshots_only_owned_export_chunks(
 
     assert _baseline_names(tensors, rank=1) == ["weight-1", "weight-3"]
     assert "chunks=4" in capsys.readouterr().out
-    assert _baseline_names(tensors, rank=1, partition="none") == [
-        f"weight-{index}" for index in range(4)
-    ]
 
 
-def test_sparse_name_partition_is_stable_for_filtered_exports(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
+def test_sparse_stream_sends_only_owned_export_chunks(monkeypatch) -> None:
+    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
+    sent = []
+    transport = _SparseTestTransport(
+        lambda _body, payload_id: sent.append(payload_id) or {"receiver": {}}
+    )
 
-    tensors = [(f"weight-{index}", torch.tensor([float(index)])) for index in range(8)]
-    owners = [
-        set(_baseline_names(tensors, rank=rank, partition="names")) for rank in range(2)
-    ]
+    result = weight_transfer_stream.stream_sparse_delta_payloads(
+        [(f"weight-{index}", torch.ones(1)) for index in range(4)],
+        delta_tracker=_SparsePipelineTracker(),
+        transport=transport,
+        shard_rank=1,
+        shard_count=2,
+    )
 
-    assert owners[0].isdisjoint(owners[1])
-    assert owners[0] | owners[1] == {name for name, _tensor in tensors}
-
-    filtered = tensors[::2]
-    for rank in range(2):
-        assert set(_baseline_names(filtered, rank=rank, partition="names")) == owners[
-            rank
-        ] & {name for name, _tensor in filtered}
+    assert result == {"payloads": 2, "changed_elements": 2, "total_elements": 2}
+    assert sorted(sent) == [0, 1]
 
 
 def test_s3_manifest_transport_validates_configuration(monkeypatch) -> None:
@@ -464,13 +513,13 @@ def test_s3_manifest_transport_validates_configuration(monkeypatch) -> None:
     }
     monkeypatch.setenv("NRL_REFIT_S3_BUCKET", "bucket")
     with pytest.raises(ValueError, match="URL is required"):
-        weight_transfer_remote_sparse.stream_sparse_delta_payloads_via_s3_manifest(
+        weight_transfer_stream.stream_sparse_delta_payloads_via_s3_manifest(
             refit_targets=[], **kwargs
         )
 
     monkeypatch.delenv("NRL_REFIT_S3_BUCKET")
     with pytest.raises(RuntimeError, match="NRL_REFIT_S3_BUCKET"):
-        weight_transfer_remote_sparse.stream_sparse_delta_payloads_via_s3_manifest(
+        weight_transfer_stream.stream_sparse_delta_payloads_via_s3_manifest(
             refit_targets=["http://receiver"], **kwargs
         )
 
@@ -496,7 +545,7 @@ def test_s3_manifest_transport_uploads_notifies_and_deletes(monkeypatch) -> None
     monkeypatch.setenv("NRL_REFIT_S3_UPLOAD_WORKERS", "3")
     monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
     monkeypatch.setattr(
-        weight_transfer_remote_sparse,
+        weight_transfer_stream,
         "_get_manifest_s3_store",
         lambda *_args: store,
     )
@@ -510,20 +559,18 @@ def test_s3_manifest_transport_uploads_notifies_and_deletes(monkeypatch) -> None
 
     def stream(iterator, **kwargs):
         assert list(iterator) == [("weight", torch.tensor([1.0]))]
-        assert kwargs["transport"] == "s3"
-        assert kwargs["transfer_workers"] == 3
-        response = kwargs["send_payload"](b"payload", 3)
+        transport = kwargs["transport"]
+        assert transport.name == "s3"
+        assert transport.transfer_workers == 3
+        response = transport.send(b"payload", 3, 4)
         assert response["receiver"] == {"receiver_total_s": 2.0}
+        transport.cleanup()
         return {"payloads": 1, "changed_elements": 1, "total_elements": 1}
 
-    monkeypatch.setattr(
-        weight_transfer_remote_sparse, "post_vllm_refit_endpoints", post
-    )
-    monkeypatch.setattr(
-        weight_transfer_remote_sparse, "stream_sparse_delta_payloads", stream
-    )
+    monkeypatch.setattr(weight_transfer_stream, "post_vllm_refit_endpoints", post)
+    monkeypatch.setattr(weight_transfer_stream, "stream_sparse_delta_payloads", stream)
 
-    result = weight_transfer_remote_sparse.stream_sparse_delta_payloads_via_s3_manifest(
+    result = weight_transfer_stream.stream_sparse_delta_payloads_via_s3_manifest(
         [("weight", torch.tensor([1.0]))],
         delta_tracker=SimpleNamespace(),
         refit_targets=[" http://receiver-a/ ", "http://receiver-b"],
@@ -548,18 +595,19 @@ def test_s3_manifest_transport_uploads_notifies_and_deletes(monkeypatch) -> None
                 "region": store.region,
                 "key": key,
                 "checksum": sparse_payload_checksum(b"payload"),
+                "verification_candidates": 4,
             },
             {"api_key": "secret", "timeout_s": 7.0},
         )
     ]
 
 
-def test_zmq_stream_routes_shards_and_reuses_clients(monkeypatch) -> None:
+def test_zmq_stream_routes_shards_and_closes_clients(monkeypatch) -> None:
     created = []
     sent = []
+    closed = []
     monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
     monkeypatch.setenv("NRL_REFIT_ZMQ_SEND_WORKERS", "2")
-    monkeypatch.delattr(weight_transfer_zmq._ZMQ_LOCAL, "clients", raising=False)
 
     class Client:
         def __init__(self, address, **kwargs) -> None:
@@ -569,12 +617,19 @@ def test_zmq_stream_routes_shards_and_reuses_clients(monkeypatch) -> None:
             sent.append(kwargs)
             return {"ok": True, "receiver_total_s": 0.5}
 
+        def close(self) -> None:
+            closed.append(True)
+
     def stream(_iterator, **kwargs):
-        assert kwargs["transport"] == "zmq"
-        assert kwargs["transfer_workers"] == 2
+        transport = kwargs["transport"]
+        assert transport.name == "zmq"
+        assert transport.transfer_workers == 2
         for payload_id in range(2):
-            response = kwargs["send_payload"](f"body-{payload_id}".encode(), payload_id)
+            response = transport.send(
+                f"body-{payload_id}".encode(), payload_id, payload_id + 1
+            )
             assert response["receiver"]["ok"]
+        transport.cleanup()
         return {"payloads": 2, "changed_elements": 2, "total_elements": 2}
 
     monkeypatch.setattr(weight_transfer_zmq, "ZmqSparseRefitClient", Client)
@@ -611,13 +666,15 @@ def test_zmq_stream_routes_shards_and_reuses_clients(monkeypatch) -> None:
         == 2
     )
 
-    assert created == [
+    assert created == 2 * [
         (
             "tcp://receiver-b",
             {"timeout_s": 7.0, "producer_id": 3, "api_key": "secret"},
         )
     ]
+    assert closed == [True, True]
     assert [item["payload_id"] for item in sent] == [0, 1, 0, 1]
+    assert [item["verification_candidates"] for item in sent] == [1, 2, 1, 2]
     assert all(
         item["checksum"] == sparse_payload_checksum(item["body"]) for item in sent
     )
@@ -690,6 +747,7 @@ def test_zmq_server_rejects_malformed_messages() -> None:
         "producer_id": 0,
         "payload_id": 1,
         "checksum": sparse_payload_checksum(body),
+        "verification_candidates": 2,
     }
 
     def frames(kind: bytes = b"DATA", **updates: object) -> list[bytes]:
@@ -741,34 +799,41 @@ def _send_zmq_payload(
     payload_id: int,
     body: bytes,
     checksum: str | None = None,
+    transfer_id: str = "transfer-a",
 ) -> dict[str, object]:
     return client.send_payload(
-        transfer_id="transfer-a",
+        transfer_id=transfer_id,
         payload_id=payload_id,
         checksum=checksum or sparse_payload_checksum(body),
+        verification_candidates=2,
         body=body,
     )
 
 
 def test_zmq_sparse_refit_relay_fans_out_and_rejects_corruption(monkeypatch) -> None:
     monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
-    received = [[], []]
+    received = [[] for _ in range(4)]
     receivers = [_receiver_server(items) for items in received]
     urls = [f"http://127.0.0.1:{server.server_port}" for server, _ in receivers]
-    relay = ZmqSparseRefitServer(
-        urls,
-        bind_address="tcp://127.0.0.1:*",
-        api_key_env_var="NRL_TEST_REFIT_KEY",
-        timeout_s=5.0,
-    )
-    address = relay.start()
+    relays = [
+        ZmqSparseRefitServer(
+            urls,
+            bind_address="tcp://127.0.0.1:*",
+            api_key_env_var="NRL_TEST_REFIT_KEY",
+            timeout_s=5.0,
+        )
+        for _ in urls
+    ]
+    addresses = [relay.start() for relay in relays]
+    for relay, address, url in zip(relays, addresses, urls, strict=True):
+        relay.configure_tree(addresses, own_address=address, local_refit_url=url)
     unauthenticated_client = ZmqSparseRefitClient(
-        address,
+        addresses[0],
         timeout_s=5.0,
         producer_id=2,
     )
     client = ZmqSparseRefitClient(
-        address,
+        addresses[0],
         timeout_s=5.0,
         producer_id=3,
         api_key="secret",
@@ -779,9 +844,14 @@ def test_zmq_sparse_refit_relay_fans_out_and_rejects_corruption(monkeypatch) -> 
         with pytest.raises(RuntimeError, match="authentication failed"):
             _send_zmq_payload(unauthenticated_client, 6, body)
         first = _send_zmq_payload(client, 7, body)
-        assert first["ok"]
-        assert first["receiver_total_s"] == 0.25
-        assert [len(items) for items in received] == [1, 1]
+        duplicate = _send_zmq_payload(client, 7, body)
+        assert first["ok"] and first["staged"]
+        assert duplicate["ok"] and duplicate["staged"]
+        for relay in relays:
+            flushed = relay.flush("transfer-a", expected_payloads=1)
+            assert flushed["payloads"] == 1
+            assert flushed["receiver_total_s"] == 0.25
+        assert [len(items) for items in received] == [1] * 4
         for items in received:
             headers, posted_body = items[0]
             assert posted_body == body
@@ -789,14 +859,19 @@ def test_zmq_sparse_refit_relay_fans_out_and_rejects_corruption(monkeypatch) -> 
             assert headers[G_VLLM_REFIT_PRODUCER_HEADER] == "3"
             assert headers[G_VLLM_REFIT_PAYLOAD_HEADER] == "7"
             assert headers[G_VLLM_REFIT_CHECKSUM_HEADER] == checksum
+            assert headers[G_VLLM_REFIT_VERIFICATION_HEADER] == "2"
             assert headers["x-nemo-rl-refit-key"] == "secret"
 
+        with pytest.raises(RuntimeError, match="already flushed"):
+            _send_zmq_payload(client, 8, body)
+        assert _send_zmq_payload(client, 8, body, "0" * 32, "transfer-b")["staged"]
         with pytest.raises(RuntimeError, match="checksum mismatch"):
-            _send_zmq_payload(client, 8, body, "0" * 32)
+            relays[0].flush("transfer-b")
     finally:
         unauthenticated_client.close()
         client.close()
-        relay.close()
+        for relay in relays:
+            relay.close()
         for server, thread in receivers:
             server.shutdown()
             thread.join(timeout=5.0)

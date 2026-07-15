@@ -17,8 +17,6 @@ import tempfile
 import threading
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from math import prod
 from typing import Any, Literal
 
 import numpy as np
@@ -30,12 +28,7 @@ SparseOperation = Literal["xor", "overwrite"]
 SparseInfo = tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, SparseOperation]
 TensorPayload = tuple[torch.Tensor, tuple[torch.Tensor, ...], list[dict[str, Any]]]
 PreparedTensorPayload = tuple[TensorPayload, int, int]
-DecodedSparseItem = tuple[dict[str, Any], torch.Tensor, torch.Tensor]
-DecodedSparsePayload = tuple[
-    tuple[torch.Tensor, torch.Tensor],
-    tuple[torch.Tensor, ...],
-    list[dict[str, Any]],
-]
+SparseItem = tuple[dict[str, Any], torch.Tensor, torch.Tensor]
 
 _INTEGER_DTYPE_BY_SIZE = {
     1: torch.uint8,
@@ -84,32 +77,6 @@ class _TensorPayloadBuilder:
             for parts in self.value_parts
         )
         return indices, values, self.metadata
-
-
-@dataclass(frozen=True)
-class SparseShardProjection:
-    """Map one local tensor shard into a canonical HF tensor."""
-
-    name: str
-    global_shape: tuple[int, ...]
-    shard_dim: int | None = None
-    offset: int = 0
-
-    def map_locations(
-        self, locations: torch.Tensor, local_shape: tuple[int, ...]
-    ) -> torch.Tensor:
-        if self.shard_dim is None:
-            return locations
-        if self.shard_dim == 0:
-            return locations + self.offset * prod(local_shape[1:])
-        inner = prod(local_shape[self.shard_dim + 1 :])
-        local_slab = local_shape[self.shard_dim] * inner
-        outer = torch.div(locations, local_slab, rounding_mode="floor")
-        return (
-            locations
-            + self.offset * inner
-            + outer * (prod(self.global_shape[self.shard_dim :]) - local_slab)
-        )
 
 
 def integer_dtype_for_element_size(element_size: int) -> torch.dtype:
@@ -217,75 +184,14 @@ def sparse_locations_for_item(
         return torch.arange(start, start + count, dtype=dtype, device=device)
 
     index_start, index_end = int(item["index_start"]), int(item["index_end"])
-    raw = (
-        packed_locations[index_start:index_end]
-        .detach()
-        .cpu()
-        .numpy()
-        .astype(np.uint8, copy=False)
-        .tobytes()
-    )
-    delta_dtype = {2: np.uint16, 4: np.uint32, 8: np.uint64}[len(raw) // count]
+    raw = packed_locations[index_start:index_end].detach().cpu().numpy()
+    delta_dtype = {2: np.uint16, 4: np.uint32, 8: np.uint64}[raw.size // count]
     location_dtype = np.int32 if dtype == torch.int32 else np.int64
-    deltas = np.frombuffer(raw, dtype=delta_dtype).astype(location_dtype, copy=False)
-    locations = np.cumsum(deltas + 1, dtype=location_dtype) - 1
+    locations = raw.view(delta_dtype).astype(location_dtype, copy=False)
+    locations += 1
+    np.cumsum(locations, out=locations)
+    locations -= 1
     return torch.from_numpy(locations).to(device=device)
-
-
-def _merge_tensor_parts(parts: list[torch.Tensor], dtype: torch.dtype) -> torch.Tensor:
-    if not parts:
-        return torch.empty(0, dtype=dtype)
-    return parts[0] if len(parts) == 1 else torch.cat(parts)
-
-
-def decode_sparse_tensor_payload_for_staging(
-    payload: TensorPayload,
-) -> DecodedSparsePayload:
-    """Flatten decoded locations so workers mmap only a few tensor storages."""
-    packed_locations, value_groups, source_metadata = payload
-    location_parts: tuple[list[torch.Tensor], list[torch.Tensor]] = ([], [])
-    location_offsets = [0, 0]
-    metadata = []
-    for item in source_metadata:
-        location_dtype = (
-            torch.int32
-            if prod(item["shape"]) <= torch.iinfo(torch.int32).max
-            else torch.int64
-        )
-        locations = sparse_locations_for_item(
-            item, packed_locations, device="cpu", dtype=location_dtype
-        )
-        group = 0 if locations.dtype == torch.int32 else 1
-        staged_item = dict(item)
-        staged_item["decoded_location_group"] = group
-        staged_item["decoded_location_start"] = location_offsets[group]
-        location_offsets[group] += locations.numel()
-        staged_item["decoded_location_end"] = location_offsets[group]
-        location_parts[group].append(locations)
-        metadata.append(staged_item)
-    locations = (
-        _merge_tensor_parts(location_parts[0], torch.int32),
-        _merge_tensor_parts(location_parts[1], torch.int64),
-    )
-    return locations, value_groups, metadata
-
-
-def iter_decoded_sparse_payload(
-    payload: DecodedSparsePayload,
-) -> Iterable[DecodedSparseItem]:
-    location_groups, value_groups, metadata = payload
-    for item in metadata:
-        location_start = int(item["decoded_location_start"])
-        location_end = int(item["decoded_location_end"])
-        value_start = int(item["value_start"])
-        value_end = int(item["value_end"])
-        yield (
-            item,
-            location_groups[int(item["decoded_location_group"])][
-                location_start:location_end
-            ],
-            value_groups[int(item["value_group"])][value_start:value_end],
-        )
 
 
 def _encode_explicit_locations(
@@ -311,13 +217,12 @@ class DeltaCompressionTracker:
     def __init__(
         self,
         config: Mapping[str, Any],
-        *,
-        projections: Mapping[str, SparseShardProjection] | None = None,
     ) -> None:
         self.sparse_bucket_size_bytes = int(config["sparse_bucket_size_bytes"])
         if self.sparse_bucket_size_bytes < 1:
             raise ValueError("delta_compression.sparse_bucket_size_bytes must be >= 1")
         self.encoding = sparse_operation(config["encoding"])
+        self.overwrite_names: frozenset[str] = frozenset()
         self.verification_samples = int(
             os.getenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "0")
         )
@@ -325,7 +230,6 @@ class DeltaCompressionTracker:
             raise ValueError("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD must be >= 0")
         self.baseline_in_memory = os.getenv("NRL_REFIT_BASELINE_IN_MEMORY") == "1"
         self.baseline_mmap_dir = os.getenv("NRL_REFIT_BASELINE_MMAP_DIR")
-        self.projections = dict(projections or {})
         self.baseline: dict[str, torch.Tensor] = {}
         self._pending_updates: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self._pending_updates_lock = threading.Lock()
@@ -346,50 +250,27 @@ class DeltaCompressionTracker:
             total_elements += current.numel()
             changed_elements += locations.numel()
             if locations.numel():
+                operation: SparseOperation = (
+                    "overwrite" if name in self.overwrite_names else self.encoding
+                )
                 values = (
                     current_values.bitwise_xor(baseline_bits[locations])
-                    if self.encoding == "xor"
+                    if operation == "xor"
                     else current_values
                 )
-                payload_name, payload_tensor, payload_locations = (
-                    name,
-                    current,
-                    locations,
-                )
-                if projection := self.projections.get(name):
-                    payload_name = projection.name
-                    payload_locations = projection.map_locations(
-                        locations, tuple(current.shape)
-                    )
-                    payload_tensor = torch.empty(
-                        projection.global_shape, dtype=current.dtype, device="meta"
-                    )
                 sparse_infos.append(
                     (
-                        payload_name,
-                        payload_tensor,
-                        payload_locations,
+                        name,
+                        current,
+                        locations,
                         values,
-                        self.encoding,
+                        operation,
                     )
                 )
         payload = encode_sparse_infos(sparse_infos)
         if self.verification_samples:
             self._add_verification_samples(payload[2])
         return payload, changed_elements, total_elements
-
-    def prepare_change_summary(
-        self, tensors: Iterable[NamedTensor]
-    ) -> tuple[set[str], int, int]:
-        """Scan local tensors without constructing a wire payload."""
-        changed_names = set()
-        changed_elements = total_elements = 0
-        for name, _, current, locations, _ in self._changes(tensors):
-            total_elements += current.numel()
-            changed_elements += locations.numel()
-            if locations.numel():
-                changed_names.add(name)
-        return changed_names, changed_elements, total_elements
 
     def _changes(
         self, tensors: Iterable[NamedTensor]
@@ -483,7 +364,7 @@ class DeltaCompressionTracker:
         if name in self.baseline:
             return self.baseline[name]
         numel = torch.Size(shape).numel()
-        nbytes = numel * torch.empty((), dtype=dtype).element_size()
+        nbytes = numel * dtype.itemsize
         if self.baseline_in_memory:
             storage = torch.empty(nbytes, dtype=torch.uint8)
         else:

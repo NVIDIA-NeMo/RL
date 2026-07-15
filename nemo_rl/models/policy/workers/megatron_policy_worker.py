@@ -1823,6 +1823,7 @@ class MegatronPolicyWorkerImpl(
         timeout_s: float,
         shard_rank: int,
         shard_count: int,
+        overwrite_names: list[str],
     ) -> dict[str, int]:
         return self._require_remote_sparse_refit().stream(
             transport,
@@ -1832,6 +1833,7 @@ class MegatronPolicyWorkerImpl(
             timeout_s=timeout_s,
             shard_rank=shard_rank,
             shard_count=shard_count,
+            overwrite_names=overwrite_names,
         )
 
     def _require_remote_sparse_refit(self) -> Any:
@@ -1906,7 +1908,6 @@ class MegatronPolicyWorkerImpl(
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
-        conversion_tasks: Optional[list[Any]] = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -1917,12 +1918,10 @@ class MegatronPolicyWorkerImpl(
             get_vllm_qkv_scale_names,
         )
 
-        if conversion_tasks is None:
-            conversion_tasks = self.refit_conversion_tasks
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=conversion_tasks,
+            conversion_tasks=self.refit_conversion_tasks,
         )
 
         # Yield the original parameters first.

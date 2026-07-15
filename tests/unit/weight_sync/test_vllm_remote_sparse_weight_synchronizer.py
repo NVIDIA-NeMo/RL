@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from nemo_rl.models.generation.vllm.config import VllmDeltaCompressionConfig
 from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
     VllmRemoteSparseWeightSynchronizer,
     validate_vllm_remote_sparse_refit,
@@ -51,15 +52,12 @@ def _remote_sparse_sync(
     policy.worker_group.run_all_workers_single_data.return_value = commit_refs
 
     generation = MagicMock()
-    generation.worker_group.run_all_workers_single_data.side_effect = [
-        [MagicMock()],
-        *([[MagicMock()]] if transport == "zmq" else []),
-    ]
+    generation.worker_group.run_all_workers_single_data.return_value = [MagicMock()]
     generation.invalidate_kv_cache.return_value = True
 
     get_results: list[object] = [["http://receiver"]]
     if transport == "zmq":
-        get_results.append(["tcp://relay:19090"])
+        get_results.extend([["tcp://relay:19090"], [None]])
     get_results.extend([[{"weight": ((8,), "float32")}], stream_result])
     mock_ray.get.side_effect = get_results
 
@@ -78,11 +76,15 @@ def _valid_config() -> dict:
 
 
 def test_validate_remote_sparse_refit_accepts_supported_scope():
+    config = _valid_config()
     assert (
         validate_vllm_remote_sparse_refit(
-            _valid_config(), colocated=False, megatron_enabled=True
+            config, colocated=False, megatron_enabled=True
         )
         == "s3"
+    )
+    assert config["delta_compression"] == VllmDeltaCompressionConfig(
+        encoding="overwrite"
     )
 
 
@@ -127,6 +129,7 @@ class TestVllmRemoteSparseWeightSynchronizer:
             transport="s3",
             baseline_init_refs=[baseline_ref],
         )
+        post.return_value = [{"overwrite_names": ["weight"]}]
 
         sync.init_communicator()
 
@@ -139,6 +142,7 @@ class TestVllmRemoteSparseWeightSynchronizer:
             timeout_s=600.0,
         )
         assert sync._baseline_init_refs == []
+        assert sync._overwrite_names == ["weight"]
 
     def test_merge_refit_info_rejects_conflicting_metadata(self):
         with pytest.raises(ValueError, match="Conflicting sparse refit metadata"):
@@ -190,6 +194,7 @@ class TestVllmRemoteSparseWeightSynchronizer:
         assert sync._baseline_commit_refs == []
         assert sync._refit_urls == []
         assert sync._targets == []
+        assert sync._overwrite_names == []
 
     def test_fails_before_transfer_when_kv_cache_invalidation_fails(self, mock_ray):
         policy = MagicMock()
@@ -219,25 +224,48 @@ class TestVllmRemoteSparseWeightSynchronizer:
                 "verification_max_abs": 1e-9,
             }
         ]
+        verification = post.return_value
+        post.side_effect = [
+            [{"ok": True, "payloads": 3, "receiver_relay_fanout_s": 1.0}],
+            verification,
+        ]
         metrics = sync.sync_weights()
 
         assert [
             entry.args[0]
             for entry in policy.worker_group.run_all_workers_multiple_data.call_args_list
         ] == ["init_remote_sparse_delta_baseline", "stream_remote_sparse_weights"]
+        assert (
+            policy.worker_group.run_all_workers_multiple_data.call_args_list[1].kwargs[
+                "common_kwargs"
+            ]["overwrite_names"]
+            == []
+        )
         assert [
             entry.args[0]
             for entry in generation.worker_group.run_all_workers_single_data.call_args_list
         ] == [
             "report_refit_server_base_url",
             "start_zmq_sparse_refit_relay",
+            "configure_zmq_sparse_refit_relay",
         ]
         generation.worker_group.run_all_workers_single_data.assert_any_call(
             "start_zmq_sparse_refit_relay",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             refit_urls=["http://receiver"],
         )
-        post.assert_called_once_with(
+        generation.worker_group.run_all_workers_single_data.assert_any_call(
+            "configure_zmq_sparse_refit_relay",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            relay_addresses=["tcp://relay:19090"],
+        )
+        post.assert_any_call(
+            ["http://receiver/nemo-rl/refit/zmq-flush"],
+            {"transfer_id": ANY, "expected_payloads": 3},
+            api_key=None,
+            timeout_s=600.0,
+        )
+        post.assert_any_call(
             ["http://receiver/nemo-rl/refit/flush"],
             {},
             api_key=None,
@@ -258,6 +286,7 @@ class TestVllmRemoteSparseWeightSynchronizer:
         assert metrics["delta_verify/mean_abs"] == 2.5e-10
         assert metrics["delta_verify/max_abs"] == 1e-9
         assert metrics["transfer/payloads"] == 3.0
+        assert metrics["transfer/relay_flush_s"] >= 0.0
         assert not sync.is_stale
 
     def test_sample_mismatch_does_not_commit_baseline(self, mock_ray, post):
@@ -275,6 +304,12 @@ class TestVllmRemoteSparseWeightSynchronizer:
             }
         ]
 
+        verification = post.return_value
+        post.side_effect = [
+            [{"ok": True, "payloads": 3}],
+            verification,
+            verification,
+        ]
         with pytest.raises(RuntimeError, match="1 mismatched deltas out of 4"):
             sync.sync_weights()
 
@@ -296,6 +331,33 @@ class TestVllmRemoteSparseWeightSynchronizer:
             api_key=None,
             timeout_s=60.0,
         )
+        policy.worker_group.run_all_workers_single_data.assert_called_once_with(
+            "finish_remote_sparse_delta_sync", succeeded=False
+        )
+
+    def test_zmq_relay_failure_drains_before_rejecting_baseline(self, mock_ray, post):
+        sync, policy, _ = _remote_sparse_sync(
+            mock_ray,
+            "zmq",
+            [{"payloads": 3, "changed_elements": 3, "total_elements": 100}],
+        )
+        mock_ray.get.side_effect = [
+            [{"payloads": 3, "changed_elements": 3, "total_elements": 100}],
+        ]
+        post.side_effect = [
+            RuntimeError("fanout failed"),
+            [{"ok": True, "payloads": 3}],
+            [{"ok": True}],
+        ]
+
+        with pytest.raises(RuntimeError, match="fanout failed"):
+            sync.sync_weights()
+
+        assert [call.args[0][0] for call in post.call_args_list] == [
+            "http://receiver/nemo-rl/refit/zmq-flush",
+            "http://receiver/nemo-rl/refit/zmq-flush",
+            "http://receiver/nemo-rl/refit/flush",
+        ]
         policy.worker_group.run_all_workers_single_data.assert_called_once_with(
             "finish_remote_sparse_delta_sync", succeeded=False
         )
