@@ -221,7 +221,7 @@ policy:
     # MTP — disabled
     mtp_loss_scaling_factor: 0.0
     mtp_use_repeated_layer: true
-    mtp_num_layers: 0
+    mtp_num_layers: 5
     mtp_detach_heads: true
 
     optimizer:
@@ -346,8 +346,13 @@ policy:
     vllm_kwargs:
       attention_backend: FLASH_ATTN
       mamba_ssm_cache_dtype: "float32"
+      # Hybrid Mamba: one state slot per running seq; the vLLM default (1024) can
+      # exceed available slots. 256 matches the Ultra GB200 serving reference
+      # (Gym nemotron_3_ultra_dev_nemorl_gb200.yaml).
+      max_num_seqs: 256
       compilation_config:
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        cudagraph_mode: PIECEWISE
         pass_config:
           fuse_allreduce_rms: false
 
