@@ -1,4 +1,4 @@
-defaults: ../../grpo_math_1B.yaml
+defaults: ../../grpo_math_1B_trtllm.yaml
 
 # Non-colocated GRPO on Qwen3-1.7B with TRT-LLM inference:
 #   4 GPUs Megatron training (TP=2, DP=2) + 4 GPUs TRT-LLM generation (TP=1, DP=4)
@@ -60,11 +60,9 @@ policy:
     backend: trtllm
     trtllm_cfg:
       tensor_parallel_size: 2
-      precision: ${policy.precision}
       max_model_len: ${policy.max_total_sequence_length}
       max_batch_size: 16
       max_num_tokens: 4096
-      async_engine: true
     colocated:
       enabled: false
       resources:

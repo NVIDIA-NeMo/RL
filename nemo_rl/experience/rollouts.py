@@ -362,7 +362,7 @@ async def generate_responses_async(
             generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
     elif backend == "trtllm":
-        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
+        assert generation_config["trtllm_cfg"]["async_engine"], (
             "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
             "synchronous engine path (async_engine=false) is no longer supported."
         )

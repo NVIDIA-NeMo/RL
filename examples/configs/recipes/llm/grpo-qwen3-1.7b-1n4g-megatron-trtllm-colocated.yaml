@@ -1,8 +1,4 @@
-defaults: ../../grpo_math_1B.yaml
-
-# Colocated GRPO on Qwen3-1.7B with TRT-LLM inference:
-#   4 GPUs shared between Megatron training (TP=2, DP=2) and TRT-LLM generation
-#   (TP=2, DP=2). Sleep/wake_up time-multiplexes GPU memory between phases.
+defaults: ../../grpo_math_1B_trtllm.yaml
 
 grpo:
   num_prompts_per_step: 4
@@ -61,14 +57,10 @@ policy:
     backend: trtllm
     trtllm_cfg:
       tensor_parallel_size: 2
-      precision: ${policy.precision}
       max_model_len: ${policy.max_total_sequence_length}
       max_batch_size: 16
       max_num_tokens: 4096
-      async_engine: true
-      # Limit KV cache fraction so training optimizer state + activations fit
-      # alongside the inference engine on shared GPUs.
-      gpu_memory_utilization: 0.4
+      gpu_memory_utilization: 0.6
     colocated:
       enabled: true
       resources:

@@ -24,10 +24,6 @@ class TrtllmSpecificArgs(TypedDict):
     precision: NotRequired[str]
     max_batch_size: NotRequired[int]
     max_num_tokens: NotRequired[int]
-    # Use tensorrt_llm._torch.async_llm.AsyncLLM instead of the sync LLM.
-    # Async mode allows true concurrent generation (one in-flight request per
-    # prompt) and exposes llm.release()/llm.resume()/llm.update_weights() for
-    # the upcoming colocated mode. Defaults to false (sync LLM, current behavior).
     async_engine: NotRequired[bool]
     # MoE expert parallelism. TRT-LLM splits the TP dimension on MoE layers
     # into moe_tp × moe_ep, so the constraint is
@@ -36,6 +32,13 @@ class TrtllmSpecificArgs(TypedDict):
     # affect how MoE expert weights are partitioned inside each TP rank.
     moe_tensor_parallel_size: NotRequired[int]
     moe_expert_parallel_size: NotRequired[int]
+    # These mirror grpo.async_grpo.{in_flight_weight_updates,
+    # recompute_kv_cache_after_weight_updates}. They are duplicated here because
+    # TrtllmGeneration.update_weights_from_collective() reads the drain / kv-recompute
+    # behavior from its generation config (self.cfg["trtllm_cfg"]) — the generation
+    # backend does not receive the top-level master_config.grpo.async_grpo. Keep the
+    # two in sync (the exemplar grpo_math_1B_trtllm.yaml interpolates them from
+    # grpo.async_grpo so they cannot diverge).
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
 

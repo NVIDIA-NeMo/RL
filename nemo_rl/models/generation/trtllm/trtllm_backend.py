@@ -70,7 +70,8 @@ class NcclExtension(WorkerExtension):
     ) -> None:
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        assert torch.distributed.is_initialized(), "TRT-LLM backend requires torch.distributed to be initialized before init_collective"
+        local_rank = torch.distributed.get_rank()
         rank = train_world_size + rank_prefix + local_rank
 
         pg = StatelessProcessGroup(

@@ -135,8 +135,6 @@ class TrtllmAsyncGenerationWorkerImpl:
             flush=True,
         )
 
-        precision = trtllm_cfg.get("precision", "bfloat16")
-
         # One PG entry per worker (placement_groups=[pg]*N,
         # placement_bundle_indices=[[i0], [i1], ...]) so the expansion
         # generalises to multi-PG layouts (cross-node TP) when
@@ -149,8 +147,10 @@ class TrtllmAsyncGenerationWorkerImpl:
             model=self.model_name,
             backend="pytorch",
             tensor_parallel_size=tp_size,
-            dtype=precision,
+            dtype=trtllm_cfg["precision"],
             max_seq_len=trtllm_cfg["max_model_len"],
+            max_batch_size=trtllm_cfg["max_batch_size"],
+            max_num_tokens=trtllm_cfg["max_num_tokens"],
             orchestrator_type="ray",
             ray_worker_extension_cls="nemo_rl.models.generation.trtllm.trtllm_backend.NcclExtension",
             placement_groups=placement_groups_list,
@@ -161,38 +161,26 @@ class TrtllmAsyncGenerationWorkerImpl:
             ),
             cuda_graph_config=CudaGraphConfig(
                 enable_padding=True,
-                max_batch_size=trtllm_cfg["max_batch_size"] if "max_batch_size" in trtllm_cfg else 0,
+                max_batch_size=trtllm_cfg["max_batch_size"],
             ),
-            sleep_config=SleepConfig(
-                restore_modes={
-                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "NONE",
-                    ExecutorMemoryType.KV_CACHE: "NONE",
-                }
-            )
         )
-        if "max_batch_size" in trtllm_cfg:
-            llm_kwargs["max_batch_size"] = trtllm_cfg["max_batch_size"]
-        if "max_num_tokens" in trtllm_cfg:
-            llm_kwargs["max_num_tokens"] = trtllm_cfg["max_num_tokens"]
 
-        # Extract KvCacheConfig-level fields from trtllm_kwargs before
-        # spreading the rest as top-level AsyncLLM kwargs.  AsyncLLM validates
-        # its kwargs against LlmArgs.model_fields and rejects unknown keys;
-        # mamba_ssm_cache_dtype and friends live on KvCacheConfig, not LlmArgs.
-        _KV_CACHE_FIELDS = {
-            "mamba_ssm_cache_dtype",
-            "mamba_ssm_stochastic_rounding",
-            "mamba_ssm_philox_rounds",
-        }
+        # Pull the optional KvCacheConfig sub-dict out of trtllm_kwargs. Its
+        # fields (free_gpu_memory_fraction, mamba_ssm_cache_dtype, ...) live on
+        # KvCacheConfig, not on LlmArgs, so they can't be spread as top-level
+        # AsyncLLM kwargs (which are validated against LlmArgs.model_fields and
+        # reject unknown keys) — pass them via kv_cache_config instead. The rest
+        # of trtllm_kwargs is spread as top-level AsyncLLM kwargs below.
         extra_trtllm_kwargs = dict(self.cfg.get("trtllm_kwargs") or {})
-        kv_cache_kwargs = {k: extra_trtllm_kwargs.pop(k) for k in _KV_CACHE_FIELDS if k in extra_trtllm_kwargs}
+        kv_cache_kwargs = dict(extra_trtllm_kwargs.pop("kv_cache_config", None) or {})
 
+        # gpu_memory_utilization is a dedicated trtllm_cfg knob for
+        # free_gpu_memory_fraction; an explicit kv_cache_config value wins.
         gpu_mem_util = trtllm_cfg.get("gpu_memory_utilization")
-        if gpu_mem_util is not None or kv_cache_kwargs:
-            llm_kwargs["kv_cache_config"] = KvCacheConfig(
-                **({"free_gpu_memory_fraction": gpu_mem_util} if gpu_mem_util is not None else {}),
-                **kv_cache_kwargs,
-            )
+        if gpu_mem_util is not None:
+            kv_cache_kwargs.setdefault("free_gpu_memory_fraction", gpu_mem_util)
+        if kv_cache_kwargs:
+            llm_kwargs["kv_cache_config"] = KvCacheConfig(**kv_cache_kwargs)
 
         moe_tp = trtllm_cfg.get("moe_tensor_parallel_size")
         moe_ep = trtllm_cfg.get("moe_expert_parallel_size")
@@ -204,7 +192,12 @@ class TrtllmAsyncGenerationWorkerImpl:
         # Colocated: share each bundle's GPU 0.5/0.5 with the policy actor.
         # RayWorkerWrapper does ray.get_gpu_ids()[0], so num_gpus must be > 0.
         if self._colocated:
-            llm_kwargs["sleep_config"] = SleepConfig()
+            llm_kwargs["sleep_config"] = SleepConfig(
+                restore_modes={
+                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "NONE",
+                    ExecutorMemoryType.KV_CACHE: "NONE",
+                }
+            )
             llm_kwargs["per_worker_gpu_share"] = 0.5
 
         # Escape hatch: spread remaining user-provided TRT-LLM kwargs last so
@@ -370,9 +363,6 @@ class TrtllmAsyncGenerationWorkerImpl:
     async def reset_prefix_cache_async(self, **kwargs: Any) -> bool:
         if self.llm is None:
             return True
-        # AsyncLLM doesn't expose reset_prefix_cache directly; dispatch via
-        # collective_rpc to invoke WorkerExtension.reset_prefix_cache on each
-        # Ray worker (which calls PyExecutor.reset_prefix_cache locally).
         await self.llm.collective_rpc("reset_prefix_cache")
         return True
 

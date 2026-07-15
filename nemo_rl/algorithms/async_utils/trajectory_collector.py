@@ -524,7 +524,7 @@ class AsyncTrajectoryCollector:
                 "async_engine", False
             )
         elif backend == "trtllm":
-            assert generation_cfg.get("trtllm_cfg", {}).get("async_engine", False), (
+            assert generation_cfg["trtllm_cfg"]["async_engine"], (
                 "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
                 "synchronous engine path (async_engine=false) is no longer supported."
             )
