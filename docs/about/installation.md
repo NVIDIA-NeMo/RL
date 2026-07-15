@@ -1,5 +1,49 @@
 # Installation and Prerequisites
 
+## Docker Quickstart
+
+The fastest way to get started is with the pre-built NGC container, which includes all system dependencies (CUDA, cuDNN, vLLM, SGLang) pre-installed and removes the need for manual system-level setup.
+
+```sh
+# Pull the latest stable release
+docker pull nvcr.io/nvidia/nemo-rl:latest
+
+# Clone the repo (needed to mount your source into the container)
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
+cd nemo-rl
+
+# Set HuggingFace variables in your shell before running (recommended):
+# export HF_TOKEN=hf_...                        # required for gated models (e.g. Llama)
+# export HF_HOME=~/.cache/huggingface           # model and tokenizer cache
+# export HF_DATASETS_CACHE=~/.cache/huggingface/datasets  # dataset cache
+
+# Launch the container
+docker run --rm -it \
+  -u root \
+  --runtime=nvidia \
+  --gpus all \
+  --shm-size=64g \
+  --ulimit memlock=-1 \
+  -v $PWD:/opt/nemo-rl \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/hf_home \
+  -v ${HF_DATASETS_CACHE:-$HOME/.cache/huggingface/datasets}:/hf_datasets_cache \
+  -e HF_HOME=/hf_home \
+  -e HF_DATASETS_CACHE=/hf_datasets_cache \
+  -e HF_TOKEN \
+  -e WANDB_API_KEY \
+  -w /opt/nemo-rl \
+  nvcr.io/nvidia/nemo-rl:latest \
+  bash
+```
+
+Once inside the container, run any training command directly:
+
+```sh
+uv run python examples/run_grpo.py
+```
+
+For instructions on building your own image (e.g. from a custom branch), see the [Docker documentation](../docker.md).
+
 ## Clone the Repository
 
 Clone **NeMo RL** with submodules:
