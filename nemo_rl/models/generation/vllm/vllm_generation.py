@@ -13,13 +13,13 @@
 # limitations under the License.
 
 import asyncio
-import logging
 import os
 import warnings
 from collections import defaultdict
 from typing import (
     Any,
     AsyncGenerator,
+    Callable,
     Optional,
     Union,
 )
@@ -30,7 +30,7 @@ from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -44,64 +44,18 @@ from nemo_rl.models.generation.vllm.utils import (
     resolve_generation_worker_cls,
 )
 
-logger = logging.getLogger(__name__)
-
 
 class VllmGeneration(GenerationInterface):
-    @staticmethod
-    def init_cluster_placement_groups(
-        cluster: RayVirtualCluster,
-        config: VllmConfig,
-    ) -> None:
-        """Pre-initialize placement groups matching the strategy VllmGeneration expects.
-
-        Call this *before* constructing ``VllmGeneration`` when other components
-        compete for the same Ray resources and you need deterministic ordering —
-        topology-constrained inference PGs should be created before unconstrained
-        ones so they claim domain-aligned nodes first.
-
-        ``VllmGeneration.__init__`` calls ``_init_placement_groups`` internally,
-        but that call early-returns when PGs already exist, so calling this
-        method first is safe.
-        """
-        tp = config["vllm_cfg"]["tensor_parallel_size"]
-        pp = config["vllm_cfg"]["pipeline_parallel_size"]
-        model_parallel_size = tp * pp
-        colocated = config["colocated"]["enabled"]
-
-        strategy = None if colocated else "PACK"
-        needs_cross_node = model_parallel_size > cluster.num_gpus_per_node
-
-        cluster._init_placement_groups(
-            strategy=strategy,
-            use_unified_pg=needs_cross_node,
-        )
-
     def __init__(
         self,
         cluster: RayVirtualCluster,
         config: VllmConfig,
         name_prefix: str = "vllm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
-        defer_model_load: bool = False,
     ):
-        """Initialize a vLLM policy with distributed workers.
-
-        When defer_model_load=True, workers only reserve ports (seconds) and
-        dp_openai_server_base_urls is populated immediately from reserved ports.
-        Call load_and_start() later to perform heavy model loading. This enables
-        overlapping vLLM model loading with NeMo Gym init.
-
-        Args:
-            cluster: Virtual cluster for worker placement
-            config: VllmConfig dictionary
-            name_prefix: Prefix for Ray actor names
-            workers_per_node: Workers per node override
-            defer_model_load: If True, defer model loading for overlapped init
-        """
+        """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
-        self._defer_model_load = defer_model_load
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -192,19 +146,10 @@ class VllmGeneration(GenerationInterface):
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
-        if self.cfg["vllm_cfg"]["async_engine"]:
-            worker_builder = RayWorkerBuilder(
-                worker_cls, config, defer_model_load=defer_model_load
-            )
-        else:
-            worker_builder = RayWorkerBuilder(worker_cls, config)
+        worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
-        # User-supplied per-recipe env vars (e.g. vllm_cfg.env_vars in the yaml).
-        # Scoped to this generation config so it does not impact other test cases.
-        for k, v in self.cfg["vllm_cfg"].get("env_vars", {}).items():
-            env_vars[str(k)] = str(v)
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
@@ -248,6 +193,13 @@ class VllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
+        # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
+        # This is necessary for async engine to work
+        self._post_init()
+
+        # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
+        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
+
         # Number of data parallel groups is the number of tied worker groups
         assert self.dp_size == self.worker_group.dp_size, (
             f"Data parallel size mismatch. Expected {self.dp_size}, got {self.worker_group.dp_size}"
@@ -256,20 +208,8 @@ class VllmGeneration(GenerationInterface):
         # Used to track the round-robin selection of worker groups for generate_async
         self.current_generate_dp_shard_idx = 0
 
-        if defer_model_load:
-            # Workers only reserved ports — collect URLs immediately and defer
-            # the heavy model loading (and HTTP server start) to load_and_start().
-            self.dp_openai_server_base_urls = self._collect_reserved_urls()
-            self.device_uuids = None
-        else:
-            # Full init: call some collective rpc functions in the worker when
-            # initializing the vLLM engine (necessary for async engine to work),
-            # then report server URLs and device ids.
-            self._post_init()
-            # dp_openai_server_base_urls is only returned by the async vLLM flow
-            # when the http server is active.
-            self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
-            self.device_uuids = self._report_device_id()
+        # Save the device uuids for the workers
+        self.device_uuids = self._report_device_id()
 
         self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
 
@@ -316,109 +256,53 @@ class VllmGeneration(GenerationInterface):
                 return dict(node_bundles)
 
             def allocate_worker_groups(
-                pg: PlacementGroup,
-                tp_size: int,
-                pp_size: int,
-                sorted_bundle_indices: list[int] | None = None,
-                nvlink_domain_per_bundle_index: tuple[str, ...] | None = None,
+                pg: PlacementGroup, tp_size: int, pp_size: int
             ) -> list[tuple[int, list[int]]]:
-                """Partition a unified PG's bundles into model-parallel worker groups.
+                # Allocate worker groups for TP and PP training, assuming all nodes have identical bundle counts.
 
-                Slices the flat bundle list into consecutive chunks of ``tp_size * pp_size``
-                bundles. Each chunk becomes one DP replica (one vLLM engine instance).
-
-                Args:
-                    pg: The single unified placement group containing all inference bundles.
-                    tp_size: Tensor-parallel degree.
-                    pp_size: Pipeline-parallel degree.
-                    sorted_bundle_indices: Topology-sorted bundle order from
-                        ``RayVirtualCluster._sorted_bundle_indices``. When provided, bundles
-                        are ordered by (NVLink domain, topo_rank, gpu_id) so consecutive
-                        slices of TP*PP stay within the same NVLink domain (when the domain
-                        GPU count is divisible by TP*PP). When None, bundles are sorted by
-                        (node_id, bundle_idx) as a deterministic fallback.
-                    nvlink_domain_per_bundle_index: Per-bundle NVLink domain from
-                        ``RayVirtualCluster._nvlink_domain_per_bundle_index``. Used only
-                        for logging a warning when a worker group straddles multiple
-                        NVLink domains.
-
-                Returns:
-                    List of (node_idx, bundle_indices) tuples — one per DP replica.
-                    ``node_idx`` is the index of the first bundle's physical node within the
-                    PG's sorted unique node set.
-                """
+                # Retrieve both bundle mapping and per-node bundles
                 pg_table = ray.util.placement_group_table(pg)
                 bundle_to_node = pg_table["bundles_to_node_id"]
+                node_bundles = get_node_bundles(pg)
 
+                if not node_bundles:
+                    raise ValueError("Placement group contains no bundles")
+
+                # Ensure all nodes have the same number of bundles
+                counts = [len(b) for b in node_bundles.values()]
+                assert len(set(counts)) == 1, (
+                    "All nodes must have identical bundle counts"
+                )
+
+                total = sum(counts)
                 model_parallel_size = tp_size * pp_size
-
-                if sorted_bundle_indices is not None:
-                    # Topology-aware: bundles sorted by (domain, topo_rank, gpu_id).
-                    # Each model-parallel group is a consecutive slice of that list; it
-                    # stays within one NVLink domain only when TP*PP divides the usable
-                    # GPU count per domain in this ordering (see topology logs).
-                    flat = list(sorted_bundle_indices)
-                else:
-                    # Fallback: sort by node ID for deterministic ordering.
-                    node_bundles = get_node_bundles(pg)
-                    if not node_bundles:
-                        raise ValueError("Placement group contains no bundles")
-                    counts = [len(b) for b in node_bundles.values()]
-                    assert len(set(counts)) == 1, (
-                        "All nodes must have identical bundle counts"
-                    )
-                    sorted_nodes = sorted(node_bundles)
-                    flat = []
-                    for nid in sorted_nodes:
-                        flat.extend(node_bundles[nid])
-
-                num_groups = len(flat) // model_parallel_size
+                num_groups = total // model_parallel_size
                 if num_groups == 0:
                     raise ValueError(
                         "Unable to allocate any worker groups with the available resources."
                     )
 
-                unique_nodes = sorted(set(bundle_to_node.values()))
-                node_idx = {nid: idx for idx, nid in enumerate(unique_nodes)}
+                # Create reproducible node indices
+                sorted_nodes = sorted(node_bundles)
+                node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
 
+                # Flatten bundles in node order
+                flat: list[int] = []
+                for nid in sorted_nodes:
+                    flat.extend(node_bundles[nid])
+
+                # Slice into groups and assign logical index
                 groups: list[tuple[int, list[int]]] = []
                 for i in range(num_groups):
                     slice_ = flat[
                         i * model_parallel_size : (i + 1) * model_parallel_size
                     ]
-                    if (
-                        nvlink_domain_per_bundle_index is not None
-                        and sorted_bundle_indices is not None
-                    ):
-                        domains: set[str] = set()
-                        for bidx in slice_:
-                            if 0 <= bidx < len(nvlink_domain_per_bundle_index):
-                                d = nvlink_domain_per_bundle_index[bidx]
-                                if d != NVLINK_DOMAIN_UNKNOWN:
-                                    domains.add(d)
-                        if len(domains) > 1:
-                            logger.warning(
-                                "[TOPOLOGY] Model-parallel group %s (TP*PP=%s) spans %s NVLink "
-                                "domains %s; cross-domain collectives may use slower links (e.g. "
-                                "IB). Prefer TP*PP that divides usable GPUs per domain, or adjust "
-                                "segment/domain allocation.",
-                                i,
-                                model_parallel_size,
-                                len(domains),
-                                sorted(domains),
-                            )
                     first_node = bundle_to_node[slice_[0]]
                     groups.append((node_idx[first_node], slice_))
 
                 return groups
 
-            tied_groups = allocate_worker_groups(
-                unified_pg,
-                tp_size,
-                pp_size,
-                sorted_bundle_indices=cluster._sorted_bundle_indices,
-                nvlink_domain_per_bundle_index=cluster._nvlink_domain_per_bundle_index,
-            )
+            tied_groups = allocate_worker_groups(unified_pg, tp_size, pp_size)
         else:
             tied_groups = []
             # For per-node PGs, each PG represents a node
@@ -473,45 +357,6 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
-
-    def _collect_reserved_urls(self) -> list[Optional[str]]:
-        """Collect reserved URLs from DP leaders before model loading.
-
-        Only called when defer_model_load=True. Workers have bound ports
-        during __init__ and can report their reserved URLs immediately.
-        """
-        if not self.cfg["vllm_cfg"]["async_engine"]:
-            return [None]
-
-        futures = self.worker_group.run_all_workers_single_data(
-            "get_reserved_url",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        results = ray.get(futures)
-        return results
-
-    def load_and_start(self) -> None:
-        """Load models on all workers and start HTTP servers.
-
-        Called after a deferred init (defer_model_load=True) to perform the
-        heavy model loading. Updates dp_openai_server_base_urls with the actual
-        running server URLs and populates device_uuids.
-        """
-        # Call load_model() on all model-owner workers
-        futures = self.worker_group.run_all_workers_single_data(
-            "load_model",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        ray.get(futures)
-
-        # Post-init (collective rpc functions needed for async engine)
-        self._post_init()
-
-        # Refresh URLs from the actual running servers
-        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
-
-        # Save device UUIDs
-        self.device_uuids = self._report_device_id()
 
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting
@@ -619,6 +464,90 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
+
+    def reset_collective(self):
+        """Tear down the cross-cluster weight-sync comm on all gen workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "reset_collective", data={}, max_workers=None
+        )
+        import ray as _ray
+
+        results = []
+        for f in futures:
+            try:
+                results.append(_ray.get(f, timeout=30.0))
+            except Exception as e:
+                print(
+                    f"[vllm_generation.reset_collective] worker raised {e}", flush=True
+                )
+                results.append(None)
+        return results
+
+    def get_dp_urls(self) -> list[str]:
+        """Return the OpenAI base URLs for all DP shards."""
+        return [url for url in self.dp_openai_server_base_urls if url is not None]
+
+    def add_dp_worker(
+        self,
+        pre_append_hook: Optional[Callable[[], None]] = None,
+    ):
+        """SLURM version: restart a dead shard's process on the same node.
+
+        Returns (actor_handles, placement_group=None, worker_indices, base_url).
+        pre_append_hook fires just before the worker is appended to the group.
+
+        For SLURM (phases 1+2), the node is still in the SLURM allocation after
+        a process-level failure, so we just spawn a new Ray actor on that node
+        using NodeAffinitySchedulingStrategy.
+        """
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy  # noqa: F401
+        from nemo_rl.distributed.worker_groups import RayWorkerGroup  # noqa: F401
+
+        # Determine which node to restart on: use the node of dp_leader 0
+        # (fallback: let Ray schedule freely). Dead workers have been removed
+        # from dp_leader_worker_indices via mark_workers_dead, so the current
+        # leaders are all alive. The dead shard's node is passed in via
+        # the placement_group field on ShardEntry (we repurpose it as node_id str).
+        # For now, schedule on any node in the SLURM allocation (Ray handles it).
+
+        pg = None  # No PG in SLURM — the node stays allocated
+        dp_shard_idx = self.worker_group.dp_size  # next slot
+        bundle_indices = (dp_shard_idx, [0])
+
+        actor, name, bundle_indices, dp_shard_idx = self.worker_group.spawn_worker_only(
+            placement_group=pg,
+            bundle_indices=bundle_indices,
+            dp_shard_idx=dp_shard_idx,
+        )
+
+        # Drive prepare_refit_info on the bare actor handle BEFORE appending.
+        # (actor.__init__ runs async; we wait for it here)
+        cached_info = getattr(self, "_cached_state_dict_info", None)
+        if cached_info is not None:
+            try:
+                ray.get(actor.prepare_refit_info.remote(cached_info), timeout=120)
+            except Exception as e:
+                print(
+                    f"[add_dp_worker] prepare_refit_info failed: {e}", flush=True
+                )
+
+        new_idx = self.worker_group.append_spawned_worker(
+            actor, name, bundle_indices, dp_shard_idx,
+            pre_append_hook=pre_append_hook,
+        )
+
+        # Get base URL (async engine only)
+        base_url = None
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            try:
+                base_url = ray.get(
+                    actor.report_dp_openai_server_base_url.remote(), timeout=120
+                )
+                self.dp_openai_server_base_urls.append(base_url)
+            except Exception as e:
+                print(f"[add_dp_worker] base_url fetch failed: {e}", flush=True)
+
+        return [actor], None, [new_idx], base_url
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -927,6 +856,9 @@ class VllmGeneration(GenerationInterface):
 
         # Wait for all futures to complete
         ray.get(futures)
+
+        # Cache so add_dp_worker can replay this on a newly-spawned worker.
+        self._cached_state_dict_info = state_dict_info
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""

@@ -93,6 +93,10 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation.ft_constants import (
+    REFIT_RETRY_MAX_ATTEMPTS,
+    REFIT_RETRY_SETTLE_S,
+)
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -540,6 +544,12 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    # HTTP-only disagg: gen server is external (separate cluster/process).
+    # Implicitly enabled when not colocated and `remote_generation_url` is set.
+    disagg_http_mode = (
+        not colocated_inference
+        and generation_config.get("remote_generation_url") is not None
+    )
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -703,7 +713,16 @@ def setup(
         inference_nodes = inference_resources["num_nodes"]
 
         # validate and configure resources
-        if policy_nodes == 1:
+        if disagg_http_mode:
+            # External gen server manages its own GPUs. Training cluster uses
+            # ALL gpus from cluster config — no subtraction.
+            inference_nodes = inference_nodes or 1
+            print(
+                f"  ⚡ Disagg HTTP mode: training uses {train_gpus_per_node} GPUs/node, "
+                f"inference is external ({inference_gpus_per_node}×{inference_nodes} GPUs)",
+                flush=True,
+            )
+        elif policy_nodes == 1:
             # When policy_nodes == 1, train and inference are on the same node
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
@@ -750,10 +769,11 @@ def setup(
             )
             train_nodes -= inference_nodes
 
-        assert train_nodes > 0 and inference_nodes > 0, (
-            f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
-            f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
-        )
+        if not disagg_http_mode:
+            assert train_nodes > 0 and inference_nodes > 0, (
+                f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
+                f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
+            )
 
         # Build topology-aware domain constraints for placement groups.
         # Each selected node's bundles are pinned to a specific NVLink domain so
@@ -868,28 +888,36 @@ def setup(
             flush=True,
         )
 
-        # Create inference cluster with topology constraints so TP groups
-        # stay within NVLink domains. Eagerly initialize PGs when constraints
-        # are set so inference claims domain-aligned nodes first.
-        inference_cluster = RayVirtualCluster(
-            name="grpo_inference_cluster",
-            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
-            use_gpus=True,
-            num_gpus_per_node=inference_gpus_per_node,
-            max_colocated_worker_groups=1,
-            port_range_low=cluster_config.get("master_port_range_low"),
-            port_range_high=cluster_config.get("master_port_range_high"),
-            segment_size=inference_segment_size,
-            node_resource_constraints=inference_node_resource_constraints,
-        )
-        if inference_node_resource_constraints is not None:
-            VllmGeneration.init_cluster_placement_groups(
-                inference_cluster, generation_config
+        if disagg_http_mode:
+            # No local inference cluster — gen server is external
+            inference_cluster = None
+            print(
+                "  ✓ No local inference cluster (disagg HTTP mode)",
+                flush=True,
             )
-        print(
-            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
-            flush=True,
-        )
+        else:
+            # Create inference cluster with topology constraints so TP groups
+            # stay within NVLink domains. Eagerly initialize PGs when constraints
+            # are set so inference claims domain-aligned nodes first.
+            inference_cluster = RayVirtualCluster(
+                name="grpo_inference_cluster",
+                bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+                use_gpus=True,
+                num_gpus_per_node=inference_gpus_per_node,
+                max_colocated_worker_groups=1,
+                port_range_low=cluster_config.get("master_port_range_low"),
+                port_range_high=cluster_config.get("master_port_range_high"),
+                segment_size=inference_segment_size,
+                node_resource_constraints=inference_node_resource_constraints,
+            )
+            if inference_node_resource_constraints is not None:
+                VllmGeneration.init_cluster_placement_groups(
+                    inference_cluster, generation_config
+                )
+            print(
+                f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
+                flush=True,
+            )
 
     # ==========================
     #   Training and Inference
@@ -1180,6 +1208,27 @@ def setup(
             worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
             worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+        elif disagg_http_mode:
+            # HTTP-only disagg: gen server is external, don't create VllmGeneration.
+            # Only initialize policy training workers.
+            from nemo_rl.models.generation.remote_generation import RemoteGeneration
+
+            remote_url = generation_config["remote_generation_url"]
+            assert remote_url, (
+                "remote_generation_url must be set for disaggregated HTTP mode"
+            )
+            policy_generation = RemoteGeneration(
+                generation=None,
+                server_url=remote_url,
+                config=generation_config,
+            )
+            print(
+                f"  ✓ Using HTTP-only RemoteGeneration via unified router {remote_url}",
+                flush=True,
+            )
+
+            policy, policy_time = init_policy()
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
         else:
             policy_generation, policy = initialize_generation_with_policy(
                 init_generation_fn=init_vllm,
@@ -1231,7 +1280,40 @@ def setup(
         # world includes all training workers and all inference workers
         train_world_size = train_cluster.world_size()
         inference_world_size = inference_nodes * inference_gpus_per_node
+        # In disagg HTTP mode, prefer the gen control server's reported
+        # current_gen_world_size — it reflects any shard already removed by a
+        # fault before train booted.
+        if disagg_http_mode and hasattr(
+            policy_generation, "_fetch_current_gen_world_size"
+        ):
+            dynamic_inf = policy_generation._fetch_current_gen_world_size()
+            if dynamic_inf is not None and dynamic_inf > 0:
+                if dynamic_inf != inference_world_size:
+                    print(
+                        f"  ↻ gen world size has drifted from config "
+                        f"(config={inference_world_size}, current={dynamic_inf}); "
+                        f"using current for init_collective.",
+                        flush=True,
+                    )
+                inference_world_size = dynamic_inf
         world_size = train_world_size + inference_world_size
+        # When the train side runs the RefitWorker split-actor path
+        # (NRL_USE_REFIT_WORKER), only ONE process on the train side participates
+        # in the cross-cluster group (the RefitWorker actor, rank 0). The gen side
+        # must agree on the smaller world so its rank computation matches.
+        uses_refit_worker = bool(getattr(policy, "_use_refit_worker", False))
+        if uses_refit_worker:
+            effective_train_ws = 1
+            effective_world_size = effective_train_ws + inference_world_size
+            print(
+                f"  ⓘ RefitWorker mode: cross-cluster world shrinks "
+                f"{train_world_size}+{inference_world_size}={world_size} → "
+                f"{effective_train_ws}+{inference_world_size}={effective_world_size}",
+                flush=True,
+            )
+        else:
+            effective_train_ws = train_world_size
+            effective_world_size = world_size
 
         # init collective
         if backend == "megatron":
@@ -1241,26 +1323,29 @@ def setup(
             futures_train = policy.init_collective_mcore_generation(
                 ip,
                 port,
-                world_size,
+                effective_world_size,
                 rank_offset=0,
                 refit_backend=refit_backend,
             )
             futures_inference = policy_generation.init_collective(
                 ip,
                 port,
-                world_size,
-                train_world_size=train_world_size,
+                effective_world_size,
+                train_world_size=effective_train_ws,
                 refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
         else:
             futures_train = policy.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
+                ip, port, effective_world_size, train_world_size=effective_train_ws
             )
             futures_inference = policy_generation.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
+                ip, port, effective_world_size, train_world_size=effective_train_ws
             )  # type: ignore
             ray.get(futures_train + futures_inference)
+        # Spawn the RefitWorker sidecar if this policy uses it
+        if hasattr(policy, "_ensure_refit_worker"):
+            policy._ensure_refit_worker()
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     state_dict_info = policy.prepare_refit_info()
@@ -2036,6 +2121,13 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    # Disagg fault-tolerance: if a vLLM DP shard was removed (or added) since
+    # the last refit, the train↔gen NCCL group is stale. Re-init both sides
+    # at the new world size before touching weights. No-op in steady state
+    # (when the world size hasn't changed) and in colocated mode.
+    if not colocated_inference and hasattr(policy_generation, "ensure_collective_synced"):
+        policy_generation.ensure_collective_synced(policy)
+
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
         policy_generation.suspend_for_refit()
@@ -2106,15 +2198,75 @@ def refit_policy_generation(
                 )
             if isinstance(policy_generation, MegatronGeneration):
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
             else:
-                futures_train = policy.broadcast_weights_for_collective(
-                    kv_scales=kv_scales
-                )
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+                # vLLM non-colocated: fault-tolerant broadcast with retry loop.
+                # On broadcast failure, abort the stale NCCL comm and re-sync at
+                # the current gen world size before retrying.
+                broadcast_attempts = 0
+                while True:
+                    broadcast_attempts += 1
+                    try:
+                        futures_train = policy.broadcast_weights_for_collective(
+                            kv_scales=kv_scales
+                        )
+                        futures_inference = (
+                            policy_generation.update_weights_from_collective()
+                        )
+                        # Set an explicit upper bound so a wedged broadcast raises
+                        # a clear GetTimeoutError instead of hanging indefinitely.
+                        ray.get(futures_train, timeout=600)
+                        results = ray.get(futures_inference, timeout=600)
+                        update_success = all(
+                            result for result in results if result is not None
+                        )
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        if broadcast_attempts >= REFIT_RETRY_MAX_ATTEMPTS or not hasattr(
+                            policy_generation, "ensure_collective_synced"
+                        ):
+                            raise
+                        print(
+                            f"  ⚠ broadcast failed ({type(e).__name__}: {e}); "
+                            "aborting stale comm and re-syncing at current "
+                            "gen world size before retry",
+                            flush=True,
+                        )
+                        if hasattr(policy, "abort_collective"):
+                            try:
+                                ray.get(policy.abort_collective(), timeout=30)
+                            except Exception as abort_e:  # noqa: BLE001
+                                print(
+                                    f"  ! abort_collective raised "
+                                    f"{type(abort_e).__name__}: {abort_e}",
+                                    flush=True,
+                                )
+                        # Also call reset_collective on the gen side: when a gen
+                        # worker dies mid-broadcast, surviving gen workers are
+                        # wedged in update_weights_from_collective. Forcing
+                        # reset_collective frees them to respond to the fresh
+                        # init_collective on the next attempt. Best-effort,
+                        # bounded — if it wedges, ensure_collective_synced will
+                        # eventually clean up.
+                        if hasattr(policy_generation, "reset_collective"):
+                            try:
+                                reset_futs = policy_generation.reset_collective()
+                                ray.wait(list(reset_futs), timeout=15.0)
+                            except Exception as reset_e:  # noqa: BLE001
+                                print(
+                                    f"  ! gen reset_collective dispatch raised "
+                                    f"{type(reset_e).__name__}: {reset_e}",
+                                    flush=True,
+                                )
+                        # Force ensure_collective_synced to re-init at the
+                        # new world size by clearing the cached value.
+                        if hasattr(policy_generation, "_last_synced_world_size"):
+                            policy_generation._last_synced_world_size = None
+                        policy_generation.ensure_collective_synced(policy)
 
         # check if update is successful
         if not update_success:
