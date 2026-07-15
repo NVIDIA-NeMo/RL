@@ -58,6 +58,9 @@ export EXTRA_MOUNTS="$Z/RL:$Z/RL,$Z/hf_home:$Z/hf_home,$Z/hf_cache:$Z/hf_cache,$
 # not a 500). Set NRL_NAN_CAPTURE=1 + NRL_NAN_CAPTURE_DIR only if you need to debug a new NaN.
 export NRL_NAN_GUARD=1
 export RAY_DEDUP_LOGS=0
+# Opt into the NCCL flight recorder (debugging the training-step collective stall). Universal flag;
+# ray.sub defaults the dump dir for USER=zhiyul, else set TORCH_NCCL_DEBUG_INFO_TEMP_FILE yourself.
+export NRL_NCCL_FLIGHT_RECORDER=1
 
 cd "$Z/RL"
 bash ultra_launch.sh checkpointing.save_period=1
