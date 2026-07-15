@@ -1799,7 +1799,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
         return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
 
     if backend == "trtllm":
-        assert generation_config["trtllm_cfg"]["async_engine"], (
+        assert generation_config.get("trtllm_cfg", {}).get("async_engine", False), (
             "TRT-LLM backend requires trtllm_cfg.async_engine=true; the "
             "synchronous engine path (async_engine=false) is no longer supported."
         )
@@ -1840,6 +1840,7 @@ def _build_async_grpo_train_data(
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
     return train_data
+
 
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
     """Zero loss_multiplier where mask_sample is True and return the count."""

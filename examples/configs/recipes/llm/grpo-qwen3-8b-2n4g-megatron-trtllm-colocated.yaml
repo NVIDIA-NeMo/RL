@@ -1,12 +1,9 @@
 defaults: ../../grpo_math_1B_trtllm.yaml
-grpo:
-  val_period: 10
 checkpointing:
   enabled: false
   checkpoint_dir: results/grpo_qwen3_8b_trtllm
 policy:
   model_name: Qwen/Qwen3-8B-Base
-  train_micro_batch_size: 4
   logprob_batch_size: 4
   max_total_sequence_length: 8192
   dtensor_cfg:
@@ -27,20 +24,12 @@ policy:
       lr_decay_iters: null
       lr_warmup_iters: 10
       lr_warmup_init: 1.0e-07
-  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size}, 2}
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    2}
   generation:
-    backend: trtllm
     trtllm_cfg:
       tensor_parallel_size: 4
-      max_model_len: ${policy.max_total_sequence_length}
-      max_batch_size: 256
       max_num_tokens: 65536
-      gpu_memory_utilization: 0.6
-    colocated:
-      enabled: true
-      resources:
-        gpus_per_node: null
-        num_nodes: null
 data:
   max_input_seq_length: 2048
   train:
