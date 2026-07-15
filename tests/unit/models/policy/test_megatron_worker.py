@@ -45,6 +45,71 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+def test_model_owned_packing_capability_is_detected():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    class ModelOwnedPackingModel:
+        model_owns_packing = True
+
+    assert _model_self_packs_for_cp(ModelOwnedPackingModel())
+
+
+def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_mtp_loss_mask,
+    )
+
+    class ModelOwnedPackingModel:
+        model_owns_mtp_loss_mask_packing = True
+
+    assert _model_self_packs_mtp_loss_mask(ModelOwnedPackingModel())
+    assert not _model_self_packs_mtp_loss_mask(object())
+
+
+def test_regular_model_does_not_delegate_packing():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    assert not _model_self_packs_for_cp(object())
+
+
+def test_refit_size_estimate_preserves_integral_buffer_dtype():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _estimate_refit_tensor_size_in_bytes,
+    )
+
+    param = torch.zeros(3, dtype=torch.int64)
+
+    assert _estimate_refit_tensor_size_in_bytes(
+        param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
+    ) == 3 * 8 * 2 * 4
+
+
+def test_refit_size_estimate_casts_floating_weight_to_export_dtype():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _estimate_refit_tensor_size_in_bytes,
+    )
+
+    param = torch.zeros(3, dtype=torch.float32)
+
+    assert _estimate_refit_tensor_size_in_bytes(
+        param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
+    ) == 3 * 2 * 2 * 4
+
+
+def test_qwen3vl_type_fallback_still_delegates_packing():
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    assert _model_self_packs_for_cp(Qwen3VLModel.__new__(Qwen3VLModel))
+
+
 class _FakeTrainableModel:
     def __init__(self):
         self.train_called = False

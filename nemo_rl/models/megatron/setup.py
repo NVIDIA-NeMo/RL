@@ -68,6 +68,11 @@ from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_c
 
 _HF_CONFIG_PATCHED = False
 
+_NEMOTRON_OMNI_ARCHITECTURES = {
+    "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Super_Omni_Reasoning_V3",
+}
+
 
 def _patch_hf_config_double_instantiation():
     """Patch HF config classes whose __post_init__ fails with Megatron's recursive instantiation.
@@ -323,6 +328,44 @@ def _get_hf_config_overrides_hash(overrides: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
 
+def _validate_nemotron_omni_megatron_lm_layout(
+    hf_config: Any,
+    checkpoint_dir: str,
+) -> None:
+    """Reject legacy LLaVA checkpoints before building the canonical Omni model.
+
+    Raw ``megatron_lm`` checkpoints have no Bridge ``run_config.yaml`` in which
+    to persist the versioned model contract. Their tensor namespace is therefore
+    the only reliable way to distinguish the old LLaVA wrapper from the canonical
+    model-owned-packing implementation.
+    """
+
+    architectures = set(getattr(hf_config, "architectures", None) or ())
+    if not architectures.intersection(_NEMOTRON_OMNI_ARCHITECTURES):
+        return
+
+    from megatron.core import dist_checkpointing
+
+    tensor_metadata = dist_checkpointing.load_tensors_metadata(checkpoint_dir)
+    legacy_keys = [
+        str(key)
+        for key in tensor_metadata
+        if "llava_model" in str(key).split(".")
+    ]
+    if not legacy_keys:
+        return
+
+    examples = ", ".join(repr(key) for key in legacy_keys[:3])
+    raise RuntimeError(
+        "Cannot load this Nemotron Omni megatron_lm checkpoint as NemotronOmniModel: "
+        "its tensor namespace contains the legacy 'llava_model' wrapper "
+        f"({examples}). In this branch NemotronOmniModel uses model-owned packing and a "
+        "different top-level checkpoint layout. Reconvert the original HF checkpoint with "
+        "this branch, or use the explicit NemotronOmniLlavaModelProvider/"
+        "NemotronOmniLlavaBridge with the compatible legacy Megatron-LM pin."
+    )
+
+
 def _resolve_iter_dir_from_root(path: str, not_found_msg: str) -> str:
     """Resolve the latest iteration directory under ``path``.
 
@@ -485,6 +528,7 @@ def setup_model_config(
         hf_cfg = AutoConfig.from_pretrained(
             hf_model_name, trust_remote_code=True, **hf_config_overrides
         )
+        _validate_nemotron_omni_megatron_lm_layout(hf_cfg, pretrained_path)
         bridge_obj = AutoBridge.from_hf_config(hf_cfg)
         model_cfg = bridge_obj.to_megatron_provider(load_weights=False)
     else:
@@ -538,6 +582,14 @@ def setup_model_config(
 
         model_cfg = cfg_from_pretrained.model
         cfg_from_pretrained.logger = LoggerConfig()
+
+    # New and legacy Nemotron Omni checkpoints once serialized the same
+    # provider class name with different semantics. Providers that implement
+    # this hook must prove their explicit, versioned contract before setup
+    # applies runtime parallelism or constructs any model layers.
+    validate_model_contract = getattr(model_cfg, "validate_model_contract", None)
+    if callable(validate_model_contract):
+        validate_model_contract()
 
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
