@@ -54,6 +54,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_off_policy_distillation_train,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import DynamicBatchingConfigDisabled, TokenizerConfig
 
 
 def has_gloo() -> bool:
@@ -172,12 +173,18 @@ def _make_master_config(
                     **{
                         "projection_matrix_path": "/tmp/dummy-projection.pt",
                         "weight": 1.0,
+                        "model_name": "teacher-model",
+                        "precision": "bfloat16",
                         "dtensor_cfg": {
                             "enabled": True,
                             "_v2": True,
                             "tensor_parallel_size": 1,
                             "context_parallel_size": 1,
+                            "sequence_parallel": False,
+                            "activation_checkpointing": False,
+                            "cpu_offload": False,
                         },
+                        "dynamic_batching": {"enabled": False},
                         "max_total_sequence_length": 64,
                         "make_sequence_length_divisible_by": 8,
                         "train_global_batch_size": 1,
@@ -216,6 +223,17 @@ def _make_master_config(
             },
         }
     )
+
+
+def test_teacher_policy_config_validates_nested_policy_fields():
+    policy_config = _make_master_config().teachers[0].policy_config()
+
+    assert isinstance(policy_config["tokenizer"], TokenizerConfig)
+    assert isinstance(
+        policy_config["dynamic_batching"], DynamicBatchingConfigDisabled
+    )
+    assert "projection_matrix_path" not in policy_config
+    assert "weight" not in policy_config
 
 
 def _make_tokenizer(vocab_size: int) -> MagicMock:
@@ -736,12 +754,18 @@ def test_setup_builds_one_policy_per_teacher():
             **{
                 "projection_matrix_path": None,
                 "weight": 0.5,
+                "model_name": "teacher-model",
+                "precision": "bfloat16",
                 "dtensor_cfg": {
                     "enabled": True,
                     "_v2": True,
                     "tensor_parallel_size": 1,
                     "context_parallel_size": 1,
+                    "sequence_parallel": False,
+                    "activation_checkpointing": False,
+                    "cpu_offload": False,
                 },
+                "dynamic_batching": {"enabled": False},
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
                 "train_global_batch_size": 1,
