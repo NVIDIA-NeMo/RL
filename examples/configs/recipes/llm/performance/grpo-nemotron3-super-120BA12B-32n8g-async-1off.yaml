@@ -56,7 +56,7 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-nemotron3-super-120BA12B-32n8g-megatron-async-1off
+    name: grpo-nemotron3-super-120BA12B-32n8g-async-1off
 cluster:
   gpus_per_node: 8
   num_nodes: 32

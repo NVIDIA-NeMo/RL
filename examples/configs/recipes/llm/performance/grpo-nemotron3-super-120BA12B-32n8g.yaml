@@ -4,8 +4,9 @@ grpo:
   num_generations_per_prompt: 8
 loss_fn:
   force_on_policy_ratio: true
+  use_importance_sampling_correction: true
 checkpointing:
-  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-32n8g-megatron
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-32n8g
 policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
   tokenizer:
@@ -45,7 +46,7 @@ logger:
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-nemotron3-super-120BA12B-32n8g-megatron
+    name: grpo-nemotron3-super-120BA12B-32n8g
 cluster:
   gpus_per_node: 8
   num_nodes: 32
