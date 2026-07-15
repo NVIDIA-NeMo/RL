@@ -26,11 +26,10 @@ if [[ "$HAS_FFMPEG" == "yes" ]]; then
     exit 0
 fi
 
-echo "[audio-deps] Installing torchaudio==2.11.0 (pytorch-cu130, with FFmpeg) and torchcodec..."
+echo "[audio-deps] Installing torchaudio==2.11.0 (pytorch-cu130, with bundled FFmpeg)..."
 uv pip install \
     --index-url https://download.pytorch.org/whl/cu130 \
     --extra-index-url https://pypi.org/simple \
     --reinstall-package torchaudio \
-    "torchaudio==2.11.0" \
-    "torchcodec>=0.3.0"
+    "torchaudio==2.11.0"
 echo "[audio-deps] Done."
