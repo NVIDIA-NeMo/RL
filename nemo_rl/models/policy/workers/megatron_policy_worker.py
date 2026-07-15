@@ -92,6 +92,10 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.checkpoint_engine import (
+    MegatronCheckpointEngineSendMixin,
+    maybe_preinit_nixl_checkpoint_engine,
+)
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -146,6 +150,7 @@ class MegatronPolicyWorkerImpl(
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     TQWorkerMixin,
+    MegatronCheckpointEngineSendMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
 ):
@@ -294,6 +299,7 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()

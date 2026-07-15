@@ -22,6 +22,10 @@ from typing import Any, Literal
 import torch
 import zmq
 
+from nemo_rl.models.generation.vllm.checkpoint_engine import (
+    VllmCheckpointEngineMixin,
+    global_rollout_rank,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -154,7 +158,7 @@ def _read_mtp_layer_weights_from_checkpoint(
     return weights
 
 
-class VllmInternalWorkerExtension:
+class VllmInternalWorkerExtension(VllmCheckpointEngineMixin):
     _sparse_delta_applier: Any = None
 
     def bind_numa(self) -> bool:
@@ -187,9 +191,10 @@ class VllmInternalWorkerExtension:
         """Initialize the collective communication."""
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        local_rank = torch.distributed.get_rank()
         # Place vLLM ranks after all training ranks so all training workers can join
-        rank = train_world_size + rank_prefix + local_rank
+        rank = train_world_size + global_rollout_rank(
+            rank_prefix, world_size - train_world_size
+        )
 
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size

@@ -26,6 +26,9 @@ from nemo_rl.models.generation.constants import (
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    enabled_checkpoint_engine_config,
+)
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
@@ -61,6 +64,28 @@ def create_weight_synchronizer(
         raise ValueError(
             f"Unknown generation backend {generation_backend!r}. "
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
+        )
+
+    checkpoint_engine_config = enabled_checkpoint_engine_config(generation.cfg)
+    if checkpoint_engine_config is not None:
+        if colocated:
+            raise ValueError(
+                "checkpoint-engine refit is only supported for non-colocated "
+                "generation. Set policy.generation.colocated.enabled=false or "
+                "disable policy.generation.checkpoint_engine.enabled."
+            )
+        if generation_backend != VLLM_BACKEND:
+            raise NotImplementedError(
+                "checkpoint-engine non-colocated refit is only supported for "
+                f"the vLLM generation backend, got {generation_backend!r}."
+            )
+
+        from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
+            CheckpointEngineWeightSynchronizer,
+        )
+
+        return CheckpointEngineWeightSynchronizer(
+            policy, generation, checkpoint_engine_config
         )
 
     if refit_buffer_size_gb is not None and refit_buffer_size_gb <= 0:

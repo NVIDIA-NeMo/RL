@@ -119,6 +119,9 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    enabled_checkpoint_engine_config,
+)
 
 # ===============================================================================
 # Configuration
@@ -1257,8 +1260,20 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    checkpoint_engine_config = enabled_checkpoint_engine_config(generation_config)
+    if checkpoint_engine_config is not None and backend != "vllm":
+        raise NotImplementedError(
+            "checkpoint-engine refit is only supported for the vLLM generation "
+            f"backend, but policy.generation.backend={backend!r}. Disable "
+            "policy.generation.checkpoint_engine.enabled."
+        )
+
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference and remote_transport is None:
+    if (
+        not colocated_inference
+        and remote_transport is None
+        and checkpoint_engine_config is None
+    ):
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -1296,6 +1311,11 @@ def setup(
             )  # type: ignore
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    elif not colocated_inference and checkpoint_engine_config is not None:
+        print(
+            f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
+            flush=True,
+        )
 
     if remote_transport is not None:
         t0 = time.perf_counter()
@@ -2097,6 +2117,16 @@ def refit_policy_generation(
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
+
+    if enabled_checkpoint_engine_config(policy_generation.cfg) is not None:
+        from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
+            sync_weights_with_checkpoint_engine,
+        )
+
+        sync_weights_with_checkpoint_engine(
+            policy, policy_generation, timer=timer, kv_scales=kv_scales
+        )
+        return {}
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
