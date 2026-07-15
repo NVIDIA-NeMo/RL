@@ -2059,8 +2059,13 @@ def run_async_nemo_gym_rollout(
 
     component_dicts = [extract_reward_components(r["full_result"]) for r in results]
     if any(c is not None for c in component_dicts):
-        # Stable, global component ordering so reward1/reward2/... map to the same
-        # signal across every sample (components absent on a sample default to 0.0).
+        # Canonical (alphabetical) component ordering, not just deduplication: the
+        # reward{n} index -> component-name mapping must be stable across every sample
+        # and every run. GDPO's per-component baseline (calculate_baseline_and_std_per_prompt)
+        # assumes reward1 denotes the same signal for all responses to a prompt, and
+        # grpo.adv_estimator.reward_weights is documented as "ordered to match reward1,
+        # reward2, ...". A first-seen order (e.g. dict.fromkeys) would be batch-dependent
+        # and could shift that mapping between runs; sorting keeps it deterministic.
         ordered_names = sorted(
             {name for c in component_dicts if c is not None for name in c}
         )
@@ -2071,14 +2076,23 @@ def run_async_nemo_gym_rollout(
                     for c in component_dicts
                 ]
             )
-        # Keep total_reward consistent with the native multi-reward path (sum of
-        # components) so GDPO and a GRPO control read the same aggregate.
-        final_batch["total_reward"] = torch.tensor(
-            [
-                sum(c.values()) if c is not None else float(r["full_result"]["reward"])
-                for c, r in zip(component_dicts, results)
-            ]
-        )
+        # Leave total_reward as the verifier's scalar `reward` (set above); do not
+        # silently overwrite it. When a verifier emits reward_components, the contract is
+        # reward == sum(components), so overwriting would be a no-op in the correct case
+        # and would only mask a misconfigured verifier when it isn't. Validate that
+        # contract instead and fail fast on a real mismatch.
+        for idx, (components, r) in enumerate(zip(component_dicts, results)):
+            if components is None:
+                continue
+            scalar_reward = float(r["full_result"]["reward"])
+            component_sum = sum(components.values())
+            if not math.isclose(scalar_reward, component_sum, rel_tol=1e-5, abs_tol=1e-6):
+                raise ValueError(
+                    f"NeMo Gym verify result {idx} has reward={scalar_reward} but its "
+                    f"reward_components sum to {component_sum} ({components}). A multi-reward "
+                    "verifier must set reward = sum(reward_components.values()) so single-reward "
+                    "(GRPO) consumers and GDPO read the same aggregate."
+                )
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,
