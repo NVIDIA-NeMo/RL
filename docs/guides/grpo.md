@@ -650,6 +650,38 @@ grpo:
 ```
 The number of weights must equal the number of reward components, or a `ValueError` is raised.
 
+#### Comparing GDPO against a GRPO baseline
+
+The clearest way to see GDPO's effect is a matched comparison: identical config, with the advantage estimator as the only difference. `examples/configs/grpo_math_1B_multireward.yaml` is exactly that control — it inherits `gdpo_math_1B.yaml` and only flips `adv_estimator.name` back to `grpo`, so both runs use the same multi-reward environment.
+
+```
+# GDPO
+uv run examples/run_grpo.py --config examples/configs/gdpo_math_1B.yaml
+# GRPO control on the same multi-reward env
+uv run examples/run_grpo.py --config examples/configs/grpo_math_1B_multireward.yaml
+```
+
+Before committing to a full run, you can reproduce the advantage-collapse mechanism on CPU in a few seconds:
+
+```
+uv run examples/run_gdpo_grpo_advantage_demo.py
+```
+
+Two responses with the same total reward but different composition (e.g. `(1, 0)` vs. `(0, 1)`) receive an identical advantage under GRPO but distinct advantages under GDPO.
+
+#### What to measure
+
+The headline metric is per-reward convergence, not just aggregate reward. Log each component (`reward1`, `reward2`, …) separately and compare the GDPO and GRPO curves:
+
+- Under GRPO, expect components to move together, or low-variance components to stall as their signal is swamped by the dominant term in the sum.
+- Under GDPO, expect each component to improve on its own schedule.
+- Watch the per-prompt advantage spread: if distinct reward combinations produce near-identical advantages under GRPO, that is the collapse GDPO is meant to fix.
+
+#### Practical notes
+
+- **Reward scaling applies per component.** `reward_scaling` rescales each `rewardN` as well as `total_reward`, so keep components on comparable scales or rely on GDPO's per-component normalization.
+- **Final batch normalization always runs.** In `GDPOAdvantageEstimator`, the final per-batch normalization applies regardless of `normalize_rewards` (which only gates the per-component std division). Account for this when reasoning about advantage magnitudes.
+
 ## LoRA Configuration
 
 GRPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
