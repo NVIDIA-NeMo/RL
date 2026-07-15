@@ -769,7 +769,12 @@ jobs:
           - script: L1_Functional_Tests_Megatron_3
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Megatron_4
-            runner: ${{ vars.GB200_RUNNER }}
+            # Non-colocated NVSHMEM refit (cuMemCreate CU_MEM_HANDLE_TYPE_FABRIC) needs an IMEX
+            # channel; nemo-ci-gcp-gpu-x2-imex (1 runner/node) provides one. Proven to work with a
+            # channel even under competing-ComputeDomain load — the plain GB200_RUNNER (2/node, no
+            # channel) fails cuMemCreate status 800, and NCCL_NVLS_ENABLE=0 does not help this path.
+            # See NeMo-CI-TF-States#223.
+            runner: nemo-ci-gcp-gpu-x2-imex
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_SGLang
