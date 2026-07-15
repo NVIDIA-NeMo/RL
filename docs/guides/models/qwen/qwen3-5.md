@@ -121,8 +121,7 @@ uv run examples/run_grpo.py \
   grpo.use_dynamic_sampling=true \
   grpo.batch_multiplier=3 \
   grpo.max_val_samples=960 \
-  grpo.val_batch_size=960 \
-  +policy.hf_config_overrides.text_config.router_aux_loss_coef=0.0
+  grpo.val_batch_size=960
 ```
 
 #### 100-Step Long-Run Results
@@ -133,8 +132,10 @@ auxiliary loss disabled (`router_aux_loss_coef=0.0`). Disabling the auxiliary lo
 matters: the AutoModel backend reads `router_aux_loss_coef` from the Hugging Face
 config (Qwen3.5 default: 0.001) and silently injects the MoE load-balancing
 gradient into the router during RL training, which conflicts with the policy
-objective and severely degrades accuracy. See
-[#3169](https://github.com/NVIDIA-NeMo/RL/pull/3169) for more details.
+objective and severely degrades accuracy. Since
+[#3169](https://github.com/NVIDIA-NeMo/RL/pull/3169), the shipped Qwen3.5 AutoModel
+recipes set `router_aux_loss_coef: 0.0` in their `hf_config_overrides`, so no
+manual override is needed.
 
 The run shows healthy convergence behavior:
 
