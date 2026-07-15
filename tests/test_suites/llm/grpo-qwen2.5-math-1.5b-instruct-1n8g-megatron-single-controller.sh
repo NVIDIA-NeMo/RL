@@ -19,7 +19,7 @@ uv run examples/run_grpo_single_controller.py \
     grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
-    logger.wandb.project=nemo-rl \
+    logger.wandb.project=sc-yukih \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
