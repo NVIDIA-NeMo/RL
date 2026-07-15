@@ -319,7 +319,7 @@ def test_normalization_metadata_survives_dp_packing(prefetch_module) -> None:
         dp_world=2,
         batch_size=4,
         sequence_packing_args={
-            "algorithm": "modified_ffd",
+            "algorithm": "modified_first_fit_decreasing",
             "input_key": "input_ids",
             "input_lengths_key": "input_lengths",
             "sequence_length_pad_multiple": 1,
@@ -641,9 +641,97 @@ def test_close_is_bounded_after_item_ready_timeout(
         assert time.monotonic() - close_started < 0.5
     finally:
         client.release.set()
-        prefetcher._producer_thread.join(timeout=1)
-    assert not prefetcher._producer_thread.is_alive()
+        prefetcher._prefetch_iterator._producer_thread.join(timeout=1)
+    assert not prefetcher._prefetch_iterator._producer_thread.is_alive()
     assert client.calls == 1
+
+
+@pytest.mark.parametrize("lookahead", [False, True])
+def test_thread_prefetch_iterator_controls_lookahead(
+    prefetch_module,
+    lookahead: bool,
+) -> None:
+    condition = threading.Condition()
+    source_calls: list[int] = []
+
+    def source():
+        for value in range(3):
+            with condition:
+                source_calls.append(value)
+                condition.notify_all()
+            yield value
+
+    def wait_for_call_count(count: int) -> None:
+        deadline = time.monotonic() + 5
+        with condition:
+            while len(source_calls) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"timed out waiting for {count} calls; got {source_calls}"
+                    )
+                condition.wait(timeout=remaining)
+
+    prefetcher = prefetch_module._ThreadPrefetchIterator(
+        iter(source()),
+        lookahead=lookahead,
+        item_ready_timeout_s=5,
+        thread_name="test-thread-prefetch",
+    )
+    try:
+        wait_for_call_count(1)
+        assert source_calls == [0]
+        assert next(prefetcher) == 0
+
+        if lookahead:
+            wait_for_call_count(2)
+            assert source_calls == [0, 1]
+        else:
+            time.sleep(0.05)
+            assert source_calls == [0]
+
+        assert next(prefetcher) == 1
+        if lookahead:
+            wait_for_call_count(3)
+            assert source_calls == [0, 1, 2]
+            assert next(prefetcher) == 2
+        else:
+            time.sleep(0.05)
+            assert source_calls == [0, 1]
+            assert next(prefetcher) == 2
+            assert source_calls == [0, 1, 2]
+        with pytest.raises(StopIteration):
+            next(prefetcher)
+    finally:
+        prefetcher.close()
+
+
+def test_thread_prefetch_iterator_propagates_source_failure(prefetch_module) -> None:
+    def source():
+        yield 1
+        raise RuntimeError("injected loader failure")
+
+    prefetcher = prefetch_module._ThreadPrefetchIterator(
+        iter(source()),
+        lookahead=True,
+        item_ready_timeout_s=5,
+        thread_name="test-thread-prefetch-failure",
+    )
+    try:
+        assert next(prefetcher) == 1
+        with pytest.raises(
+            prefetch_module._ThreadPrefetchError,
+            match="injected loader failure",
+        ):
+            next(prefetcher)
+        with pytest.raises(
+            prefetch_module._ThreadPrefetchError,
+            match="terminal after failure",
+        ):
+            next(prefetcher)
+    finally:
+        prefetcher.close()
+        prefetcher.close()
 
 
 def test_depth_one_stays_exactly_one_microbatch_ahead(
@@ -666,6 +754,19 @@ def test_depth_one_stays_exactly_one_microbatch_ahead(
         client.wait_for_call_count(3)
         assert client.calls() == [("A", "B"), ("C",), ("D",)]
         third = next(prefetcher)
+
+        metrics = prefetcher.metrics()
+        assert metrics["tq_get_calls"] == 3
+        assert metrics["consume_count"] == 3
+        assert metrics["materialized_payload_bytes"] > 0
+        assert {
+            "tq_get_s",
+            "materialize_s",
+            "distribute_s",
+            "consumer_wait_s",
+            "first_microbatch_ready_s",
+            "ready_fraction",
+        } <= metrics.keys()
 
         reconstructed = BatchedDataDict.from_batches(
             [first.data, second.data, third.data]
