@@ -1,21 +1,20 @@
 # Direct TransferQueue Rollouts with NeMo Gym
 
-This guide explains the experimental vLLM-to-TransferQueue rollout writer and
-shows how to run controlled legacy, shadow, and direct comparisons with the
-eight-GPU Workplace Assistant recipe. It intentionally contains no benchmark
-results.
+This guide explains how NeMo RL trains on NeMo Gym rollouts written directly
+from vLLM workers to TransferQueue (TQ). One mechanism — gateway-minted call
+identity, a forest cursor, and receipt-reconciled finalization — serves both
+Gym's native agent loop and black-box harnesses (unmodified CLIs such as
+Claude Code or Codex that construct their own requests, speak text rather
+than token IDs, and may branch, spawn sub-agents, or compact their context).
 
-The writer has two cursor modes. The **linear** cursor (the first half of
-this guide) serves Gym's native sequential agent loop, where the driver signs
-every request and turns extend one committed prefix. The **forest** cursor
-(see [Black-box harness rollouts](#black-box-harness-rollouts-forest-cursor))
-serves black-box harnesses — unmodified CLIs that construct their own
-requests, speak text rather than token IDs, and may branch, spawn sub-agents,
-or compact their context mid-rollout.
+The guide covers how the system works end to end, how to run controlled
+legacy-versus-direct comparisons with the eight-GPU Workplace Assistant
+recipe, and the measured results of that comparison on the synchronous GRPO
+path.
 
 ## What changes
 
-The normal synchronous TransferQueue path returns complete token-bearing
+The legacy synchronous TransferQueue path returns complete token-bearing
 trajectories through Gym. The rollout actor flattens them and publishes the
 canonical training rows:
 
@@ -23,67 +22,75 @@ canonical training rows:
 vLLM -> Gym -> rollout actor -> TransferQueue train partition
 ```
 
-With `data_plane.rollout_writer.enabled=true`, NeMo RL attaches a signed sample
-identity to each Gym request. The vLLM model-owner worker reserves the next
-turn, verifies the historical token prefix, and writes the new token, mask,
-and sampling-log-probability delta to a staging partition. The rollout actor
-then verifies and assembles the canonical row:
+With the direct writer enabled (`data_plane.rollout_writer.enabled=true`,
+`mode=direct`, `cursor=forest`, `accept_gateway_identity=true`), tokens stop
+riding HTTP responses back through Gym. Every model call is admitted by
+Gym's ingress gate, which stamps it with a per-call identity; the vLLM
+model-owner worker writes that call's token delta straight to a TQ staging
+partition; and after the rollout finishes, a trusted finalizer reconciles
+the gate's sealed receipt against the cursor registry, re-verifies every
+staged tensor, and publishes one canonical training row:
 
 ```text
-                           +-> rollout_staging --+
-Gym -> vLLM model owner ---+                      +-> finalizer -> train
-                           +-> cursor registry --+
+                 +----> rollout_staging ----+
+harness/agent    |                          |
+  -> ingress ----+-> vLLM model owner       +-> finalizer -> train
+     gate        |                          |
+                 +----> forest registry ----+
 ```
 
-The cursor rejects concurrent turns, stale leases, duplicate completed
-requests, prefix drift, and weight-version mismatches. The finalizer verifies
-turn order, identity, hashes, tensor shapes, masks, and finite log
-probabilities. A missing or corrupt trajectory becomes a masked placeholder
-and is excluded from reward baselines and advantage normalization.
+The system is fail-closed at every boundary: an unidentified call is served
+without being collected, a broken or ambiguous rollout becomes a masked
+placeholder row that is excluded from reward baselines and advantage
+normalization, and nothing a harness does can fail the batch or silently
+train on corrupt tokens.
 
 The main implementation is in:
 
-- `nemo_rl/experience/rollout_writer.py`: signed context, linear and forest
-  cursor state machines, staging verification, canonical assembly, and
-  manifests.
-- `nemo_rl/models/generation/vllm/vllm_worker_async.py`: request reservation and
-  per-turn TransferQueue writes from model-owner workers.
-- `nemo_rl/experience/sync_rollout_actor.py`: finalization and canonical publish.
-- `nemo_rl/experience/blackbox_finalizer.py`: receipt-reconciling finalizer for
-  the forest cursor.
-- `nemo_rl/experience/staged_token_source.py`: adapts verified staging rows to
-  Gym's `TokenSource` protocol for trajectory assembly.
-- `nemo_rl/algorithms/grpo_sync.py`: setup guards, writer lifecycle, and invalid
-  trajectory masking.
+- `nemo_rl/experience/rollout_writer.py`: rollout identity minting, the
+  forest cursor state machine, staging deltas and digests, and canonical
+  batch assembly.
+- `nemo_rl/models/generation/vllm/vllm_worker_async.py`: gateway-identity
+  validation, prefix selection, and per-call TransferQueue writes from
+  model-owner workers.
+- `nemo_rl/experience/blackbox_finalizer.py`: receipt reconciliation,
+  integrity re-verification, and canonical row construction.
+- `nemo_rl/experience/staged_token_source.py`: adapts verified staging rows
+  to Gym's `TokenSource` protocol for trajectory assembly.
+- `nemo_rl/experience/sync_rollout_actor.py`: identity attachment,
+  finalization, and canonical publish.
 - `nemo_rl/environments/nemo_gym.py`: ingress-gate installation and rollout
-  register/seal orchestration for black-box mode.
-- `3rdparty/Gym-workspace/Gym/nemo_gym/`: token-only response conversion needed
-  to continue multi-turn tool calls without returning sampling log
-  probabilities, plus the model-server ingress gate, rollout receipts, and the
-  pure trajectory builder used by the black-box finalizer.
+  register/seal orchestration.
+- `nemo_rl/algorithms/grpo_sync.py`: setup guards, writer lifecycle, and
+  invalid trajectory masking.
+- `3rdparty/Gym-workspace/Gym/nemo_gym/`: the model-server ingress gate,
+  rollout receipts, the `ServerClient` rollout-id header lift, and the pure
+  trajectory builder the finalizer delegates chain assembly to.
 
 ## Architecture and code flow
 
 ### Component ownership
 
-The implementation deliberately separates untrusted request transport from the
-trusted code that decides what reaches training.
+The implementation deliberately separates untrusted request transport from
+the trusted code that decides what reaches training.
 
 | Component | Process | Responsibility |
 | --- | --- | --- |
-| `grpo_train_sync` | training driver | Validate the supported configuration, create the secret and cursor actor, and attach writers |
+| `grpo_train_sync` | training driver | Validate the supported configuration and create the forest registry actor |
 | `TQPolicy` | training driver | Bootstrap TransferQueue and register the staging and canonical partitions |
-| `SyncRolloutActor` | Ray rollout actor | Mint sample identities, invoke Gym, finalize staged turns, and publish canonical rows |
-| NeMo Gym | Gym Ray actor and HTTP services | Run the multi-turn agent/environment loop and forward opaque rollout metadata |
-| `VllmAsyncGenerationWorkerImpl` | vLLM model-owner Ray worker | Verify request identity and prefix continuity, then write one staging delta per generated turn |
-| `RolloutCursorRegistry` | dedicated Ray actor | Serialize reservations and commits for each sample |
-| `assemble_staged_batch` | rollout actor | Read, verify, and assemble staging rows into trainer-facing tensors |
+| `SyncRolloutActor` | Ray rollout actor | Mint rollout identities, invoke Gym, finalize sealed rollouts, and publish canonical rows |
+| NeMo Gym env | Gym Ray actor and HTTP services | Install the ingress gate, register rollouts before dispatch, run the agent/harness, and seal receipts |
+| Ingress gate | model-server HTTP middleware | Admit calls for registered rollouts, mint `call_id` and admission order, strip tokens from harness-facing responses |
+| `VllmAsyncGenerationWorkerImpl` | vLLM model-owner Ray worker | Verify the committed prefix by hash and write one staging delta per admitted call |
+| `RolloutForestRegistry` | dedicated Ray actor | Serialize node reservations and commits for each rollout |
+| `assemble_blackbox_batch` | rollout actor | Reconcile receipts, verify staging rows, and assemble trainer-facing tensors |
 | GRPO/GDPO advantage estimator | training driver | Exclude rejected placeholders from baselines and normalization |
 
-The Gym services can route successive turns to different HTTP workers. Cursor
-state is therefore not stored in a vLLM worker. The dedicated registry is the
-single authority for the next turn number, committed token length, prefix
-hash, active lease, and terminal failure state.
+Gym services can route successive calls to different HTTP workers, and a
+harness can issue calls concurrently, so cursor state is never stored in a
+vLLM worker. The dedicated registry is the single authority for each
+rollout's committed nodes, their cumulative lengths and hashes, active
+leases, and terminal failure state.
 
 ### Setup lifecycle
 
@@ -94,318 +101,49 @@ The writer is attached once when `grpo_train_sync` starts:
 2. `TQPolicy` bootstraps the configured TransferQueue backend and registers
    the normal `train` partition for canonical rows.
 3. `grpo_train_sync` validates that this is synchronous NeMo Gym GRPO using
-   async vLLM, a supported advantage estimator, and no router replay.
+   async vLLM, a GRPO or GDPO advantage estimator, no router replay, and a
+   consistent writer config (`cursor=forest` requires
+   `accept_gateway_identity=true` and `mode=direct`).
 4. `TQPolicy.prepare_rollout_writer` registers `rollout_staging` with the
-   per-turn tensor fields.
-5. The driver creates a random 32-byte HMAC secret and a
-   `RolloutCursorRegistry` Ray actor.
+   per-call tensor fields.
+5. The driver creates a `RolloutForestRegistry` Ray actor.
 6. `VllmGeneration.configure_rollout_writer` sends the validated data-plane
-   config, cursor handle, and secret only to vLLM model-owner workers.
-7. `SyncRolloutActor` receives the same cursor handle and secret so it can mint
-   identities and later request finalization manifests.
+   config and registry handle only to vLLM model-owner workers.
+7. The driver derives `blackbox_rollouts=true` for the NeMo Gym env, which
+   injects the ingress gate into the policy model server's config: a
+   capture directory, a minted control token, `require_registration=true`,
+   and `return_token_ids=false`. The control token guards the
+   register/seal API and never reaches agents or task rows.
+8. The rollout actor runs in a venv that bundles both the vLLM and NeMo-Gym
+   extras (`VLLM_NEMO_GYM`) because finalization calls Gym's trajectory
+   builder.
 
-The secret is runtime state. It is never placed in YAML, Gym data, manifests,
-or TransferQueue rows.
+Batch-level rollout retries are forbidden
+(`rollout_max_attempts_to_avoid_lp_nan=1`) because registration is
+create-only and sealing is terminal: a re-run of the same `rollout_id`
+would be rejected at admission.
 
-### Sample identity and trust boundary
-
-At the start of `SyncRolloutActor.rollout_to_tq`, one `group_id` is created per
-original prompt and one `sample_id` per generation:
-
-```text
-group_id  = 7d89...                         # one prompt
-sample_id = 7d89..._g0                      # generation 0
-sample_id = 7d89..._g1                      # generation 1
-```
-
-`_attach_rollout_contexts` adds a `RolloutContext` to the request's existing
-`metadata.extra_body`. The signed fields are:
-
-| Field | Meaning |
-| --- | --- |
-| `sample_id` | Stable identity of one generated trajectory |
-| `group_id` | Groups generations that share the same GRPO prompt |
-| `weight_version` | Training step whose policy weights produced the rollout |
-| `nonce` | Random context identity |
-| `issued_at`, `expires_at` | Bounded context lifetime |
-| `version` | Wire-contract version |
-| `signature` | HMAC-SHA256 over every preceding field |
-
-Gym forwards this object opaquely. It does not decide a sample ID, turn number,
-cursor length, or staging key. On each chat request,
-`VllmAsyncGenerationWorkerImpl._prepare_rollout_request` reconstructs the
-context and calls `validate_rollout_context` before accepting it.
-
-### Per-turn write path
-
-Each model call follows this sequence:
-
-1. vLLM finishes chat-template rendering and obtains the exact
-   `prompt_token_ids` that will be sent to the model.
-2. `_prepare_rollout_request` derives an idempotency key from `sample_id` and
-   the complete prompt tokens.
-3. `RolloutCursorRegistry.reserve_turn` returns a `TurnReservation` containing
-   `turn`, `lease`, `prev_len`, and `prev_hash`.
-4. For turns after the first, Gym echoes the model-produced historical prefix
-   in `required_prefix_token_ids`. The worker requires its length and hash to
-   match the committed cursor and requires the rendered model prompt to start
-   with those exact tokens.
-5. vLLM generates one response. `_stage_rollout_response` extracts generated
-   token IDs and sampling log probabilities from the non-streaming response.
-6. `build_staging_delta` removes the already committed prefix. It emits only
-   newly introduced prompt tokens plus newly generated tokens.
-7. The worker synchronously writes the delta to
-   `<sample_id>/t<turn>` in `rollout_staging`.
-8. Only after the write succeeds does the worker call `commit_turn` with the
-   new total length and full-prefix hash.
-9. The HTTP response returns token IDs to Gym so a later tool turn can preserve
-   the exact model prefix. In direct mode it removes sampling log probabilities
-   from the HTTP payload because their authoritative copy is already staged.
-
-The staging schema is intentionally small:
-
-| Field | Dtype | Meaning |
-| --- | --- | --- |
-| `token_ids_delta` | `int64` | New environment/prompt tokens followed by generated tokens |
-| `token_mask_delta` | `float32` | `0` for prompt/environment tokens and `1` for trainable generated tokens |
-| `generation_logprobs_delta` | `float32` | `0` for prompt/environment tokens and the sampling log probability for generated tokens |
-
-TransferQueue tags also record sample, group, turn, weight version, request
-nonce, previous/new lengths, previous/new hashes, and lease state. Correctness
-does not depend on trusting those tags: the finalizer uses the signed cursor
-manifest and recomputes tensor-derived hashes.
-
-### Cursor state machine
-
-`RolloutCursorStateMachine` is single-threaded inside the Ray actor. Each
-sample owns one `SampleCursor` and at most one active reservation.
-
-```text
-                    reserve_turn
-          +--------------------------------+
-          |                                v
-no cursor/committed -----------------> reserved
-                                         |   |
-                              commit_turn |   | fail_turn
-                                         v   v
-                                     committed failed
-                                         |
-                                         +----> next reserve_turn
-```
-
-The important transitions are:
-
-- A new request nonce reserves `next_turn` and captures the current
-  `committed_length` and `prefix_hash`.
-- Retrying the same nonce before commit returns the same reservation. After
-  lease expiry it receives a new lease for the same turn.
-- A different request while a turn is active fails the entire sample as a
-  concurrent request.
-- Committing requires the current lease and a strictly growing token length.
-- Retrying an already committed request fails the sample as a duplicate.
-- Once failed, a sample cannot reserve another turn.
-
-This policy prefers rejecting one trajectory over accepting ambiguous tokens.
-Other samples in the batch remain usable.
-
-### Finalization and canonical publication
-
-After Gym finishes the trajectories, `SyncRolloutActor` calls
-`assemble_staged_batch` with the expected sample IDs, group IDs, and weight
-version. For each sample, the finalizer:
-
-1. gets an immutable `FinalizationManifest` from the cursor;
-2. requires at least one committed turn and no active or failed cursor;
-3. requires contiguous turn numbers beginning at zero;
-4. verifies group identity and weight version on every turn;
-5. verifies the previous length/hash chain;
-6. reads every staging key, polling only until `finalize_timeout_s`;
-7. verifies equal tensor lengths, binary token masks, and finite log
-   probabilities;
-8. appends each delta and recomputes the full token hash after every turn; and
-9. verifies the terminal length and terminal prefix hash.
-
-Verified rows are padded to the legacy batch width and form the canonical
-training tensors: `input_ids`, `input_lengths`, `generation_logprobs`,
-`token_mask`, and `sample_mask`. Reward and other driver-carry fields still
-come from the trusted Gym result.
-
-If a row fails verification, the finalizer substitutes a one-token padded row
-and sets `trajectory_valid_mask=0` and `sample_mask=0`. It also zeros that
-row's total and component rewards. `grpo_train_sync` passes the validity mask
-into GRPO or GDPO baseline calculation and advantage estimation, then applies
-it again before clipping and writeback as a fail-safe.
-
-In shadow mode, `compare_shadow_candidate` requires every valid direct tensor
-and driver-carry tensor to equal the legacy path. In direct mode, the verified
-candidate is authoritative. Both modes publish only the canonical
-`sample_id` to the `train` partition; staging keys never appear in trainer
-metadata.
-
-After canonical publication succeeds, the rollout actor clears the staging
-keys and cursor entries. Training workers consume the canonical row through
-the existing `TQPolicy` read/logprob/train pipeline.
-
-## Two-turn rollout example
-
-This simplified example follows one generation, `group-a_g0`, through two
-model calls. Token values are illustrative, but the shapes and masks match the
-implementation.
-
-### Turn 0: initial assistant tool call
-
-The rendered initial prompt is:
-
-```text
-prompt_token_ids    = [101, 102, 103]
-generated_token_ids = [201, 202]
-generated_logprobs  = [-0.10, -0.20]
-```
-
-The initial cursor has committed length zero and the well-known empty-prefix
-hash:
-
-```text
-reservation = {
-  turn: 0,
-  prev_len: 0,
-  prev_hash: EMPTY_PREFIX_HASH,
-  lease: "lease-0"
-}
-```
-
-`build_staging_delta` has no old prefix to remove, so the worker writes:
-
-```text
-key                         = group-a_g0/t0
-token_ids_delta             = [101, 102, 103, 201, 202]
-token_mask_delta            = [  0,   0,   0,   1,   1]
-generation_logprobs_delta   = [0.0, 0.0, 0.0, -0.10, -0.20]
-```
-
-The worker commits:
-
-```text
-new_len  = 5
-new_hash = hash_token_ids([101, 102, 103, 201, 202])
-```
-
-Gym receives the token IDs, executes the requested tool, and adds its tool
-result to the next prompt. In direct mode Gym does not receive the sampling
-log probabilities.
-
-### Turn 1: answer after the tool result
-
-Suppose chat-template rendering adds tool-result tokens `[301, 302]`, then the
-model generates `[401, 402]`:
-
-```text
-required_prefix_token_ids = [101, 102, 103, 201, 202]
-prompt_token_ids = [101, 102, 103, 201, 202, 301, 302]
-generated_token_ids = [401, 402]
-generated_logprobs = [-0.30, -0.40]
-```
-
-The cursor returns:
-
-```text
-reservation = {
-  turn: 1,
-  prev_len: 5,
-  prev_hash: hash_token_ids([101, 102, 103, 201, 202]),
-  lease: "lease-1"
-}
-```
-
-The worker verifies that the required prefix is exactly the first five prompt
-tokens. `build_staging_delta` removes those five committed tokens and writes
-only the tool-result and new assistant tokens:
-
-```text
-key                         = group-a_g0/t1
-token_ids_delta             = [301, 302, 401, 402]
-token_mask_delta            = [  0,   0,   1,   1]
-generation_logprobs_delta   = [0.0, 0.0, -0.30, -0.40]
-```
-
-The second commit records:
-
-```text
-new_len  = 9
-new_hash = hash_token_ids(
-  [101, 102, 103, 201, 202, 301, 302, 401, 402]
-)
-```
-
-### Final canonical row
-
-The finalizer reads `group-a_g0/t0` and `group-a_g0/t1`, verifies both cursor
-links and hashes, and concatenates them:
-
-```text
-input_ids = [101, 102, 103, 201, 202, 301, 302, 401, 402]
-token_mask = [0, 0, 0, 1, 1, 0, 0, 1, 1]
-generation_logprobs = [0.0, 0.0, 0.0, -0.10, -0.20,
-                       0.0, 0.0, -0.30, -0.40]
-input_lengths = 9
-sample_mask = 1
-trajectory_valid_mask = 1
-```
-
-`kv_first_write` publishes that row under canonical key `group-a_g0` in the
-`train` partition. The rollout actor then deletes `group-a_g0/t0`,
-`group-a_g0/t1`, and the cursor entry. Policy logprob and training workers see
-the same canonical schema they use for ordinary synchronous TransferQueue
-training; they do not need to understand turns or staging.
-
-If turn 1 had the wrong prefix, a missing staging row, or a mismatched hash,
-the canonical row would instead have `sample_mask=0` and
-`trajectory_valid_mask=0`, while sibling generations from `group-a` could
-still train normally.
-
-## Black-box harness rollouts (forest cursor)
-
-Everything above assumes Gym's native agent loop: the driver signs each
-request, turns are strictly sequential, and Gym echoes the exact historical
-token prefix so the worker can verify continuity token-by-token. A black-box
-harness — an unmodified CLI agent driven inside a Gym task — breaks all three
-assumptions:
-
-- it constructs its own request bodies, so the driver cannot attach a signed
-  per-request context;
-- it speaks text, so it never echoes `required_prefix_token_ids`; and
-- it may issue concurrent calls, spawn sub-agents that branch from a shared
-  history, or compact its context so a later prompt no longer extends any
-  earlier one.
-
-Setting `data_plane.rollout_writer.cursor=forest` (with
-`accept_gateway_identity=true` and `mode=direct`) switches the write path to
-a design that tolerates these behaviors while keeping the same fail-closed
-guarantee: an ambiguous or broken rollout becomes a masked placeholder row,
-never a failed batch.
-
-### Identity model
+## Identity model
 
 | Identity | Minted by | Meaning |
 | --- | --- | --- |
 | `rollout_id` | driver (`mint_rollout_id`) | One GRPO generation: its Gym execution, its staged rows, its receipt, and its canonical train row. Opaque, URL-safe, 128 random bits as lowercase hex. Where a legacy field still requires a `sample_id`, it equals `rollout_id`. |
-| `call_id` | Gym ingress gate | One admitted model call. The staging key is `<rollout_id>/<call_id>`. Two admitted calls with identical prompts are two nodes — prompt hashes are integrity metadata, never identity. |
-| admission order | Gym ingress gate | Per-rollout monotonic order in which calls were admitted. HTTP completion order and TransferQueue write order carry no meaning. |
+| `call_id` | ingress gate | One admitted model call. The staging key is `<rollout_id>/<call_id>`. Two admitted calls with identical prompts are two nodes — prompt hashes are integrity metadata, never identity. |
+| admission order | ingress gate | Per-rollout monotonic order in which calls were admitted. HTTP completion order and TransferQueue write order carry no meaning. |
 | `group_id` | driver | GRPO sibling grouping only. It stays in the driver's private `rollout_id -> group_id` mapping and never travels in requests, staged rows, keys, or receipts. |
 
-In forest mode `_attach_rollout_contexts` attaches only the bare
-`nemo_rl_rollout_id` to each task row's `metadata.extra_body` — deliberately
-no signed context, because a signed linear context would route the worker
-onto the sequential staging path. Because gateway-identified requests carry
-no per-request weight version, the driver declares the step's policy weight
-version to every model-owner worker up front
-(`VllmGeneration.set_rollout_weight_version`).
+`_attach_rollout_contexts` stamps the bare `nemo_rl_rollout_id` into each
+task row's `metadata.extra_body`; per-call identity is minted later, at
+admission. Because requests carry no per-request weight version, the driver
+declares the step's policy weight version to every model-owner worker up
+front (`VllmGeneration.set_rollout_weight_version`), and the finalizer
+verifies it on every committed node.
 
-### Trust boundary
+## Trust boundary
 
 The vLLM serving endpoint is assumed to be reachable only through Gym's
 ingress gate (same host; sandbox networking does not route to the vLLM
-port). Under that assumption, when `accept_gateway_identity=true`, the
+port). Under that assumption, with `accept_gateway_identity=true`, the
 worker trusts the `nemo_rl_rollout_id`/`nemo_rl_call_id` pair the gate
 stamped on the internal request. The gate in turn:
 
@@ -416,15 +154,17 @@ stamped on the internal request. The gate in turn:
   URL prefix (sandboxed CLIs) or from the `x-nemo-gym-rollout-id` header,
   which Gym's `ServerClient` lifts out of the trainer-stamped
   `metadata.extra_body` on every in-tree agent call; and
-- strips token IDs and log probabilities from harness-facing responses — the
-  staged TransferQueue row is the only token store.
+- strips token IDs and log probabilities from sandboxed-harness-facing
+  responses — for those clients the staged TransferQueue row is the only
+  token store.
 
 The register/seal control API (`/ng-control/rollouts/...`) is guarded by a
 random bearer token that `NemoGym` mints at startup; it never reaches agents
 or task rows. Correctness still does not rest on the gate alone: the trusted
-finalizer independently re-verifies every staged tensor (see below).
+finalizer independently re-verifies every staged tensor (see
+[Finalization](#finalization-one-assembler-two-verifiers)).
 
-### End-to-end lifecycle
+## End-to-end lifecycle
 
 ```text
 driver          NemoGym env            ingress gate        vLLM worker        forest registry
@@ -437,8 +177,7 @@ driver          NemoGym env            ingress gate        vLLM worker        fo
   |                  |                       |                  | reserve_call ----->|
   |                  |                       |                  | write staging row  |
   |                  |                       |                  | commit_call ------>|
-  |                  |                       |<-- token-free    |                    |
-  |                  |                       |    response      |                    |
+  |                  |                       |<-- response      |                    |
   |                  | seal rollout -------->|                  |                    |
   |                  | (POST .../seal)       |                  |                    |
   |<-- receipt ------|                       |                  |                    |
@@ -446,48 +185,75 @@ driver          NemoGym env            ingress gate        vLLM worker        fo
   | publish canonical row, clear staging keys and cursor entries                    |
 ```
 
-1. **Setup.** `grpo_train_sync` validates the mode (forest requires
-   `accept_gateway_identity=true` and `mode=direct`), registers the staging
-   partition, and creates a `RolloutForestRegistry` Ray actor instead of the
-   linear cursor registry. The rollout actor runs in a venv that bundles both
-   the vLLM and NeMo-Gym extras (`VLLM_NEMO_GYM`) because finalization calls
-   Gym's trajectory builder.
-2. **Gate installation.** When the driver derives `blackbox_rollouts=true`
-   from the writer config, `NemoGym` injects an observability block into the
-   policy model server's config: the ingress gate, a capture directory, a
-   control token, `require_registration=true`, and `return_token_ids=false`.
-   Batch retries are forbidden (`rollout_max_attempts_to_avoid_lp_nan=1`)
-   because registration is create-only and sealing is terminal.
-3. **Registration.** Before dispatching a batch, the env reads each row's
+1. **Registration.** Before dispatching a batch, the env reads each row's
    `nemo_rl_rollout_id` and registers it with the gate. Unregistered calls
    are rejected at admission.
-4. **Per-call write path.** For each admitted call the worker: fetches the
-   rollout's committed candidates from the registry (cumulative sequences,
-   longest first); hashes its rendered prompt at each candidate length and
-   reserves against the longest match as the storage parent; a prompt that
-   extends no committed prefix reserves a `new_root` full-prompt row
-   (context compaction), not a failure, and a second child of one prefix is
-   a branch. It then writes one self-describing delta to
-   `<rollout_id>/<call_id>` — token IDs, mask, log probabilities, plus a
-   SHA-256 staging digest over all three and the identifying metadata — and
-   commits the node with its new cumulative length and hash. The HTTP
-   response returns neither token IDs nor log probabilities.
+2. **Admission.** The gate correlates each model call to its rollout, mints
+   `call_id` and the admission index, and forwards both to vLLM inside the
+   internal request.
+3. **Per-call write.** The worker stages the call's token delta (see the
+   next section) and commits the node to the registry.
+4. **Response.** Sampling log probabilities are never returned over HTTP —
+   their authoritative copy is already staged. Token IDs are returned only
+   to native in-tree agents (which rebuild message logs from them);
+   sandboxed harnesses receive plain text.
 5. **Sealing.** After the harness (and its verifier) finishes, the env seals
    the rollout. The gate returns a token-free receipt: the call manifest
-   (each admitted `call_id`, its admission index, and whether it staged) and
-   a terminal status. The env attaches the verifier reward to the receipt as
-   driver-carry. A seal failure yields a `seal_failed` receipt, which the
-   finalizer turns into a masked placeholder. Receipts ride the batch as
-   `ng_rollout_receipts` and are popped before anything is written to
-   TransferQueue.
+   (each admitted `call_id`, its admission index, and whether it staged)
+   and a terminal status. The env attaches the verifier reward to the
+   receipt as driver-carry. A seal failure yields a `seal_failed` receipt,
+   which the finalizer turns into a masked placeholder. Receipts ride the
+   batch as `ng_rollout_receipts` and are popped before anything is written
+   to TransferQueue.
+6. **Finalization and publish.** The rollout actor reconciles each receipt
+   against the registry's manifest, verifies the staged rows, assembles the
+   canonical row, publishes it under `rollout_id` to the `train` partition,
+   and clears the staging keys and cursor entries. Training workers consume
+   the canonical row through the existing `TQPolicy` read/logprob/train
+   pipeline; they never see calls or staging.
 
-### Forest cursor state machine
+## Per-call write path
 
-`ForestCursorStateMachine` replaces the strictly sequential rules of the
-linear cursor with per-node rules:
+Each admitted model call follows this sequence on the model-owner worker:
 
-- Nodes are keyed by `call_id`. States are `reserved`, `committed`, and
-  `failed`, each node with its own lease.
+1. vLLM finishes chat-template rendering and obtains the exact
+   `prompt_token_ids` that will be sent to the model.
+2. The worker fetches the rollout's committed candidates from the registry —
+   cumulative sequences, longest first — hashes its rendered prompt at each
+   candidate length, and reserves against the longest match as the storage
+   parent. A prompt that extends no committed prefix reserves a `new_root`
+   full-prompt row (context compaction), not a failure; a second child of
+   one prefix is a branch.
+3. vLLM generates one response. The worker extracts generated token IDs and
+   sampling log probabilities from the non-streaming response.
+4. `build_staging_delta` removes the already committed parent prefix,
+   emitting only newly introduced prompt tokens plus generated tokens, and
+   `compute_staging_digest` hashes the delta tensors together with the
+   identifying metadata.
+5. The worker synchronously writes the delta to `<rollout_id>/<call_id>` in
+   `rollout_staging`, then — only after the write succeeds — commits the
+   node with its new cumulative length, full-sequence hash, and digest.
+
+The staging schema is intentionally small:
+
+| Field | Dtype | Meaning |
+| --- | --- | --- |
+| `token_ids_delta` | `int64` | New environment/prompt tokens followed by generated tokens |
+| `token_mask_delta` | `float32` | `0` for prompt/environment tokens and `1` for trainable generated tokens |
+| `generation_logprobs_delta` | `float32` | `0` for prompt/environment tokens and the sampling log probability for generated tokens |
+
+TransferQueue tags also record the rollout, call, parent, weight version,
+previous/new lengths and hashes, digest, and lease state. Correctness does
+not depend on trusting those tags: the finalizer uses the registry manifest
+and recomputes tensor-derived hashes and digests from the fetched rows.
+
+## Forest cursor state machine
+
+`ForestCursorStateMachine` is single-threaded inside the registry actor.
+Each rollout owns a set of nodes keyed by `call_id`:
+
+- Node states are `reserved`, `committed`, and `failed`, each node with its
+  own lease. Concurrent reservations are legal.
 - Retrying an in-flight `call_id` idempotently returns the same reservation
   (a new lease after expiry); retrying a committed `call_id` is a duplicate
   and fails the node.
@@ -497,10 +263,14 @@ linear cursor with per-node rules:
 - Committing requires the current lease and a strictly growing cumulative
   length, and records the staging key, prompt/generation lengths, terminal
   hash, staging digest, and weight version.
-- Concurrent reservations are legal. A failed call fails only its node — the
-  rollout survives, and the finalizer decides validity from reconciliation.
+- A failed call fails only its node — the rollout survives, and the
+  finalizer decides validity from reconciliation.
 
-### Finalization: one assembler, two verifiers
+This policy prefers masking one trajectory over accepting ambiguous tokens,
+and it never fails a rollout for structure the harness is entitled to
+produce (branches, compaction, concurrency).
+
+## Finalization: one assembler, two verifiers
 
 `assemble_blackbox_batch` finalizes each rollout from two independent
 sources: the gate's sealed receipt (what was admitted) and the forest
@@ -531,15 +301,94 @@ For each rollout, `finalize_blackbox_rollout`:
 6. asserts Gym's vendored NeMo-RL prefix-contiguity contract on the
    projected main-chain response.
 
+Verified rows are padded to the legacy batch width and form the canonical
+training tensors: `input_ids`, `input_lengths`, `generation_logprobs`,
+`token_mask`, and `sample_mask`. Reward and other driver-carry fields come
+from the trusted Gym result.
+
 Any failure at any step returns an invalid row whose reason feeds
 `rollout_writer_manifest.jsonl`; the batch assembler substitutes a one-token
 placeholder with `sample_mask=0` and `trajectory_valid_mask=0` and zeroes
-every reward channel for that row. Verified rows are padded through the same
-`pad_finalized_candidate_batch` tail as the linear assembler and published
-under the canonical `rollout_id`. After publication the rollout actor clears
-the staging keys and the forest cursor entries.
+every reward channel for that row. `grpo_train_sync` passes the validity
+mask into GRPO or GDPO baseline calculation and advantage estimation, then
+applies it again before clipping and writeback as a fail-safe. Sibling
+generations in the same group train normally.
 
-### Worked example: branch and compaction
+## The native agent flow on the same path
+
+Nothing above requires the client to be a black-box CLI. Gym's native agent
+loop (the Workplace Assistant's tool-calling agent, for example) runs on
+exactly the same machinery and is simply the degenerate case:
+
+- The agent forwards `responses_create_params` verbatim, so
+  `ServerClient` finds the trainer-stamped `nemo_rl_rollout_id` in
+  `metadata.extra_body` and lifts it into the `x-nemo-gym-rollout-id`
+  header. The gate admits the call without the agent knowing the gate
+  exists.
+- The native loop is sequential and append-only, so every call's rendered
+  prompt extends the previous committed sequence: the forest degenerates to
+  a single chain, and finalization selects it as the one `main` chain.
+- Prefix continuity is verified by hashing the rendered prompt against the
+  committed cumulative hash — no token echo or re-tokenization round trip
+  is needed on the request path.
+- Native agents still receive generated token IDs in responses (they
+  rebuild message logs from them); sampling log probabilities are never
+  returned, because the staged copy is authoritative.
+
+## Worked examples
+
+### Sequential rollout (the native case)
+
+One rollout, two admitted calls. Token values are illustrative, but the
+shapes and masks match the implementation. The gate mints `c1` and `c2`;
+the rollout id is abbreviated `rid`.
+
+Call `c1` renders prompt `[101, 102, 103]` and generates `[201, 202]` with
+log probabilities `[-0.10, -0.20]`. No candidates are committed yet, so the
+reservation is rootless (`prev_len=0`) and the worker stages the full
+sequence:
+
+```text
+key                         = rid/c1
+token_ids_delta             = [101, 102, 103, 201, 202]
+token_mask_delta            = [  0,   0,   0,   1,   1]
+generation_logprobs_delta   = [0.0, 0.0, 0.0, -0.10, -0.20]
+commit: new_len=5, new_hash=hash([101, 102, 103, 201, 202])
+```
+
+Gym executes the requested tool and the next rendered prompt appends the
+tool result: `[101, 102, 103, 201, 202, 301, 302]`, generating
+`[401, 402]`. The worker finds `c1`'s committed sequence as the longest
+matching candidate (hash of the first five prompt tokens matches), reserves
+with `parent=c1, prev_len=5`, and stages only the delta:
+
+```text
+key                         = rid/c2
+token_ids_delta             = [301, 302, 401, 402]
+token_mask_delta            = [  0,   0,   1,   1]
+generation_logprobs_delta   = [0.0, 0.0, -0.30, -0.40]
+commit: new_len=9, new_hash=hash(full 9-token sequence)
+```
+
+After sealing, the receipt lists `c1` and `c2` as staged; both reconcile
+against committed nodes; the builder produces one chain; and the canonical
+row is:
+
+```text
+input_ids = [101, 102, 103, 201, 202, 301, 302, 401, 402]
+token_mask = [0, 0, 0, 1, 1, 0, 0, 1, 1]
+generation_logprobs = [0.0, 0.0, 0.0, -0.10, -0.20,
+                       0.0, 0.0, -0.30, -0.40]
+input_lengths = 9
+sample_mask = 1
+trajectory_valid_mask = 1
+```
+
+`kv_first_write` publishes that row under canonical key `rid` in the
+`train` partition, and the rollout actor deletes `rid/c1`, `rid/c2`, and
+the cursor entry.
+
+### Branch and compaction (the black-box case)
 
 Suppose one rollout admits four calls:
 
@@ -554,38 +403,140 @@ The registry records `c2` and `c3` as two children of `c1` (a branch) and
 `c4` as a `new_root` full-prompt row, and all four stage successfully — the
 write path never fails a rollout for structure. At finalization, the
 `prefix_merging` builder sees multiple eligible chains, so the rollout is
-rejected as `ambiguous_forest` and trains as a masked placeholder. Had the
-harness been purely sequential (`c1 -> c2` only), the single main chain
-`[1, 2, 3, 4, 5, 6, 7]` would train with mask `[0, 0, 0, 1, 1, 0, 1]`,
-exactly like the linear worked example above.
+rejected as `ambiguous_forest` and trains as a masked placeholder while its
+sibling generations train normally. Had the harness been purely sequential
+(`c1 -> c2` only), the single main chain `[1, 2, 3, 4, 5, 6, 7]` would
+train with mask `[0, 0, 0, 1, 1, 0, 1]`, exactly like the sequential
+example above.
 
-## Supported modes
+## Measured performance: legacy vs direct (sync GRPO)
+
+The numbers below are from a counterbalanced eight-GPU campaign
+(method: `docs/design-docs/tq-blackbox-perf-plan.md`; artifacts:
+`results/tq-blackbox-e2e-perf-20260714/`, including the runner, analyzer,
+per-job consoles, and a byte-regenerable `summary.json`).
+
+| | |
+| --- | --- |
+| Hardware | 1 node, 8× H100, colocated Megatron TP2 policy + 8× vLLM TP1 |
+| Model | nvidia/NVIDIA-Nemotron-Nano-9B-v2 |
+| Workload | Workplace Assistant (native Gym `simple_agent`, tool calls), seed 42, shuffle off |
+| Shape | 2 prompts × 2 generations × 8 steps/job; step 1 discarded; 21 retained steps/arm |
+| Arms | legacy = `rollout_writer.enabled=false`; direct = `mode=direct cursor=forest accept_gateway_identity=true` |
+| Order | legacy-1, direct-1, direct-2, legacy-2, legacy-3, direct-3 (counterbalanced) |
+
+### Signal quality (gates the performance numbers)
+
+Across all 96 direct-path rollouts (3 jobs × 32): **95 finalized, 1
+rejected** (`ambiguous_forest`, 1.04% — under the campaign's 5% abort
+threshold; the rejected rollout became a masked placeholder, fail-closed).
+Chain-length distribution over finalized rollouts: 60× 1-call, 21× 2-call,
+13× 3-call, 1× 4-call (mean 1.53, max 4) — multi-call chains survive
+assembly with no silent forest collapse. A same-day smoke measured
+generation-KL error 0.0002, confirming staged log probabilities align with
+policy recomputation.
+
+### Transport
+
+| Metric (21 steps/arm) | Legacy | Direct (forest) | Change |
+| --- | ---: | ---: | ---: |
+| HTTP bytes / generated token | 1456.9 | 773.4 | **−46.9%** |
+| HTTP total | 11.93 MB | 5.76 MB | **−51.7%** |
+| HTTP exchanges | 280 | 124 | **−55.7%** |
+| — `/tokenize` traffic | 7.01 MB | **0** | eliminated |
+| — response logprob payload | 0.82 MB | **0** | eliminated |
+| — response token-id echo | 0.01 MB | 2.65 MB | native echo retained |
+| Terminal Gym→RL bytes / sample | 87,752 | 47,966 | **−45.3%** |
+
+The two big wins are structural: prefix continuity is verified against the
+committed cumulative hash, so the legacy exact-token echo — one full
+`/tokenize` round trip per turn plus its payload — is gone entirely (that
+alone is half the exchange count), and sampling log probabilities ride TQ
+staging rather than the HTTP response. Token-id echo remains for the native
+loop because it rebuilds message logs from it; a sandboxed harness (which
+speaks text) drops that 2.65 MB too.
+
+### TransferQueue cost
+
+| Metric | Legacy | Direct (forest) |
+| --- | ---: | ---: |
+| Staging put / read | 0 / 0 | 5.42 MB / 5.42 MB |
+| Canonical put | 6.97 MB | 5.42 MB |
+| Write amplification vs legacy canonical | 1× | 1.56× |
+| Movement amplification vs legacy canonical | 1× | 2.33× |
+| Staging bytes / canonical byte | — | **1.00×** |
+
+Because the worker stages **deltas against the longest committed prefix**
+(full snapshots only on compaction roots), staging is exactly 1.00× of
+canonical bytes on this workload — storage does not grow quadratically with
+chain length. Per-call worker overhead (p50): reserve 2.1 ms, commit
+1.7 ms, staging put 8.0 ms, put-blocked fraction 1.2%.
+
+### Latency, throughput, and process cost
+
+| Metric (p50, 21 steps/arm) | Legacy | Direct (forest) | Change |
+| --- | ---: | ---: | ---: |
+| Total step time | 16.91 s | 16.19 s | **−4.3%** |
+| Rollout wall | 2.50 s | 2.01 s | −19.6% |
+| Rollout start → canonical ready | 2.51 s | 2.11 s | **−15.8%** |
+| Rollout return → canonical ready | 0.01 s | 0.12 s | +0.11 s (finalizer) |
+| Generated tokens/s | 167.9 | 160.4 | −4.5%* |
+| Rollout-actor / vLLM peak RSS | 1363 / 1310 MiB | 1366 / 1344 MiB | ~flat |
+
+\* Sampled trajectories differ across arms (7,803 vs 8,584 generated
+tokens, 124 vs 140 turns), so tokens/s ratios carry workload noise; the
+per-token byte ratios and step time are the robust comparisons. Finalizer
+cost is small and off the generation path: manifest fetch 3.4 ms, full
+finalize (fetch + verify + Gym chain build) 96.7 ms p50 / 113.2 ms p95 per
+step, assembly 0.2 ms.
+
+### What the numbers mean
+
+1. **Less data on the wire, structurally.** −47% HTTP bytes per generated
+   token and −56% exchanges against legacy, because token integrity is
+   enforced by hashes and TQ digests instead of echoing tokens over HTTP;
+   −45% on the terminal Gym→RL hop because training tensors travel through
+   TQ, not Ray returns.
+2. **No step-time or memory tax.** Step p50 is slightly faster; RSS is
+   flat; all verification (digest, hash chain, manifest reconciliation, Gym
+   chain build) costs ~0.1 s per step off the generation path.
+3. **Verified, not trusted, training data.** Every canonical row is
+   reconciled exactly against a sealed call manifest and re-verified before
+   training; the smoke's 2e-4 generation-KL error is the end-to-end proof.
+4. **Fail-closed by construction.** The one broken rollout in 96 became a
+   masked placeholder with an exact reason (`ambiguous_forest`).
+5. **The capability unlock.** Identity is minted at the gateway and
+   reconstruction is post-hoc, so an unmodified CLI that branches, spawns
+   sub-agents, or compacts context trains with the same machinery — the
+   native loop measured here is the degenerate single-chain case. The
+   legacy path cannot drive such a client at all.
+
+Costs to weigh: 2.33× TQ movement versus legacy's single canonical write
+(~16 MB per arm over 21 steps here), +0.11 s of post-rollout finalizer per
+step, roughly one masked rollout per hundred (monitor rejection reasons at
+scale), the native loop's remaining token-id echo, and no batch-level
+rollout retries.
+
+## Supported configuration
 
 | Mode | Overrides | Purpose |
 | --- | --- | --- |
 | Legacy TQ | `rollout_writer.enabled=false` | Control path; rollout actor publishes rows |
-| Shadow | `enabled=true`, `mode=shadow` | Stage direct rows and require tensor equality with legacy rows |
-| Direct | `enabled=true`, `mode=direct` | Train from verified staged tensors |
-| Forest | `enabled=true`, `mode=direct`, `cursor=forest`, `accept_gateway_identity=true` | Black-box harnesses: gate-minted call identity, receipt-reconciled finalization |
+| Direct | `enabled=true`, `mode=direct`, `cursor=forest`, `accept_gateway_identity=true` | The supported write path for native agents and black-box harnesses |
 
 The writer is opt-in and currently requires:
 
 - synchronous NeMo Gym GRPO;
 - the async vLLM HTTP backend;
-- signed rollout contexts (linear cursor) or a trusted gateway identity
-  (`accept_gateway_identity=true`);
-- a GRPO or GDPO advantage estimator; and
-- router replay and asynchronous GRPO to be disabled.
-
-The forest cursor additionally requires `mode=direct` (finalization consumes
-sealed receipts, which only the direct path produces),
-`accept_gateway_identity=true` (staging rows are keyed by the gate-minted
-`call_id`), and a single rollout attempt
-(`rollout_max_attempts_to_avoid_lp_nan=1`).
+- a trusted gateway identity (`accept_gateway_identity=true`, meaning the
+  vLLM endpoint is reachable only through the gate);
+- a GRPO or GDPO advantage estimator;
+- router replay and asynchronous GRPO to be disabled; and
+- a single rollout attempt (`rollout_max_attempts_to_avoid_lp_nan=1`).
 
 The initial writer performs synchronous staging writes. The
-`max_pending_writes_per_worker` setting is reserved for a future asynchronous
-writer.
+`max_pending_writes_per_worker` setting is reserved for a future
+asynchronous writer.
 
 ## Prerequisites
 
@@ -628,8 +579,8 @@ test -s "$VAL_DATA"
 
 ## Launch a comparison
 
-The helper below fixes the workload and changes only the rollout-writer mode.
-Every attempt gets a new result directory.
+The helper below fixes the workload and changes only the rollout-writer
+mode. Every attempt gets a new result directory.
 
 ```bash
 export EXPERIMENT_ROOT=results/tq-rollout-writer-comparison
@@ -645,13 +596,7 @@ run_variant() {
     legacy)
       writer_overrides=(data_plane.rollout_writer.enabled=false)
       ;;
-    shadow|direct)
-      writer_overrides=(
-        data_plane.rollout_writer.enabled=true
-        "data_plane.rollout_writer.mode=$mode"
-      )
-      ;;
-    forest)
+    direct)
       writer_overrides=(
         data_plane.rollout_writer.enabled=true
         data_plane.rollout_writer.mode=direct
@@ -701,14 +646,13 @@ Run correctness gates first:
 
 ```bash
 run_variant legacy "$EXPERIMENT_ROOT/gate-legacy"
-run_variant shadow "$EXPERIMENT_ROOT/gate-shadow"
 run_variant direct "$EXPERIMENT_ROOT/gate-direct"
 ```
 
-Continue only when all jobs exit successfully, shadow mode has no tensor
-mismatch, direct mode has no rejected manifest rows, an optimizer step
-completes with finite loss and KL values, and all GPUs are released after each
-job.
+Continue only when both jobs exit successfully, the direct gate's manifest
+has no rejected rows (or only a rate well under 5%, each with an explained
+reason), an optimizer step completes with finite loss and KL values, and
+all GPUs are released after each job.
 
 For repeated measurements, use a counterbalanced sequential order:
 
@@ -722,8 +666,9 @@ run_variant direct "$EXPERIMENT_ROOT/direct-3"
 ```
 
 Discard the first step of each repetition as warm-up. Interpret timing or
-transport metrics only when configuration matches, direct mode has zero
-rejections, and token, turn, and HTTP-exchange distributions are comparable.
+transport metrics only when configuration matches, the direct arm's
+rejection rate is negligible, and token, turn, and HTTP-exchange
+distributions are comparable.
 
 ## Artifacts and diagnosis
 
@@ -731,30 +676,29 @@ Each run writes:
 
 - `rollout_perf_metrics.jsonl`: per-step HTTP, Gym, TransferQueue, latency,
   CPU, and memory instrumentation;
-- `rollout_writer_manifest.jsonl`: per-sample finalization or rejection status
-  for shadow and direct modes; and
+- `rollout_writer_manifest.jsonl`: per-rollout finalization or rejection
+  status for the direct path; and
 - the normal NeMo RL console and logger output.
 
-Use the manifest before any performance analysis. Common rejection reasons
-identify prefix mismatch, missing staging rows, invalid turn order, identity or
-weight-version mismatch, hash mismatch, invalid masks, or non-finite log
-probabilities. Do not treat masked rejected rows as equivalent workload.
-
-Forest-mode runs add receipt-reconciliation reasons to the same manifest:
+Use the manifest before any performance analysis. Rejection reasons group
+as follows:
 
 - `missing_receipt` / `receipt_status:*` / `missing_forest_manifest`: the
   rollout never sealed cleanly (including `seal_failed` receipts) or the
   cursor entry is gone;
 - `missing_staged_node` / `orphan_staged_node` / `uncollected_call` /
-  `no_staged_calls`: the sealed call manifest and the committed cursor nodes
-  do not match one-to-one;
-- `staging_digest_mismatch` / `delta_length_mismatch` /
-  `terminal_hash_mismatch`: a fetched staging row fails integrity
+  `no_staged_calls`: the sealed call manifest and the committed cursor
+  nodes do not match one-to-one;
+- `missing_staging_row` / `invalid_delta_shape` / `invalid_token_mask` /
+  `non_finite_generation_logprob` / `delta_length_mismatch` /
+  `staging_digest_mismatch` / `terminal_hash_mismatch` /
+  `weight_version_mismatch`: a fetched staging row fails integrity
   re-verification; and
 - `ambiguous_forest` / `empty_forest`: the verified snapshot did not reduce
   to exactly one unambiguous main chain (branches, multiple roots, or
   quarantined nodes).
 
-A high `ambiguous_forest` rate is expected for harnesses that branch or
+A nonzero `ambiguous_forest` rate is expected for harnesses that branch or
 compact aggressively; it indicates masked (untrained) rollouts, not
-corruption.
+corruption. Do not treat masked rejected rows as equivalent workload in
+performance comparisons.
