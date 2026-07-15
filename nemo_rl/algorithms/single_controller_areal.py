@@ -215,7 +215,7 @@ class SingleControllerArealActor:
         self._sampler = StalenessSampler(
             self._buffer,
             max_staleness_versions=self._async_cfg.max_weight_staleness_versions,
-            require_order=not self._async_cfg.over_sampling,
+            require_order=False,  # AReaL will consume whatever is ready
             force_in_order=self._async_cfg.force_in_order,
         )
 
@@ -743,11 +743,12 @@ class SingleControllerArealActor:
 
             # Drop groups that aged past the staleness window [v-η, v]; free
             # their buffer slots so the rollout pump can keep producing.
-            evicted = await self._sampler.evict(
-                current_train_weight=self._trainer_version,
-            )
-            for _ in range(evicted):
-                self._buffer_capacity.release()
+            if self._async_cfg.get("evict_stale_samples", True):  # AReaL does not evict
+                evicted = await self._sampler.evict(
+                    current_train_weight=self._trainer_version,
+                )
+                for _ in range(evicted):
+                    self._buffer_capacity.release()
 
             # Claim in-window groups (lag ≤ η). select() returns (meta|None, num).
             # min == max == the full step: one all-or-nothing claim.

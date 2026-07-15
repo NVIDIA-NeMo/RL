@@ -16,7 +16,8 @@ grpo:
   seed: 42
   async_grpo:
     enabled: true
-    max_trajectory_age_steps: 1
+    max_trajectory_age_steps: 4
+    in_flight_weight_updates: true
   batch_multiplier: 1
   use_dynamic_sampling: false
   reward_shaping:
@@ -53,6 +54,7 @@ checkpointing:
   save_optimizer: true
 policy:
   model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/data/nano-v3-12b-hf
+  # model_name: Qwen/Qwen3-8B
   tokenizer:
     name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/rohitkumarj/data/nano-v3-12b-hf
   train_global_batch_size: 1024
@@ -83,7 +85,7 @@ policy:
     pipeline_model_parallel_size: 2
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 8
+    context_parallel_size: 4
     pipeline_dtype: bfloat16
     sequence_parallel: true
     freeze_moe_router: true
@@ -184,13 +186,15 @@ policy:
         reasoning_parser: deepseek_r1
     vllm_kwargs:
       mamba_ssm_cache_dtype: float32
+      mamba_cache_mode: align
       compilation_config:
         backend: eager
+        cudagraph_mode: PIECEWISE
     colocated:
       enabled: false
       resources:
         gpus_per_node: 8
-        num_nodes: 4
+        num_nodes: 6
 data:
   max_input_seq_length: null
   shuffle: false
@@ -264,9 +268,12 @@ data_plane:
 
 async_rl:
   batch_selection_strategy: staleness_window
-  max_weight_staleness_versions: 1     # η — matches the legacy async_grpo.max_trajectory_age_steps: 1
-  max_inflight_prompts: 64             # = grpo.num_prompts_per_step
-  max_buffered_rollouts: 128           # 64 * (η+1); controller re-derives anyway
-  over_sampling: false
-  force_in_order: true
+  max_weight_staleness_versions: 4     # η — matches the legacy async_grpo.max_trajectory_age_steps: 1
+  max_inflight_prompts: 320             # = grpo.num_prompts_per_step
+  max_buffered_rollouts: 320           # floor = 64 * (η+1); with over_sampling values above the floor add failure/straggler headroom
+  over_sampling: true
+  # AReaL-native consumption (mixed-version, oldest-first) has no per-batch
+  # target_step — the controller raises if this is true.
+  force_in_order: false
   refit_invalidate_kv_cache: true      # AReaL interruptible refit
+  evict_stale_samples: false

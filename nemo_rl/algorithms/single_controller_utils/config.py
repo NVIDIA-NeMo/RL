@@ -57,6 +57,7 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # in-flight requests and reprefills them under the new weights;
     # False keeps stale KV (Magistral-style, cheaper).
     refit_invalidate_kv_cache: bool = True
+    evict_stale_samples: bool = True
 
 
 class MasterConfig(BaseModel, extra="allow"):
