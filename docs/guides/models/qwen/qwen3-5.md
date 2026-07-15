@@ -34,17 +34,18 @@ convergence.
 | Model | Modality | Training backend | Parallelism | Inference |
 | --- | --- | --- | --- | --- |
 | `Qwen/Qwen3.5-9B-Base` | LLM (dense) | Megatron | TP | vLLM |
-| `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | Megatron | EP + TP + CP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
 | `Qwen/Qwen3.5-35B-A3B-Base` | LLM (MoE) | AutoModel (DTensor) | EP + CP | vLLM |
-| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | Megatron | EP + CP | vLLM |
+| `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
 | `Qwen/Qwen3.5-35B-A3B-Base` | VLM (MoE) | AutoModel (DTensor) | EP | vLLM |
-| `Qwen/Qwen3.5-397B-A17B` | LLM (MoE) | Megatron | TP + PP + EP | vLLM |
+| `Qwen/Qwen3.5-397B-A17B` | LLM (MoE) | Megatron | TP + EP + PP + CP | vLLM |
 
 Notes on backends and parallelism:
 
-- **Megatron (MCore)** supports the widest parallelism for Qwen3.5 MoE, including
-  Context Parallel (CP) for longer sequences on both the LLM and the VLM (see
-  [#2312](https://github.com/NVIDIA-NeMo/RL/pull/2312)).
+- **Megatron (MCore)** supports the full parallelism set for Qwen3.5 MoE — Tensor
+  Parallel (TP), Expert Parallel (EP), Pipeline Parallel (PP), and Context Parallel
+  (CP) for longer sequences — on both the LLM and the VLM (see
+  [#2312](https://github.com/NVIDIA-NeMo/RL/pull/2312) for CP).
 - **AutoModel (DTensor)** supports Expert Parallel (EP), and Context Parallel for
   the MoE **LLM** only; CP on AutoModel requires the TE backend and
   `flash-linear-attention`. **Dense Qwen3.5 and the VLM do not support Context
