@@ -14,6 +14,7 @@
 
 import importlib.util
 import json
+import math
 import os
 import sys
 import types
@@ -41,6 +42,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _replace_non_finite,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
@@ -1730,6 +1732,19 @@ def test_vllm_deferred_model_load(cluster, tokenizer):
 
     # Clean up
     vllm_generation.shutdown()
+
+
+def test_replace_non_finite():
+    assert _replace_non_finite(math.nan) == 0.0
+    assert _replace_non_finite(math.inf) == 0.0
+    assert _replace_non_finite(-math.inf) == 0.0
+    assert _replace_non_finite(1.5) == 1.5
+    assert _replace_non_finite({"a": [math.nan, 1.0], "b": {"c": math.inf}}) == {
+        "a": [0.0, 1.0],
+        "b": {"c": 0.0},
+    }
+    assert _replace_non_finite("x") == "x"
+    assert _replace_non_finite([{"lp": -math.inf}, 2, None]) == [{"lp": 0.0}, 2, None]
 
 
 def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
