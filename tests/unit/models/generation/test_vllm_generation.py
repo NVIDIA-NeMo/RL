@@ -2470,7 +2470,7 @@ async def test_vllm_refit_non_colocated_update_weights(
         tokenizer = get_tokenizer({"name": model_name})
 
         lm_config["model_name"] = model_name
-        lm_config["tokenizer"]["name"] = model_name
+        lm_config["tokenizer"].name = model_name
 
         vllm_config["model_name"] = model_name
         vllm_config["tokenizer"]["name"] = model_name
@@ -2576,7 +2576,7 @@ def test_vllm_generation_with_megatron_training(
         tp=tensor_parallel_size, pp=1, precision="float32"
     )
     megatron_config["model_name"] = model_name
-    megatron_config["tokenizer"]["name"] = model_name
+    megatron_config["tokenizer"].name = model_name
 
     vllm_policy = None
     megatron_policy = None
@@ -2737,7 +2737,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
     # Megatron config with same model
     megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="bfloat16")
     megatron_config["model_name"] = model_name
-    megatron_config["tokenizer"]["name"] = model_name
+    megatron_config["tokenizer"].name = model_name
     megatron_config["expert_model_parallel_size"] = expert_parallel_size
 
     vllm_policy = None
@@ -2893,7 +2893,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
         tp=1, pp=1, precision="float32", empty_unused_memory_level=1
     )
     megatron_config["model_name"] = model_name
-    megatron_config["tokenizer"]["name"] = model_name
+    megatron_config["tokenizer"].name = model_name
 
     # Create policies
     print("Creating vLLM policy...")
@@ -2989,7 +2989,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
         precision="float32",
     )
     megatron_config["model_name"] = model_name
-    megatron_config["tokenizer"]["name"] = model_name
+    megatron_config["tokenizer"].name = model_name
 
     vllm_policy = None
     megatron_policy = None
@@ -3075,7 +3075,7 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             tp=1, pp=1, precision="bfloat16"
         )
         megatron_config["model_name"] = model_name
-        megatron_config["tokenizer"]["name"] = model_name
+        megatron_config["tokenizer"].name = model_name
         megatron_policy = Policy(cluster, megatron_config, tokenizer)
 
         # Create VllmGeneration
