@@ -192,6 +192,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.chat_completion",
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
+        "vllm.entrypoints.openai.responses",
         "vllm.entrypoints.serve",
         "vllm.entrypoints.serve.render",
         "vllm.entrypoints.serve.tokenize",
@@ -229,6 +230,18 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.instances.append(self)
+
+    class OpenAIServingResponses:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.last_request = None
+            self.instances.append(self)
+
+        async def create_responses(self, request, raw_request=None):
+            self.last_request = request
+            return "responses-result"
 
     class OpenAIServingTokenization:
         instances = []
@@ -268,6 +281,16 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         OpenAIServingModels=OpenAIServingModels,
     )
     make_module(
+        "vllm.entrypoints.openai.responses.api_router",
+        attach_router=MagicMock(
+            side_effect=lambda app: app.include_router("responses-router")
+        ),
+    )
+    make_module(
+        "vllm.entrypoints.openai.responses.serving",
+        OpenAIServingResponses=OpenAIServingResponses,
+    )
+    make_module(
         "vllm.entrypoints.serve.tokenize.protocol",
         TokenizeChatRequest=type("TokenizeChatRequest", (), {}),
         TokenizeCompletionRequest=type("TokenizeCompletionRequest", (), {}),
@@ -291,12 +314,19 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         ToolParserManager=ToolParserManager,
     )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
-    return ToolParserManager, ReasoningParserManager, OpenAIServingChat
+    return (
+        ToolParserManager,
+        ReasoningParserManager,
+        OpenAIServingChat,
+        OpenAIServingResponses,
+    )
 
 
 class _FakeFastAPIApp:
     def __init__(self):
         self.routes = []
+        self.included_routers = []
+        self.state = types.SimpleNamespace()
 
     def post(self, path):
         def decorator(func):
@@ -305,12 +335,17 @@ class _FakeFastAPIApp:
 
         return decorator
 
+    def include_router(self, router):
+        self.included_routers.append(router)
 
-def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
+
+@pytest.mark.asyncio
+async def test_vllm_async_http_server_loads_parsers_and_responses_api(monkeypatch):
     (
         tool_parser_manager,
         reasoning_parser_manager,
         openai_serving_chat,
+        openai_serving_responses,
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -342,6 +377,20 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+    responses_handler = openai_serving_responses.instances[0]
+    assert responses_handler.kwargs["reasoning_parser"] == "nano_v3"
+    assert responses_handler.kwargs["return_tokens_as_token_ids"] is True
+    assert app.state.openai_serving_responses is responses_handler
+    assert app.included_routers == ["responses-router"]
+
+    request = types.SimpleNamespace(top_k=None, temperature=1.0, top_p=1.0)
+    assert await responses_handler.create_responses(request) == "responses-result"
+    assert request.top_k == -1
+
+    mismatched_request = types.SimpleNamespace(top_k=None, temperature=0.5, top_p=1.0)
+    with pytest.raises(AssertionError):
+        await responses_handler.create_responses(mismatched_request)
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
@@ -1605,6 +1654,29 @@ def test_vllm_http_server(cluster, tokenizer):
         return d
 
     assert _standardize(expected_result) == _standardize(actual_result)
+
+    # Check that the Responses API is backed by the same engine and sampling
+    # configuration as the Chat Completions endpoint.
+    responses_body = dict(
+        model=generation_config["model_name"],
+        input="count to 5",
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        max_output_tokens=1,
+        store=False,
+        enable_response_messages=True,
+    )
+    response = requests.post(url=f"{base_urls[0]}/responses", json=responses_body)
+    assert response.status_code == 200, response.text
+    responses_result = response.json()
+    assert responses_result["object"] == "response"
+    assert responses_result["model"] == generation_config["model_name"]
+    assert responses_result["usage"]["output_tokens"] == 1
+    assert responses_result["output"]
+    assert responses_result["input_messages"][0]["type"] == "raw_message_tokens"
+    assert responses_result["input_messages"][0]["tokens"]
+    assert responses_result["output_messages"][0]["type"] == "raw_message_tokens"
+    assert responses_result["output_messages"][0]["tokens"]
 
     # Check that tokenization route works
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
