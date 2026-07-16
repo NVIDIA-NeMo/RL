@@ -1,0 +1,84 @@
+# Full GLM-5.2 131K stress recipe on 72 H100 nodes. The allocation reserves
+# 64 nodes for TP2/PP8/CP32/EP64 training and 8 nodes for vLLM generation.
+# TP2 * PP8 * CP32 consumes all 512 training GPUs, preserving the DP=1
+# layout of the verified GLM-5.1 131K run. This is important for the
+# fixed-size EP64 all-gather token dispatcher when sequence packing is used.
+defaults: ./grpo-glm5.2-72n8g-megatron-8K-full-onpolicy-h100-cudnn-noncolocated.yaml
+
+grpo:
+  # Match the resolved successful GLM-5.1 131K run: one prompt produces
+  # eight generations, which form one global training batch at DP=1.
+  max_num_epochs: 1
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 8
+
+data:
+  max_input_seq_length: 130560
+  train:
+    # The source GLM-5.1 recipe points at a shorter 30K pipeclean by default;
+    # this dataset exercises the requested 130,560 + 512 = 131,072 tokens.
+    data_path: /lustre/fsw/portfolios/llmservice/users/slikhite/nemo-rl-integration/data/grpo_nemotron_math_30k_160_20steps.jsonl
+
+checkpointing:
+  checkpoint_dir: results/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+  # Match the verified GLM-5.1 131K cadence. GRPO always saves the last step,
+  # so a 10-step validation writes one resumable full-state checkpoint rather
+  # than the 19 TB required for both step 5 and step 10.
+  save_period: 10
+
+policy:
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 131072
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 131072
+    logprob_mb_tokens: 131072
+  dynamic_batching:
+    train_mb_tokens: 131072
+    logprob_mb_tokens: 131072
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 14
+    num_layers_in_last_pipeline_stage: 16
+    context_parallel_size: 32
+    expert_model_parallel_size: 64
+    activation_checkpointing: true
+    distributed_data_parallel_config:
+      # Keep the memory behavior proven by the successful GLM-5.2 run.
+      # In particular, disabling parameter-gather overlap avoids retaining an
+      # extra gather buffer when the post-step refit exports the MoE experts.
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    optimizer:
+      lr: 5.0e-7
+      min_lr: 5.0e-8
+      weight_decay: 0.0
+      adam_beta2: 0.999
+      # GLM-5.2 allocates its optimizer state on the first update. Keeping that
+      # state on HBM left only 1.18 GiB for a 1.50-GiB EP64 refit gather. These
+      # are the exact optimizer-memory settings of the successful GLM-5.2 job.
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    scheduler:
+      lr_decay_iters: 1000
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-8
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+      expert_parallel_size: 64
+      gpu_memory_utilization: 0.7
+    vllm_kwargs:
+      max_num_batched_tokens: 4096
+      max_num_seqs: 1
+
+logger:
+  log_dir: logs/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated
+  wandb:
+    name: grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated

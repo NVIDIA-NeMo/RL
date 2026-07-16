@@ -1,0 +1,47 @@
+# GLM-5.2 maximum-context comparison using the exact GLM-5.1 synthetic
+# 130,560-token dataset. GLM-5.2's default chat template adds the seven-token
+# "Reasoning Effort: Max" prefix, so the formatted prompt is 130,567 tokens.
+defaults: ./grpo-glm5.2-72n8g-megatron-131K-full-onpolicy-h100-cudnn-noncolocated.yaml
+
+loss_fn:
+  # Match the verified GLM-5.1 full-on-policy clipping configuration.
+  ratio_clip_max: 0.2
+
+data:
+  # math_hf_data_processor currently rejects length >= max_seq_length. Keep
+  # this strictly above the 130,567-token GLM-5.2 formatted prompt.
+  max_input_seq_length: 130568
+  validation: null
+  train:
+    data_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/xuanzic/RL/data/nemotron-cascade-2-math/generated/grpo_nemotron_math_130560_160_20steps.jsonl
+
+policy:
+  # The prompt plus a 512-token rollout is 131,079 tokens. TP2/CP32 requires
+  # sequence packing to use the next 128-token-aligned capacity, 131,200.
+  max_total_sequence_length: 131200
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 131200
+    logprob_mb_tokens: 131200
+  # Dynamic batching is disabled by the parent, but keep its latent budgets
+  # consistent if it is enabled by a future override.
+  dynamic_batching:
+    train_mb_tokens: 131200
+    logprob_mb_tokens: 131200
+  generation:
+    max_new_tokens: 512
+
+env:
+  math:
+    # Match the GLM-5.1 reward implementation for an apples-to-apples run.
+    num_workers: 8
+    math_verify_impl: hf_math_verify
+
+checkpointing:
+  checkpoint_dir: results/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated-glm51data
+  save_period: 10
+
+logger:
+  log_dir: logs/grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated-glm51data
+  wandb:
+    name: grpo-glm52-full-72n8g-131k-h100-cudnn-noncolocated-glm51data

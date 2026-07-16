@@ -122,9 +122,14 @@ class VllmInternalWorkerExtension:
         """Initialize the collective communication."""
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        local_rank = torch.distributed.get_rank()
-        # Place vLLM ranks after all training ranks so all training workers can join
-        rank = train_world_size + rank_prefix + local_rank
+        inference_rank = torch.distributed.get_rank()
+        # vLLM initializes one distributed process group across every inference
+        # worker, including all data-parallel replicas. Its rank is therefore
+        # already global within the inference world. Adding rank_prefix again
+        # would double-count the DP offset and produce duplicate/out-of-range
+        # ranks whenever DP > 1. Keep rank_prefix in the RPC API for backward
+        # compatibility with callers, but do not use it to form the rank.
+        rank = train_world_size + inference_rank
 
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size

@@ -1,0 +1,123 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  max_num_steps: 100
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  val_period: -1
+  skip_reference_policy_logprobs_calculation: true
+  reward_shaping:
+    max_response_length: 6144
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: 0.5
+
+checkpointing:
+  checkpoint_dir: results/grpo-glm5.2-32n8g-megatron-8K-h100
+
+policy:
+  model_name: zai-org/GLM-5.2
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # 2K prompt budget plus a 6K response budget for initial H100 bring-up.
+  max_total_sequence_length: 8192
+  logprob_chunk_size: 8192
+  dtensor_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    converter_type: GlmMoeDsaForCausalLM
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 14
+    num_layers_in_last_pipeline_stage: 16
+    context_parallel_size: 8
+    cp_comm_type: all_gather
+    expert_model_parallel_size: 32
+    sequence_parallel: true
+    activation_checkpointing: true
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    dsa_indexer_rope_interleaved: true
+    dsa_indexer_rotate_activation: false
+    dsa_indexer_k_norm_epsilon: 1.0e-6
+    dsa_kernel_backend: cudnn
+    dsa_indexer_loss_coeff: 0.0
+    dsa_indexer_use_sparse_loss: false
+    clear_memory_caches_before_refit: true
+    empty_unused_memory_level: 2
+    moe_router_dtype: fp32
+    gradient_accumulation_fusion: false
+    moe_grouped_gemm: true
+    deallocate_pipeline_outputs: true
+    persist_layer_norm: true
+    bias_dropout_fusion: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      weight_decay: 0.1
+      adam_beta2: 0.98
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 0
+      lr_warmup_init: 1.0e-6
+  generation:
+    max_new_tokens: 6144
+    # BF16 weights plus inherited kv_cache_dtype=auto avoid the FP8 rollout path.
+    # Inherited colocated.enabled=true uses a standard vLLM engine with no P/D split.
+    vllm_cfg:
+      precision: bfloat16
+      tensor_parallel_size: 4
+      expert_parallel_size: 64
+      gpu_memory_utilization: 0.9
+      enforce_eager: true
+    vllm_kwargs:
+      max_num_batched_tokens: 4096
+      max_num_seqs: 16
+      enable_chunked_prefill: true
+      attention_config:
+        backend: FLASHMLA_SPARSE
+      kernel_config:
+        moe_backend: flashinfer_cutlass
+
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+
+env:
+  math:
+    num_workers: 64
+    math_verify_impl: dapo_math_verify
+
+logger:
+  log_dir: logs/grpo-glm5.2-32n8g-megatron-8K-h100
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-glm
+    name: grpo-glm5.2-32n8g-megatron-8K-h100
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32
