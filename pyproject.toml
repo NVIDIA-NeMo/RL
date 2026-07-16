@@ -176,8 +176,10 @@ mcore = [
   # onnxscript, flash-linear-attention, ...) flow transitively and pick up upstream changes on
   # every submodule bump + `uv lock`. Do not mirror them here. transformer-engine's exact
   # version is still pinned globally via [tool.uv] override-dependencies.
-  "megatron-core",
   # [te]/[ssm] activate megatron-bridge's transformer-engine and mamba-ssm/causal-conv1d extras.
+  # megatron-core is intentionally NOT listed: it flows from megatron-bridge's own
+  # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
+  # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
@@ -185,20 +187,14 @@ mcore = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
+  # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
+  # conflicting extras resolve in separate forks — without these direct deps the mcore fork
+  # silently falls back to the PyPI releases instead of the pinned git revs.
   "mamba-ssm",
   "causal-conv1d",
-  "fast-hadamard-transform",
-  # emerging-optimizers already comes transitively via megatron-core[dev] (whose
-  # [tool.uv.sources] points it at git), but uv requires git/URL deps introduced by a path
-  # dependency's own sources to also appear as a direct requirement or constraint of the
-  # root project ("URL dependencies must be expressed as direct requirements"). Keep this
-  # pin in sync with Megatron-LM's [tool.uv.sources] entry.
-  "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  "quart",
-  "hypercorn",
-  "orjson",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
@@ -258,7 +254,6 @@ test = [
 ]
 
 [tool.uv.sources]
-megatron-core = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM", editable = true }
 nemo-automodel = { path = "3rdparty/Automodel-workspace/Automodel", editable = true }
 megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge", editable = true }
 nemo_gym = { workspace = true }
@@ -279,9 +274,6 @@ triton = [
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
-emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
-# rev must match the [tool.uv.sources] pin in Megatron-LM (transitive via megatron-core[dev])
-fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
@@ -393,19 +385,25 @@ override-dependencies = [
 
 # CVE fixes
 constraint-dependencies = [
-  "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484
-  "starlette>=0.49.1",        # Address CVE GHSA-7f5h-v6xp-fcq8
-  "urllib3>=2.7.0",           # Address CVE GHSA-38jv-5279-wg99
-  "aiohttp>=3.13.3",          # Address CVE GHSA-mqqc-3gqh-h2x8
-  "pyasn1>=0.6.3",            # Address CVE GHSA-jr27-m4p2-rc6r
-  "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
-  "protobuf>=6.33.5",         # Address CVE GHSA-7gcm-g887-7qv7
-  "python-multipart>=0.0.22", # Address CVE GHSA-wp53-j4wj-2cfg
-  "pygments>=2.20.0",         # Address CVE GHSA-5239-wwwm-4pmq
-  "cbor2>=5.9.0",             # Address CVE GHSA-3c37-wwvx-h642
-  "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
-  "cryptography>=48.0.1",     # Address CVE GHSA-6w46-j5rx-g56g, GHSA-537c-gmf6-5ccf
-  "orjson>=3.11.6",           # Address CVE GHSA-hx9q-6w63-j58v
+  # emerging-optimizers / fast-hadamard-transform flow transitively from megatron-core[dev],
+  # whose [tool.uv.sources] pins them to git. uv requires such URL deps to also appear as a
+  # direct requirement or constraint of the root project. Keep these URLs/revs in sync with
+  # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
+  "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0",
+  "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
+  "brotli>=1.2.0",                                                                                                                   # Address CVE GHSA-2qfp-q593-8484
+  "starlette>=0.49.1",                                                                                                               # Address CVE GHSA-7f5h-v6xp-fcq8
+  "urllib3>=2.7.0",                                                                                                                  # Address CVE GHSA-38jv-5279-wg99
+  "aiohttp>=3.13.3",                                                                                                                 # Address CVE GHSA-mqqc-3gqh-h2x8
+  "pyasn1>=0.6.3",                                                                                                                   # Address CVE GHSA-jr27-m4p2-rc6r
+  "wheel>=0.46.2",                                                                                                                   # Address CVE GHSA-8rrh-rw8j-w5fx
+  "protobuf>=6.33.5",                                                                                                                # Address CVE GHSA-7gcm-g887-7qv7
+  "python-multipart>=0.0.22",                                                                                                        # Address CVE GHSA-wp53-j4wj-2cfg
+  "pygments>=2.20.0",                                                                                                                # Address CVE GHSA-5239-wwwm-4pmq
+  "cbor2>=5.9.0",                                                                                                                    # Address CVE GHSA-3c37-wwvx-h642
+  "onnx>=1.21.0rc4",                                                                                                                 # Address CVE GHSA-hqmj-h5c6-369m
+  "cryptography>=48.0.1",                                                                                                            # Address CVE GHSA-6w46-j5rx-g56g, GHSA-537c-gmf6-5ccf
+  "orjson>=3.11.6",                                                                                                                  # Address CVE GHSA-hx9q-6w63-j58v
   "pyjwt>=2.13.0",
   "dulwich>=1.2.5",
   "diffusers>=0.38.0",
