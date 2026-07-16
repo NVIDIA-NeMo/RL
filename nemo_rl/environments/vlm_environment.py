@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import importlib
+import importlib.util
 import io
 import logging
+import sys
 from functools import partial
+from pathlib import Path
+from types import ModuleType
 from typing import Any, Callable, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
@@ -40,10 +46,151 @@ from nemo_rl.environments.rewards import (
 from nemo_rl.environments.utils import chunk_list_to_workers
 
 
+class CustomRewardFunctionConfig(BaseModel, extra="forbid"):
+    """Import location for a user-defined VLM reward function."""
+
+    name: str = Field(min_length=1)
+    function: str = Field(min_length=1)
+    module: Optional[str] = None
+    file: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _require_exactly_one_source(self) -> "CustomRewardFunctionConfig":
+        if (self.module is None) == (self.file is None):
+            raise ValueError("exactly one of 'module' or 'file' must be set")
+        return self
+
+
 class VLMEnvConfig(TypedDict):
     num_workers: int
     stop_strings: NotRequired[Optional[list[str]]]  # Default stop strings for this env
     reward_functions: List[dict[str, Any]]  # list of reward functions and their weights
+    custom_reward_functions: NotRequired[list[CustomRewardFunctionConfig]]
+
+
+RewardFunction = Callable[[str, str], tuple[float, Optional[bool]]]
+
+_BUILTIN_REWARD_FUNCTIONS: dict[str, RewardFunction] = {
+    "format": format_reward,
+    "exact_alnum": exact_answer_alphanumeric_reward,
+    "math_expr": math_expression_reward,
+    "bbox_giou": bbox_giou_reward,
+    "geo3k": geo3k_reward,
+}
+
+
+def _load_reward_module(config: CustomRewardFunctionConfig) -> ModuleType:
+    """Load the module containing a configured custom reward function."""
+    if config.module is not None:
+        try:
+            return importlib.import_module(config.module)
+        except Exception as error:
+            raise ValueError(
+                f"Failed to import module '{config.module}' for custom reward "
+                f"function '{config.name}'"
+            ) from error
+
+    assert config.file is not None  # Enforced by CustomRewardFunctionConfig.
+    file_path = Path(config.file)
+    if not file_path.is_file():
+        raise ValueError(
+            f"Python file '{file_path}' for custom reward function "
+            f"'{config.name}' does not exist"
+        )
+
+    module_name = f"nemo_rl_custom_reward_{abs(hash(file_path.resolve()))}"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ValueError(
+            f"Could not create an import spec for custom reward file '{file_path}'"
+        )
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:
+        sys.modules.pop(module_name, None)
+        raise ValueError(
+            f"Failed to load Python file '{file_path}' for custom reward "
+            f"function '{config.name}'"
+        ) from error
+    return module
+
+
+def _load_custom_reward_function(
+    raw_config: CustomRewardFunctionConfig | dict[str, Any],
+) -> tuple[str, RewardFunction]:
+    """Load and validate one custom reward function from user configuration."""
+    config = CustomRewardFunctionConfig.model_validate(raw_config)
+    module = _load_reward_module(config)
+
+    try:
+        reward_function = getattr(module, config.function)
+    except AttributeError as error:
+        source = config.module if config.module is not None else config.file
+        raise ValueError(
+            f"Custom reward source '{source}' has no attribute "
+            f"'{config.function}' for reward '{config.name}'"
+        ) from error
+
+    if not callable(reward_function):
+        raise ValueError(
+            f"Custom reward '{config.name}' resolves to non-callable attribute "
+            f"'{config.function}'"
+        )
+    return config.name, reward_function
+
+
+def _get_reward_function_registry(cfg: VLMEnvConfig) -> dict[str, RewardFunction]:
+    """Return built-in and configured custom VLM reward functions by name."""
+    registry = dict(_BUILTIN_REWARD_FUNCTIONS)
+    custom_reward_configs = cfg.get("custom_reward_functions")
+    if custom_reward_configs is None:
+        return registry
+
+    for raw_config in custom_reward_configs:
+        config = CustomRewardFunctionConfig.model_validate(raw_config)
+        if config.name in registry:
+            raise ValueError(
+                f"Reward function name '{config.name}' is already registered; custom "
+                "reward names must not replace built-in or previously configured functions"
+            )
+        name, reward_function = _load_custom_reward_function(config)
+        registry[name] = reward_function
+    return registry
+
+
+def _resolve_configured_reward_functions(
+    cfg: VLMEnvConfig,
+) -> list[tuple[RewardFunction, float]]:
+    """Resolve weighted reward functions selected by a VLM environment config."""
+    registry = _get_reward_function_registry(cfg)
+    reward_functions = []
+    for reward_func_cfg in cfg["reward_functions"]:
+        reward_func_name: str = reward_func_cfg["name"]
+        reward_func_weight: float = reward_func_cfg["weight"]
+        reward_func_kwargs: Optional[dict] = reward_func_cfg.get("kwargs", None)
+
+        try:
+            reward_func = registry[reward_func_name]
+        except KeyError as error:
+            available_names = ", ".join(sorted(registry))
+            raise ValueError(
+                f"Invalid reward function: {reward_func_name}. "
+                f"Available reward functions: {available_names}"
+            ) from error
+
+        if reward_func_kwargs is not None:
+            reward_func = partial(reward_func, **reward_func_kwargs)
+        reward_functions.append((reward_func, reward_func_weight))
+
+    if len(reward_functions) == 0:
+        raise ValueError("No reward functions provided")
+    return reward_functions
 
 
 @contextlib.contextmanager
@@ -60,38 +207,7 @@ def _mute_output():
 class VLMVerifyWorker:
     def __init__(self, cfg: VLMEnvConfig) -> None:
         logging.getLogger("vlm_worker").setLevel(logging.CRITICAL)
-        # this is a simple reward function that rewards the agent for correct answer and correct format
-        reward_functions = []
-        # loop over all configs
-        for reward_func_cfg in cfg["reward_functions"]:
-            # get name and weight
-            reward_func_name: str = reward_func_cfg["name"]
-            reward_func_weight: float = reward_func_cfg["weight"]
-            reward_func_kwargs: Optional[dict] = reward_func_cfg.get("kwargs", None)
-            reward_func: Callable[[str, str], tuple[float, Optional[bool]]]
-            if reward_func_name == "format":
-                reward_func = format_reward
-            elif reward_func_name == "exact_alnum":
-                reward_func = exact_answer_alphanumeric_reward
-            elif reward_func_name == "math_expr":
-                reward_func = math_expression_reward
-            elif reward_func_name == "bbox_giou":
-                reward_func = bbox_giou_reward
-            elif reward_func_name == "geo3k":
-                reward_func = geo3k_reward
-            else:
-                raise ValueError(f"Invalid reward function: {reward_func_name}")
-
-            # check for additional kwargs
-            if reward_func_kwargs is not None:
-                reward_func = partial(reward_func, **reward_func_kwargs)
-
-            reward_functions.append((reward_func, reward_func_weight))
-
-        if len(reward_functions) == 0:
-            raise ValueError("No reward functions provided")
-
-        # combine the reward functions
+        reward_functions = _resolve_configured_reward_functions(cfg)
         self.verify_func = combine_reward_functions(reward_functions)
 
     def verify(
