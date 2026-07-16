@@ -26,8 +26,10 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "<tool_call>",
@@ -473,18 +475,88 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
         raise NotImplementedError
 
 
+def create_nemo_gym_actor(
+    *,
+    model_name: str,
+    base_urls: list[str],
+    nemo_gym_config: dict[str, Any],
+) -> Any:
+    """Create and start a NeMo Gym actor connected to generation endpoints.
+
+    Args:
+        model_name: Model name advertised to NeMo Gym.
+        base_urls: OpenAI-compatible generation server base URLs.
+        nemo_gym_config: NeMo Gym global configuration.
+
+    Returns:
+        A started ``NemoGym`` Ray actor handle.
+    """
+    nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
+    if nemo_gym_py_exec.startswith("uv"):
+        nemo_gym_py_exec = create_local_venv_on_each_node(
+            nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
+        )
+
+    initial_global_config_dict = dict(nemo_gym_config)
+    invalid_tool_call_patterns = initial_global_config_dict.pop(
+        "invalid_tool_call_patterns", None
+    )
+    thinking_tags = initial_global_config_dict.pop("thinking_tags", None)
+
+    uv_cache_dir = get_nemo_gym_uv_cache_dir()
+    if uv_cache_dir is not None:
+        initial_global_config_dict.setdefault("uv_cache_dir", uv_cache_dir)
+    uv_venv_dir = get_nemo_gym_venv_dir()
+    if uv_venv_dir is not None:
+        initial_global_config_dict.setdefault("uv_venv_dir", uv_venv_dir)
+
+    nemo_gym_cfg = NemoGymConfig(
+        model_name=model_name,
+        base_urls=base_urls,
+        invalid_tool_call_patterns=invalid_tool_call_patterns,
+        thinking_tags=thinking_tags,
+        require_routed_experts=False,
+        initial_global_config_dict=initial_global_config_dict,
+    )
+    runtime_env = {
+        "py_executable": nemo_gym_py_exec,
+        "env_vars": {
+            **os.environ,
+            "VIRTUAL_ENV": nemo_gym_py_exec,
+            "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+        },
+    }
+    actor = NemoGym.options(runtime_env=runtime_env).remote(nemo_gym_cfg)
+    ray.get(actor._spinup.remote())
+    return actor
+
+
 ########################################
 # Global config utils
 ########################################
 
 
-def setup_nemo_gym_config(config, tokenizer) -> None:
-    generation_config = config.policy["generation"]
+def setup_nemo_gym_generation_config(generation_config: dict[str, Any]) -> None:
+    """Configure a generation backend for NeMo Gym HTTP rollouts."""
+    backend = generation_config.get("backend")
+    if backend == "vllm":
+        backend_config = generation_config["vllm_cfg"]
+    elif backend == "megatron":
+        backend_config = generation_config["mcore_generation_config"]
+    else:
+        raise ValueError(
+            "NeMo Gym HTTP rollouts require backend=vllm or backend=megatron"
+        )
 
-    # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    # Gym calls the rollout engine through its OpenAI-compatible HTTP server.
+    backend_config["async_engine"] = True
+    backend_config["expose_http_server"] = True
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+
+def setup_nemo_gym_config(config, tokenizer) -> None:
+    """Configure a training config for NeMo Gym rollouts."""
+    setup_nemo_gym_generation_config(config.policy["generation"])

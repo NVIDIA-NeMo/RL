@@ -79,7 +79,8 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     """Collate function for evaluation.
 
     Takes a list of data samples and combines them into a single batched dictionary
-    for model evaluation.
+    for model evaluation. ``loss_multiplier`` is retained because agent-backed
+    evaluation reuses the rollout result assembly path, which expects this field.
 
     Args:
         data_batch: List of data samples with message_log, extra_env_info, and idx fields.
@@ -117,6 +118,10 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     message_log = [datum_spec["message_log"] for datum_spec in data_batch]
     extra_env_info = [datum_spec["extra_env_info"] for datum_spec in data_batch]
     idx = [datum_spec["idx"] for datum_spec in data_batch]
+    task_names = [datum_spec.get("task_name", None) for datum_spec in data_batch]
+    loss_multiplier = torch.tensor(
+        [datum_spec.get("loss_multiplier", 1.0) for datum_spec in data_batch]
+    )
 
     # Check if any of the data batch has vllm content (multimodal data)
     extra_args = {}
@@ -137,6 +142,8 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         message_log=message_log,
         extra_env_info=extra_env_info,
         idx=idx,
+        task_name=task_names,
+        loss_multiplier=loss_multiplier,
         **extra_args,
     )
     return output

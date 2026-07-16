@@ -25,10 +25,20 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
 from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.nemo_gym import setup_nemo_gym_generation_config
 from nemo_rl.environments.utils import create_env
-from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
+from nemo_rl.evals.eval import (
+    EvalRunResult,
+    MasterConfig,
+    NemoGymEvalDataConfig,
+    run_env_eval,
+    setup,
+    setup_nemo_gym_environment,
+    should_use_nemo_gym,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
+from nemo_rl.utils.logger import Logger
 
 
 def parse_args():
@@ -49,6 +59,18 @@ def parse_args():
 
 def setup_data(tokenizer, data_config, env_configs):
     print("Setting up data...")
+
+    if isinstance(data_config, NemoGymEvalDataConfig):
+        base_dataset = load_response_dataset(data_config.model_dump())
+        dataset = AllTaskProcessedDataset(
+            dataset=base_dataset.dataset,
+            tokenizer=tokenizer,
+            default_task_data_spec=base_dataset.task_spec,
+            task_data_processors=base_dataset.processor,
+            task_data_preprocessors=base_dataset.preprocessor,
+            max_seq_length=data_config.max_input_seq_length,
+        )
+        return dataset, None, tokenizer
 
     # load dataset
     base_dataset = load_eval_dataset(data_config)
@@ -72,9 +94,65 @@ def setup_data(tokenizer, data_config, env_configs):
     return dataset, env, tokenizer
 
 
-def main():
-    """Main entry point."""
-    # Parse arguments
+def run_eval(config: MasterConfig) -> EvalRunResult:
+    """Run evaluation from an already validated eval configuration."""
+    # Print config
+    print("Final config:")
+    pprint.pprint(config)
+
+    # Init ray
+    init_ray()
+
+    # Setup tokenizer — get_tokenizer handles both text-only and multimodal
+    is_multimodal = not should_use_nemo_gym(config) and _is_multimodal_dataset(
+        config.data["dataset_name"]
+    )
+    tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
+    config.generation = configure_generation_config(
+        config.generation, tokenizer, is_eval=True
+    )
+    if should_use_nemo_gym(config):
+        setup_nemo_gym_generation_config(config.generation)
+
+    # Setup data
+    (
+        dataset,
+        env,
+        tokenizer,
+    ) = setup_data(tokenizer, config.data, config.env, is_multimodal=is_multimodal)
+
+    # Setup
+    (
+        vllm_generation,
+        dataloader,
+        master_config,
+    ) = setup(config, tokenizer, dataset)
+
+    if should_use_nemo_gym(master_config):
+        env = setup_nemo_gym_environment(vllm_generation, master_config)
+
+    logger = Logger(master_config.logger) if master_config.logger is not None else None
+    if logger is not None:
+        logger.log_hyperparams(master_config.model_dump())
+
+    # Run evaluation
+    try:
+        result = run_env_eval(
+            vllm_generation,
+            dataloader,
+            env,
+            master_config,
+            tokenizer=tokenizer,
+            logger=logger,
+        )
+    finally:
+        if logger is not None:
+            logger.close()
+    return result
+
+
+def main() -> None:
+    """Load a standard eval YAML and run evaluation."""
     args, overrides = parse_args()
 
     if not args.config:
@@ -91,44 +169,9 @@ def main():
         config = OmegaConf.merge(config, override_conf)
 
     config = OmegaConf.to_container(config, resolve=True)
-    config = MasterConfig(**config)
+    master_config = MasterConfig(**config)
     print("Applied CLI overrides")
-
-    # Print config
-    print("Final config:")
-    pprint.pprint(config)
-
-    # Init ray
-    init_ray()
-
-    # Setup tokenizer — get_tokenizer handles both text-only and multimodal
-    is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
-    tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
-    config.generation = configure_generation_config(
-        config.generation, tokenizer, is_eval=True
-    )
-
-    # Setup data
-    (
-        dataset,
-        env,
-        tokenizer,
-    ) = setup_data(tokenizer, config.data, config.env)
-
-    # Setup
-    (
-        vllm_generation,
-        dataloader,
-        master_config,
-    ) = setup(config, tokenizer, dataset)
-
-    # Run evaluation
-    run_env_eval(
-        vllm_generation,
-        dataloader,
-        env,
-        master_config,
-    )
+    run_eval(master_config)
 
 
 if __name__ == "__main__":

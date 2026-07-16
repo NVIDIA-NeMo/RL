@@ -51,6 +51,8 @@ class WandbConfig(TypedDict):
     project: NotRequired[str]
     name: NotRequired[str]
     entity: NotRequired[str]
+    id: NotRequired[str]
+    resume: NotRequired[str | bool]
 
 
 class SwanlabConfig(TypedDict):
@@ -367,8 +369,9 @@ class WandbLogger(LoggerInterface):
 
         # If step_metric is provided, use the corresponding value from metrics as step
         if step_metric and step_metric in metrics:
-            # commit=False so the step does not get incremented
-            self.run.log(metrics, commit=False)
+            # Multiple metrics from one logical step can be accumulated with
+            # commit=False and committed together by the final batch log.
+            self.run.log(metrics, commit=step_finished)
         elif step_finished:
             # Commit param defaults to None. By default if step is set, then commit defaults to False
             # Here, we have an explicit fork for commit in case W&B ever decides to change their default logic.
@@ -384,14 +387,29 @@ class WandbLogger(LoggerInterface):
         """
         self.run.config.update(params, allow_val_change=True)
 
-    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+    def log_plot(
+        self,
+        figure: plt.Figure,
+        step: int,
+        name: str,
+        *,
+        step_metric: Optional[str] = None,
+        step_finished: bool = False,
+    ) -> None:
         """Log a plot to wandb.
 
         Args:
             figure: Matplotlib figure to log
             step: Global step value
         """
-        self.run.log({name: figure}, step=step)
+        if step_metric:
+            self.run.log({step_metric: step, name: figure}, commit=step_finished)
+        else:
+            self.run.log({name: figure}, step=step)
+
+    def finish(self) -> None:
+        """Finish the W&B run so all pending batch metrics are uploaded."""
+        self.run.finish()
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
         """Log histogram metrics to wandb.
@@ -507,6 +525,11 @@ class RayGpuMonitorLogger:
         self.collection_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
         self.start_time: float = float("-inf")
+        self.batch_step_metric: Optional[str] = None
+
+    def use_batch_steps(self, step_metric: str) -> None:
+        """Buffer samples until the caller flushes them at a batch step."""
+        self.batch_step_metric = step_metric
 
     def start(self) -> None:
         """Start the GPU monitoring thread."""
@@ -539,8 +562,14 @@ class RayGpuMonitorLogger:
             self.collection_thread.join(timeout=self.collection_interval * 2)
             self.collection_thread = None
 
-        # Final flush
-        self.flush()
+        # Wall-clock mode preserves the historical final flush. In batch mode,
+        # samples collected after the final batch have no valid batch step and
+        # must not create a second, time-based axis.
+        if self.batch_step_metric is None:
+            self.flush()
+        else:
+            with self.lock:
+                self.metrics_buffer = []
         print("GPU monitoring stopped")
 
     def _collection_loop(self) -> None:
@@ -565,7 +594,10 @@ class RayGpuMonitorLogger:
 
                 # Check if it's time to flush
                 current_time = time.time()
-                if current_time - self.last_flush_time >= self.flush_interval:
+                if (
+                    self.batch_step_metric is None
+                    and current_time - self.last_flush_time >= self.flush_interval
+                ):
                     self.flush()
                     self.last_flush_time = current_time
 
@@ -747,27 +779,63 @@ class RayGpuMonitorLogger:
             print(f"Error fetching metrics from {metric_address}: {e}")
             return {}
 
-    def flush(self) -> None:
-        """Flush collected metrics to the parent logger."""
+    def flush(self, step: Optional[int] = None) -> None:
+        """Flush metrics using wall-clock samples or one aggregated batch step."""
         with self.lock:
             if not self.metrics_buffer:
                 return
 
             if self.parent_logger:
-                # Log each set of metrics with its original step
-                for entry in self.metrics_buffer:
-                    step = entry["step"]
-                    metrics = entry["metrics"]
+                if step is None:
+                    # Historical training behavior: one point per collection
+                    # time, using seconds since monitor startup as the step.
+                    for entry in self.metrics_buffer:
+                        entry_step = entry["step"]
+                        metrics = dict(entry["metrics"])
+                        metrics[self.step_metric] = entry_step
+                        self.parent_logger.log_metrics(
+                            metrics,
+                            step=entry_step,
+                            prefix=self.metric_prefix,
+                            step_metric=self.step_metric,
+                        )
+                else:
+                    # Eval has no meaningful optimizer/global step. Aggregate
+                    # every sample observed during the batch and attach it to
+                    # the batch index supplied by the eval loop.
+                    values_by_name: dict[str, list[float]] = {}
+                    latest_by_name: dict[str, Any] = {}
+                    for entry in self.metrics_buffer:
+                        for name, value in entry["metrics"].items():
+                            if isinstance(
+                                value, (int, float, np.integer, np.floating)
+                            ) and not isinstance(value, bool):
+                                if np.isfinite(value):
+                                    latest_by_name[name] = value
+                                    values_by_name.setdefault(name, []).append(
+                                        float(value)
+                                    )
+                            else:
+                                latest_by_name[name] = value
 
-                    # Add the step metric directly to metrics for use as step_metric
-                    metrics[self.step_metric] = step
+                    metrics: dict[str, Any] = {
+                        "samples": len(self.metrics_buffer),
+                    }
+                    for name, values in values_by_name.items():
+                        metrics[f"{name}/mean"] = float(np.mean(values))
+                        metrics[f"{name}/max"] = float(np.max(values))
+                        metrics[f"{name}/last"] = float(values[-1])
+                    for name, value in latest_by_name.items():
+                        if name not in values_by_name:
+                            metrics[f"{name}/last"] = value
 
-                    # Pass step_metric as the step_metric to use it as the step value in wandb
+                    step_metric = self.batch_step_metric or self.step_metric
+                    metrics[step_metric] = step
                     self.parent_logger.log_metrics(
                         metrics,
                         step=step,
                         prefix=self.metric_prefix,
-                        step_metric=self.step_metric,
+                        step_metric=step_metric,
                     )
 
             # Clear buffer after logging
@@ -959,8 +1027,9 @@ class Logger(LoggerInterface):
                 - "gpu_monitoring": dict with "collection_interval" and "flush_interval" when GPU monitoring is enabled.
         """
         self.loggers: list[LoggerInterface] = []
-        self.wandb_logger = None
-        self.swanlab_logger = None
+        self.wandb_logger: Optional[WandbLogger] = None
+        self.swanlab_logger: Optional[SwanlabLogger] = None
+        self.gpu_monitor: Optional[RayGpuMonitorLogger] = None
 
         self.base_log_dir = cfg["log_dir"]
         os.makedirs(self.base_log_dir, exist_ok=True)
@@ -994,7 +1063,6 @@ class Logger(LoggerInterface):
             self.loggers.append(mlflow_logger)
 
         # Initialize GPU monitoring if requested
-        self.gpu_monitor = None
         if cfg["monitor_gpus"]:
             metric_prefix = "ray"
             step_metric = f"{metric_prefix}/ray_step"
@@ -1043,6 +1111,17 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_hyperparams(params)
+
+    def use_batch_steps(
+        self, step_metric: str, metric_patterns: tuple[str, ...]
+    ) -> None:
+        """Configure existing backends and system monitoring for batch steps."""
+        if self.wandb_logger is not None:
+            self.wandb_logger.define_metric(step_metric)
+            for pattern in metric_patterns:
+                self.wandb_logger.define_metric(pattern, step_metric=step_metric)
+        if self.gpu_monitor is not None:
+            self.gpu_monitor.use_batch_steps(step_metric)
 
     def log_batched_dict_as_jsonl(
         self, to_log: BatchedDataDict[Any] | dict[str, Any], filename: str
@@ -1098,6 +1177,7 @@ class Logger(LoggerInterface):
         prefix: str,
         name: str,
         timeline_interval: float,
+        step_metric: Optional[str] = None,
     ) -> None:
         """Log a plot of per-worker timeline metrics.
 
@@ -1150,7 +1230,12 @@ class Logger(LoggerInterface):
         ax.grid(True, alpha=0.2)
         fig.tight_layout()
 
-        self.log_plot(fig, step, f"{prefix}/per_worker_{name}")
+        self.log_plot(
+            fig,
+            step,
+            f"{prefix}/per_worker_{name}",
+            step_metric=step_metric,
+        )
         plt.close(fig)
 
         # Plot the average of the metrics
@@ -1167,7 +1252,12 @@ class Logger(LoggerInterface):
         ax.set_title(name)
         ax.grid(True, alpha=0.2)
         fig.tight_layout()
-        self.log_plot(fig, step, f"{prefix}/average_{name}")
+        self.log_plot(
+            fig,
+            step,
+            f"{prefix}/average_{name}",
+            step_metric=step_metric,
+        )
         plt.close(fig)
 
     def log_histogram(self, histogram: list[Any], step: int, name: str) -> None:
@@ -1181,7 +1271,15 @@ class Logger(LoggerInterface):
         for logger in self.loggers:
             logger.log_histogram(histogram, step, name)
 
-    def log_plot(self, figure: plt.Figure, step: int, name: str) -> None:
+    def log_plot(
+        self,
+        figure: plt.Figure,
+        step: int,
+        name: str,
+        *,
+        step_metric: Optional[str] = None,
+        step_finished: bool = False,
+    ) -> None:
         """Log a matplotlib figure to all backends.
 
         Args:
@@ -1189,8 +1287,36 @@ class Logger(LoggerInterface):
             step: Global step value
             name: Name of the plot
         """
+        wandb_logger = getattr(self, "wandb_logger", None)
         for logger in self.loggers:
-            logger.log_plot(figure, step, name)
+            if (
+                wandb_logger is not None
+                and logger is wandb_logger
+                and (step_metric is not None or step_finished)
+            ):
+                wandb_logger.log_plot(
+                    figure,
+                    step,
+                    name,
+                    step_metric=step_metric,
+                    step_finished=step_finished,
+                )
+            else:
+                logger.log_plot(figure, step, name)
+
+    def flush_system_metrics(self, step: int) -> None:
+        """Attach buffered Ray system metrics to a caller-defined batch step."""
+        if self.gpu_monitor is not None:
+            self.gpu_monitor.flush(step=step)
+
+    def close(self) -> None:
+        """Stop background monitoring and finish remote logging backends."""
+        if self.gpu_monitor is not None:
+            self.gpu_monitor.stop()
+            self.gpu_monitor = None
+        if self.wandb_logger is not None:
+            self.wandb_logger.finish()
+            self.wandb_logger = None
 
     def log_plot_token_mult_prob_error(
         self, data: dict[str, Any], step: int, name: str
