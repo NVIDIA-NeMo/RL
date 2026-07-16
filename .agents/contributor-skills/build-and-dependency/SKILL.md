@@ -108,8 +108,10 @@ uv lock
   as direct requirements or constraints`** — upstream changed or added a git/URL dep
   in Megatron-Bridge's or Megatron-LM's `[tool.uv.sources]` (e.g., Megatron-LM bumping
   its `emerging-optimizers` rev). uv requires such URLs to also appear as a direct
-  requirement of the root project: update the matching pin in the `mcore` extra /
-  `[tool.uv.sources]` / `override-dependencies` in `pyproject.toml` to the same URL/rev.
+  requirement or constraint of the root project: update the matching pin in
+  `constraint-dependencies` (where `emerging-optimizers` and `fast-hadamard-transform`
+  live today) / the `mcore` extra / `[tool.uv.sources]` / `override-dependencies` in
+  `pyproject.toml` to the same URL/rev.
 - **Version conflicts** — resolve via `[tool.uv] override-dependencies` in
   `pyproject.toml`, same as any other conflict.
 

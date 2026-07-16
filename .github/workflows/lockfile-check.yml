@@ -1,0 +1,50 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Always-on, GPU-free lockfile freshness check. Dependencies for path deps
+# (megatron-bridge and its nested Megatron-LM) flow straight from the
+# submodules' own pyproject.toml files, so a submodule bump without a
+# corresponding `uv lock` makes uv.lock stale. The container build catches
+# this too (`uv sync --locked`), but only inside the gated GPU pipeline —
+# this job catches it on every PR before `/ok to test`.
+name: "Lockfile freshness"
+
+on:
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "3rdparty/**"
+      - ".github/workflows/lockfile-check.yml"
+
+jobs:
+  check:
+    name: uv lock check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Building megatron-bridge's metadata provisions its build requirements
+      # (incl. torch) into an isolated env on a cold cache — first run on a new
+      # uv.lock is slow (~5 min); cached runs are fast.
+      - name: Check lockfile is up to date
+        run: uv lock --check

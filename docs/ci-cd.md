@@ -89,6 +89,7 @@ All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
 | `detect-secrets.yml` | PR | Secrets scanning |
 | `semantic-pull-request.yml` | PR | PR title validation |
 | `labeler.yaml` | PR | Auto-label by file path |
+| `lockfile-check.yml` | PR (dependency paths) | uv.lock freshness vs submodule pyprojects |
 | `claude-review.yml` | `/claude-review` comment | AI code review |
 | `healthcheck_vms.yml` | schedule (07:00 UTC), dispatch | GPU runner health |
 | `automodel-submodule-checks.yml` | PR | Submodule validation |
