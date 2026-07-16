@@ -323,6 +323,8 @@ design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
 design-docs/checkpointing.md
+design-docs/partial-rollout-checkpointing-mvp.md
+design-docs/partial-rollout-checkpointing-milestone-1.md
 design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md
 design-docs/training-backends.md
