@@ -1,0 +1,92 @@
+# Full GLM-5.2 on 72 H100 nodes: 64 nodes for Megatron training and
+# 8 dedicated nodes for vLLM generation. This combines the model settings
+# proven by the 32-node GLM-5.2 run with the verified GLM-5.1 H100 layout.
+defaults: ./grpo-glm5.2-32n8g-megatron-8K-h100.yaml
+
+grpo:
+  # The deterministic pipeclean dataset contains 20 optimizer steps per epoch.
+  max_num_epochs: 5
+  val_period: -1
+  reward_shaping:
+    max_response_length: 512
+
+loss_fn:
+  # Match the verified full-on-policy GLM-5.1 recipe.
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  force_on_policy_ratio: true
+
+data:
+  max_input_seq_length: 7680
+  shuffle: false
+  train:
+    dataset_name: ResponseDataset
+    data_path: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/xuanzic/RL/data/nemotron-cascade-2-math/generated/grpo_nemotron_math_7680_160_20steps.jsonl
+    input_key: input
+    output_key: output
+    split_validation_size: 0
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-glm52-full-72n8g-8k-h100-cudnn-noncolocated
+  # Match the verified GLM-5.1 full-model recipe and avoid writing a second
+  # multi-terabyte full-state checkpoint during a 10-step validation run.
+  save_period: 10
+
+policy:
+  model_name: /lustre/fsw/portfolios/llmservice/users/slikhite/models/GLM-5.2
+  tokenizer:
+    name: /lustre/fsw/portfolios/llmservice/users/slikhite/models/GLM-5.2
+  logprob_chunk_size: 2048
+  hf_config_overrides:
+    qk_rope_head_dim: 64
+  megatron_cfg:
+    force_reconvert_from_hf: false
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 8
+    # GLM-5.2 has 78 layers: 14 + (6 * 8) + 16 = 78.
+    num_layers_in_first_pipeline_stage: 14
+    num_layers_in_last_pipeline_stage: 16
+    context_parallel_size: 2
+    expert_model_parallel_size: 64
+    moe_token_dispatcher_type: allgather
+    dsa_kernel_backend: cudnn
+    clear_memory_caches_before_refit: true
+    empty_unused_memory_level: 2
+  generation:
+    max_new_tokens: 512
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 8
+        gpus_per_node: 8
+    vllm_cfg:
+      precision: bfloat16
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 64
+      async_engine: false
+      gpu_memory_utilization: 0.5
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+    vllm_kwargs:
+      max_num_batched_tokens: 2048
+      max_num_seqs: 2
+      enable_chunked_prefill: true
+      async_scheduling: false
+      attention_config:
+        backend: FLASHMLA_SPARSE
+      kernel_config:
+        moe_backend: flashinfer_cutlass
+
+logger:
+  log_dir: logs/grpo-glm52-full-72n8g-8k-h100-cudnn-noncolocated
+  wandb:
+    project: nemo-rl-glm-perf
+    name: grpo-glm52-full-72n8g-8k-h100-cudnn-noncolocated
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 72
