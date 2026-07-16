@@ -23,6 +23,7 @@ from typing import Any, Optional, Union
 import decord
 import requests
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from transformers import PreTrainedTokenizerBase
 from transformers.audio_utils import load_audio
@@ -82,6 +83,8 @@ class PackedTensor:
         self,
         tensors: Union[torch.Tensor, list[Optional[torch.Tensor]], list[None]],
         dim_to_pack: int,
+        *,
+        pad_to_max_shape: bool = False,
     ) -> None:
         assert tensors is not None, "Input tensors to PackedTensor cannot be None"
 
@@ -97,6 +100,7 @@ class PackedTensor:
                 f"Unsupported type for input tensors to PackedTensor: {type(tensors)}"
             )
         self.dim_to_pack = dim_to_pack
+        self.pad_to_max_shape = pad_to_max_shape
 
     def as_tensor(
         self, device: Optional[torch.device] = None
@@ -109,8 +113,29 @@ class PackedTensor:
         non_none_tensors = [t for t in self.tensors if t is not None]
         if len(non_none_tensors) == 0:
             return None
-        else:
-            return torch.cat(non_none_tensors, dim=self.dim_to_pack).to(device)
+
+        # Dynamic-resolution image processors can produce one raw-pixel batch
+        # per prompt with a different spatial extent, for example
+        # ``[1, 3, 448, 544]`` and ``[1, 3, 544, 448]``. These batches still
+        # pack along the image-count dimension, but they must first share a
+        # common canvas. The accompanying image-size tensor retains the true
+        # per-image dimensions so the model can crop away this padding before
+        # patchification.
+        if (
+            self.pad_to_max_shape
+            and
+            self.dim_to_pack == 0
+            and all(t.ndim == 4 for t in non_none_tensors)
+            and len({t.shape[1] for t in non_none_tensors}) == 1
+        ):
+            max_height = max(t.shape[2] for t in non_none_tensors)
+            max_width = max(t.shape[3] for t in non_none_tensors)
+            non_none_tensors = [
+                F.pad(t, (0, max_width - t.shape[3], 0, max_height - t.shape[2]))
+                for t in non_none_tensors
+            ]
+
+        return torch.cat(non_none_tensors, dim=self.dim_to_pack).to(device)
 
     def __len__(self) -> int:
         # this is the number of tensors in this data wrapper
@@ -125,12 +150,20 @@ class PackedTensor:
     def slice(self, indices: Union[list[int], torch.Tensor]) -> "PackedTensor":
         idx = indices.tolist() if isinstance(indices, torch.Tensor) else indices
         tensors = [self.tensors[i] for i in idx]
-        return PackedTensor(tensors, self.dim_to_pack)
+        return PackedTensor(
+            tensors,
+            self.dim_to_pack,
+            pad_to_max_shape=self.pad_to_max_shape,
+        )
 
     @classmethod
     def empty_like(cls, other: "PackedTensor") -> "PackedTensor":
         """Return a new PackedTensor with same length and dim_to_pack as `other`, with all entries None."""
-        return cls([None] * len(other.tensors), other.dim_to_pack)
+        return cls(
+            [None] * len(other.tensors),
+            other.dim_to_pack,
+            pad_to_max_shape=other.pad_to_max_shape,
+        )
 
     @classmethod
     def concat(cls, from_packed_tensors: list["PackedTensor"]) -> "PackedTensor":
@@ -158,12 +191,22 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
+        pad_to_max_shapes = [
+            batch.pad_to_max_shape for batch in from_packed_tensors
+        ]
+        assert len(set(pad_to_max_shapes)) == 1, (
+            "All packed tensors must have the same pad_to_max_shape setting"
+        )
         # concatenate the tensors
         tensors = []
         for packed_tensor in from_packed_tensors:
             tensors.extend(packed_tensor.tensors)
         dim_to_pack = dim_to_packs[0]
-        return cls(tensors, dim_to_pack)
+        return cls(
+            tensors,
+            dim_to_pack,
+            pad_to_max_shape=pad_to_max_shapes[0],
+        )
 
     @classmethod
     def flattened_concat(
@@ -195,8 +238,18 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
+        pad_to_max_shapes = [
+            batch.pad_to_max_shape for batch in from_packed_tensors
+        ]
+        assert len(set(pad_to_max_shapes)) == 1, (
+            "All packed tensors must have the same pad_to_max_shape setting"
+        )
         tensors = [p.as_tensor() for p in from_packed_tensors]
-        return cls(tensors, from_packed_tensors[0].dim_to_pack)
+        return cls(
+            tensors,
+            from_packed_tensors[0].dim_to_pack,
+            pad_to_max_shape=pad_to_max_shapes[0],
+        )
 
 
 def get_multimodal_keys_from_processor(processor) -> list[str]:
