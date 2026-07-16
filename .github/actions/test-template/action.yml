@@ -116,6 +116,7 @@ runs:
           --env HF_DATASETS_CACHE=/home/TestData/nemo-rl/hf_datasets_cache \
           --env NEMO_RL_REPO_DIR=/opt/nemo-rl \
           --env HF_TOKEN \
+          --env BASH_ENV= \
           ${{ inputs.is_fork_pr == 'true' && '--env HF_HUB_OFFLINE=1' || '' }} \
           ${{ inputs.image-tag != '' && '--env FAST=1' || '' }} \
           --volume $(pwd)/${{ github.run_id }}/${{steps.uuid.outputs.id }}/nemo-rl:/opt/nemo-rl \
