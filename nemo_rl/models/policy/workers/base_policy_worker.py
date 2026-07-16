@@ -37,25 +37,13 @@ class AbstractPolicyWorker:
             train_world_size: Number of training workers participating in the
                 cross-cluster process group.
 
-        NOTE: under the RefitWorker architecture (RL-412 follow-up) the
-        cross-cluster group is owned by a sibling ``RefitWorker`` actor
-        on the same node as train rank 0 — train workers do NOT
-        participate. ``Policy.init_collective`` skips dispatching to
-        train workers in that mode, so this method's body only runs on
-        the legacy DTensor path (or with ``NRL_USE_REFIT_WORKER=0``).
+        NOTE: on the RefitWorker path the cross-cluster group is owned by a sibling
+        actor; this method's body only runs on the legacy DTensor path.
         """
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        # Idempotent re-init: tear down any prior group (e.g. world size
-        # shrunk after a fault). Order matters:
-        #   1) ``destroy()`` first — NCCL's abort marks pending kernels
-        #      cancelled without waiting; sync'ing first would block on
-        #      ops that NCCL has noticed cannot make progress (their
-        #      peer is gone) and surface ``cudaErrorLaunchFailure`` into
-        #      the CUDA context.
-        #   2) ``cuda.synchronize()`` second, in try/except, to drain and
-        #      swallow the queued async error.
-        #   3) ``cuda.empty_cache()`` third, also try/except'd.
+        # Idempotent re-init: tear down any prior group before creating a new one.
+        # destroy() first (abort pending kernels), then sync to drain async errors.
         old = getattr(self, "model_update_group", None)
         if old is not None:
             try:
@@ -87,12 +75,7 @@ class AbstractPolicyWorker:
         self.model_update_group.init_nccl_communicator(device=device)
 
     def abort_collective(self) -> None:
-        """Abort the cross-cluster weight-sync NCCL group on this worker.
-
-        Legacy path only — under the RefitWorker architecture the
-        cross-cluster group lives in a sibling actor and is torn down
-        via ``ray.kill`` from ``Policy.abort_collective``.
-        """
+        """Abort the cross-cluster weight-sync NCCL group on this worker (legacy path only)."""
         old = getattr(self, "model_update_group", None)
         if old is None:
             return

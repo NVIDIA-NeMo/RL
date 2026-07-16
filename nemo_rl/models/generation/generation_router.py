@@ -13,23 +13,10 @@
 # limitations under the License.
 """GenerationRouter — unified ingress for disaggregated vLLM generation.
 
-A single FastAPI service exposes both the data plane (proxied
-``/v1/{completions,chat/completions}`` to per-shard vLLM endpoints with
-cordon + replay) and the control plane (weight sync, lifecycle, refit
-gate, metrics). Both training (``RemoteGeneration._http_mode``) and
-NemoGym point at this server, so cordoning of failed DP shards is
-invisible to clients.
-
-The router proxies requests to a per-shard vLLM OpenAI endpoint
-(round-robin, optionally sticky via ``X-NRL-Session-Id``) and replays on
-a different shard if the chosen one returns 5xx / connection error.
-
-The router also owns the gen-side lifecycle: placement-group + Ray-actor
-add/remove and weight-sync NCCL coordination. Control endpoints
-(``/init_collective``, ``/update_weights_from_collective``, etc.) wrap
-the underlying ``VllmGeneration`` and run on the same uvicorn process /
-event loop, so there is exactly one HTTP service and one port (8089) per
-gen daemon.
+Exposes data plane (``/v1/{completions,chat/completions}`` proxied to per-shard
+vLLM with cordon + replay) and control plane (weight sync, lifecycle, metrics)
+on a single port (8089). Both training and NemoGym point here; shard failures
+are invisible to clients via round-robin routing with replay.
 """
 
 from __future__ import annotations
@@ -51,58 +38,28 @@ from fastapi.responses import JSONResponse, Response
 
 ShardStatus = Literal["ready", "draining", "cordoned", "joining"]
 
-# vLLM's OpenAI HTTP server (in nemo-rl's nightly image) exposes only
-# /v1/{completions,chat/completions}, /tokenize, and /openapi.json — no
-# /health, /v1/models, or /healthz. /openapi.json is the only stable
-# always-200 GET we can use as a liveness probe; if a future vLLM build
-# adds /health we can flip this without changing the rest of the router.
+# vLLM's HTTP server exposes /openapi.json as a stable always-200 liveness probe.
 _HEALTH_PATH = "/openapi.json"
 _DEFAULT_HEALTH_INTERVAL_S = 2.0
-# Bumped from 1s — vLLM's FastAPI event loop can stall 2-3s under heavy
-# inflight load (hundreds of concurrent /v1/completions for 30B-class
-# models with TP>1). A 1s probe timeout misclassifies that as failure.
+# 5s timeout: vLLM's event loop can stall 2-3s under heavy burst load.
 _DEFAULT_HEALTH_TIMEOUT_S = 5.0
-# Bumped from 3 — combined with the longer timeout above, cordon now
-# requires ~50s of sustained unresponsiveness instead of ~6s. Genuine
-# failures (pod death, OOM, NCCL hang) still trip cordon within a
-# bounded window; transient probe lag during burst load doesn't.
+# 10 failures required: ~50s of sustained unresponsiveness before cordon.
 _DEFAULT_FAILURE_THRESHOLD = 10
 _DEFAULT_JOIN_SUCCESS_THRESHOLD = 2
-# RL-412 §3 warm-up gate default (env NRL_JOINABLE_MIN_AGE_S). Imported from
-# ft_constants so the default lives in one place alongside the other FT knobs.
+# Warm-up gate default (env NRL_JOINABLE_MIN_AGE_S). In ft_constants so the default lives alongside other FT knobs.
 from nemo_rl.models.generation.ft_constants import (  # noqa: E402
     JOINABLE_MIN_AGE_S as _DEFAULT_JOINABLE_MIN_AGE_S,
 )
-# Data-plane (proxy) error threshold. The proxy used to cordon on a
-# single 5xx or transport error from a shard, which under burst load
-# turned an overloaded vLLM into a permanently-removed shard. Now we
-# require N consecutive proxy errors — same shape as the health-poll
-# threshold but accumulated on /v1/completions failures instead of
-# /openapi.json probe failures.
+# Require N consecutive proxy errors before cordoning; prevents burst 5xx from evicting a healthy shard.
 _DEFAULT_PROXY_FAILURE_THRESHOLD = 5
-# aiohttp's default TCPConnector(limit=100) caps the router at 100
-# in-flight downstream connections — 20x too small for a 2048-prompt
-# burst (32 generations × 64 prompts). Excess requests queue in the
-# router and time out / get connection-reset before reaching a shard.
-# 4096 total + 1024/host gives plenty of headroom for typical RL
-# batches (2048-4096) without exhausting OS file handles.
+# Raise connection limits well above aiohttp's default (100) to handle large RL batches.
 _DEFAULT_PROXY_POOL_LIMIT_TOTAL = 4096
 _DEFAULT_PROXY_POOL_LIMIT_PER_HOST = 1024
-# uvicorn's default backlog (2048) is fine for typical loads, but
-# explicit so it's tunable. timeout_keep_alive 120 stays — long
-# enough to amortize TLS/TCP setup across many requests.
+# Explicit backlog for tuning; keep_alive 120s amortizes TCP setup.
 _DEFAULT_UVICORN_BACKLOG = 4096
 _DEFAULT_UVICORN_KEEP_ALIVE_S = 120
 _DEFAULT_PROXY_TIMEOUT_S = 300.0
-# Per-worker timeout for reset_collective during add_shard / remove_shard.
-# Bounds how long we wait on a survivor's NCCL teardown after a peer was
-# actor-killed. NCCL abort can wedge if a dead peer's collective was
-# in-flight; without this bound, ray.get(futures) deadlocks the lifecycle
-# lock and `_nccl_reinit_in_progress` stays True forever, killing the train
-# run via ensure_collective_synced's 600s timeout. 30s is well above
-# legitimate abort+reset wall time (~1-2s on healthy survivors); a hung
-# survivor is treated as failed and the next init_collective rebuilds
-# from a clean rendezvous.
+# Bounds NCCL teardown per survivor after a peer is killed; prevents deadlock if abort wedges.
 _DEFAULT_RESET_COLLECTIVE_TIMEOUT_S = 30.0
 
 
@@ -110,13 +67,9 @@ _DEFAULT_RESET_COLLECTIVE_TIMEOUT_S = 30.0
 class ShardEntry:
     """Router's view of a single vLLM DP shard.
 
-    `url` is the OpenAI-compatible base, e.g. http://<pod-ip>:8000/v1.
-    `_health_url` is derived once (strip trailing /v1, append /health) so we
-    don't pay string ops on the hot path.
-
-    `actor_handles` are populated when the router owns the lifecycle (post
-    bring-up); they let `remove_shard` kill the actors. `node_id` records
-    which SLURM node the shard ran on so a replacement can be pinned there.
+    `url` is the OpenAI-compatible base URL. `actor_handles` let `remove_shard`
+    kill the actors. `node_id` records the SLURM node so a replacement can be
+    pinned there.
     """
 
     shard_id: str
@@ -126,44 +79,19 @@ class ShardEntry:
     inflight: int = 0
     consecutive_failures: int = 0
     consecutive_successes: int = 0
-    # Data-plane (proxy) error counter — distinct from the health-poll
-    # `consecutive_failures` so a transient burst of 5xx/transport errors
-    # on /v1/completions doesn't cordon a shard before the health-poll
-    # has even noticed.
+    # Separate from health-poll failures so burst 5xx doesn't cordon a shard before the probe notices.
     proxy_consecutive_failures: int = 0
-    # Number of successful refits this shard has participated in since
-    # being added (or since the last fault). Used to gate joining→ready
-    # transition: the FIRST refit including a freshly-joined shard pays
-    # the full NCCL connection bootstrap cost (~20s on 30B-class hardware
-    # — IB queue pairs, GPU memory IPC mappings, NCCL topology cache),
-    # and during that bootstrap window the broadcast can land on the new
-    # shard while NCCL is still finishing setup, leaving its weights
-    # *almost* correct but with subtle byte corruption that surfaces as
-    # KL=1.4+ on the next training step. Requiring >=2 successful refits
-    # means the second refit lands on a fully-warm comm with clean bytes,
-    # and only then do we let the data plane route requests to this
-    # shard — eliminates the post-join KL spike.
+    # Gates joining→ready: requires >=2 successful refits to avoid post-join weight corruption
+    # from an incomplete NCCL bootstrap on the first refit.
     successful_refits_since_join: int = 0
-    # RL-412 elastic re-init: True once this shard has been included in a
-    # successful cross-cluster ``init_collective`` (i.e. it is in the live
-    # weight-sync comm). A freshly added shard is ``in_comm=False`` until the
-    # trainer grows the comm to include it; until then the gen-side broadcast
-    # skips it (no comm) and the router must NOT promote it to ``ready`` —
-    # otherwise the data plane would route to stale ``load_format=dummy``
-    # weights. Set in the ``/init_collective`` success path; reset on add.
+    # True once this shard is in the live weight-sync comm. Freshly added shards start False;
+    # the data plane skips them until in_comm is set by /init_collective success.
     in_comm: bool = False
-    # RL-412 §3 warm-up gate: monotonic timestamp this entry was created. A
-    # freshly backfilled shard answers /openapi.json long before its COLD
-    # cross-cluster RoCE route can complete a TCPStore rendezvous (~60-90s), so
-    # it must not count as joinable until it has aged past JOINABLE_MIN_AGE_S
-    # — UNLESS ``proven``. Stamped in __post_init__ (guarded so tests may pass
-    # an explicit aged value).
+    # Monotonic timestamp this entry was created. A cold backfill shard must age past
+    # JOINABLE_MIN_AGE_S before counting as joinable (unless already proven).
     joined_at: float = 0.0
-    # Sticky (never reset): True once this shard completed >=1 successful
-    # init_collective, i.e. its cross-cluster route has rendezvoused at least
-    # once and is warm. A proven shard rejoins immediately (no age gate). Kept
-    # distinct from ``in_comm`` (which is reset on add/uncordon and tracks
-    # *current* membership): ``proven`` tracks route warmth across re-adds.
+    # Sticky: True once this shard completed >=1 successful init_collective (route is warm).
+    # A proven shard bypasses the age gate on re-add.
     proven: bool = False
     actor_handles: list[Any] = field(default_factory=list, repr=False)
     # SLURM node the shard ran on — used by add_shard to pin the replacement
@@ -189,17 +117,10 @@ class ShardEntry:
 class GenerationRouter:
     """Unified data plane + control plane for the gen cluster.
 
-    Owns the only authoritative shard table for the gen cluster, plus
-    Ray-actor lifecycle and gen-side NCCL reset/init.
-    The shard table is populated once at bring-up via ``register_shards()``
-    and mutated by the health poll loop, the data-plane proxy on
-    threshold-breaching errors, and admin endpoints (cordon /
-    add_shard / remove_shard).
-
-    Control-plane endpoints (init_collective, update_weights_from_collective,
-    reset_collective, prepare_refit_info, etc.) wrap the underlying
-    ``VllmGeneration`` so the train side has a single HTTP target for
-    everything: data, status, lifecycle, weight sync.
+    Owns the authoritative shard table (populated by ``register_shards()``,
+    mutated by the health poller and admin endpoints) and gen-side NCCL
+    lifecycle. The train side has a single HTTP target for data, status,
+    lifecycle, and weight sync.
     """
 
     def __init__(
@@ -225,8 +146,7 @@ class GenerationRouter:
         self.health_timeout_s = health_timeout_s
         self.failure_threshold = failure_threshold
         self.join_success_threshold = join_success_threshold
-        # RL-412 §3: a fresh (unproven) joining shard isn't counted joinable
-        # until it has aged past this (cold cross-cluster RoCE route warm-up).
+        # Unproven joining shards must age past this before counting as joinable (cold route warm-up).
         self._joinable_min_age_s = float(joinable_min_age_s)
         self.proxy_failure_threshold = proxy_failure_threshold
         self.proxy_pool_limit_total = proxy_pool_limit_total
@@ -236,23 +156,12 @@ class GenerationRouter:
         self.proxy_timeout_s = proxy_timeout_s
         self._reset_collective_timeout_s = reset_collective_timeout_s
 
-        # RL-412 elastic re-init: a shard counts toward the cross-cluster
-        # rendezvous only once it is *joinable* — actor __init__ complete AND
-        # health-responsive — not merely spawned/`joining`. The trainer reads
-        # joinable_world_size + joinable_stable_for_s to decide WHEN to grow
-        # the comm (debounced) vs reuse it. Tracked here; refreshed once per
-        # health-poll tick by ``_refresh_joinable_stability``.
+        # Tracks when the joinable shard count last changed; used by the trainer's debounce logic.
         self._joinable_changed_at: float = time.monotonic()
         self._last_joinable_count: int = 0
 
-        # RL-412 elastic re-init: bumped whenever a shard that was IN the live
-        # comm (``in_comm``) is removed/evicted — i.e. the cross-cluster group
-        # the trainer last synced is now missing a member and is wedged. The
-        # trainer compares this epoch and re-inits PROACTIVELY instead of
-        # reusing the dead group and only discovering it when the weight
-        # broadcast fails (~1 heartbeat wasted). Critical for the "member
-        # evicted but backfill restored the count" case, where the shard count
-        # is unchanged so the trainer would otherwise reuse.
+        # Bumped when an in-comm shard is removed; trainer re-inits proactively instead of
+        # reusing a wedged group (handles the "backfill restored count" case).
         self._comm_reset_epoch: int = 0
 
         self._shards: dict[str, ShardEntry] = {}
@@ -266,33 +175,17 @@ class GenerationRouter:
         # it. Set inside add_shard / remove_shard, cleared once the gen-side
         # workers have completed reset_collective + init_collective.
         self._nccl_reinit_in_progress: bool = False
-        # Count of weight-refit broadcasts the router has handled. The
-        # FaultInjector gates its FIRST kill on this reaching >=1 ("training
-        # has actually started refitting") instead of a wall-clock guess —
-        # setup time varies wildly (warm reuse ~4min vs cold Megatron-30B
-        # load ~13min), so a fixed delay-from-daemon-start fires during setup
-        # on a slow start or after the run finished on a fast one.
+        # Count of refit broadcasts handled. FaultInjector waits for >=1 before triggering.
         self._refit_attempts: int = 0
         # Set at bring-up via register_shards; updated on add/remove.
         self._per_shard_world_size: int = 1
-        # Reference to the underlying VllmGeneration. Drives both the
-        # control-plane endpoints (init/reset/update_weights_from_collective,
-        # prepare_for_generation, etc.) and the lifecycle path
-        # (reset_collective after add/remove). None when the router runs
-        # without a backing VllmGeneration (unit tests, manual /admin
-        # operations on a fake setup); control endpoints then 503.
+        # Backing VllmGeneration; drives control-plane and lifecycle. None in unit-test / cordon-only mode.
         self._generation: Any = generation
 
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._health_task: Optional[asyncio.Task[None]] = None
-        # Set true in the lifespan teardown. Background tasks that schedule
-        # blocking work via ``loop.run_in_executor`` (the default thread-pool)
-        # will fail with "cannot schedule new futures after shutdown" once
-        # the loop is being torn down — observed during gen daemon restart
-        # / ``--replace`` when a cordon-driven auto-remove fires concurrently
-        # with shutdown. Hooks read this flag and short-circuit so the next
-        # daemon starts with a clean shard table instead of inheriting
-        # half-removed actors / dangling cordons.
+        # Set during lifespan teardown so background tasks short-circuit instead of
+        # scheduling new executor work after the event loop starts shutting down.
         self._shutting_down: bool = False
         self._app = self._build_app()
 
@@ -301,22 +194,11 @@ class GenerationRouter:
         # Hook for tests / step 2: called after each cordon transition.
         self.on_cordon: Optional[Callable[[str, str], Awaitable[None]]] = None
 
-        # =====================================================================
-        # Fault-tolerance metrics (surfaced via metrics_snapshot()).
-        #
-        # Counters track shard fleet churn over the daemon's lifetime so wandb
-        # can plot how many shards we've lost / regained over the full run.
-        # Note: these reset when the gen daemon restarts (e.g. on `--replace`);
-        # we accept that limitation rather than persist counters across a
-        # daemon recycle. RemoteGeneration scrapes these once per training
-        # step via /step_metrics_snapshot.
-        # =====================================================================
+        # Fault-tolerance metrics scraped by RemoteGeneration via /step_metrics_snapshot.
+        # Reset when the gen daemon restarts.
         self._total_shards_at_bootstrap: int = 0
         self._cumulative_shards_removed: int = 0
         self._cumulative_shards_added: int = 0
-        # Most recent fault event ({"reason": str, "shard_id": str,
-        # "monotonic_ts": float, "kind": "remove"|"add"|"cordon"}).
-        # Train side flips a per-step fault marker when this changes.
         self._last_fault_event: Optional[dict[str, Any]] = None
 
     # =====================================================================
@@ -332,30 +214,12 @@ class GenerationRouter:
         worker_indices_by_shard: Optional[dict[str, list[int]]] = None,
         generation: Any = None,
     ) -> None:
-        """Seed the shard table at bring-up.
+        """Seed the shard table at bring-up (synchronous, call before ``start()``).
 
-        Synchronous; intended to be called before `start()`. Initial status
-        is `ready` because the existing VllmGeneration bring-up already
-        waits for vLLM `/health` before returning; the health poller demotes
-        on subsequent failure.
-
-        Args:
-            shards: List of ``(shard_id, url)`` tuples.
-            per_shard_world_size: TP*PP for one DP shard. Multiplied by the
-                ready-shard count to derive ``current_gen_world_size``,
-                which the train driver reads on each refit to pick up
-                shrink/grow without redeploying.
-            actor_handles_by_shard: Optional ``{shard_id: [actor, ...]}``.
-                Required for ``remove_shard`` to kill the right actors.
-                Omit for unit tests / manual cordon-only usage.
-            node_id_by_shard: Optional ``{shard_id: ray_node_id}``. Used by
-                ``add_shard`` to pin a replacement actor to the same SLURM
-                node via NodeAffinitySchedulingStrategy.
-            generation: Optional reference to the underlying
-                ``VllmGeneration`` instance. The router calls
-                ``generation.reset_collective()`` on the surviving workers
-                after a remove_shard, and uses it to drive control-plane
-                endpoints. May also be passed at construction time.
+        Initial status is ``ready`` since VllmGeneration bring-up already waits for
+        vLLM health before returning. ``per_shard_world_size`` (TP*PP) is used to
+        derive ``current_gen_world_size``. ``generation`` may also be passed at
+        construction time.
         """
         self._per_shard_world_size = per_shard_world_size
         actor_handles_by_shard = actor_handles_by_shard or {}
@@ -371,10 +235,7 @@ class GenerationRouter:
                 node_id=node_id_by_shard.get(shard_id, ""),
                 worker_indices=list(worker_indices_by_shard.get(shard_id, [])),
             )
-        # Capture the bootstrap fleet size on first registration so wandb can
-        # compute "lost X of Y shards" over the run. Subsequent calls (which
-        # we don't currently make, but keep correct just in case) only update
-        # if we observe a larger fleet — never decrease.
+        # Capture bootstrap fleet size for wandb "lost X of Y shards" metric.
         self._total_shards_at_bootstrap = max(
             self._total_shards_at_bootstrap, len(self._shards)
         )
@@ -388,9 +249,6 @@ class GenerationRouter:
                 return
             entry.status = "cordoned"
             entry.consecutive_successes = 0
-            # Stash the most recent cordon as a fault event so wandb can mark
-            # the step boundary where the fleet shrank. Cheap dict assignment
-            # under the existing lock — no new network or compute.
             self._last_fault_event = {
                 "kind": "cordon",
                 "shard_id": shard_id,
@@ -408,20 +266,12 @@ class GenerationRouter:
             entry = self._shards.get(shard_id)
             if entry is None or entry.status == "ready":
                 return
-            # Flip cordoned -> joining, NOT directly to ready. We can't
-            # prove a cordoned shard's weights are current: cordon could
-            # have fired because the actor was hung mid-broadcast, in
-            # which case it missed the last weight sync and would serve
-            # stale completions if we routed traffic to it now. `joining`
-            # gates the data plane and the refit_ready signal until the
-            # next /update_weights_from_collective rebroadcasts and
-            # promote_all_joining moves it back to ready.
+            # Flip to joining (not ready): a cordoned shard may have missed the last
+            # broadcast. Data plane is gated until the next refit promotes it.
             entry.status = "joining"
             entry.consecutive_failures = 0
             entry.consecutive_successes = 0
-            # Reset the warmup-refit counter — a cordoned shard's NCCL
-            # state may be wedged, so the same N-refit warmup gate
-            # applies as for a fresh add_shard.
+            # Reset refit counter — NCCL state may be wedged; re-apply warmup gate.
             entry.successful_refits_since_join = 0
             entry.last_health_ok_at = time.monotonic()
 
@@ -437,15 +287,9 @@ class GenerationRouter:
     ) -> dict[str, Any]:
         """Remove a shard from the rotation, kill its actors, free its PG.
 
-        After this returns, the gen-side workers have torn down their
-        weight-sync NCCL group via ``generation.reset_collective()``. The
-        train driver's ``ensure_collective_synced`` notices the new
-        ``current_gen_world_size`` on its next refit and drives the
-        rendezvous via the existing ``/init_collective`` control endpoint;
-        until that completes ``/refit_ready`` returns false.
-
-        Returns a small dict summarising the outcome — useful for the
-        ``--fault-mode`` injector and integration tests.
+        Returns a dict summarising the outcome. The train driver's
+        ``ensure_collective_synced`` re-rendezvouses at the new world size
+        on the next refit via ``/init_collective``.
         """
         async with self._lifecycle_lock:
             async with self._table_lock:
@@ -491,11 +335,7 @@ class GenerationRouter:
             async with self._table_lock:
                 removed_entry = self._shards.pop(shard_id, None)
                 self._cumulative_shards_removed += 1
-                # If the removed shard was IN the live comm, the surviving
-                # members' cross-cluster group is now wedged (a peer is gone).
-                # Bump the epoch so the trainer re-inits proactively rather
-                # than reusing the dead group (esp. when backfill restores the
-                # count and the world-size check alone would say "reuse").
+                # Bump epoch if the removed shard was in the live comm; forces proactive re-init.
                 if removed_entry is not None and removed_entry.in_comm:
                     self._comm_reset_epoch += 1
                 self._last_fault_event = {
@@ -520,44 +360,9 @@ class GenerationRouter:
                 if hasattr(self._generation, "dp_size") and wg is not None:
                     self._generation.dp_size = wg.dp_size
 
-            # NB: we used to dispatch ``generation.reset_collective()`` on
-            # surviving workers here so they'd tear down the cross-cluster
-            # NCCL group. That was redundant with per-refit self-teardown
-            # (RefitWorker + vllm_backend both ``destroy()`` at the end of
-            # every refit) AND it triggered a cascade-eviction failure
-            # mode under burst kills:
-            #   1. dp-X killed → ``remove_shard(dp-X)`` → reset_collective
-            #      on N-1 survivors with a 30s timeout.
-            #   2. ONE survivor is mid-broadcast (its update_weights_from_
-            #      collective is still draining the NCCL kernel that was
-            #      waiting on the now-dead peer). Its reset_collective
-            #      queues behind that and exceeds the 30s budget.
-            #   3. Router (incorrectly) treats the timeout as "poisoned"
-            #      and evicts that survivor → triggers another
-            #      remove_shard → another reset round → another timeout
-            #      on a different survivor (which had its own pending
-            #      drain because of the eviction). Cascade to world=0.
-            #
-            # With the reset call dropped, the next refit's
-            # ``ensure_collective_synced`` retry path in
-            # ``grpo.refit_policy_generation`` handles this cleanly:
-            # the broadcast raises (peer death), the train driver
-            # ray.kills RefitWorker, calls ensure_collective_synced
-            # again at the new (smaller) world. ``vllm_backend.init_
-            # collective`` on each survivor destroys its wedged old
-            # comm before creating the new one — so the destroy
-            # happens in the natural lifecycle, not pre-emptively
-            # from this remove_shard handler.
-
-            # Refit gate stays false until the train driver re-inits the
-            # collective. We can't observe that directly from the gen side;
-            # the simplest signal is "no more `joining` shards AND the gen
-            # workers have rendezvoused with the train side". For now, lift
-            # the gate immediately — the train side's
-            # ensure_collective_synced is idempotent and will block on the
-            # actual rendezvous before unblocking refit. The /refit_ready
-            # gate then guards subsequent refits from the train side's
-            # perspective.
+            # reset_collective is NOT dispatched here — redundant with per-refit self-teardown
+            # and caused cascade evictions under burst kills. The next refit's
+            # ensure_collective_synced handles recovery at the new world size.
             self._nccl_reinit_in_progress = False
             return {
                 "shard_id": shard_id,
@@ -567,23 +372,11 @@ class GenerationRouter:
             }
 
     async def add_shard(self, reason: str = "manual") -> dict[str, Any]:
-        """Allocate a new DP shard and append it as ``joining``.
+        """Allocate a new DP shard and register it as ``joining``.
 
-        RL-412 scale-up: drives a fresh placement-group request (KubeRay
-        autoscaler v2 schedules a new pod into the gpu-shard worker group),
-        spawns a vLLM async worker, and registers it here as a ``joining``
-        shard. The data plane skips ``joining`` shards (their weights are
-        stale) until the train side completes the next refit — at which
-        point ``/update_weights_from_collective`` calls
-        ``promote_all_joining`` and the new shard flips to ``ready``.
-
-        ``reset_collective`` is also driven against surviving workers so
-        that the next ``init_collective`` from the train side rendezvouses
-        at the new (world_size + 1).
-
-        The ``_nccl_reinit_in_progress`` flag is held True until refit
-        succeeds (cleared by ``promote_all_joining``), gating ``refit_ready``
-        for the next training step.
+        Spawns a vLLM worker and registers it as ``joining``; the data plane
+        skips joining shards until the next refit promotes them to ``ready``.
+        ``_nccl_reinit_in_progress`` gates ``refit_ready`` until refit succeeds.
         """
         async with self._lifecycle_lock:
             if self._generation is None:
@@ -596,26 +389,8 @@ class GenerationRouter:
             shard_id = self._next_shard_id()
             loop = asyncio.get_running_loop()
 
-            # Refit-gate timing — three phases inside ``add_dp_worker``:
-            #   1. ``pg.ready()`` (~90-120s): autoscaler v2 schedules the
-            #      pod. Worker_group is UNCHANGED. Train can keep
-            #      refitting at the smaller (post-remove) world freely.
-            #      Gate stays DOWN.
-            #   2. Spawn actor (instant) → ``pre_append_hook`` fires.
-            #      Gate goes UP here, BEFORE the worker is appended to
-            #      ``_workers`` / ``dp_leader_worker_indices``. After
-            #      this point, any ``init_collective`` dispatch from the
-            #      gen side would include the new worker, so train's
-            #      ``ensure_collective_synced`` must see ``refit_ready=False``
-            #      until reset_collective publishes the new world size.
-            #   3. Append + prepare_refit_info + base_url + return
-            #      (~30-60s while actor's __init__ finishes). Gate is
-            #      UP, train blocks on ``/refit_ready`` if it hits this
-            #      window.
-            # The router then inserts into the shard table, dispatches
-            # reset_collective on all gen workers (incl. new joining),
-            # and clears the gate. Train's next refit picks up the new
-            # world via /current_gen_world_size and rendezvouses cleanly.
+            # Gate goes UP (via pre_append_hook) just before the worker is appended
+            # so train sees refit_ready=False during actor init. Cleared once done.
 
             def _gate_up() -> None:
                 self._nccl_reinit_in_progress = True
@@ -652,28 +427,11 @@ class GenerationRouter:
                 proxy_url = base_url
 
             async with self._table_lock:
-                # ``spawn_workers_for_shard`` compacts dead indices before
-                # spawning, which shifts the indices of the surviving
-                # workers. Re-map the existing _shards entries'
-                # worker_indices so a future ``remove_shard`` on a
-                # survivor doesn't kill the wrong actor.
-                #
-                # For TP/PP > 1, each shard owns N=tp*pp consecutive
-                # worker indices: ``[leader, leader+1, ..., leader+N-1]``.
-                # After compaction the alive workers stay in their
-                # original relative order, so each surviving leader's
-                # NEW index is just its position in
-                # ``dp_leader_worker_indices``, and the followers are
-                # the next N-1 indices. The router preserves shard
-                # insertion order so we can pair leader-list and shard
-                # table positionally.
+                # After compaction, re-map surviving shard worker_indices to avoid kill-wrong-actor bugs.
                 wg = self._generation.worker_group
                 leaders = list(wg.dp_leader_worker_indices)
                 per_shard_ws = max(self._per_shard_world_size, 1)
-                # leaders[-1] is the just-added shard's leader;
-                # leaders[:-1] map 1:1 to existing _shards entries in
-                # insertion order.
-                survivor_leaders = leaders[:-1]
+                survivor_leaders = leaders[:-1]  # leaders[-1] is the new shard
                 for entry, leader_new_idx in zip(
                     self._shards.values(), survivor_leaders
                 ):
@@ -709,23 +467,8 @@ class GenerationRouter:
                     "monotonic_ts": time.monotonic(),
                 }
 
-            # NB: previously dispatched ``generation.reset_collective()``
-            # here for symmetry with remove_shard (tear down existing
-            # comm so the next init_collective rebuilds at the new
-            # world). Removed for the same reasons as the remove_shard
-            # version: redundant with per-refit self-teardown, AND
-            # creates a cascade-eviction failure mode if any survivor
-            # is mid-refit. The next refit's init_collective on each
-            # worker destroys the old comm naturally before creating
-            # the new one at world=N+1.
-
-            # Clear the gate now that the gen-side teardown is complete.
-            # The train driver's ``ensure_collective_synced`` reads
-            # ``/refit_ready`` (this gate) at the top of the next refit
-            # and then re-rendezvouses the cross-cluster NCCL group at
-            # the new world size (which now includes the joining shard).
-            # ``promote_all_joining`` runs after refit completes and
-            # flips the new shard to ``ready``.
+            # reset_collective not dispatched here — same reasoning as remove_shard.
+            # The next refit's init_collective destroys the old comm naturally.
             self._nccl_reinit_in_progress = False
             return {
                 "shard_id": shard_id,
@@ -852,14 +595,7 @@ class GenerationRouter:
             entry.proxy_consecutive_failures += 1
             if entry.proxy_consecutive_failures < self.proxy_failure_threshold:
                 return
-            # Mirror the health-poll guard: don't cordon (and don't fire
-            # the auto-remove hook) while a cross-cluster NCCL re-init
-            # is in flight. The gen workers' event loop stalls during
-            # rendezvous, so any rollout traffic in that window times
-            # out and lands here as 5xx — but the shard is healthy, it's
-            # just busy. Cordoning + auto-removing the whole surviving
-            # fleet over a transient NCCL stall is exactly the cascade
-            # that took down the 4B run on the first stress-test pass.
+            # Don't cordon during NCCL re-init; event loop stall causes transient 5xx.
             if self._nccl_reinit_in_progress:
                 return
             entry.status = "cordoned"
@@ -961,12 +697,7 @@ class GenerationRouter:
                 )
                 async with self._table_lock:
                     nccl_paused = self._nccl_reinit_in_progress
-                    # Count alive (ready/joining) shards so we can detect
-                    # the deadlock-on-flap case: if EVERY shard is
-                    # cordoned, auto-recovery on probe-success is the
-                    # only path forward (the on_cordon → remove_shard
-                    # hook is blocked by the last-alive guard, and the
-                    # operator path is too slow for runs in flight).
+                    # Count alive shards for deadlock detection (all cordoned = auto-recovery path).
                     n_alive_or_joining = sum(
                         1 for s in self._shards.values()
                         if s.status in ("ready", "joining")
@@ -979,46 +710,9 @@ class GenerationRouter:
                             entry.consecutive_failures = 0
                             entry.consecutive_successes += 1
                             entry.last_health_ok_at = time.monotonic()
-                            # The health poller never auto-promotes a shard
-                            # to `ready`. Both joining and cordoned states
-                            # require explicit signals to leave:
-                            #
-                            # - `joining`  -> `ready` only via
-                            #   `promote_all_joining()` (called from the
-                            #   /update_weights_from_collective handler
-                            #   after a successful broadcast). Auto-
-                            #   promoting on /health alone would route
-                            #   real rollouts to a shard with STALE
-                            #   weights (vLLM answers /health as soon as
-                            #   the engine is up off the model file on
-                            #   disk, well before the next refit catches
-                            #   it up).
-                            #
-                            # - `cordoned` -> `ready` only via admin
-                            #   `/admin/uncordon` UNLESS the cordoned
-                            #   shard is the last way out of a stuck
-                            #   state (no ready or joining shards left).
-                            #   That deadlock case can happen when a
-                            #   transient probe flap on the last alive
-                            #   shard trips its cordon, the on_cordon
-                            #   → remove_shard hook is suppressed by the
-                            #   last-alive guard (which prevents dropping
-                            #   the fleet to zero), AND no operator
-                            #   intervenes with /admin/uncordon. Without
-                            #   the auto-recovery path below, the run
-                            #   wedges forever: refit_ready stays false,
-                            #   train can't refit, joining shards never
-                            #   promote. So when ALL shards are
-                            #   cordoned and a cordoned shard's probes
-                            #   recover for ``join_success_threshold``
-                            #   consecutive ticks, demote it to
-                            #   ``joining`` (NOT directly to ``ready`` —
-                            #   we still can't prove its weights are
-                            #   current; the next refit's
-                            #   ``promote_all_joining`` is what
-                            #   certifies that). This is the same
-                            #   semantics as the explicit
-                            #   ``/admin/uncordon`` endpoint.
+                            # Health poller never auto-promotes to ready. joining→ready
+                            # requires a successful refit broadcast. cordoned→joining
+                            # only when ALL shards are cordoned (deadlock escape hatch).
                             if (
                                 entry.status == "cordoned"
                                 and n_alive_or_joining == 0
@@ -1029,17 +723,8 @@ class GenerationRouter:
                                 entry.status = "joining"
                                 entry.consecutive_failures = 0
                                 entry.consecutive_successes = 0
-                                # Reset warmup-refit counter: this shard
-                                # has been out of the fleet for
-                                # potentially several refits, so its
-                                # weights are stale. promote_all_joining
-                                # will re-certify after the next refit.
+                                # Reset refit counter; next refit re-certifies weights.
                                 entry.successful_refits_since_join = 0
-                                # n_alive_or_joining now becomes 1 from
-                                # this transition; no further auto-
-                                # uncordons in this iteration so we
-                                # don't bulk-promote everything that
-                                # happened to flap together.
                                 n_alive_or_joining = 1
                                 print(
                                     f"[router] auto-uncordoned {shard_id} "
@@ -1051,11 +736,7 @@ class GenerationRouter:
                         else:
                             entry.consecutive_successes = 0
                             entry.consecutive_failures += 1
-                            # Skip cordon transitions while a cross-cluster
-                            # NCCL re-init is in flight. The gen workers'
-                            # event loop can stall during rendezvous and
-                            # miss /openapi.json probes; cordoning here would
-                            # break a healthy run that's mid-refit.
+                            # Skip cordoning during NCCL re-init (event loop stall causes probe misses).
                             if nccl_paused:
                                 continue
                             if (
@@ -1324,105 +1005,26 @@ class GenerationRouter:
     ) -> tuple[int, list[str]]:
         """Cordon + remove the gen workers whose futures failed.
 
-        Synchronous from caller's perspective: by the time we return, the
-        evicted shards have been popped from the router table, their
-        actors killed, their PGs released, and ``reset_collective`` has
-        been driven against the survivors. Train's next read of
-        ``/current_gen_world_size`` will reflect the smaller world.
-
-        Mapping ``failed_idxs`` (indices into the dispatched futures list)
-        to shard ids: ``init_collective`` / weight-broadcast dispatches
-        one future per DP-leader (``run_rank_0_only_axes=["tensor_parallel",
-        "pipeline_parallel"]``), in worker_group insertion order. The
-        router preserves shard insertion order in ``self._shards``, so
-        positional pairing is correct at any TP/PP. With TP>1, the
-        leader's ``init_collective`` internally fans out to TP partners
-        via vLLM's ``collective_rpc``; a single failed leader future thus
-        encompasses the whole TP group, and ``remove_shard`` (which
-        ``ray.kill`` s every actor in the worker_group) is the right
-        unit of eviction.
-
-        Liveness gate (TP>1 cascade fix): a burst kill of M shards leaves
-        survivors blocked on the TCPStore rendezvous waiting for the dead
-        shards' ranks. Their futures fail with mixed
-        ``DistNetworkError`` / ``RayActorError`` (the latter from
-        ``collective_rpc`` propagating a TP-partner crash) — looking
-        identical to the dead shards' futures. Without filtering, the
-        eviction path mass-evicts EVERY failed-future shard, dropping
-        the world to zero. We probe each candidate's leader actor with
-        ``is_alive`` (5s timeout) and only evict shards confirmed dead.
-        Survivors stay; the train-side ``ensure_collective_synced`` retry
-        re-rendezvouses at the same N now that the dead shards have been
-        cleared.
-
-        Force-evict shortcut: two kinds of candidate bypass the liveness
-        probe. (1) Actor death — the future raised ``RayActorError`` /
-        ``ActorDiedError``; Ray confirmed the actor is gone. (2) Fast-fail —
-        ``force_evict_idxs`` lists workers whose future RAISED within the
-        fast-fail window (<8s); their engine_core died or their NCCL state is
-        poisoned (next ``comm_init`` raises immediately), yet their actor
-        wrapper still answers ``is_alive`` — so the probe would wrongly keep
-        them. Both must be evicted: a poisoned/dead worker can never rejoin
-        the rendezvous and a collective needs all ranks. For TP>1, the death
-        of any actor in the shard's TP group means the shard is unrecoverable
-        and must be removed wholesale — ``remove_shard`` ray.kills the whole
-        actor list, including survivors, so a half-dead TP group doesn't get
-        orphaned. Slow-failers and PENDING timeouts (healthy survivors blocked
-        on a dead peer) are NOT force-evicted — they route through the probe
-        and are kept.
-
-        Returns ``(num_evicted, evicted_shard_ids)``.
+        Maps ``failed_idxs`` (per-DP-leader future indices) to shard ids and
+        evicts confirmed-dead shards. Liveness probe (``is_alive``) prevents
+        mass-eviction of survivors blocked on a dead peer's rendezvous (TP>1
+        cascade fix). Force-evicts shards with ``RayActorError`` or fast-fail
+        (<8s raise) without probing. Returns ``(num_evicted, evicted_shard_ids)``.
         """
         if not failed_idxs:
             return 0, []
 
-        # Dispatch goes per-DP-leader (run_rank_0_only_axes covers
-        # tensor_parallel + pipeline_parallel), so the futures list is one
-        # entry per DP shard regardless of TP/PP. failed_idxs map directly
-        # to shard insertion order. With TP>1, one failed leader future
-        # implies the whole TP group is evicted via remove_shard (which
-        # ray.kills every actor in the worker_group).
-        # ``shard_ids_in_order`` maps a failed future index → shard id. The
-        # caller MUST pass the exact dispatch order. For the frozen-cohort
-        # rendezvous (RL-412) the futures cover only the cohort, so the handler
-        # passes the cohort's shard ids; otherwise we fall back to full shard
-        # insertion order (broadcast path, which dispatches to all live).
+        # ``shard_ids_in_order`` maps failed future index → shard id (caller must pass
+        # the exact dispatch order). Falls back to full shard insertion order.
         if shard_ids_in_order is None:
             async with self._table_lock:
                 shard_ids_in_order = list(self._shards.keys())
         targets: list[str] = []
-        # ``force_dead`` shards are confirmed dead by Ray (the future
-        # raised RayActorError/ActorDiedError). These bypass the
-        # liveness probe — Ray told us the actor is gone, no need to
-        # double-check, and the probe can race-classify them as alive
-        # if a sibling actor in the TP group is still up.
+        # Force-evict (bypass liveness probe): RayActorError/ActorDiedError (Ray confirmed
+        # dead) or fast-fail (<8s raise, NCCL poisoned). All other failures route through
+        # is_alive probe to retain healthy survivors blocked on a dead peer.
         force_dead: set[str] = set()
         seen: set[str] = set()
-        # Two ways a shard force-evicts (bypassing the is_alive probe):
-        #
-        #   1. Actor death — the future raised RayActorError / ActorDiedError.
-        #      Ray itself confirmed the actor process is gone; no need to probe.
-        #
-        #   2. Fast-fail (idx in ``force_evict_idxs``) — the future RAISED
-        #      within the fast-fail window (<8s, see ``_per_worker_results``).
-        #      The worker's own engine/NCCL blew up immediately: a dead
-        #      EngineCore, or NCCL state POISONED by a prior in-band
-        #      ``comm_abort`` so the next ``comm_init_rank_scalable`` raises at
-        #      once. Such a worker is still POD-ALIVE (``is_alive`` returns
-        #      True), so the liveness probe would wrongly KEEP it — but it can
-        #      NEVER rejoin the rendezvous, and a collective needs ALL ranks,
-        #      so it blocks recovery for everyone. Force-evict + replace.
-        #
-        # Everything else routes through the is_alive probe, which RETAINS the
-        # healthy. The critical case: a survivor that merely TIMED OUT
-        # ("PENDING") or hit the ~30s NCCL bootstrap timeout (slow-fail) while
-        # blocked on the rendezvous for a dead/poisoned peer. Timing — not the
-        # exception type — is what separates it from a poisoned worker (whose
-        # comm_init raises in <1s). Evicting these survivors would cascade the
-        # gen world toward zero; instead they rejoin on the next attempt once
-        # the bad peers are gone. (DistStoreError / DistNetworkError from the
-        # rendezvous master are already short-circuited by the caller's
-        # ``_is_rendezvous_master_failure`` before we get here.)
         _ACTOR_DEAD_TYPES = {"RayActorError", "ActorDiedError"}
         force_idx_set = set(force_evict_idxs or [])
         for idx in failed_idxs:
@@ -1503,14 +1105,7 @@ class GenerationRouter:
         return len(evicted), evicted
 
     async def _fire_cordon_hook(self, shard_id: str, reason: str) -> None:
-        # Daemon is being torn down (--replace, SIGTERM, etc). Skip
-        # auto-remove: it dispatches blocking Ray ops onto the asyncio
-        # executor, which raises "cannot schedule new futures after
-        # shutdown" once the loop is closing. The half-finished cordon
-        # can leave the shard table in a state where the next daemon
-        # bring-up sees zombie shards. The next process starts fresh
-        # anyway via register_shards, so dropping the hook here is the
-        # safest cleanup.
+        # Skip auto-remove during teardown to avoid executor errors; next daemon starts fresh.
         if self._shutting_down:
             print(
                 f"[router] skipping cordon hook for {shard_id} ({reason}); "
@@ -1529,13 +1124,7 @@ class GenerationRouter:
                 print(f"[router] on_cordon hook raised for {shard_id}: {e}", flush=True)
             return
 
-        # Default: a cordoned shard is no use to anyone. Its weights are
-        # now uncertain, the data plane skips it, auto-recovery is gone,
-        # and it occupies a placement-group slot that KubeRay's autoscaler
-        # could be giving to a fresh replacement. Drive remove_shard so
-        # the actor + PG come down and the pod is reclaimed; if the run
-        # is configured for recovery, FaultInjector / a separate policy
-        # will follow up with add_shard.
+        # Default: drive remove_shard so the actor + PG come down and the pod is reclaimed.
         if self._generation is None:
             # No lifecycle ownership — this is a unit-test or cordon-only
             # mode where the router doesn't know how to kill anything.
@@ -1547,20 +1136,7 @@ class GenerationRouter:
                 flush=True,
             )
             return
-        # Last-alive guard: the shard we just cordoned was excluded from
-        # ``shard_count_alive_for_collective`` (cordoned status). If that
-        # count is now 0, this was the LAST alive shard. Auto-removing it
-        # would drop the gen world to 0 and force the train side to wait
-        # the full add_shard recovery budget (~7-10 min on 30B) before
-        # any progress is possible — and during that window every refit
-        # endpoint returns 503 and the rollout collector burns retries.
-        # The shard's actor MIGHT recover (e.g., the cordon was driven by
-        # a transient health-probe timeout from a vLLM engine that's just
-        # busy serving a backlog, not actually dead) — keeping it parked
-        # leaves a path to recovery via ``/admin/uncordon`` or future
-        # health-poll auto-promotion. If it's truly dead, the next
-        # init_collective will surface ActorDiedError → the force-evict
-        # path in ``_evict_failed_workers_inline`` will reap it cleanly.
+        # Last-alive guard: don't auto-remove if this was the last alive shard (would drop world to 0).
         if self.shard_count_alive_for_collective() == 0:
             print(
                 f"[router] skipping auto-remove of {shard_id} "
@@ -1597,16 +1173,10 @@ class GenerationRouter:
     def _build_app(self) -> FastAPI:
         @asynccontextmanager
         async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
-            # Explicit TCPConnector — aiohttp's default `limit=100` is the
-            # router's #1 bottleneck under RL burst load (2048+ concurrent
-            # /v1/completions). limit_per_host caps connections to a single
-            # shard so one slow shard can't starve the others.
+            # Explicit limits to avoid bottleneck under burst load; limit_per_host prevents one slow shard starving others.
             connector = aiohttp.TCPConnector(
                 limit=self.proxy_pool_limit_total,
                 limit_per_host=self.proxy_pool_limit_per_host,
-                # Force-close stale keepalive connections faster than the
-                # default to avoid mid-request resets when a shard's TCP
-                # state changes (e.g. NCCL re-init briefly stalls uvicorn).
                 keepalive_timeout=60,
             )
             self._http_session = aiohttp.ClientSession(connector=connector)
@@ -1614,11 +1184,8 @@ class GenerationRouter:
             try:
                 yield
             finally:
-                # Flip the flag FIRST so any in-flight cordon-fired
-                # _fire_cordon_hook tasks (created with asyncio.create_task
-                # earlier in the loop) short-circuit before they hit
-                # remove_shard's run_in_executor — which would raise
-                # "cannot schedule new futures after shutdown" and leave
+                # Set flag first so in-flight cordon hooks short-circuit before hitting
+                # run_in_executor (which would raise "cannot schedule new futures") and leave
                 # the shard table in a half-removed state. The next
                 # daemon process starts from a clean register_shards call
                 # so we don't need to finish in-flight removes here.
@@ -1834,18 +1401,9 @@ class GenerationRouter:
             prev_flag = self._nccl_reinit_in_progress
             self._nccl_reinit_in_progress = True
             try:
-                # Dispatch init_collective to all gen workers and capture
-                # the returned futures WITHOUT blocking on ray.get — we
-                # need per-future error tracking so a single bad worker
-                # (cudaErrorLaunchFailure / poisoned NCCL state /
-                # DistStoreError) doesn't sink the whole rendezvous.
-                # Frozen cohort (RL-412): snapshot exactly the JOINABLE shards
-                # and rendezvous only them. A booting/cold backfill shard is in
-                # the worker group but not yet joinable, so it's omitted from
-                # the cohort and cannot sabotage the handshake; it joins a later
-                # re-init once warm. The explicit worker-index list IS the
-                # freeze — a concurrent append can't change it. On success these
-                # are the comm members → mark ``in_comm``/``proven``.
+                # Dispatch to only the JOINABLE cohort (cold backfills excluded) so a
+                # booting shard can't sabotage the handshake. Per-future tracking
+                # avoids a single bad worker sinking the whole rendezvous.
                 async with self._table_lock:
                     cohort_sids, cohort_indices = self._joinable_cohort()
                 dispatched_sids = set(cohort_sids)
@@ -2120,11 +1678,7 @@ class GenerationRouter:
                     raise RuntimeError(
                         f"One or more workers reported broadcast failure. Results: {results}"
                     )
-                # RL-412 scale-up: only after refit succeeds do we promote
-                # `joining` shards to `ready`. Until now the data plane was
-                # routing past them because their weights were stale (vLLM
-                # came up with the model file but doesn't yet have the
-                # latest training-side weights).
+                # Promote joining shards to ready only after refit succeeds (weights are now current).
                 promoted: list[str] = []
                 if success:
                     promoted = self.promote_all_joining(
@@ -2272,25 +1826,16 @@ class GenerationRouter:
         # cascade-to-zero between burst kill and recovery.
         if self.shard_count_alive_for_collective() == 0:
             return False, "no_shards_alive"
-        # Note: ``joining`` does NOT block refit. RL-412 scale-up registers
-        # a new shard as joining (stale weights) and the *next* refit is
-        # exactly what we want to push fresh weights to it. The data plane
-        # skips joining shards (see ``_pick_shard``), so no client traffic
-        # hits stale weights. Initial bring-up's joining state is also
-        # cleared by the health poller without depending on this gate.
+        # joining does NOT block refit — the next refit pushes fresh weights to joining shards.
         return True, "ok"
 
     def shard_count_ready(self) -> int:
         return sum(1 for s in self._shards.values() if s.status == "ready")
 
     def shard_count_alive_for_collective(self) -> int:
-        """Number of shards present in the cross-cluster NCCL group.
+        """Number of shards in the cross-cluster NCCL group (``ready`` + ``joining``).
 
-        Includes ``ready`` AND ``joining`` (RL-412 scale-up: a freshly
-        added shard joins NCCL via ``init_collective`` before being
-        promoted to ``ready`` by the next successful refit). Excludes
-        ``cordoned``/``draining`` (the actor is being killed) and any
-        shard already popped on ``remove_shard``.
+        Excludes ``cordoned``/``draining`` shards whose actors are being torn down.
         """
         return sum(
             1

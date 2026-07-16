@@ -13,43 +13,10 @@
 # limitations under the License.
 """RefitWorker — sibling Ray actor that owns the cross-cluster weight-sync NCCL group.
 
-Architecture (RL-412 follow-up):
-
-The cross-cluster ``model_update_group`` (StatelessProcessGroup, NCCL) used to
-broadcast weights from train rank 0 to vLLM gen ranks lived inside the train
-worker process itself. That meant a gen peer dying mid-broadcast would queue
-``cudaErrorLaunchFailure`` into train rank 0's CUDA primary context, which is
-shared device-wide across every NCCL group in the process (Megatron's
-EP/TP/PP/DP groups all sit on the same context). Stream isolation contained
-the symptom but not the root cause — a queued device error can surface on
-any subsequent CUDA op submitted by that process.
-
-The RefitWorker fixes this by hosting the cross-cluster group in a SEPARATE
-PROCESS, scheduled with hard node affinity to the same node and the same
-physical GPU as train rank 0. Two processes sharing one GPU is fine — they
-have independent primary CUDA contexts, and CUDA IPC lets us hand a buffer
-across the process boundary in zero-copy form.
-
-Cross-cluster world layout becomes:
-  - rank 0: RefitWorker (this actor)
-  - ranks 1..N: gen workers
-  - Megatron policy workers DO NOT participate.
-
-Data path mirrors the proven colocated-vLLM ZMQ-IPC ping-pong pipeline
-(``stream_weights_via_ipc_zmq_impl`` + ``vllm_backend.update_weights_via_ipc_zmq``):
-
-  1. Train rank 0 packs params into one of two GPU "ping-pong" buffers,
-     ``cuda.synchronize()``s, ``reduce_tensor``-exports a CUDA IPC handle,
-     and sends ``(handle, param_names, used_bytes)`` over ZMQ REQ.
-  2. RefitWorker (REP) ``recv_pyobj``s the handle, ``rebuild_cuda_tensor``s
-     it (zero-copy view of train rank 0's GPU memory — same physical GPU),
-     and broadcasts the buffer to gen ranks via NCCL on its own
-     ``model_update_group``.
-  3. RefitWorker syncs the broadcast stream (surfaces any queued NCCL
-     error from a dead peer immediately, scoped to its own process) and
-     ACKs back so the sender can swap to the other ping-pong buffer.
-  4. When the sender is done it sends ``IPCProtocol.COMPLETE``; RefitWorker
-     finishes, ACKs, and returns from ``broadcast_weights_until_complete``.
+Hosts the cross-cluster NCCL group in a separate process (same node + GPU as train
+rank 0, independent CUDA context) so a gen peer dying mid-broadcast can't corrupt
+train rank 0's primary context. Receives weight buffers from train rank 0 via CUDA
+IPC + ZMQ and broadcasts them to gen workers via NCCL.
 """
 import gc
 import hashlib
@@ -66,11 +33,7 @@ from nemo_rl.models.policy.utils import (
 )
 
 
-# Use num_gpus=0 — RefitWorker shares the physical GPU with train rank 0
-# (separate processes, separate primary CUDA contexts; CUDA IPC bridges
-# them). Pinning via NodeAffinitySchedulingStrategy in the orchestrator
-# is what gets it onto the right node; here we just need Ray to NOT
-# allocate a brand-new GPU.
+# num_gpus=0: shares the physical GPU with train rank 0 via separate CUDA contexts + IPC.
 @ray.remote(num_gpus=0)  # pragma: no cover
 class RefitWorker:
     """Standalone process that owns the cross-cluster weight-sync NCCL group.
@@ -82,21 +45,10 @@ class RefitWorker:
     """
 
     def __init__(self, gpu_index: int) -> None:
-        # ``num_gpus=0`` makes Ray set ``CUDA_VISIBLE_DEVICES=""``
-        # (empty) on this actor's process, masking ALL GPUs. We
-        # FORCE-override it to the physical GPU we want to share with
-        # train rank 0 — ``setdefault`` is wrong here because Ray's
-        # empty value already exists in os.environ; we need to
-        # overwrite it. This must happen BEFORE the first CUDA op
-        # (torch defers cuInit until the first cuda call), so do it
-        # at the very top of ``__init__`` before ``set_device``.
+        # Force-override CUDA_VISIBLE_DEVICES before the first CUDA op (Ray sets it to "").
         import os
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-        # If torch.cuda was already initialized in this process with
-        # the empty visibility list, force re-init by clearing the
-        # internal cache. The first ``torch.cuda.set_device(0)`` below
-        # will then re-read CUDA_VISIBLE_DEVICES.
         if torch.cuda.is_initialized():
             print(
                 "[refit_worker] WARNING: torch.cuda already initialized "
@@ -104,8 +56,6 @@ class RefitWorker:
                 "happen with num_gpus=0 + clean process start",
                 flush=True,
             )
-        # Bind the CUDA primary context to cuda:0 (which now points at
-        # the physical GPU above).
         torch.cuda.set_device(0)
         self._gpu_index = gpu_index
         self._device = torch.device("cuda:0")
@@ -195,21 +145,11 @@ class RefitWorker:
 
         self._zmq_context = zmq.Context()
         self._zmq_socket = self._zmq_context.socket(zmq.REP)
-        # Cross-cluster broadcast on a 30B-class model: first chunk
-        # arrival is bounded below by Megatron's expert-parallel
-        # all-gather + IPC handle export on rank 0 (~30-90s warm,
-        # longer if Megatron hasn't materialized the optimizer state
-        # yet). 600s gives plenty of headroom; subsequent chunks land
-        # in <1s each.
-        # peer doesn't get summarily killed. The outer broadcast retry
-        # loop in grpo handles real wedges.
+        # 600s timeout covers first-chunk latency (~30-90s for large models); subsequent chunks are fast.
         self._zmq_socket.setsockopt(zmq.SNDTIMEO, 600000)
         self._zmq_socket.setsockopt(zmq.RCVTIMEO, 600000)
         self._zmq_socket.setsockopt(zmq.LINGER, 0)
-        # /tmp is mounted into the pod and shared between processes
-        # on the same node — we already use /tmp/{device_uuid}.sock for
-        # the colocated path. Use a PID-namespaced path to avoid
-        # collisions with a sibling worker on the same GPU.
+        # PID-namespaced path avoids collisions with sibling workers on the same GPU.
         self._zmq_address = f"ipc:///tmp/refit-worker-{os.getpid()}.sock"
         self._zmq_socket.bind(self._zmq_address)
         print(
@@ -267,28 +207,10 @@ class RefitWorker:
                     self._zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
                 ipc_handle, _list_keys, _used_bytes = payload
-                # Rebuild the tensor as a view onto the sender's GPU
-                # memory. Same physical GPU → no cross-device traffic.
+                # Zero-copy view of sender's GPU memory (same physical GPU).
                 ipc_view = rebuild_cuda_tensor_from_ipc(ipc_handle, 0)
-                # DEFENSIVE COPY into RefitWorker's own allocation:
-                # the IPC view aliases the sender's storage. Once we
-                # ACK, the sender is free to reuse / reallocate that
-                # storage. NCCL broadcast across an internode wire
-                # may *kernel-complete* on the source rank before the
-                # destination ranks have finished pulling — and even
-                # if it doesn't, having the producer hold the buffer
-                # for the duration of the entire collective is a
-                # subtle dependency we don't want. ``clone()`` plus
-                # ``torch.cuda.synchronize()`` guarantees the bytes
-                # we're about to broadcast are stable in OUR memory
-                # before we release the view back to the producer.
-                #
-                # 30B-class refit produces ~5GB chunks; one extra
-                # buffer here costs ~5GB of GPU memory (we share the
-                # GPU with train rank 0 which sits at ~70% util, so
-                # there's headroom — Megatron's 30B-A3B leaves a few
-                # tens of GB free per H100/B100 once the optimizer
-                # state is shed during refit).
+                # Clone into our own allocation before ACKing so the sender can reuse its buffer
+                # while NCCL still reads ours.
                 buffer = ipc_view.clone()
                 torch.cuda.synchronize()
                 if _refit_pack_debug:
@@ -312,10 +234,7 @@ class RefitWorker:
                         f"bytes={int(buffer.numel())} head_tail_sha={_src_sha}",
                         flush=True,
                     )
-                # Release the view to the sender BEFORE the broadcast
-                # so the sender can safely reuse its buffer the moment
-                # ACK arrives. The clone above means the broadcast
-                # reads from OUR memory, not the sender's.
+                # Release view before ACK so sender can reuse its buffer immediately.
                 del ipc_view
                 ipc_view = None
                 # Now broadcast our LOCAL stable copy.
@@ -344,28 +263,8 @@ class RefitWorker:
                 del buffer
             if ipc_view is not None:
                 del ipc_view
-            # Tear down the cross-cluster group ONLY on failure. On success we
-            # KEEP the group alive across refits.
-            #
-            # Recreating the group every refit forces a fresh cross-cluster
-            # TCPStore rendezvous on a NEW master port each step. On this
-            # cluster that rendezvous is intermittently flaky (1-2 gen workers'
-            # TCPStore clients fail to connect/validate → they never join the
-            # NCCL group → the broadcast collective can never complete → every
-            # survivor trips the 60s in-band abort and a healthy worker gets
-            # evicted, all with NO injected fault). Holding the group alive
-            # makes a steady-state refit a plain broadcast on the existing
-            # comm (~2.5s, no rendezvous, reliable) — mirroring the non-disagg
-            # path. ``ensure_collective_synced`` re-inits only when the world
-            # size changes (a real fault); ``_last_synced_world_size`` gates it.
-            #
-            # Faults are still handled without a per-refit teardown: a peer
-            # dying mid-broadcast trips the consumer's in-band abort
-            # (StatelessProcessGroup.synchronize_or_abort) → this method
-            # returns False → the grpo retry loop ray.kills + respawns this
-            # RefitWorker (poisoned context dies with the process) and re-inits
-            # at the new world. On FAILURE we MUST tear down here so a wedged
-            # group is never reused.
+            # Keep the comm alive on success (avoids per-step rendezvous flakiness).
+            # On failure, tear it down so a wedged group is never reused.
             if not _ok:
                 try:
                     old = self._group

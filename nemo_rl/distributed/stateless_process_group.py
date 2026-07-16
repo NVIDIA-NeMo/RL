@@ -22,34 +22,17 @@ from nccl.core.communicator import Communicator, NCCLConfig
 from nccl.core.utils import UniqueId, get_unique_id
 
 
-# Bound TCPStore rendezvous + key-wait at 30s instead of the 300s
-# default. The philosophy: rendezvous is sub-second when pods are
-# healthy; minutes only happen when something is wrong. Fail fast and
-# let ``ensure_collective_synced``'s retry loop handle the rare slow
-# case (the retry creates a FRESH TCPStore on each attempt, so VPC
-# routes warm up across retries — by attempt 2 connectivity that took
-# 60-90s cold is sub-second).
-#
-# Tradeoff: a single bad pod blocks the rendezvous for 30s instead
-# of 5 min. Across 4 retry attempts that's 2 min worst-case, vs the
-# 20 min wedge we hit on the 300s default.
-# Env-overridable (RL-412 elastic re-init §C): the quiescence gating on the
-# train side means we only START a rendezvous at a settled point, so a shorter
-# window mainly makes the rare mid-rendezvous fault fail fast → the retry loop
-# re-snapshots the world. Default kept at 30s (no behavior change); the FT
-# verification dials it down via NRL_RENDEZVOUS_TIMEOUT_S.
+# Bound TCPStore rendezvous + key-wait at 30s instead of the 300s default.
+# Rendezvous is sub-second when healthy; fail fast and let the retry loop handle
+# slow cases (each retry creates a fresh TCPStore, so cold routes warm up across
+# retries). Env-overridable via NRL_RENDEZVOUS_TIMEOUT_S.
 _RENDEZVOUS_TIMEOUT = timedelta(
     seconds=float(os.environ.get("NRL_RENDEZVOUS_TIMEOUT_S", "30"))
 )
 
-# Bound NCCL bootstrap (the ncclCommInitRank handshake) at the same 30s.
-# In blocking mode (NCCL default) this call BLOCKS in C land and ignores
-# Python signals — a peer that dies mid-rendezvous wedges all survivors
-# forever. We switch to non-blocking mode here so we can poll
-# ``get_async_error`` and surface the failure as a clean Python exception
-# the caller's actor can catch and recover from. See RL-412 cascade
-# fix: without this, the survivors' Ray actor processes also die when
-# one peer is SIGKILL'd during init_collective bootstrap.
+# Bound NCCL bootstrap at 30s. Blocking mode (NCCL default) wedges all
+# survivors forever if a peer dies mid-rendezvous. Non-blocking mode lets
+# us poll ``get_async_error`` and surface failures as clean Python exceptions.
 _NCCL_BOOTSTRAP_TIMEOUT = timedelta(seconds=30)
 
 
@@ -80,12 +63,7 @@ class StatelessProcessGroup:
             # Rank 0: store unique_id to TCPStore
             self.tcp_store.set(UNIQUE_ID_KEY, unique_id_bytes)
         else:
-            # Other ranks: get unique_id from TCPStore. The wait is
-            # bounded at the same 60s ceiling as the TCPStore rendezvous
-            # — if rank 0 hasn't published the key by then, something is
-            # wrong on the master side and we want to surface that fast
-            # rather than block here for 5 min waiting on a key that
-            # will never arrive.
+            # Other ranks: wait for rank 0 to publish the key, bounded by the rendezvous timeout.
             self.tcp_store.wait([UNIQUE_ID_KEY], _RENDEZVOUS_TIMEOUT)
             unique_id_bytes = self.tcp_store.get(UNIQUE_ID_KEY)
             unique_id = UniqueId.from_bytes(unique_id_bytes)
@@ -93,26 +71,9 @@ class StatelessProcessGroup:
 
         with torch.cuda.device(device):
             _t = _time.monotonic()
-            # Non-blocking init: ncclCommInitRank in BLOCKING mode (the
-            # default) is a synchronous C-land call that ignores Python
-            # signals — if a peer dies during bootstrap, the call wedges
-            # forever. Non-blocking mode returns immediately with an
-            # ``ncclInProgress`` async-state which we poll; on peer
-            # death the state flips to a real error code and we abort
-            # the half-init'd communicator and raise. This converts a
-            # cross-process cascade death into a clean Python exception
-            # the caller's actor can catch and respawn from.
-            #
-            # We can't go through the high-level ``Communicator.init``
-            # classmethod here: in non-blocking mode the comm pointer
-            # comes back BEFORE the rendezvous completes, and the
-            # ``Communicator`` constructor immediately calls
-            # ``comm_count`` / ``comm_cu_device`` / ``comm_user_rank``
-            # on the still-in-progress pointer, which raises
-            # ``NCCLError(InvalidArgument)``. Instead we call the raw
-            # binding, poll the async state to completion, and only
-            # then wrap into the high-level ``Communicator`` (which can
-            # now safely introspect the fully-initialized comm).
+            # Non-blocking init: poll async state to completion rather than blocking in C.
+            # We use the raw binding because the high-level Communicator constructor
+            # introspects the comm immediately, which fails on an in-progress pointer.
             cfg = NCCLConfig(blocking=False)
             comm_ptr = _nccl_bindings.comm_init_rank_scalable(
                 int(self.world_size),
@@ -138,11 +99,8 @@ class StatelessProcessGroup:
             else:
                 data = torch.zeros(1, device=device)
             self.broadcast(data, 0)
-            # Non-blocking comms return immediately from ``broadcast``;
-            # the op may not be enqueued onto the stream yet. Poll the
-            # async-error state until the enqueue is observed before
-            # syncing the stream — without this the assertion below
-            # races against the still-in-progress enqueue.
+            # Poll async-error state until the enqueue is observed before syncing —
+            # without this, the assertion below races against the in-progress enqueue.
             self._poll_raw_async(
                 self.nccl_communicator._comm,
                 phase="warmup_broadcast",
@@ -227,20 +185,8 @@ class StatelessProcessGroup:
     def broadcast(
         self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None
     ):
-        # Run on the caller's current stream by default. Stream isolation
-        # used to be enforced here (a dedicated ``_broadcast_stream``
-        # contained ``cudaErrorLaunchFailure`` from a dead gen peer so it
-        # didn't poison Megatron's training streams) but that's no longer
-        # needed: the cross-cluster broadcast now lives in ``RefitWorker``,
-        # a sibling Ray actor in a separate process. A peer-death NCCL
-        # error poisons RefitWorker's primary CUDA context and we
-        # ``ray.kill`` + respawn it; Megatron's process is already
-        # isolated by the process boundary. Letting the broadcast run
-        # on the caller's stream means the consumer's reads (on the same
-        # stream) are naturally ordered after the NCCL kernel — which
-        # fixes a silent cross-stream race in ``packed_broadcast_consumer``
-        # that was loading uninitialized bytes into model parameters
-        # (KL=1.0, rewards=0 on Qwen3-30B-MoE).
+        # Run on the caller's current stream so consumer reads are naturally ordered
+        # after the NCCL kernel, avoiding a cross-stream race on model parameters.
         if stream is None:
             stream = torch.cuda.current_stream()
         self.nccl_communicator.broadcast(
@@ -250,17 +196,9 @@ class StatelessProcessGroup:
     def destroy(self):
         """Tear down the NCCL communicator and TCP store so the group can be re-initialized.
 
-        Safe to call even if the communicator was never initialized. Any errors raised by
-        the NCCL library (e.g. the peers have already gone away) are swallowed so the
-        caller can always bring the group back up with a fresh `init_nccl_communicator`.
-
-        Whole-device sync before aborting drains any in-flight broadcast
-        kernels so they finish (or surface their error) before we abort
-        the communicator. RefitWorker is the only caller that runs this
-        group; if a dead peer queued ``cudaErrorLaunchFailure``, it
-        surfaces here and the caller (``RefitWorker.abort_collective``)
-        ray.kills the actor — Megatron's process is unaffected because
-        we're in a different process.
+        Safe to call even if the communicator was never initialized. Whole-device sync
+        drains in-flight broadcast kernels before aborting; errors are surfaced to the
+        caller so it can decide whether to kill and respawn the actor.
         """
         try:
             torch.cuda.synchronize()

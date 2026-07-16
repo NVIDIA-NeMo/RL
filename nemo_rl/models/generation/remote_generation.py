@@ -469,12 +469,7 @@ class RemoteGeneration(GenerationInterface):
                 return  # Older gen server: no dynamic world size, nothing to do.
             alive_gen_ws, joinable_gen_ws, stable_for_s, comm_epoch, _reinit = gen_world
 
-            # RL-412 follow-up: under the RefitWorker architecture only ONE
-            # train-side actor (the RefitWorker) participates in the
-            # cross-cluster NCCL group. Effective ``train_world_size`` for
-            # rank-numbering purposes is therefore 1, regardless of how
-            # many physical Megatron workers exist. Legacy DTensor path
-            # still has every train rank in the group.
+            # RefitWorker architecture: only 1 train-side actor in the cross-cluster group.
             uses_refit_worker = bool(getattr(policy, "_use_refit_worker", False))
             if uses_refit_worker:
                 effective_train_ws = 1
@@ -482,21 +477,9 @@ class RemoteGeneration(GenerationInterface):
                 effective_train_ws = policy.worker_group.cluster.world_size()
 
             last = getattr(self, "_last_synced_world_size", None)
-            # The cross-cluster ``model_update_group`` is kept alive across
-            # refits (the per-refit teardown only fires on a FAILED refit), so
-            # we only re-rendezvous when membership genuinely settled into a
-            # new shape — see ``decide_collective_sync``. Elastic re-init
-            # (RL-412): shrink eager (lost member → old comm broken → rebuild
-            # now at survivors), grow debounced (replacement joinable →
-            # rebuild only once the joinable set == the dispatch set and has
-            # held for REJOIN_DEBOUNCE_S), same → reuse.
-            #
-            # CRITICAL: when a fault trips ``abort_collective`` it ray.kills
-            # the RefitWorker (``policy._refit_worker`` → None) but the gen
-            # world can be unchanged (the dead shard's replacement rejoined at
-            # the same count) — reusing then would call broadcast with no
-            # RefitWorker and raise. ``refit_worker_alive=False`` forces a
-            # re-init (which respawns it).
+            # Re-rendezvous only when membership genuinely settled into a new shape.
+            # Shrink re-inits eagerly; grow debounces until joinable set is stable.
+            # refit_worker_alive=False forces re-init if RefitWorker was killed.
             refit_worker_alive = (not uses_refit_worker) or (
                 getattr(policy, "_refit_worker", None) is not None
             )
@@ -551,21 +534,10 @@ class RemoteGeneration(GenerationInterface):
                 num_returns=len(all_futures),
                 timeout=rendezvous_timeout_s,
             )
-            # Whether THIS attempt requires kill+respawn of the RefitWorker
-            # (dead or NCCL-poisoned) vs reuse (clean pre-NCCL rendezvous
-            # timeout). Default False: a ray.wait timeout means the RefitWorker
-            # is still blocked in the TCPStore rendezvous (no NCCL formed →
-            # reuse), and a gen-side 503 eviction is a clean structured body.
+            # respawn=True means RefitWorker is dead/NCCL-poisoned; False means reuse (clean timeout).
             respawn = False
             if not pending:
-                # Router-owned classification: in HTTP mode, the gen-side
-                # ``init_collective`` future resolves to the router's
-                # response body (``raise_on_status=False`` preserves the
-                # structured 503 payload). 200 = success across all
-                # surviving shards; 503 = router did per-worker eviction
-                # and the new world size has shrunk. Train just retries
-                # at the next world; we do NOT re-do the classification
-                # here. Index-based eviction is gone — that's bug #1.
+                # 200 = all shards succeeded; 503 = router evicted some shards, retry at smaller world.
                 try:
                     results = ray.get(ready)
                     inf_results = [r for r in results if isinstance(r, dict)]
@@ -605,23 +577,12 @@ class RemoteGeneration(GenerationInterface):
                         flush=True,
                     )
             else:
-                # Outer timeout: gen-side router took longer than our
-                # ``rendezvous_timeout_s``. With router-owned classification
-                # (raise_on_status=False on the gen future), this should
-                # only happen on transport / proxy hangs — the router's
-                # 90s per-worker classifier completes well within our
-                # 150s default. Train side just cleans up its NCCL state
-                # and retries; we do NOT try to identify "straggler" gen
-                # shards by index, because the gen-side future is a single
-                # HTTP call covering all shards (bug #1).
+                # Outer timeout: transport/proxy hang. Clean up NCCL state and retry.
                 pending_set = set(pending)
                 pending_gen = sum(1 for f in futures_inf if f in pending_set)
                 pending_train = sum(1 for f in futures_train if f in pending_set)
                 consecutive_timeouts += 1
-                # If the RefitWorker future itself is what's stuck (pending),
-                # or we've timed out repeatedly, the RefitWorker is likely
-                # poisoned (CUDA/NCCL error from a near-total collapse) — escalate
-                # to respawn below so the next attempt gets a clean actor.
+                # Escalate to respawn on repeated timeouts or if the RefitWorker itself is stuck.
                 if consecutive_timeouts >= 2 or pending_train > 0:
                     respawn = True
                 print(
@@ -632,20 +593,8 @@ class RemoteGeneration(GenerationInterface):
                     flush=True,
                 )
 
-            # Per-attempt teardown. Distinguish two failure modes:
-            #  - respawn: the RefitWorker is dead OR its NCCL context is
-            #    poisoned (an NCCLError partially ran the bootstrap; reusing it
-            #    would fail forever with NCCLError) → kill + respawn
-            #    (``abort_collective``) so the next attempt gets a clean actor.
-            #  - clean pre-NCCL rendezvous timeout / 503 eviction (the COMMON
-            #    case): the RefitWorker is ALIVE and never formed an NCCL comm,
-            #    so its context is clean. Do NOT ray.kill it — reuse it. Killing
-            #    on every timeout is the kill/respawn storm on train rank-0's
-            #    shared GPU that destabilized Megatron rank-0. ``reset_collective``
-            #    keeps the live actor; its next ``init_collective`` destroys the
-            #    stale (TCPStore-only) group and rebinds a fresh one on a new
-            #    free port. Re-reading /current_gen_world_size next attempt picks
-            #    up whatever (smaller) world the gen side evicted to.
+            # respawn: RefitWorker dead/poisoned → kill+respawn for clean context.
+            # reuse (common case): clean pre-NCCL timeout → reuse actor to avoid kill/respawn storm.
             try:
                 if respawn:
                     abort_train = policy.abort_collective()
@@ -661,14 +610,8 @@ class RemoteGeneration(GenerationInterface):
                     flush=True,
                 )
 
-            # Drain pending futures before the next attempt so we don't dispatch
-            # a fresh init_collective behind in-flight work. The gen-side HTTP
-            # task is a stateless Ray task — safe to force-cancel. The
-            # RefitWorker (train) future is an ACTOR task: when we're REUSING
-            # the actor, force-cancelling it can mark the actor dead (defeating
-            # reuse), so instead we let it drain via its own ~30s TCPStore /
-            # bootstrap timeout under the bounded ray.wait below. (When
-            # respawning, the actor is being killed anyway, so cancelling is moot.)
+            # Drain pending futures. On reuse path, don't cancel the RefitWorker future
+            # (force-cancel can mark it dead); let it drain via the bounded ray.wait.
             train_set = set(futures_train)
             for f in pending:
                 if f in train_set and not respawn:
@@ -678,18 +621,12 @@ class RemoteGeneration(GenerationInterface):
                 except Exception:  # noqa: BLE001
                     pass
             try:
-                # Bound comfortably above NRL_RENDEZVOUS_TIMEOUT (default 30s,
-                # FT recipe 90s) so a reused RefitWorker's rendezvous wait fully
-                # drains and its actor task queue is empty before we redispatch.
+                # Bounded above NRL_RENDEZVOUS_TIMEOUT so reused RefitWorker drains before redispatch.
                 ray.wait(pending, timeout=120.0)
             except Exception:  # noqa: BLE001
                 pass
 
-            # Quiesce-gated retry: instead of a blind exponential backoff, wait
-            # until the gen world has SETTLED (joinable count stable, no
-            # lifecycle op in flight) before the next rendezvous. Each retry
-            # then fires on a stable, warm world — far more likely to succeed,
-            # which is what converges recovery without a kill/respawn storm.
+            # Wait for gen world to settle before retrying (stable joinable count, no lifecycle op in flight).
             self._quiesce_wait()
 
         raise RuntimeError(
@@ -748,16 +685,7 @@ class RemoteGeneration(GenerationInterface):
         validation, etc). The unified router proxies to a healthy shard
         with replay on failure.
         """
-        # Aligned with the router's ``proxy_timeout_s`` (default 600s,
-        # set explicitly in the recipe YAML for 30B-class shards under
-        # heavy gen burst). The mismatch the previous client-side 300s
-        # introduced — train giving up at 5 min while the router would
-        # still happily wait 10 — caused a hard ``asyncio.TimeoutError``
-        # on the 30B TP=2 post-fault path: 4 shards' worth of inflight
-        # was rebalanced onto 3 surviving shards, per-request latency
-        # nearly doubled, and the train-side cap fired before the
-        # router gave up. By matching router proxy_timeout we let the
-        # router's own retry/replay handle transient slow shards.
+        # Match the router's proxy_timeout_s so the router's replay handles slow shards before we time out.
         gen_timeout = aiohttp.ClientTimeout(total=600)
 
         completions_url = f"{self.server_url}/v1/completions"
@@ -789,23 +717,10 @@ class RemoteGeneration(GenerationInterface):
                 req["stop_token_ids"] = self.cfg["stop_token_ids"]
             requests_list.append(req)
 
-        # Send all requests concurrently to the router. Per-request retry
-        # on transient transport errors (TimeoutError, ServerDisconnectedError,
-        # ClientConnectionError, ClientPayloadError) so a single slow shard
-        # under post-fault rebalanced load doesn't sink the whole step. Each
-        # retry goes through the router's load balancer fresh, so the next
-        # attempt is routed to whichever shard has the smallest queue.
-        # 5xx responses are NOT retried here — the router itself retries
-        # 5xx via its replay buffer (cordon + replay-to-different-shard).
-        # Only client-observed transport failures (where the router didn't
-        # even respond) get retried, since the router has no chance to
-        # apply its own logic in that case.
+        # Send all requests concurrently; retry on transport errors only (5xx is handled by the router).
         async with aiohttp.ClientSession(timeout=gen_timeout) as session:
             async def _send_one(req):
-                # Up to 3 attempts: original + 2 retries. Linear backoff
-                # 0.5s → 1.0s. 30B generation latency dominates anyway,
-                # so backoff just prevents instant retry from hitting the
-                # same overloaded shard before the router rebalances.
+                # Up to 3 attempts with linear backoff to allow the router to rebalance.
                 last_err: Exception | None = None
                 for attempt in range(3):
                     try:
@@ -925,14 +840,8 @@ class RemoteGeneration(GenerationInterface):
             f"world_size={world_size} train_world_size={train_world_size}",
             flush=True,
         )
-        # ``raise_on_status=False``: the router's 503 response carries the
-        # structured per-worker classifier result (current_gen_world_size,
-        # evicted_shard_ids, failed_indices). ``raise_for_status`` would
-        # collapse it into a generic HTTPError on the train side, losing
-        # that info — which is exactly the bug behind the index-based
-        # straggler eviction that incorrectly evicted dp-0 on outer
-        # timeouts. ensure_collective_synced inspects the body to decide
-        # retry vs success without trying to do its own classification.
+        # raise_on_status=False: preserves the structured 503 body so ensure_collective_synced
+        # can inspect evicted_shard_ids / current_gen_world_size without losing info to HTTPError.
         ref = _http_call_blocking.remote(
             url,
             json_body={

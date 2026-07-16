@@ -72,12 +72,7 @@ class VllmInternalWorkerExtension:
         _t_phases: dict[str, float] = {}
         _t_overall = _time.monotonic()
 
-        # RL-412: idempotent re-init — abort the leftover NCCL comm
-        # FIRST (without sync, so we don't block on ops whose peer just
-        # left), then drain + clear queued async errors via try/except'd
-        # sync + empty_cache. Without the swallow, the next CUDA op
-        # surfaces ``cudaErrorLaunchFailure`` and crashes the worker.
-        # Mirror of base_policy_worker.init_collective.
+        # Idempotent re-init: abort the old comm first, then drain queued CUDA errors.
         _t = _time.monotonic()
         old = getattr(self, "model_update_group", None)
         if old is not None:
@@ -375,15 +370,8 @@ class VllmInternalWorkerExtension:
     )
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
-        # RL-412 elastic re-init: this worker may not be in the current
-        # cross-cluster comm. A freshly added shard is appended to the gen
-        # worker group (so the broadcast dispatch targets it) BEFORE the
-        # trainer has grown the comm to include it — during that "debounce"
-        # window the trainer broadcasts on the existing comm, which this
-        # worker never joined (``model_update_group is None``). Skip the
-        # receive: there is nothing to recv, and erroring/blocking here would
-        # break the whole refit. The shard stays ``joining`` (router does NOT
-        # promote a not-in-comm shard) until a later grow re-init pulls it in.
+        # A freshly added shard may not yet be in the comm during the debounce window.
+        # Skip the receive; the shard stays joining until a later re-init pulls it in.
         if getattr(self, "model_update_group", None) is None:
             print(
                 "[vllm_backend.update_weights_from_collective] no comm "
@@ -462,26 +450,8 @@ class VllmInternalWorkerExtension:
                 flush=True,
             )
         finally:
-            # Tear down the cross-cluster ``model_update_group`` ONLY on a
-            # FAILED refit (in disagg mode). On a SUCCESSFUL refit we KEEP the
-            # group alive across refits — symmetric with
-            # RefitWorker.broadcast_weights_until_complete.
-            #
-            # Recreating the group every refit forces a fresh cross-cluster
-            # TCPStore rendezvous each step, which is intermittently flaky on
-            # this cluster (gen workers fail to connect → the broadcast
-            # collective can never complete → spurious 60s aborts + healthy
-            # worker eviction with NO fault). Holding the group alive makes a
-            # steady-state refit a plain broadcast on the existing comm
-            # (reliable, no per-step rendezvous); ``ensure_collective_synced``
-            # re-inits only when the world size changes (a real fault). A peer
-            # dying mid-broadcast trips ``synchronize_or_abort`` (sets
-            # success=False here) → we tear down → the next refit re-inits at
-            # the new world. In single-cluster (non-disagg) mode the group is
-            # never torn down per-refit (it's stable for the whole run).
-            #
-            # Disagg mode is identified by DISAGG_JOB_ID env var, set by
-            # run_standalone_generation_server.py's entrypoint.
+            # In disagg mode, tear down the comm only on failure. On success keep it alive
+            # across refits to avoid per-step rendezvous flakiness.
             import os as _os
 
             is_disagg = bool(_os.environ.get("DISAGG_JOB_ID"))

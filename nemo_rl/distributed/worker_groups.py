@@ -343,22 +343,13 @@ class RayWorkerGroup:
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
         self.dp_leader_worker_indices: list[int] = []
-        # RL-412: indices of workers whose actor has been ray.kill'd by the
-        # router on a shard-down. Dispatch methods skip these so the
-        # surviving workers can still serve init_collective / reset_collective
-        # / generate without raising RayActorError on the dead actor.
+        # Indices of ray.kill'd workers; dispatch methods skip these to avoid RayActorError.
         self._dead_indices: set[int] = set()
-        # RL-412 scale-up: stash the worker builder + env vars so add_worker
-        # (router.add_shard path) can spawn a new vLLM DP shard post-init
-        # using the same configuration as the initial cohort.
+        # Stash builder + env vars so add_worker can spawn new DP shards post-init.
         self._remote_worker_builder = remote_worker_builder
         self._env_vars: dict[str, str] = dict(env_vars)
-        # Monotonic counter for unique actor names on add_worker. NEVER decremented
-        # — even on failed creates, so a retry never collides with a stale Ray
-        # actor namespace entry from the previous failed attempt. Without this,
-        # ``len(self._workers)`` was reused across retries (since failed actors
-        # don't append) and the second create raised ActorAlreadyExistsError on
-        # the same ``vllm_policy-added-3`` name.
+        # Monotonic counter for unique actor names; never decremented so retries
+        # don't collide with stale Ray namespace entries from failed attempts.
         self._add_worker_seq: int = 0
 
         # If explicit bundle indices are provided, use those
@@ -647,17 +638,14 @@ class RayWorkerGroup:
 
     @property
     def dead_indices(self) -> set[int]:
-        """Worker indices removed via mark_workers_dead (RL-412)."""
+        """Worker indices removed via mark_workers_dead."""
         return self._dead_indices
 
     def mark_workers_dead(self, indices: list[int]) -> None:
         """Drop these worker indices from the dispatch set.
 
-        Called by the router after ``ray.kill`` on a shard's actor so that
-        subsequent ``run_all_workers_*`` calls don't dispatch onto a dead
-        actor. Also shrinks ``dp_leader_worker_indices`` so ``dp_size``
-        reflects the new shard count, which feeds into init_collective's
-        rank computation.
+        Called after ``ray.kill`` on a shard's actor so subsequent dispatches skip it.
+        Also shrinks ``dp_leader_worker_indices`` so ``dp_size`` reflects the new count.
         """
         if not indices:
             return
@@ -675,14 +663,10 @@ class RayWorkerGroup:
     ) -> tuple[Any, str, tuple[int, list[int]], int]:
         """Phase A of add_worker: spawn the actor handle WITHOUT appending.
 
-        Returns ``(actor_handle, name, bundle_indices, dp_shard_idx)``. The
-        actor's ``__init__`` is queued on Ray and runs asynchronously — the
-        caller can drive setup methods (``prepare_refit_info``,
-        ``report_dp_openai_server_base_url``) directly on the handle while
-        ``__init__`` finishes. Until ``append_spawned_worker`` is called,
-        the actor is INVISIBLE to ``run_all_workers_*`` / ``init_collective``
-        / ``generate`` dispatch — so train-side refits can keep flowing
-        at the smaller (pre-fault) world without blocking.
+        Returns ``(actor_handle, name, bundle_indices, dp_shard_idx)``. The actor's
+        ``__init__`` runs asynchronously; the caller can drive setup methods on the handle
+        while it finishes. The actor is invisible to dispatch until ``append_spawned_worker``
+        is called, so in-flight work continues at the pre-fault world size.
         """
         if self._remote_worker_builder is None:
             raise RuntimeError(
@@ -792,12 +776,10 @@ class RayWorkerGroup:
     ) -> int:
         """Phase B of add_worker: append a pre-spawned actor.
 
-        After this call, the worker becomes visible to all
-        ``run_all_workers_*`` dispatches and the next ``init_collective``
-        / ``reset_collective`` will include it. ``pre_append_hook`` fires
-        the instant before the append, so the router can flip its
-        ``_nccl_reinit_in_progress`` gate at the precise moment the gen
-        world size is about to change.
+        After this call, the worker is visible to all dispatch methods and will
+        be included in the next ``init_collective`` / ``reset_collective``.
+        ``pre_append_hook`` fires just before the append so the caller can
+        update any gates at the moment the world size changes.
         """
         if pre_append_hook is not None:
             pre_append_hook()
@@ -856,7 +838,6 @@ class RayWorkerGroup:
         *args,
         run_rank_0_only_axes: list[str] | None = None,
         common_kwargs: Optional[dict[str, Any]] = None,
-        restrict_to_indices: Optional[set[int]] = None,
         **kwargs,
     ) -> list[ray.ObjectRef]:
         """Run a method on all workers in parallel with different data.
@@ -867,13 +848,6 @@ class RayWorkerGroup:
                    e.g. [[arg1_for_worker_1, arg1_for_worker_2], [arg2_for_worker_1, arg2_for_worker_2]]
             run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
             common_kwargs: Keyword arguments to pass to all workers
-            restrict_to_indices: When provided, dispatch ONLY to workers whose
-                index is in this set (in addition to the dead-index and
-                rank-0-only filters). Used by the cross-cluster ``init_collective``
-                to rendezvous a FROZEN cohort (RL-412): a booting/cold backfill
-                shard is omitted from the cohort entirely, so it cannot sabotage
-                the rendezvous. ``rank_prefix``/data lists must already be sized
-                to the restricted, dispatched workers.
             **kwargs: Keyword arguments to pass to workers/groups
                       e.g. {"key1": [value_for_worker_1, value_for_worker_2], "key2": [value_for_worker_1, value_for_worker_2]}
 
@@ -929,8 +903,6 @@ class RayWorkerGroup:
         data_idx = 0
         for worker_idx, worker in enumerate(self.workers):
             if worker_idx in self._dead_indices:
-                continue
-            if restrict_to_indices is not None and worker_idx not in restrict_to_indices:
                 continue
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 
@@ -1253,14 +1225,11 @@ class RayWorkerGroup:
         if True:
             initializers_to_kill = []
             for worker in self._workers:
-                if hasattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC"):
-                    # Store the initializer ref before the main worker is killed,
-                    # as killing the worker might affect accessibility of this attribute later.
-                    initializer = getattr(
-                        worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC", None
-                    )
-                    if initializer:
-                        initializers_to_kill.append(initializer)
+                # Store the initializer ref before the main worker is killed,
+                # as killing the worker might affect accessibility of this attribute later.
+                initializer = getattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC", None)
+                if initializer is not None:
+                    initializers_to_kill.append(initializer)
                 try:
                     ray.kill(worker)
                 except Exception as e:
