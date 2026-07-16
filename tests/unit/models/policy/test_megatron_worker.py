@@ -83,9 +83,12 @@ def test_refit_size_estimate_preserves_integral_buffer_dtype():
 
     param = torch.zeros(3, dtype=torch.int64)
 
-    assert _estimate_refit_tensor_size_in_bytes(
-        param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
-    ) == 3 * 8 * 2 * 4
+    assert (
+        _estimate_refit_tensor_size_in_bytes(
+            param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
+        )
+        == 3 * 8 * 2 * 4
+    )
 
 
 def test_refit_size_estimate_casts_floating_weight_to_export_dtype():
@@ -95,9 +98,12 @@ def test_refit_size_estimate_casts_floating_weight_to_export_dtype():
 
     param = torch.zeros(3, dtype=torch.float32)
 
-    assert _estimate_refit_tensor_size_in_bytes(
-        param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
-    ) == 3 * 2 * 2 * 4
+    assert (
+        _estimate_refit_tensor_size_in_bytes(
+            param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
+        )
+        == 3 * 2 * 2 * 4
+    )
 
 
 def test_qwen3vl_type_fallback_still_delegates_packing():

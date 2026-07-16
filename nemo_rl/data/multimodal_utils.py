@@ -123,8 +123,7 @@ class PackedTensor:
         # patchification.
         if (
             self.pad_to_max_shape
-            and
-            self.dim_to_pack == 0
+            and self.dim_to_pack == 0
             and all(t.ndim == 4 for t in non_none_tensors)
             and len({t.shape[1] for t in non_none_tensors}) == 1
         ):
@@ -191,9 +190,7 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
-        pad_to_max_shapes = [
-            batch.pad_to_max_shape for batch in from_packed_tensors
-        ]
+        pad_to_max_shapes = [batch.pad_to_max_shape for batch in from_packed_tensors]
         assert len(set(pad_to_max_shapes)) == 1, (
             "All packed tensors must have the same pad_to_max_shape setting"
         )
@@ -238,9 +235,7 @@ class PackedTensor:
         assert len(set(dim_to_packs)) == 1, (
             "All packed tensors must have the same dim_to_pack"
         )
-        pad_to_max_shapes = [
-            batch.pad_to_max_shape for batch in from_packed_tensors
-        ]
+        pad_to_max_shapes = [batch.pad_to_max_shape for batch in from_packed_tensors]
         assert len(set(pad_to_max_shapes)) == 1, (
             "All packed tensors must have the same pad_to_max_shape setting"
         )

@@ -339,7 +339,6 @@ def _validate_nemotron_omni_megatron_lm_layout(
     the only reliable way to distinguish the old LLaVA wrapper from the canonical
     model-owned-packing implementation.
     """
-
     architectures = set(getattr(hf_config, "architectures", None) or ())
     if not architectures.intersection(_NEMOTRON_OMNI_ARCHITECTURES):
         return
@@ -348,9 +347,7 @@ def _validate_nemotron_omni_megatron_lm_layout(
 
     tensor_metadata = dist_checkpointing.load_tensors_metadata(checkpoint_dir)
     legacy_keys = [
-        str(key)
-        for key in tensor_metadata
-        if "llava_model" in str(key).split(".")
+        str(key) for key in tensor_metadata if "llava_model" in str(key).split(".")
     ]
     if not legacy_keys:
         return

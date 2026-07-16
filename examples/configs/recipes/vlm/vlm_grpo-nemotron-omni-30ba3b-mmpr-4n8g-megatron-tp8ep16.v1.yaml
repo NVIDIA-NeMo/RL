@@ -1,72 +1,30 @@
 defaults: ./vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-megatron-tp8ep8.v1.yaml
-
-# Production-shaped, non-Gym Nano Omni image-GRPO recipe. This is the main-side
-# counterpart of Omni's scripts/nanov3_vision_rl.sh workload. Keep behavioral
-# changes synchronized with the frozen Omni control and document exceptions.
-
 grpo:
   num_prompts_per_step: 512
-  num_generations_per_prompt: 16
-  max_num_steps: 1000000
-  val_period: 10
-  max_val_samples: 256
-  val_batch_size: 256
-  seed: 42
   overlong_filtering: true
   zero_variance_prompt_filtering: false
-  seq_logprob_error_threshold: null
-  # The first maintained comparison disables the fork-only PackedTensor dedup
-  # optimization on both sides. Qualify it separately before enabling it here.
   deduplicate_multimodal_data: false
-
 loss_fn:
-  reference_policy_kl_penalty: 0.0
-  ratio_clip_min: 0.2
   ratio_clip_max: 0.28
   use_on_policy_kl_approximation: true
   sequence_level_importance_ratios: true
   token_level_loss: false
-
 checkpointing:
-  enabled: true
   checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr_megatron
   keep_top_k: 4
-  save_period: 10
   checkpoint_must_save_by: 00:03:45:00
-
 policy:
   train_global_batch_size: 2048
-  train_micro_batch_size: 1
-  logprob_batch_size: 1
   logprob_chunk_size: 1024
-  max_total_sequence_length: 8192
-  dynamic_batching:
-    enabled: false
-  sequence_packing:
-    enabled: true
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: modified_first_fit_decreasing
-    sequence_length_round: 64
   megatron_cfg:
     empty_unused_memory_level: 2
-    tensor_model_parallel_size: 8
     expert_model_parallel_size: 16
-    expert_tensor_parallel_size: 1
-    context_parallel_size: 1
-    sequence_parallel: true
-    bias_activation_fusion: false
-    activation_checkpointing: true
     optimizer:
       lr: 3.0e-06
       min_lr: 2.0e-09
       weight_decay: 0.0
-      adam_beta1: 0.9
       adam_beta2: 0.99
-      optimizer_cpu_offload: false
-      optimizer_offload_fraction: 0.0
     scheduler:
-      lr_decay_style: constant
       lr_decay_iters: null
       lr_warmup_iters: 10
       lr_warmup_init: 3.0e-08
@@ -75,22 +33,12 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 2
       load_format: auto
-      logprobs_mode: raw_logprobs
       enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
       gpu_memory_utilization: 0.75
-      enable_prefix_caching: false
     vllm_kwargs:
-      limit_mm_per_prompt:
-        image: 2
       max_num_batched_tokens: 32768
       max_num_seqs: 512
-      mamba_ssm_cache_dtype: float32
-      skip_mm_profiling: true
-      kernel_config:
-        enable_flashinfer_autotune: false
-        moe_backend: triton
-
 data:
   train:
     dataset_name: mmpr-tiny
@@ -99,9 +47,7 @@ data:
     seed: 42
   default:
     prompt_file: null
-    processor: vlm_hf_data_processor
     env_name: mmpr-tiny
-
 env:
   mmpr-tiny:
     num_workers: 8
@@ -110,13 +56,10 @@ env:
       weight: 1.0
       kwargs:
         format_score: 0.1
-
 logger:
   wandb_enabled: true
   wandb:
     project: nemotron-omni-main-migration
     name: nemotron-omni-mmpr-megatron
-
 cluster:
   num_nodes: 4
-  gpus_per_node: 8

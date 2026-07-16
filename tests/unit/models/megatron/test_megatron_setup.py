@@ -54,9 +54,7 @@ class TestNemotronOmniCheckpointContract:
             _validate_nemotron_omni_megatron_lm_layout,
         )
 
-        hf_config = SimpleNamespace(
-            architectures=["NemotronH_Nano_Omni_Reasoning_V3"]
-        )
+        hf_config = SimpleNamespace(architectures=["NemotronH_Nano_Omni_Reasoning_V3"])
         metadata = {
             "language_model.embedding.word_embeddings.weight": object(),
             "vision_model.decoder.layers.0.self_attention.linear_qkv.weight": object(),
@@ -74,9 +72,7 @@ class TestNemotronOmniCheckpointContract:
             _validate_nemotron_omni_megatron_lm_layout,
         )
 
-        hf_config = SimpleNamespace(
-            architectures=["NemotronH_Super_Omni_Reasoning_V3"]
-        )
+        hf_config = SimpleNamespace(architectures=["NemotronH_Super_Omni_Reasoning_V3"])
         metadata = {
             "model.llava_model.language_model.embedding.word_embeddings.weight": object(),
             "model.llava_model.vision_model.decoder.layers.0.self_attention.linear_qkv.weight": object(),

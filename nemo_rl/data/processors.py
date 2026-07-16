@@ -638,9 +638,7 @@ def vlm_hf_data_processor(
     if "imgs_sizes" in message and "imgs_sizes" not in multimodal_keys:
         multimodal_keys.append("imgs_sizes")
     if "imgs_sizes" in message and "num_frames" not in message:
-        message["num_frames"] = torch.ones(
-            len(message["imgs_sizes"]), dtype=torch.long
-        )
+        message["num_frames"] = torch.ones(len(message["imgs_sizes"]), dtype=torch.long)
     if "num_frames" in message and "num_frames" not in multimodal_keys:
         multimodal_keys.append("num_frames")
     for key in multimodal_keys:

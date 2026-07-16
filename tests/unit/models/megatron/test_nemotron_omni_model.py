@@ -22,19 +22,18 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from megatron.core import dist_checkpointing, parallel_state
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
 from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
     NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT,
     NemotronOmniModelProvider,
 )
+from megatron.core import dist_checkpointing, parallel_state
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
 from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.models.megatron.data import process_microbatch
-
 
 pytestmark = pytest.mark.mcore
 
@@ -143,9 +142,7 @@ def _expanded_fixture(device: torch.device):
     generator.manual_seed(2026)
     images = torch.randn(2, 3, 32, 64, generator=generator, device=device)
     images[1, :, :, 32:] = 0
-    image_sizes = torch.tensor(
-        [[32, 64], [32, 32]], dtype=torch.int32, device=device
-    )
+    image_sizes = torch.tensor([[32, 64], [32, 32]], dtype=torch.int32, device=device)
     return input_ids, lengths, images, image_sizes
 
 
@@ -177,9 +174,9 @@ def _forward(model):
         inference_only=False,
         cp_group=parallel_state.get_context_parallel_group(),
     )
-    prediction_mask = torch.arange(
-        input_ids.shape[1] - 1, device=device
-    ).unsqueeze(0) < (lengths - 1).unsqueeze(1)
+    prediction_mask = torch.arange(input_ids.shape[1] - 1, device=device).unsqueeze(
+        0
+    ) < (lengths - 1).unsqueeze(1)
     loss = -(logprobs * prediction_mask).sum() / prediction_mask.sum()
     return loss, output
 
@@ -256,9 +253,7 @@ def _run_training_checkpoint_roundtrip(
     provider.finalize()
     restored_model = provider.provide().cuda().eval()
     restore_template = restored_model.sharded_state_dict(metadata=metadata)
-    loaded_state = dist_checkpointing.load(
-        {"model": restore_template}, checkpoint_dir
-    )
+    loaded_state = dist_checkpointing.load({"model": restore_template}, checkpoint_dir)
     incompatible = restored_model.load_state_dict(loaded_state["model"])
     assert not incompatible.missing_keys
     assert not incompatible.unexpected_keys

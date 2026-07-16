@@ -237,9 +237,7 @@ class TestVLMProcessorMMPRTiny:
         assert len(result["vllm_images"]) == 1
         assert result["task_name"] == "mmpr-tiny"
         user_message = result["message_log"][0]
-        assert torch.equal(
-            user_message["num_frames"].as_tensor(), torch.tensor([1])
-        )
+        assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))
 
     def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
         from nemo_rl.data.interfaces import TaskDataSpec
@@ -247,9 +245,7 @@ class TestVLMProcessorMMPRTiny:
 
         task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
         task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
-        processor = _make_stub_nemotron_processor(
-            include_imgs_sizes=False, num_tiles=3
-        )
+        processor = _make_stub_nemotron_processor(include_imgs_sizes=False, num_tiles=3)
         result = vlm_hf_data_processor(
             datum_dict={
                 "images": [tiny_image_path],
