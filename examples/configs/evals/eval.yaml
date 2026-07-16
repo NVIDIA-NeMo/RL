@@ -52,6 +52,25 @@ env:
   math:
     num_workers: 8
 
+logger:
+  log_dir: "logs/eval"
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false # set true to log cluster GPU/host-memory metrics at eval_step
+  wandb:
+    project: "nemo-rl-eval"
+    name: "eval"
+  tensorboard: {}
+  swanlab:
+    project: "nemo-rl-eval"
+    name: "eval"
+  mlflow: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
 cluster:
   gpus_per_node: 1
   num_nodes: 1

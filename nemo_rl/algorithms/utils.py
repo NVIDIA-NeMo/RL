@@ -920,6 +920,7 @@ def log_generation_metrics_to_wandb(
     step: int,
     timeline_interval: float,
     logger: Logger,
+    step_metric: str | None = None,
 ) -> None:
     """Log generation metrics to wandb.
 
@@ -928,6 +929,7 @@ def log_generation_metrics_to_wandb(
         step: Global step value
         timeline_interval: Interval between timeline points (in seconds)
         logger: Logger instance
+        step_metric: Optional custom step field for batch-driven eval logging
     """
     for generation_metric in generation_logger_metrics.keys():
         logger.log_plot_per_worker_timeline_metrics(
@@ -936,6 +938,7 @@ def log_generation_metrics_to_wandb(
             prefix="generation_metrics",
             name=generation_metric,
             timeline_interval=timeline_interval,
+            step_metric=step_metric,
         )
 
 

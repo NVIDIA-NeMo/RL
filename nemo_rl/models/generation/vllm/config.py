@@ -49,6 +49,9 @@ class VllmSpecificArgs(TypedDict):
     http_refit_server_port: NotRequired[int | None]
     # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
     zmq_refit_server_port: NotRequired[int | None]
+    # Periodically sample vLLM engine telemetry for rollout performance reporting.
+    enable_vllm_metrics_logger: NotRequired[bool]
+    vllm_metrics_logger_interval: NotRequired[int | float]
     # These kwargs are passed to the vllm.LLM HTTP server Chat Completions endpoint config. Typically this will include things like tool parser, chat template, etc
     http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
     # Miscellaneous top level vLLM HTTP server arguments.
