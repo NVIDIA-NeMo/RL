@@ -79,24 +79,19 @@ def _http_executor(workers: int) -> ThreadPoolExecutor:
 
 def post_vllm_refit_endpoints(
     endpoint_urls: Sequence[str],
-    body: Mapping[str, Any] | bytes,
+    body: Mapping[str, Any],
     *,
     api_key: str | None,
     timeout_s: float,
-    headers: Mapping[str, str] | None = None,
-    executor: ThreadPoolExecutor | None = None,
 ) -> list[dict[str, Any]]:
-    request_headers = dict(headers or {})
+    request_headers = {}
     if api_key:
         request_headers[G_VLLM_REFIT_API_KEY_HEADER] = api_key
-    request_kwargs: dict[str, Any] = (
-        {"data": body} if isinstance(body, bytes) else {"json": body}
-    )
 
     def post(url: str) -> dict[str, Any]:
         response = refit_http_session().post(
             url,
-            **request_kwargs,
+            json=body,
             headers=request_headers,
             timeout=timeout_s,
         )
@@ -111,8 +106,7 @@ def post_vllm_refit_endpoints(
             )
         return result
 
-    pool = executor or _http_executor(len(endpoint_urls))
-    return list(pool.map(post, endpoint_urls))
+    return list(_http_executor(len(endpoint_urls)).map(post, endpoint_urls))
 
 
 def merge_vllm_refit_metrics(

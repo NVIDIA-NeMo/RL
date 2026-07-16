@@ -56,6 +56,7 @@ class _SparseWeightLoadMode(TorchDispatchMode):
         self._targets = targets
         self._verification = verification
         self._source_storage = 0
+        self._source_name = ""
         self._operation: sparse_codec.SparseOperation = "overwrite"
         self._sample_limit = 0
         self._exact_sentinel: int | None = None
@@ -69,11 +70,13 @@ class _SparseWeightLoadMode(TorchDispatchMode):
 
     def start(
         self,
+        name: str,
         source: torch.Tensor,
         operation: sparse_codec.SparseOperation,
         sample_limit: int,
         exact_sentinel: int | None,
     ) -> None:
+        self._source_name = name
         self._source_storage = _storage_key(source)
         self._operation = operation
         self._sample_limit = sample_limit
@@ -171,7 +174,8 @@ class _SparseWeightLoadMode(TorchDispatchMode):
 
         if not xor_compatible:
             raise RuntimeError(
-                "XOR cannot pass through this native loader without changing semantics."
+                f"XOR for {self._source_name!r} cannot pass through this native "
+                "loader without changing semantics."
             )
         source = source.expand_as(destination)
         destination_bits = sparse_codec.integer_view(destination)
@@ -354,7 +358,7 @@ class VllmSparseDeltaApplier:
                     observations.append(
                         (yielded_names[-1], mode.copies, mode.xor_compatible)
                     )
-                mode.start(source, operation, sample_limit, exact_sentinel)
+                mode.start(name, source, operation, sample_limit, exact_sentinel)
                 active = True
                 yielded_names.append(name)
                 yield name, source

@@ -19,6 +19,7 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Literal, NamedTuple, cast
 
@@ -48,12 +49,6 @@ from nemo_rl.utils.weight_transfer_stream import (
     refit_env_int,
 )
 from nemo_rl.utils.weight_transfer_zmq import (
-    G_VLLM_REFIT_CHECKSUM_HEADER,
-    G_VLLM_REFIT_PAYLOAD_HEADER,
-    G_VLLM_REFIT_PRODUCER_HEADER,
-    G_VLLM_REFIT_TRANSFER_HEADER,
-    G_VLLM_REFIT_VERIFICATION_HEADER,
-    G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
     ZmqSparseRefitServer,
 )
 
@@ -394,37 +389,22 @@ class VllmSparseRefitReceiver:
         result["receiver_s3_download_s"] = download_s
         return result
 
-    async def _apply_zmq_payload(self, raw_request: Any) -> dict[str, Any]:
-        headers = raw_request.headers
-        transfer_id = headers.get(G_VLLM_REFIT_TRANSFER_HEADER, "")
-        producer_id = int(headers.get(G_VLLM_REFIT_PRODUCER_HEADER, "-1"))
-        payload_id = int(headers.get(G_VLLM_REFIT_PAYLOAD_HEADER, "-1"))
-        checksum = headers.get(G_VLLM_REFIT_CHECKSUM_HEADER, "")
-        verification_candidates = int(
-            headers.get(G_VLLM_REFIT_VERIFICATION_HEADER, "-1")
-        )
-        if (
-            not transfer_id
-            or producer_id < 0
-            or payload_id < 0
-            or not checksum
-            or verification_candidates < 0
-        ):
-            raise ValueError("Missing or invalid ZeroMQ sparse refit payload headers.")
-        compressed = await raw_request.body()
+    def _apply_zmq_payload(
+        self, compressed: bytes, metadata: Mapping[str, Any]
+    ) -> dict[str, Any]:
         started = time.perf_counter()
-        payload = await asyncio.to_thread(
-            decode_sparse_payload,
-            compressed,
-            checksum,
-        )
+        checksum = str(metadata["checksum"])
+        payload = decode_sparse_payload(compressed, checksum)
         decode_s = time.perf_counter() - started
-        result = await asyncio.to_thread(
-            self._enqueue_sparse_payload_apply,
+        result = self._enqueue_sparse_payload_apply(
             payload,
-            (transfer_id, producer_id, payload_id),
+            (
+                str(metadata["transfer_id"]),
+                int(metadata["producer_id"]),
+                int(metadata["payload_id"]),
+            ),
             checksum,
-            verification_candidates,
+            int(metadata["verification_candidates"]),
         )
         result["receiver_zmq_decode_s"] = decode_s
         return result
@@ -435,7 +415,7 @@ class VllmSparseRefitReceiver:
 
         async def respond(
             raw_request: Request,
-            action: Literal["prepare", "s3", "flush", "zmq", "zmq_flush"],
+            action: Literal["prepare", "s3", "flush", "zmq_flush"],
         ) -> JSONResponse:
             if cfg["vllm_cfg"]["async_engine"]:
                 self._refit_async_loop = asyncio.get_running_loop()
@@ -456,8 +436,6 @@ class VllmSparseRefitReceiver:
                     result = await self._apply_s3_manifest_payload(
                         await raw_request.json()
                     )
-                elif action == "zmq":
-                    result = await self._apply_zmq_payload(raw_request)
                 elif action == "zmq_flush":
                     body = await raw_request.json()
                     result = await asyncio.to_thread(
@@ -475,7 +453,7 @@ class VllmSparseRefitReceiver:
             )
 
         def endpoint(
-            action: Literal["prepare", "s3", "flush", "zmq", "zmq_flush"],
+            action: Literal["prepare", "s3", "flush", "zmq_flush"],
         ):
             async def handle(raw_request: Request) -> JSONResponse:
                 return await respond(raw_request, action)
@@ -486,7 +464,6 @@ class VllmSparseRefitReceiver:
             (G_VLLM_REFIT_S3_MANIFEST_PATH, "s3"),
             (G_VLLM_REFIT_PREPARE_PATH, "prepare"),
             (G_VLLM_REFIT_FLUSH_PATH, "flush"),
-            (G_VLLM_REFIT_ZMQ_PAYLOAD_PATH, "zmq"),
             (G_VLLM_REFIT_ZMQ_FLUSH_PATH, "zmq_flush"),
         ):
             app.add_api_route(path, endpoint(action), methods=["POST"])
@@ -497,7 +474,7 @@ class VllmSparseRefitReceiver:
         base_url = getattr(self._worker, "base_url", None)
         return base_url.removesuffix("/v1") if base_url else None
 
-    def start_zmq_sparse_refit_relay(self, refit_urls: list[str]) -> str:
+    def start_zmq_sparse_refit_relay(self) -> str:
         if self._zmq_refit_server is not None:
             return self._zmq_refit_server[1]
         cfg = self._worker.cfg
@@ -506,7 +483,7 @@ class VllmSparseRefitReceiver:
             cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
         )
         server = ZmqSparseRefitServer(
-            refit_urls,
+            self._apply_zmq_payload,
             bind_address=f"tcp://0.0.0.0:{port}",
             api_key_env_var=cfg["vllm_cfg"].get("http_refit_api_key_env_var"),
             timeout_s=float(os.getenv("NRL_REFIT_ZMQ_TIMEOUT_S") or 600.0),
@@ -520,14 +497,10 @@ class VllmSparseRefitReceiver:
     def configure_zmq_sparse_refit_relay(self, relay_addresses: list[str]) -> None:
         if self._zmq_refit_server is None:
             raise RuntimeError("ZeroMQ sparse refit relay is not running.")
-        local_refit_url = self.report_refit_server_base_url()
-        if local_refit_url is None:
-            raise RuntimeError("Local vLLM sparse refit endpoint is unavailable.")
         server, own_address = self._zmq_refit_server
         server.configure_tree(
             relay_addresses,
             own_address=own_address,
-            local_refit_url=local_refit_url,
         )
 
     def stop_zmq_sparse_refit_relay(self) -> None:

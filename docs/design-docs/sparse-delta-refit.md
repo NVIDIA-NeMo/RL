@@ -172,8 +172,8 @@ S3 uses 64 MiB multipart parts, a 2 GiB CRT client memory limit, and a 10 Gbps
 throughput target. ZeroMQ assigns each producer to one inference-cluster relay.
 That root applies the payload locally and forwards it through a balanced binary
 relay tree, so each payload crosses the inter-cluster boundary once rather than
-once per generation replica. Both transports use the same receiver endpoints
-and checksum validation.
+once per generation replica. The relay calls the same receiver decode/apply
+queue as S3 directly, without a loopback HTTP data hop.
 
 Each ZeroMQ relay validates and deduplicates `(transfer_id, producer_id,
 payload_id)`, submits its local apply and at most two child forwards to bounded
@@ -315,7 +315,6 @@ same nonempty token on producers and receivers.
 | `NRL_REFIT_ZMQ_SEND_WORKERS` | 4 |
 | `NRL_REFIT_ZMQ_RELAY_PAYLOAD_WORKERS` | 16 |
 | `NRL_REFIT_ZMQ_RELAY_FORWARD_WORKERS` | 8 |
-| `NRL_REFIT_ZMQ_RELAY_FANOUT_WORKERS` | receiver endpoints x relay payload workers |
 | `NRL_REFIT_APPLY_QUEUE_DEPTH` / `NRL_REFIT_APPLY_BATCH_SIZE` | 32 / 8 |
 | `NRL_REFIT_PARTITION_WORKERS` | 2-8 from CPU count |
 | `NRL_REFIT_{S3,ZMQ}_ZSTD_THREADS` | 0 |

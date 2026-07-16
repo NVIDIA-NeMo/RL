@@ -341,7 +341,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
             self._targets = [
                 address
                 for address in self._run_generation_workers(
-                    "start_zmq_sparse_refit_relay", refit_urls=self._refit_urls
+                    "start_zmq_sparse_refit_relay"
                 )
                 if address
             ]

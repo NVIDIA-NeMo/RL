@@ -24,7 +24,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, Protocol
+from typing import Any, Callable
 from urllib.parse import quote
 
 import torch
@@ -51,19 +51,14 @@ _S3_PART_SIZE = 64 * 1024**2
 _S3_MEMORY_LIMIT = 2 * 1024**3
 
 
-class SparseRefitTransport(Protocol):
-    """Payload delivery owned by one generic stream invocation."""
+@dataclass(frozen=True)
+class SparseRefitTransport:
+    """Transport-specific callbacks used by the shared streaming pipeline."""
 
     name: str
     transfer_workers: int
-
-    def send(
-        self, body: bytes, payload_id: int, verification_candidates: int
-    ) -> dict[str, Any]: ...
-
-    def cleanup(self) -> None:
-        """Release resources created on the current transfer worker."""
-        ...
+    send: Callable[[bytes, int, int], dict[str, Any]]
+    cleanup: Callable[[], None]
 
 
 @dataclass
@@ -168,75 +163,6 @@ class _S3ObjectStore:
             headers,
             io.BytesIO(body) if body is not None else None,
         )
-
-
-class _S3ManifestTransport:
-    name = "s3"
-
-    def __init__(
-        self,
-        *,
-        store: _S3ObjectStore,
-        endpoint_urls: Sequence[str],
-        run_prefix: str,
-        api_key: str | None,
-        timeout_s: float,
-        transfer_workers: int,
-    ) -> None:
-        self._store = store
-        self._endpoint_urls = endpoint_urls
-        self._run_prefix = run_prefix
-        self._api_key = api_key
-        self._timeout_s = timeout_s
-        self.transfer_workers = transfer_workers
-        self._keys = threading.local()
-
-    def send(
-        self, body: bytes, payload_id: int, verification_candidates: int
-    ) -> dict[str, Any]:
-        key = f"{self._run_prefix}/{payload_id:06d}.pt"
-        keys = getattr(self._keys, "values", None)
-        if keys is None:
-            keys = []
-            self._keys.values = keys
-        keys.append(key)
-
-        try:
-            started = time.perf_counter()
-            self._store.put(key, body)
-            s3_put_s = time.perf_counter() - started
-            started = time.perf_counter()
-            responses = post_vllm_refit_endpoints(
-                self._endpoint_urls,
-                {
-                    "bucket": self._store.bucket,
-                    "region": self._store.region,
-                    "key": key,
-                    "checksum": sparse_payload_checksum(body),
-                    "verification_candidates": verification_candidates,
-                },
-                api_key=self._api_key,
-                timeout_s=self._timeout_s,
-            )
-            result = {
-                "s3_put_s": s3_put_s,
-                "manifest_post_s": time.perf_counter() - started,
-                "receiver": merge_vllm_refit_metrics({}, responses, maximum=True),
-            }
-        finally:
-            try:
-                self._store.delete(key)
-            except Exception:
-                pass
-            else:
-                keys.remove(key)
-        return result
-
-    def cleanup(self) -> None:
-        for key in getattr(self._keys, "values", ()):
-            with suppress(Exception):
-                self._store.delete(key)
-        self._keys.values = []
 
 
 def refit_env_int(name: str, *, default: int, min_value: int = 1) -> int:
@@ -611,19 +537,65 @@ def stream_sparse_delta_payloads_via_s3_manifest(
         if object_prefix
         else f"{transfer_id}/{shard_rank:06d}"
     )
+    api_key = vllm_refit_api_key(api_key_env_var)
+    keys = threading.local()
+
+    def send(
+        body: bytes, payload_id: int, verification_candidates: int
+    ) -> dict[str, Any]:
+        key = f"{run_prefix}/{payload_id:06d}.pt"
+        pending = getattr(keys, "values", None)
+        if pending is None:
+            pending = keys.values = []
+        pending.append(key)
+        try:
+            started = time.perf_counter()
+            store.put(key, body)
+            s3_put_s = time.perf_counter() - started
+            started = time.perf_counter()
+            responses = post_vllm_refit_endpoints(
+                endpoint_urls,
+                {
+                    "bucket": store.bucket,
+                    "region": store.region,
+                    "key": key,
+                    "checksum": sparse_payload_checksum(body),
+                    "verification_candidates": verification_candidates,
+                },
+                api_key=api_key,
+                timeout_s=timeout_s,
+            )
+            result = {
+                "s3_put_s": s3_put_s,
+                "manifest_post_s": time.perf_counter() - started,
+                "receiver": merge_vllm_refit_metrics({}, responses, maximum=True),
+            }
+        finally:
+            try:
+                store.delete(key)
+            except Exception:
+                pass
+            else:
+                pending.remove(key)
+        return result
+
+    def cleanup() -> None:
+        for key in getattr(keys, "values", ()):
+            with suppress(Exception):
+                store.delete(key)
+        keys.values = []
+
     return stream_sparse_delta_payloads(
         iterator,
         delta_tracker=delta_tracker,
-        transport=_S3ManifestTransport(
-            store=store,
-            endpoint_urls=endpoint_urls,
-            run_prefix=run_prefix,
-            api_key=vllm_refit_api_key(api_key_env_var),
-            timeout_s=timeout_s,
+        transport=SparseRefitTransport(
+            name="s3",
             transfer_workers=refit_env_int(
                 "NRL_REFIT_S3_UPLOAD_WORKERS",
                 default=max(4, min(32, os.cpu_count() or 32)),
             ),
+            send=send,
+            cleanup=cleanup,
         ),
         shard_rank=shard_rank,
         shard_count=shard_count,

@@ -252,7 +252,6 @@ class TestVllmRemoteSparseWeightSynchronizer:
         generation.worker_group.run_all_workers_single_data.assert_any_call(
             "start_zmq_sparse_refit_relay",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-            refit_urls=["http://receiver"],
         )
         generation.worker_group.run_all_workers_single_data.assert_any_call(
             "configure_zmq_sparse_refit_relay",

@@ -46,14 +46,6 @@ from nemo_rl.utils.weight_transfer_sparse_codec import (
     encode_sparse_infos,
     sparse_locations_for_item,
 )
-from nemo_rl.utils.weight_transfer_zmq import (
-    G_VLLM_REFIT_CHECKSUM_HEADER,
-    G_VLLM_REFIT_PAYLOAD_HEADER,
-    G_VLLM_REFIT_PRODUCER_HEADER,
-    G_VLLM_REFIT_TRANSFER_HEADER,
-    G_VLLM_REFIT_VERIFICATION_HEADER,
-    G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
-)
 
 
 @contextmanager
@@ -422,21 +414,16 @@ async def test_sparse_refit_payload_handlers_decode_and_enqueue(monkeypatch) -> 
         )
         assert s3_result["ok"]
 
-        invalid_request = SimpleNamespace(headers={}, body=AsyncMock())
-        with pytest.raises(ValueError, match="Missing or invalid"):
-            await receiver._apply_zmq_payload(invalid_request)
-
-        request = SimpleNamespace(
-            headers={
-                G_VLLM_REFIT_TRANSFER_HEADER: "transfer",
-                G_VLLM_REFIT_PRODUCER_HEADER: "2",
-                G_VLLM_REFIT_PAYLOAD_HEADER: "3",
-                G_VLLM_REFIT_CHECKSUM_HEADER: "checksum",
-                G_VLLM_REFIT_VERIFICATION_HEADER: "5",
+        zmq_result = receiver._apply_zmq_payload(
+            b"compressed",
+            {
+                "transfer_id": "transfer",
+                "producer_id": 2,
+                "payload_id": 3,
+                "checksum": "checksum",
+                "verification_candidates": 5,
             },
-            body=AsyncMock(return_value=b"compressed"),
         )
-        zmq_result = await receiver._apply_zmq_payload(request)
         assert zmq_result["ok"]
         assert enqueue.call_args_list == [
             call(b"s3-payload", ("object-key", -1, -1), "checksum", 4),
@@ -458,9 +445,6 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
     with _sparse_refit_receiver(async_engine=True, config=config) as receiver:
         receiver._apply_s3_manifest_payload = AsyncMock(
             return_value={"ok": True, "payloads": 1}
-        )
-        receiver._apply_zmq_payload = AsyncMock(
-            side_effect=RuntimeError("apply failed")
         )
         receiver._flush_queued_sparse_payloads = MagicMock(
             return_value={"ok": True, "payloads": 2}
@@ -491,21 +475,13 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
                 json={"tensors": {"weight": [[2, 3], "bfloat16"]}},
                 headers=headers,
             )
-            zmq_response = client.post(
-                G_VLLM_REFIT_ZMQ_PAYLOAD_PATH,
-                content=b"payload",
-                headers=headers,
-            )
-
         assert unauthorized.status_code == 403
         assert s3_response.status_code == 200
         assert flush_response.status_code == 200
         assert zmq_flush_response.status_code == 200
         assert prepare_response.status_code == 200
-        assert zmq_response.status_code == 500
         assert receiver._refit_async_loop is not None
         receiver._apply_s3_manifest_payload.assert_awaited_once_with({"key": "key"})
-        receiver._apply_zmq_payload.assert_awaited_once()
         receiver._flush_queued_sparse_payloads.assert_called_once_with()
         receiver.flush_zmq_sparse_refit_relay.assert_called_once_with("transfer", 0)
         receiver._refit_collective_rpc.assert_called_once_with(
@@ -611,8 +587,12 @@ def test_async_sparse_refit_exposes_zmq_relay(monkeypatch) -> None:
 
     with _sparse_refit_receiver(async_engine=True, config=config) as receiver:
         receiver._worker.base_url = "http://10.0.0.1:8000/v1"
-        assert receiver.start_zmq_sparse_refit_relay(["http://receiver"]) == (
-            "tcp://10.0.0.1:12345"
+        assert receiver.start_zmq_sparse_refit_relay() == "tcp://10.0.0.1:12345"
+        server_type.assert_called_once_with(
+            receiver._apply_zmq_payload,
+            bind_address="tcp://0.0.0.0:12345",
+            api_key_env_var=None,
+            timeout_s=600.0,
         )
         server.start.assert_called_once_with()
         receiver.configure_zmq_sparse_refit_relay(
@@ -621,7 +601,6 @@ def test_async_sparse_refit_exposes_zmq_relay(monkeypatch) -> None:
         server.configure_tree.assert_called_once_with(
             ["tcp://10.0.0.1:12345", "tcp://10.0.0.2:12345"],
             own_address="tcp://10.0.0.1:12345",
-            local_refit_url="http://10.0.0.1:8000",
         )
         server.flush.return_value = {"ok": True, "payloads": 2}
         assert receiver.flush_zmq_sparse_refit_relay("transfer") == {

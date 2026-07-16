@@ -104,14 +104,6 @@ def integer_view(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(integer_dtype_for_element_size(tensor.element_size()))
 
 
-def _bytewise_diff_mask(current: torch.Tensor, baseline: torch.Tensor) -> torch.Tensor:
-    if current.shape != baseline.shape or current.dtype != baseline.dtype:
-        raise ValueError(
-            "Current tensor and baseline must have identical shape and dtype."
-        )
-    return integer_view(current) != integer_view(baseline)
-
-
 def encode_sparse_infos(
     infos: Iterable[SparseInfo],
 ) -> TensorPayload:
@@ -241,15 +233,23 @@ class DeltaCompressionTracker:
     def prepare_sparse_delta_payload(
         self, tensors: TensorBatch
     ) -> PreparedTensorPayload:
+        self._wait_for_baseline_commits()
         sparse_infos: list[SparseInfo] = []
+        pending_updates = {}
         changed_elements = total_elements = 0
-        for name, baseline, current, locations, current_values in self._changes(
-            tensors
-        ):
+        for name, tensor in tensors:
+            baseline = self.baseline.get(name)
+            if baseline is None:
+                raise RuntimeError(f"Sparse delta baseline is missing {name!r}.")
+            current = tensor.detach().cpu().contiguous()
             baseline_bits = integer_view(baseline).view(-1)
+            current_bits = integer_view(current).view(-1)
+            locations = current_bits.ne(baseline_bits).nonzero().view(-1)
             total_elements += current.numel()
             changed_elements += locations.numel()
             if locations.numel():
+                current_values = current_bits[locations]
+                pending_updates[name] = (locations, current_values)
                 operation: SparseOperation = (
                     "overwrite" if name in self.overwrite_names else self.encoding
                 )
@@ -267,30 +267,12 @@ class DeltaCompressionTracker:
                         operation,
                     )
                 )
+        with self._pending_updates_lock:
+            self._pending_updates.update(pending_updates)
         payload = encode_sparse_infos(sparse_infos)
         if self.verification_samples:
             self._add_verification_samples(payload[2])
         return payload, changed_elements, total_elements
-
-    def _changes(
-        self, tensors: Iterable[NamedTensor]
-    ) -> Iterable[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        self._wait_for_baseline_commits()
-        pending_updates = {}
-        for name, tensor in tensors:
-            baseline = self.baseline.get(name)
-            if baseline is None:
-                raise RuntimeError(f"Sparse delta baseline is missing {name!r}.")
-            current = tensor.detach().cpu().contiguous()
-            locations = (
-                _bytewise_diff_mask(current, baseline).view(-1).nonzero().view(-1)
-            )
-            values = integer_view(current).view(-1)[locations]
-            if locations.numel():
-                pending_updates[name] = (locations, values)
-            yield name, baseline, current, locations, values
-        with self._pending_updates_lock:
-            self._pending_updates.update(pending_updates)
 
     def _add_verification_samples(
         self,

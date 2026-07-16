@@ -16,7 +16,6 @@ import io
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -35,16 +34,12 @@ from nemo_rl.utils.weight_transfer_sparse_codec import (
     sparse_locations_for_item,
 )
 from nemo_rl.utils.weight_transfer_stream import (
+    SparseRefitTransport,
     download_s3_refit_payload,
     sparse_export_chunk_size,
     sparse_payload_checksum,
 )
 from nemo_rl.utils.weight_transfer_zmq import (
-    G_VLLM_REFIT_CHECKSUM_HEADER,
-    G_VLLM_REFIT_PAYLOAD_HEADER,
-    G_VLLM_REFIT_PRODUCER_HEADER,
-    G_VLLM_REFIT_TRANSFER_HEADER,
-    G_VLLM_REFIT_VERIFICATION_HEADER,
     ZmqSparseRefitClient,
     ZmqSparseRefitServer,
 )
@@ -81,23 +76,14 @@ class _BaselineNamesTracker:
         self.names.extend(name for name, _tensor in chunk)
 
 
-class _SparseTestTransport:
-    name = "zmq"
-    transfer_workers = 1
-
-    def __init__(self, send_payload) -> None:
-        self._send_payload = send_payload
-        self.cleaned = False
-
-    def send(self, body, payload_id, _verification_candidates):
-        return self._send_payload(body, payload_id)
-
-    def cleanup(self) -> None:
-        self.cleaned = True
-
-
 def _stream_sparse_test_payloads(tensors, send_payload):
-    transport = _SparseTestTransport(send_payload)
+    cleaned = []
+    transport = SparseRefitTransport(
+        name="zmq",
+        transfer_workers=1,
+        send=lambda body, payload_id, _candidates: send_payload(body, payload_id),
+        cleanup=lambda: cleaned.append(True),
+    )
     try:
         return weight_transfer_stream.stream_sparse_delta_payloads(
             tensors,
@@ -107,7 +93,7 @@ def _stream_sparse_test_payloads(tensors, send_payload):
             shard_count=1,
         )
     finally:
-        assert transport.cleaned
+        assert cleaned
 
 
 def _delta_tracker(encoding: str = "overwrite") -> DeltaCompressionTracker:
@@ -434,7 +420,13 @@ def test_sparse_stream_coalesces_export_chunks(monkeypatch) -> None:
         )
         return {"receiver": {}}
 
-    transport = _SparseTestTransport(send)
+    cleaned = []
+    transport = SparseRefitTransport(
+        "zmq",
+        1,
+        lambda body, payload_id, _candidates: send(body, payload_id),
+        lambda: cleaned.append(True),
+    )
     result = weight_transfer_stream.stream_sparse_delta_payloads(
         tensors,
         delta_tracker=tracker,
@@ -443,7 +435,7 @@ def test_sparse_stream_coalesces_export_chunks(monkeypatch) -> None:
         shard_count=1,
     )
 
-    assert transport.cleaned
+    assert cleaned
     assert result == {"payloads": 2, "changed_elements": 4, "total_elements": 4}
     payload_names = [
         [item["name"] for item in payloads[index][2]] for index in sorted(payloads)
@@ -485,8 +477,13 @@ def test_sparse_baseline_snapshots_only_owned_export_chunks(
 def test_sparse_stream_sends_only_owned_export_chunks(monkeypatch) -> None:
     monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
     sent = []
-    transport = _SparseTestTransport(
-        lambda _body, payload_id: sent.append(payload_id) or {"receiver": {}}
+    transport = SparseRefitTransport(
+        "zmq",
+        1,
+        lambda _body, payload_id, _candidates: (
+            sent.append(payload_id) or {"receiver": {}}
+        ),
+        lambda: None,
     )
 
     result = weight_transfer_stream.stream_sparse_delta_payloads(
@@ -759,39 +756,13 @@ def test_zmq_server_rejects_malformed_messages() -> None:
         (frames(protocol="other"), ValueError, "protocol"),
         (frames(api_key="wrong"), PermissionError, "authentication"),
         (frames(transfer_id=""), ValueError, "identity"),
+        (frames(checksum=""), ValueError, "identity"),
+        (frames(verification_candidates=-1), ValueError, "identity"),
     ):
         with pytest.raises(error, match=match):
             server._parse_data_message(message)
 
     assert server._parse_data_message(frames())[1] == ("transfer", 0, 1)
-
-
-def _receiver_server(received):
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            body = self.rfile.read(int(self.headers["content-length"]))
-            received.append(
-                ({key.lower(): value for key, value in self.headers.items()}, body)
-            )
-            ok = self.headers[G_VLLM_REFIT_CHECKSUM_HEADER] == sparse_payload_checksum(
-                body
-            )
-            response = json.dumps(
-                {"ok": ok, "receiver_total_s": 0.25, "error": "checksum mismatch"}
-            ).encode()
-            self.send_response(200 if ok else 500)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(response)))
-            self.end_headers()
-            self.wfile.write(response)
-
-        def log_message(self, *args):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, thread
 
 
 def _send_zmq_payload(
@@ -813,20 +784,28 @@ def _send_zmq_payload(
 def test_zmq_sparse_refit_relay_fans_out_and_rejects_corruption(monkeypatch) -> None:
     monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
     received = [[] for _ in range(4)]
-    receivers = [_receiver_server(items) for items in received]
-    urls = [f"http://127.0.0.1:{server.server_port}" for server, _ in receivers]
+
+    def apply(items):
+        def apply_payload(body, metadata):
+            if metadata["checksum"] != sparse_payload_checksum(body):
+                raise ValueError("checksum mismatch")
+            items.append((dict(metadata), body))
+            return {"ok": True, "receiver_total_s": 0.25}
+
+        return apply_payload
+
     relays = [
         ZmqSparseRefitServer(
-            urls,
+            apply(items),
             bind_address="tcp://127.0.0.1:*",
             api_key_env_var="NRL_TEST_REFIT_KEY",
             timeout_s=5.0,
         )
-        for _ in urls
+        for items in received
     ]
     addresses = [relay.start() for relay in relays]
-    for relay, address, url in zip(relays, addresses, urls, strict=True):
-        relay.configure_tree(addresses, own_address=address, local_refit_url=url)
+    for relay, address in zip(relays, addresses, strict=True):
+        relay.configure_tree(addresses, own_address=address)
     unauthenticated_client = ZmqSparseRefitClient(
         addresses[0],
         timeout_s=5.0,
@@ -853,14 +832,14 @@ def test_zmq_sparse_refit_relay_fans_out_and_rejects_corruption(monkeypatch) -> 
             assert flushed["receiver_total_s"] == 0.25
         assert [len(items) for items in received] == [1] * 4
         for items in received:
-            headers, posted_body = items[0]
+            metadata, posted_body = items[0]
             assert posted_body == body
-            assert headers[G_VLLM_REFIT_TRANSFER_HEADER] == "transfer-a"
-            assert headers[G_VLLM_REFIT_PRODUCER_HEADER] == "3"
-            assert headers[G_VLLM_REFIT_PAYLOAD_HEADER] == "7"
-            assert headers[G_VLLM_REFIT_CHECKSUM_HEADER] == checksum
-            assert headers[G_VLLM_REFIT_VERIFICATION_HEADER] == "2"
-            assert headers["x-nemo-rl-refit-key"] == "secret"
+            assert metadata["transfer_id"] == "transfer-a"
+            assert metadata["producer_id"] == 3
+            assert metadata["payload_id"] == 7
+            assert metadata["checksum"] == checksum
+            assert metadata["verification_candidates"] == 2
+            assert metadata["api_key"] == "secret"
 
         with pytest.raises(RuntimeError, match="already flushed"):
             _send_zmq_payload(client, 8, body)
@@ -872,7 +851,3 @@ def test_zmq_sparse_refit_relay_fans_out_and_rejects_corruption(monkeypatch) -> 
         client.close()
         for relay in relays:
             relay.close()
-        for server, thread in receivers:
-            server.shutdown()
-            thread.join(timeout=5.0)
-            server.server_close()

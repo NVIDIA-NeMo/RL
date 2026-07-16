@@ -18,7 +18,7 @@ import json
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -28,26 +28,18 @@ import zmq
 
 from nemo_rl.utils.weight_transfer_http import (
     merge_vllm_refit_metrics,
-    post_vllm_refit_endpoints,
     vllm_refit_api_key,
-    vllm_refit_endpoints,
 )
 from nemo_rl.utils.weight_transfer_sparse_codec import (
     DeltaCompressionTracker,
     NamedTensor,
 )
 from nemo_rl.utils.weight_transfer_stream import (
+    SparseRefitTransport,
     refit_env_int,
     sparse_payload_checksum,
     stream_sparse_delta_payloads,
 )
-
-G_VLLM_REFIT_ZMQ_PAYLOAD_PATH = "/nemo-rl/refit/zmq-payload"
-G_VLLM_REFIT_TRANSFER_HEADER = "x-nemo-rl-refit-transfer"
-G_VLLM_REFIT_PRODUCER_HEADER = "x-nemo-rl-refit-producer"
-G_VLLM_REFIT_PAYLOAD_HEADER = "x-nemo-rl-refit-payload"
-G_VLLM_REFIT_CHECKSUM_HEADER = "x-nemo-rl-refit-checksum"
-G_VLLM_REFIT_VERIFICATION_HEADER = "x-nemo-rl-refit-verification-candidates"
 
 _PROTOCOL = "nemo-rl-sparse-zmq-v1"
 _DATA = b"DATA"
@@ -170,75 +162,18 @@ class ZmqSparseRefitClient:
         self._socket.close()
 
 
-class _ZmqTransport:
-    name = "zmq"
-
-    def __init__(
-        self,
-        address: str,
-        *,
-        transfer_id: str,
-        timeout_s: float,
-        producer_id: int,
-        api_key: str | None,
-        transfer_workers: int,
-    ) -> None:
-        self._address = address
-        self._transfer_id = transfer_id
-        self._timeout_s = timeout_s
-        self._producer_id = producer_id
-        self._api_key = api_key
-        self.transfer_workers = transfer_workers
-        self._local = threading.local()
-
-    def send(
-        self, body: bytes, payload_id: int, verification_candidates: int
-    ) -> dict[str, Any]:
-        client = getattr(self._local, "client", None)
-        if client is None:
-            client = ZmqSparseRefitClient(
-                self._address,
-                timeout_s=self._timeout_s,
-                producer_id=self._producer_id,
-                api_key=self._api_key,
-            )
-            self._local.client = client
-        started = time.perf_counter()
-        reply = client.send_payload(
-            transfer_id=self._transfer_id,
-            payload_id=payload_id,
-            checksum=sparse_payload_checksum(body),
-            verification_candidates=verification_candidates,
-            body=body,
-        )
-        return {
-            "zmq_send_s": time.perf_counter() - started,
-            "receiver": reply,
-        }
-
-    def cleanup(self) -> None:
-        client = getattr(self._local, "client", None)
-        if client is not None:
-            client.close()
-            del self._local.client
-
-
 class ZmqSparseRefitServer:
-    """Bounded ROUTER relay that fans each compressed payload to all replicas."""
+    """Bounded ROUTER relay that applies locally and fans out through a tree."""
 
     def __init__(
         self,
-        refit_urls: Sequence[str],
+        apply_payload: Callable[[bytes, Mapping[str, Any]], dict[str, Any]],
         *,
         bind_address: str,
         api_key_env_var: str | None,
         timeout_s: float,
     ) -> None:
-        self._refit_endpoints = vllm_refit_endpoints(
-            refit_urls, G_VLLM_REFIT_ZMQ_PAYLOAD_PATH
-        )
-        if not self._refit_endpoints:
-            raise ValueError("ZeroMQ sparse refit requires receiver HTTP URLs.")
+        self._apply_payload = apply_payload
         self._bind_address = bind_address
         self._token = vllm_refit_api_key(api_key_env_var)
         self._timeout_s = timeout_s
@@ -250,15 +185,11 @@ class ZmqSparseRefitServer:
         self._payload_workers = refit_env_int(
             "NRL_REFIT_ZMQ_RELAY_PAYLOAD_WORKERS", default=16
         )
-        self._fanout_workers = refit_env_int(
-            "NRL_REFIT_ZMQ_RELAY_FANOUT_WORKERS",
-            default=len(self._refit_endpoints) * self._payload_workers,
-        )
         self._transfer_lock = threading.Lock()
         self._transfer_condition = threading.Condition(self._transfer_lock)
         self._transfers: dict[str, _RelayTransfer] = {}
         self._flush_results: dict[str, Future[dict[str, Any]]] = {}
-        self._tree: tuple[tuple[str, ...], int, str] | None = None
+        self._tree: tuple[tuple[str, ...], int] | None = None
         self._forward_local = threading.local()
         self._forward_clients: list[ZmqSparseRefitClient] = []
         self._payload_executor = ThreadPoolExecutor(
@@ -269,23 +200,15 @@ class ZmqSparseRefitServer:
             max_workers=refit_env_int("NRL_REFIT_ZMQ_RELAY_FORWARD_WORKERS", default=8),
             thread_name_prefix="nrl-zmq-forward",
         )
-        self._http_executor = ThreadPoolExecutor(
-            max_workers=self._fanout_workers,
-            thread_name_prefix="nrl-zmq-fanout",
-        )
 
     def configure_tree(
         self,
         relay_addresses: Sequence[str],
         *,
         own_address: str,
-        local_refit_url: str,
     ) -> None:
         addresses = tuple(dict.fromkeys(relay_addresses))
-        (local_endpoint,) = vllm_refit_endpoints(
-            [local_refit_url], G_VLLM_REFIT_ZMQ_PAYLOAD_PATH
-        )
-        self._tree = (addresses, addresses.index(own_address), local_endpoint)
+        self._tree = (addresses, addresses.index(own_address))
 
     def start(self) -> str:
         self._thread = threading.Thread(
@@ -317,10 +240,12 @@ class ZmqSparseRefitServer:
             completion = self._flush_results.get(transfer_id)
             if completion is None:
                 ready = self._transfer_condition.wait_for(
-                    lambda: len(
-                        self._transfers.get(transfer_id, _RelayTransfer()).checksums
-                    )
-                    >= expected_payloads,
+                    lambda: (
+                        len(
+                            self._transfers.get(transfer_id, _RelayTransfer()).checksums
+                        )
+                        >= expected_payloads
+                    ),
                     timeout=self._timeout_s,
                 )
                 if not ready:
@@ -371,29 +296,10 @@ class ZmqSparseRefitServer:
         body: bytes,
         metadata: Mapping[str, Any],
     ) -> dict[str, Any]:
-        headers = {
-            "content-type": "application/octet-stream",
-            G_VLLM_REFIT_TRANSFER_HEADER: str(metadata["transfer_id"]),
-            G_VLLM_REFIT_PRODUCER_HEADER: str(metadata["producer_id"]),
-            G_VLLM_REFIT_PAYLOAD_HEADER: str(metadata["payload_id"]),
-            G_VLLM_REFIT_CHECKSUM_HEADER: str(metadata["checksum"]),
-            G_VLLM_REFIT_VERIFICATION_HEADER: str(metadata["verification_candidates"]),
-        }
         started = time.perf_counter()
-        endpoints = self._refit_endpoints
-        if self._tree is not None:
-            endpoints = [self._tree[2]]
-        results = post_vllm_refit_endpoints(
-            endpoints,
-            body,
-            api_key=self._token,
-            timeout_s=self._timeout_s,
-            headers=headers,
-            executor=self._http_executor,
-        )
-        merged = merge_vllm_refit_metrics({}, results, maximum=True)
-        merged["receiver_relay_fanout_s"] = time.perf_counter() - started
-        return merged
+        result = self._apply_payload(body, metadata)
+        result["receiver_relay_fanout_s"] = time.perf_counter() - started
+        return result
 
     def _forward(
         self,
@@ -459,7 +365,14 @@ class ZmqSparseRefitServer:
         producer_id = int(metadata["producer_id"])
         payload_id = int(metadata["payload_id"])
         checksum = str(metadata["checksum"])
-        if not transfer_id or producer_id < 0 or payload_id < 0:
+        verification_candidates = int(metadata["verification_candidates"])
+        if (
+            not transfer_id
+            or producer_id < 0
+            or payload_id < 0
+            or not checksum
+            or verification_candidates < 0
+        ):
             raise ValueError("Invalid ZeroMQ sparse refit payload identity.")
         relay_root = metadata.get("relay_root")
         if relay_root is not None and (
@@ -508,7 +421,7 @@ class ZmqSparseRefitServer:
                                     )
                                 )
                                 if self._tree is not None:
-                                    addresses, own_index, _ = self._tree
+                                    addresses, own_index = self._tree
                                     relay_root = str(
                                         metadata.get("relay_root", addresses[own_index])
                                     )
@@ -560,7 +473,6 @@ class ZmqSparseRefitServer:
         finally:
             self._payload_executor.shutdown(wait=True, cancel_futures=True)
             self._forward_executor.shutdown(wait=True, cancel_futures=True)
-            self._http_executor.shutdown(wait=True, cancel_futures=True)
             for client in self._forward_clients:
                 client.close()
             socket.close()
@@ -582,16 +494,48 @@ def stream_sparse_delta_payloads_via_zmq(
     if not addresses:
         raise ValueError("At least one ZeroMQ sparse refit address is required.")
     address = addresses[shard_rank % len(addresses)]
+    api_key = vllm_refit_api_key(api_key_env_var)
+    local = threading.local()
+
+    def send(
+        body: bytes, payload_id: int, verification_candidates: int
+    ) -> dict[str, Any]:
+        client = getattr(local, "client", None)
+        if client is None:
+            client = ZmqSparseRefitClient(
+                address,
+                timeout_s=timeout_s,
+                producer_id=shard_rank,
+                api_key=api_key,
+            )
+            local.client = client
+        started = time.perf_counter()
+        reply = client.send_payload(
+            transfer_id=transfer_id,
+            payload_id=payload_id,
+            checksum=sparse_payload_checksum(body),
+            verification_candidates=verification_candidates,
+            body=body,
+        )
+        return {
+            "zmq_send_s": time.perf_counter() - started,
+            "receiver": reply,
+        }
+
+    def cleanup() -> None:
+        client = getattr(local, "client", None)
+        if client is not None:
+            client.close()
+            del local.client
+
     return stream_sparse_delta_payloads(
         iterator,
         delta_tracker=delta_tracker,
-        transport=_ZmqTransport(
-            address,
-            transfer_id=transfer_id,
-            timeout_s=timeout_s,
-            producer_id=shard_rank,
-            api_key=vllm_refit_api_key(api_key_env_var),
+        transport=SparseRefitTransport(
+            name="zmq",
             transfer_workers=refit_env_int("NRL_REFIT_ZMQ_SEND_WORKERS", default=4),
+            send=send,
+            cleanup=cleanup,
         ),
         shard_rank=shard_rank,
         shard_count=shard_count,
