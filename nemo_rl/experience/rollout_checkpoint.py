@@ -36,9 +36,10 @@ import shutil
 import struct
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 import numpy as np
 import torch
@@ -190,17 +191,27 @@ class PersistAck:
     already_existed: bool
 
 
+@dataclass
+class _GroupLockEntry:
+    """Reference-counted lock for one rollout group."""
+
+    lock: threading.Lock
+    users: int = 0
+
+
 class RolloutCheckpointStore:
     """Atomic filesystem store for completed siblings and attempt fences.
 
     One store instance is safe for concurrent calls in a process. Milestone 1
-    still requires exactly one writer actor per ``root_dir``; the lock is not a
-    distributed filesystem lock.
+    still requires exactly one writer actor per ``root_dir``; group-scoped
+    locks coordinate that actor's threads but are not distributed filesystem
+    locks.
     """
 
     def __init__(self, root_dir: str | os.PathLike[str]) -> None:
         self.root_dir = Path(root_dir)
-        self._lock = threading.RLock()
+        self._group_locks_guard = threading.Lock()
+        self._group_locks: dict[tuple[str, str], _GroupLockEntry] = {}
         _create_directory_durably(self.root_dir)
 
     def persist_completed(self, record: CompletedSiblingRecord) -> PersistAck:
@@ -210,7 +221,15 @@ class RolloutCheckpointStore:
         original acknowledgement. A different semantic payload for an existing
         logical key raises ``CheckpointConflictError``.
         """
-        with self._lock:
+        record_payload = _record_to_payload(record)
+        record_checksum = _semantic_checksum(record_payload)
+        payload_bytes = _serialize_payload(record_payload)
+        file_bytes = _encode_file(
+            payload_bytes=payload_bytes,
+            record_checksum=record_checksum,
+        )
+
+        with self._locked_group(record.run_id, record.group_id):
             min_attempt_id = self._load_fence_unlocked(record.run_id, record.group_id)
             if record.attempt_id < min_attempt_id:
                 raise StaleAttemptError(
@@ -221,8 +240,6 @@ class RolloutCheckpointStore:
             path = self._record_path(
                 record.run_id, record.group_id, record.generation_index
             )
-            record_payload = _record_to_payload(record)
-            record_checksum = _semantic_checksum(record_payload)
             if path.exists():
                 existing, existing_checksum = self._load_record_file(path)
                 if existing.logical_key != record.logical_key:
@@ -241,11 +258,6 @@ class RolloutCheckpointStore:
                     already_existed=True,
                 )
 
-            payload_bytes = _serialize_payload(record_payload)
-            file_bytes = _encode_file(
-                payload_bytes=payload_bytes,
-                record_checksum=record_checksum,
-            )
             self._atomic_write(path, file_bytes)
             committed, committed_checksum = self._load_record_file(path)
             if (
@@ -266,7 +278,7 @@ class RolloutCheckpointStore:
         self, work: RolloutWorkItem
     ) -> dict[int, CompletedSiblingRecord]:
         """Load and validate durable siblings reusable by ``work``."""
-        with self._lock:
+        with self._locked_group(work.run_id, work.group_id):
             group_dir = self._group_dir(work.run_id, work.group_id)
             if not group_dir.exists():
                 return {}
@@ -305,7 +317,7 @@ class RolloutCheckpointStore:
         _validate_path_component(group_id, "group_id")
         _validate_nonnegative_int(min_attempt_id, "min_attempt_id")
 
-        with self._lock:
+        with self._locked_group(run_id, group_id):
             current = self._load_fence_unlocked(run_id, group_id)
             if min_attempt_id <= current:
                 return current
@@ -326,7 +338,7 @@ class RolloutCheckpointStore:
         """Return the durable minimum accepted attempt for a group."""
         _validate_path_component(run_id, "run_id")
         _validate_path_component(group_id, "group_id")
-        with self._lock:
+        with self._locked_group(run_id, group_id):
             return self._load_fence_unlocked(run_id, group_id)
 
     def validate_attempt(self, run_id: str, group_id: str, attempt_id: int) -> None:
@@ -334,7 +346,7 @@ class RolloutCheckpointStore:
         _validate_path_component(run_id, "run_id")
         _validate_path_component(group_id, "group_id")
         _validate_nonnegative_int(attempt_id, "attempt_id")
-        with self._lock:
+        with self._locked_group(run_id, group_id):
             min_attempt_id = self._load_fence_unlocked(run_id, group_id)
             if attempt_id < min_attempt_id:
                 raise StaleAttemptError(
@@ -346,7 +358,7 @@ class RolloutCheckpointStore:
         """Idempotently delete every sibling and fence for a group."""
         _validate_path_component(run_id, "run_id")
         _validate_path_component(group_id, "group_id")
-        with self._lock:
+        with self._locked_group(run_id, group_id):
             group_dir = self._group_dir(run_id, group_id)
             if not group_dir.exists():
                 return
@@ -357,6 +369,26 @@ class RolloutCheckpointStore:
                 raise StorageUnavailableError(
                     f"failed to delete rollout checkpoint group {group_dir}"
                 ) from exc
+
+    @contextmanager
+    def _locked_group(self, run_id: str, group_id: str) -> Iterator[None]:
+        """Serialize operations for one group while allowing other groups."""
+        key = (run_id, group_id)
+        with self._group_locks_guard:
+            entry = self._group_locks.get(key)
+            if entry is None:
+                entry = _GroupLockEntry(lock=threading.Lock())
+                self._group_locks[key] = entry
+            entry.users += 1
+
+        try:
+            with entry.lock:
+                yield
+        finally:
+            with self._group_locks_guard:
+                entry.users -= 1
+                if entry.users == 0:
+                    del self._group_locks[key]
 
     def _validate_record_for_work(
         self,

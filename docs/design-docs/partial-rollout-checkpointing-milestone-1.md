@@ -363,6 +363,16 @@ Persistence is asynchronous across siblings, but durability remains explicit:
 5. the complete group is not published to TQ until every sibling has a durable
    acknowledgement.
 
+The writer runs synchronous store calls with bounded threaded concurrency.
+The store uses reference-counted locks keyed by `(run_id, group_id)`: writes
+for different prompt groups may encode and `fsync` concurrently, while a
+group's writes, fence updates, loads, and deletion remain ordered. Record
+encoding occurs before acquiring the group lock. Lock entries are removed when
+the last active or waiting operation leaves, so the registry does not grow with
+the number of completed groups. The writer must not be configured with
+unbounded concurrency; its thread limit and the GenerationWorker's pending-RPC
+limit are separate backpressure controls.
+
 If the writer is unavailable, GenerationWorker retains completed records in a
 bounded in-memory backfill buffer, replaces/reconnects to the writer when
 directed, and retries with the same idempotency keys. A record in this buffer
@@ -467,6 +477,7 @@ class RolloutCheckpointingConfig(BaseModel, extra="allow"):
     enabled: bool = False
     mode: Literal["completed_generations"] = "completed_generations"
     root_dir: Path | None = None
+    writer_concurrency: int = 8
     max_pending_writes: int = 64
     persist_timeout_s: float = 60.0
     max_persist_retries: int = 3

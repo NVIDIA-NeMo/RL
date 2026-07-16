@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -30,6 +32,7 @@ from nemo_rl.experience.rollout_checkpoint import (
     CompletedSiblingRecord,
     CorruptCheckpointError,
     IncompatibleCheckpointError,
+    PersistAck,
     RolloutCheckpointStore,
     RolloutWorkItem,
     StaleAttemptError,
@@ -56,6 +59,7 @@ def _work(*, attempt_id: int = 0, policy_version: int = 7) -> RolloutWorkItem:
 
 def _record(
     *,
+    group_id: str = "group-1",
     generation_index: int = 0,
     attempt_id: int = 0,
     reward: float = 1.5,
@@ -63,7 +67,7 @@ def _record(
     return CompletedSiblingRecord(
         schema_version=ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
         run_id="run-1",
-        group_id="group-1",
+        group_id=group_id,
         prompt_id="prompt-1",
         generation_index=generation_index,
         attempt_id=attempt_id,
@@ -125,6 +129,52 @@ def test_same_record_retry_returns_prior_ack(tmp_path) -> None:
     assert second.already_existed
     assert second.record_checksum == first.record_checksum
     assert second.path == first.path
+
+
+def test_same_record_concurrent_retry_is_idempotent(tmp_path) -> None:
+    store = RolloutCheckpointStore(tmp_path)
+    record = _record()
+    start = threading.Barrier(2)
+
+    def _persist() -> PersistAck:
+        start.wait(timeout=2)
+        return store.persist_completed(record)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        acknowledgements = [
+            future.result(timeout=5)
+            for future in (executor.submit(_persist), executor.submit(_persist))
+        ]
+
+    assert sorted(ack.already_existed for ack in acknowledgements) == [False, True]
+    assert acknowledgements[0].record_checksum == acknowledgements[1].record_checksum
+    assert store._group_locks == {}
+
+
+def test_different_groups_persist_concurrently(tmp_path, monkeypatch) -> None:
+    store = RolloutCheckpointStore(tmp_path)
+    writes_ready = threading.Barrier(2)
+    atomic_write = store._atomic_write
+
+    def _synchronized_atomic_write(path: Path, data: bytes) -> None:
+        writes_ready.wait(timeout=2)
+        atomic_write(path, data)
+
+    monkeypatch.setattr(store, "_atomic_write", _synchronized_atomic_write)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        acknowledgements = [
+            future.result(timeout=5)
+            for future in (
+                executor.submit(store.persist_completed, _record(group_id="group-1")),
+                executor.submit(store.persist_completed, _record(group_id="group-2")),
+            )
+        ]
+
+    assert {ack.logical_key[1] for ack in acknowledgements} == {
+        "group-1",
+        "group-2",
+    }
+    assert store._group_locks == {}
 
 
 def test_same_key_with_different_payload_is_a_conflict(tmp_path) -> None:
