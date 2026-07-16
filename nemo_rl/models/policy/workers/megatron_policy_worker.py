@@ -484,10 +484,12 @@ class MegatronPolicyWorkerImpl(
             return False
         return len(getattr(self.model, "remove_forward_pre_hook_handles", {})) > 0
 
-    def _disable_forward_pre_hook_until_next_train_step(self) -> None:
+    def _disable_forward_pre_hook_until_next_train_step(
+        self, *, param_sync: bool = False
+    ) -> None:
         assert isinstance(self.model, DistributedDataParallel)
         if self._forward_pre_hook_enabled():
-            self.disable_forward_pre_hook(param_sync=False)
+            self.disable_forward_pre_hook(param_sync=param_sync)
         model_config = get_model_config(self.model)
         self._first_train_step_param_sync_func = model_config.param_sync_func
         model_config.param_sync_func = None
