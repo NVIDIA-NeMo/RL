@@ -18,6 +18,76 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.utils.checkpoint import PretrainedCheckpointConfig
 
 
+def _patch_transformers_tokenizer_class_set():
+    """Undo the transformers block on deepseek_v3 tokenizers.
+
+    Root cause: transformers 5.4-5.11 lists "deepseek_v3" in two internal
+    registries -- MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS (a set) and
+    TOKENIZER_MAPPING_NAMES (a dict pinning it to "TokenizersBackend"). Together
+    they force the fast tokenizer backend and suppress trust_remote_code, so
+    AutoTokenizer can only load via a local tokenizer.json. Models like
+    Moonlight-16B-A3B ship no tokenizer.json (only tiktoken.model + a remote-code
+    TikTokenTokenizer), so offline loading fails.
+
+    Removing both entries restores the trust_remote_code / auto_map path.
+    discard/pop-with-default are no-ops when the entries are absent, so this is
+    safe on any transformers version in the currently-supported range.
+
+    Placed here (nemo_rl/models/policy/__init__.py) so it fires exactly once
+    per process the first time any policy code is imported -- covers the driver
+    (via nemo_rl.algorithms.grpo) and every policy worker (Megatron / DTensor /
+    DTensor v2 all import from nemo_rl.models.policy) without polluting nemo_rl
+    consumers that don't touch tokenizers.
+    """
+    import transformers
+    from packaging.version import Version as PkgVersion
+
+    # This whole patch exists only because Megatron-Bridge caps the transformers
+    # upper bound below 5.9 today, which forces us onto a transformers version
+    # that still has the deepseek_v3 tokenizer-blocklist bug. Once MBridge relaxes
+    # its transformers upper bound to >=5.12, we can drop this workaround.
+    # TODO: remove this patch (and the assert below) once MBridge relaxes its
+    # transformers upper bound past the deepseek_v3 fix (~transformers 5.12).
+    # https://github.com/NVIDIA-NeMo/RL/issues/2764
+    assert PkgVersion(transformers.__version__) < PkgVersion("5.12.0"), (
+        f"transformers {transformers.__version__} detected. "
+        "The deepseek_v3 tokenizer-blocklist patch was written for <5.12. "
+        "Check if the upstream fix now applies and remove this patch if so."
+    )
+
+    from transformers import AutoTokenizer
+    from transformers.models.auto.tokenization_auto import (
+        MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS,
+        TOKENIZER_MAPPING_NAMES,
+    )
+
+    _original_from_pretrained = AutoTokenizer.from_pretrained
+
+    def _patched_from_pretrained(pretrained_model_name_or_path, *args, **kwargs):
+        try:
+            # DSV3 goes here: the transformers blocklist routes its
+            # tokenizer.json around LlamaTokenizerFast.__init__'s Llama-specific
+            # post-processing, which would corrupt DSV3 special tokens.
+            return _original_from_pretrained(
+                pretrained_model_name_or_path, *args, **kwargs
+            )
+        except Exception:
+            # Moonlight goes here: it ships no tokenizer.json (only
+            # tiktoken.model + remote-code TikTokenTokenizer), so the blocklist
+            # prevents loading. Strip deepseek_v3 from the registries so
+            # trust_remote_code / auto_map takes over.
+            MODELS_WITH_INCORRECT_HUB_TOKENIZER_CLASS.discard("deepseek_v3")
+            TOKENIZER_MAPPING_NAMES.pop("deepseek_v3", None)
+            return _original_from_pretrained(
+                pretrained_model_name_or_path, *args, **kwargs
+            )
+
+    AutoTokenizer.from_pretrained = _patched_from_pretrained
+
+
+_patch_transformers_tokenizer_class_set()
+
+
 class LoRAConfigDisabled(TypedDict):
     enabled: Literal[False]
 
@@ -237,6 +307,21 @@ class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
 
 
+class MegatronCheckpointConfig(TypedDict, total=False):
+    """Checkpoint knobs passed through to Megatron Bridge CheckpointConfig."""
+
+    # Offload disk writes to a persistent background worker so save_checkpoint
+    # returns after D2H staging.
+    async_save: bool
+    # Skip metadata recomputation after the first two saves when the sharded
+    # state structure is constant across steps.
+    ckpt_assume_constant_structure: bool
+    # Field names match megatron.bridge CheckpointConfig (ckpt_ prefix).
+    ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
+    ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
+    ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+
+
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
@@ -325,6 +410,8 @@ class MegatronConfig(TypedDict):
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
+    # Megatron-specific checkpointing knobs (async save, parallel I/O, etc.)
+    checkpoint: NotRequired[MegatronCheckpointConfig]
     gradient_accumulation_fusion: NotRequired[bool]
     # Enable fused weighted squared ReLU when the architecture supports it.
     use_fused_weighted_squared_relu: NotRequired[bool]

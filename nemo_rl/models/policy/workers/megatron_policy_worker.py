@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -597,6 +598,10 @@ class MegatronPolicyWorkerImpl(
             saved_extra_state = None
             reenable_forward_pre_hook_after_eval = False
 
+        torch.distributed.barrier()  # pragma: no cover
+        torch.cuda.synchronize()  # pragma: no cover
+        _train_t0 = time.perf_counter()  # pragma: no cover
+
         with ctx:
             all_mb_metrics = []
             losses = []
@@ -722,8 +727,15 @@ class MegatronPolicyWorkerImpl(
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    # Megatron-LM PR #4116 replaced the optimizer.mtp_grad_norm attribute
+                    # with a per-group dict populated during gradient clipping. Value is
+                    # None when clip_grad == 0 or this rank owns no MTP-tagged params
+                    # (MTP params are tagged only when mtp_detach_heads=True, on the last
+                    # pipeline stage). grad_norms_by_group always exists after step().
+                    mtp_grad_norm = self.optimizer.grad_norms_by_group.get("mtp")
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
+                    mtp_grad_norm = None
 
                 pg_collection = get_pg_collection(self.model)
 
@@ -739,6 +751,11 @@ class MegatronPolicyWorkerImpl(
                 )
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
                     num_zeros_in_grad, mp_group=pg_collection.mp
+                )
+                # Max-reduce across the model-parallel group so every rank (including
+                # non-last-PP-stage ranks, where it is None) has the MTP grad norm.
+                mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
+                    mtp_grad_norm, mp_group=pg_collection.mp
                 )
                 if (
                     not eval_mode
@@ -799,6 +816,10 @@ class MegatronPolicyWorkerImpl(
             # accumulation starts from a clean shared param/grad buffer.
             self._disable_forward_pre_hook_until_next_train_step()
 
+        torch.distributed.barrier()  # pragma: no cover
+        torch.cuda.synchronize()  # pragma: no cover
+        metrics_train_elapsed = time.perf_counter() - _train_t0  # pragma: no cover
+
         if not eval_mode:
             # Step LR scheduler once per train() call, not per global batch.
             # Megatron's OptimizerParamScheduler.step takes an `increment` in
@@ -821,6 +842,7 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
@@ -837,7 +859,33 @@ class MegatronPolicyWorkerImpl(
                 metrics["moe_metrics"] = moe_metrics
         # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
         # pull an unpicklable torch ConfigModuleInstance into the worker actor).
-        self._collect_mtp_metrics(metrics)
+        self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
+
+        # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
+        # samples but each packed sequence spans max_total_sequence_length tokens,
+        # so flops_per_sample * gbs would overcount by the packing factor.
+        if not self.cfg.get("sequence_packing", {}).get("enabled", False):
+            try:  # pragma: no cover
+                from megatron.bridge.training.utils import flop_utils as _mb_flop_utils
+
+                # cfg.model.seq_length is set from max_position_embeddings (model max context)
+                # via CONFIG_MAPPING, not from max_total_sequence_length. Override it with the
+                # actual training sequence length so FLOPs are not inflated.
+                _orig_seq = self.mcore_state.cfg.model.seq_length
+                self.mcore_state.cfg.model.seq_length = self.cfg[
+                    "max_total_sequence_length"
+                ]
+                try:
+                    flops_per_sample = _mb_flop_utils.num_floating_point_operations(
+                        self.mcore_state.cfg, batch_size=1
+                    )
+                finally:
+                    self.mcore_state.cfg.model.seq_length = _orig_seq
+
+                metrics["total_flops"] = flops_per_sample * gbs * num_global_batches
+                metrics["num_ranks"] = torch.distributed.get_world_size()
+            except Exception as e:
+                warnings.warn(f"Failed to compute FLOPs for MFU reporting: {e}")
         self.timer.stop("train")
         return metrics
 
@@ -1690,12 +1738,26 @@ class MegatronPolicyWorkerImpl(
 
         return refit_param_info_hf
 
-    def _collect_mtp_metrics(self, metrics: dict[str, Any]) -> None:
+    def _collect_mtp_metrics(
+        self,
+        metrics: dict[str, Any],
+        total_num_microbatches: int,
+        mtp_grad_norm: Optional[float],
+    ) -> None:
         """Add Multi-Token Prediction metrics to ``metrics`` when MTP is enabled.
 
         get_mtp_metrics is imported lazily (not a module global) so cloudpickle
         does not pull an unpicklable torch ConfigModuleInstance into the worker
         actor's serialization.
+
+        Args:
+            metrics: Metrics dict to populate with MTP metrics (under "mtp_metrics").
+            total_num_microbatches: Microbatches accumulated this step. The MTP loss
+                logging helper sums the per-microbatch loss without dividing, so we pass
+                1/total_num_microbatches to recover the mean (mirroring the MoE path).
+            mtp_grad_norm: The MTP parameter group's gradient norm, already reduced across
+                the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
+                mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
         """
         mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
         if mtp_num_layers is not None and mtp_num_layers > 0:
@@ -1704,8 +1766,13 @@ class MegatronPolicyWorkerImpl(
             # MTP layers live only on the last pipeline stage, so the tracker is
             # populated there alone. Broadcast to all stages so downstream metric
             # aggregation (which reads rank 0's results) sees them when PP > 1.
-            mtp_metrics = get_mtp_metrics()
+            mtp_loss_scale = 1.0 / max(1, total_num_microbatches)
+            mtp_metrics = get_mtp_metrics(loss_scale=mtp_loss_scale)
             mtp_metrics = broadcast_loss_metrics_from_last_stage(mtp_metrics)
+            # mtp_grad_norm is already MP-reduced (same value on every rank); expose it
+            # under the "mtp/" namespace so it logs as train/mtp/grad_norm.
+            if mtp_grad_norm is not None:
+                mtp_metrics["grad_norm"] = float(mtp_grad_norm)
             if mtp_metrics:
                 metrics["mtp_metrics"] = mtp_metrics
 
@@ -2145,6 +2212,13 @@ class MegatronPolicyWorkerImpl(
     ):
         """Save a training checkpoint.
 
+        With async_save=True, this method returns after D2H staging. The actual
+        disk write continues in a background persistent worker process. Callers
+        must call finalize_async_save() before renaming the directory or starting
+        another save.
+
+        With async_save=False (default), this blocks until the write is complete.
+
         Args:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
@@ -2217,6 +2291,18 @@ class MegatronPolicyWorkerImpl(
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def finalize_async_save(self):
+        """Block until the in-flight async write completes and run finalize_fns.
+
+        Safe to call when async_save is disabled (no-op).
+        Does NOT terminate the persistent worker — it stays alive for the next save.
+        """
+        maybe_finalize_async_save(
+            self.mcore_state,
+            ckpt_cfg=self.mcore_state.cfg.checkpoint,
+            blocking=True,
+        )
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.
@@ -2482,7 +2568,13 @@ class MegatronPolicyWorkerImpl(
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"),
+    # max_concurrency=1 is load-bearing: the split-API state machine
+    # (_train_step_state mutations in begin/microbatch/finish/abort) is not
+    # thread-safe. SingleController submits train_microbatches_from_meta
+    # without awaiting and relies on actor-mailbox serialization. Do not
+    # change without auditing _train_step_state mutation sites.
+    max_concurrency=1,
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass

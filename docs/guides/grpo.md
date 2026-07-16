@@ -143,7 +143,7 @@ The class must be importable — install it as a package or add its
 parent directory to `PYTHONPATH` before launching training.
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
-[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
+[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [OpenR1-Math-220k](../../nemo_rl/data/datasets/response_datasets/openr1_math.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
 ```python
 # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
@@ -631,7 +631,7 @@ grpo:
     normalize_rewards: true
     use_leave_one_out_baseline: false
 ```
-Note that this method only has an effect when training involve more than one reward function.
+Note that this method only has an effect when training involves more than one reward function.
 
 ## LoRA Configuration
 
