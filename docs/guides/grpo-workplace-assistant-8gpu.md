@@ -12,6 +12,8 @@ legacy-versus-direct comparisons with the eight-GPU Workplace Assistant
 recipe, and the measured results of that comparison on the synchronous GRPO
 path.
 
+Design Overview: https://terryk.gitlab-master-pages.nvidia.com/nemo-html/pthombre/tq-blackbox-rollout-lifecycle.html
+
 ## What changes
 
 The legacy synchronous TransferQueue path returns complete token-bearing
