@@ -1138,7 +1138,9 @@ def ppo_train(
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(policy, policy_generation, colocated_inference)
             if not colocated_inference:
-                # Free the shared training GPUs for value.
+                # Colocated refit offloads policy inside
+                # `refit_policy_generation`. Do it here so the value
+                # model can reuse the training GPUs.
                 policy.offload_to_cpu()
             POLICY_GENERATION_STALE = False
         else:
@@ -1234,7 +1236,9 @@ def ppo_train(
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         if not colocated_inference:
-                            # Free the shared training GPUs for value.
+                            # Colocated refit offloads policy inside
+                            # `refit_policy_generation`. Do it here so the value
+                            # model can reuse the training GPUs.
                             with timer.time("policy_offload_after_refit"):
                                 policy.offload_to_cpu()
                         POLICY_GENERATION_STALE = False
@@ -1551,6 +1555,9 @@ def ppo_train(
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         if not colocated_inference:
+                            # Colocated refit offloads policy inside
+                            # `refit_policy_generation`. Do it here so the value
+                            # model can reuse the training GPUs.
                             with timer.time("policy_offload_after_refit"):
                                 policy.offload_to_cpu()
                         POLICY_GENERATION_STALE = False
