@@ -1,0 +1,5 @@
+{
+  "name": "nemo-rl",
+  "description": "NeMo-RL repository skills (code style, testing, config conventions, GPU leasing, launching recipes, PR review) for Regent agents working on this repo.",
+  "version": "0.1.0"
+}
