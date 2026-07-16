@@ -83,7 +83,9 @@ class BaseVllmGenerationWorker:
 
     @staticmethod
     def configure_worker(
-        num_gpus: int | float, bundle_indices: Optional[tuple[int, list[int]]] = None
+        num_gpus: int | float,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+        num_gpus_per_node: Optional[int] = None,
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         """Provides complete worker configuration for vLLM tensor and pipeline parallelism.
 
@@ -93,6 +95,9 @@ class BaseVllmGenerationWorker:
         Args:
             num_gpus: Original GPU allocation for this worker based on the placement group
             bundle_indices: Tuple of (node_idx, local_bundle_indices) for parallelism (if applicable)
+            num_gpus_per_node: Number of GPUs per node in the cluster. Used to map a
+                bundle id to a node-local engine slot when deriving VLLM_PORT. When
+                None, the original per-engine index is used unchanged.
 
         Returns:
             tuple with complete worker configuration:
@@ -136,16 +141,40 @@ class BaseVllmGenerationWorker:
                 + f"_{seed}"
             )
 
-            # Give each vLLM engine a deterministic starting port for TP/DP
-            # rendezvous.  vLLM's _get_open_port() reads VLLM_PORT and
-            # auto-increments on collision, so the per-engine spacing
-            # provides headroom.  See the port layout in virtual_cluster.py.
-            if len(local_bundle_indices) == 1:
-                engine_index_on_node = local_bundle_indices[0]
-            else:
-                engine_index_on_node = local_bundle_indices[0] // len(
-                    local_bundle_indices
+            # Give each vLLM engine a deterministic starting VLLM_PORT for the
+            # TP/DP rendezvous. vLLM's _get_open_port() reads VLLM_PORT and
+            # increments it on collision, so spacing engines by
+            # DEFAULT_VLLM_PORTS_PER_ENGINE leaves headroom. See the port layout
+            # in virtual_cluster.py.
+            #
+            # The port offset must be a node-local slot. The first entry of
+            # local_bundle_indices is a bundle id within the placement group.
+            # When a single engine spans more than one node (model parallel size
+            # larger than the per-node GPU count), that id can exceed the per-node
+            # GPU count, so dividing it by mp_size gives an offset that grows with
+            # the number of engines and can push VLLM_PORT into the OS ephemeral
+            # range, causing address-in-use errors. When num_gpus_per_node is
+            # known, reduce the id modulo the per-node GPU count to get a
+            # node-local slot. When it is not provided, use the original index,
+            # which is correct for engines that fit within one node.
+            mp_size = len(local_bundle_indices)
+            if num_gpus_per_node is None:
+                engine_index_on_node = (
+                    local_bundle_indices[0]
+                    if mp_size == 1
+                    else local_bundle_indices[0] // mp_size
                 )
+            elif mp_size > num_gpus_per_node:
+                # The engine spans several nodes. Each engine's rank-0 process is
+                # on a different node, so every such engine can use node-local
+                # slot 0 without colliding.
+                engine_index_on_node = 0
+            elif mp_size == 1:
+                engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
+            else:
+                engine_index_on_node = (
+                    local_bundle_indices[0] % num_gpus_per_node
+                ) // mp_size
             env_vars["VLLM_PORT"] = str(
                 DEFAULT_VLLM_PORT_RANGE_LOW
                 + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE

@@ -27,12 +27,17 @@ from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_LOW,
     DEFAULT_MASTER_PORT_RANGE_HIGH,
     DEFAULT_MASTER_PORT_RANGE_LOW,
+    DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH,
+    DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW,
+    DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
     PY_EXECUTABLES,
     RayVirtualCluster,
     ResourceInsufficientError,
     _bind_socket_in_range,
+    _get_free_consecutive_ports_local,
     _get_free_port_local,
     _get_node_ip_and_free_port,
 )
@@ -322,6 +327,80 @@ class TestGetFreePortLocal:
         assert len(ports) > 1
 
 
+class TestGetFreeConsecutivePortsLocal:
+    """Tests for _get_free_consecutive_ports_local()."""
+
+    def test_single_port_in_range(self):
+        port = _get_free_consecutive_ports_local(14000, 14100, consecutive=1)
+        assert 14000 <= port < 14100
+
+    def test_returns_bindable_contiguous_block(self):
+        n = 5
+        base = _get_free_consecutive_ports_local(14100, 14300, consecutive=n)
+        assert 14100 <= base
+        assert base + n - 1 < 14300
+        # All n ports are simultaneously bindable.
+        socks = []
+        try:
+            for offset in range(n):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                socks.append(s)
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_start_port_below_low_is_clamped(self):
+        base = _get_free_consecutive_ports_local(
+            14300, 14400, consecutive=1, start_port=1000
+        )
+        assert base >= 14300
+
+    def test_cursor_advance_yields_non_overlapping_blocks(self):
+        n = 3
+        first = _get_free_consecutive_ports_local(14400, 14600, consecutive=n)
+        second = _get_free_consecutive_ports_local(
+            14400, 14600, consecutive=n, start_port=first + n
+        )
+        assert second >= first + n
+
+    def test_raises_when_range_exhausted(self):
+        # A 3-wide range cannot fit a block of 5.
+        with pytest.raises(RuntimeError, match="consecutive free ports"):
+            _get_free_consecutive_ports_local(14600, 14603, consecutive=5)
+
+    def test_port_is_reusable_after_return(self):
+        base = _get_free_consecutive_ports_local(14700, 14800, consecutive=2)
+        # Sockets are closed before return, so the block can be re-bound.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", base))
+
+    def test_raises_when_start_port_at_or_above_high(self):
+        with pytest.raises(RuntimeError, match="consecutive free ports"):
+            _get_free_consecutive_ports_local(
+                14850, 14900, consecutive=1, start_port=15000
+            )
+
+    def test_block_fits_exactly_against_high_boundary(self):
+        # high is exclusive: a block whose last port is high-1 must still fit.
+        n = 4
+        base = _get_free_consecutive_ports_local(14900, 14900 + n, consecutive=n)
+        assert base == 14900
+        socks = []
+        try:
+            for offset in range(n):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                socks.append(s)
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_rejects_non_positive_consecutive(self):
+        with pytest.raises(AssertionError, match="consecutive must be >= 1"):
+            _get_free_consecutive_ports_local(14950, 15000, consecutive=0)
+
+
 class TestRayVirtualClusterPortRange:
     """Tests for port range propagation in RayVirtualCluster."""
 
@@ -373,6 +452,56 @@ class TestVllmPortAssignment:
         )
         assert env_vars["VLLM_PORT"] == str(expected_port)
 
+    @pytest.mark.parametrize(
+        "num_gpus_per_node,bundle_indices,expected_slot",
+        [
+            # expected_slot is the node-local engine index; the port is
+            # DEFAULT_VLLM_PORT_RANGE_LOW + slot * DEFAULT_VLLM_PORTS_PER_ENGINE.
+            # Deriving it from the constants keeps this test correct if the base
+            # of the vLLM port band changes.
+            #
+            # With 8 GPUs per node, engines that fit on one node give the same
+            # slot as the original index, since the bundle id modulo 8 is
+            # unchanged within a node.
+            (8, (0, [0]), 0),
+            (8, (0, [7]), 7),
+            (8, (0, [4, 5, 6, 7]), 1),  # (4 % 8) // 4
+            (8, (0, [0, 1, 2, 3, 4, 5, 6, 7]), 0),  # 8-GPU engine
+            # A model-parallel size larger than the per-node GPU count means the
+            # engine spans several nodes. Each engine's rank-0 process is on a
+            # different node, so they all use node-local slot 0. The original
+            # index would instead climb (the second engine gives 16 // 16 = 1,
+            # and so on).
+            (8, (0, list(range(16))), 0),  # 16-GPU engine across 2 nodes
+            (8, (0, list(range(16, 32))), 0),  # second such engine
+            (8, (0, list(range(32, 48))), 0),  # third such engine
+            # 4 GPUs per node, for example GB200 NVL72.
+            (4, (0, [3]), 3),  # 3 % 4
+            (4, (0, [0, 1, 2, 3]), 0),  # 4-GPU engine
+            (4, (0, list(range(8, 16))), 0),  # 8-GPU engine across 2 nodes
+        ],
+    )
+    def test_vllm_port_assignment_respects_num_gpus_per_node(
+        self, num_gpus_per_node, bundle_indices, expected_slot
+    ):
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORT_RANGE_LOW,
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=bundle_indices,
+            num_gpus_per_node=num_gpus_per_node,
+        )
+        expected_port = (
+            DEFAULT_VLLM_PORT_RANGE_LOW + expected_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
+        )
+        assert env_vars["VLLM_PORT"] == str(expected_port)
+
     def test_no_vllm_port_without_bundle_indices(self):
         from nemo_rl.models.generation.vllm.vllm_worker import (
             BaseVllmGenerationWorker,
@@ -397,5 +526,22 @@ def test_default_port_ranges_ordered_and_below_ephemeral_floor():
         DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
         < EPHEMERAL_FLOOR
     )
+    # SGLang router / Prometheus carve-outs live inside the vLLM band (only one
+    # rollout backend runs at a time), stay above the 8-engine vLLM high-water
+    # mark and the Ray dashboard (8265), and sit below the ephemeral floor.
+    assert (
+        DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
+        < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    )
+    assert 8265 < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    assert DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW < DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH
+    assert (
+        DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
+    )
+    assert (
+        DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
+        < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH
+    )
+    assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
     # Avoid privileged ports (<1024).
     assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
