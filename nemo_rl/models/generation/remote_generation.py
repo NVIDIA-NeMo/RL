@@ -13,18 +13,11 @@
 # limitations under the License.
 """RemoteGeneration — GenerationInterface wrapper for disaggregated vLLM.
 
-Two modes:
-
-  Co-located (``generation`` provided):
-    Wraps a VllmGeneration instance in the SAME Ray cluster. All calls delegate
-    to the underlying VllmGeneration; a GenerationRouter runs alongside
-    for external HTTP clients (e.g. NemoGym).
-
-  HTTP-only (``generation=None`` + ``server_url``):
-    VllmGeneration lives in a SEPARATE Ray cluster (or standalone process).
-    The unified GenerationRouter at ``server_url`` exposes both the data plane
-    (``/v1/completions`` with cordon + replay) and the control plane (weight
-    sync, lifecycle, refit gate, metrics) on one port.
+HTTP-only mode (``server_url``):
+  VllmGeneration lives in a SEPARATE Ray cluster (or standalone process).
+  The unified GenerationRouter at ``server_url`` exposes both the data plane
+  (``/v1/completions`` with cordon + replay) and the control plane (weight
+  sync, lifecycle, refit gate, metrics) on one port.
 """
 
 from __future__ import annotations
@@ -213,26 +206,26 @@ def decide_collective_sync(
 
 
 class RemoteGeneration(GenerationInterface):
-    """GenerationInterface wrapper that supports direct delegation or HTTP-only mode."""
+    """GenerationInterface wrapper for HTTP-only disaggregated vLLM.
+
+    VllmGeneration lives in a SEPARATE Ray cluster (or standalone process).
+    The unified GenerationRouter at ``server_url`` exposes both the data plane
+    (``/v1/completions`` with cordon + replay) and the control plane (weight
+    sync, lifecycle, refit gate, metrics) on one port.
+    """
 
     def __init__(
         self,
-        generation: Optional[GenerationInterface],
         server_url: str,
         config: dict,
     ):
-        self._generation = generation
         # The unified GenerationRouter exposes data plane + control plane on
         # one port. Both /v1/completions and /init_collective live here.
         self.server_url = server_url.rstrip("/")
-        self._http_mode = generation is None
 
         # Per-step cache for the consolidated /step_metrics_snapshot fetch.
         # Train side calls get_step_metrics_snapshot() multiple times around
-        if self._http_mode:
-            self.cfg = self._fetch_remote_config(config)
-        else:
-            self.cfg = dict(generation.cfg)
+        self.cfg = self._fetch_remote_config(config)
 
         # Merge caller-provided overrides
         for key in (
@@ -247,27 +240,20 @@ class RemoteGeneration(GenerationInterface):
             if key in config:
                 self.cfg[key] = config[key]
 
-        # In HTTP mode, /v1/{completions,chat/completions} go to the
-        # unified router (which proxies to a healthy shard with replay on
-        # failure). The shard URLs are still pulled once for diagnostics
-        # and so colocated NemoGym (in the train cluster) can see them.
-        self._shard_urls: list[str] = []
-        if self._http_mode:
-            self._shard_urls = self._fetch_shard_urls()
-            print(
-                f"  ✓ Disagg HTTP routing via unified router {self.server_url} "
-                f"({len(self._shard_urls)} backing DP shard(s))",
-                flush=True,
-            )
+        # /v1/{completions,chat/completions} go to the unified router (which
+        # proxies to a healthy shard with replay on failure). The shard URLs
+        # are pulled once for diagnostics and so colocated NemoGym (in the
+        # train cluster) can see them.
+        self._shard_urls: list[str] = self._fetch_shard_urls()
+        print(
+            f"  ✓ Disagg HTTP routing via unified router {self.server_url} "
+            f"({len(self._shard_urls)} backing DP shard(s))",
+            flush=True,
+        )
 
-        # NemoGym round-robins across whatever URLs we publish here. In
-        # HTTP-only mode we publish a single URL = the router (transparent
-        # cordon + replay for gym too). Co-located mode points gym at the
-        # local router's /v1 surface.
-        if self._http_mode:
-            self.dp_openai_server_base_urls = [f"{self.server_url}/v1"]
-        else:
-            self.dp_openai_server_base_urls = [f"{self.server_url}/v1"]
+        # NemoGym round-robins across whatever URLs we publish here. Publish a
+        # single URL = the router (transparent cordon + replay for gym too).
+        self.dp_openai_server_base_urls = [f"{self.server_url}/v1"]
 
     def _fetch_shard_urls(self) -> list[str]:
         """Fetch per-shard vLLM URLs from the gen server."""
@@ -435,14 +421,6 @@ class RemoteGeneration(GenerationInterface):
         state). Safe to call on the first refit too — sets
         ``_last_synced_world_size`` from the initial init_collective.
         """
-        # Only meaningful in HTTP-only disagg mode. Co-located /
-        # delegating-RemoteGeneration use the wrapped instance directly.
-        if not self._http_mode:
-            inner = self._generation
-            if inner is not None and hasattr(inner, "ensure_collective_synced"):
-                inner.ensure_collective_synced(policy)
-            return
-
         from nemo_rl.models.generation.ft_constants import (
             COLLECTIVE_SYNC_MAX_ATTEMPTS,
             COLLECTIVE_SYNC_RENDEZVOUS_TIMEOUT_S,
@@ -671,8 +649,6 @@ class RemoteGeneration(GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        if not self._http_mode:
-            return self._generation.generate(data, greedy)
         return asyncio.run(self._generate_json_completions(data, greedy))
 
     async def _generate_json_completions(
@@ -802,11 +778,6 @@ class RemoteGeneration(GenerationInterface):
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        if not self._http_mode:
-            async for result in self._generation.generate_async(data, greedy):
-                yield result
-            return
-
         result = await self._generate_json_completions(data, greedy)
         batch_size = result["output_ids"].shape[0]
         for i in range(batch_size):
@@ -826,12 +797,8 @@ class RemoteGeneration(GenerationInterface):
         # Cache the world size we last rendezvoused at so
         # ensure_collective_synced can skip work in steady state.
         self._last_synced_world_size = world_size
-        if not self._http_mode:
-            return self._generation.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
-            )
 
-        # HTTP mode: dispatch as a Ray task so it returns a future.
+        # Dispatch as a Ray task so it returns a future.
         # The training side calls ray.get(futures_train + futures_inference)
         # and both sides must enter NCCL rendezvous simultaneously.
         url = f"{self.server_url}/init_collective"
@@ -856,9 +823,6 @@ class RemoteGeneration(GenerationInterface):
         return [ref]
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
-        if not self._http_mode:
-            return self._generation.update_weights_from_collective()
-
         return [
             _http_call_blocking.remote(
                 f"{self.server_url}/update_weights_from_collective",
@@ -875,9 +839,6 @@ class RemoteGeneration(GenerationInterface):
         world size. Not called on the steady-state path — the comm is
         long-lived across refits.
         """
-        if not self._http_mode:
-            return self._generation.reset_collective()
-
         return [
             _http_call_blocking.remote(
                 f"{self.server_url}/reset_collective",
@@ -885,26 +846,16 @@ class RemoteGeneration(GenerationInterface):
         ]
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
-        if not self._http_mode:
-            return self._generation.prepare_for_generation(*args, **kwargs)
-
         resp = requests.post(f"{self.server_url}/prepare_for_generation", timeout=_HTTP_TIMEOUT)
         resp.raise_for_status()
         return resp.json().get("success", False)
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        if not self._http_mode:
-            return self._generation.finish_generation(*args, **kwargs)
-
         resp = requests.post(f"{self.server_url}/finish_generation", timeout=_HTTP_TIMEOUT)
         resp.raise_for_status()
         return resp.json().get("success", False)
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        if not self._http_mode:
-            self._generation.prepare_refit_info(state_dict_info)
-            return
-
         buf = io.BytesIO()
         torch.save(state_dict_info, buf)
         resp = requests.post(
@@ -916,38 +867,24 @@ class RemoteGeneration(GenerationInterface):
         resp.raise_for_status()
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
-        if not self._http_mode:
-            return self._generation.update_weights_via_ipc_zmq()
         raise NotImplementedError("update_weights_via_ipc_zmq not supported in HTTP mode")
 
     def invalidate_kv_cache(self) -> bool:
-        if not self._http_mode:
-            return self._generation.invalidate_kv_cache()
-
         resp = requests.post(f"{self.server_url}/invalidate_kv_cache", timeout=_HTTP_TIMEOUT)
         resp.raise_for_status()
         return resp.json().get("success", False)
 
     @property
     def requires_kv_scale_sync(self) -> bool:
-        if not self._http_mode:
-            return getattr(self._generation, "requires_kv_scale_sync", False)
         return False
 
     def clear_logger_metrics(self) -> None:
-        if not self._http_mode:
-            self._generation.clear_logger_metrics()
-            return
-
         try:
             requests.post(f"{self.server_url}/clear_logger_metrics", timeout=30)
         except requests.RequestException:
             pass
 
     def get_logger_metrics(self) -> dict[str, Any]:
-        if not self._http_mode:
-            return self._generation.get_logger_metrics()
-
         try:
             resp = requests.get(f"{self.server_url}/get_logger_metrics", timeout=30)
             resp.raise_for_status()
@@ -956,22 +893,12 @@ class RemoteGeneration(GenerationInterface):
             return {}
 
     def snapshot_step_metrics(self) -> None:
-        if not self._http_mode:
-            if hasattr(self._generation, "snapshot_step_metrics"):
-                self._generation.snapshot_step_metrics()
-            return
-
         try:
             requests.post(f"{self.server_url}/snapshot_step_metrics", timeout=30)
         except requests.RequestException:
             pass
 
     def get_step_metrics(self) -> dict[str, float]:
-        if not self._http_mode:
-            if hasattr(self._generation, "get_step_metrics"):
-                return self._generation.get_step_metrics()
-            return {}
-
         try:
             resp = requests.get(f"{self.server_url}/get_step_metrics", timeout=30)
             resp.raise_for_status()

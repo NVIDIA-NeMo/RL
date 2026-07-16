@@ -397,8 +397,12 @@ class GenerationRouter:
 
             # Heavy work: vLLM worker init (~1-2min for 4B). Run on a thread so
             # the asyncio loop stays responsive (health poll, /metrics, /shards).
+            target_node_id = (self._last_fault_event or {}).get("node_id") or None
+
             def _do_add() -> tuple[list[Any], Any, list[int], Optional[str]]:
-                return self._generation.add_dp_worker(pre_append_hook=_gate_up)
+                return self._generation.add_dp_worker(
+                    pre_append_hook=_gate_up, node_id=target_node_id
+                )
 
             try:
                 actor_handles, _pg, worker_indices, base_url = (
@@ -984,9 +988,7 @@ class GenerationRouter:
 
         dead: list[str] = []
         alive: list[str] = []
-        seen: set[str] = set()
         for sid, is_alive in results:
-            seen.add(sid)
             if is_alive:
                 alive.append(sid)
             else:

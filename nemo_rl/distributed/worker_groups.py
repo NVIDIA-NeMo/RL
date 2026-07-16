@@ -199,11 +199,14 @@ class RayWorkerBuilder:
                     worker_kwargs.update(init_kwargs)
 
             # Create options for Ray actor
-            options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
-                placement_group=placement_group,
-                placement_group_bundle_index=placement_group_bundle_index,
-                placement_group_capture_child_tasks=True,
-            )
+            if placement_group is not None:
+                options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=placement_group,
+                    placement_group_bundle_index=placement_group_bundle_index,
+                    placement_group_capture_child_tasks=True,
+                )
+            # else: use whatever scheduling_strategy was supplied in extra_options
+            # (e.g. NodeAffinitySchedulingStrategy for SLURM restarts), or Ray default.
             options["num_gpus"] = num_gpus
             worker = worker_class.options(**options).remote(
                 *self.init_args, **worker_kwargs
@@ -660,6 +663,8 @@ class RayWorkerGroup:
         bundle_indices: Optional[tuple[int, list[int]]] = None,
         dp_shard_idx: Optional[int] = None,
         compact_dead_indices: bool = True,
+        local_rank: int = 0,
+        node_id: Optional[str] = None,
     ) -> tuple[Any, str, tuple[int, list[int]], int]:
         """Phase A of add_worker: spawn the actor handle WITHOUT appending.
 
@@ -708,7 +713,7 @@ class RayWorkerGroup:
         worker_env_vars.update(
             {
                 "RANK": str(new_worker_idx),
-                "LOCAL_RANK": "0",
+                "LOCAL_RANK": str(local_rank),
                 "WORLD_SIZE": str(new_worker_idx + 1),
                 "MASTER_ADDR": self.master_address,
                 "MASTER_PORT": str(self.master_port),
@@ -748,7 +753,12 @@ class RayWorkerGroup:
         # collide with the next attempt.
         self._add_worker_seq += 1
         name = f"{self.name_prefix}-added-{self._add_worker_seq}"
-        extra_options = {"runtime_env": runtime_env, "name": name}
+        extra_options: dict[str, Any] = {"runtime_env": runtime_env, "name": name}
+        if node_id is not None:
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+            extra_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                node_id=node_id, soft=False
+            )
 
         num_gpus = (
             1 / self.cluster.max_colocated_worker_groups
@@ -770,9 +780,11 @@ class RayWorkerGroup:
         self,
         worker: Any,
         name: str,
-        bundle_indices: tuple[int, list[int]],
+        bundle_indices: Optional[tuple[int, list[int]]],
         dp_shard_idx: int,
         pre_append_hook: Optional[Callable[[], None]] = None,
+        is_leader: bool = True,
+        local_rank: int = 0,
     ) -> int:
         """Phase B of add_worker: append a pre-spawned actor.
 
@@ -780,23 +792,28 @@ class RayWorkerGroup:
         be included in the next ``init_collective`` / ``reset_collective``.
         ``pre_append_hook`` fires just before the append so the caller can
         update any gates at the moment the world size changes.
+        Only the shard leader (``is_leader=True``) is added to
+        ``dp_leader_worker_indices``; TP followers are appended to ``_workers``
+        but not registered as dispatch targets.
         """
         if pre_append_hook is not None:
             pre_append_hook()
 
         new_worker_idx = len(self._workers)
         self._workers.append(worker)
+        node_idx = bundle_indices[0] if bundle_indices is not None else 0
         self._worker_metadata.append(
             {
-                "node_idx": bundle_indices[0],
-                "local_rank": 0,
+                "node_idx": node_idx,
+                "local_rank": local_rank,
                 "global_rank": new_worker_idx,
                 "name": name,
                 "bundle_indices": bundle_indices,
                 "dp_shard_idx": dp_shard_idx,
             }
         )
-        self.dp_leader_worker_indices.append(new_worker_idx)
+        if is_leader:
+            self.dp_leader_worker_indices.append(new_worker_idx)
         return new_worker_idx
 
     def run_single_worker_single_data(

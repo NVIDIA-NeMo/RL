@@ -486,64 +486,83 @@ class VllmGeneration(GenerationInterface):
     def add_dp_worker(
         self,
         pre_append_hook: Optional[Callable[[], None]] = None,
+        node_id: Optional[str] = None,
     ):
-        """SLURM version: restart a dead shard's process on the same node.
+        """SLURM version: restart a dead shard on the same node.
 
-        Returns (actor_handles, placement_group=None, worker_indices, base_url).
-        pre_append_hook fires just before the worker is appended to the group.
-
-        For SLURM (phases 1+2), the node is still in the SLURM allocation after
-        a process-level failure, so we just spawn a new Ray actor on that node
-        using NodeAffinitySchedulingStrategy.
+        Spawns ``tp_size * pp_size`` workers (one per GPU in the shard), pins
+        them all to ``node_id`` via NodeAffinitySchedulingStrategy if provided,
+        and appends them atomically. Returns
+        ``(actor_handles, None, worker_indices, base_url)``.
         """
-        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy  # noqa: F401
-        from nemo_rl.distributed.worker_groups import RayWorkerGroup  # noqa: F401
+        model_parallel_size = self.tp_size * self.pp_size
+        dp_shard_idx = self.worker_group.dp_size  # next shard slot
 
-        # Determine which node to restart on: use the node of dp_leader 0
-        # (fallback: let Ray schedule freely). Dead workers have been removed
-        # from dp_leader_worker_indices via mark_workers_dead, so the current
-        # leaders are all alive. The dead shard's node is passed in via
-        # the placement_group field on ShardEntry (we repurpose it as node_id str).
-        # For now, schedule on any node in the SLURM allocation (Ray handles it).
+        # Spawn all workers for this shard. The leader (local_rank=0) gets
+        # bundle_indices so vLLM knows the full TP/PP GPU layout; followers
+        # get None and discover their role from the leader.
+        actors: list[Any] = []
+        names: list[str] = []
+        bis: list[Optional[tuple[int, list[int]]]] = []
 
-        pg = None  # No PG in SLURM — the node stays allocated
-        dp_shard_idx = self.worker_group.dp_size  # next slot
-        bundle_indices = (dp_shard_idx, [0])
+        for local_rank in range(model_parallel_size):
+            bi: Optional[tuple[int, list[int]]] = (
+                (dp_shard_idx, list(range(model_parallel_size)))
+                if local_rank == 0
+                else None
+            )
+            actor, name, bi_resolved, _ = self.worker_group.spawn_worker_only(
+                placement_group=None,
+                bundle_indices=bi,
+                dp_shard_idx=dp_shard_idx,
+                compact_dead_indices=(local_rank == 0),
+                local_rank=local_rank,
+                node_id=node_id,
+            )
+            actors.append(actor)
+            names.append(name)
+            bis.append(bi_resolved)
 
-        actor, name, bundle_indices, dp_shard_idx = self.worker_group.spawn_worker_only(
-            placement_group=pg,
-            bundle_indices=bundle_indices,
-            dp_shard_idx=dp_shard_idx,
-        )
+        # If node_id wasn't provided, get it from the leader after spawning so
+        # we can record it in the ShardEntry (the router will call get_node_id
+        # on actor_handles[0] separately — nothing to do here).
 
-        # Drive prepare_refit_info on the bare actor handle BEFORE appending.
-        # (actor.__init__ runs async; we wait for it here)
+        # prepare_refit_info on the leader before appending (waits for __init__).
         cached_info = getattr(self, "_cached_state_dict_info", None)
         if cached_info is not None:
             try:
-                ray.get(actor.prepare_refit_info.remote(cached_info), timeout=120)
+                ray.get(actors[0].prepare_refit_info.remote(cached_info), timeout=300)
             except Exception as e:
-                print(
-                    f"[add_dp_worker] prepare_refit_info failed: {e}", flush=True
-                )
+                print(f"[add_dp_worker] prepare_refit_info failed: {e}", flush=True)
 
-        new_idx = self.worker_group.append_spawned_worker(
-            actor, name, bundle_indices, dp_shard_idx,
-            pre_append_hook=pre_append_hook,
-        )
+        # Append all workers atomically. pre_append_hook fires before the leader
+        # is appended so the router's NCCL gate flips at the right moment.
+        worker_indices: list[int] = []
+        for i, (actor, name, bi) in enumerate(zip(actors, names, bis)):
+            is_leader = i == 0
+            new_idx = self.worker_group.append_spawned_worker(
+                actor,
+                name,
+                bi,
+                dp_shard_idx,
+                pre_append_hook=pre_append_hook if is_leader else None,
+                is_leader=is_leader,
+                local_rank=i,
+            )
+            worker_indices.append(new_idx)
 
-        # Get base URL (async engine only)
+        # Get base URL from the leader (async engine only).
         base_url = None
         if self.cfg["vllm_cfg"]["async_engine"]:
             try:
                 base_url = ray.get(
-                    actor.report_dp_openai_server_base_url.remote(), timeout=120
+                    actors[0].report_dp_openai_server_base_url.remote(), timeout=120
                 )
                 self.dp_openai_server_base_urls.append(base_url)
             except Exception as e:
                 print(f"[add_dp_worker] base_url fetch failed: {e}", flush=True)
 
-        return [actor], None, [new_idx], base_url
+        return actors, None, worker_indices, base_url
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

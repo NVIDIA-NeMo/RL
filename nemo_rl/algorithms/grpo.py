@@ -1218,7 +1218,6 @@ def setup(
                 "remote_generation_url must be set for disaggregated HTTP mode"
             )
             policy_generation = RemoteGeneration(
-                generation=None,
                 server_url=remote_url,
                 config=generation_config,
             )

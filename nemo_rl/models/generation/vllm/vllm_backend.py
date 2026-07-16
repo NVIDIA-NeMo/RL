@@ -147,6 +147,11 @@ class VllmInternalWorkerExtension:
                 pass
         self.model_update_group = None  # type: ignore[assignment]
 
+    def get_node_id(self) -> str:
+        """Return the Ray node ID this worker is running on."""
+        import ray
+        return ray.get_runtime_context().get_node_id()
+
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
         from nemo_rl.utils.nvml import get_device_uuid
