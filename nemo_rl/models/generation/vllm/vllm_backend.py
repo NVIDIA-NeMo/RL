@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import re
 import traceback
 from typing import Any
 
@@ -37,21 +38,79 @@ except ImportError:
     )
 
 
-def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor:
-    """Apply GPT-OSS down_proj transpose fix to the weight.
+def fix_gemma3_vision_weight_name(key: str) -> str:
+    """Re-insert the `vision_model` segment into Gemma3 vision-tower weights.
 
-    This is a workaround for the issue that the down_proj layout is not the same across different frameworks.
-        - HF needs [in, out] layout.
-        - Megatron needs [in, out] layout.
-        - vLLM needs [out, in] layout.
-    See https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/3271 for more details.
+    When performing refit, the vision-tower weight paths are flattened. This unflattens them.
     """
-    if key.endswith("mlp.experts.down_proj"):
-        weight = weight.transpose(-2, -1).contiguous()
-    return weight
+    return re.sub(
+        r"vision_tower\.(?!vision_model\.)", "vision_tower.vision_model.", key
+    )
+
+
+def _read_mtp_layer_weights_from_checkpoint(
+    model_path: str, mtp_layer_indices: set[int]
+) -> list[tuple[str, torch.Tensor]]:
+    """Read only the MTP draft layer weights from a sharded HF safetensors checkpoint.
+
+    Uses the checkpoint's ``model.safetensors.index.json`` to open only the
+    shards that contain the requested transformer layer indices, so the
+    multi-terabyte base-model weights are never read from disk.
+
+    Args:
+        model_path: Path to the HF checkpoint directory.
+        mtp_layer_indices: Transformer layer indices belonging to the MTP module(s).
+
+    Returns:
+        A list of ``(weight_name, tensor)`` pairs for the requested layers, with
+        tensors on CPU.
+    """
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    shard_to_names: dict[str, list[str]] = {}
+    for name, shard in weight_map.items():
+        match = layer_re.search(name)
+        if match is not None and int(match.group(1)) in mtp_layer_indices:
+            shard_to_names.setdefault(shard, []).append(name)
+
+    weights: list[tuple[str, torch.Tensor]] = []
+    for shard, names in shard_to_names.items():
+        with safe_open(
+            os.path.join(model_path, shard), framework="pt", device="cpu"
+        ) as reader:
+            for name in names:
+                weights.append((name, reader.get_tensor(name)))
+    return weights
 
 
 class VllmInternalWorkerExtension:
+    def bind_numa(self) -> bool:
+        """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
+
+        Invoked via ``collective_rpc`` on each vLLM TP worker once the engine
+        (and CUDA) is up, so the worker's physical GPU id is resolved from its
+        local device index (see ``resolve_visible_gpu_id``).
+        """
+        import torch
+
+        from nemo_rl.distributed.numa_utils import (
+            bind_to_gpu_numa,
+            resolve_visible_gpu_id,
+        )
+
+        gpu_id = resolve_visible_gpu_id(torch.cuda.current_device())
+        if gpu_id is None:
+            return False
+        return bind_to_gpu_numa(gpu_id)
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -72,7 +131,7 @@ class VllmInternalWorkerExtension:
         _t_phases: dict[str, float] = {}
         _t_overall = _time.monotonic()
 
-        # Idempotent re-init: abort the old comm first, then drain queued CUDA errors.
+        # Idempotent re-init: destroy the old comm before creating a new one.
         _t = _time.monotonic()
         old = getattr(self, "model_update_group", None)
         if old is not None:
@@ -101,8 +160,6 @@ class VllmInternalWorkerExtension:
         _t_phases["nccl_init"] = _time.monotonic() - _t
 
         _t_total = _time.monotonic() - _t_overall
-        # Only log on slow inits (>3s) to avoid noise on the steady-state
-        # ~2.7s case.
         if _t_total > 3.0:
             print(
                 f"[init_collective_timing] rank={rank} world={world_size} "
@@ -114,32 +171,19 @@ class VllmInternalWorkerExtension:
             )
 
     def reset_collective(self) -> None:
-        """Tear down the cross-cluster weight-sync collective on this worker.
+        """Tear down the cross-cluster NCCL comm. Idempotent; no-op if not held.
 
-        Order: ``group.destroy()`` FIRST, then ``cuda.synchronize()``.
-        ``destroy()`` calls ``ncclCommAbort`` which immediately kills any
-        in-flight NCCL op (including a broadcast hung waiting for a dead
-        peer). After the abort, ``cuda.synchronize()`` drains remaining
-        side-stream work and returns quickly (~ms instead of 60-100s).
-
-        The previous order (synchronize → destroy) caused reset_collective
-        to block for the full NCCL heartbeat timeout (60s+) when a peer
-        died mid-broadcast, because synchronize waited for the hung op
-        to complete before the abort could fire.
-
-        Idempotent — a no-op if no collective is currently held.
+        Abort first (kills any hung broadcast immediately), then synchronize
+        and clear cache. The reverse order would block for the full NCCL
+        heartbeat timeout when a peer dies mid-broadcast.
         """
         group = getattr(self, "model_update_group", None)
         if group is None:
             return
-        import torch
-
-        # Abort the NCCL comm first — kills hung broadcasts immediately.
         try:
             group.destroy()
         except Exception as e:  # noqa: BLE001
             print(f"[vllm_backend.reset_collective] destroy raised {e}", flush=True)
-        # Now drain side streams + clear cache (fast after abort).
         for fn in (torch.cuda.synchronize, torch.cuda.empty_cache):
             try:
                 fn()
@@ -202,6 +246,7 @@ class VllmInternalWorkerExtension:
             return
 
         # FP8 KV cache: process KV scales after weight loading
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
@@ -210,11 +255,12 @@ class VllmInternalWorkerExtension:
         target_device = next(self.model_runner.model.parameters()).device
 
         # Call process_weights_after_loading to handle KV scales
-        process_weights_after_loading(
-            self.model_runner.model,
-            self.model_runner.model_config,
-            target_device,
-        )
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(
+                self.model_runner.model,
+                self.model_runner.model_config,
+                target_device,
+            )
 
     @staticmethod
     def _split_policy_and_draft_weights(
@@ -238,6 +284,42 @@ class VllmInternalWorkerExtension:
                 policy_weights.append((key, tensor))
         return policy_weights, draft_weights
 
+    @staticmethod
+    def _trim_vocab_padding(
+        draft_model: torch.nn.Module,
+        draft_weights: list[tuple[str, torch.Tensor]],
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Trim padded vocab dimensions from draft weights.
+
+        Megatron pads vocab to a multiple, but vLLM 0.20's autoloader
+        strictly asserts loaded_weight.shape[0] == org_vocab_size on
+        VocabParallelEmbedding layers. Each such layer may have a
+        different org_vocab_size (e.g. embed_tokens uses vocab_size
+        while lm_head uses draft_vocab_size), so we match each weight
+        to its target module by name.
+        """
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+
+        vocab_sizes: dict[str, int] = {}
+        for name, module in draft_model.named_modules():
+            if isinstance(module, VocabParallelEmbedding):
+                vocab_sizes[name] = module.org_vocab_size
+
+        if not vocab_sizes:
+            return draft_weights
+
+        trimmed = []
+        for key, tensor in draft_weights:
+            for mod_name, org_vocab_size in vocab_sizes.items():
+                leaf = mod_name.rsplit(".", 1)[-1]
+                if leaf in key and tensor.shape[0] > org_vocab_size:
+                    tensor = tensor[:org_vocab_size]
+                    break
+            trimmed.append((key, tensor))
+        return trimmed
+
     def _load_draft_weights(
         self, draft_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
@@ -252,24 +334,81 @@ class VllmInternalWorkerExtension:
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
             )
             return
+        draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
 
-    def _load_weights(self, weights):
-        """Load weights with GptOss transpose fix, FP8, and draft-weight support.
+    def load_mtp_weights_from_disk(self, model_path: str) -> bool:
+        """Load only the MTP (multi-token-prediction) draft weights from disk.
 
-        Applies GPT-OSS down_proj transpose if needed, splits policy/draft
+        Used when an MTP speculative-decoding policy runs with
+        ``load_format="dummy"``: the main model receives real weights via refit,
+        but the MTP draft layer is not covered by refit (the trainer runs with
+        ``mtp_num_layers=0``), so its weights must come from the checkpoint. Only
+        the MTP layer(s) are read, avoiding a full base-model load (~1.3 TB for
+        DeepSeek-V3) on every inference replica.
+
+        Args:
+            model_path: Path to the HF checkpoint directory.
+
+        Returns:
+            bool: True if MTP weights were loaded.
+        """
+        draft_owner = getattr(self.model_runner, "drafter", None)
+        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
+        if draft_model is None:
+            print("[mtp] Drafter unavailable; cannot load MTP weights from disk.")
+            return False
+
+        predictor = draft_model.model
+        mtp_layer_indices = set(
+            range(
+                predictor.mtp_start_layer_idx,
+                predictor.mtp_start_layer_idx + predictor.num_mtp_layers,
+            )
+        )
+        weights = _read_mtp_layer_weights_from_checkpoint(model_path, mtp_layer_indices)
+        if not weights:
+            raise ValueError(
+                f"No MTP layer weights for layers {sorted(mtp_layer_indices)} "
+                f"found in checkpoint at {model_path}. The checkpoint must "
+                f"include MTP layer weights to run deepseek_mtp speculative decoding."
+            )
+
+        self._load_draft_weights(weights)
+
+        # The MTP block contains MoE experts whose weights need post-load
+        # processing (e.g. grouped-GEMM layout), matching the main-model path.
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
+
+        draft_model_config = (
+            self.model_runner.vllm_config.speculative_config.draft_model_config
+        )
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(draft_model, draft_model_config, self.device)
+        print(
+            f"[mtp] Loaded MTP draft weights for layers "
+            f"{sorted(mtp_layer_indices)} from {model_path}"
+        )
+        return True
+
+    def _load_weights(self, weights):
+        """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
+
+        Applies Gemma3 vision-tower weight name fix if needed, splits policy/draft
         weights, applies FP8 conversion if needed, and loads draft weights
         into the drafter model.
         """
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if (
-            "GptOssForCausalLM"
+            "Gemma3ForConditionalGeneration"
             in self.model_runner.vllm_config.model_config.architectures
         ):
             for idx, (key, weight) in enumerate(weights):
-                weight = fix_gpt_oss_export_transpose(key, weight)
-                weights[idx] = (key, weight)
+                weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
@@ -297,13 +436,15 @@ class VllmInternalWorkerExtension:
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
+                    from vllm.config import set_current_vllm_config
                     from vllm.model_executor.model_loader.utils import (
                         process_weights_after_loading,
                     )
 
-                    process_weights_after_loading(
-                        self.model_runner.model, self.model_config, self.device
-                    )
+                    with set_current_vllm_config(self.model_runner.vllm_config):
+                        process_weights_after_loading(
+                            self.model_runner.model, self.model_config, self.device
+                        )
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
@@ -325,12 +466,6 @@ class VllmInternalWorkerExtension:
                         .view(dtype=dtype)
                         .view(shape)
                     )
-                    # apply gpt-oss transpose fix
-                    if (
-                        "GptOssForCausalLM"
-                        in self.model_runner.vllm_config.model_config.architectures
-                    ):
-                        weight = fix_gpt_oss_export_transpose(key, weight)
                     weights.append((key, weight))
 
                     # Move offset to the next weight
@@ -375,66 +510,24 @@ class VllmInternalWorkerExtension:
     )
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
-        # A freshly added shard may not yet be in the comm during the debounce window.
-        # Skip the receive; the shard stays joining until a later re-init pulls it in.
+        # A freshly added shard may not yet be in the comm during the debounce
+        # window. Skip the receive; the shard stays joining until a later
+        # re-init includes it.
         if getattr(self, "model_update_group", None) is None:
             print(
-                "[vllm_backend.update_weights_from_collective] no comm "
-                "(not in current model_update_group); skipping broadcast recv",
+                "[vllm_backend.update_weights_from_collective] no comm; skipping",
                 flush=True,
             )
             return True
+
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
         )
 
         load_model_weight_func = self._load_weights
-
-        # DIAGNOSTIC: log consumer-side ordering fingerprint so we can compare
-        # against the producer (megatron_policy_worker).  ``state_dict_info``
-        # came from ``prepare_refit_info`` at startup; if its iteration order
-        # diverges from the producer's runtime ``_iter_params_with_optional_kv_scales``
-        # the packed-broadcast byte boundaries skew silently and the
-        # rebuilt tensors are garbage.
-        try:
-            import hashlib as _hashlib
-            import math as _math
-            import os as _os
-
-            _consumer_meta = [
-                (
-                    name,
-                    tuple(shape),
-                    str(dtype),
-                    _math.prod(shape) * dtype.itemsize,
-                )
-                for name, (shape, dtype) in self.state_dict_info.items()
-            ]
-            _names_blob = "\n".join(m[0] for m in _consumer_meta).encode()
-            _full_blob = "\n".join(
-                f"{m[0]}|{m[1]}|{m[2]}|{m[3]}" for m in _consumer_meta
-            ).encode()
-            _names_hash = _hashlib.sha256(_names_blob).hexdigest()[:16]
-            _full_hash = _hashlib.sha256(_full_blob).hexdigest()[:16]
-            _total_bytes = sum(m[3] for m in _consumer_meta)
-            _vrank = _os.environ.get("VLLM_DP_RANK", _os.environ.get("RANK", "?"))
-            print(
-                f"[refit_diag.consumer] vllm_dp_rank={_vrank} "
-                f"n_params={len(_consumer_meta)} "
-                f"total_bytes={_total_bytes} "
-                f"names_sha={_names_hash} full_sha={_full_hash} "
-                f"first3={[m[0] for m in _consumer_meta[:3]]} "
-                f"last3={[m[0] for m in _consumer_meta[-3:]]}",
-                flush=True,
-            )
-        except Exception as _e:  # noqa: BLE001
-            print(
-                f"[refit_diag.consumer] failed to log fingerprint: {_e}",
-                flush=True,
-            )
-
         success = True
+
         try:
             packed_broadcast_consumer(
                 iterator=iter(self.state_dict_info.items()),
@@ -443,35 +536,38 @@ class VllmInternalWorkerExtension:
                 post_unpack_func=load_model_weight_func,
             )
 
-            # Process weights after loading for FP8 KV cache
+            # Process weights after loading
+            from vllm.config import set_current_vllm_config
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                process_weights_after_loading(
+                    self.model_runner.model, self.model_config, self.device
+                )
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
             success = False
-            import traceback as _tb
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}\n"
-                f"{_tb.format_exc()}",
+                f"{traceback.format_exc()}",
                 flush=True,
             )
-        finally:
-            # In disagg mode, tear down the comm only on failure. On success keep it alive
-            # across refits to avoid per-step rendezvous flakiness.
-            import os as _os
+            # On failure, tear down the stale comm so the next init_collective
+            # starts clean. On success, keep it alive across refits.
+            group = getattr(self, "model_update_group", None)
+            if group is not None:
+                try:
+                    group.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.model_update_group = None  # pyrefly: ignore
 
-            is_disagg = bool(_os.environ.get("DISAGG_JOB_ID"))
-            if is_disagg and not success:
-                group = getattr(self, "model_update_group", None)
-                if group is not None:
-                    try:
-                        group.destroy()
-                    except Exception as _e:  # noqa: BLE001
-                        print(
-                            f"[vllm_backend] post-refit destroy raised "
-                            f"{type(_e).__name__}: {_e} — comm already gone",
-                            flush=True,
-                        )
-                    self.model_update_group = None  # pyrefly: ignore
+        if success:
+            gc.collect()
+            torch.cuda.empty_cache()
         return success
 
     def cleanup(self) -> None:
