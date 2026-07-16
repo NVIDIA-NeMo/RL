@@ -20,6 +20,7 @@ import unittest.mock as mock
 import pytest
 import ray
 import torch
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 # Set up Ray temp directory before any Ray operations
 # Try multiple approaches to ensure Ray uses a writable directory
@@ -1167,7 +1168,7 @@ class TestReplayBufferNew:
 class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
 
-    def create_local_collector(self, replay_buffer=None):
+    def create_local_collector(self, replay_buffer=None, start_step=0, start_epoch=0):
         """Create a non-Ray collector instance for unit-testing local state."""
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
         mock_generation = MockGenerationInterface()
@@ -1183,7 +1184,8 @@ class TestAsyncTrajectoryCollector:
             task_to_env=task_to_env,
             master_config=master_config,
             replay_buffer=replay_buffer,
-            start_step=0,
+            start_step=start_step,
+            start_epoch=start_epoch,
         )
 
     def _prime_collection_loop(self, collector):
@@ -1216,6 +1218,60 @@ class TestAsyncTrajectoryCollector:
         assert status["data_exhausted"] is True
         assert status["errored"] is False
         assert status["running"] is False
+        assert status["current_epoch"] == 1
+
+    def test_collection_loop_repeats_dataloader_for_max_num_epochs(self):
+        """The collector supplies every configured dataset pass to async GRPO."""
+        collector = self.create_local_collector()
+        collector.master_config.grpo["max_num_epochs"] = 2
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = [{"b": 0}, {"b": 1}]
+
+        collector._collection_loop()
+
+        assert processed == [{"b": 0}, {"b": 1}, {"b": 0}, {"b": 1}]
+        assert collector.data_exhausted is True
+        assert collector.current_epoch == 2
+
+    def test_collection_loop_resume_processes_only_remaining_epochs(self):
+        """A resumed collector does not replay already-completed epochs."""
+        collector = self.create_local_collector(start_step=2, start_epoch=1)
+        collector.master_config.grpo["max_num_epochs"] = 2
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = [{"b": 0}, {"b": 1}]
+
+        collector._collection_loop()
+
+        assert processed == [{"b": 0}, {"b": 1}]
+        assert collector.data_exhausted is True
+        assert collector.current_epoch == 2
+
+    def test_collection_loop_resume_finishes_partial_epoch(self):
+        """Dataloader and epoch checkpoints jointly resume a partial epoch."""
+        source = StatefulDataLoader([{"b": 0}, {"b": 1}], batch_size=None)
+        assert next(iter(source)) == {"b": 0}
+        dataloader_state = source.state_dict()
+
+        resumed = StatefulDataLoader([{"b": 0}, {"b": 1}], batch_size=None)
+        resumed.load_state_dict(dataloader_state)
+
+        collector = self.create_local_collector(start_epoch=0)
+        collector.master_config.grpo["max_num_epochs"] = 2
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = resumed
+
+        collector._collection_loop()
+
+        assert processed == [{"b": 1}, {"b": 0}, {"b": 1}]
+        state, epoch = collector.get_dataloader_checkpoint()
+        assert state
+        assert epoch == 2
 
     def test_collection_loop_marks_errored_on_crash(self):
         """A crash sets errored (not data_exhausted) so driver guards fail fast."""
@@ -1263,6 +1319,7 @@ class TestAsyncTrajectoryCollector:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,
                 "max_rollout_turns": 1,
+                "max_num_epochs": 1,
                 "async_grpo": {"max_trajectory_age_steps": 2},
             },
             "policy": {
@@ -1608,6 +1665,7 @@ class TestAsyncUtilsIntegration:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 2,
                 "max_rollout_turns": 1,
+                "max_num_epochs": 1,
                 "async_grpo": {"max_trajectory_age_steps": 1},
             },
             "policy": {
