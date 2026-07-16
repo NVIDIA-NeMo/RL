@@ -50,7 +50,7 @@ Key settings:
 | `update_weights_bucket_megabytes` | Reusable transfer-buffer size per participating worker. Start with `2048`; tune only after measuring. |
 | `device` | `cuda` uses GPU RDMA buffers. `cpu` uses host-pinned buffers and is mainly a fallback. |
 | `cleanup_after_load` | Set `false` to avoid extra `torch.cuda.empty_cache()` overhead after each refit when memory is stable. |
-| `shard_hf_weights` | Omits weights absent from each vLLM PP stage and sends destination-local MoE expert shards for TP/EP. |
+| `shard_expert_weights` | Sends destination-local MoE expert shards for TP/EP and omits weights absent from each vLLM PP stage. |
 | `backend_init_params` | NIXL backend parameters such as UCX peer error handling, device lists, and UCX engine config. |
 
 The built-in NIXL topology is paired policy-to-rollout transfer, so allocate at
@@ -111,10 +111,10 @@ policy:
         nixl:
           device: cuda
           cleanup_after_load: false
-          shard_hf_weights: true
+          shard_expert_weights: true
 ```
 
-With `shard_hf_weights`, each vLLM worker reports its live destination layout
+With `shard_expert_weights`, each vLLM worker reports its live destination layout
 during checkpoint-engine setup. For pipeline parallelism, the source omits
 every weight that vLLM marks as absent from the destination stage. For
 tensor-parallel MoE, the source sends that TP rank's slice of every expert. For
@@ -123,6 +123,13 @@ them, followed by any intra-expert TP slice reported by vLLM. Any static
 ownership map reported by vLLM is supported. The reported destination layout is
 authoritative; do not configure a separate target-TP or rank-derived sharding
 hint.
+
+Set `shard_expert_weights: false` to use the reference full-weight loader. This is
+the fallback for a new vLLM layout or loader contract; fallback cannot happen
+after transfer starts because the sender has already discarded non-local
+shards. Sharded setup therefore validates vLLM's canonical parameter layout
+and source shard shapes and fails before loading when those contracts do not
+match.
 
 Dynamic expert load balancing and redundant experts are not supported because
 ownership can change after metadata exchange. The direct-copy load path accepts
@@ -137,7 +144,8 @@ multiple buffers are reassembled on CPU before that standard loader to limit
 peak GPU memory.
 
 When vLLM EP is larger than TP, NeMo RL currently requires `async_engine: false`.
-For non-MoE models, `shard_hf_weights` only applies pipeline-stage filtering.
+For non-MoE models, `shard_expert_weights` only applies pipeline-stage filtering;
+dense tensors are not sharded.
 Expert sharding requires HF expert names that map to vLLM `w13_weight` and
 `w2_weight` parameters.
 
@@ -149,16 +157,24 @@ refit unless that workload has been explicitly validated with it.
 The full-model benchmark used 36 eight-GPU nodes: 32 policy nodes
 with Megatron TP1/PP16/EP16 and four rollout nodes with vLLM TP32/PP1/EP1. NIXL
 used CUDA buffers, UCX over eight RDMA rails, a 4096 MiB bucket, Triton MoE, and
-`shard_hf_weights: true`. Each vLLM rank loaded 45,395 destination-local tensors
+`shard_expert_weights: true`. Each vLLM rank loaded 45,395 destination-local tensors
 in 18 batches, totaling 69.95 GiB.
 
 | Measurement | NIXL GPU RDMA | NCCL | NIXL improvement |
 |---|---:|---:|---:|
 | Dedicated async refit timer | 9.25 s | 14.21 s | 1.54x, 35% less time |
-| Matched synchronous verifier | 11.42 s | 15.52 s | 1.36x, 26% less time |
+| Matched synchronous verifier | 10.92 s | 15.52 s | 1.42x, 30% less time |
 
 Compare results within one row only; async and synchronous vLLM have different
 control-path overhead.
+
+A same-build synchronous regression run on 2026-07-15 changed only
+`shard_expert_weights`: the full-expert path took 36.812 s and the sharded-expert
+path took 10.923 s, a 3.37x speedup and 70% less time. The verifier's recorded
+output IDs, vLLM logprobs, policy logprobs, per-row errors, and aggregate metrics
+were identical between paths. Both paths reported mean/max policy-to-vLLM
+logprob differences of 0.03227/0.09738; this comparison establishes parity with
+the full-weight loader, not absolute equivalence between the two model stacks.
 
 ## Fault Tolerance Boundary
 

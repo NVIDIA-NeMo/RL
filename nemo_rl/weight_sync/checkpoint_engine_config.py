@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import cast
+
+from nemo_rl.models.generation.interfaces import (
+    CheckpointEngineConfig,
+    GenerationConfig,
+)
 
 
 def enabled_checkpoint_engine_config(
-    generation_config: dict[str, Any],
-) -> dict[str, Any] | None:
+    generation_config: GenerationConfig,
+) -> CheckpointEngineConfig | None:
     """Return the enabled checkpoint-engine config, if configured."""
     checkpoint_engine = generation_config.get("checkpoint_engine")
     if checkpoint_engine and checkpoint_engine["enabled"]:
-        return checkpoint_engine
+        return cast(CheckpointEngineConfig, checkpoint_engine)
     return None

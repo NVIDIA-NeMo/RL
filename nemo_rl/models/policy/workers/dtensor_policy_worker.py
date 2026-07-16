@@ -91,9 +91,6 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     DTensorCheckpointEngineSendMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
-from nemo_rl.models.policy.workers.tokenizer_serialization import (
-    resolve_worker_tokenizer,
-)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -212,7 +209,7 @@ class DTensorPolicyWorkerImpl(
     def __init__(
         self,
         config: PolicyConfig,
-        tokenizer: Optional[AutoTokenizer] = None,
+        tokenizer: AutoTokenizer,
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
         optimizer_path: Optional[str] = None,
@@ -229,7 +226,6 @@ class DTensorPolicyWorkerImpl(
         # affinity file, and reading it does not initialize CUDA.
         bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
 
-        tokenizer, processor = resolve_worker_tokenizer(config, tokenizer, processor)
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None

@@ -39,14 +39,14 @@ class TensorMeta:
 
 class CheckpointEngine(ABC):
     cleanup_after_load: bool = True
-    shard_hf_weights: bool = False
+    shard_expert_weights: bool = False
 
     def get_target_weight_layout(self) -> dict[str, Any] | None:
         """Return the destination-local layout for this policy rank, if any."""
-        if self.shard_hf_weights:
+        if self.shard_expert_weights:
             raise NotImplementedError(
                 f"{type(self).__name__} must implement get_target_weight_layout() "
-                "when shard_hf_weights is enabled."
+                "when shard_expert_weights is enabled."
             )
         return None
 

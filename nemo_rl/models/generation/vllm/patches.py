@@ -15,7 +15,6 @@
 import os
 from contextlib import contextmanager
 from importlib.util import find_spec
-from typing import Any
 
 
 def _get_vllm_file(relative_path: str) -> str:
@@ -287,7 +286,6 @@ def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
-    checkpoint_engine_config: dict[str, Any] | None = None,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     from vllm.logger import init_logger
@@ -297,10 +295,5 @@ def _apply_vllm_patches(
     _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
     patch_logger.info("Successfully patched vllm _init_workers_ray.")
 
-    from nemo_rl.models.generation.vllm.checkpoint_engine_patch import (
-        patch_vllm_worker_nixl_preinit,
-    )
-
-    patch_vllm_worker_nixl_preinit(checkpoint_engine_config)
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)

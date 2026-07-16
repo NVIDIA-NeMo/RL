@@ -19,22 +19,54 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from nemo_rl.models.generation.vllm.refit_loader import VllmShardedRefitMixin
+from nemo_rl.models.generation.vllm.refit_loader import VllmRefitLoaderMixin
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 if TYPE_CHECKING:
     from nemo_rl.utils.checkpoint_engines.base import CheckpointEngine
 
 
-def maybe_preinit_nixl_for_vllm_worker(
-    worker_wrapper: Any,
-    *,
-    backend_name: str,
-    backend_init_params: dict[str, Any] | None = None,
-) -> None:  # pragma: no cover
-    from nemo_rl.utils.checkpoint_engines.nixl import preinit_nixl_agent
+NEMO_RL_VLLM_WORKER = "nemo_rl.models.generation.vllm.vllm_backend.NemoRLVllmWorker"
+_NIXL_CONFIG_KEY = "nemo_rl_checkpoint_engine"
 
-    vars(worker_wrapper)["_nrl_nixl_preinit_agent"] = preinit_nixl_agent(
+
+def configure_nixl_worker(config: dict[str, Any], vllm_kwargs: dict[str, Any]) -> None:
+    """Configure vLLM's worker hook for early NIXL initialization."""
+    checkpoint_config = config.get("checkpoint_engine")
+    if not (
+        checkpoint_config
+        and checkpoint_config["enabled"]
+        and checkpoint_config["backend"] == "nixl"
+    ):
+        return
+
+    worker_cls = vllm_kwargs.setdefault("worker_cls", NEMO_RL_VLLM_WORKER)
+    if worker_cls != NEMO_RL_VLLM_WORKER:
+        raise ValueError(
+            "NIXL checkpoint-engine refit requires vllm_kwargs.worker_cls to "
+            f"be unset or {NEMO_RL_VLLM_WORKER}."
+        )
+
+    additional_config = dict(vllm_kwargs.get("additional_config") or {})
+    additional_config[_NIXL_CONFIG_KEY] = checkpoint_config
+    vllm_kwargs["additional_config"] = additional_config
+
+
+def preinit_nixl_from_vllm_config(vllm_config: Any) -> Any:
+    """Create the NIXL preinit agent carried by a vLLM internal worker."""
+    checkpoint_config = vllm_config.additional_config.get(_NIXL_CONFIG_KEY)
+    if checkpoint_config is None:
+        return None
+
+    from nemo_rl.utils.checkpoint_engines.nixl import (
+        preinit_nixl_agent,
+        resolve_nixl_backend_kwargs,
+    )
+
+    backend_name, backend_init_params = resolve_nixl_backend_kwargs(
+        checkpoint_config["engine_kwargs"]["nixl"]
+    )
+    return preinit_nixl_agent(
         backend_name=backend_name, backend_init_params=backend_init_params
     )
 
@@ -46,7 +78,7 @@ def global_rollout_rank(rank_prefix: int, rollout_world_size: int) -> int:
     return rank_prefix + rank
 
 
-class VllmCheckpointEngineMixin(VllmShardedRefitMixin):
+class VllmCheckpointEngineMixin(VllmRefitLoaderMixin):
     """Checkpoint-engine lifecycle for vLLM workers."""
 
     checkpoint_engine: "CheckpointEngine"
@@ -69,7 +101,7 @@ class VllmCheckpointEngineMixin(VllmShardedRefitMixin):
         metadata = self.checkpoint_engine.prepare()
         if isinstance(metadata, dict):
             metadata = {**metadata, "rank": torch.distributed.get_rank()}
-            if self.checkpoint_engine.shard_hf_weights:
+            if self.checkpoint_engine.shard_expert_weights:
                 metadata["weight_layout"] = self._checkpoint_engine_weight_layout()
         return metadata
 

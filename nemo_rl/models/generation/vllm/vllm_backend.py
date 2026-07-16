@@ -25,6 +25,7 @@ import zmq
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineMixin,
     global_rollout_rank,
+    preinit_nixl_from_vllm_config,
 )
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -36,6 +37,7 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
 try:
     import vllm  # noqa: F401
+    from vllm.v1.worker.gpu_worker import Worker as VllmWorker
 except ImportError:
     raise ImportError(
         "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -103,6 +105,15 @@ class _IPCWeightManifest:
             details.append(_format_refit_key_error("missing keys", missing_keys))
         if details:
             raise IPCWeightManifestError("; ".join(details))
+
+
+class NemoRLVllmWorker(VllmWorker):
+    """vLLM worker that establishes NIXL/UCX before vLLM initialization."""
+
+    def __new__(cls, vllm_config: Any, *args: Any, **kwargs: Any) -> "NemoRLVllmWorker":
+        worker = super().__new__(cls)
+        worker._nrl_nixl_preinit_agent = preinit_nixl_from_vllm_config(vllm_config)
+        return worker
 
 
 def fix_gemma3_vision_weight_name(key: str) -> str:
@@ -412,11 +423,9 @@ class VllmInternalWorkerExtension(VllmCheckpointEngineMixin):
         """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
 
         Applies Gemma3 vision-tower weight name fix if needed, splits policy/draft
-        weights, applies FP8 conversion if needed, and loads draft weights
-        into the drafter model.
+        weights, dispatches policy weights through the configured refit loader,
+        and loads draft weights into the drafter model.
         """
-        from nemo_rl.models.generation.vllm.quantization import fp8
-
         if (
             "Gemma3ForConditionalGeneration"
             in self.model_runner.vllm_config.model_config.architectures
@@ -425,11 +434,7 @@ class VllmInternalWorkerExtension(VllmCheckpointEngineMixin):
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
-        if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
-        else:
-            self.model_runner.model.load_weights(weights=policy_weights)
-
+        self._load_hf_weights(policy_weights)
         self._load_draft_weights(draft_weights)
 
     def _get_sparse_delta_applier(self) -> Any:

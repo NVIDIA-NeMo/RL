@@ -199,13 +199,13 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         backend_name: str = NIXL_DEFAULT_BACKEND_NAME,
         cleanup_after_load: bool = True,
         backend_init_params: dict[str, Any] | None = None,
-        shard_hf_weights: bool = False,
+        shard_expert_weights: bool = False,
     ) -> None:
         if bucket_size < 1:
             raise ValueError("NIXL checkpoint-engine bucket_size must be >= 1 byte.")
         self.bucket_size = bucket_size
         self.cleanup_after_load = cleanup_after_load
-        self.shard_hf_weights = shard_hf_weights
+        self.shard_expert_weights = shard_expert_weights
         self._target_weight_layout: dict[str, Any] | None = None
         self.agent = NixlAgent(backend_name, backend_init_params)
         self.prev_agent: str | None = None
@@ -269,7 +269,7 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         rollout_rank = source_to_rollout.get(worker_rank)
         if rollout_rank is not None:
             target_metadata = metadata[train_world_size + rollout_rank]
-            if self.shard_hf_weights:
+            if self.shard_expert_weights:
                 self._target_weight_layout = target_metadata["weight_layout"]
             self.next_agent = self.agent.add_remote_agent(target_metadata)
 

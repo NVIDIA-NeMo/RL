@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.generation.interfaces import CheckpointEngineConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -56,7 +57,7 @@ def _ordered_generation_metadata(generation_results: list[Any]) -> list[Any]:
 class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     _policy: Any
     _generation: Any
-    _checkpoint_engine_config: dict[str, Any]
+    _checkpoint_engine_config: CheckpointEngineConfig
     _stale: bool = True
     _checkpoint_engine_ready: bool = False
 

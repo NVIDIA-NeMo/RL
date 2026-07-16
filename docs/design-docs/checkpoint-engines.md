@@ -163,7 +163,7 @@ The `weights` generator is consumed once. `receive_weight_batches()` should
 yield tensors with original parameter names and values. vLLM loads each yielded
 batch immediately.
 
-A backend that enables `shard_hf_weights` must implement
+A backend that enables `shard_expert_weights` must implement
 `get_target_weight_layout()`. It returns `None` on policy ranks without a
 rollout peer; otherwise it returns the destination layout used to filter and
 slice the policy iterator.
@@ -191,14 +191,25 @@ rollout peer so those collectives are entered by every required rank.
 vLLM generation workers forward checkpoint-engine calls through
 `collective_rpc()` into vLLM internal workers. The internal worker extension
 creates the backend, prepares rollout metadata, receives weight batches, and
-loads each batch. With sharded HF refit, it directly copies supported local
-expert shards into canonical vLLM storage and sends dense or otherwise
-unhandled tensors through the normal vLLM load path. The vLLM worker prints
-timing for each update:
+loads each batch. Its explicit full-weight path delegates complete HF tensors
+to `model.load_weights()` and is selected when `shard_expert_weights` is false.
+With sharded-expert refit, it instead loads supported local expert shards through
+validated destination-local views of canonical vLLM expert parameters. Dense
+or otherwise unhandled tensors use the full-weight path. Before advertising a
+sharded layout, the worker checks the physical expert storage shape and
+backend. The vLLM worker prints timing for each update:
 
 ```text
 [vLLM refit] Loaded ... via checkpoint engine; bytes=... total=... receive=... load=...
 ```
+
+NeMo RL pins the tested vLLM version, but the sharded MoE path still depends on
+vLLM's canonical expert parameter layout. A version bump fails setup if the
+storage dimensions or backend change, and the vLLM unit test compares batched
+W1, W3, and W2 destination-local copies against vLLM's normal full-weight TP
+loading. The residual silent-error risk is a same-shape layout semantic change.
+A vLLM bump must therefore run `tools/refit_verifier.py`; use
+`shard_expert_weights: false` until that verification passes.
 
 Async vLLM uses `checkpoint_engine_rpc_async()` and resolves nested
 `collective_rpc()` awaitables, futures, and Ray object refs before reporting
@@ -221,7 +232,7 @@ not send. A rollout worker connects to the policy metadata entry at its rollout
 rank, so production runs should allocate at least as many policy workers as
 rollout workers for this backend.
 
-When sharded HF refit is enabled, rollout metadata also contains the actual
+When sharded-expert refit is enabled, rollout metadata also contains the actual
 vLLM destination layout for that worker. Each expert parameter reports whether
 vLLM uses expert placement, its local global-expert IDs, and any remaining TP
 coordinate. The layout also includes the missing-layer prefixes that vLLM uses
@@ -260,10 +271,17 @@ path. The current code preinitializes NIXL agents in two places when the config
 selects `backend: nixl`:
 
 - policy worker construction
-- vLLM internal worker construction, via the vLLM worker patch hook
+- vLLM internal worker construction, via vLLM's `worker_cls` hook
 
-The preinit path uses the configured `backend_name` and `backend_init_params`.
-Logs usually show NIXL agents named `preinit-...` during worker setup.
+NeMo RL passes the checkpoint-engine settings through
+`VllmConfig.additional_config`. `NemoRLVllmWorker` creates and retains the
+preinit agent before calling vLLM's worker constructor. The preinit path uses
+the configured `backend_name` and `backend_init_params`; logs usually show
+NIXL agents named `preinit-...` during worker setup.
+
+`worker_extension_cls` remains the RPC extension point. It cannot intercept
+construction in vLLM 0.20 because vLLM appends it after `WorkerBase`, whose
+constructor does not continue the `super()` chain.
 
 ## How NIXL Supports Fault Tolerance
 

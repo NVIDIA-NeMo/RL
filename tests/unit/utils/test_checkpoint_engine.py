@@ -168,7 +168,7 @@ def test_checkpoint_engine_helpers():
     assert isinstance(engine, _PluginCheckpointEngine)
     assert (engine.bucket_size, engine.marker) == (16, "ok")
     assert engine.cleanup_after_load
-    assert not engine.shard_hf_weights
+    assert not engine.shard_expert_weights
     assert engine.get_target_weight_layout() is None
 
     async def roundtrip(bucket_size):
@@ -190,7 +190,7 @@ def test_checkpoint_engine_helpers():
 
 def test_sharded_plugin_requires_target_weight_layout_accessor():
     engine = _PluginCheckpointEngine(bucket_size=16, marker="sharded")
-    engine.shard_hf_weights = True
+    engine.shard_expert_weights = True
 
     with pytest.raises(NotImplementedError, match="get_target_weight_layout"):
         engine.get_target_weight_layout()
@@ -522,7 +522,7 @@ def test_nixl_process_group_uses_parallel_policy_to_rollout_topology():
         engine.prev_agent = None
         engine.next_agent = None
         engine._target_weight_layout = None
-        engine.shard_hf_weights = True
+        engine.shard_expert_weights = True
         engine.agent = MagicMock()
         engine.agent.add_remote_agent.side_effect = lambda metadata: metadata["name"]
         return engine

@@ -53,7 +53,7 @@ def test_checkpoint_engine_worker_lifecycle(monkeypatch):
     )
 
     worker = VllmCheckpointEngineMixin()
-    worker.checkpoint_engine = MagicMock(shard_hf_weights=False)
+    worker.checkpoint_engine = MagicMock(shard_expert_weights=False)
     worker.checkpoint_engine.prepare.return_value = {"agent": "rollout"}
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 2)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)

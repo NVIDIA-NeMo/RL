@@ -39,6 +39,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
+    configure_nixl_worker,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
@@ -299,7 +300,6 @@ class BaseVllmGenerationWorker:
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
-            checkpoint_engine_config=config.get("checkpoint_engine"),
         )
 
         # Skip model loading if we're not the model owner
@@ -340,6 +340,7 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        configure_nixl_worker(self.cfg, vllm_kwargs)
 
         # Calculate total parallel size (TP * PP)
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
