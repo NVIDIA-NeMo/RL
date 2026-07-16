@@ -68,7 +68,6 @@ from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
-
 _POLICY_CONFIG_ADAPTER = TypeAdapter(PolicyConfig)
 
 

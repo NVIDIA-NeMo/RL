@@ -229,9 +229,7 @@ def test_teacher_policy_config_validates_nested_policy_fields():
     policy_config = _make_master_config().teachers[0].policy_config()
 
     assert isinstance(policy_config["tokenizer"], TokenizerConfig)
-    assert isinstance(
-        policy_config["dynamic_batching"], DynamicBatchingConfigDisabled
-    )
+    assert isinstance(policy_config["dynamic_batching"], DynamicBatchingConfigDisabled)
     assert "projection_matrix_path" not in policy_config
     assert "weight" not in policy_config
 
