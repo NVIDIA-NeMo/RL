@@ -18,10 +18,170 @@ on:
     branches:
       - main
 
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
 jobs:
   cherry-pick:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@v0.63.0
-    secrets:
-      PAT: ${{ secrets.PAT }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+    runs-on: ubuntu-latest
+    environment:
+      name: main
+      deployment: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+
+      - name: Cherry pick
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          SLACK_WEBHOOK_ADMIN: "<!subteam^${{ secrets.SLACK_WEBHOOK_ADMIN }}>"
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_RL_ALERTS: ${{ secrets.SLACK_WEBHOOK_RL_ALERTS }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCHES_PATTERN: 'r[0-9]+\.[0-9]+\.[0-9]+'
+        run: |
+          set -x
+          set +e
+
+          git config --global user.email "nemo-bot@nvidia.com"
+          git config --global user.name "NeMo Bot"
+
+          SHA=$(git rev-list --no-merges -n 1 HEAD)
+          MESSAGE=$(git log -n 1 --pretty=format:%s $SHA)
+          PR_ID=$(echo $MESSAGE | awk -F'#' '{print $2}' | awk -F')' '{print $1}')
+          USERNAME=$(git log -n 1 --pretty=format:%ae $SHA | awk -F'@' '{print $1}')
+
+          PR=$(curl -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/$REPOSITORY/pulls/$PR_ID)
+          PR_TITLE=$(echo -E $PR | jq '.title' | tr -d '"')
+
+          LABELS=$(echo -E $PR | jq '.labels | [.[].name] | join(",")' | tr -d '"')
+          AUTHOR=$(echo -E $PR | jq '.user.login' | tr -d '"')
+
+          TARGET_BRANCHES=$(echo "$LABELS" | egrep -o "$TARGET_BRANCHES_PATTERN")
+
+          if [[ $TARGET_BRANCHES == '' ]]; then
+            echo Nothing to cherry-pick
+            exit 0
+          fi
+
+          OVERALL_FAILURE=0
+
+          # Use here-string to avoid pipe subshell so OVERALL_FAILURE propagates
+          while IFS= read -r RELEASE_BRANCH; do
+            TARGET_BRANCH_EXISTS_OK=$([[ "$(git ls-remote --heads origin refs/heads/$RELEASE_BRANCH)" != "" ]] && echo true || echo false)
+
+            if [[ "$TARGET_BRANCH_EXISTS_OK" == "false" ]]; then
+              echo "Release branch $RELEASE_BRANCH does not yet exist, will not cherry-pick"
+              continue
+            fi
+
+            (
+              git fetch origin $RELEASE_BRANCH:$RELEASE_BRANCH
+              git switch --force-create cherry-pick-$PR_ID-$RELEASE_BRANCH $RELEASE_BRANCH
+              git cherry-pick -s $SHA
+              git push -u origin --force cherry-pick-$PR_ID-$RELEASE_BRANCH
+              git checkout ${CI_DEFAULT_BRANCH:-main}
+            )
+
+            CHERRYPICK_SUCCESSFUL=$?
+
+            if [[ $CHERRYPICK_SUCCESSFUL -eq 0 ]]; then
+              PR_URL="https://github.com/$REPOSITORY/pull/$PR_ID"
+
+              MESSAGE="Hi @$AUTHOR 👋,
+
+              we've cherry picked #$PR_ID into \`$RELEASE_BRANCH\` for you! 🚀
+
+              Please review and approve this cherry pick by your convenience!"
+
+              PAYLOAD=$(jq \
+                -n \
+                -c \
+                --arg TITLE "cp: \`$PR_TITLE ($PR_ID)\` into \`$RELEASE_BRANCH\`" \
+                --arg HEAD "cherry-pick-$PR_ID-$RELEASE_BRANCH" \
+                --arg RELEASE_BRANCH "$RELEASE_BRANCH" \
+                --arg BODY "beep boop [🤖]: $MESSAGE" \
+                '{
+                  "title": $TITLE,
+                  "head": $HEAD,
+                  "base": $RELEASE_BRANCH,
+                  "body": $BODY
+                }'
+              )
+
+              NEW_PR=$(curl -L \
+                -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/$REPOSITORY/pulls \
+                -d "$PAYLOAD")
+
+              NEW_PR_ID=$(echo -E $NEW_PR | jq '.number')
+              curl -L \
+                -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/$REPOSITORY/pulls/$NEW_PR_ID/requested_reviewers \
+                -d "{\"reviewers\":[\"$AUTHOR\"]}"
+
+              curl -L \
+                -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                https://api.github.com/repos/$REPOSITORY/issues/$NEW_PR_ID/labels \
+                -d '{"labels":["Run CICD", "cherry-pick"]}'
+
+              if [ -f ".github/copy-pr-bot.yaml" ]; then
+                LATEST_SHA=$(git rev-parse origin/cherry-pick-$PR_ID-$RELEASE_BRANCH)
+                curl -L \
+                  -X POST \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  https://api.github.com/repos/$REPOSITORY/issues/$NEW_PR_ID/comments \
+                  -d "{\"body\":\"/ok to test $LATEST_SHA\"}"
+              fi
+
+            else
+              OVERALL_FAILURE=1
+              URL="https://github.com/$REPOSITORY/pull/$PR_ID"
+
+              SLACK_MESSAGE=$(jq -cn \
+                --arg message "beep boop 🤖: Hey <@$USERNAME>: Cherry-pick of <$URL|#$PR_ID> into \`$RELEASE_BRANCH\` failed (3-way merge impossible).
+
+Please resolve manually and create a PR.
+
+cc: $SLACK_WEBHOOK_ADMIN" \
+                '{
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": { "type": "mrkdwn", "text": $message }
+                    }
+                  ]
+                }')
+
+              curl -X POST -H "Content-type: application/json" --data "$SLACK_MESSAGE" "$SLACK_WEBHOOK"
+
+              if [[ -n "$SLACK_WEBHOOK_RL_ALERTS" ]]; then
+                curl -X POST -H "Content-type: application/json" --data "$SLACK_MESSAGE" "$SLACK_WEBHOOK_RL_ALERTS"
+              fi
+            fi
+
+          done <<< "$TARGET_BRANCHES"
+
+          exit $OVERALL_FAILURE
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
