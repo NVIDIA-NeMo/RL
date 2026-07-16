@@ -4,6 +4,18 @@ This guide explains how to use NeMo RL to train [Qwen2.5-Omni-7B](https://huggin
 
 Each training sample feeds the Qwen2.5-Omni processor both the video stream (8 frames) and the audio track decoded from the same file at 16 kHz mono. Audio and video flow as two **independent multimodal items** per prompt: the dataset emits `{type: video}` + `{type: audio}` content items, the Qwen2.5-Omni chat template renders both `<|VIDEO|>` and `<|AUDIO|>` placeholders, and vLLM rollouts populate `multi_modal_data["video"]` and `multi_modal_data["audio"]` from the same sample.
 
+## 0. Install Audio/Video Dependencies
+
+The NeMo RL container does not ship `torchaudio`, `torchcodec`, or system FFmpeg. Run the helper script once before training or evaluation:
+
+```bash
+bash scripts/install_audio_deps.sh
+```
+
+This installs system FFmpeg (required by `torchcodec` at runtime) and pins `torchaudio==2.11.0` + `torchcodec>=0.3.0` into the container venv. The script is idempotent — re-running it on a machine where the deps are already present exits immediately.
+
+> **Note:** `decord` and `av` (PyAV) are **not** used. Audio and video are decoded via `torchcodec` (backed by system FFmpeg) and `torchaudio` respectively.
+
 ## 1. Train the Model
 
 Run GRPO training with the provided config:
