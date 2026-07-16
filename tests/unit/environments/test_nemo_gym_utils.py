@@ -17,14 +17,93 @@ These run in the default L0 suite. Keep this module free of heavy imports
 (e.g. vllm) so the fast detector tests are not gated behind the nemo_gym extra.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
     _detect_invalid_tool_call_and_malformed_thinking,
+    create_nemo_gym_actor,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    setup_nemo_gym_generation_config,
 )
+
+
+def test_create_nemo_gym_actor_starts_with_generation_endpoints(monkeypatch) -> None:
+    actor = MagicMock()
+    actor._spinup.remote.return_value = "started"
+    actor_class = MagicMock()
+    actor_class.options.return_value.remote.return_value = actor
+
+    monkeypatch.setattr(nemo_gym_mod, "NemoGym", actor_class)
+    monkeypatch.setattr(nemo_gym_mod, "get_actor_python_env", lambda _: "/gym/python")
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_uv_cache_dir", lambda: None)
+    monkeypatch.setattr(nemo_gym_mod, "get_nemo_gym_venv_dir", lambda: None)
+    ray_get = MagicMock(return_value=None)
+    monkeypatch.setattr(nemo_gym_mod.ray, "get", ray_get)
+
+    result = create_nemo_gym_actor(
+        model_name="test-model",
+        base_urls=["http://worker-0:8000/v1"],
+        nemo_gym_config={
+            "config_paths": ["gym.yaml"],
+            "invalid_tool_call_patterns": ["<bad>"],
+        },
+    )
+
+    assert result is actor
+    actor_options = actor_class.options.call_args.kwargs
+    assert actor_options["runtime_env"]["py_executable"] == "/gym/python"
+    nemo_gym_config = actor_class.options.return_value.remote.call_args.args[0]
+    assert nemo_gym_config["model_name"] == "test-model"
+    assert nemo_gym_config["base_urls"] == ["http://worker-0:8000/v1"]
+    assert nemo_gym_config["invalid_tool_call_patterns"] == ["<bad>"]
+    assert nemo_gym_config["initial_global_config_dict"] == {
+        "config_paths": ["gym.yaml"]
+    }
+    ray_get.assert_called_once_with("started")
+
+
+def test_setup_nemo_gym_generation_config_enables_http_rollouts() -> None:
+    generation_config = {
+        "backend": "vllm",
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+        "vllm_cfg": {"async_engine": False, "expose_http_server": False},
+    }
+
+    setup_nemo_gym_generation_config(generation_config)
+
+    assert generation_config["vllm_cfg"]["async_engine"] is True
+    assert generation_config["vllm_cfg"]["expose_http_server"] is True
+    assert generation_config["stop_strings"] is None
+    assert generation_config["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_generation_config_enables_megatron_http_rollouts() -> None:
+    generation_config = {
+        "backend": "megatron",
+        "stop_strings": ["stop"],
+        "stop_token_ids": [1],
+        "mcore_generation_config": {
+            "async_engine": False,
+            "expose_http_server": False,
+        },
+    }
+
+    setup_nemo_gym_generation_config(generation_config)
+
+    assert generation_config["mcore_generation_config"]["async_engine"] is True
+    assert generation_config["mcore_generation_config"]["expose_http_server"] is True
+    assert generation_config["stop_strings"] is None
+    assert generation_config["stop_token_ids"] is None
+
+
+def test_setup_nemo_gym_generation_config_rejects_unsupported_backend() -> None:
+    with pytest.raises(ValueError, match="backend=vllm or backend=megatron"):
+        setup_nemo_gym_generation_config({"backend": "sglang"})
 
 
 @pytest.mark.parametrize(

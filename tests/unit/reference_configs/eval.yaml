@@ -34,6 +34,7 @@ generation:
       gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
       num_nodes: null # Decides number of nodes to be dedicated to generation
 
+policy: null
 
 tokenizer:
   name: ${generation.model_name} ## specify if you'd like to use a tokenizer different from the model's default
@@ -51,6 +52,25 @@ data:
 env:
   math:
     num_workers: 8
+
+logger:
+  log_dir: "logs/eval"
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false # set true to log cluster GPU/host-memory metrics at eval_step
+  wandb:
+    project: "nemo-rl-eval"
+    name: "eval"
+  tensorboard: {}
+  swanlab:
+    project: "nemo-rl-eval"
+    name: "eval"
+  mlflow: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
 
 cluster:
   gpus_per_node: 1
