@@ -37,6 +37,7 @@ run_test() {
 run_test      uv run --no-sync bash ./tests/functional/eval.sh
 run_test      uv run --no-sync bash ./tests/functional/eval_async.sh
 run_test fast uv run --no-sync bash ./tests/functional/eval_audio.sh
+run_test fast uv run --no-sync bash ./tests/functional/eval_daily_omni.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

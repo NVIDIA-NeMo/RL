@@ -457,3 +457,140 @@ class TQPolicy(Policy):
                 warnings.warn(f"Error getting theoretical flops: {e}")
 
         return aggregated_results
+
+    # ── split-API fanout (SC async path) ───────────────────────────────────
+    #
+    # Counterpart to :meth:`train_from_meta`, consumed directly by
+    # :class:`SingleControllerActor` so it can stream microbatches without
+    # forcing a full-step optimizer.step on every dispatch.
+    #
+    # Lifecycle (one step open at a time — workers raise on a second
+    # ``begin``, so no step identifier is threaded through the API):
+    #   begin_train_step                    — open step; broadcast loss_fn/gbs/mbs
+    #   train_microbatches_from_meta (N×)   — DP-sharded fwd/bwd, grads accumulate
+    #   finish_train_step                   — all_reduce + opt.step + sched.step
+    #   abort_train_step                    — drop accumulators, no opt.step
+    #
+    # ``train_from_meta`` is unchanged and remains the sync entrypoint.
+
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open a logical train step on every worker."""
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+        # run_all_workers_single_data returns plain ObjectRefs (one per
+        # GPU), not a MultiWorkerFuture — consume with ray.get, matching
+        # every other single-data fan-out in lm_policy.
+        futures = self.worker_group.run_all_workers_single_data(
+            "begin_train_step_presharded",
+            loss_fn=loss_fn,
+            gbs=batch_size,
+            mbs=micro_batch_size,
+        )
+        ray.get(futures)
+
+    def train_microbatches_from_meta(
+        self,
+        meta: KVBatchMeta,
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """Dispatch one meta slice (DP-sharded) into an open train step.
+
+        Named plural because one call fans out to every DP rank and the
+        backend then iterates its own internal (pipeline/packed)
+        microbatches — with a 2x packing ratio a group of G generations is
+        G/2 backend microbatches inside this single call, not G/2 calls.
+
+        Mirrors the sharding logic of :meth:`train_from_meta` but without
+        a logical-batch sizing constraint: this routes ``meta`` to DP
+        ranks and runs forward+backward; gradients accumulate in
+        ``.grad``. Returns nothing — per-microbatch metrics accumulate in
+        the workers' open-step state and surface once via
+        :meth:`finish_train_step`.
+        """
+        self._stamp_pad_seqlen(meta)
+        spa, dba = self._packing_args("train_mb_tokens")
+        train_meta = replace(
+            meta,
+            fields=list(DP_TRAIN_FIELDS),
+            task_name="train",
+        )
+        with timer.time("policy_training/shard_meta") if timer else nullcontext():
+            dp_metas, _ = shard_meta_for_dp(
+                train_meta,
+                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                batch_size=None,
+                sequence_packing_args=spa,
+                dynamic_batching_args=dba,
+            )
+
+        if self.flops_tracker is not None:
+            for m in dp_metas:
+                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+
+        with (
+            timer.time("policy_training/submit_microbatch_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_microbatch_presharded",
+                meta=dp_metas,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+            )
+        # Wait for completion only — workers return None (metrics
+        # accumulate in their open-step state until finish_train_step).
+        self.worker_group.get_all_worker_results(futures)
+
+    def finish_train_step(self) -> dict[str, Any]:
+        """Close an open train step: all_reduce, rescale, optimizer.step.
+
+        Aggregates per-rank step results into the same shape as
+        :meth:`train_from_meta` so callers don't have to special-case
+        the split path.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "finish_train_step_presharded",
+        )
+        results = ray.get(futures)
+        # Filter to DP-replica leaders only. ``run_all_workers_single_data``
+        # returns one result per GPU (TP×CP×PP×DP), but TP/CP/non-last-PP
+        # twins hold identical copies of their DP shard's metric list.
+        # Aggregating without dedup inflates every per-token metric by
+        # TP*CP*(1 if PP==1 else PP_last_stage_count). ``train_from_meta``
+        # gets this for free via ``output_is_replicated`` on its sharded
+        # dispatch; finish has no data to shard, so we dedupe here.
+        leader_results = [r for r in results if r.get("is_replica_leader", True)]
+        aggregated_results = _aggregate_train_results(leader_results)
+
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+
+        return aggregated_results
+
+    def abort_train_step(self) -> None:
+        """Drop partial step state on every worker. No optimizer.step."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "abort_train_step_presharded",
+        )
+        ray.get(futures)
+
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()

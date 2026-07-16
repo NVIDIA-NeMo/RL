@@ -41,7 +41,7 @@ Explore the current features and upcoming enhancements in NeMo RL, including dis
 :link: about/tips-and-tricks
 :link-type: doc
 
-Troubleshooting common issues including missing submodules, Ray dashboard access, and debugging techniques.
+Troubleshooting common issues including missing submodules and memory fragmentation.
 :::
 
 ::::
@@ -73,10 +73,10 @@ Learn how to evaluate your models using built-in evaluation datasets and custom 
 :::
 
 :::{grid-item-card} {octicon}`server` Cluster Setup
-:link: about/clusters
+:link: cluster
 :link-type: doc
 
-Configure and deploy NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
+Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
 :::
 
 ::::
@@ -119,6 +119,13 @@ Configure offline and online Eagle3 draft-model workflows to accelerate rollout 
 :link-type: doc
 
 Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
+:::
+
+:::{grid-item-card} {octicon}`device-camera-video` Audio-Visual Intent GRPO
+:link: guides/grpo-audio-visual
+:link-type: doc
+
+Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and evaluate on Daily-Omni, following HumanOmniV2's joint audio-visual setup.
 :::
 
 :::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
@@ -190,7 +197,6 @@ Optimize large language models with FP8 quantization for faster training and inf
 
 Run quantization-aware GRPO and distillation using NVIDIA ModelOpt.
 Includes NVFP4 W4A16 real rollout.
-W4A8 rollout uses fake quantization.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
@@ -216,9 +222,12 @@ Comprehensive reference for all NeMo RL modules, classes, functions, and methods
 
 ::::
 
+## Full Documentation Index
+
+The complete table of contents below lists all pages, including guide, development, and design-doc pages that are not shown in the cards above.
+
 ```{toctree}
 :caption: About
-:hidden:
 
 about/overview
 about/performance-summary
@@ -237,7 +246,6 @@ about/tips-and-tricks
 
 ```{toctree}
 :caption: Environment Start
-:hidden:
 
 local-workstation.md
 cluster.md
@@ -246,14 +254,12 @@ cluster.md
 
 ```{toctree}
 :caption: E2E Examples
-:hidden:
 
 guides/sft-openmathinstruct2.md
 ```
 
 ```{toctree}
 :caption: Guides
-:hidden:
 
 guides/nemotron-3-nano.md
 guides/nemotron-3-nano-omni.md
@@ -271,6 +277,7 @@ guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
+guides/grpo-audio-visual.md
 guides/rm.md
 guides/environments.md
 guides/eval.md
@@ -289,14 +296,12 @@ guides/ft-launcher-guide.md
 
 ```{toctree}
 :caption: Containers
-:hidden:
 
 docker.md
 ```
 
 ```{toctree}
 :caption: Development
-:hidden:
 
 ci-cd.md
 testing.md
@@ -309,7 +314,6 @@ guides/use-custom-vllm.md
 
 ```{toctree}
 :caption: Design Docs
-:hidden:
 
 design-docs/design-and-philosophy.md
 design-docs/padding.md
@@ -329,7 +333,6 @@ design-docs/nemo-gym-integration.md
 
 ```{toctree}
 :caption: API Reference
-:hidden:
 
 apidocs/index
 ```

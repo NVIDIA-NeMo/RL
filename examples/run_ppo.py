@@ -52,7 +52,7 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "ppo_math_1B_megatron.yaml"
+            os.path.dirname(__file__), "configs", "ppo_math_1B.yaml"
         )
 
     config = load_config(args.config)
@@ -114,23 +114,26 @@ def main() -> None:
 
     print("🚀 Running synchronous PPO training")
 
-    # Run standard PPO training
-    ppo_train(
-        policy,
-        policy_generation,
-        value_model,
-        dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        value_loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        ppo_state,
-        master_config,
-    )
+    # Run standard PPO training. The checkpointer owns background
+    # async-checkpoint finalization threads; the context manager guarantees they
+    # are flushed (rename + delete) on exit.
+    with checkpointer:
+        ppo_train(
+            policy,
+            policy_generation,
+            value_model,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            value_loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            ppo_state,
+            master_config,
+        )
 
 
 if __name__ == "__main__":

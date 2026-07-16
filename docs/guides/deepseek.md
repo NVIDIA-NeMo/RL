@@ -12,7 +12,7 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 DeepSeek-V3-FP8
 # clone DeepSeek-V3 code
 git clone https://github.com/deepseek-ai/DeepSeek-V3.git
 
-# transformers (since v4.23.0) (checks for tensor format in the metadata)[https://github.com/huggingface/transformers/blob/9ae22fe3c1b81f99a764d382054b6ebe2b025bd4/src/transformers/modeling_utils.py#L388]
+# transformers (since v4.23.0) [checks for tensor format in the metadata](https://github.com/huggingface/transformers/blob/9ae22fe3c1b81f99a764d382054b6ebe2b025bd4/src/transformers/modeling_utils.py#L388)
 cd DeepSeek-V3/inference
 sed -i '88{s/new_safetensor_file/new_safetensor_file, metadata={"format": "pt"}/}' fp8_cast_bf16.py
 
