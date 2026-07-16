@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import ray
@@ -960,6 +960,10 @@ def test_async_grpo_train_propagates_training_errors_after_cleanup(
     policy.train.side_effect = RuntimeError("intentional async training failure")
     policy_generation = _mock_policy_generation()
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    lifecycle = MagicMock()
+    lifecycle.attach_mock(mock_grpo_components["logger"].close, "logger_close")
+    lifecycle.attach_mock(policy_generation.shutdown, "generation_shutdown")
+    lifecycle.attach_mock(policy.shutdown, "policy_shutdown")
 
     with (
         mock_async_grpo_infrastructure(mock_batch, {}),
@@ -983,6 +987,12 @@ def test_async_grpo_train_propagates_training_errors_after_cleanup(
 
     policy_generation.shutdown.assert_called_once_with()
     policy.shutdown.assert_called_once_with()
+    mock_grpo_components["logger"].close.assert_called_once_with()
+    assert lifecycle.method_calls == [
+        call.logger_close(),
+        call.generation_shutdown(),
+        call.policy_shutdown(),
+    ]
 
 
 @ray.remote(num_cpus=0)

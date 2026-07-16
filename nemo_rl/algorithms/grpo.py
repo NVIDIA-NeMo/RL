@@ -4452,6 +4452,11 @@ def async_grpo_train(
 
     finally:
         # Clean up
+        # Stop GPU polling while the Ray actors it samples are still alive.
+        # Waiting for Logger.__del__ runs this after actor teardown and can leave
+        # the monitor repeatedly polling disconnected Ray endpoints.
+        logger.close()
+
         print("🛑 Stopping trajectory collection...")
         try:
             ray.kill(trajectory_collector)

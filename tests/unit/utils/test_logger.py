@@ -986,6 +986,38 @@ class TestRayGpuMonitorLogger:
 
             # Verify monitor state
             assert monitor.is_running is False
+            assert monitor.collection_thread is None
+
+            # Repeated lifecycle cleanup must not flush or log twice.
+            monitor.stop()
+            mock_flush.assert_called_once()
+
+    @patch("nemo_rl.utils.logger.ray")
+    def test_collection_error_during_stop_is_suppressed(self, mock_ray):
+        """A collection racing with stop should exit without retry noise."""
+        mock_ray.is_initialized.return_value = True
+        monitor = RayGpuMonitorLogger(
+            collection_interval=10.0,
+            flush_interval=60.0,
+            metric_prefix="test",
+            step_metric="test/step",
+            parent_logger=None,
+        )
+        monitor.is_running = True
+
+        def fail_after_stop():
+            monitor.is_running = False
+            raise RuntimeError("Connection lost")
+
+        with (
+            patch.object(monitor, "_collect_metrics", side_effect=fail_after_stop),
+            patch("nemo_rl.utils.logger.time.sleep") as mock_sleep,
+            patch("builtins.print") as mock_print,
+        ):
+            monitor._collection_loop()
+
+        mock_sleep.assert_not_called()
+        mock_print.assert_not_called()
 
     @patch("nemo_rl.utils.logger.ray")
     def test_parse_metric(self, mock_ray):
@@ -1495,6 +1527,20 @@ class TestLogger:
         temp_dir = tempfile.mkdtemp()
         yield temp_dir
         shutil.rmtree(temp_dir)
+
+    def test_close_stops_gpu_monitor_once(self):
+        """Explicit cleanup stops monitoring and breaks its parent cycle."""
+        logger = Logger.__new__(Logger)
+        monitor = MagicMock()
+        monitor.parent_logger = logger
+        logger.gpu_monitor = monitor
+
+        logger.close()
+        logger.close()
+
+        monitor.stop.assert_called_once_with()
+        assert monitor.parent_logger is None
+        assert logger.gpu_monitor is None
 
     @patch("nemo_rl.utils.logger.WandbLogger")
     @patch("nemo_rl.utils.logger.TensorboardLogger")

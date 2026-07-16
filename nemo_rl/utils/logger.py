@@ -531,9 +531,13 @@ class RayGpuMonitorLogger:
 
     def stop(self) -> None:
         """Stop the GPU monitoring thread."""
+        if not self.is_running and self.collection_thread is None:
+            return
+
         self.is_running = False
         if self.collection_thread:
             self.collection_thread.join(timeout=self.collection_interval * 2)
+            self.collection_thread = None
 
         # Final flush
         self.flush()
@@ -567,6 +571,8 @@ class RayGpuMonitorLogger:
 
                 time.sleep(self.collection_interval)
             except Exception as e:
+                if not self.is_running:
+                    break
                 print(
                     f"Error in GPU monitoring collection loop or stopped abruptly: {e}"
                 )
@@ -1285,10 +1291,27 @@ class Logger(LoggerInterface):
 
         plt.close(fig)
 
+    def close(self) -> None:
+        """Stop background logging before the resources it samples are destroyed."""
+        gpu_monitor = self.gpu_monitor
+        if gpu_monitor is None:
+            return
+
+        # Clear the reference first so close() and the destructor are idempotent.
+        self.gpu_monitor = None
+        try:
+            gpu_monitor.stop()
+        finally:
+            # Break the parent/monitor reference cycle after the final flush.
+            gpu_monitor.parent_logger = None
+
     def __del__(self) -> None:
         """Clean up resources when the logger is destroyed."""
-        if self.gpu_monitor:
-            self.gpu_monitor.stop()
+        try:
+            self.close()
+        except Exception:
+            # Destructors must not turn interpreter shutdown into a job failure.
+            pass
 
 
 def flatten_dict(
