@@ -47,6 +47,9 @@ ppo:
     source_max: 1.0
     target_min: -1.0  # DAPO: scale rewards to [-1, 1]
     target_max: 1.0
+  # Log train/generation probability mismatch. Set a threshold to mask
+  # high-error sequences; null keeps metrics-only behavior.
+  seq_logprob_error_threshold: null
 
 loss_fn:
   disable_ppo_ratio: false
