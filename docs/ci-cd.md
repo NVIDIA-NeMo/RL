@@ -37,7 +37,6 @@ All PRs must pass these checks before merging:
 - **DCO sign-off**: all commits must be signed with `--signoff` (see [CONTRIBUTING.md](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md))
 - **Secrets detection**: scans for accidentally committed secrets
 - **Submodule validation**: Automodel submodule must be fast-forwarded from the base branch
-- **Megatron-Bridge dependency sync**: `pyproject.toml` dependencies must match the Megatron-Bridge submodule metadata
 
 ## CI Pipeline Architecture
 
@@ -90,10 +89,10 @@ All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
 | `detect-secrets.yml` | PR | Secrets scanning |
 | `semantic-pull-request.yml` | PR | PR title validation |
 | `labeler.yaml` | PR | Auto-label by file path |
+| `lockfile-check.yml` | PR (dependency paths) | uv.lock freshness vs submodule pyprojects |
 | `claude-review.yml` | `/claude-review` comment | AI code review |
 | `healthcheck_vms.yml` | schedule (07:00 UTC), dispatch | GPU runner health |
 | `automodel-submodule-checks.yml` | PR | Submodule validation |
-| `mbridge-deps-sync.yml` | PR (specific paths) | Dependency sync check |
 | `merge-queue-retry.yml` | PR dequeued (timeout) | Auto-retry merge queue |
 | `cherry-pick-release-commit.yml` | push main | Release cherry-picks |
 | `close-inactive-issue-pr.yml` | schedule (01:30 UTC) | Stale issue/PR cleanup |

@@ -78,6 +78,56 @@ git commit -s -m "build: add <package> dependency"
 
 ---
 
+## Bumping Megatron-Bridge (and Megatron-LM)
+
+`megatron-bridge` is installed directly from the submodule's own `pyproject.toml`
+(`[tool.uv.sources]` points at `3rdparty/Megatron-Bridge-workspace/Megatron-Bridge`),
+and `megatron-core` at the Megatron-LM checkout nested inside it. Their dependency
+lists — including `megatron-core[dev,mlm]` — flow transitively, so there is **no
+mirrored dependency list to maintain** in NeMo RL.
+
+The bump procedure is:
+
+```bash
+# 1. Check out the new Megatron-Bridge commit (brings its pinned Megatron-LM along)
+cd 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
+git fetch origin && git checkout <new-commit>
+git submodule update --init --recursive
+cd -
+
+# 2. Relock. uv detects the submodule pyproject.toml change automatically and
+#    rebuilds megatron-bridge's metadata (~1 min warm cache, ~3 min cold).
+uv lock
+
+# 3. Review `git diff uv.lock`, then commit the submodule pointer and uv.lock together.
+```
+
+### When `uv lock` errors after a bump
+
+- **`Package X was included as a URL dependency. URL dependencies must be expressed
+  as direct requirements or constraints`** — upstream changed or added a git/URL dep
+  in Megatron-Bridge's or Megatron-LM's `[tool.uv.sources]` (e.g., Megatron-LM bumping
+  its `emerging-optimizers` rev). uv requires such URLs to also appear as a direct
+  requirement or constraint of the root project: update the matching pin in
+  `constraint-dependencies` (where `emerging-optimizers` and `fast-hadamard-transform`
+  live today) / the `mcore` extra / `[tool.uv.sources]` / `override-dependencies` in
+  `pyproject.toml` to the same URL/rev.
+- **Version conflicts** — resolve via `[tool.uv] override-dependencies` in
+  `pyproject.toml`, same as any other conflict.
+
+### Known fragilities
+
+- uv currently does **not** enforce `requires-python` for path dependencies
+  (Megatron-Bridge caps `<3.13` while NeMo RL runs 3.13). If a future uv upgrade
+  starts enforcing it, `uv lock` will fail loudly: ask upstream to relax the cap,
+  or reintroduce a thin proxy package with its own `pyproject.toml`.
+- Megatron-Bridge's and Megatron-LM's own `[tool.uv.sources]` are honored for their
+  dependencies. Root-level pins (e.g., `nvidia-modelopt` from git) win only because
+  they are direct requirements of NeMo RL — don't remove those direct deps without
+  re-checking where the transitive resolution lands.
+
+---
+
 ## Common Pitfalls
 
 | Problem | Cause | Fix |
