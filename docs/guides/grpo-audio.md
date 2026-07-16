@@ -4,7 +4,7 @@
 > Run the following script once before training or evaluation:
 >
 > ```bash
-> bash scripts/install_audio_deps.sh
+> bash tools/install_audio_deps.sh
 > ```
 >
 > The script is a no-op if they are already installed. Audio tests run it automatically.

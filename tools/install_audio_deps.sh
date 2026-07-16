@@ -3,7 +3,7 @@
 #
 # Run this script before using audio features or running audio tests:
 #
-#   bash scripts/install_audio_deps.sh
+#   bash tools/install_audio_deps.sh
 #
 # Safe to call multiple times — exits immediately if already installed.
 set -euo pipefail

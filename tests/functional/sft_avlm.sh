@@ -11,7 +11,7 @@ git config --global --add safe.directory $PROJECT_ROOT
 set -eou pipefail
 
 # Audio/video deps (torchaudio/torchcodec/ffmpeg) are not in the shipped container.
-bash "$PROJECT_ROOT/scripts/install_audio_deps.sh"
+bash "$PROJECT_ROOT/tools/install_audio_deps.sh"
 
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME

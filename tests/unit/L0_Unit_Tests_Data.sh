@@ -19,6 +19,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
 # Audio/video deps (torchaudio/torchcodec/ffmpeg) are not in the shipped container.
 # Data unit tests (e.g. dailyomni) decode real audio/video via these deps.
-bash "$PROJECT_ROOT/scripts/install_audio_deps.sh"
+bash "$PROJECT_ROOT/tools/install_audio_deps.sh"
 
 uv run --no-sync bash -x ./tests/run_unit.sh "unit/data/" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated

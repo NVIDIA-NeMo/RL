@@ -9,7 +9,7 @@ Each training sample feeds the Qwen2.5-Omni processor both the video stream (8 f
 The NeMo RL container does not ship `torchaudio`, `torchcodec`, or system FFmpeg. Run the helper script once before training or evaluation:
 
 ```bash
-bash scripts/install_audio_deps.sh
+bash tools/install_audio_deps.sh
 ```
 
 This installs system FFmpeg (required by `torchcodec` at runtime) and pins `torchaudio==2.11.0` + `torchcodec>=0.3.0` into the container venv. The script is idempotent — re-running it on a machine where the deps are already present exits immediately.
