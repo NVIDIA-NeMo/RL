@@ -31,8 +31,6 @@ policy:
       mm_processor_cache_gb: 0
       limit_mm_per_prompt:
         audio: 1
-      compilation_config:
-        custom_ops: ["all", "-sequence_parallel_chunk"]
   megatron_cfg:
     converter_type: Qwen3OmniMoeForConditionalGeneration
     expert_model_parallel_size: 8
