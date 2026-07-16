@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
@@ -697,6 +701,429 @@ def test_create_advantage_estimator_requires_adv_estimator_key():
 
 
 # ============================================================================
+# Tests for PPO train/generation logprob mismatch handling
+# ============================================================================
+
+
+def _make_logprob_mismatch_data() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "token_mask": torch.ones(3, 4),
+            "sample_mask": torch.tensor([1.0, 1.0, 0.0]),
+            "prev_logprobs": torch.zeros(3, 4),
+            "generation_logprobs": torch.tensor(
+                [
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.6931472, 0.6931472, 0.6931472],
+                    [0.0, 1.0986123, 1.0986123, 1.0986123],
+                ]
+            ),
+        }
+    )
+
+
+def test_ppo_seq_logprob_error_metrics_do_not_mask_without_threshold():
+    from nemo_rl.algorithms.ppo import _apply_ppo_seq_logprob_error_masking
+
+    train_data = _make_logprob_mismatch_data()
+    advantage_mask, metrics = _apply_ppo_seq_logprob_error_masking(
+        train_data=train_data,
+        rewards=torch.tensor([0.0, 1.0, 1.0]),
+        seq_logprob_error_threshold=None,
+    )
+
+    expected_sample_mask = torch.tensor([1.0, 1.0, 0.0])
+    torch.testing.assert_close(train_data["sample_mask"], expected_sample_mask)
+    torch.testing.assert_close(
+        advantage_mask,
+        train_data["token_mask"] * expected_sample_mask.unsqueeze(-1),
+    )
+    assert metrics["num_masked_seqs_by_logprob_error"] == 0
+    assert "num_masked_seqs" not in metrics
+    assert metrics["max_seq_mult_prob_error"] == pytest.approx(2.0)
+
+
+def test_ppo_seq_logprob_error_mask_returns_combined_advantage_mask():
+    from nemo_rl.algorithms.ppo import _apply_ppo_seq_logprob_error_masking
+
+    train_data = _make_logprob_mismatch_data()
+    advantage_mask, metrics = _apply_ppo_seq_logprob_error_masking(
+        train_data=train_data,
+        rewards=torch.tensor([0.0, 1.0, 1.0]),
+        seq_logprob_error_threshold=1.5,
+    )
+
+    expected_sample_mask = torch.tensor([1.0, 0.0, 0.0])
+    torch.testing.assert_close(train_data["sample_mask"], expected_sample_mask)
+    torch.testing.assert_close(
+        advantage_mask,
+        train_data["token_mask"] * expected_sample_mask.unsqueeze(-1),
+    )
+    assert metrics["num_masked_seqs_by_logprob_error"] == 1
+
+
+def test_ppo_seq_logprob_error_mask_rejects_all_masked_batch():
+    from nemo_rl.algorithms.ppo import _apply_ppo_seq_logprob_error_masking
+
+    train_data = _make_logprob_mismatch_data()
+    with pytest.raises(
+        RuntimeError,
+        match="no valid response tokens after filtering",
+    ):
+        _apply_ppo_seq_logprob_error_masking(
+            train_data=train_data,
+            rewards=torch.tensor([0.0, 1.0, 1.0]),
+            seq_logprob_error_threshold=0.5,
+        )
+
+
+def _make_ppo_loop_batch() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "prompt-0",
+                        "token_ids": torch.tensor([1]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "answer-0",
+                        "token_ids": torch.tensor([2, 3]),
+                    },
+                ],
+                [
+                    {
+                        "role": "user",
+                        "content": "prompt-1",
+                        "token_ids": torch.tensor([1]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "answer-1",
+                        "token_ids": torch.tensor([4, 5]),
+                    },
+                ],
+            ],
+            "total_reward": torch.tensor([0.0, 1.0]),
+            "loss_multiplier": torch.ones(2),
+            "truncated": torch.zeros(2, dtype=torch.bool),
+            "length": torch.ones(2, dtype=torch.int32),
+        }
+    )
+
+
+def _run_mock_ppo_train(
+    monkeypatch,
+    *,
+    max_num_steps: int,
+    ppo_epochs: int,
+    seq_logprob_error_threshold: float | None,
+    policy_training_start_step: int = 0,
+):
+    """Run the real PPO loop with deterministic in-process collaborators."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    events: list[str] = []
+    generation_logprobs = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.6931472, 0.6931472],
+        ]
+    )
+
+    def fake_flatten(message_logs, *_args, **_kwargs):
+        batch_size = len(message_logs)
+        return (
+            BatchedDataDict(
+                {
+                    "token_ids": torch.tensor([[1, 2, 3], [1, 4, 5]])[:batch_size],
+                    "generation_logprobs": generation_logprobs[:batch_size].clone(),
+                    "token_loss_mask": torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]])[
+                        :batch_size
+                    ],
+                    "content": [["prompt", "answer"] for _ in range(batch_size)],
+                }
+            ),
+            torch.full((batch_size,), 3, dtype=torch.int32),
+        )
+
+    class DummyAdvantageEstimator:
+        def __init__(self):
+            self.masks = []
+
+        def compute_advantage(self, **kwargs):
+            mask = kwargs["mask"].clone()
+            self.masks.append(mask)
+            return mask.clone(), mask.clone()
+
+    class DummyTimer:
+        def time(self, *_args, **_kwargs):
+            return nullcontext()
+
+        def get_timing_metrics(self, **_kwargs):
+            return {"total_step_time": 1.0}
+
+        def reset(self):
+            pass
+
+    class DummyTimeoutChecker:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start_iterations(self):
+            pass
+
+        def mark_iteration(self):
+            pass
+
+        def check_save(self):
+            return False
+
+    class DummyMemoryTracker:
+        def snapshot_start_of_stage(self, *_args, **_kwargs):
+            pass
+
+    class DummyLoader:
+        def __init__(self, batches):
+            self.batches = batches
+
+        def __iter__(self):
+            return iter(self.batches)
+
+        def __len__(self):
+            return len(self.batches)
+
+    train_result = {
+        "loss": torch.tensor([0.1]),
+        "grad_norm": torch.tensor([1.0]),
+        "all_mb_metrics": {},
+    }
+    value_result = {
+        "loss": torch.tensor([0.2]),
+        "grad_norm": torch.tensor([2.0]),
+        "all_mb_metrics": {},
+    }
+
+    policy = MagicMock()
+    policy.prepare_for_lp_inference.side_effect = lambda: events.append("policy_lp")
+    policy.offload_to_cpu.side_effect = lambda: events.append("policy_offload")
+    policy.prepare_for_training.side_effect = lambda: events.append("policy_train_prep")
+    policy.train.side_effect = lambda *_args, **_kwargs: (
+        events.append("policy_train") or train_result
+    )
+    policy.get_logprobs.return_value = {"logprobs": torch.zeros(2, 3)}
+    policy.get_reference_policy_logprobs.return_value = {
+        "reference_logprobs": torch.zeros(2, 3)
+    }
+
+    value_model = MagicMock()
+    value_model.finish_training.side_effect = lambda: events.append("value_finish")
+    value_model.get_values.return_value = {"values": torch.zeros(2, 3, 1)}
+    value_model.train.side_effect = lambda *_args, **_kwargs: (
+        events.append("value_train") or value_result
+    )
+
+    policy_generation = MagicMock()
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.prepare_for_generation.side_effect = lambda: events.append(
+        "generation_prepare"
+    )
+    policy_generation.get_logger_metrics.return_value = {}
+    policy_generation.get_step_metrics.return_value = {}
+
+    def fake_rollout(*_args, input_batch, **_kwargs):
+        events.append("rollout")
+        return input_batch, {"mean_gen_tokens_per_sample": 2.0}
+
+    refit = MagicMock(side_effect=lambda *_args, **_kwargs: events.append("refit"))
+    advantage_estimator = DummyAdvantageEstimator()
+
+    monkeypatch.setattr(ppo_mod, "Timer", DummyTimer)
+    monkeypatch.setattr(ppo_mod, "TimeoutChecker", DummyTimeoutChecker)
+    monkeypatch.setattr(ppo_mod, "MemoryTracker", DummyMemoryTracker)
+    monkeypatch.setattr(ppo_mod, "maybe_gpu_profile_step", lambda *_args: None)
+    monkeypatch.setattr(ppo_mod, "print_performance_metrics", lambda *_args: {})
+    monkeypatch.setattr(ppo_mod, "scale_rewards", lambda batch, _config: batch)
+    monkeypatch.setattr(ppo_mod, "_should_use_nemo_gym", lambda _config: False)
+    monkeypatch.setattr(ppo_mod, "_should_use_async_rollouts", lambda _config: False)
+    monkeypatch.setattr(ppo_mod, "run_multi_turn_rollout", fake_rollout)
+    monkeypatch.setattr(ppo_mod, "refit_policy_generation", refit)
+    monkeypatch.setattr(ppo_mod, "batched_message_log_to_flat_message", fake_flatten)
+    monkeypatch.setattr(
+        ppo_mod,
+        "extract_initial_prompt_messages",
+        lambda message_logs, _lengths: message_logs,
+    )
+    monkeypatch.setattr(
+        ppo_mod,
+        "_create_advantage_estimator",
+        lambda _config: advantage_estimator,
+    )
+
+    master_config = SimpleNamespace(
+        ppo={
+            "max_num_steps": max_num_steps,
+            "max_num_epochs": 1,
+            "max_rollout_turns": 1,
+            "num_prompts_per_step": 2,
+            "num_generations_per_prompt": 1,
+            "overlong_filtering": False,
+            "policy_training_start_step": policy_training_start_step,
+            "ppo_epochs": ppo_epochs,
+            "reward_scaling": {"enabled": False},
+            "reward_shaping": {"enabled": False},
+            "seq_logprob_error_threshold": seq_logprob_error_threshold,
+            "val_at_start": False,
+            "val_at_end": False,
+            "val_period": 0,
+        },
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": False},
+                "vllm_cfg": {"async_engine": False},
+            },
+            "max_total_sequence_length": 3,
+            "make_sequence_length_divisible_by": 1,
+        },
+        loss_fn=_make_loss_config(),
+        checkpointing={
+            "enabled": False,
+            "checkpoint_must_save_by": None,
+            "save_period": 100,
+            "metric_name": None,
+        },
+        cluster={"num_nodes": 1, "gpus_per_node": 2},
+    )
+
+    logger = MagicMock()
+    checkpointer = MagicMock()
+    checkpointer.save_optimizer = False
+    dataloader = DummyLoader([_make_ppo_loop_batch() for _ in range(max_num_steps)])
+    tokenizer = SimpleNamespace(pad_token_id=0)
+
+    ppo_mod.ppo_train(
+        policy,
+        policy_generation,
+        value_model,
+        dataloader,
+        None,
+        tokenizer,
+        MagicMock(),
+        MagicMock(),
+        {},
+        None,
+        logger,
+        checkpointer,
+        ppo_mod._default_ppo_save_state(),
+        master_config,
+    )
+
+    return SimpleNamespace(
+        policy=policy,
+        policy_generation=policy_generation,
+        value_model=value_model,
+        logger=logger,
+        checkpointer=checkpointer,
+        advantage_estimator=advantage_estimator,
+        refit=refit,
+        events=events,
+    )
+
+
+def test_ppo_train_noncolocated_refit_offload_lifecycle(monkeypatch):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        max_num_steps=2,
+        ppo_epochs=2,
+        seq_logprob_error_threshold=None,
+    )
+
+    assert harness.refit.call_count == 2
+    assert harness.policy.train.call_count == 4
+    assert harness.value_model.train.call_count == 4
+    assert harness.policy.offload_to_cpu.call_count == 4
+    harness.policy_generation.prepare_for_generation.assert_not_called()
+    assert harness.policy_generation.finish_generation.call_count == 2
+
+    for call in harness.refit.call_args_list:
+        assert call.args[0] is harness.policy
+        assert call.args[1] is harness.policy_generation
+        assert call.args[2] is False
+
+    refit_indices = [
+        index for index, event in enumerate(harness.events) if event == "refit"
+    ]
+    for index in refit_indices:
+        assert harness.events[index - 2 : index + 3] == [
+            "value_finish",
+            "policy_lp",
+            "refit",
+            "policy_offload",
+            "rollout",
+        ]
+
+
+def test_ppo_train_critic_warmup_reuses_generation_until_policy_update(monkeypatch):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        max_num_steps=2,
+        ppo_epochs=1,
+        seq_logprob_error_threshold=None,
+        policy_training_start_step=1,
+    )
+
+    assert harness.refit.call_count == 1
+    assert harness.policy_generation.prepare_for_generation.call_count == 1
+    assert harness.policy.train.call_count == 1
+    assert harness.value_model.train.call_count == 2
+    assert harness.policy_generation.finish_generation.call_count == 2
+
+    rollout_indices = [
+        index for index, event in enumerate(harness.events) if event == "rollout"
+    ]
+    assert harness.events[rollout_indices[1] - 1 : rollout_indices[1] + 1] == [
+        "generation_prepare",
+        "rollout",
+    ]
+
+
+def test_ppo_train_wires_logprob_mask_to_advantage_training_and_metrics(monkeypatch):
+    harness = _run_mock_ppo_train(
+        monkeypatch,
+        max_num_steps=1,
+        ppo_epochs=1,
+        seq_logprob_error_threshold=1.5,
+    )
+
+    expected_sample_mask = torch.tensor([1.0, 0.0])
+    expected_advantage_mask = torch.tensor([[0.0, 1.0, 1.0], [0.0, 0.0, 0.0]])
+    torch.testing.assert_close(
+        harness.advantage_estimator.masks[0], expected_advantage_mask
+    )
+
+    policy_train_data = harness.policy.train.call_args.args[0]
+    value_train_data = harness.value_model.train.call_args.args[0]
+    torch.testing.assert_close(policy_train_data["sample_mask"], expected_sample_mask)
+    torch.testing.assert_close(value_train_data["sample_mask"], expected_sample_mask)
+
+    final_train_metrics = [
+        call.args[0]
+        for call in harness.logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+        and "num_masked_seqs_by_logprob_error" in call.args[0]
+    ]
+    assert len(final_train_metrics) == 1
+    assert final_train_metrics[0]["num_masked_seqs_by_logprob_error"] == 1
+    assert final_train_metrics[0]["max_seq_mult_prob_error"] == pytest.approx(2.0)
+    assert final_train_metrics[0]["advantages/mean"] == pytest.approx(1.0)
+    assert final_train_metrics[0]["advantages/min"] == pytest.approx(1.0)
+    assert final_train_metrics[0]["advantages/max"] == pytest.approx(1.0)
+
+
+# ============================================================================
 # Tests for non-colocated setup
 # ============================================================================
 
@@ -710,6 +1137,7 @@ def _make_noncolocated_setup_config(
     inference_gpus_per_node: int | None = 2,
     reward_model_gpus_per_node: int | None = None,
     segment_size: int | None = None,
+    tensor_parallel_size: int = 1,
 ):
     """Build the minimal config needed to exercise PPO cluster setup."""
     from nemo_rl.algorithms.ppo import MasterConfig
@@ -722,7 +1150,9 @@ def _make_noncolocated_setup_config(
     }
     env_config = {}
     if reward_model_gpus_per_node is not None:
-        data_config["default"] = {"env_name": "reward_model"}
+        data_config["train"] = [
+            {"dataset_name": "fake-dataset", "env_name": "reward_model"}
+        ]
         env_config["reward_model"] = {
             "resources": {
                 "num_nodes": 1,
@@ -749,7 +1179,7 @@ def _make_noncolocated_setup_config(
                 "vllm_cfg": {
                     "precision": "bf16",
                     "kv_cache_dtype": "auto",
-                    "tensor_parallel_size": 1,
+                    "tensor_parallel_size": tensor_parallel_size,
                     "pipeline_parallel_size": 1,
                 },
                 "vllm_kwargs": {},
@@ -857,6 +1287,7 @@ def _run_noncolocated_setup(monkeypatch, config):
     class DummyCluster:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.get_placement_groups_called = False
             cluster_calls.append(self)
 
         def world_size(self):
@@ -864,6 +1295,10 @@ def _run_noncolocated_setup(monkeypatch, config):
 
         def get_master_address_and_port(self):
             return "127.0.0.1", 1234
+
+        def get_placement_groups(self):
+            self.get_placement_groups_called = True
+            return []
 
     policy = MagicMock()
     policy.prepare_refit_info.return_value = {"state": "dict"}
@@ -874,12 +1309,13 @@ def _run_noncolocated_setup(monkeypatch, config):
     policy_factory = MagicMock(return_value=policy)
     value_factory = MagicMock(return_value=value_model)
     generation_factory = MagicMock(return_value=generation)
+    ray_get = MagicMock(side_effect=lambda futures: futures)
 
     monkeypatch.setattr(ppo_mod, "RayVirtualCluster", DummyCluster)
     monkeypatch.setattr(ppo_mod, "Policy", policy_factory)
     monkeypatch.setattr(ppo_mod, "Value", value_factory)
     monkeypatch.setattr(ppo_mod, "VllmGeneration", generation_factory)
-    monkeypatch.setattr(ppo_mod.ray, "get", lambda futures: futures)
+    monkeypatch.setattr(ppo_mod.ray, "get", ray_get)
 
     result = ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
     return (
@@ -890,6 +1326,7 @@ def _run_noncolocated_setup(monkeypatch, config):
         policy_factory,
         value_factory,
         generation_factory,
+        ray_get,
     )
 
 
@@ -991,6 +1428,105 @@ def test_noncolocated_topology_requires_enough_alive_nodes(monkeypatch):
     cluster_cls.assert_not_called()
 
 
+def test_noncolocated_topology_counts_shared_node_once(monkeypatch):
+    """A one-node GPU split must not require two physical Ray nodes."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    monkeypatch.setattr(
+        ppo_mod,
+        "get_ray_cluster_topology",
+        lambda: {"node-0": ("domain-0", 0)},
+    )
+    config = _make_noncolocated_setup_config(
+        total_nodes=1,
+        total_gpus_per_node=8,
+        inference_gpus_per_node=2,
+        segment_size=1,
+    )
+
+    result, cluster_calls, *_ = _run_noncolocated_setup(monkeypatch, config)
+
+    train_cluster, inference_cluster = result[3]
+    assert train_cluster.kwargs["node_resource_constraints"] == [{"domain-0": 0.001}]
+    assert inference_cluster.kwargs["node_resource_constraints"] is None
+    assert train_cluster.get_placement_groups_called
+    assert len(cluster_calls) == 2
+
+
+def test_noncolocated_multi_node_topology_constraints(monkeypatch):
+    """Topology constraints are applied to a successful multi-node train split."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    monkeypatch.setattr(
+        ppo_mod,
+        "get_ray_cluster_topology",
+        lambda: {
+            "node-0": ("domain-0", 0),
+            "node-1": ("domain-0", 1),
+            "node-2": ("domain-0", 2),
+        },
+    )
+    config = _make_noncolocated_setup_config(
+        total_nodes=3,
+        total_gpus_per_node=8,
+        inference_nodes=1,
+        inference_gpus_per_node=8,
+        segment_size=1,
+    )
+
+    result, _, *_ = _run_noncolocated_setup(monkeypatch, config)
+
+    train_cluster, inference_cluster = result[3]
+    assert train_cluster.kwargs["node_resource_constraints"] == [
+        {"domain-0": 0.001},
+        {"domain-0": 0.001},
+    ]
+    assert inference_cluster.kwargs["node_resource_constraints"] is None
+    assert train_cluster.get_placement_groups_called
+
+
+def test_noncolocated_multi_node_inference_topology_constraints(monkeypatch):
+    """Multi-node vLLM instances are pinned and initialized eagerly."""
+    from nemo_rl.algorithms import ppo as ppo_mod
+
+    monkeypatch.setattr(
+        ppo_mod,
+        "get_ray_cluster_topology",
+        lambda: {
+            "node-0": ("domain-0", 0),
+            "node-1": ("domain-0", 1),
+            "node-2": ("domain-1", 0),
+            "node-3": ("domain-1", 1),
+        },
+    )
+    config = _make_noncolocated_setup_config(
+        total_nodes=4,
+        total_gpus_per_node=8,
+        inference_nodes=2,
+        inference_gpus_per_node=8,
+        segment_size=2,
+        tensor_parallel_size=16,
+    )
+
+    result, _, _, _, _, _, generation_factory, _ = _run_noncolocated_setup(
+        monkeypatch, config
+    )
+
+    train_cluster, inference_cluster = result[3]
+    assert train_cluster.kwargs["node_resource_constraints"] == [
+        {"domain-0": 0.001},
+        {"domain-0": 0.001},
+    ]
+    assert inference_cluster.kwargs["node_resource_constraints"] == [
+        {"domain-1": 0.001},
+        {"domain-1": 0.001},
+    ]
+    assert inference_cluster.kwargs["segment_size"] == 2
+    generation_factory.init_cluster_placement_groups.assert_called_once_with(
+        inference_cluster, config.policy["generation"]
+    )
+
+
 def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     """Policy/value share two slots while rollout gets a separate one-slot cluster."""
     config = _make_noncolocated_setup_config(
@@ -1005,6 +1541,7 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
         policy_factory,
         value_factory,
         generation_factory,
+        ray_get,
     ) = _run_noncolocated_setup(monkeypatch, config)
 
     train_cluster, inference_cluster = result[3]
@@ -1026,6 +1563,36 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     generation.init_collective.assert_called_once_with(
         "127.0.0.1", 1234, 8, train_world_size=6
     )
+    ray_get.assert_called_once_with(["policy-future", "generation-future"])
+
+    policy.offload_to_cpu.assert_called_once_with()
+    value_model = result[2]
+    value_model.finish_training.assert_called_once_with()
+    policy.prepare_for_training.assert_called_once_with()
+    policy.prepare_refit_info.assert_called_once_with()
+    generation.prepare_refit_info.assert_called_once_with({"state": "dict"})
+
+
+def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):
+    """The default colocated setup remains unchanged by the cluster split."""
+    config = _make_noncolocated_setup_config()
+    config.policy["generation"]["colocated"] = {
+        "enabled": True,
+        "resources": {"num_nodes": None, "gpus_per_node": None},
+    }
+
+    result, cluster_calls, policy, generation, *_, ray_get = _run_noncolocated_setup(
+        monkeypatch, config
+    )
+
+    train_cluster, inference_cluster = result[3]
+    assert train_cluster is inference_cluster
+    assert len(cluster_calls) == 1
+    assert train_cluster.kwargs["name"] == "ppo_policy_cluster"
+    assert train_cluster.kwargs["max_colocated_worker_groups"] == 3
+    policy.init_collective.assert_not_called()
+    generation.init_collective.assert_not_called()
+    ray_get.assert_not_called()
 
 
 def test_noncolocated_vllm_multi_node_cluster_and_collective_sizes(monkeypatch):
@@ -1065,3 +1632,27 @@ def test_noncolocated_vllm_single_node_reserves_reward_model_gpu(monkeypatch):
     assert train_cluster.kwargs["max_colocated_worker_groups"] == 2
     assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [2]
     assert inference_cluster.kwargs["max_colocated_worker_groups"] == 1
+
+
+def test_noncolocated_reward_model_node_leaves_shared_train_inference_node(
+    monkeypatch,
+):
+    """A dedicated RM node does not consume GPUs on the shared PPO node."""
+    config = _make_noncolocated_setup_config(
+        total_nodes=2,
+        total_gpus_per_node=8,
+        inference_gpus_per_node=2,
+        reward_model_gpus_per_node=1,
+    )
+
+    result, _, policy, generation, *_ = _run_noncolocated_setup(monkeypatch, config)
+
+    train_cluster, inference_cluster = result[3]
+    assert train_cluster.kwargs["bundle_ct_per_node_list"] == [6]
+    assert inference_cluster.kwargs["bundle_ct_per_node_list"] == [2]
+    policy.init_collective.assert_called_once_with(
+        "127.0.0.1", 1234, 8, train_world_size=6
+    )
+    generation.init_collective.assert_called_once_with(
+        "127.0.0.1", 1234, 8, train_world_size=6
+    )

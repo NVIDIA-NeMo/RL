@@ -20,22 +20,19 @@ mkdir -p $EXP_DIR $LOG_DIR
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_ppo.py \
-    --config $PROJECT_ROOT/examples/configs/ppo_math_1B_megatron.yaml \
     policy.model_name=Qwen/Qwen2.5-0.5B \
     value.model_name=Qwen/Qwen2.5-0.5B \
     ppo.num_prompts_per_step=2 \
     ppo.num_generations_per_prompt=4 \
     ppo.ppo_epochs=2 \
-    ppo.policy_training_start_step=1 \
-    ppo.seq_logprob_error_threshold=1000 \
-    ppo.val_at_end=true \
     policy.train_global_batch_size=4 \
     policy.logprob_batch_size=4 \
     policy.train_micro_batch_size=1 \
-    value.train_global_batch_size=4 \
-    value.train_micro_batch_size=1 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
+    policy.generation.vllm_cfg.async_engine=false \
+    value.train_global_batch_size=4 \
+    value.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
     ppo.max_num_steps=2 \
     logger.tensorboard_enabled=true \
@@ -53,9 +50,7 @@ grep -q "collective communication" $RUN_LOG
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'len(data["train/loss"]) == 1' \
-    'len(data["train/critic/loss"]) == 2' \
-    'max(data["train/num_masked_seqs_by_logprob_error"]) == 0' \
+    'len(data["train/loss"]) == 2' \
     'max(data["train/token_mult_prob_error"]) < 1.05' \
     'max(data["train/max_seq_mult_prob_error"]) < 1.1' \
     'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
