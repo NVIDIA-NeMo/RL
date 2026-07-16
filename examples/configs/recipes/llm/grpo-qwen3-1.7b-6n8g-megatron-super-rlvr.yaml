@@ -4,8 +4,8 @@
 #
 # Resource layout (6 nodes total):
 #   - 1 node:  policy training + colocated vllm (Qwen3-1.7B is tiny)
-#   - 5 nodes: nemo-gym judge servers (genrm, nl2bash, safety)
-#              inherited from stage1_rlvr.yaml (env.nemo_gym.num_gpu_nodes: 5)
+#   - 5 nodes: nemo-gym judge servers
+#              genrm dp=2×tp=8 (2 nodes) + nl2bash dp=2×tp=8 (2 nodes) + safety dp=8×tp=1 (1 node)
 #
 # Data: nvidia/Nemotron-RL-Super-Training-Blends (rlvr1 split).
 # See docs/guides/nemotron-3-super.md for download instructions.
@@ -51,6 +51,7 @@ data:
 env:
   nemo_gym:
     uv_venv_dir: "${oc.env:HF_HOME}/gym_venvs"
+    num_gpu_nodes: 5
     genrm_compare_resources_server:
       resources_servers:
         genrm_compare:
@@ -59,6 +60,7 @@ env:
       responses_api_models:
         genrm_model:
           vllm_serve_kwargs:
+            data_parallel_size: 2  # reduced from 4 to fit within 5 gym nodes (2+2+1)
             max_num_seqs: 16
     nl2bash_judge_model:
       responses_api_models:
