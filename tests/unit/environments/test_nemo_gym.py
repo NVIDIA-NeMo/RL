@@ -224,6 +224,67 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
 
 
+class _MaskTokenizer:
+    eos_token_id = 99
+
+    def batch_decode(self, batch):
+        return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+    def apply_chat_template(self, messages, tokenize=True):
+        return [11, 12]
+
+
+def test_nemo_gym_postprocess_masked_rollout_without_generations():
+    """Masked rollouts (unreliable reward) may carry no token-annotated items —
+    e.g. a failed trace capture. They must convert to a prompt-only message log
+    instead of raising; the sample's loss multiplier is zeroed downstream."""
+
+    class _MockSelf:
+        cfg = {}
+
+    nemo_gym_result = {
+        "mask_sample": True,
+        "response": {"output": [{"type": "message"}]},
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _MaskTokenizer()
+        )
+    )
+    assert [m["role"] for m in result["message_log"]] == ["user"]
+    assert result["message_log"][0]["token_ids"].tolist() == [11, 12]
+
+    # An empty input prompt still yields a non-empty token_ids tensor.
+    nemo_gym_result_empty_input = {
+        "mask_sample": True,
+        "response": {"output": []},
+        "responses_create_params": {"input": []},
+    }
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result_empty_input, _MaskTokenizer()
+        )
+    )
+    assert result["message_log"][0]["token_ids"].tolist() == [99]
+
+
+def test_nemo_gym_postprocess_unmasked_rollout_without_generations_raises():
+    class _MockSelf:
+        cfg = {}
+
+    nemo_gym_result = {
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    with pytest.raises(ValueError, match="no generation data"):
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _MaskTokenizer()
+        )
+
+
 @pytest.mark.nemo_gym
 def test_nemo_gym_sanity(
     nemo_gym,
