@@ -87,6 +87,38 @@ def _patch_vllm_postload(monkeypatch):
     return process_weights
 
 
+def _make_mtp_refit_extension(
+    *, method="mtp", from_disk=False, has_drafter=True, draft_model_config=None
+):
+    """Build an extension for exercising the MTP-refit drafter gating.
+
+    The drafter here is fed from the refit stream (co-trained MTP layer), as
+    opposed to the disk-load path built by ``_make_extension_with_drafter``.
+
+    Returns:
+        (ext, drafter_model): drafter_model is None when has_drafter is False.
+    """
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.device = torch.device("cpu")
+    ext._mtp_drafter_from_disk = from_disk
+
+    spec_config = (
+        None
+        if method is None
+        else SimpleNamespace(method=method, draft_model_config=draft_model_config)
+    )
+    drafter_model = SimpleNamespace(load_weights=MagicMock()) if has_drafter else None
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(speculative_config=spec_config),
+        drafter=SimpleNamespace(model=drafter_model) if has_drafter else None,
+    )
+    return ext, drafter_model
+
+
 @pytest.mark.vllm
 def test_update_weights_from_collective_processes_weights_after_loading(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
@@ -259,3 +291,84 @@ def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
     with pytest.raises(ValueError, match="No MTP layer weights"):
         ext.load_mtp_weights_from_disk(str(model_dir))
     ext._load_draft_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "method, from_disk, has_drafter, expected",
+    [
+        ("mtp", False, True, True),  # co-trained MTP drafter refit from policy stream
+        ("deepseek_mtp", False, True, True),  # same, DeepSeek naming
+        ("mtp", True, True, False),  # served once from disk -> leave static weights
+        ("eagle3", False, True, False),  # non-MTP drafter uses the draft. prefix path
+        (None, False, True, False),  # speculative decoding disabled
+        ("mtp", False, False, False),  # vLLM built no drafter
+    ],
+)
+def test_mtp_drafter_refit_enabled(method, from_disk, has_drafter, expected):
+    """The refit-into-drafter path only fires for a co-trained MTP drafter."""
+    ext, _ = _make_mtp_refit_extension(
+        method=method, from_disk=from_disk, has_drafter=has_drafter
+    )
+    assert ext._mtp_drafter_refit_enabled() is expected
+
+
+@pytest.mark.vllm
+def test_maybe_refit_mtp_drafter_loads_when_enabled():
+    """A co-trained MTP drafter is fed the (vocab-trimmed) policy weights on refit."""
+    ext, drafter_model = _make_mtp_refit_extension(method="mtp", from_disk=False)
+    weights = [("mtp.layers.0.weight", "w0")]
+    trimmed = [("mtp.layers.0.weight", "trimmed")]
+    # Isolate from _trim_vocab_padding, which needs a real vLLM module tree.
+    ext._trim_vocab_padding = MagicMock(return_value=trimmed)
+
+    ext._maybe_refit_mtp_drafter(weights)
+
+    ext._trim_vocab_padding.assert_called_once_with(drafter_model, weights)
+    drafter_model.load_weights.assert_called_once_with(weights=trimmed)
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "method, from_disk",
+    [
+        ("mtp", True),  # disk-served MTP drafter must not be reloaded on refit
+        ("eagle3", False),  # non-MTP drafter is handled elsewhere
+    ],
+)
+def test_maybe_refit_mtp_drafter_noop_when_gated(method, from_disk):
+    """The drafter is left untouched for the disk-load path and non-MTP drafters."""
+    ext, drafter_model = _make_mtp_refit_extension(method=method, from_disk=from_disk)
+    ext._trim_vocab_padding = MagicMock()
+
+    ext._maybe_refit_mtp_drafter([("mtp.layers.0.weight", "w0")])
+
+    ext._trim_vocab_padding.assert_not_called()
+    drafter_model.load_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_maybe_process_mtp_drafter_after_loading_when_enabled(monkeypatch):
+    """The refit MTP drafter is finalized against its own draft_model_config."""
+    draft_model_config = object()
+    ext, drafter_model = _make_mtp_refit_extension(
+        method="mtp", from_disk=False, draft_model_config=draft_model_config
+    )
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    ext._maybe_process_mtp_drafter_after_loading()
+
+    process_weights.assert_called_once_with(
+        drafter_model, draft_model_config, ext.device
+    )
+
+
+@pytest.mark.vllm
+def test_maybe_process_mtp_drafter_after_loading_noop_when_disk_loaded(monkeypatch):
+    """The disk-load path already finalized its weights, so refit skips reprocessing."""
+    ext, _ = _make_mtp_refit_extension(method="mtp", from_disk=True)
+    process_weights = _patch_vllm_postload(monkeypatch)
+
+    ext._maybe_process_mtp_drafter_after_loading()
+
+    process_weights.assert_not_called()
