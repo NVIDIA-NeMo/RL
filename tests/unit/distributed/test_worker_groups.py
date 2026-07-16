@@ -94,7 +94,7 @@ class MyTestActor:
         self.call_count = 0
 
     @staticmethod
-    def configure_worker(num_gpus, bundle_indices):
+    def configure_worker(num_gpus, bundle_indices, num_gpus_per_node=None):
         init_kwargs_update = {
             "configured_gpus": num_gpus,
             "bundle_indices_seen_in_init": bundle_indices is not None,
@@ -130,7 +130,7 @@ class PrecedenceActor:
         return dict(self.env_vars)
 
     @classmethod
-    def configure_worker(cls, num_gpus, bundle_indices=None):
+    def configure_worker(cls, num_gpus, bundle_indices=None, num_gpus_per_node=None):
         return (
             {"num_gpus": num_gpus},  # resources
             {
