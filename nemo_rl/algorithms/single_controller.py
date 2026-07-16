@@ -113,7 +113,7 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     ] = "strict_on_policy"
 
     # Concurrency limits
-    max_inflight_prompts: int = 8
+    max_inflight_rollouts: int = 32
     max_buffered_rollouts: int = 8  # _buffer_capacity semaphore size
 
     # Training
@@ -333,7 +333,7 @@ class SingleControllerActor:
             f"SingleControllerActor: staleness_cap="
             f"{cfg.max_weight_staleness_versions} "
             f"buffer={cfg.max_buffered_rollouts} "
-            f"inflight={cfg.max_inflight_prompts} "
+            f"inflight={cfg.max_inflight_rollouts} "
             f"transport={cfg.refit_cfg.impl}",
             flush=True,
         )
@@ -406,14 +406,11 @@ class SingleControllerActor:
 
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
-          2. Acquire sem (cap concurrent in-flight rollouts)
-          3. Wait for _rollout_permitted (paused during weight sync)
-          4. Call rollout_manager.generate_and_push(prompt) — local async
-             RolloutManager reserves a slot, runs the rollout, then commits the
-             group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
-          5. Decrement _inflight_rollouts
+          2. Wait for _rollout_permitted (paused during weight sync)
+          3. Wait for prev group to have fully started (await_group_started)
+          4. Dispatch _dispatch_one_prompt as a task; RolloutManager caps
+             concurrent rollouts via its own traj_sem.
         """
-        sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         over_sampling = self._async_cfg.over_sampling
         max_staleness = self._async_cfg.max_weight_staleness_versions
         force_in_order = self._async_cfg.force_in_order
@@ -436,7 +433,6 @@ class SingleControllerActor:
                     print(f"  rollout done for prompt='{content[:20]}...'", flush=True)
             finally:
                 self._inflight_rollouts -= 1
-                sem.release()
 
         max_epochs = self._master_config.grpo["max_num_epochs"]
         epoch = 0
@@ -461,10 +457,10 @@ class SingleControllerActor:
 
                     # check if buffer is full
                     await self._buffer_capacity.acquire()
-                    # check if inflight rollouts is full
-                    await sem.acquire()
                     # wait for rollout to be permitted
                     await self._rollout_permitted.wait()
+                    # wait for prev group to have all trajs admitted (first iter: free-pass)
+                    await self._rollout_manager.await_group_started()
 
                     # dispatch rollout
                     task = asyncio.create_task(

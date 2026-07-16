@@ -226,7 +226,7 @@ def test_train_pump_dry_run(ray_cluster, tmp_path):
         target_groups_per_step=num_groups,
         group_size=group_size,
         batch_selection_strategy="staleness_window",
-        max_inflight_prompts=8,
+        max_inflight_rollouts=max(8, group_size),
         max_buffered_rollouts=8,
         max_train_steps=1,
         max_rollout_prompts=num_groups,

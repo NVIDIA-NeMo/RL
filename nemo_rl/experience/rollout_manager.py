@@ -53,6 +53,8 @@ class AsyncRolloutImpl:
         max_seq_len: int,
         policy_generation: GenerationInterface,
         max_rollout_turns: int = 999999,
+        traj_sem: Optional[asyncio.Semaphore] = None,
+        start_sem: Optional[asyncio.Semaphore] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -61,6 +63,8 @@ class AsyncRolloutImpl:
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
         self._policy_generation = policy_generation
+        self._traj_sem = traj_sem
+        self._start_sem = start_sem
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -76,14 +80,33 @@ class AsyncRolloutImpl:
         timer.start(f"{timer_prefix}/total")
 
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            results = list(
-                await asyncio.gather(
-                    *[
-                        self._run_single_rollout(input_sample, traj_idx)
-                        for traj_idx in range(self._num_generations_per_prompt)
-                    ]
-                )
-            )
+            if self._traj_sem is not None:
+                assert self._start_sem is not None
+                started_count = 0
+
+                async def _run_single_with_budget(
+                    traj_idx: int,
+                ) -> tuple[Completion, dict]:
+                    nonlocal started_count
+                    await self._traj_sem.acquire()  # type: ignore[union-attr]
+                    started_count += 1
+                    if started_count == self._num_generations_per_prompt:
+                        self._start_sem.release()  # type: ignore[union-attr]
+                    try:
+                        return await self._run_single_rollout(input_sample, traj_idx)
+                    finally:
+                        self._traj_sem.release()  # type: ignore[union-attr]
+
+                coros = [
+                    _run_single_with_budget(traj_idx)
+                    for traj_idx in range(self._num_generations_per_prompt)
+                ]
+            else:
+                coros = [
+                    self._run_single_rollout(input_sample, traj_idx)
+                    for traj_idx in range(self._num_generations_per_prompt)
+                ]
+            results = list(await asyncio.gather(*coros))
             completions = [c for c, _ in results]
             all_sample_metrics = [m for _, m in results]
 
@@ -628,10 +651,27 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         tq_buffer: Optional[TQReplayBuffer] = None,
+        max_inflight_rollouts: Optional[int] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
+
+        # None disables per-traj scheduling.
+        if max_inflight_rollouts is not None:
+            assert max_inflight_rollouts >= num_generations_per_prompt, (
+                f"max_inflight_rollouts ({max_inflight_rollouts}) must be >= "
+                f"num_generations_per_prompt ({num_generations_per_prompt}); "
+                f"else a group can never assemble group_size permits."
+            )
+            self._traj_sem: Optional[asyncio.Semaphore] = asyncio.Semaphore(
+                max_inflight_rollouts
+            )
+            # Init 1: first dispatch free-pass; later iters wait for prev group.
+            self._start_sem: Optional[asyncio.Semaphore] = asyncio.Semaphore(1)
+        else:
+            self._traj_sem = None
+            self._start_sem = None
 
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -646,6 +686,7 @@ class RolloutManager:
                 "generation_config is required for the NeMo-Gym path"
             )
 
+        # NeMo-Gym Impl absorbs traj_sem/start_sem via **kwargs (batched, no per-traj signal).
         self._impl: AsyncRolloutImpl | AsyncNemoGymRolloutImpl = rollout_cls(
             tokenizer=tokenizer,
             env_handles=env_handles,
@@ -654,11 +695,18 @@ class RolloutManager:
             max_rollout_turns=max_rollout_turns,  # type: ignore
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
+            traj_sem=self._traj_sem,
+            start_sem=self._start_sem,
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
+
+    async def await_group_started(self) -> None:
+        """Block until the previously-dispatched group has all trajs admitted to traj_sem. No-op when max_inflight_rollouts is unset."""
+        if self._start_sem is not None:
+            await self._start_sem.acquire()
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
