@@ -77,6 +77,8 @@ CHECKPOINT_SAVE_PERIOD=${CHECKPOINT_SAVE_PERIOD:-20}
 DEEP_GEMM_PREFLIGHT=${DEEP_GEMM_PREFLIGHT:-true}
 SLURM_OUTPUT=${SLURM_OUTPUT:-slurm-%j-${JOB_NAME}.out}
 SLURM_COMMENT=${SLURM_COMMENT:-'{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"other","description":"debugging idle gpu"}}'}
+SBATCH_REQ_SWITCH=${SBATCH_REQ_SWITCH:-}
+NRL_SLURM_NODELIST=${NRL_SLURM_NODELIST:-}
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-60}
 GLM51_CACHE_TAG=${GLM51_CACHE_TAG:-py313-onnx121}
 GLM51_SEED_UV_CACHE=${GLM51_SEED_UV_CACHE:-true}
@@ -126,6 +128,14 @@ if [[ -n "$(dirname "$SLURM_OUTPUT")" && "$(dirname "$SLURM_OUTPUT")" != "." ]];
     mkdir -p "$(dirname "$SLURM_OUTPUT")"
 fi
 
+SBATCH_TOPOLOGY_ARGS=()
+if [[ -n "$SBATCH_REQ_SWITCH" ]]; then
+    SBATCH_TOPOLOGY_ARGS+=(--switches="$SBATCH_REQ_SWITCH")
+fi
+if [[ -n "$NRL_SLURM_NODELIST" ]]; then
+    SBATCH_TOPOLOGY_ARGS+=(--nodelist="$NRL_SLURM_NODELIST")
+fi
+
 if [[ -n "${DRYRUN:-}" ]]; then
     echo "[DRYRUN] CONTAINER=$CONTAINER"
     echo "[DRYRUN] ACCOUNT=$ACCOUNT"
@@ -139,6 +149,8 @@ if [[ -n "${DRYRUN:-}" ]]; then
     fi
     echo "[DRYRUN] NUM_NODES=$NUM_NODES"
     echo "[DRYRUN] GPUS_PER_NODE=$GPUS_PER_NODE"
+    echo "[DRYRUN] SBATCH_REQ_SWITCH=${SBATCH_REQ_SWITCH:-<unset>}"
+    echo "[DRYRUN] NRL_SLURM_NODELIST=${NRL_SLURM_NODELIST:-<unset>}"
     echo "[DRYRUN] SLURM_COMMENT=$SLURM_COMMENT"
     echo "[DRYRUN] MOUNTS=$MOUNTS"
     echo "[DRYRUN] GLM51_CACHE_TAG=$GLM51_CACHE_TAG"
@@ -157,7 +169,9 @@ if [[ -n "${DRYRUN:-}" ]]; then
         echo "[DRYRUN] HF_TOKEN=<unset>"
     fi
     echo "[DRYRUN] COMMAND=$COMMAND"
-    printf "[DRYRUN] sbatch --nodes=%q --gres=%q --account=%q --job-name=%q --partition=%q --time=%q --output=%q --comment=%q ray.sub\n" \
+    printf "[DRYRUN] sbatch"
+    printf " %q" "${SBATCH_TOPOLOGY_ARGS[@]}"
+    printf " --nodes=%q --gres=%q --account=%q --job-name=%q --partition=%q --time=%q --output=%q --comment=%q ray.sub\n" \
         "$NUM_NODES" \
         "gpu:$GPUS_PER_NODE" \
         "$ACCOUNT" \
@@ -168,6 +182,10 @@ if [[ -n "${DRYRUN:-}" ]]; then
         "$SLURM_COMMENT"
     exit 0
 fi
+
+# SBATCH_REQ_SWITCH is also interpreted directly by Slurm as an integer-only
+# environment option. Keep the richer count@max-time value only in the CLI arg.
+unset SBATCH_REQ_SWITCH
 
 CONTAINER="$CONTAINER" \
 MOUNTS="$MOUNTS" \
@@ -182,6 +200,7 @@ NEMO_RL_VENV_DIR="$NEMO_RL_VENV_DIR" \
 UV_CACHE_DIR_OVERRIDE= \
 NRL_FORCE_REBUILD_VENVS="$NRL_FORCE_REBUILD_VENVS" \
 sbatch \
+    "${SBATCH_TOPOLOGY_ARGS[@]}" \
     --nodes="$NUM_NODES" \
     --gres="gpu:$GPUS_PER_NODE" \
     --account="$ACCOUNT" \

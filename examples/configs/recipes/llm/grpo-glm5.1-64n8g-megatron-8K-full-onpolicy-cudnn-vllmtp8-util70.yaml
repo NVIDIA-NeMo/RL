@@ -1,0 +1,6 @@
+defaults: ./grpo-glm5.1-64n8g-megatron-8K-full-onpolicy-cudnn-vllmtp8.yaml
+
+policy:
+  generation:
+    vllm_cfg:
+      gpu_memory_utilization: 0.7
