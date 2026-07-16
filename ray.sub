@@ -333,11 +333,21 @@ for node in $nodes; do
     # Try multiple methods to get IP address - ENHANCED VERSION v2.0
     echo "[DEBUG] Resolving hostname: $node using enhanced resolution methods"
     ip_address=""
-    
+
+    # Method 0: Ask the node itself. DNS records on this cluster can lag node
+    # re-addressing by several minutes after boot, so any DNS-based answer at
+    # job start may be stale (jobs 21344/21345 hung on ray start because the
+    # head connected to a stale DNS IP). The node's own view is authoritative.
+    echo "[DEBUG] Method 0: srun hostname -I on the node"
+    ip_address=$(timeout 60 srun --overlap -N1 -n1 -w "$node" hostname -I 2>/dev/null | awk '{ print $1 }' || true)
+    echo "[DEBUG] srun result: '$ip_address'"
+
     # Method 1: Try host command
-    echo "[DEBUG] Method 1: host command"
-    ip_address=$(host $node 2>/dev/null | awk '/has address/ { print $4 }' | head -1 || true)
-    echo "[DEBUG] host result: '$ip_address'"
+    if [[ -z "$ip_address" ]]; then
+        echo "[DEBUG] Method 1: host command"
+        ip_address=$(host $node 2>/dev/null | awk '/has address/ { print $4 }' | head -1 || true)
+        echo "[DEBUG] host result: '$ip_address'"
+    fi
     
     # Method 2: If host fails, try getent
     if [[ -z "$ip_address" ]]; then
