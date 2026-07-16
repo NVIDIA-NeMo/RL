@@ -165,6 +165,78 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._validate_nemotron_omni_radio_layerscale_refit(state_dict_info)
+
+    def _is_nemotron_omni(self) -> bool:
+        architectures = set(
+            self.model_runner.vllm_config.model_config.architectures or []
+        )
+        return not architectures.isdisjoint(
+            {
+                "NemotronH_Nano_Omni_Reasoning_V3",
+                "NemotronH_Super_Omni_Reasoning_V3",
+            }
+        )
+
+    def _validate_nemotron_omni_radio_layerscale_refit(
+        self, state_dict_info: dict[str, Any]
+    ) -> None:
+        """Reject explicit LayerScale state that stock vLLM would ignore.
+
+        This method can run while a colocated vLLM engine is asleep. It must not
+        read or mutate model tensors because vLLM's level-1 sleep allocator has
+        temporarily released their CUDA storage.
+        """
+        if not self._is_nemotron_omni():
+            return
+
+        explicit_layerscale = [
+            name
+            for name in state_dict_info
+            if name.startswith("vision_model.radio_model.model.blocks.")
+            and name.endswith((".ls1", ".ls2"))
+        ]
+        if explicit_layerscale:
+            raise RuntimeError(
+                "Nemotron Omni refit contains explicit RADIO LayerScale tensors, "
+                "but the stock vLLM 0.20 loader ignores them. Refusing to replace "
+                "checkpoint values with the folded-checkpoint identity behavior."
+            )
+
+    def _initialize_nemotron_omni_radio_layerscale(self) -> int:
+        """Set folded RADIO LayerScale parameters to identity while vLLM is awake.
+
+        Nano/Super Omni checkpoints fold RADIO LayerScale into the adjacent
+        projection weights and therefore do not export ``ls1``/``ls2``. Stock
+        vLLM 0.20 leaves those parameters at dummy-initialized values during
+        direct load or refit, corrupting image inference. Initialize the
+        vLLM-only parameters once, immediately after engine creation and before
+        colocated sleep can release their CUDA storage.
+        """
+        if not self._is_nemotron_omni():
+            return 0
+
+        model = self.model_runner.model
+        vision_model = getattr(model, "vision_model", None)
+        if vision_model is None:
+            raise RuntimeError(
+                "Nemotron Omni vLLM model has no vision_model during initialization."
+            )
+
+        initializer_factor = getattr(vision_model.config, "initializer_factor", 1.0)
+        initialized = 0
+        with torch.no_grad():
+            for name, parameter in vision_model.named_parameters():
+                if name.rsplit(".", 1)[-1] in {"ls1", "ls2"}:
+                    parameter.fill_(initializer_factor)
+                    initialized += 1
+
+        if initialized == 0:
+            raise RuntimeError(
+                "Nemotron Omni vLLM model exposes no RADIO ls1/ls2 parameters; "
+                "the expected vLLM 0.20 model layout may have changed."
+            )
+        return initialized
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""

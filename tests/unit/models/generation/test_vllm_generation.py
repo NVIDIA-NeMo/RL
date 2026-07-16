@@ -37,6 +37,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    VllmGenerationWorkerImpl,
+    _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -136,6 +138,52 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+def test_context_capped_max_new_tokens():
+    assert (
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=8192,
+            input_length=3058,
+            max_model_len=8192,
+        )
+        == 5134
+    )
+    assert (
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=256,
+            input_length=3058,
+            max_model_len=8192,
+        )
+        == 256
+    )
+    with pytest.raises(ValueError, match="exhausts the model context"):
+        _context_capped_max_new_tokens(
+            configured_max_new_tokens=8192,
+            input_length=8192,
+            max_model_len=8192,
+        )
+
+
+def test_sampling_params_preserve_bad_words():
+    worker = object.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {
+        "top_k": None,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 128,
+        "stop_token_ids": None,
+        "bad_words": ["<image>", "<img>"],
+        "ignore_eos": False,
+    }
+    worker.SamplingParams = lambda **kwargs: kwargs
+
+    sampling_params = worker._build_sampling_params(
+        greedy=False,
+        stop_strings=None,
+    )
+
+    assert sampling_params["bad_words"] == ["<image>", "<img>"]
 
 
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
