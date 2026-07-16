@@ -21,6 +21,8 @@ ppo:
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
   skip_reference_policy_logprobs_calculation: true  # No KL, so skip ref logprobs
+  log_rollout_dump: false
+  rollout_dump_period: 1
 
   reward_shaping:
     enabled: true

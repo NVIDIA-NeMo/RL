@@ -1317,3 +1317,161 @@ def test_resolve_resume_optimizer_path(tmp_path):
     # DTensor without a separate optimizer/ dir -> None (don't misread weights as
     # an optimizer path for a backend that stores it separately).
     assert _resolve_resume_optimizer_path(missing_optim, weights, dtensor) is None
+
+
+# ---------------------------------------------------------------------------
+# Per-token rollout dump (ppo.log_rollout_dump)
+# ---------------------------------------------------------------------------
+class _FakeDumpTokenizer:
+    def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+        return [f"<tok{i}>" for i in ids]
+
+
+def test_should_log_ppo_rollout_dump_gate():
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.ppo import _should_log_ppo_rollout_dump
+
+    # Absent / disabled -> never dump.
+    assert not _should_log_ppo_rollout_dump(SimpleNamespace(ppo={}), 1)
+    assert not _should_log_ppo_rollout_dump(
+        SimpleNamespace(ppo={"log_rollout_dump": False, "rollout_dump_period": 1}), 1
+    )
+
+    # Enabled without a period -> loud failure, not a hidden default.
+    with pytest.raises(ValueError, match="rollout_dump_period"):
+        _should_log_ppo_rollout_dump(SimpleNamespace(ppo={"log_rollout_dump": True}), 1)
+
+    # Enabled with period 2 -> fires on even (1-based) steps only.
+    cfg = SimpleNamespace(ppo={"log_rollout_dump": True, "rollout_dump_period": 2})
+    assert not _should_log_ppo_rollout_dump(cfg, 1)
+    assert _should_log_ppo_rollout_dump(cfg, 2)
+    assert not _should_log_ppo_rollout_dump(cfg, 3)
+    assert _should_log_ppo_rollout_dump(cfg, 4)
+
+
+def test_build_ppo_rollout_dump_payload_packing(tmp_path):
+    from nemo_rl.algorithms.ppo import _build_ppo_rollout_dump_payload
+
+    # 2 samples x 5 positions; sample 0 has 3 response tokens, sample 1 has 2.
+    token_mask = torch.tensor([[0, 0, 1, 1, 1], [0, 0, 0, 1, 1]], dtype=torch.float32)
+    input_ids = torch.arange(10).reshape(2, 5)
+    values = torch.arange(10, dtype=torch.float32).reshape(2, 5) * 0.1
+    advantages = torch.arange(10, dtype=torch.float32).reshape(2, 5) * -1.0
+    returns = torch.arange(10, dtype=torch.float32).reshape(2, 5) * 2.0
+    generation_logprobs = torch.arange(10, dtype=torch.float32).reshape(2, 5) - 20.0
+    prev_logprobs = torch.arange(10, dtype=torch.float32).reshape(2, 5) - 30.0
+    reference_policy_logprobs = (
+        torch.arange(10, dtype=torch.float32).reshape(2, 5) - 40.0
+    )
+
+    train_data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([5, 5]),
+            "token_mask": token_mask,
+            "sample_mask": torch.tensor([1.0, 0.0]),
+            "rewards": torch.tensor([1.0, -1.0]),
+            "values": values,
+            "advantages": advantages,
+            "returns": returns,
+            "generation_logprobs": generation_logprobs,
+            "prev_logprobs": prev_logprobs,
+            "reference_policy_logprobs": reference_policy_logprobs,
+        }
+    )
+    repeated_batch = BatchedDataDict(
+        {
+            "length": torch.tensor([2, 3]),
+            "task_name": ["math", "math"],
+            "idx": torch.tensor([7, 8]),
+            "truncated": [False, True],
+        }
+    )
+
+    payload = _build_ppo_rollout_dump_payload(
+        step=3,
+        num_generations_per_prompt=2,
+        tokenizer=_FakeDumpTokenizer(),
+        train_data=train_data,
+        prompt_lengths=repeated_batch["length"],
+        content=["convo A", "convo B"],
+        repeated_batch=repeated_batch,
+    )
+
+    assert payload["format_version"] == 1
+    assert payload["step"] == 3
+
+    # Packed token coordinates.
+    mask = token_mask.bool()
+    assert payload["token_sample_index"].tolist() == [0, 0, 0, 1, 1]
+    assert payload["token_sequence_position"].tolist() == [2, 3, 4, 3, 4]
+    assert payload["token_response_position"].tolist() == [0, 1, 2, 0, 1]
+
+    # Per-token tensors align with the masked positions.
+    assert torch.equal(payload["token_ids"], input_ids[mask])
+    assert torch.equal(payload["values"], values[mask])
+    assert torch.equal(payload["advantages"], advantages[mask])
+    assert torch.equal(payload["returns"], returns[mask])
+    assert torch.equal(payload["generation_logprobs"], generation_logprobs[mask])
+    assert torch.equal(payload["prev_logprobs"], prev_logprobs[mask])
+    assert torch.equal(
+        payload["reference_policy_logprobs"], reference_policy_logprobs[mask]
+    )
+    assert payload["token_text"] == [f"<tok{i}>" for i in input_ids[mask].tolist()]
+
+    # Per-sample context.
+    assert payload["reward"].tolist() == [1.0, -1.0]
+    assert payload["sample_loss_mask"].tolist() == [1.0, 0.0]
+    assert payload["input_length"].tolist() == [5, 5]
+    assert payload["prompt_length"].tolist() == [2, 3]
+    assert payload["num_response_tokens"].tolist() == [3, 2]
+    assert payload["content"] == ["convo A", "convo B"]
+    assert payload["prompt_group_index"].tolist() == [0, 0]
+    assert payload["generation_index"].tolist() == [0, 1]
+    assert payload["task_name"] == ["math", "math"]
+    assert payload["idx"].tolist() == [7, 8]
+    assert payload["truncated"] == [False, True]
+
+    # Round-trips through torch.save/load (what the dump actually does).
+    dump_path = tmp_path / "ppo_rollout_dump_step3.pt"
+    torch.save(payload, dump_path)
+    reloaded = torch.load(dump_path, weights_only=False)
+    assert torch.equal(reloaded["advantages"], payload["advantages"])
+    assert reloaded["token_text"] == payload["token_text"]
+
+
+def test_build_ppo_rollout_dump_payload_optional_fields_absent():
+    from nemo_rl.algorithms.ppo import _build_ppo_rollout_dump_payload
+
+    train_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "input_lengths": torch.tensor([3]),
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0]]),
+            "sample_mask": torch.tensor([1.0]),
+            "rewards": torch.tensor([0.5]),
+            "values": torch.zeros(1, 3),
+            "advantages": torch.zeros(1, 3),
+            "generation_logprobs": torch.zeros(1, 3),
+            "prev_logprobs": torch.zeros(1, 3),
+        }
+    )
+
+    payload = _build_ppo_rollout_dump_payload(
+        step=1,
+        num_generations_per_prompt=1,
+        tokenizer=_FakeDumpTokenizer(),
+        train_data=train_data,
+        prompt_lengths=torch.tensor([1]),
+        content=["convo"],
+        repeated_batch=BatchedDataDict({"length": torch.tensor([1])}),
+    )
+
+    # No returns / reference logprobs / batch metadata -> keys omitted, not None.
+    assert "returns" not in payload
+    assert "reference_policy_logprobs" not in payload
+    assert "task_name" not in payload
+    assert "idx" not in payload
+    assert "truncated" not in payload
+    assert payload["num_response_tokens"].tolist() == [2]

@@ -238,6 +238,15 @@ class PPOConfig(TypedDict):
     # masking rather than fail MasterConfig validation — e.g. a config whose
     # `defaults:` base predates this field.
     seq_logprob_error_threshold: NotRequired[float | None]
+    # Optional per-token rollout dump for offline analysis: writes packed
+    # token ids / critic values / GAE advantages / logprobs (plus decoded text
+    # and per-sample context) to {logger.log_dir}/ppo_rollout_dump_step{N}.pt.
+    # Tensors reflect the state entering the PPO-epoch loop (before any update
+    # this step). NotRequired (read via .get()): configs that omit it disable
+    # the dump rather than fail MasterConfig validation.
+    log_rollout_dump: NotRequired[bool]
+    # Dump every N PPO steps. Must be set when log_rollout_dump is true.
+    rollout_dump_period: NotRequired[int]
     # Asynchronous PPO (replay-buffer, non-colocated generation). Absent/disabled
     # runs synchronous PPO.
     async_ppo: NotRequired[AsyncPPOConfig]
@@ -1441,9 +1450,7 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(v, (np.ndarray, list)):
             critic_metrics["critic/" + k] = np.sum(v).item()
         else:
-            raise ValueError(
-                f"Unknown metric for value don't know how to handle: {k}"
-            )
+            raise ValueError(f"Unknown metric for value don't know how to handle: {k}")
 
     # Compute explained variance from sufficient statistics:
     # EV = 1 - Var(returns - values) / Var(returns)
@@ -1453,9 +1460,7 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     res_sq = critic_metrics.get("critic/residual_sq_mean", 0)
     var_returns = r_sq - r_mean**2
     var_residual = res_sq - (r_mean - v_mean) ** 2
-    critic_metrics["critic/explained_var"] = 1.0 - var_residual / max(
-        var_returns, 1e-8
-    )
+    critic_metrics["critic/explained_var"] = 1.0 - var_residual / max(var_returns, 1e-8)
     return critic_metrics
 
 
@@ -1499,6 +1504,134 @@ def _positional_value_metrics(
         out[f"critic/mean_v_{names[i]}"] = v.mean().item()
         out[f"critic/n_tokens_{names[i]}"] = float(n)
     return out
+
+
+def _should_log_ppo_rollout_dump(master_config: MasterConfig, step: int) -> bool:
+    """Whether to write the packed per-token rollout dump for this (1-based) step."""
+    if not master_config.ppo.get("log_rollout_dump"):
+        return False
+
+    period = master_config.ppo.get("rollout_dump_period")
+    if period is None:
+        raise ValueError(
+            "ppo.log_rollout_dump is enabled but ppo.rollout_dump_period is not set."
+        )
+    return step % max(int(period), 1) == 0
+
+
+def _build_ppo_rollout_dump_payload(
+    *,
+    step: int,
+    num_generations_per_prompt: int,
+    tokenizer: PreTrainedTokenizerBase,
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    prompt_lengths: torch.Tensor,
+    content: list[str],
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> dict[str, Any]:
+    """Build the packed per-token rollout dump payload for torch.save.
+
+    Response tokens (``token_mask == 1``) from the whole batch are packed into
+    flat tensors; ``token_sample_index`` / ``token_sequence_position`` map each
+    packed token back to its sample and position. All tensors reflect the state
+    entering the PPO-epoch loop, i.e. before any policy/value update this step.
+
+    Args:
+        step: 1-based PPO step number (matches the filename suffix).
+        num_generations_per_prompt: Generations per prompt; used to derive
+            prompt-group/generation indices.
+        tokenizer: Tokenizer used to decode per-token text fragments.
+        train_data: Fully populated training batch (values, advantages,
+            logprobs, masks).
+        prompt_lengths: Per-sample prompt length, shape ``[batch]``.
+        content: Per-sample decoded conversation text.
+        repeated_batch: Rollout batch; optional per-sample metadata
+            (``task_name``, ``idx``, ``truncated``) is copied when present.
+
+    Returns:
+        Payload dict of packed per-token tensors, per-sample arrays, and
+        metadata, ready for ``torch.save``.
+    """
+    token_mask = train_data["token_mask"].detach().bool().cpu()
+    batch_size = token_mask.shape[0]
+    token_count = token_mask.sum(dim=-1)
+
+    token_coords = token_mask.nonzero(as_tuple=False)
+    token_sample_index = token_coords[:, 0].to(torch.int32)
+    token_sequence_position = token_coords[:, 1].to(torch.int32)
+    if token_sample_index.numel() > 0:
+        token_response_position = torch.cat(
+            [
+                torch.arange(int(count), dtype=torch.int32)
+                for count in token_count.tolist()
+            ]
+        )
+    else:
+        token_response_position = torch.empty(0, dtype=torch.int32)
+
+    def _pack_float(field: str) -> torch.Tensor:
+        return train_data[field].detach().float().cpu()[token_mask]
+
+    token_ids = train_data["input_ids"].detach().cpu()[token_mask]
+    sample_indices = torch.arange(batch_size, dtype=torch.int32)
+
+    payload: dict[str, Any] = {
+        "format_version": 1,
+        "description": (
+            "Packed response-token PPO rollout dump. Per-token tensors are "
+            "flattened over token_mask; entry i belongs to sample "
+            "token_sample_index[i] at sequence position "
+            "token_sequence_position[i] and describes token token_ids[i]. "
+            "prev_logprobs are the policy logprobs before any update this "
+            "step (the PPO-ratio denominator, pi_old); generation_logprobs "
+            "come from the rollout backend; values are the critic estimates "
+            "GAE consumed; returns are the critic regression targets."
+        ),
+        "step": int(step),
+        "num_generations_per_prompt": int(num_generations_per_prompt),
+        # Per-sample arrays, shape [batch].
+        "sample_index": sample_indices,
+        "reward": train_data["rewards"].detach().float().cpu(),
+        "sample_loss_mask": train_data["sample_mask"].detach().float().cpu(),
+        "input_length": train_data["input_lengths"].detach().cpu(),
+        "prompt_length": prompt_lengths.detach().cpu(),
+        "num_response_tokens": token_count,
+        "content": list(content),
+        # Packed per-token tensors, shape [num_response_tokens_total].
+        "token_sample_index": token_sample_index,
+        "token_sequence_position": token_sequence_position,
+        "token_response_position": token_response_position,
+        "token_ids": token_ids,
+        "token_text": tokenizer.convert_ids_to_tokens(token_ids.tolist()),
+        "values": _pack_float("values"),
+        "advantages": _pack_float("advantages"),
+        "generation_logprobs": _pack_float("generation_logprobs"),
+        "prev_logprobs": _pack_float("prev_logprobs"),
+    }
+    if "returns" in train_data:
+        payload["returns"] = _pack_float("returns")
+    if "reference_policy_logprobs" in train_data:
+        payload["reference_policy_logprobs"] = _pack_float("reference_policy_logprobs")
+
+    if num_generations_per_prompt > 0:
+        payload["prompt_group_index"] = (
+            sample_indices // num_generations_per_prompt
+        ).to(torch.int32)
+        payload["generation_index"] = (sample_indices % num_generations_per_prompt).to(
+            torch.int32
+        )
+
+    for key in ("task_name", "idx", "truncated"):
+        if key in repeated_batch:
+            value = repeated_batch[key]
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu()
+            else:
+                value = list(value)
+            if len(value) == batch_size:
+                payload[key] = value
+
+    return payload
 
 
 # ===============================================================================
@@ -1709,9 +1842,7 @@ def ppo_train(
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
                             reward_penalty_config=master_config.reward_penalties,
-                            thinking_tags=get_nemo_gym_thinking_tags(
-                                master_config.env
-                            ),
+                            thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                         )
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -1999,6 +2130,27 @@ def ppo_train(
                                 train_data["token_mask"],
                                 critic_batch["token_mask"],
                             )
+
+                if _should_log_ppo_rollout_dump(master_config, total_steps + 1):
+                    with timer.time("rollout_dump"):
+                        rollout_dump_path = os.path.join(
+                            logger.base_log_dir,
+                            f"ppo_rollout_dump_step{total_steps + 1}.pt",
+                        )
+                        rollout_dump_payload = _build_ppo_rollout_dump_payload(
+                            step=total_steps + 1,
+                            num_generations_per_prompt=master_config.ppo[
+                                "num_generations_per_prompt"
+                            ],
+                            tokenizer=tokenizer,
+                            train_data=train_data,
+                            prompt_lengths=repeated_batch["length"],
+                            content=flat_messages["content"],
+                            repeated_batch=repeated_batch,
+                        )
+                        torch.save(rollout_dump_payload, rollout_dump_path)
+                        print(f"  📝 Dumped rollout data to {rollout_dump_path}")
+                        del rollout_dump_payload
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -3435,6 +3587,27 @@ def async_ppo_train(
                     log_data, f"train_data_step{step + 1}.jsonl"
                 )
                 del log_data
+
+            if _should_log_ppo_rollout_dump(master_config, step + 1):
+                with timer.time("rollout_dump"):
+                    rollout_dump_path = os.path.join(
+                        logger.base_log_dir,
+                        f"ppo_rollout_dump_step{step + 1}.pt",
+                    )
+                    rollout_dump_payload = _build_ppo_rollout_dump_payload(
+                        step=step + 1,
+                        num_generations_per_prompt=master_config.ppo[
+                            "num_generations_per_prompt"
+                        ],
+                        tokenizer=tokenizer,
+                        train_data=train_data,
+                        prompt_lengths=repeated_batch["length"],
+                        content=flat_messages_content,
+                        repeated_batch=repeated_batch,
+                    )
+                    torch.save(rollout_dump_payload, rollout_dump_path)
+                    print(f"  📝 Dumped rollout data to {rollout_dump_path}")
+                    del rollout_dump_payload
             del flat_messages_content
 
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
@@ -3468,9 +3641,7 @@ def async_ppo_train(
             print("\n📊 Training Results:")
             if "loss" in metrics:
                 print(f"  • Loss: {metrics['loss']:.4f}")
-                print(
-                    f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}"
-                )
+                print(f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}")
             else:
                 print("  • (critic warmup: policy not trained this step)")
             if "critic/loss" in metrics:
