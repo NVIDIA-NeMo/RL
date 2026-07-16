@@ -21,6 +21,7 @@ This module provides different advantage estimation strategies:
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 - OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
+- GRPOWithTeacherAdvantageEstimator: GRPO reward-baseline advantage plus a token-level teacher-distillation term
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
@@ -587,4 +588,105 @@ class OPDAdvantageEstimator:
             "on_policy_distillation/teacher_student_logprob_gap_mean": distill_mean,
             "on_policy_distillation/adv_mean": adv_mean,
             "on_policy_distillation/adv_std": adv_std,
+        }
+
+
+class GRPOWithTeacherAdvantageEstimator:
+    """GRPO advantage plus a token-level teacher-distillation term.
+
+    The advantage returned is:
+        Â_t = Â_grpo + distill_coeff * sg[log π_teacher - log π_student]
+
+    where ``Â_grpo`` is the standard GRPO leave-one-out (optional) advantage
+    ``rewards - baseline`` (optionally divided by the per-prompt std), broadcast
+    across the token dimension, and the teacher term is the token-level MOPD
+    log-prob gap. Both feed into the same ``ClippedPGLoss`` — no separate
+    distillation loss is added; the two advantage signals sum into one gradient.
+
+    Required kwargs in compute_advantage:
+        teacher_logprobs: [B, S] teacher model log probabilities
+        prev_logprobs: [B, S] student training-engine log probabilities
+
+    Config (``grpo.adv_estimator``):
+        distill_coeff: float scaling the teacher term
+        normalize_rewards: bool, per-prompt std normalization on the GRPO term
+        use_leave_one_out_baseline: bool, leave-one-out baseline for the GRPO term
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
+        self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
+        self.normalize_rewards = estimator_config["normalize_rewards"]
+        self.distill_coeff = estimator_config["distill_coeff"]
+        self.last_metrics: dict[str, float] = {}
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        teacher_logprobs=None,
+        prev_logprobs=None,
+        **kwargs,
+    ):
+        """Compute combined GRPO + teacher-distillation advantages.
+
+        Args:
+            prompt_ids: [B] prompt IDs (for per-prompt GRPO baseline).
+            rewards: [B] scalar rewards per sample.
+            mask: [B, S] response token mask (1 for valid, 0 for pad).
+            teacher_logprobs: [B, S] teacher model log probabilities (required).
+            prev_logprobs: [B, S] student training-engine log probabilities (required).
+            **kwargs: Additional arguments (unused).
+
+        Returns:
+            [B, S] token-level advantages.
+        """
+        if teacher_logprobs is None:
+            raise ValueError("GRPOWithTeacher requires teacher_logprobs")
+        if prev_logprobs is None:
+            raise ValueError("GRPOWithTeacher requires prev_logprobs")
+
+        baseline, std = calculate_baseline_and_std_per_prompt(
+            prompt_ids,
+            rewards,
+            torch.ones_like(rewards),
+            leave_one_out_baseline=self.use_leave_one_out_baseline,
+        )
+        grpo_advantages = (rewards - baseline).unsqueeze(-1)
+
+        if self.normalize_rewards:
+            epsilon = 1e-6
+            non_zero_std_mask = std > 0
+            grpo_advantages[non_zero_std_mask] = grpo_advantages[non_zero_std_mask] / (
+                std.unsqueeze(-1)[non_zero_std_mask] + epsilon
+            )
+
+        grpo_advantages = grpo_advantages.expand(mask.shape)
+
+        distill_gap = (teacher_logprobs - prev_logprobs).detach()
+        teacher_advantages = self.distill_coeff * distill_gap * mask
+
+        advantages = grpo_advantages + teacher_advantages
+
+        self._compute_metrics(grpo_advantages, teacher_advantages, distill_gap, mask)
+
+        return advantages
+
+    def _compute_metrics(
+        self, grpo_advantages, teacher_advantages, distill_gap, mask
+    ):
+        """Compute logging metrics and store in ``self.last_metrics``."""
+        valid_bool = mask.bool()
+        grpo_valid = torch.masked_select(grpo_advantages, valid_bool)
+        teacher_valid = torch.masked_select(teacher_advantages, valid_bool)
+        gap_valid = torch.masked_select(distill_gap, valid_bool)
+
+        def _mean(t):
+            return t.mean().item() if t.numel() > 0 else 0.0
+
+        self.last_metrics = {
+            "grpo_with_teacher/grpo_adv_mean": _mean(grpo_valid),
+            "grpo_with_teacher/teacher_adv_mean": _mean(teacher_valid),
+            "grpo_with_teacher/teacher_student_logprob_gap_mean": _mean(gap_valid),
+            "grpo_with_teacher/distill_coeff": float(self.distill_coeff),
         }

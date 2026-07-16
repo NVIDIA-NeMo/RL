@@ -97,6 +97,10 @@ loss_fn:
   # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
   # 0.0 disables it. VAPO paper recommends 0.1.
   positive_example_nll_weight: 0.0
+  # Optional forward-KL distillation against teacher per-token logprobs
+  # (populated by on-policy distillation). When enabled, adds
+  # ``loss_coeff * KL_fwd(teacher || student)`` to the loss.
+  teacher_distillation: null
 
 checkpointing:
   enabled: true

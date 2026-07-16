@@ -104,6 +104,18 @@ class DraftCrossEntropyLossFn(LossFunction):
         )
 
 
+class TeacherDistillationConfig(BaseModel, extra="forbid"):
+    """Forward-KL distillation term between current policy and teacher logprobs.
+
+    Adds ``loss_coeff * KL_fwd(teacher || student)`` to the ClippedPG loss when
+    ``enabled`` is True and ``teacher_logprobs`` is present in the batch dict.
+    KL is a Schulman k3 estimator on the sampled tokens.
+    """
+
+    enabled: bool = False
+    loss_coeff: float = 0.0
+
+
 class ClippedPGLossConfig(BaseModel, extra="allow"):
     # --- Loss type ---
     disable_ppo_ratio: bool = False
@@ -159,6 +171,11 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # Set to 0 to disable.
     positive_example_nll_weight: float = 0.0
 
+    # --- Teacher distillation ---
+    # Optional forward-KL distillation term against teacher per-token logprobs
+    # (e.g. OPD's ``teacher_reference_logprobs``). Disabled when None.
+    teacher_distillation: Optional[TeacherDistillationConfig] = None
+
 
 class ClippedPGLossDataDict(TypedDict):
     """Required keys for the Clipped Policy Gradient loss function."""
@@ -170,6 +187,8 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    # Populated by the async GRPO loop when teacher_distillation is enabled.
+    teacher_logprobs: NotRequired[torch.Tensor]
     __extra__: Any
 
 
@@ -319,6 +338,14 @@ class ClippedPGLossFn(LossFunction):
                     "and is incompatible with sequence_level_importance_ratios=True"
                 )
 
+        teacher_distill_cfg = cfg.teacher_distillation
+        self.teacher_distillation_enabled = (
+            teacher_distill_cfg is not None and teacher_distill_cfg.enabled
+        )
+        self.teacher_distillation_loss_coeff = (
+            teacher_distill_cfg.loss_coeff if self.teacher_distillation_enabled else 0.0
+        )
+
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
         # that pick the denominators — so split-API trainers can undo the
@@ -333,6 +360,8 @@ class ClippedPGLossFn(LossFunction):
             # Normalized like the gradient (loss_type-dependent).
             "loss": grad_normalizer,
             "kl_penalty": grad_normalizer,
+            "teacher_distillation_loss": grad_normalizer,
+            "teacher_distillation_kl": grad_normalizer,
             # Token-normalized diagnostics, independent of loss_type.
             "probs_ratio": MetricNormalizer.TOKENS,
             "probs_ratio_clamped": MetricNormalizer.TOKENS,
@@ -511,6 +540,37 @@ class ClippedPGLossFn(LossFunction):
                 )
         else:
             kl = torch.tensor(0.0)
+
+        # Forward-KL distillation term between teacher and student sampled-token
+        # logprobs. Uses the Schulman k3 estimator over the same (token_mask *
+        # sample_mask) mask as the actor loss. See TeacherDistillationConfig.
+        teacher_distillation_loss = curr_logprobs.new_zeros(())
+        teacher_distillation_kl_val = 0.0
+        if self.teacher_distillation_enabled and "teacher_logprobs" in data:
+            teacher_logprobs = data["teacher_logprobs"][:, 1:]
+            per_token_teacher_kl = calculate_kl(
+                logprobs=teacher_logprobs,
+                logprobs_reference=curr_logprobs,
+                kl_type="k3",
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+            )
+            if self.loss_type == LossType.TOKEN_LEVEL:
+                teacher_kl = masked_mean(
+                    per_token_teacher_kl,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            else:
+                teacher_kl = masked_mean(
+                    masked_mean(per_token_teacher_kl, token_mask, dim=-1),
+                    sample_mask,
+                    global_normalization_factor=global_valid_seqs,
+                )
+            teacher_distillation_loss = (
+                self.teacher_distillation_loss_coeff * teacher_kl
+            )
+            teacher_distillation_kl_val = teacher_kl.detach().item()
 
         # Calculate clipped loss function if ppo ratio is enabled.
         if self.force_on_policy_ratio:
@@ -728,7 +788,12 @@ class ClippedPGLossFn(LossFunction):
                     global_normalization_factor=correct_valid_toks,
                 )
 
-        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
+        loss = (
+            actor_loss
+            + kl
+            + teacher_distillation_loss
+            + self.positive_example_nll_weight * nll_loss
+        )
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -780,6 +845,8 @@ class ClippedPGLossFn(LossFunction):
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
                 "positive_nll_loss": nll_loss.item(),
+                "teacher_distillation_loss": teacher_distillation_loss.detach().item(),
+                "teacher_distillation_kl": teacher_distillation_kl_val,
             },
         )
 
