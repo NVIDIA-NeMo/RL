@@ -34,6 +34,7 @@ from nemo_rl.algorithms.grpo import (
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
+    compute_and_apply_seq_logprob_error_masking,
     extract_initial_prompt_messages,
     refit_policy_generation,
     scale_rewards,
@@ -144,6 +145,9 @@ class PPOConfig(TypedDict):
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
     policy_training_start_step: NotRequired[int]
+    # Nullable sequence-level multiplicative probability-error threshold.
+    # None logs metrics without masking; values above the threshold are excluded.
+    seq_logprob_error_threshold: float | None
 
 
 class PPOSaveState(TypedDict):
@@ -166,6 +170,28 @@ def _default_ppo_save_state() -> PPOSaveState:
         "total_valid_tokens": 0,
         "val_reward": -99999999.0,
     }
+
+
+def _apply_ppo_seq_logprob_error_masking(
+    train_data: BatchedDataDict,
+    rewards: torch.Tensor,
+    seq_logprob_error_threshold: float | None,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Apply optional mismatch masking and return the GAE mask and metrics."""
+    metrics = compute_and_apply_seq_logprob_error_masking(
+        train_data=train_data,
+        rewards=rewards,
+        seq_logprob_error_threshold=seq_logprob_error_threshold,
+    )
+    metrics["num_masked_seqs_by_logprob_error"] = metrics.pop("num_masked_seqs")
+    advantage_mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
+    if not advantage_mask.bool().any():
+        raise RuntimeError(
+            "PPO has no valid response tokens after filtering. Check overlong "
+            "filtering and ppo.seq_logprob_error_threshold to avoid an optimizer "
+            "step with an empty batch."
+        )
+    return advantage_mask, metrics
 
 
 class PPOLoggerConfig(LoggerConfig):
@@ -434,8 +460,9 @@ def setup(
         inference_resources = generation_config["colocated"]["resources"]
         inference_gpus_per_node = inference_resources["gpus_per_node"]
         inference_nodes = inference_resources["num_nodes"]
+        shared_node_inference = policy_nodes == 1
 
-        if policy_nodes == 1:
+        if shared_node_inference:
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
             ), (
@@ -489,11 +516,14 @@ def setup(
         if segment_size is not None:
             topology = get_ray_cluster_topology()
             num_alive_nodes = len(topology)
-            required_nodes = train_nodes + inference_nodes
+            required_nodes = (
+                train_nodes if shared_node_inference else train_nodes + inference_nodes
+            )
             assert num_alive_nodes >= required_nodes, (
                 "Not enough alive Ray nodes for all PPO roles: "
                 f"need {required_nodes} "
-                f"(train={train_nodes} + inference={inference_nodes}), "
+                f"(train={train_nodes}, inference={inference_nodes}, "
+                f"shared_node={shared_node_inference}), "
                 f"but only {num_alive_nodes} alive nodes found"
             )
             node_resource_constraints, remaining_node_ids, topology = (
@@ -1386,6 +1416,17 @@ def ppo_train(
 
                     policy.finish_inference()
 
+                (
+                    advantage_mask,
+                    seq_logprob_error_metrics,
+                ) = _apply_ppo_seq_logprob_error_masking(
+                    train_data=train_data,
+                    rewards=rewards,
+                    seq_logprob_error_threshold=master_config.ppo[
+                        "seq_logprob_error_threshold"
+                    ],
+                )
+
                 # Build prompt IDs for advantage estimation (groups responses from same prompt).
                 # Use the token-length-based extractor so multi-turn prompts containing
                 # assistant messages still resolve to the original prompt only.
@@ -1406,7 +1447,7 @@ def ppo_train(
                     adv_kwargs = dict(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
-                        mask=train_data["token_mask"],
+                        mask=advantage_mask,
                         reference_logprobs=train_data.get("reference_policy_logprobs"),
                         logprobs=train_data["prev_logprobs"],
                     )
@@ -1536,11 +1577,10 @@ def ppo_train(
 
                 # Metrics
                 flat_advantages = train_data["advantages"]
-                flat_token_mask = flat_messages["token_loss_mask"]
                 del flat_messages
 
                 response_advantages = torch.masked_select(
-                    flat_advantages, flat_token_mask.bool()
+                    flat_advantages, advantage_mask.bool()
                 )
 
                 memory_tracker.snapshot_start_of_stage("Metrics", dir())
@@ -1649,6 +1689,7 @@ def ppo_train(
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
+                metrics.update(seq_logprob_error_metrics)
                 if "global_valid_toks" in metrics:
                     total_valid_tokens += metrics["global_valid_toks"]
 
@@ -1782,6 +1823,7 @@ def ppo_train(
             print("\n📊 Training Results:")
             if train_results is not None:
                 print(f"  • Policy Loss: {metrics.get('loss', 'N/A')}")
+                print(f"  • Generation KL Error: {metrics.get('gen_kl_error', 'N/A')}")
             if value_results is not None:
                 print(f"  • Critic Loss: {metrics.get('critic/loss', 'N/A')}")
                 print(f"  • Critic Grad Norm: {metrics.get('critic/grad_norm', 'N/A')}")
