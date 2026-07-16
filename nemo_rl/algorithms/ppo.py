@@ -72,6 +72,10 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.algorithms.privileged_critic import (
+    build_privileged_value_inputs,
+    remap_by_response_mask,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
@@ -354,6 +358,49 @@ def setup(
     # Extract individual configs for easier access
     policy_config = master_config.policy
     value_config = master_config.value
+
+    # Privileged (answer-conditioned) critic is currently wired for synchronous PPO
+    # only; fail loudly rather than silently falling back to a blind critic on the
+    # async path (which does not build the answer-augmented value batch).
+    _privileged_critic = value_config.get("privileged_critic")
+    if _privileged_critic is not None and _privileged_critic.get("enabled"):
+        assert not (
+            "async_ppo" in master_config.ppo
+            and master_config.ppo["async_ppo"].get("enabled")
+        ), (
+            "value.privileged_critic is supported only for synchronous PPO for now "
+            "(the async_ppo value stage does not build the answer-augmented batch). "
+            "Disable async_ppo or value.privileged_critic.enabled."
+        )
+        # The critic scores [prompt + answer + response], which is longer than the
+        # policy's [prompt + response] by up to max_answer_tokens (+ grader-note
+        # template overhead). Give the VALUE model that much headroom so every
+        # answer-augmented sample fits its sequence-packing bins. Only ever RAISES the
+        # budget; if the user already configured enough, this is a no-op.
+        _needed = (
+            policy_config["max_total_sequence_length"]
+            + int(_privileged_critic.get("max_answer_tokens", 256) or 0)
+            + 128  # grader-note template + chat re-render slack
+        )
+        if value_config["max_total_sequence_length"] < _needed:
+            print(
+                "  ↑ privileged critic: raising value.max_total_sequence_length "
+                f"{value_config['max_total_sequence_length']} -> {_needed}",
+                flush=True,
+            )
+            value_config["max_total_sequence_length"] = _needed
+        for _bcfg_key in ("sequence_packing", "dynamic_batching"):
+            _bcfg = value_config.get(_bcfg_key) or {}
+            if not _bcfg.get("enabled"):
+                continue
+            for _tok_key in ("train_mb_tokens", "logprob_mb_tokens"):
+                if _bcfg.get(_tok_key) is not None and _bcfg[_tok_key] < _needed:
+                    print(
+                        f"  ↑ privileged critic: raising value.{_bcfg_key}.{_tok_key} "
+                        f"{_bcfg[_tok_key]} -> {_needed}",
+                        flush=True,
+                    )
+                    _bcfg[_tok_key] = _needed
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
     loss_config: ClippedPGLossConfig = master_config.loss_fn
@@ -1412,6 +1459,48 @@ def _compute_critic_metrics(value_results: dict[str, Any]) -> dict[str, Any]:
     return critic_metrics
 
 
+def _positional_value_metrics(
+    values: torch.Tensor,
+    returns: torch.Tensor,
+    token_mask: torch.Tensor,
+    n_bins: int = 3,
+) -> dict[str, float]:
+    """Explained variance of V(s_t) vs the GAE return, bucketed by RELATIVE position
+    within each response (early / mid / late thirds).
+
+    Answers "where does the critic do its job well?" — expected to rise early->late,
+    since near the end the outcome is nearly determined. Comparing a privileged
+    (answer-conditioned) run against a blind one, the golden answer should lift the
+    EARLY/MID buckets most (a large early-bucket gap = the privileged-critic mechanism
+    working; a flat gap = the answer isn't buying sharper early credit). Cheap:
+    driver-side tensor ops on tensors already in ``train_data``.
+    """
+    mask = token_mask.bool()
+    if int(mask.sum()) < 2:
+        return {}
+    # 0-based index of each response token within its sample's response, scaled to [0,1)
+    resp_len = mask.sum(dim=1, keepdim=True).clamp(min=1)
+    rel = (torch.cumsum(mask.long(), dim=1) - 1).float() / resp_len.float()
+    names = ["early", "mid", "late"] if n_bins == 3 else [f"bin{i}" for i in range(n_bins)]
+    out: dict[str, float] = {}
+    for i in range(n_bins):
+        lo, hi = i / n_bins, (i + 1) / n_bins
+        upper = (rel < hi) if i < n_bins - 1 else (rel <= 1.0)
+        bmask = mask & (rel >= lo) & upper
+        n = int(bmask.sum())
+        if n < 2:
+            continue
+        v = values[bmask].float()
+        r = returns[bmask].float()
+        var_r = r.var(unbiased=False)
+        ev = (1.0 - (r - v).var(unbiased=False) / var_r).item() if var_r > 1e-8 else 0.0
+        out[f"critic/ev_{names[i]}"] = ev
+        out[f"critic/abs_err_{names[i]}"] = (r - v).abs().mean().item()
+        out[f"critic/mean_v_{names[i]}"] = v.mean().item()
+        out[f"critic/n_tokens_{names[i]}"] = float(n)
+    return out
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -1755,9 +1844,41 @@ def ppo_train(
                 memory_tracker.snapshot_start_of_stage("Value inference", dir())
                 print("▶ Computing values...", flush=True)
                 with timer.time("value_inference"):
+                    # Privileged (answer-conditioned) critic: the value model scores an
+                    # answer-augmented sequence [prompt(+gold), response] (built at the
+                    # message level, response tokens verbatim) and the response-position
+                    # values are mapped back into the original layout. Policy/GAE/value
+                    # workers are untouched. See nemo_rl/algorithms/privileged_critic.py.
+                    privileged_critic_cfg = master_config.value.get("privileged_critic")
+                    if privileged_critic_cfg is not None and not privileged_critic_cfg.get(
+                        "enabled"
+                    ):
+                        privileged_critic_cfg = None
+                    critic_batch = None
+
                     value_model.prepare_for_inference()
-                    values = value_model.get_values(train_data)
-                    train_data["values"] = values["values"].squeeze(-1)
+                    if privileged_critic_cfg is not None:
+                        critic_batch = build_privileged_value_inputs(
+                            repeated_batch,
+                            tokenizer,
+                            privileged_critic_cfg,
+                            make_seq_len_divisible_by=master_config.policy[
+                                "make_sequence_length_divisible_by"
+                            ],
+                        )
+                        vals_aug = value_model.get_values(critic_batch)["values"].squeeze(
+                            -1
+                        )
+                        # keep aug-layout old values around for the (optional) value clip
+                        critic_batch["values"] = vals_aug
+                        train_data["values"] = remap_by_response_mask(
+                            vals_aug,
+                            critic_batch["token_mask"],
+                            train_data["token_mask"],
+                        )
+                    else:
+                        values = value_model.get_values(train_data)
+                        train_data["values"] = values["values"].squeeze(-1)
                     value_model.finish_inference()
 
                 print(
@@ -1869,6 +1990,15 @@ def ppo_train(
                     train_data["advantages"] = advantages
                     if returns is not None:
                         train_data["returns"] = returns
+                        # Privileged critic trains on the answer-augmented sequence:
+                        # scatter the (original-layout) GAE returns onto the augmented
+                        # response positions. Same response tokens => exact mapping.
+                        if critic_batch is not None:
+                            critic_batch["returns"] = remap_by_response_mask(
+                                returns,
+                                train_data["token_mask"],
+                                critic_batch["token_mask"],
+                            )
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
@@ -1884,8 +2014,16 @@ def ppo_train(
 
                     with timer.time("value_training"):
                         print("▶ Training value...", flush=True)
+                        # Privileged critic: train on the answer-augmented batch
+                        # (returns already scattered onto its response positions above;
+                        # values=aug old-values for the optional value clip).
+                        if critic_batch is not None:
+                            critic_batch["sample_mask"] = train_data["sample_mask"]
+                            value_train_batch = critic_batch
+                        else:
+                            value_train_batch = train_data
                         value_results = value_model.train(
-                            train_data,
+                            value_train_batch,
                             value_loss_fn,
                             timer=timer,
                         )
@@ -2006,6 +2144,17 @@ def ppo_train(
                 # Extract critic metrics from value training results
                 if value_results is not None:
                     metrics.update(_compute_critic_metrics(value_results))
+                    # Positional critic-quality diagnostic (early/mid/late tokens): how
+                    # well V predicts the return along the trajectory, and — for the
+                    # privileged critic — where the golden answer sharpens it.
+                    if "values" in train_data and "returns" in train_data:
+                        metrics.update(
+                            _positional_value_metrics(
+                                train_data["values"],
+                                train_data["returns"],
+                                train_data["token_mask"],
+                            )
+                        )
                 metrics.update(
                     {
                         "reward": rewards.numpy(),
