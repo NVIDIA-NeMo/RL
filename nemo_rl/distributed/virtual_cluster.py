@@ -39,7 +39,7 @@ class ClusterConfig(TypedDict):
     # kept below the OS ephemeral range (32768-60999 on stock Linux) to avoid
     # TOCTOU collisions with kernel-assigned source ports.  When absent,
     # RayVirtualCluster falls back to DEFAULT_MASTER_PORT_RANGE_LOW/HIGH
-    # (25000-28000).  See ray.sub for the full port layout.
+    # (1400-1999).  See ray.sub for the full port layout.
     master_port_range_low: NotRequired[int]
     master_port_range_high: NotRequired[int]
     segment_size: NotRequired[
@@ -77,27 +77,40 @@ class PY_EXECUTABLES:
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
-# Default port ranges — kept below the OS ephemeral range (32768-60999 on
-# stock Linux) to avoid TOCTOU collisions.  See ray.sub for the full layout
-# including Ray's own GCS / worker gRPC ports.
+# Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
+# nodes the ephemeral floor is as low as 9000 (32768 on stock Linux), so every
+# service port is pinned below 9000 to avoid TOCTOU collisions.  See ray.sub for
+# the full layout including Ray's own GCS / worker gRPC ports.
 #
-#   11001-15000  vLLM / SGLang HTTP servers  (policy.generation.port_range_low/high)
-#   15001-20000  NeMo Gym HTTP servers       (env.nemo_gym.port_range_low/high)
-#   20001+       vLLM TP/DP rendezvous       (VLLM_PORT env var, 100-port spacing)
-#   25000-28000  Master address / TCPStore    (cluster.master_port_range_low/high)
-DEFAULT_GENERATION_PORT_RANGE_LOW = 11001
-DEFAULT_GENERATION_PORT_RANGE_HIGH = 15000
-DEFAULT_GYM_PORT_RANGE_LOW = 15001
-DEFAULT_GYM_PORT_RANGE_HIGH = 20000
-# vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports
-# starting at LOW + engine_index * PORTS_PER_ENGINE.  The effective upper
-# bound is LOW + max_engines_per_node * PORTS_PER_ENGINE.  With 8 GPUs and
-# TP=1 (8 engines): 20001 + 8*100 = 20801.  There is no fixed ceiling —
-# ensure the range does not overlap with MASTER (25000+) on very large nodes.
-DEFAULT_VLLM_PORT_RANGE_LOW = 20001
+#   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
+#   3000-4999    NeMo RL generation HTTP servers + SGLang engine NCCL/dist_init
+#                                                 (policy.generation.port_range_low/high)
+#   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
+#   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
+#   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
+#                                                 carved out of the vLLM band — only one rollout
+#                                                 backend runs at a time)
+#   8800-8999    SGLang Prometheus metrics       (DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_*, hard-coded)
+DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
+DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
+DEFAULT_GYM_PORT_RANGE_LOW = 5000
+DEFAULT_GYM_PORT_RANGE_HIGH = 5999
+# vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting
+# at LOW + engine_index * PORTS_PER_ENGINE.  With 8 GPUs and TP=1 (8 engines):
+# 7000 + 8*100 = 7800, still below the 9000 ephemeral floor.
+DEFAULT_VLLM_PORT_RANGE_LOW = 7000
 DEFAULT_VLLM_PORTS_PER_ENGINE = 100
-DEFAULT_MASTER_PORT_RANGE_LOW = 25000
-DEFAULT_MASTER_PORT_RANGE_HIGH = 28000
+# SGLang control-plane ports, carved out of the top of the vLLM rendezvous band —
+# safe because only one rollout backend runs at a time, and a vLLM run only
+# climbs past 8600 with >=16 engines on a single node.  Both bands also steer
+# clear of the Ray dashboard carve-out at 8265 (see ray.sub).
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 8600
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 8799
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 8800
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 8999
+# Master address / TCPStore range, tucked below the Ray worker-gRPC band (2000+).
+DEFAULT_MASTER_PORT_RANGE_LOW = 1400
+DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
 
 # ---------------------------------------------------------------------------
 # Topology resource keys
@@ -122,7 +135,9 @@ Nodes sharing the same key belong to the same NVLink switch fabric (e.g. one GB2
 TOPO_RANK_KEY = "topo_rank"
 """Ray resource key for the SLURM topological rank.
 Derived from ``SLURM_TOPOLOGY_ADDR`` (when ``SLURM_TOPOLOGY_ADDR_PATTERN=block.node``),
-falling back to ``SLURM_PROCID`` or hostname digits.
+falling back to ``SLURM_PROCID + 2`` on worker nodes (head node is pinned to ``1``),
+then to hostname digits when SLURM is unavailable. Values are always ``>= 1`` so that
+Ray does not drop the custom resource (Ray drops value-0 custom resources).
 Used to sort nodes within and across NVLink domains so rank assignment follows physical topology."""
 
 NVLINK_DOMAIN_UNKNOWN = "unknown"
@@ -181,6 +196,40 @@ def _get_free_port_local(
         s.listen(1)
 
     return port
+
+
+def _get_free_consecutive_ports_local(
+    port_range_low: int,
+    port_range_high: int,
+    consecutive: int = 1,
+    start_port: Optional[int] = None,
+) -> int:
+    """Find ``consecutive`` contiguous bindable ports and return the base.
+
+    Scans upward from *start_port* within [port_range_low, port_range_high).
+    *start_port* lets a caller thread a per-node cursor so successive blocks do
+    not overlap. Raises ``RuntimeError`` if no such block exists in the range.
+    """
+    assert consecutive >= 1, f"consecutive must be >= 1, got {consecutive}"
+    base = port_range_low if start_port is None else max(start_port, port_range_low)
+    while base + consecutive - 1 < port_range_high:
+        socks: list[socket.socket] = []
+        try:
+            for offset in range(consecutive):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                s.listen(1)
+                socks.append(s)
+            return base
+        except OSError:
+            base += 1
+        finally:
+            for s in socks:
+                s.close()
+    raise RuntimeError(
+        f"Could not find {consecutive} consecutive free ports in "
+        f"[{port_range_low}, {port_range_high})."
+    )
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:
@@ -874,20 +923,42 @@ class RayVirtualCluster:
         Returns:
             Tuple of (address, port)
         """
-        # Get placement groups if not already created
-        if not self._node_placement_groups:
-            self.get_placement_groups()
+        results = self.get_available_addresses_and_ports_batch([(pg_idx, bundle_idx)])
+        return results[0]
 
-        # Get the placement group
+    def get_available_addresses_and_ports_batch(
+        self,
+        pg_bundle_pairs: list[tuple[int, int]],
+        batch_size: int = 256,
+    ) -> list[tuple[str, int]]:
+        """Discovers available addresses and ports for multiple bundles in parallel.
+
+        Fires all remote tasks up front, then collects results in batches via ray.wait()
+        to avoid putting too many objects into the Ray object
+        store at once.
+        See https://docs.ray.io/en/latest/ray-core/patterns/ray-get-too-many-objects.html
+
+        Args:
+            pg_bundle_pairs: List of ``(pg_idx, bundle_idx)`` pairs.
+            batch_size: Maximum number of ready futures to fetch at once.
+
+        Returns:
+            List of ``(address, port)`` tuples in the same order as ``pg_bundle_pairs``.
+        """
         placement_groups = self.get_placement_groups()
-        if len(placement_groups) == 1:
-            pg = placement_groups[0]
-        else:
-            pg = placement_groups[pg_idx]
+        refs: list[ray.ObjectRef] = []
+        for pg_idx, bundle_idx in pg_bundle_pairs:
+            pg = (
+                placement_groups[0]
+                if len(placement_groups) == 1
+                else placement_groups[pg_idx]
+            )
+            if not pg.bundle_specs:
+                raise RuntimeError(
+                    "No valid placement groups found to get available address and port"
+                )
 
-        if pg.bundle_specs:
-            # Launch port finder on the given bundle of this placement group
-            addr, port = ray.get(
+            refs.append(
                 _get_node_ip_and_free_port.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg, placement_group_bundle_index=bundle_idx
@@ -896,11 +967,29 @@ class RayVirtualCluster:
                     num_cpus=0,
                 ).remote(self.port_range_low, self.port_range_high)
             )
-            return addr, port
 
-        raise RuntimeError(
-            "No valid placement groups found to get available address and port"
-        )
+        if len(refs) <= batch_size:
+            return ray.get(refs)
+
+        # ray.wait returns refs in completion order, so map each ref back to
+        # its input index to preserve worker-to-port ordering.
+        ref_to_idx = {ref: idx for idx, ref in enumerate(refs)}
+        results: list[Optional[tuple[str, int]]] = []
+        for _ in refs:
+            results.append(None)
+        remaining = list(refs)
+        while remaining:
+            ready, remaining = ray.wait(
+                remaining, num_returns=min(batch_size, len(remaining))
+            )
+            for ref, value in zip(ready, ray.get(ready)):
+                results[ref_to_idx[ref]] = value
+
+        ordered_results: list[tuple[str, int]] = []
+        for result in results:
+            assert result is not None
+            ordered_results.append(result)
+        return ordered_results
 
     def get_master_address_and_port(self) -> tuple[str, int]:
         """Gets the master address and port for the distributed training setup.
@@ -978,6 +1067,11 @@ class RayVirtualCluster:
 
         This method is idempotent and can be safely called multiple times.
         """
+        # Skip if Ray is already gone (typically from __del__ during _Py_Finalize
+        # after Ray's atexit teardown). Any Ray API call would trigger a fatal
+        # core_worker_process.cc:88 CHECK. Placement groups die with Ray.
+        if not ray.is_initialized():
+            return True
         if self._node_placement_groups is not None:
             # Remove all placement groups
             for pg in self._node_placement_groups:

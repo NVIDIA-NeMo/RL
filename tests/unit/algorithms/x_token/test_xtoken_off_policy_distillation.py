@@ -469,6 +469,27 @@ def test_exit_on_max_steps(mock_xtoken_components):
     assert mock_xtoken_components.student_policy.train.call_count == 3
 
 
+def test_ft_save_period_triggers_periodic_saves(mock_xtoken_components):
+    """ft_save_period triggers checkpoint saves independent of save_period."""
+    c = mock_xtoken_components
+    c.master_config.distillation["max_num_steps"] = 5
+    c.master_config.distillation["max_num_epochs"] = 1
+    c.master_config.checkpointing["enabled"] = True
+    c.master_config.checkpointing["save_period"] = 100  # only the final step saves
+    c.master_config.checkpointing["ft_save_period"] = 2
+    c.master_config.checkpointing["metric_name"] = None
+    c.checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
+
+    with patch("nemo_rl.algorithms.xtoken_off_policy_distillation.torch.save"):
+        _run_train(c)
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
+    saved_steps = [
+        call.args[0] for call in c.checkpointer.init_tmp_checkpoint.call_args_list
+    ]
+    assert saved_steps == [2, 4, 5]
+
+
 def test_exit_on_max_epochs(mock_xtoken_components):
     # max_num_steps high so it doesn't fire first; max_num_epochs caps the loop.
     mock_xtoken_components.master_config.distillation["max_num_steps"] = 10_000

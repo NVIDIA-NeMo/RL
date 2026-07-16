@@ -714,6 +714,8 @@ def distillation_train(
     # Run distillation training (multi-epoch until reaching max_num_steps or max_num_epochs)
     batch: BatchedDataDict[DatumSpec]
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while total_steps < max_steps and current_epoch < max_epochs:
         print(
             f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_epochs} {'=' * 25}",
@@ -951,6 +953,10 @@ def distillation_train(
                     is_last_step
                     or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 # +1 because total_steps is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
@@ -1026,7 +1032,10 @@ def distillation_train(
                             dataloader.state_dict(),
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=student_policy.finalize_async_save,
+                        )
 
             # Logging
             # Log training data
@@ -1101,9 +1110,11 @@ def distillation_train(
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_steps:
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -1113,6 +1124,13 @@ def distillation_train(
         # End of epoch
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_epochs falls through the while loop and bypasses the
+    # inline shutdown() calls at the max_steps / timeout early returns, so
+    # without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
 
 
 def validate(
