@@ -21,6 +21,7 @@ from examples.swe_bench.verified_trajectory_audit import (
     PERF_FIELDS,
     SWE_BENCH_VERIFIED,
     AuditError,
+    build_explicit_subset_manifest,
     build_no_timeout_manifest,
     build_prefix_manifest,
     build_subset_manifest,
@@ -390,6 +391,53 @@ def test_build_subset_manifest_is_hash_ranked_and_order_independent(tmp_path) ->
     assert first_metadata["selection"] == second_metadata["selection"]
     assert first_metadata["selection"]["method"] == "sha256_ranked_instance_id"
     assert first_metadata["rows"] == 2
+
+
+def test_build_explicit_subset_manifest_preserves_reviewed_order(tmp_path) -> None:
+    rows = [
+        manifest_row("owner__repo-3"),
+        manifest_row("owner__repo-1"),
+        manifest_row("owner__repo-2"),
+    ]
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    instance_ids = tmp_path / "instance-ids.txt"
+    instance_ids.write_text(
+        "# reviewed tool-rich cohort\nowner__repo-2\n\nowner__repo-1\n"
+    )
+    output = tmp_path / "explicit-subset.jsonl"
+
+    metadata = build_explicit_subset_manifest(
+        manifest,
+        instance_ids,
+        output,
+        expected_count=3,
+        expected_subset_count=2,
+    )
+
+    output_rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [row["instance_id"] for row in output_rows] == [
+        "owner__repo-2",
+        "owner__repo-1",
+    ]
+    assert metadata["selection"]["method"] == "explicit_instance_id_list"
+    assert metadata["rows"] == 2
+
+
+def test_build_explicit_subset_manifest_rejects_unknown_ids(tmp_path) -> None:
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(json.dumps(manifest_row("owner__repo-1")) + "\n")
+    instance_ids = tmp_path / "instance-ids.txt"
+    instance_ids.write_text("owner__repo-missing\n")
+
+    with pytest.raises(AuditError, match="unknown instance IDs"):
+        build_explicit_subset_manifest(
+            manifest,
+            instance_ids,
+            tmp_path / "explicit-subset.jsonl",
+            expected_count=1,
+            expected_subset_count=1,
+        )
 
 
 def test_build_prefix_manifest_preserves_source_order(tmp_path) -> None:

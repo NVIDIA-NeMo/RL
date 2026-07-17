@@ -693,6 +693,67 @@ def build_subset_manifest(
     return metadata
 
 
+def build_explicit_subset_manifest(
+    manifest_path: Path,
+    instance_ids_path: Path,
+    output: Path,
+    expected_count: int,
+    expected_subset_count: int | None,
+) -> dict[str, Any]:
+    """Build a manifest in the exact order of a reviewed instance-ID list."""
+    manifest_rows = read_jsonl(manifest_path)
+    manifest = validate_manifest(manifest_rows, expected_count)
+
+    selected_ids = []
+    seen_ids = set()
+    with instance_ids_path.open() as f:
+        for line_number, line in enumerate(f, start=1):
+            instance_id = line.strip()
+            if not instance_id or instance_id.startswith("#"):
+                continue
+            if instance_id in seen_ids:
+                raise AuditError(
+                    f"{instance_ids_path}:{line_number}: duplicate instance_id="
+                    f"{instance_id}"
+                )
+            seen_ids.add(instance_id)
+            selected_ids.append(instance_id)
+
+    if not selected_ids:
+        raise AuditError("explicit subset instance-ID list is empty")
+    if expected_subset_count is not None and len(selected_ids) != expected_subset_count:
+        raise AuditError(
+            "explicit subset: expected "
+            f"{expected_subset_count} instance IDs, got {len(selected_ids)}"
+        )
+    unknown_ids = [
+        instance_id for instance_id in selected_ids if instance_id not in manifest
+    ]
+    if unknown_ids:
+        raise AuditError(
+            f"explicit subset contains unknown instance IDs: {unknown_ids[:10]}"
+        )
+
+    atomic_write_jsonl(output, (manifest[instance_id] for instance_id in selected_ids))
+    metadata = {
+        "dataset": SWE_BENCH_VERIFIED,
+        "rows": len(selected_ids),
+        "sha256": file_sha256(output),
+        "manifest": str(output.resolve()),
+        "source_manifest": str(manifest_path.resolve()),
+        "source_manifest_rows": len(manifest),
+        "source_manifest_sha256": file_sha256(manifest_path),
+        "selection": {
+            "method": "explicit_instance_id_list",
+            "instance_ids_file": str(instance_ids_path.resolve()),
+            "instance_ids_file_sha256": file_sha256(instance_ids_path),
+            "selected_instance_ids_sha256": canonical_json_sha256(selected_ids),
+        },
+    }
+    atomic_write_json(output.with_suffix(".metadata.json"), metadata)
+    return metadata
+
+
 def build_prefix_manifest(
     manifest_path: Path,
     output: Path,
@@ -1239,6 +1300,16 @@ def parse_args() -> argparse.Namespace:
         "--selection-seed", default="streaming-tool-call-subset-v1"
     )
 
+    explicit_subset_manifest = subparsers.add_parser(
+        "explicit-subset-manifest",
+        help="build a manifest from a reviewed instance-ID list",
+    )
+    explicit_subset_manifest.add_argument("--manifest", type=Path, required=True)
+    explicit_subset_manifest.add_argument("--instance-ids", type=Path, required=True)
+    explicit_subset_manifest.add_argument("--output", type=Path, required=True)
+    explicit_subset_manifest.add_argument("--expected-count", type=int, default=500)
+    explicit_subset_manifest.add_argument("--expected-subset-count", type=int)
+
     prefix_manifest = subparsers.add_parser(
         "prefix-manifest", help="build a manifest from the first rows in source order"
     )
@@ -1313,6 +1384,14 @@ def main() -> int:
                 args.expected_count,
                 args.subset_count,
                 args.selection_seed,
+            )
+        elif args.command == "explicit-subset-manifest":
+            summary = build_explicit_subset_manifest(
+                args.manifest,
+                args.instance_ids,
+                args.output,
+                args.expected_count,
+                args.expected_subset_count,
             )
         elif args.command == "prefix-manifest":
             summary = build_prefix_manifest(
