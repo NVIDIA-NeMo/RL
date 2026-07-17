@@ -14,12 +14,14 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -28,6 +30,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
+from nemo_rl.utils.venvs import create_local_venv_on_each_node
 
 DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "<tool_call>",
@@ -496,3 +499,66 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+
+def spinup_nemo_gym_actor(
+    env_configs: dict[str, Any],
+    base_urls: list[Optional[str]],
+    model_name: str,
+    enable_router_replay: bool,
+) -> Any:
+    """Spin up the NeMo-Gym actor against the given generation server URLs.
+
+    When ``env_configs["nemo_gym"]["num_gpu_nodes"] > 0``, the actor is
+    scheduled with soft NodeAffinity to the current Ray node so its colocated
+    GPU resources land where the caller expects.
+    """
+    nemo_gym_dict = dict(env_configs["nemo_gym"])
+
+    # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
+    # (where the detector reads them), not part of Gym's global config.
+    invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
+    thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+
+    # Pass prebuilt cache + venv dirs through the global config so the gym reuses
+    # image-baked venvs instead of rebuilding them.
+    uv_cache_dir = get_nemo_gym_uv_cache_dir()
+    if uv_cache_dir is not None:
+        nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
+    uv_venv_dir = get_nemo_gym_venv_dir()
+    if uv_venv_dir is not None:
+        nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
+
+    nemo_gym_cfg = NemoGymConfig(
+        model_name=model_name,
+        base_urls=base_urls,
+        invalid_tool_call_patterns=invalid_tool_call_patterns,
+        thinking_tags=thinking_tags,
+        require_routed_experts=enable_router_replay,
+        initial_global_config_dict=nemo_gym_dict,
+    )
+
+    nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
+    if nemo_gym_py_exec.startswith("uv"):
+        nemo_gym_py_exec = create_local_venv_on_each_node(
+            nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
+        )
+
+    nemo_gym_opts: dict[str, Any] = {}
+    if nemo_gym_dict.get("num_gpu_nodes", 0):
+        nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(),
+            soft=True,
+        )
+    nemo_gym_opts["runtime_env"] = {
+        "py_executable": nemo_gym_py_exec,
+        "env_vars": {
+            **os.environ,
+            "VIRTUAL_ENV": nemo_gym_py_exec,
+            "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+        },
+    }
+
+    actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+    ray.get(actor._spinup.remote())
+    return actor

@@ -717,6 +717,8 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_PPO
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_SingleController
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Other_1
@@ -785,6 +787,8 @@ jobs:
           - script: L1_Functional_Tests_SFT
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_PPO
+            runner: ${{ vars.GB200_RUNNER }}
+          - script: L1_Functional_Tests_SingleController
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ vars.GB200_RUNNER }}
@@ -857,6 +861,8 @@ jobs:
           - script: L1_Functional_Tests_SFT
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_PPO
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_SingleController
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
