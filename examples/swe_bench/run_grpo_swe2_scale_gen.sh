@@ -47,6 +47,7 @@
 #               EXP_SUFFIX, MODEL_PATH,
 #               CONTAINER, MAX_NUM_STEPS, SBATCH_TIME, SBATCH_DEPENDENCY,
 #               CACHE_NAMESPACE, PERSISTENT_CACHE,
+#               UV_CACHE_SEED_MODE,
 #               SUBMIT_MODE,
 #               BASE_LOG_DIR, LOGGER_LOG_DIR, STREAMING_TOOL_CALL,
 #               LOG_GYM_RESPONSES, TEMPERATURE, TOP_P,
@@ -556,6 +557,11 @@ CACHE_NAMESPACE="${CACHE_NAMESPACE:-${CACHE_MODEL_KEY}-${CACHE_CONTAINER_KEY}-${
 PERSISTENT_CACHE="${PERSISTENT_CACHE:-${REPO_ROOT}/results/cache/swe_scale/${CACHE_NAMESPACE}}"
 export PERSISTENT_CACHE
 export LUSTRE_UV_CACHE_SEED="${LUSTRE_UV_CACHE_SEED:-${PERSISTENT_CACHE}/uv_seed}"
+UV_CACHE_SEED_MODE="${UV_CACHE_SEED_MODE:-persistent}"
+if [ "${UV_CACHE_SEED_MODE}" != "persistent" ] && [ "${UV_CACHE_SEED_MODE}" != "image-only" ]; then
+  echo "ERROR: UV_CACHE_SEED_MODE must be persistent or image-only." >&2
+  exit 1
+fi
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${PERSISTENT_CACHE}/pip}"
 # Never let `uv sync` reuse a worktree `.venv` created under another image.
 # The setup and driver run in the same allocation and rebuild this node-local
@@ -636,6 +642,7 @@ if [ -n "${STREAMING_INITIAL_CHUNK_CHARS}" ]; then
 fi
 echo "SWE-bench artifact cache offline: ${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}"
 echo "Package caches: uv-local=${UV_CACHE_DIR} uv-seed=${LUSTRE_UV_CACHE_SEED:-none} pip=${PIP_CACHE_DIR} driver-venv=${UV_PROJECT_ENVIRONMENT}"
+echo "uv cache seed mode: ${UV_CACHE_SEED_MODE}"
 echo "Gym shared venv: ${NEMO_GYM_VENV_DIR}"
 echo "uv executable: ${UV_BIN}"
 echo "Ray vLLM venv: ${VLLM_SHARED_VENV} -> ${NEMO_RL_VENV_DIR}/{async-worker,replay,collector} (link-mode=${UV_LINK_MODE})"
@@ -713,7 +720,18 @@ if [ -d /root/.cache/uv ] && [ "\$(ls -A /root/.cache/uv 2>/dev/null)" ]; then
 else
   echo "[CACHE SEED] uv (image): no baked cache"
 fi
-_seed_cache "${LUSTRE_UV_CACHE_SEED}" "/tmp/uv_cache" "uv (prebuilt transformer-engine)"
+if [ "${UV_CACHE_SEED_MODE}" = "persistent" ]; then
+  if [ -f "${LUSTRE_UV_CACHE_SEED}/.seed-complete-mcore-v1" ] \
+    || [ -f "${LUSTRE_UV_CACHE_SEED}/.seed-complete-mcore-v2" ]; then
+    _seed_cache "${LUSTRE_UV_CACHE_SEED}" "/tmp/uv_cache" "uv (prebuilt transformer-engine)"
+  elif [ -d "${LUSTRE_UV_CACHE_SEED}" ] && [ "\$(ls -A "${LUSTRE_UV_CACHE_SEED}" 2>/dev/null)" ]; then
+    echo "[CACHE SEED] uv (persistent): incomplete seed has no completion marker; ignored"
+  else
+    echo "[CACHE SEED] uv (persistent): no warm cache on Lustre yet"
+  fi
+else
+  echo "[CACHE SEED] uv (persistent): image-only mode; using baked image cache"
+fi
 echo "[CACHE SEED] Done."
 
 UV_CACHE_DIR=/tmp/uv_cache \
@@ -723,18 +741,22 @@ NVTE_CUDA_ARCHS='90;100' \
 UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT}" \
   uv sync --frozen --extra mcore
 
-# Persist complete uv cache entries after every successful locked sync. A
-# marker records the sync contract but must not suppress future merges: the
-# driver and Ray environment builders can add native wheels after setup.
-(
-  if flock -n 9; then
-    rsync -a --exclude '.tmp*' /tmp/uv_cache/ "${LUSTRE_UV_CACHE_SEED}/"
-    touch "${LUSTRE_UV_CACHE_SEED}/.seed-complete-mcore-v2"
-    echo "[CACHE WRITEBACK] uv setup merge: complete"
-  else
-    echo "[CACHE WRITEBACK] uv setup merge: another node owns the seed lock; skipped"
-  fi
-) 9>"${LUSTRE_UV_CACHE_SEED}.lock"
+if [ "${UV_CACHE_SEED_MODE}" = "persistent" ]; then
+  # Persist complete uv cache entries after every successful locked sync. A
+  # marker records the sync contract but must not suppress future merges: the
+  # driver and Ray environment builders can add native wheels after setup.
+  (
+    if flock -n 9; then
+      rsync -a --exclude '.tmp*' /tmp/uv_cache/ "${LUSTRE_UV_CACHE_SEED}/"
+      touch "${LUSTRE_UV_CACHE_SEED}/.seed-complete-mcore-v2"
+      echo "[CACHE WRITEBACK] uv setup merge: complete"
+    else
+      echo "[CACHE WRITEBACK] uv setup merge: another node owns the seed lock; skipped"
+    fi
+  ) 9>"${LUSTRE_UV_CACHE_SEED}.lock"
+else
+  echo "[CACHE WRITEBACK] uv setup merge: skipped in image-only mode"
+fi
 SETUPEOF
 export SETUP_COMMAND
 
@@ -928,18 +950,22 @@ fi
 # cache persistence never turns a failed workload into a successful job.
 export COMMAND="${COMMAND}
 _nrl_driver_exit=\$?
-(
-  if flock -w 600 9; then
-    if rsync -a --exclude '.tmp*' /tmp/uv_cache/ '${LUSTRE_UV_CACHE_SEED}/'; then
-      touch '${LUSTRE_UV_CACHE_SEED}/.driver-writeback-mcore-v1'
-      echo '[CACHE WRITEBACK] uv driver merge: complete'
+if [ '${UV_CACHE_SEED_MODE}' = 'persistent' ]; then
+  (
+    if flock -w 600 9; then
+      if rsync -a --exclude '.tmp*' /tmp/uv_cache/ '${LUSTRE_UV_CACHE_SEED}/'; then
+        touch '${LUSTRE_UV_CACHE_SEED}/.driver-writeback-mcore-v1'
+        echo '[CACHE WRITEBACK] uv driver merge: complete'
+      else
+        echo '[CACHE WRITEBACK] WARNING: uv driver merge failed' >&2
+      fi
     else
-      echo '[CACHE WRITEBACK] WARNING: uv driver merge failed' >&2
+      echo '[CACHE WRITEBACK] WARNING: timed out waiting for uv seed lock' >&2
     fi
-  else
-    echo '[CACHE WRITEBACK] WARNING: timed out waiting for uv seed lock' >&2
-  fi
-) 9>'${LUSTRE_UV_CACHE_SEED}.lock'
+  ) 9>'${LUSTRE_UV_CACHE_SEED}.lock'
+else
+  echo '[CACHE WRITEBACK] uv driver merge: skipped in image-only mode'
+fi
 exit \${_nrl_driver_exit}"
 
 # Validate the fully assembled driver without printing it; the command contains
