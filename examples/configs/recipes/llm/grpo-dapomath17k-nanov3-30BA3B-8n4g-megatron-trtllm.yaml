@@ -1,0 +1,85 @@
+defaults: ../../grpo_math_1B_trtllm.yaml
+grpo:
+  num_prompts_per_step: 128
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 2048
+    max_response_length: 47104
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo-dapomath17k-nanov3-30BA3B-8n4g-megatron-trtllm
+  keep_top_k: 5
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 49152
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    context_parallel_size: 4
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    moe_per_layer_logging: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+  generation:
+    max_new_tokens: 47104
+    trtllm_cfg:
+      max_batch_size: 64
+      gpu_memory_utilization: 0.7
+    trtllm_kwargs:
+      kv_cache_config:
+        mamba_ssm_cache_dtype: float32
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-dapomath17k-nanov3-30BA3B-8n4g-megatron-trtllm
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
