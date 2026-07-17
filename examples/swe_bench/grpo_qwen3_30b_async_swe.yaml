@@ -266,6 +266,7 @@ policy:
         initial_chunk_chars: 256
         snapshot_poll_interval_seconds: 0.1
         snapshot_long_poll_timeout_seconds: 1.0
+        event_driven_snapshot_wait: true
         flush_interval_seconds: 0.25
         request_timeout_seconds: 60
       http_server_serving_chat_kwargs:
