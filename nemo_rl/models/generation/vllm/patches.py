@@ -466,6 +466,168 @@ def _patch_vllm_streaming_session_priority(logger) -> bool:
     return True
 
 
+def _patch_vllm_streaming_session_output_state(logger) -> bool:
+    """Keep vLLM output state consistent across streaming-input chunks.
+
+    vLLM 0.20 updates the scheduler-side sampling parameters when a resumable
+    request receives another chunk, but its output processor only appends the
+    prompt tokens. This leaves the original detokenizer and logprob processor
+    alive. For same-request prefill, that state contains the discarded dummy
+    token and was created without logprobs; the authoritative final decode then
+    requests logprobs and crashes in ``LogprobsProcessor``.
+
+    Rebuild the output-side processors from the accumulated authoritative
+    prompt and the new chunk's sampling parameters. This mirrors the scheduler,
+    which discards the last sampled dummy token before applying the update.
+    Guard every replacement so future vLLM versions fail closed instead of
+    receiving a partial source patch.
+    """
+    try:
+        output_processor_file = _get_vllm_file("v1/engine/output_processor.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate vLLM output processor for streaming-input patch."
+        )
+        return False
+
+    replacements = (
+        (
+            "    prompt_token_ids: list[int] | None\n"
+            "    arrival_time: float\n"
+            "    final: bool = False\n",
+            "    prompt_token_ids: list[int] | None\n"
+            "    arrival_time: float\n"
+            "    request: EngineCoreRequest\n"
+            "    final: bool = False\n",
+        ),
+        (
+            "    def __init__(\n        self,\n        request_id: str,\n",
+            "    def __init__(\n"
+            "        self,\n"
+            "        tokenizer: TokenizerLike | None,\n"
+            "        request_id: str,\n",
+        ),
+        (
+            "    ):\n"
+            "        self.request_id = request_id\n"
+            "        self.external_req_id = external_req_id\n",
+            "    ):\n"
+            "        self.tokenizer = tokenizer\n"
+            "        self.request_id = request_id\n"
+            "        self.external_req_id = external_req_id\n",
+        ),
+        (
+            "    def apply_streaming_update(self, update: StreamingUpdate) -> None:\n"
+            "        # Apply the update to the request state.\n"
+            "        self.streaming_input = not update.final\n"
+            "        # TODO also include relevant output tokens in new prompt here\n"
+            "        #     (match scheduler behavior).\n"
+            "        if update.prompt:\n"
+            "            self.prompt = (\n"
+            "                (self.prompt + update.prompt) if self.prompt else update.prompt\n"
+            "            )\n"
+            "        if self.prompt_token_ids:\n"
+            "            self.prompt_token_ids.extend(update.prompt_token_ids or ())\n"
+            "        else:\n"
+            "            self.prompt_token_ids = update.prompt_token_ids or []\n"
+            "        assert self.prompt_token_ids is not None\n"
+            "        self.prompt_len = len(self.prompt_token_ids)\n"
+            "        if self.stats is not None:\n"
+            "            self.stats.arrival_time = update.arrival_time\n"
+            "        self.is_prefilling = True\n",
+            "    def apply_streaming_update(self, update: StreamingUpdate) -> None:\n"
+            "        # Mirror Scheduler._update_request_as_session: the prior chunk's\n"
+            "        # sampled dummy token is not part of the resumed prompt. Recreate\n"
+            "        # output-side state from the accumulated real prompt so neither\n"
+            "        # detokenization nor logprobs retain that discarded token.\n"
+            "        self.streaming_input = not update.final\n"
+            "        if update.prompt:\n"
+            "            self.prompt = (\n"
+            "                (self.prompt + update.prompt) if self.prompt else update.prompt\n"
+            "            )\n"
+            "        if self.prompt_token_ids:\n"
+            "            self.prompt_token_ids.extend(update.prompt_token_ids or ())\n"
+            "        else:\n"
+            "            self.prompt_token_ids = update.prompt_token_ids or []\n"
+            "        assert self.prompt_token_ids is not None\n"
+            "\n"
+            "        request = update.request\n"
+            "        request.prompt_token_ids = list(self.prompt_token_ids)\n"
+            "        request.prompt_embeds = None\n"
+            "        sampling_params = request.sampling_params\n"
+            "        assert sampling_params is not None\n"
+            "        tokenizer = self.tokenizer if sampling_params.detokenize else None\n"
+            "        self.output_kind = sampling_params.output_kind\n"
+            "        self.logprobs_processor = LogprobsProcessor.from_new_request(\n"
+            "            tokenizer=tokenizer, request=request\n"
+            "        )\n"
+            "        self.detokenizer = IncrementalDetokenizer.from_new_request(\n"
+            "            tokenizer=tokenizer, request=request\n"
+            "        )\n"
+            "        self.prompt_embeds = None\n"
+            "        self.prompt_len = len(self.prompt_token_ids)\n"
+            "        self.max_tokens_param = sampling_params.max_tokens\n"
+            "        self.top_p = sampling_params.top_p\n"
+            "        self.n = sampling_params.n\n"
+            "        self.temperature = sampling_params.temperature\n"
+            "        self.sent_tokens_offset = 0\n"
+            "        if self.queue is not None:\n"
+            "            self.queue.aggregate = (\n"
+            "                sampling_params.output_kind == RequestOutputKind.DELTA\n"
+            "            )\n"
+            "        if self.stats is not None:\n"
+            "            self.stats.arrival_time = update.arrival_time\n"
+            "        self.is_prefilling = True\n",
+        ),
+        (
+            "        return cls(\n            request_id=request.request_id,\n",
+            "        return cls(\n"
+            "            tokenizer=tokenizer,\n"
+            "            request_id=request.request_id,\n",
+        ),
+        (
+            "        update = StreamingUpdate(\n"
+            "            prompt=prompt,\n"
+            "            prompt_token_ids=request.prompt_token_ids,\n"
+            "            arrival_time=request.arrival_time,\n"
+            "        )\n",
+            "        update = StreamingUpdate(\n"
+            "            prompt=prompt,\n"
+            "            prompt_token_ids=request.prompt_token_ids,\n"
+            "            arrival_time=request.arrival_time,\n"
+            "            request=request,\n"
+            "        )\n",
+        ),
+    )
+
+    lock_path = output_processor_file + ".streaming_session_output_state_patch_lock"
+    with _exclusive_patch_lock(lock_path):
+        with open(output_processor_file) as source_file:
+            content = source_file.read()
+
+        for old_snippet, new_snippet in replacements:
+            if new_snippet in content:
+                continue
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply vLLM streaming-session output-state patch: "
+                    "expected snippet not found in %s.",
+                    output_processor_file,
+                )
+                return False
+
+        for old_snippet, new_snippet in replacements:
+            if new_snippet in content:
+                continue
+            content = content.replace(old_snippet, new_snippet, 1)
+
+        with open(output_processor_file, "w") as source_file:
+            source_file.write(content)
+
+    logger.info("Successfully patched vLLM streaming-session output state.")
+    return True
+
+
 def _apply_vllm_patches(
     py_executable: str, *, extra_env_vars: list[str] | None = None
 ) -> dict[str, bool]:
@@ -481,7 +643,9 @@ def _apply_vllm_patches(
     _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)
     max_tokens_supported = _patch_vllm_streaming_session_max_tokens(patch_logger)
     priority_supported = _patch_vllm_streaming_session_priority(patch_logger)
+    output_state_supported = _patch_vllm_streaming_session_output_state(patch_logger)
     return {
         "streaming_session_max_tokens": max_tokens_supported,
         "streaming_session_priority": priority_supported,
+        "streaming_session_output_state": output_state_supported,
     }

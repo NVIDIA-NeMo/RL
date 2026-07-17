@@ -352,6 +352,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ):
             required_patches = {
                 "streaming_session_max_tokens",
+                "streaming_session_output_state",
                 "streaming_session_priority",
             }
             available_patches = {
