@@ -589,34 +589,54 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
-                # Multi-LoRA: compute per-adapter global valid-token counts
-                # by all-reducing each adapter's local token count across DP
-                # ranks. This gives MultiAdapterLoss the same per-adapter
-                # global denominator that standalone NLLLoss receives via
-                # ``global_valid_toks`` — essential for bit-equivalence under
-                # DP>1 (without it, each rank divides by its local count and
-                # the DP-reduced gradient is scaled by DP_size instead of 1).
+                # Multi-LoRA: compute per-adapter GLOBAL valid-token counts.
+                # Every DP rank participates in the same two collectives:
+                # first find the canonical adapter count, then SUM one dense
+                # count vector. Ranks where an adapter is absent contribute 0.
+                # Store the result row-aligned so BatchedDataDict.slice keeps
+                # the correct denominator through microbatching.
                 if "adapter_names" in batch:
                     import torch.distributed as _dist
-                    _adapter_names = batch["adapter_names"]
                     _token_mask = batch.get("token_mask")
                     _sample_mask = batch.get("sample_mask")
-                    if _token_mask is not None and _sample_mask is not None:
-                        _mask = _token_mask[:, 1:] * _sample_mask.unsqueeze(-1)
-                        _adapter_ids = batch.get("adapter_ids")
-                        if _adapter_ids is not None:
-                            from nousnet.rl.lora.multi.loss import (
-                                GLOBAL_ADAPTER_TOKEN_COUNTS_KEY,
-                                adapter_row_ranges,
+                    _adapter_ids = batch.get("adapter_ids")
+                    if (
+                        _token_mask is not None
+                        and _sample_mask is not None
+                        and _adapter_ids is not None
+                    ):
+                        from nousnet.rl.lora.multi.loss import (
+                            GLOBAL_ADAPTER_TOKEN_COUNTS_KEY,
+                        )
+
+                        _row_token_counts = (
+                            _token_mask[:, 1:] * _sample_mask.unsqueeze(-1)
+                        ).sum(dim=-1).to(torch.float32)
+                        _max_id = _adapter_ids.max().to(torch.long).clone()
+                        _dist.all_reduce(
+                            _max_id,
+                            op=_dist.ReduceOp.MAX,
+                            group=self.dp_mesh.get_group(),
+                        )
+                        _n_adapters = int(_max_id.item()) + 1
+                        _global_counts = torch.zeros(
+                            _n_adapters,
+                            dtype=torch.float32,
+                            device=_adapter_ids.device,
+                        )
+                        _global_counts.scatter_add_(
+                            0, _adapter_ids.to(torch.long), _row_token_counts
+                        )
+                        _dist.all_reduce(
+                            _global_counts,
+                            op=_dist.ReduceOp.SUM,
+                            group=self.dp_mesh.get_group(),
+                        )
+                        batch[GLOBAL_ADAPTER_TOKEN_COUNTS_KEY] = (
+                            _global_counts.index_select(
+                                0, _adapter_ids.to(torch.long)
                             )
-                            _ranges = adapter_row_ranges(list(_adapter_names))
-                            _global_counts = {}
-                            for _name, _start, _end in _ranges:
-                                _local = _mask[_start:_end].sum()
-                                _t = _local.cuda().clone()
-                                _dist.all_reduce(_t, group=self.dp_mesh.get_group())
-                                _global_counts[_name] = _t
-                            batch[GLOBAL_ADAPTER_TOKEN_COUNTS_KEY] = _global_counts
+                        )
 
                 self.optimizer.zero_grad()
 
