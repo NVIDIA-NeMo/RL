@@ -72,12 +72,12 @@ _run_worker() {
   unset VLLM_TP
 
   local_cache_root="/tmp/nemo_rl_streaming_prefill/${BENCH_CACHE_NAMESPACE}"
-  local_vllm_cache="${local_cache_root}/vllm"
-  local_inductor_cache="${local_cache_root}/inductor"
-  local_triton_cache="${local_cache_root}/triton"
-  persistent_vllm_cache="${BENCH_BUILD_CACHE_ROOT}/vllm"
-  persistent_inductor_cache="${BENCH_BUILD_CACHE_ROOT}/inductor"
-  persistent_triton_cache="${BENCH_BUILD_CACHE_ROOT}/triton"
+  local_vllm_cache="${BENCH_LOCAL_VLLM_CACHE:-${local_cache_root}/vllm}"
+  local_inductor_cache="${BENCH_LOCAL_INDUCTOR_CACHE:-${local_cache_root}/inductor}"
+  local_triton_cache="${BENCH_LOCAL_TRITON_CACHE:-${local_cache_root}/triton}"
+  persistent_vllm_cache="${BENCH_PERSISTENT_VLLM_CACHE:-${BENCH_BUILD_CACHE_ROOT}/vllm}"
+  persistent_inductor_cache="${BENCH_PERSISTENT_INDUCTOR_CACHE:-${BENCH_BUILD_CACHE_ROOT}/inductor}"
+  persistent_triton_cache="${BENCH_PERSISTENT_TRITON_CACHE:-${BENCH_BUILD_CACHE_ROOT}/triton}"
 
   _seed_cache "${persistent_vllm_cache}" "${local_vllm_cache}" vllm
   _seed_cache "${persistent_inductor_cache}" "${local_inductor_cache}" inductor
@@ -234,6 +234,9 @@ export BENCH_SIZE_SWEEP_REPEATS
 export BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS
 export BENCH_FINAL_DECODE_OVERLAP_SECONDS
 export BENCH_OUTPUT_JSON BENCH_BUILD_CACHE_ROOT BENCH_RUNTIME_PYTHON
+export BENCH_LOCAL_VLLM_CACHE BENCH_LOCAL_INDUCTOR_CACHE BENCH_LOCAL_TRITON_CACHE
+export BENCH_PERSISTENT_VLLM_CACHE BENCH_PERSISTENT_INDUCTOR_CACHE
+export BENCH_PERSISTENT_TRITON_CACHE
 
 echo "[LAUNCH] account=${ACCOUNT} partition=${PARTITION} nodes=1 gpus_per_node=${VLLM_TP} exclusive=false"
 echo "[LAUNCH] benchmark_mode=${BENCH_MODE} container=${CONTAINER}"
