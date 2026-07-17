@@ -30,6 +30,7 @@ from nemo_rl.data.datasets import (
     update_single_dataset_config,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -189,6 +190,11 @@ def main(is_vlm: bool = False):
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
+    # Initialise telemetry on the driver BEFORE init_ray() so the resolved
+    # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
+    # by every worker. No-op unless nemo-lens is installed and telemetry is on.
+    init_telemetry_driver(config, algorithm="sft")
+
     init_ray()
 
     # setup tokenizer (or processor)
@@ -223,6 +229,9 @@ def main(is_vlm: bool = False):
             checkpointer,
             sft_save_state,
         )
+
+    # Flush and shut down telemetry (no-op when telemetry is inactive).
+    shutdown_telemetry()
 
 
 if __name__ == "__main__":

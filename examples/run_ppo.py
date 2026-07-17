@@ -24,6 +24,7 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
@@ -122,6 +123,11 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
+    # Initialise telemetry on the driver BEFORE init_ray() so the resolved
+    # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
+    # by every worker. No-op unless nemo-lens is installed and telemetry is on.
+    init_telemetry_driver(config, algorithm="ppo")
+
     init_ray()
 
     # setup tokenizer
@@ -198,6 +204,9 @@ def main() -> None:
                 ppo_state,
                 master_config,
             )
+
+    # Flush and shut down telemetry (no-op when telemetry is inactive).
+    shutdown_telemetry()
 
 
 if __name__ == "__main__":
