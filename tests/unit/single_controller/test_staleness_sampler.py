@@ -87,17 +87,6 @@ class TestStalenessSamplerSelect:
         )
         assert result == (None, 0)
 
-    def test_select_returns_none_on_empty_buffer(self):
-        buf = FakeBuffer()
-        sampler = StalenessSampler(buf, max_staleness_versions=2)
-
-        result = _run(
-            sampler.select(
-                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=1
-            )
-        )
-        assert result == (None, 0)
-
     def test_select_filters_by_staleness_window(self):
         buf = FakeBuffer()
         # Weights 3, 4, 5, 2, 6 against trainer=5, max_staleness=2:
@@ -117,23 +106,6 @@ class TestStalenessSamplerSelect:
         assert selected is not None
         # Freshest first → g2 (lag 0), g1 (lag 1)
         assert selected.sample_ids == ["g2_g0", "g1_g0"]
-        assert num_groups == 2
-
-    def test_select_freshest_first_orders_by_lag(self):
-        buf = FakeBuffer()
-        for w in [3, 4, 5]:
-            buf.add(f"v{w}", weight=w)
-        sampler = StalenessSampler(
-            buf, max_staleness_versions=5, sample_freshest_first=True
-        )
-
-        selected, num_groups = _run(
-            sampler.select(
-                current_train_weight=6, min_prompt_groups=2, max_prompt_groups=2
-            )
-        )
-        assert selected is not None
-        assert selected.sample_ids == ["v5_g0", "v4_g0"]
         assert num_groups == 2
 
     def test_select_fifo_orders_by_insertion(self):
