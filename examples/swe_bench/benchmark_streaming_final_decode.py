@@ -163,17 +163,50 @@ def _extract_completion_delta(
     return token_ids, tuple(sampled_logprobs), str(completion.text or "")
 
 
-def _parity(
+def _max_abs_logprob_delta(
     reference: FinalGenerationMeasurement, candidate: FinalGenerationMeasurement
-) -> dict[str, bool]:
-    """Return exact per-field output parity for one candidate generation."""
+) -> float:
+    """Return sampled-token logprob drift, or infinity for incompatible outputs."""
+    if len(reference.output_logprobs) != len(candidate.output_logprobs):
+        return float("inf")
+    return max(
+        (
+            abs(reference_logprob - candidate_logprob)
+            for reference_logprob, candidate_logprob in zip(
+                reference.output_logprobs,
+                candidate.output_logprobs,
+                strict=True,
+            )
+        ),
+        default=0.0,
+    )
+
+
+def _parity(
+    reference: FinalGenerationMeasurement,
+    candidate: FinalGenerationMeasurement,
+    *,
+    logprob_atol: float,
+) -> dict[str, bool | float]:
+    """Return output parity relative to normal-request logprob drift."""
+    max_abs_logprob_delta = _max_abs_logprob_delta(reference, candidate)
     details = {
         "output_token_ids": reference.output_token_ids == candidate.output_token_ids,
-        "output_logprobs": reference.output_logprobs == candidate.output_logprobs,
+        "output_logprobs_exact": (
+            reference.output_logprobs == candidate.output_logprobs
+        ),
+        "output_logprobs_within_atol": max_abs_logprob_delta <= logprob_atol,
+        "max_abs_logprob_delta": max_abs_logprob_delta,
+        "logprob_atol": logprob_atol,
         "output_text": reference.output_text == candidate.output_text,
         "decoded_text": reference.decoded_text == candidate.decoded_text,
     }
-    details["all"] = all(details.values())
+    details["all"] = bool(
+        details["output_token_ids"]
+        and details["output_logprobs_within_atol"]
+        and details["output_text"]
+        and details["decoded_text"]
+    )
     return details
 
 
@@ -252,6 +285,7 @@ async def _generate_same_request_final(
     tokenizer: Any,
     stability_margin_tokens: int,
     background_priority: int,
+    expected_dummy_token_id: int,
 ) -> SameRequestFinalMeasurement:
     stable_prefix = _stable_streamed_prefix(
         trace, stability_margin_tokens=stability_margin_tokens
@@ -307,6 +341,10 @@ async def _generate_same_request_final(
                 if len(token_ids) != 1:
                     raise RuntimeError(
                         "prefill phase generated more than one dummy token"
+                    )
+                if token_ids[0] != expected_dummy_token_id:
+                    raise RuntimeError(
+                        "prefill phase did not generate the forced EOS dummy token"
                     )
                 dummy_token_ids.extend(token_ids)
                 dummy_logprobs.extend(logprobs)
@@ -490,6 +528,9 @@ async def _main(args: argparse.Namespace) -> None:
         raise ValueError("overlap and cleanup delays must be non-negative")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    if tokenizer.eos_token_id is None:
+        raise RuntimeError("same-request benchmark requires an EOS token")
+    eos_token_id = int(tokenizer.eos_token_id)
     traces: dict[int, PromptTrace] = {}
     common_final: list[int] | None = None
     for candidate_tokens in args.candidate_chunk_token_sweep:
@@ -526,6 +567,20 @@ async def _main(args: argparse.Namespace) -> None:
         seed=args.seed,
         max_tokens=1,
         logprobs=0,
+        output_kind=RequestOutputKind.DELTA,
+    )
+    # vLLM fixes Request.max_tokens when the input-streaming session is first
+    # created, even though later chunks can replace SamplingParams. Preserve
+    # the final budget from the start, while allowed_token_ids + EOS makes the
+    # prefill phase terminate after exactly one discardable dummy token.
+    same_request_prefill_sampling_params = SamplingParams(
+        temperature=0,
+        top_p=1,
+        top_k=-1,
+        seed=args.seed,
+        max_tokens=args.max_output_tokens,
+        logprobs=0,
+        allowed_token_ids=[eos_token_id],
         output_kind=RequestOutputKind.DELTA,
     )
     final_delta_sampling_params = SamplingParams(
@@ -570,6 +625,7 @@ async def _main(args: argparse.Namespace) -> None:
             await asyncio.sleep(args.cleanup_delay_seconds)
 
     raw: dict[str, dict[str, list[Any]]] = {}
+    parity_observations: list[dict[str, Any]] = []
     parity_failures: list[dict[str, Any]] = []
     try:
         for candidate_tokens, trace in traces.items():
@@ -633,13 +689,16 @@ async def _main(args: argparse.Namespace) -> None:
                         measurement = await _generate_same_request_final(
                             llm,
                             trace=trace,
-                            prefill_sampling_params=prefill_sampling_params,
+                            prefill_sampling_params=(
+                                same_request_prefill_sampling_params
+                            ),
                             final_sampling_params=final_delta_sampling_params,
                             tokens_prompt_type=TokensPrompt,
                             streaming_input_type=StreamingInput,
                             tokenizer=tokenizer,
                             stability_margin_tokens=args.stability_margin_tokens,
                             background_priority=args.background_priority,
+                            expected_dummy_token_id=eos_token_id,
                         )
                     iteration_results[arm] = measurement
 
@@ -649,26 +708,34 @@ async def _main(args: argparse.Namespace) -> None:
                     raw[label][arm].append(measurement)
 
                 reference = iteration_results["control_delta"]
+                final_only_control = iteration_results["control_final_only"]
+                separate_control = iteration_results["separate_final"].final_generation
+                normal_control_logprob_drift = max(
+                    _max_abs_logprob_delta(reference, final_only_control),
+                    _max_abs_logprob_delta(reference, separate_control),
+                )
                 parity_candidates = {
-                    "control_final_only": iteration_results["control_final_only"],
-                    "separate_final": iteration_results[
-                        "separate_final"
-                    ].final_generation,
+                    "control_final_only": final_only_control,
+                    "separate_final": separate_control,
                     "same_request_final": iteration_results[
                         "same_request_final"
                     ].final_generation,
                 }
                 for arm, candidate in parity_candidates.items():
-                    details = _parity(reference, candidate)
+                    details = _parity(
+                        reference,
+                        candidate,
+                        logprob_atol=normal_control_logprob_drift,
+                    )
+                    observation = {
+                        "candidate_chunk_tokens": candidate_tokens,
+                        "repeat": iteration - args.warmup_repeats,
+                        "arm": arm,
+                        "details": details,
+                    }
+                    parity_observations.append(observation)
                     if not details["all"]:
-                        parity_failures.append(
-                            {
-                                "candidate_chunk_tokens": candidate_tokens,
-                                "repeat": iteration - args.warmup_repeats,
-                                "arm": arm,
-                                "details": details,
-                            }
-                        )
+                        parity_failures.append(observation)
 
         measurements: dict[str, Any] = {}
         subpage_ttft_positive = []
@@ -704,6 +771,7 @@ async def _main(args: argparse.Namespace) -> None:
                 )
             no_dummy_leak &= all(
                 len(item.dummy_token_ids) == 1
+                and item.dummy_token_ids[0] == eos_token_id
                 and item.final_generation.output_token_ids == control.output_token_ids
                 for item, control in zip(same_request_final, control_delta, strict=True)
             )
@@ -734,7 +802,22 @@ async def _main(args: argparse.Namespace) -> None:
                 },
             }
 
-        exact_output_parity = not parity_failures
+        exact_token_and_text_parity = all(
+            observation["details"][field]
+            for observation in parity_observations
+            for field in ("output_token_ids", "output_text", "decoded_text")
+        )
+        logprobs_within_normal_control_drift = all(
+            observation["details"]["output_logprobs_within_atol"]
+            for observation in parity_observations
+        )
+        exact_logprob_parity = all(
+            observation["details"]["output_logprobs_exact"]
+            for observation in parity_observations
+        )
+        output_contracts_passed = (
+            exact_token_and_text_parity and logprobs_within_normal_control_drift
+        )
         result = {
             "model": args.model,
             "engine": {
@@ -764,12 +847,18 @@ async def _main(args: argparse.Namespace) -> None:
             "repeats": args.repeats,
             "warmup_repeats": args.warmup_repeats,
             "acceptance": {
-                "exact_output_parity": exact_output_parity,
+                "output_contracts_passed": output_contracts_passed,
+                "exact_token_and_text_parity": exact_token_and_text_parity,
+                "logprobs_within_normal_control_drift": (
+                    logprobs_within_normal_control_drift
+                ),
+                "exact_logprob_parity": exact_logprob_parity,
                 "no_dummy_token_in_final_output": no_dummy_leak,
                 "all_subpage_mean_ttft_savings_positive": bool(subpage_ttft_positive)
                 and all(subpage_ttft_positive),
                 "all_subpage_mean_total_savings_positive": bool(subpage_total_positive)
                 and all(subpage_total_positive),
+                "parity_observations": parity_observations,
                 "parity_failures": parity_failures,
             },
             "measurements": measurements,
@@ -779,10 +868,8 @@ async def _main(args: argparse.Namespace) -> None:
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(serialized + "\n")
-        if args.strict_parity and (not exact_output_parity or not no_dummy_leak):
-            raise RuntimeError(
-                "same-request final decode failed exact output-parity gates"
-            )
+        if args.strict_parity and (not output_contracts_passed or not no_dummy_leak):
+            raise RuntimeError("same-request final decode failed output-contract gates")
     finally:
         llm.shutdown()
 
