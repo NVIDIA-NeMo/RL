@@ -446,6 +446,18 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             _init_xfer_os.environ.get("NOUSNET_INIT_EXPORT_DIR")
             or _init_xfer_os.environ.get("NOUSNET_INIT_IMPORT_DIR")
         ):
+            import hashlib as _init_xfer_hashlib
+            import inspect as _init_xfer_inspect
+            import nousnet.rl.lora.multi.adapter as _init_xfer_adapter
+
+            _init_xfer_source = _init_xfer_inspect.getsourcefile(_init_xfer_adapter)
+            with open(_init_xfer_source, "rb") as _init_xfer_file:
+                _init_xfer_sha = _init_xfer_hashlib.sha256(_init_xfer_file.read()).hexdigest()
+            print(
+                f"[NOUSNET_SOURCE_HASH][worker rank={torch.distributed.get_rank()}] "
+                f"{_init_xfer_source} {_init_xfer_sha}",
+                flush=True,
+            )
             from nousnet.rl.lora.multi.init_transfer import maybe_transfer_initial_lora
 
             maybe_transfer_initial_lora(self.model)
