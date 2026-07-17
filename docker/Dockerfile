@@ -190,7 +190,7 @@ fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+uv sync --link-mode symlink --locked --all-groups --extra telemetry --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache

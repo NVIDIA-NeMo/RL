@@ -120,7 +120,7 @@ uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project
 uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --all-groups --extra telemetry --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
