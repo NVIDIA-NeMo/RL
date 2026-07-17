@@ -59,6 +59,9 @@ export SBATCH_TIME="${SBATCH_TIME:-2:0:0}"
 # common repository instead of rebuilding environments and kernels under the
 # worktree. An explicit pair cache always wins; otherwise reuse the matching
 # namespace only when it already exists.
+COMMON_REPO_ROOT=""
+CACHE_CONTAINER_KEY=""
+CACHE_LOCK_KEY=""
 if [ -z "${PAIR_SHARED_PERSISTENT_CACHE:-}" ] && command -v git >/dev/null 2>&1; then
   COMMON_GIT_DIR="$(git -C "${REPO_ROOT}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
   if [ -n "${COMMON_GIT_DIR}" ]; then
@@ -70,6 +73,28 @@ if [ -z "${PAIR_SHARED_PERSISTENT_CACHE:-}" ] && command -v git >/dev/null 2>&1;
     if [ -d "${COMMON_CACHE}" ]; then
       export PAIR_SHARED_PERSISTENT_CACHE="${COMMON_CACHE}"
     fi
+  fi
+fi
+
+# Package caches are compatible across the Base and Instruct checkpoints when
+# the container and uv.lock fingerprint match. Keep model-, Gym-, and JIT-
+# specific caches in the Instruct namespace, but borrow a completed Base uv
+# seed when the Instruct package seed is cold. Explicit cache overrides win.
+if [ -z "${LUSTRE_UV_CACHE_SEED:-}" ] && [ -n "${COMMON_REPO_ROOT}" ] && [ -n "${PAIR_SHARED_PERSISTENT_CACHE:-}" ]; then
+  BASE_CACHE_MODEL_KEY="$(printf '%s' "NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16" | tr -c '[:alnum:]_.-' '_')"
+  BASE_COMPATIBLE_CACHE="${COMMON_REPO_ROOT}/results/cache/swe_scale/${BASE_CACHE_MODEL_KEY}-${CACHE_CONTAINER_KEY}-${CACHE_LOCK_KEY}"
+  INSTRUCT_UV_SEED="${PAIR_SHARED_PERSISTENT_CACHE}/uv_seed"
+  BASE_UV_SEED="${BASE_COMPATIBLE_CACHE}/uv_seed"
+  if [ ! -f "${INSTRUCT_UV_SEED}/.seed-complete-mcore-v1" ] \
+    && [ ! -f "${INSTRUCT_UV_SEED}/.seed-complete-mcore-v2" ] \
+    && { [ -f "${BASE_UV_SEED}/.seed-complete-mcore-v1" ] \
+      || [ -f "${BASE_UV_SEED}/.seed-complete-mcore-v2" ]; }; then
+    export LUSTRE_UV_CACHE_SEED="${BASE_UV_SEED}"
+    if [ -z "${PIP_CACHE_DIR:-}" ] && [ -d "${BASE_COMPATIBLE_CACHE}/pip" ]; then
+      export PIP_CACHE_DIR="${BASE_COMPATIBLE_CACHE}/pip"
+    fi
+    echo "Package cache fallback: completed Base seed ${LUSTRE_UV_CACHE_SEED}"
+    echo "Model/Gym/JIT cache namespace remains: ${PAIR_SHARED_PERSISTENT_CACHE}"
   fi
 fi
 
