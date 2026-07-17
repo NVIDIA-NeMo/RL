@@ -25,7 +25,7 @@ class StalenessSampler:
         buffer: Shared TQReplayBuffer holding the candidate slots.
         max_staleness_versions: Max weight-version gap a sample may have from the trainer.
         sample_freshest_first: Prefer smallest lag when picking from the in-window set.
-        require_order: Take only from the oldest in-window weight_version and wait for its batch to fill.
+        strict_weight_fifo: Consume in strict weight_version FIFO — take only from the oldest in-window weight_version and wait for its batch to fill.
         force_in_order: Match each slot's target_step against current_train_weight, ignoring the window; mirrors legacy async_grpo target_weight semantics.
     """
 
@@ -34,7 +34,7 @@ class StalenessSampler:
         buffer: TQReplayBuffer,
         max_staleness_versions: int,
         sample_freshest_first: bool = False,
-        require_order: bool = False,
+        strict_weight_fifo: bool = False,
         force_in_order: bool = False,
     ) -> None:
         if max_staleness_versions < 0:
@@ -42,14 +42,14 @@ class StalenessSampler:
                 f"max_staleness_versions must be non-negative, got "
                 f"{max_staleness_versions}"
             )
-        if require_order and sample_freshest_first:
+        if strict_weight_fifo and sample_freshest_first:
             raise ValueError(
-                "require_order and sample_freshest_first are mutually exclusive"
+                "strict_weight_fifo and sample_freshest_first are mutually exclusive"
             )
         self._buffer = buffer
         self.max_staleness_versions = max_staleness_versions
         self.sample_freshest_first = sample_freshest_first
-        self.require_order = require_order
+        self.strict_weight_fifo = strict_weight_fifo
         self.force_in_order = force_in_order
 
     async def select(
@@ -93,7 +93,7 @@ class StalenessSampler:
             min_valid_version = max(
                 0, current_train_weight - self.max_staleness_versions
             )
-            if self.require_order:
+            if self.strict_weight_fifo:
                 in_window = [
                     weight
                     for weight in self._buffer.start_weight_list
