@@ -20,8 +20,9 @@ import threading
 import time
 import uuid
 import warnings
-from dataclasses import asdict
+from collections import OrderedDict
 from collections.abc import Callable, Coroutine
+from dataclasses import asdict
 from typing import Any, AsyncGenerator, Optional, TypeVar, cast
 
 import ray
@@ -46,10 +47,14 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.incremental_tokenizer import (
     ExactIncrementalTokenizerSessionManager,
     IncrementalTokenizerError,
+    IncrementalTokenizerPrefixSeedError,
+    IncrementalTokenizerStablePrefixError,
 )
+from nemo_rl.models.generation.vllm.cache_utils import writeback_vllm_cache
 from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallError,
     StreamingToolCallPrefillManager,
+    StreamingToolCallPromptTooLongError,
     StreamingToolCallSessionNotFoundError,
 )
 from nemo_rl.models.generation.vllm.utils import (
@@ -64,6 +69,36 @@ LOGGER = logging.getLogger(__name__)
 
 
 StreamingToolCallManagerResult = TypeVar("StreamingToolCallManagerResult")
+
+
+def _configure_background_prefill_scheduling(
+    llm_kwargs: dict[str, Any],
+    streaming_tool_call_config: dict[str, Any] | None,
+) -> int:
+    """Protect foreground generation with a lower-priority prefill class."""
+    if streaming_tool_call_config is None or not streaming_tool_call_config.get(
+        "background_prefill_completion"
+    ):
+        return 0
+
+    background_prefill_priority = streaming_tool_call_config[
+        "background_prefill_priority"
+    ]
+    if (
+        isinstance(background_prefill_priority, bool)
+        or not isinstance(background_prefill_priority, int)
+        or background_prefill_priority <= 0
+    ):
+        raise ValueError(
+            "background_prefill_priority must be a positive integer so foreground "
+            "requests keep priority zero"
+        )
+    scheduling_policy = llm_kwargs.setdefault("scheduling_policy", "priority")
+    if scheduling_policy != "priority":
+        raise ValueError(
+            "background prefill completion requires vLLM scheduling_policy='priority'"
+        )
+    return background_prefill_priority
 
 
 class StreamingToolCallPrefillRequest(BaseModel):
@@ -85,6 +120,13 @@ class StreamingToolCallAbortRequest(BaseModel):
     """Request to abort a streaming prefill session."""
 
     session_id: str
+
+
+def _materialize_message_tool_calls(messages: list[dict[str, Any]]) -> None:
+    """Replace lazy tool-call iterators with lists in-place."""
+    for message in messages:
+        if message.get("tool_calls"):
+            message["tool_calls"] = list(message["tool_calls"])
 
 
 def _replace_prefix_tokens(
@@ -301,6 +343,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
 
+        streaming_tool_call_config = self.cfg["vllm_cfg"].get("streaming_tool_call")
+        background_prefill_priority = _configure_background_prefill_scheduling(
+            llm_kwargs, streaming_tool_call_config
+        )
+
         # Workaround: convert compilation_config dict to CompilationConfig object
         # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
         if llm_kwargs.get("compilation_config", None):
@@ -333,7 +380,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
 
         self.streaming_tool_call_manager = None
-        streaming_tool_call_config = self.cfg["vllm_cfg"].get("streaming_tool_call")
         if (
             streaming_tool_call_config is not None
             and streaming_tool_call_config["enabled"]
@@ -355,6 +401,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     prompt=input_stream,
                     sampling_params=prefill_sampling_params,
                     request_id=request_id,
+                    priority=background_prefill_priority,
                 )
 
             def make_streaming_input(token_ids):
@@ -378,6 +425,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 stability_margin_tokens=streaming_tool_call_config[
                     "stability_margin_tokens"
                 ],
+                # Each submitted streaming chunk produces one dummy decode token.
+                max_prompt_tokens=self.llm_async_engine_args.max_model_len - 1,
             )
 
         self.server_thread, self.base_url, self.http_server = None, None, None
@@ -482,6 +531,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.generation_tokens: list[int] = []
         self.streaming_tool_call_dummy_tokens: list[int] = []
         self.streaming_tool_call_prefill_tokens: list[int] = []
+        self.streaming_tool_call_prompt_too_long_rejections: list[int] = []
         self.prefix_cache_queries: list[int] = []
         self.prefix_cache_hits: list[int] = []
 
@@ -502,9 +552,15 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             manager = self.streaming_tool_call_manager
             dummy_tokens = manager.total_dummy_tokens if manager is not None else 0
             prefill_tokens = manager.total_prefill_tokens if manager is not None else 0
+            prompt_too_long_rejections = (
+                manager.total_prompt_too_long_rejections if manager is not None else 0
+            )
             self.generation_tokens.append(max(0, int(metric_value) - dummy_tokens))
             self.streaming_tool_call_dummy_tokens.append(dummy_tokens)
             self.streaming_tool_call_prefill_tokens.append(prefill_tokens)
+            self.streaming_tool_call_prompt_too_long_rejections.append(
+                prompt_too_long_rejections
+            )
         elif metric_name == "vllm:prefix_cache_queries":
             self.prefix_cache_queries.append(int(metric_value))
         elif metric_name == "vllm:prefix_cache_hits":
@@ -526,6 +582,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "streaming_tool_call_prefill_tokens": copy.deepcopy(
                     self.streaming_tool_call_prefill_tokens
                 ),
+                "streaming_tool_call_prompt_too_long_rejections": copy.deepcopy(
+                    self.streaming_tool_call_prompt_too_long_rejections
+                ),
                 "prefix_cache_queries": copy.deepcopy(self.prefix_cache_queries),
                 "prefix_cache_hits": copy.deepcopy(self.prefix_cache_hits),
             }
@@ -541,6 +600,23 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def post_init_async(self):
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
+            manager = self.streaming_tool_call_manager
+            if manager is not None:
+                block_sizes = await self.llm.collective_rpc(
+                    "report_kv_cache_block_size", args=tuple()
+                )
+                unique_block_sizes = {int(block_size) for block_size in block_sizes}
+                if len(unique_block_sizes) != 1:
+                    raise RuntimeError(
+                        "vLLM workers reported inconsistent KV cache block sizes: "
+                        f"{sorted(unique_block_sizes)}"
+                    )
+                cache_page_size_tokens = unique_block_sizes.pop()
+                manager.set_cache_page_size_tokens(cache_page_size_tokens)
+                LOGGER.info(
+                    "Streaming tool-call background prefill uses a %d-token APC page",
+                    cache_page_size_tokens,
+                )
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:
             await self.llm.collective_rpc(
@@ -561,7 +637,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from copy import deepcopy
         from logging import Filter as LoggingFilter
         from logging import LogRecord
-        from typing import List, Optional, Union
+        from typing import ClassVar, List, Optional, Union
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
@@ -760,9 +836,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 *,
                 skip_mm_cache: bool = False,
             ):
-                for message in messages:
-                    if message.get("tool_calls"):
-                        message["tool_calls"] = list(message["tool_calls"])
+                # Materialize the message tool calls so we can deepcopy below.
+                _materialize_message_tool_calls(messages)
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
@@ -1044,12 +1119,38 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         class NeMoRLTokenizeChatRequest(
             NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest
         ):
+            # OpenAIBaseModel caches field names on the class. Reset the
+            # inherited cache so this subclass's extension is not logged as an
+            # ignored request field on every tokenizer call.
+            field_names: ClassVar[set[str] | None] = None
             required_prefix_token_ids: Optional[List[int]] = None
 
         class NeMoRLIncrementalTokenizeChatRequest(NeMoRLTokenizeChatRequest):
+            # NeMoRLTokenizeChatRequest can populate its own cache before the
+            # incremental endpoint receives a request, so this subclass needs
+            # an independent cache as well.
+            field_names: ClassVar[set[str] | None] = None
             session_id: str
             sequence_no: int
             final: bool = False
+            return_tokens: bool = False
+            prefill: bool = False
+            prefill_continuation: bool = False
+            prefill_from_required_prefix: bool = False
+            finalize_from_required_prefix: bool = False
+            compact_context: bool = False
+            max_contexts: Optional[int] = None
+            context_ttl_seconds: Optional[float] = None
+
+        class NeMoRLCompactIncrementalTokenizeRequest(BaseModel):
+            session_id: str
+            sequence_no: int
+            tool_output: str
+            final: bool = False
+            prefill: bool = False
+            prefill_continuation: bool = False
+            prefill_from_required_prefix: bool = False
+            finalize_from_required_prefix: bool = False
 
         NeMoRLTokenizeRequest = Union[
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
@@ -1085,6 +1186,70 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     "incremental_tokenizer_checkpoint_interval"
                 ],
             )
+        compact_request_context_enabled = bool(
+            streaming_config and streaming_config.get("compact_request_context")
+        )
+        incremental_request_contexts: OrderedDict[
+            str, tuple[NeMoRLIncrementalTokenizeChatRequest, float, float]
+        ] = OrderedDict()
+
+        def expire_incremental_request_contexts() -> None:
+            now = time.time()
+            expired_session_ids = [
+                session_id
+                for session_id, (_, _, expires_at) in (
+                    incremental_request_contexts.items()
+                )
+                if expires_at <= now
+            ]
+            for session_id in expired_session_ids:
+                incremental_request_contexts.pop(session_id, None)
+
+        def store_incremental_request_context(
+            request: NeMoRLIncrementalTokenizeChatRequest,
+        ) -> None:
+            max_contexts = request.max_contexts
+            context_ttl_seconds = request.context_ttl_seconds
+            if (
+                max_contexts is None
+                or max_contexts <= 0
+                or context_ttl_seconds is None
+                or context_ttl_seconds <= 0
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "compact sequence-zero requests require positive context limits"
+                    ),
+                )
+            expire_incremental_request_contexts()
+            incremental_request_contexts.pop(request.session_id, None)
+            incremental_request_contexts[request.session_id] = (
+                request,
+                context_ttl_seconds,
+                time.time() + context_ttl_seconds,
+            )
+            while len(incremental_request_contexts) > max_contexts:
+                incremental_request_contexts.popitem(last=False)
+
+        def get_incremental_request_context(
+            session_id: str,
+        ) -> NeMoRLIncrementalTokenizeChatRequest:
+            expire_incremental_request_contexts()
+            context_entry = incremental_request_contexts.get(session_id)
+            if context_entry is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="compact tokenization context is missing or expired",
+                )
+            request_template, context_ttl_seconds, _ = context_entry
+            incremental_request_contexts[session_id] = (
+                request_template,
+                context_ttl_seconds,
+                time.time() + context_ttl_seconds,
+            )
+            incremental_request_contexts.move_to_end(session_id)
+            return request_template
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
@@ -1149,45 +1314,328 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
             return rendered_prompt
 
+        async def render_incremental_prefix_prompt(
+            request: NeMoRLIncrementalTokenizeChatRequest,
+        ) -> str:
+            last_assistant_message_idx = next(
+                (
+                    index
+                    for index in reversed(range(len(request.messages)))
+                    if request.messages[index].get("role") == "assistant"
+                ),
+                None,
+            )
+            if last_assistant_message_idx is None:
+                raise IncrementalTokenizerPrefixSeedError(
+                    "the incremental prompt has no assistant token prefix"
+                )
+            prefix_request = request.model_copy(
+                update={
+                    "messages": deepcopy(
+                        request.messages[: last_assistant_message_idx + 1]
+                    ),
+                    "add_generation_prompt": False,
+                }
+            )
+            return await render_incremental_prompt(prefix_request)
+
+        async def render_incremental_empty_tool_prompt(
+            request: NeMoRLIncrementalTokenizeChatRequest,
+        ) -> str:
+            messages = deepcopy(request.messages)
+            last_tool_message_idx = next(
+                (
+                    index
+                    for index in reversed(range(len(messages)))
+                    if messages[index].get("role") == "tool"
+                ),
+                None,
+            )
+            if last_tool_message_idx is None:
+                raise IncrementalTokenizerStablePrefixError(
+                    "the incremental prompt has no trailing tool output"
+                )
+            messages[last_tool_message_idx] = {
+                **messages[last_tool_message_idx],
+                "content": "",
+            }
+            empty_tool_request = request.model_copy(update={"messages": messages})
+            return await render_incremental_prompt(empty_tool_request)
+
         @app.post("/incremental_tokenize")
         async def incremental_tokenize(
             request: NeMoRLIncrementalTokenizeChatRequest,
             raw_request: Request,
         ):
+            request_handler_start = time.perf_counter()
+            if request.compact_context:
+                if not compact_request_context_enabled:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="compact request context is not enabled",
+                    )
+                if request.sequence_no != 0:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=("full compact-context requests require sequence zero"),
+                    )
+                if not request.final and (
+                    request.max_contexts is None
+                    or request.max_contexts <= 0
+                    or request.context_ttl_seconds is None
+                    or request.context_ttl_seconds <= 0
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "compact sequence-zero requests require positive "
+                            "context limits"
+                        ),
+                    )
+            if request.prefill_continuation and not request.prefill:
+                raise HTTPException(
+                    status_code=422,
+                    detail="prefill continuation requires prefill",
+                )
+            if request.prefill_from_required_prefix and (
+                not request.prefill
+                or not request.prefill_continuation
+                or request.sequence_no != 0
+                or request.final
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "prefill from required prefix requires a non-final "
+                        "sequence-zero prefill continuation"
+                    ),
+                )
+            if request.finalize_from_required_prefix and (
+                not request.final or request.sequence_no != 0 or request.prefill
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "finalization from required prefix requires a final "
+                        "sequence-zero request without prefill"
+                    ),
+                )
+            if (
+                request.prefill_from_required_prefix
+                or request.finalize_from_required_prefix
+            ) and request.required_prefix_token_ids is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="an authoritative required token prefix is absent",
+                )
+            if (
+                request.prefill
+                and not request.prefill_continuation
+                and (request.sequence_no != 0 or request.final)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="prefill requires a non-final sequence-zero request",
+                )
+            if request.prefill and request.sequence_no == 0 and request.final:
+                raise HTTPException(
+                    status_code=422,
+                    detail="prefill cannot start with a final request",
+                )
             manager = incremental_tokenizer_manager
             if manager is None:
                 raise HTTPException(
                     status_code=503,
                     detail="exact incremental tokenization is not enabled",
                 )
+            prefix_seed_attempts = 0
+            prefix_seed_successes = 0
+            prefix_seed_fallbacks = 0
+            prefix_seed_seconds = 0.0
+            prefix_seed_fallback_reason = None
+            stable_first_snapshot_prefill_attempts = 0
+            stable_first_snapshot_prefill_successes = 0
+            stable_first_snapshot_prefill_fallbacks = 0
+            stable_first_snapshot_prefill_seconds = 0.0
+            stable_first_snapshot_prefill_stable_tokens = 0
+            stable_first_snapshot_prefill_committable_tokens = 0
+            stable_first_snapshot_prefill_dynamic_tokens = 0
+            stable_first_snapshot_prefill_fallback_reason = None
+            materialize_seconds = 0.0
+            render_seconds = 0.0
+            prefix_render_seconds = 0.0
+            incremental_tokenizer_seconds = 0.0
+            authoritative_tokenizer_seconds = 0.0
+            prefill_initial_candidate_token_ids = (
+                request.required_prefix_token_ids
+                if request.prefill_from_required_prefix
+                else None
+            )
             try:
+                # Pydantic parses tool calls into lazy ValidatorIterator values.
+                # Both render passes need the same materialized values, and the
+                # prefix pass deep-copies them into its shortened request.
+                materialize_start = time.perf_counter()
+                _materialize_message_tool_calls(request.messages)
+                materialize_seconds = time.perf_counter() - materialize_start
+                render_start = time.perf_counter()
                 rendered_prompt = await render_incremental_prompt(request)
+                render_seconds = time.perf_counter() - render_start
+                authoritative_token_ids = None
                 if request.sequence_no == 0:
-                    authoritative_token_ids = await get_authoritative_token_ids(
-                        request,
-                        raw_request,
+                    prefix_seed_enabled = bool(
+                        (request.prefill or request.finalize_from_required_prefix)
+                        and streaming_config
+                        and streaming_config.get("prefix_seeded_start")
                     )
-                    if isinstance(authoritative_token_ids, JSONResponse):
-                        return authoritative_token_ids
-                    result = manager.start(
-                        session_id=request.session_id,
-                        sequence_no=request.sequence_no,
-                        rendered_prompt=rendered_prompt,
-                        authoritative_token_ids=authoritative_token_ids,
-                    )
+                    if prefix_seed_enabled:
+                        prefix_seed_attempts = 1
+                        prefix_seed_start = time.perf_counter()
+                        if request.required_prefix_token_ids is None:
+                            prefix_seed_fallbacks = 1
+                            prefix_seed_fallback_reason = (
+                                "authoritative prefix tokens are absent"
+                            )
+                        else:
+                            try:
+                                prefix_render_start = time.perf_counter()
+                                template_prefix_prompt = (
+                                    await render_incremental_prefix_prompt(request)
+                                )
+                                prefix_render_seconds = (
+                                    time.perf_counter() - prefix_render_start
+                                )
+                                incremental_tokenizer_start = time.perf_counter()
+                                (
+                                    result,
+                                    authoritative_token_ids,
+                                ) = manager.start_from_authoritative_prefix(
+                                    session_id=request.session_id,
+                                    sequence_no=request.sequence_no,
+                                    rendered_prompt=rendered_prompt,
+                                    template_prefix_prompt=template_prefix_prompt,
+                                    authoritative_prefix_token_ids=(
+                                        request.required_prefix_token_ids
+                                    ),
+                                )
+                                incremental_tokenizer_seconds += (
+                                    time.perf_counter() - incremental_tokenizer_start
+                                )
+                            except IncrementalTokenizerPrefixSeedError as error:
+                                prefix_seed_fallbacks = 1
+                                prefix_seed_fallback_reason = str(error)
+                            else:
+                                prefix_seed_successes = 1
+                                stable_first_snapshot_prefill_enabled = bool(
+                                    request.prefill_from_required_prefix
+                                    and streaming_config
+                                    and streaming_config.get(
+                                        "stable_first_snapshot_prefill"
+                                    )
+                                )
+                                if stable_first_snapshot_prefill_enabled:
+                                    stable_first_snapshot_prefill_attempts = 1
+                                    stable_first_snapshot_prefill_start = (
+                                        time.perf_counter()
+                                    )
+                                    try:
+                                        empty_tool_prompt = (
+                                            await render_incremental_empty_tool_prompt(
+                                                request
+                                            )
+                                        )
+                                        stable_prefix_token_ids = manager.stable_prefix_token_ids_before_alternate_suffix(
+                                            session_id=request.session_id,
+                                            alternate_rendered_prompt=(
+                                                empty_tool_prompt
+                                            ),
+                                        )
+                                        stability_margin_tokens = streaming_config[
+                                            "stability_margin_tokens"
+                                        ]
+                                        candidate_token_count = min(
+                                            len(authoritative_token_ids),
+                                            len(stable_prefix_token_ids)
+                                            + stability_margin_tokens,
+                                        )
+                                        prefill_initial_candidate_token_ids = (
+                                            authoritative_token_ids[
+                                                :candidate_token_count
+                                            ]
+                                        )
+                                    except (
+                                        IncrementalTokenizerStablePrefixError
+                                    ) as error:
+                                        stable_first_snapshot_prefill_fallbacks = 1
+                                        stable_first_snapshot_prefill_fallback_reason = str(
+                                            error
+                                        )
+                                    else:
+                                        stable_first_snapshot_prefill_successes = 1
+                                        stable_first_snapshot_prefill_stable_tokens = (
+                                            len(stable_prefix_token_ids)
+                                        )
+                                        stable_first_snapshot_prefill_committable_tokens = max(
+                                            0,
+                                            candidate_token_count
+                                            - stability_margin_tokens,
+                                        )
+                                        stable_first_snapshot_prefill_dynamic_tokens = max(
+                                            0,
+                                            stable_first_snapshot_prefill_committable_tokens
+                                            - len(request.required_prefix_token_ids),
+                                        )
+                                    finally:
+                                        stable_first_snapshot_prefill_seconds = (
+                                            time.perf_counter()
+                                            - stable_first_snapshot_prefill_start
+                                        )
+                        prefix_seed_seconds = time.perf_counter() - prefix_seed_start
+
+                    if authoritative_token_ids is None:
+                        authoritative_tokenizer_start = time.perf_counter()
+                        authoritative_token_ids = await get_authoritative_token_ids(
+                            request,
+                            raw_request,
+                        )
+                        authoritative_tokenizer_seconds += (
+                            time.perf_counter() - authoritative_tokenizer_start
+                        )
+                        if isinstance(authoritative_token_ids, JSONResponse):
+                            return authoritative_token_ids
+                        incremental_tokenizer_start = time.perf_counter()
+                        result = manager.start(
+                            session_id=request.session_id,
+                            sequence_no=request.sequence_no,
+                            rendered_prompt=rendered_prompt,
+                            authoritative_token_ids=authoritative_token_ids,
+                        )
+                        incremental_tokenizer_seconds += (
+                            time.perf_counter() - incremental_tokenizer_start
+                        )
+                    if request.finalize_from_required_prefix:
+                        incremental_tokenizer_start = time.perf_counter()
+                        result = manager.finalize_current(request.session_id)
+                        incremental_tokenizer_seconds += (
+                            time.perf_counter() - incremental_tokenizer_start
+                        )
                 else:
                     checkpoint_due = manager.requires_checkpoint(
                         session_id=request.session_id,
                         sequence_no=request.sequence_no,
                     )
-                    authoritative_token_ids = None
                     if checkpoint_due:
+                        authoritative_tokenizer_start = time.perf_counter()
                         authoritative_token_ids = await get_authoritative_token_ids(
                             request,
                             raw_request,
                         )
+                        authoritative_tokenizer_seconds += (
+                            time.perf_counter() - authoritative_tokenizer_start
+                        )
                         if isinstance(authoritative_token_ids, JSONResponse):
                             return authoritative_token_ids
+                    incremental_tokenizer_start = time.perf_counter()
                     if request.final:
                         result = manager.finalize(
                             session_id=request.session_id,
@@ -1202,18 +1650,451 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                             rendered_prompt=rendered_prompt,
                             authoritative_token_ids=authoritative_token_ids,
                         )
+                    incremental_tokenizer_seconds += (
+                        time.perf_counter() - incremental_tokenizer_start
+                    )
             except IncrementalTokenizerError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
-            return asdict(result)
+
+            counterfactual_requests = 0
+            counterfactual_seconds = 0.0
+            counterfactual_tokens = 0
+            counterfactual_mismatches = 0
+            counterfactual_failures = 0
+            if (
+                request.final
+                and authoritative_token_ids is None
+                and streaming_config
+                and streaming_config.get("counterfactual_full_tokenizer_timing", False)
+            ):
+                counterfactual_requests = 1
+                counterfactual_start = time.perf_counter()
+                counterfactual_token_ids = await get_authoritative_token_ids(
+                    request,
+                    raw_request,
+                )
+                counterfactual_seconds = time.perf_counter() - counterfactual_start
+                if isinstance(counterfactual_token_ids, JSONResponse):
+                    counterfactual_failures = 1
+                else:
+                    counterfactual_tokens = len(counterfactual_token_ids)
+                    counterfactual_mismatches = int(
+                        result.tokens != counterfactual_token_ids
+                    )
+
+            prefill_sessions_started = 0
+            prefill_requests = 0
+            prefill_tokens = 0
+            prefill_completed_chunks = 0
+            prefill_dummy_tokens = 0
+            prefill_prefix_matched = False
+            prefill_failures = 0
+            prefill_prompt_too_long_rejections = 0
+            prefill_committed_tokens = 0
+            prefill_dynamic_tokens = 0
+            prefill_effective_requests = 0
+            prefill_seconds = 0.0
+            prefill_background_scheduled_chunks = 0
+            prefill_background_scheduled_tokens = 0
+            prefill_background_completed_chunks = 0
+            prefill_background_completed_tokens = 0
+            prefill_background_completed_dummy_tokens = 0
+            prefill_background_effective_chunks = 0
+            prefill_background_dynamic_tokens = 0
+            prefill_background_cancelled_chunks = 0
+            prefill_background_cancelled_tokens = 0
+            prefill_background_failed_chunks = 0
+            prefill_background_failed_tokens = 0
+            prefill_background_enqueue_seconds = 0.0
+            prefill_background_completion_seconds = 0.0
+            if request.prefill:
+                prefill_manager = get_streaming_tool_call_manager()
+                background_prefill_completion = bool(
+                    streaming_config
+                    and streaming_config.get("background_prefill_completion")
+                )
+                prefill_start = time.perf_counter()
+                try:
+                    if request.final:
+                        assert result.tokens is not None
+                        prefill_close_result = await prefill_manager.close(
+                            session_id=request.session_id,
+                            final_prompt_token_ids=result.tokens,
+                        )
+                    else:
+                        prefill_prompt_token_ids = authoritative_token_ids
+                        if prefill_prompt_token_ids is None:
+                            prefill_prompt_token_ids = manager.current_token_ids(
+                                request.session_id
+                            )
+                        if request.sequence_no == 0:
+                            if request.prefill_continuation:
+                                if background_prefill_completion:
+                                    prefill_background_start_result = (
+                                        await prefill_manager.start_background(
+                                            session_id=request.session_id,
+                                            prompt_token_ids=(prefill_prompt_token_ids),
+                                            sequence_no=0,
+                                            initial_candidate_token_ids=(
+                                                prefill_initial_candidate_token_ids
+                                            ),
+                                            dynamic_token_baseline=len(
+                                                request.required_prefix_token_ids or []
+                                            ),
+                                        )
+                                    )
+                                else:
+                                    prefill_append_result = await prefill_manager.start(
+                                        session_id=request.session_id,
+                                        prompt_token_ids=prefill_prompt_token_ids,
+                                        sequence_no=0,
+                                        initial_candidate_token_ids=(
+                                            prefill_initial_candidate_token_ids
+                                        ),
+                                    )
+                            else:
+                                prefill_prime_result = await prefill_manager.prime(
+                                    session_id=request.session_id,
+                                    prompt_token_ids=prefill_prompt_token_ids,
+                                )
+                        else:
+                            prefill_append_result = await prefill_manager.append(
+                                session_id=request.session_id,
+                                prompt_token_ids=prefill_prompt_token_ids,
+                                sequence_no=request.sequence_no,
+                            )
+                except (
+                    IncrementalTokenizerError,
+                    StreamingToolCallError,
+                ) as error:
+                    prefill_failures = 1
+                    prefill_prompt_too_long_rejections = int(
+                        isinstance(error, StreamingToolCallPromptTooLongError)
+                    )
+                    await prefill_manager.abort(session_id=request.session_id)
+                else:
+                    if request.final:
+                        prefill_prefix_matched = prefill_close_result.prefix_matched
+                        prefill_committed_tokens = prefill_close_result.committed_tokens
+                        prefill_background_completed_chunks = (
+                            prefill_close_result.background_completed_chunks
+                        )
+                        prefill_background_completed_tokens = (
+                            prefill_close_result.background_completed_tokens
+                        )
+                        prefill_background_completed_dummy_tokens = (
+                            prefill_close_result.background_completed_dummy_tokens
+                        )
+                        prefill_background_effective_chunks = (
+                            prefill_close_result.background_effective_chunks
+                        )
+                        prefill_background_dynamic_tokens = (
+                            prefill_close_result.background_dynamic_tokens
+                        )
+                        prefill_background_cancelled_chunks = (
+                            prefill_close_result.background_cancelled_chunks
+                        )
+                        prefill_background_cancelled_tokens = (
+                            prefill_close_result.background_cancelled_tokens
+                        )
+                        prefill_background_failed_chunks = (
+                            prefill_close_result.background_failed_chunks
+                        )
+                        prefill_background_failed_tokens = (
+                            prefill_close_result.background_failed_tokens
+                        )
+                        prefill_background_completion_seconds = (
+                            prefill_close_result.background_completion_seconds
+                        )
+                        # Background work is intentionally unreported by the
+                        # start response. Settle it exactly once at close.
+                        prefill_requests = prefill_background_completed_chunks
+                        prefill_tokens = prefill_background_completed_tokens
+                        prefill_completed_chunks = prefill_background_completed_chunks
+                        prefill_dummy_tokens = prefill_background_completed_dummy_tokens
+                        prefill_dynamic_tokens = prefill_background_dynamic_tokens
+                        prefill_effective_requests = prefill_background_effective_chunks
+                        prefill_failures = int(prefill_background_failed_chunks > 0)
+                    elif request.sequence_no == 0 and not request.prefill_continuation:
+                        prefill_sessions_started = 1
+                        prefill_requests = int(prefill_prime_result.chunk_tokens > 0)
+                        prefill_tokens = prefill_prime_result.chunk_tokens
+                        prefill_completed_chunks = prefill_prime_result.completed_chunks
+                        prefill_dummy_tokens = prefill_prime_result.dummy_tokens
+                        prefill_prefix_matched = prefill_prime_result.prefix_matched
+                    elif request.sequence_no == 0 and background_prefill_completion:
+                        prefill_sessions_started = 1
+                        prefill_background_scheduled_chunks = (
+                            prefill_background_start_result.scheduled_chunks
+                        )
+                        prefill_background_scheduled_tokens = (
+                            prefill_background_start_result.scheduled_tokens
+                        )
+                        prefill_background_enqueue_seconds = (
+                            prefill_background_start_result.enqueue_seconds
+                        )
+                    else:
+                        prefill_sessions_started = int(request.sequence_no == 0)
+                        prefill_requests = int(prefill_append_result.chunk_tokens > 0)
+                        prefill_tokens = prefill_append_result.chunk_tokens
+                        prefill_completed_chunks = prefill_requests
+                        prefill_dummy_tokens = prefill_requests
+                    if not request.final and not (
+                        request.sequence_no == 0 and background_prefill_completion
+                    ):
+                        if (
+                            request.sequence_no == 0
+                            and not request.prefill_continuation
+                        ):
+                            prefill_committed_tokens = (
+                                prefill_prime_result.committed_tokens
+                            )
+                            prefill_chunk_tokens = prefill_prime_result.chunk_tokens
+                        else:
+                            prefill_committed_tokens = (
+                                prefill_append_result.committed_tokens
+                            )
+                            prefill_chunk_tokens = prefill_append_result.chunk_tokens
+                        if request.required_prefix_token_ids is not None:
+                            required_prefix_tokens = len(
+                                request.required_prefix_token_ids
+                            )
+                            previous_committed_tokens = (
+                                prefill_committed_tokens - prefill_chunk_tokens
+                            )
+                            prefill_dynamic_tokens = max(
+                                0,
+                                prefill_committed_tokens - required_prefix_tokens,
+                            ) - max(
+                                0,
+                                previous_committed_tokens - required_prefix_tokens,
+                            )
+                            prefill_effective_requests = int(prefill_dynamic_tokens > 0)
+                finally:
+                    prefill_seconds = time.perf_counter() - prefill_start
+
+            compact_context_registered = False
+            compact_context_registration_seconds = 0.0
+            if request.compact_context and not request.final:
+                compact_context_registration_start = time.perf_counter()
+                store_incremental_request_context(request)
+                compact_context_registration_seconds = (
+                    time.perf_counter() - compact_context_registration_start
+                )
+                compact_context_registered = True
+            if request.final:
+                incremental_request_contexts.pop(request.session_id, None)
+
+            response = asdict(result)
+            if request.return_tokens and authoritative_token_ids is not None:
+                response["tokens"] = authoritative_token_ids
+            response.update(
+                {
+                    "counterfactual_full_tokenizer_requests": (counterfactual_requests),
+                    "counterfactual_full_tokenizer_seconds": (counterfactual_seconds),
+                    "counterfactual_full_tokenizer_tokens": (counterfactual_tokens),
+                    "counterfactual_full_tokenizer_mismatches": (
+                        counterfactual_mismatches
+                    ),
+                    "counterfactual_full_tokenizer_failures": (counterfactual_failures),
+                    "prefill_sessions_started": prefill_sessions_started,
+                    "prefill_requests": prefill_requests,
+                    "prefill_control_plane_requests": 0,
+                    "prefill_tokens": prefill_tokens,
+                    "prefill_completed_chunks": prefill_completed_chunks,
+                    "prefill_dummy_tokens": prefill_dummy_tokens,
+                    "prefill_prefix_matched": prefill_prefix_matched,
+                    "prefill_failures": prefill_failures,
+                    "prefill_prompt_too_long_rejections": (
+                        prefill_prompt_too_long_rejections
+                    ),
+                    "prefill_committed_tokens": prefill_committed_tokens,
+                    "prefill_dynamic_tokens": prefill_dynamic_tokens,
+                    "prefill_effective_requests": prefill_effective_requests,
+                    "prefill_seconds": prefill_seconds,
+                    "prefill_background_scheduled_chunks": (
+                        prefill_background_scheduled_chunks
+                    ),
+                    "prefill_background_scheduled_tokens": (
+                        prefill_background_scheduled_tokens
+                    ),
+                    "prefill_background_completed_chunks": (
+                        prefill_background_completed_chunks
+                    ),
+                    "prefill_background_completed_tokens": (
+                        prefill_background_completed_tokens
+                    ),
+                    "prefill_background_completed_dummy_tokens": (
+                        prefill_background_completed_dummy_tokens
+                    ),
+                    "prefill_background_effective_chunks": (
+                        prefill_background_effective_chunks
+                    ),
+                    "prefill_background_dynamic_tokens": (
+                        prefill_background_dynamic_tokens
+                    ),
+                    "prefill_background_cancelled_chunks": (
+                        prefill_background_cancelled_chunks
+                    ),
+                    "prefill_background_cancelled_tokens": (
+                        prefill_background_cancelled_tokens
+                    ),
+                    "prefill_background_failed_chunks": (
+                        prefill_background_failed_chunks
+                    ),
+                    "prefill_background_failed_tokens": (
+                        prefill_background_failed_tokens
+                    ),
+                    "prefill_background_enqueue_seconds": (
+                        prefill_background_enqueue_seconds
+                    ),
+                    "prefill_background_completion_seconds": (
+                        prefill_background_completion_seconds
+                    ),
+                    "prefix_seed_attempts": prefix_seed_attempts,
+                    "prefix_seed_successes": prefix_seed_successes,
+                    "prefix_seed_fallbacks": prefix_seed_fallbacks,
+                    "prefix_seed_seconds": prefix_seed_seconds,
+                    "prefix_seed_fallback_reason": prefix_seed_fallback_reason,
+                    "stable_first_snapshot_prefill_attempts": (
+                        stable_first_snapshot_prefill_attempts
+                    ),
+                    "stable_first_snapshot_prefill_successes": (
+                        stable_first_snapshot_prefill_successes
+                    ),
+                    "stable_first_snapshot_prefill_fallbacks": (
+                        stable_first_snapshot_prefill_fallbacks
+                    ),
+                    "stable_first_snapshot_prefill_seconds": (
+                        stable_first_snapshot_prefill_seconds
+                    ),
+                    "stable_first_snapshot_prefill_stable_tokens": (
+                        stable_first_snapshot_prefill_stable_tokens
+                    ),
+                    "stable_first_snapshot_prefill_committable_tokens": (
+                        stable_first_snapshot_prefill_committable_tokens
+                    ),
+                    "stable_first_snapshot_prefill_dynamic_tokens": (
+                        stable_first_snapshot_prefill_dynamic_tokens
+                    ),
+                    "stable_first_snapshot_prefill_fallback_reason": (
+                        stable_first_snapshot_prefill_fallback_reason
+                    ),
+                    "deferred_prefill_admissions": int(
+                        request.prefill_from_required_prefix
+                        and prefill_sessions_started > 0
+                        and prefill_failures == 0
+                    ),
+                    "final_prefix_tokenizations": int(
+                        request.finalize_from_required_prefix
+                        and result.tokens is not None
+                    ),
+                    "server_materialize_seconds": materialize_seconds,
+                    "server_render_seconds": render_seconds,
+                    "server_prefix_render_seconds": prefix_render_seconds,
+                    "server_incremental_tokenizer_seconds": (
+                        incremental_tokenizer_seconds
+                    ),
+                    "server_authoritative_tokenizer_seconds": (
+                        authoritative_tokenizer_seconds
+                    ),
+                    "server_compact_context_registrations": int(
+                        compact_context_registered
+                    ),
+                    "server_compact_context_hits": 0,
+                    "server_compact_context_rebuild_seconds": 0.0,
+                    "server_compact_context_registration_seconds": (
+                        compact_context_registration_seconds
+                    ),
+                    "server_request_handler_seconds": (
+                        time.perf_counter() - request_handler_start
+                    ),
+                }
+            )
+            return response
+
+        @app.post("/incremental_tokenize/compact")
+        async def compact_incremental_tokenize(
+            request: NeMoRLCompactIncrementalTokenizeRequest,
+            raw_request: Request,
+        ):
+            compact_context_rebuild_start = time.perf_counter()
+            if not compact_request_context_enabled:
+                raise HTTPException(
+                    status_code=503,
+                    detail="compact request context is not enabled",
+                )
+            if request.sequence_no <= 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="compact tool-output requests require a positive sequence",
+                )
+            request_template = get_incremental_request_context(request.session_id)
+            if (
+                not request_template.messages
+                or request_template.messages[-1].get("role") != "tool"
+            ):
+                incremental_request_contexts.pop(request.session_id, None)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "compact tokenization context has no trailing tool message"
+                    ),
+                )
+            messages = list(request_template.messages)
+            messages[-1] = {
+                **messages[-1],
+                "content": request.tool_output,
+            }
+            reconstructed_request = request_template.model_copy(
+                update={
+                    "messages": messages,
+                    "sequence_no": request.sequence_no,
+                    "final": request.final,
+                    "prefill": request.prefill,
+                    "prefill_continuation": request.prefill_continuation,
+                    "prefill_from_required_prefix": (
+                        request.prefill_from_required_prefix
+                    ),
+                    "finalize_from_required_prefix": (
+                        request.finalize_from_required_prefix
+                    ),
+                    "compact_context": False,
+                    "max_contexts": None,
+                    "context_ttl_seconds": None,
+                }
+            )
+            compact_context_rebuild_seconds = (
+                time.perf_counter() - compact_context_rebuild_start
+            )
+            result = await incremental_tokenize(
+                reconstructed_request,
+                raw_request,
+            )
+            if isinstance(result, dict):
+                result["server_compact_context_hits"] = 1
+                result["server_compact_context_rebuild_seconds"] = (
+                    compact_context_rebuild_seconds
+                )
+            return result
 
         @app.post("/incremental_tokenize/abort")
         async def abort_incremental_tokenize(
             request: StreamingToolCallAbortRequest,
         ):
+            incremental_request_contexts.pop(request.session_id, None)
             manager = incremental_tokenizer_manager
-            if manager is None:
-                return {"aborted": False}
-            return {"aborted": manager.abort(request.session_id)}
+            tokenizer_aborted = (
+                manager.abort(request.session_id) if manager is not None else False
+            )
+            prefill_manager = getattr(self, "streaming_tool_call_manager", None)
+            prefill_aborted = False
+            if prefill_manager is not None:
+                prefill_manager.bind_to_current_loop()
+                prefill_aborted = await prefill_manager.abort(
+                    session_id=request.session_id
+                )
+            return {"aborted": tokenizer_aborted or prefill_aborted}
 
         ########################################
         # Streaming tool-call prefill endpoints
@@ -1246,6 +2127,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     prompt_token_ids=request.prompt_token_ids,
                     sequence_no=request.sequence_no,
                 )
+            except StreamingToolCallPromptTooLongError as error:
+                await manager.abort(session_id=request.session_id)
+                raise HTTPException(status_code=409, detail=str(error)) from error
             except StreamingToolCallError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
             return asdict(result)
@@ -1261,6 +2145,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     prompt_token_ids=request.prompt_token_ids,
                     sequence_no=request.sequence_no,
                 )
+            except StreamingToolCallPromptTooLongError as error:
+                await manager.abort(session_id=request.session_id)
+                raise HTTPException(status_code=409, detail=str(error)) from error
             except StreamingToolCallSessionNotFoundError as error:
                 raise HTTPException(status_code=404, detail=str(error)) from error
             except StreamingToolCallError as error:
@@ -2063,21 +2950,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             gc.collect()
             torch.cuda.empty_cache()
 
-            if self.server_thread is not None:
-                from threading import Thread
-
+            server_thread = getattr(self, "server_thread", None)
+            if server_thread is not None:
                 from uvicorn import Server
 
                 self.http_server: Server
-                self.server_thread: Thread
 
                 self.http_server.should_exit = True
-                self.server_thread.join()
+                server_thread.join()
 
             return True
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            writeback_vllm_cache()
 
 
 @ray.remote(

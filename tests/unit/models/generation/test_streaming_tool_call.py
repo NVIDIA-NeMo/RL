@@ -53,6 +53,8 @@ def _make_manager(
     max_sessions: int = 2,
     session_ttl_seconds: float = 60,
     stability_margin_tokens: int = 0,
+    max_prompt_tokens: int = 1024,
+    cache_page_size_tokens: int | None = None,
 ) -> StreamingToolCallPrefillManager:
     return StreamingToolCallPrefillManager(
         generate=engine.generate,
@@ -61,6 +63,8 @@ def _make_manager(
         max_sessions=max_sessions,
         session_ttl_seconds=session_ttl_seconds,
         stability_margin_tokens=stability_margin_tokens,
+        max_prompt_tokens=max_prompt_tokens,
+        cache_page_size_tokens=cache_page_size_tokens,
     )
 
 
@@ -71,6 +75,7 @@ def test_worker_records_streaming_and_prefix_cache_metrics() -> None:
     worker.streaming_tool_call_manager = SimpleNamespace(
         total_dummy_tokens=3,
         total_prefill_tokens=40,
+        total_prompt_too_long_rejections=2,
     )
     worker._reset_vllm_logger_metrics()
 
@@ -88,6 +93,7 @@ def test_worker_records_streaming_and_prefix_cache_metrics() -> None:
         "generation_tokens": [97],
         "streaming_tool_call_dummy_tokens": [3],
         "streaming_tool_call_prefill_tokens": [40],
+        "streaming_tool_call_prompt_too_long_rejections": [2],
         "prefix_cache_queries": [80],
         "prefix_cache_hits": [48],
     }
@@ -96,6 +102,31 @@ def test_worker_records_streaming_and_prefix_cache_metrics() -> None:
     assert all(
         not metric_values for metric_values in worker.get_vllm_logger_metrics().values()
     )
+
+
+@pytest.mark.asyncio
+async def test_worker_configures_page_size_reported_by_vllm_workers() -> None:
+    class _FakeLlm:
+        async def collective_rpc(self, method: str, args: tuple[Any, ...]):
+            if method == "bind_numa":
+                return [True, True]
+            if method == "report_kv_cache_block_size":
+                return [1152, 1152]
+            if method == "report_device_id":
+                return ["GPU-0", "GPU-1"]
+            raise AssertionError(method)
+
+    manager = _make_manager(_FakeEngine())
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = _FakeLlm()
+    worker.streaming_tool_call_manager = manager
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker._mtp_load_from_disk = False
+
+    await worker.post_init_async()
+
+    assert manager.cache_page_size_tokens == 1152
+    assert worker.vllm_device_ids == ["GPU-0", "GPU-1"]
 
 
 @pytest.mark.asyncio
@@ -136,6 +167,291 @@ async def test_prefills_only_new_monotonic_suffix() -> None:
     assert closed.prefix_matched
     assert closed.completed_chunks == 2
     assert closed.dummy_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_first_snapshot_prefills_authoritative_model_prefix() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine, stability_margin_tokens=1)
+
+    admitted = await manager.start(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6],
+        sequence_no=0,
+        initial_candidate_token_ids=[1, 2, 3, 4],
+    )
+    appended = await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7],
+        sequence_no=1,
+    )
+
+    assert engine.received_chunks == [[1, 2, 3], [4, 5]]
+    assert admitted.committed_tokens == 3
+    assert admitted.chunk_tokens == 3
+    assert appended.committed_tokens == 5
+    assert appended.chunk_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_background_start_returns_before_engine_completion() -> None:
+    engine = _FakeEngine()
+    engine.block_outputs = True
+    manager = _make_manager(engine)
+
+    started = await asyncio.wait_for(
+        manager.start_background(
+            session_id="session",
+            prompt_token_ids=[1, 2, 3, 4],
+            initial_candidate_token_ids=[1, 2, 3],
+            dynamic_token_baseline=2,
+        ),
+        timeout=0.1,
+    )
+
+    assert started.scheduled_chunks == 1
+    assert started.scheduled_tokens == 3
+    assert manager.total_prefill_tokens == 0
+    closed = await asyncio.wait_for(
+        manager.close(
+            session_id="session",
+            final_prompt_token_ids=[1, 2, 3, 4, 5],
+        ),
+        timeout=0.1,
+    )
+    assert closed.committed_tokens == 0
+    assert closed.background_completed_chunks == 0
+    assert closed.background_cancelled_chunks == 1
+    assert closed.background_cancelled_tokens == 3
+
+
+@pytest.mark.asyncio
+async def test_background_completion_is_settled_once_at_close() -> None:
+    engine = _FakeEngine()
+    engine.block_outputs = True
+    manager = _make_manager(engine)
+
+    started = await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        initial_candidate_token_ids=[1, 2, 3],
+        dynamic_token_baseline=2,
+    )
+    engine.release_output.set()
+    while manager.total_prefill_tokens == 0:
+        await asyncio.sleep(0)
+
+    closed = await manager.close(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+    )
+
+    assert started.scheduled_chunks == 1
+    assert closed.prefix_matched
+    assert closed.committed_tokens == 3
+    assert closed.background_scheduled_tokens == 3
+    assert closed.background_completed_chunks == 1
+    assert closed.background_completed_tokens == 3
+    assert closed.background_completed_dummy_tokens == 1
+    assert closed.background_effective_chunks == 1
+    assert closed.background_dynamic_tokens == 1
+    assert closed.background_cancelled_chunks == 0
+    assert closed.background_failed_chunks == 0
+    assert closed.background_completion_seconds > 0
+
+
+@pytest.mark.asyncio
+async def test_background_prefill_defers_until_stable_prefix_crosses_cache_page() -> (
+    None
+):
+    engine = _FakeEngine()
+    manager = _make_manager(engine, cache_page_size_tokens=4)
+
+    started = await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7],
+        initial_candidate_token_ids=[1, 2, 3, 4, 5, 6, 7],
+        dynamic_token_baseline=6,
+    )
+    still_deferred = await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        sequence_no=1,
+    )
+    admitted = await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9],
+        sequence_no=2,
+    )
+    closed = await manager.close(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    )
+
+    assert started.scheduled_chunks == 0
+    assert started.scheduled_tokens == 0
+    assert still_deferred.chunk_tokens == 0
+    assert admitted.chunk_tokens == 8
+    assert engine.received_chunks == [[1, 2, 3, 4, 5, 6, 7, 8]]
+    assert closed.prefix_matched
+    assert closed.committed_tokens == 8
+    assert closed.background_completed_chunks == 0
+    assert closed.background_cancelled_chunks == 0
+
+
+@pytest.mark.asyncio
+async def test_background_prefill_admits_exact_cache_page_boundary() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine, cache_page_size_tokens=4)
+
+    started = await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        initial_candidate_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        dynamic_token_baseline=6,
+    )
+    while manager.total_prefill_tokens == 0:
+        await asyncio.sleep(0)
+    closed = await manager.close(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9],
+    )
+
+    assert started.scheduled_chunks == 1
+    assert started.scheduled_tokens == 8
+    assert engine.received_chunks == [[1, 2, 3, 4, 5, 6, 7, 8]]
+    assert closed.prefix_matched
+    assert closed.committed_tokens == 8
+    assert closed.background_completed_chunks == 1
+    assert closed.background_cancelled_chunks == 0
+
+
+@pytest.mark.asyncio
+async def test_first_snapshot_rejects_nonmatching_model_prefix() -> None:
+    manager = _make_manager(_FakeEngine())
+
+    with pytest.raises(
+        StreamingToolCallPrefixMismatchError,
+        match="does not extend the initial candidate",
+    ):
+        await manager.start(
+            session_id="session",
+            prompt_token_ids=[1, 2, 3],
+            sequence_no=0,
+            initial_candidate_token_ids=[1, 9],
+        )
+
+
+@pytest.mark.asyncio
+async def test_prime_prefills_exact_prompt_and_closes_session() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine, stability_margin_tokens=2)
+
+    result = await manager.prime(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 5],
+    )
+
+    assert result.committed_tokens == 3
+    assert result.chunk_tokens == 3
+    assert result.completed_chunks == 1
+    assert result.dummy_tokens == 1
+    assert result.prefix_matched
+    assert engine.received_chunks == [[1, 2, 3]]
+    assert manager.active_session_count == 0
+    assert manager.total_prefill_tokens == 3
+    assert manager.total_dummy_tokens == 1
+
+
+@pytest.mark.asyncio
+async def test_continuation_proves_prefix_before_prefilling_mutable_output() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine, stability_margin_tokens=0)
+
+    initial = await manager.start(
+        session_id="session",
+        prompt_token_ids=[1, 2, 9, 10],
+        sequence_no=0,
+    )
+    first_candidate = await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 9, 10],
+        sequence_no=1,
+    )
+    appended = await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4, 5, 6, 9, 10],
+        sequence_no=2,
+    )
+    closed = await manager.close(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 9, 10],
+    )
+
+    assert initial.committed_tokens == 0
+    assert initial.chunk_tokens == 0
+    assert first_candidate.committed_tokens == 2
+    assert first_candidate.chunk_tokens == 2
+    assert appended.committed_tokens == 4
+    assert appended.chunk_tokens == 2
+    assert engine.received_chunks == [[1, 2], [3, 4]]
+    assert closed.prefix_matched
+    assert closed.completed_chunks == 2
+    assert closed.dummy_tokens == 2
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_rejects_chunk_before_cumulative_prompt_exceeds_limit() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine, max_prompt_tokens=3)
+
+    await manager.start(session_id="session", prompt_token_ids=[1, 2, 3], sequence_no=0)
+    accepted = await manager.append(
+        session_id="session", prompt_token_ids=[1, 2, 3, 4], sequence_no=1
+    )
+
+    with pytest.raises(
+        StreamingToolCallError,
+        match="streaming prefill prompt would exceed its token limit: 4 > 3",
+    ):
+        await manager.append(
+            session_id="session",
+            prompt_token_ids=[1, 2, 3, 4, 5],
+            sequence_no=2,
+        )
+
+    assert accepted.committed_tokens == 3
+    assert engine.received_chunks == [[1, 2, 3]]
+    assert manager.total_prompt_too_long_rejections == 1
+    assert await manager.abort(session_id="session")
+
+
+@pytest.mark.asyncio
+async def test_prime_aborts_session_after_engine_failure() -> None:
+    async def failed_generate(
+        inputs: AsyncIterator[Any], request_id: str
+    ) -> AsyncGenerator[Any, None]:
+        async for _ in inputs:
+            raise ValueError("engine failed")
+        if False:
+            yield None
+
+    manager = StreamingToolCallPrefillManager(
+        generate=failed_generate,
+        make_streaming_input=lambda token_ids: token_ids,
+        count_output_tokens=lambda output: 1,
+        max_sessions=1,
+        session_ttl_seconds=60,
+        stability_margin_tokens=0,
+        max_prompt_tokens=1024,
+    )
+
+    with pytest.raises(StreamingToolCallSessionClosedError) as error:
+        await manager.prime(session_id="session", prompt_token_ids=[1, 2, 3])
+
+    assert isinstance(error.value.__cause__, ValueError)
+    assert manager.active_session_count == 0
 
 
 @pytest.mark.asyncio
@@ -239,6 +555,15 @@ async def test_capacity_abort_and_missing_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_abort_blocks_late_prefill_start() -> None:
+    manager = _make_manager(_FakeEngine())
+
+    assert not await manager.abort(session_id="session")
+    with pytest.raises(StreamingToolCallSessionClosedError, match="was aborted"):
+        await manager.start(session_id="session", prompt_token_ids=[1])
+
+
+@pytest.mark.asyncio
 async def test_invalidate_all_cancels_every_session() -> None:
     engine = _FakeEngine()
     manager = _make_manager(engine)
@@ -332,6 +657,7 @@ async def test_engine_failure_is_forwarded_to_append() -> None:
         max_sessions=1,
         session_ttl_seconds=60,
         stability_margin_tokens=0,
+        max_prompt_tokens=1024,
     )
 
     await manager.start(session_id="session", prompt_token_ids=[1])

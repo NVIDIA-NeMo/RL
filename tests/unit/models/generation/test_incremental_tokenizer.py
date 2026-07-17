@@ -6,7 +6,9 @@ from nemo_rl.models.generation.vllm.incremental_tokenizer import (
     ExactIncrementalTokenizer,
     ExactIncrementalTokenizerSessionManager,
     IncrementalTokenizerError,
+    IncrementalTokenizerPrefixSeedError,
     IncrementalTokenizerSessionNotFoundError,
+    IncrementalTokenizerStablePrefixError,
 )
 
 
@@ -58,6 +60,8 @@ class _Backend:
 class _CharTokenizer:
     is_fast = True
     backend_tokenizer = _Backend()
+    eos_token = "|"
+    eos_token_id = ord("|")
 
     def __call__(self, text, *, add_special_tokens, return_offsets_mapping):
         assert not add_special_tokens
@@ -235,6 +239,194 @@ def test_incremental_tokenizer_manager_finalizes_with_incremental_tokens():
         manager.requires_checkpoint(session_id="session", sequence_no=2)
 
 
+def test_incremental_tokenizer_manager_finalizes_from_empty_tool_output():
+    tokenizer = _CharTokenizer()
+    manager = ExactIncrementalTokenizerSessionManager(
+        tokenizer=tokenizer,
+        max_sessions=2,
+        session_ttl_seconds=30,
+        checkpoint_interval=8,
+    )
+    initial = "system and conversation\ntool:\nassistant:"
+    final = "system and conversation\ntool:complete command output\nassistant:"
+    manager.start(
+        session_id="session",
+        sequence_no=0,
+        rendered_prompt=initial,
+        authoritative_token_ids=_encode(tokenizer, initial),
+    )
+
+    result = manager.finalize(
+        session_id="session",
+        sequence_no=1,
+        rendered_prompt=final,
+    )
+
+    assert result.incremental_valid
+    assert result.checkpoint_count == 0
+    assert result.encoded_chars < len(final)
+    assert result.reused_tokens > 0
+    assert result.tokens == _encode(tokenizer, final)
+
+
+def test_incremental_tokenizer_manager_seeds_from_authoritative_prefix():
+    tokenizer = _CharTokenizer()
+    manager = ExactIncrementalTokenizerSessionManager(
+        tokenizer=tokenizer,
+        max_sessions=2,
+        session_ttl_seconds=30,
+        checkpoint_interval=8,
+    )
+    template_prefix = "template history|"
+    initial = f"{template_prefix}\ntool:\nassistant:"
+    final = f"{template_prefix}\ntool:complete command output\nassistant:"
+    authoritative_prefix = [9001, 9002, tokenizer.eos_token_id]
+
+    start_result, start_tokens = manager.start_from_authoritative_prefix(
+        session_id="session",
+        sequence_no=0,
+        rendered_prompt=initial,
+        template_prefix_prompt=template_prefix,
+        authoritative_prefix_token_ids=authoritative_prefix,
+    )
+
+    expected_start_tokens = authoritative_prefix[:-1] + _encode(
+        tokenizer, initial[initial.index("|") :]
+    )
+    assert start_tokens == expected_start_tokens
+    assert start_result.checkpoint_count == 0
+    assert start_result.reused_tokens == 2
+    assert start_result.encoded_chars < len(initial)
+    assert manager.current_token_ids("session") == expected_start_tokens
+
+    final_result = manager.finalize(
+        session_id="session",
+        sequence_no=1,
+        rendered_prompt=final,
+    )
+    expected_final_tokens = authoritative_prefix[:-1] + _encode(
+        tokenizer, final[final.index("|") :]
+    )
+    assert final_result.incremental_valid
+    assert final_result.tokens == expected_final_tokens
+
+
+def test_incremental_tokenizer_proves_stable_first_tool_output_prefix():
+    tokenizer = _CharTokenizer()
+    manager = ExactIncrementalTokenizerSessionManager(
+        tokenizer=tokenizer,
+        max_sessions=2,
+        session_ttl_seconds=30,
+        checkpoint_interval=8,
+    )
+    template_prefix = "template history|"
+    empty = f"{template_prefix}\ntool:\nassistant:"
+    first = f"{template_prefix}\ntool:complete output\nassistant:"
+    later = f"{template_prefix}\ntool:complete output and more\nassistant:"
+    authoritative_prefix = [9001, 9002, tokenizer.eos_token_id]
+
+    _, first_tokens = manager.start_from_authoritative_prefix(
+        session_id="session",
+        sequence_no=0,
+        rendered_prompt=first,
+        template_prefix_prompt=template_prefix,
+        authoritative_prefix_token_ids=authoritative_prefix,
+    )
+    stable_tokens = manager.stable_prefix_token_ids_before_alternate_suffix(
+        session_id="session",
+        alternate_rendered_prompt=empty,
+    )
+
+    assert stable_tokens[:2] == authoritative_prefix[:2]
+    assert len(stable_tokens) > len(authoritative_prefix)
+    assert first_tokens[: len(stable_tokens)] == stable_tokens
+    later_result = manager.append(
+        session_id="session",
+        sequence_no=1,
+        rendered_prompt=later,
+    )
+    assert manager.current_token_ids("session")[: len(stable_tokens)] == stable_tokens
+    assert later_result.incremental_valid
+
+
+def test_incremental_tokenizer_rejects_stable_prefix_without_tool_output():
+    tokenizer = _CharTokenizer()
+    empty = "template history|\ntool:\nassistant:"
+    encoder, _ = ExactIncrementalTokenizer.from_authoritative_prefix(
+        tokenizer=tokenizer,
+        rendered_prompt=empty,
+        template_prefix_prompt="template history|",
+        authoritative_prefix_token_ids=[9001, tokenizer.eos_token_id],
+    )
+
+    with pytest.raises(
+        IncrementalTokenizerStablePrefixError,
+        match="no nonempty tool output",
+    ):
+        encoder.stable_prefix_token_ids_before_alternate_suffix(empty)
+
+
+def test_incremental_tokenizer_manager_finalizes_prefix_seed_without_append():
+    tokenizer = _CharTokenizer()
+    manager = ExactIncrementalTokenizerSessionManager(
+        tokenizer=tokenizer,
+        max_sessions=2,
+        session_ttl_seconds=30,
+        checkpoint_interval=8,
+    )
+    template_prefix = "template history|"
+    final = f"{template_prefix}\ntool:short output\nassistant:"
+    authoritative_prefix = [9001, 9002, tokenizer.eos_token_id]
+
+    start_result, start_tokens = manager.start_from_authoritative_prefix(
+        session_id="session",
+        sequence_no=0,
+        rendered_prompt=final,
+        template_prefix_prompt=template_prefix,
+        authoritative_prefix_token_ids=authoritative_prefix,
+    )
+    final_result = manager.finalize_current("session")
+
+    assert final_result.sequence_no == start_result.sequence_no
+    assert final_result.incremental_valid
+    assert final_result.tokens == start_tokens
+    with pytest.raises(IncrementalTokenizerSessionNotFoundError):
+        manager.current_token_ids("session")
+
+
+def test_incremental_tokenizer_prefix_seed_rejects_changed_history():
+    tokenizer = _CharTokenizer()
+
+    with pytest.raises(
+        IncrementalTokenizerPrefixSeedError,
+        match="changed before the assistant EOS boundary",
+    ):
+        ExactIncrementalTokenizer.from_authoritative_prefix(
+            tokenizer=tokenizer,
+            rendered_prompt="different history|\ntool:\nassistant:",
+            template_prefix_prompt="template history|",
+            authoritative_prefix_token_ids=[9001, tokenizer.eos_token_id],
+        )
+
+
+def test_incremental_tokenizer_prefix_seed_rejects_mutation_before_suffix():
+    tokenizer = _CharTokenizer()
+    template_prefix = "template history|"
+    initial = f"{template_prefix}\ntool:\nassistant:"
+    encoder, _ = ExactIncrementalTokenizer.from_authoritative_prefix(
+        tokenizer=tokenizer,
+        rendered_prompt=initial,
+        template_prefix_prompt=template_prefix,
+        authoritative_prefix_token_ids=[9001, tokenizer.eos_token_id],
+    )
+
+    with pytest.raises(
+        IncrementalTokenizerError,
+        match="changed before the mapped suffix",
+    ):
+        encoder.append("changed history|\ntool:output\nassistant:")
+
+
 def test_incremental_tokenizer_manager_finalizes_with_checkpoint_tokens():
     tokenizer = _CharTokenizer()
     manager = ExactIncrementalTokenizerSessionManager(
@@ -341,4 +533,24 @@ def test_incremental_tokenizer_manager_sequence_and_idempotency():
             session_id="session",
             sequence_no=0,
             rendered_prompt="different",
+        )
+
+
+def test_incremental_tokenizer_manager_abort_blocks_late_start():
+    tokenizer = _CharTokenizer()
+    manager = ExactIncrementalTokenizerSessionManager(
+        tokenizer=tokenizer,
+        max_sessions=2,
+        session_ttl_seconds=30,
+        checkpoint_interval=8,
+    )
+    prompt = "prefix a suffix"
+
+    assert not manager.abort("session")
+    with pytest.raises(IncrementalTokenizerError, match="was aborted"):
+        manager.start(
+            session_id="session",
+            sequence_no=0,
+            rendered_prompt=prompt,
+            authoritative_token_ids=_encode(tokenizer, prompt),
         )

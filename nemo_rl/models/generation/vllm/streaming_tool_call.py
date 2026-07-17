@@ -14,7 +14,7 @@
 
 import asyncio
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +32,10 @@ class StreamingToolCallPrefixMismatchError(StreamingToolCallError):
     """Raised when a prompt no longer extends the committed token prefix."""
 
 
+class StreamingToolCallPromptTooLongError(StreamingToolCallError):
+    """Raised before speculative prefill would exceed the model context."""
+
+
 class StreamingToolCallSessionClosedError(StreamingToolCallError):
     """Raised when work is submitted to a closed or failed session."""
 
@@ -47,6 +51,16 @@ class StreamingToolCallAppendResult:
 
 
 @dataclass(frozen=True)
+class StreamingToolCallBackgroundStartResult:
+    """Result returned once background prefill has been safely enqueued."""
+
+    sequence_no: int
+    scheduled_chunks: int
+    scheduled_tokens: int
+    enqueue_seconds: float
+
+
+@dataclass(frozen=True)
 class StreamingToolCallCloseResult:
     """Result returned when a prefill session is closed."""
 
@@ -54,6 +68,30 @@ class StreamingToolCallCloseResult:
     committed_tokens: int
     completed_chunks: int
     dummy_tokens: int
+    background_scheduled_chunks: int
+    background_scheduled_tokens: int
+    background_completed_chunks: int
+    background_completed_tokens: int
+    background_completed_dummy_tokens: int
+    background_effective_chunks: int
+    background_dynamic_tokens: int
+    background_cancelled_chunks: int
+    background_cancelled_tokens: int
+    background_failed_chunks: int
+    background_failed_tokens: int
+    background_enqueue_seconds: float
+    background_completion_seconds: float
+
+
+@dataclass(frozen=True)
+class StreamingToolCallPrimeResult:
+    """Result returned after a one-shot prefill session completes."""
+
+    committed_tokens: int
+    chunk_tokens: int
+    completed_chunks: int
+    dummy_tokens: int
+    prefix_matched: bool
 
 
 @dataclass
@@ -79,6 +117,22 @@ class _StreamingToolCallSession:
     last_activity_monotonic: float = field(default_factory=time.monotonic)
     terminal_error: BaseException | None = None
     closed: bool = False
+    background_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    background_start_prompt_token_ids: list[int] | None = None
+    background_start_result: StreamingToolCallBackgroundStartResult | None = None
+    background_scheduled_chunks: int = 0
+    background_scheduled_tokens: int = 0
+    background_completed_chunks: int = 0
+    background_completed_tokens: int = 0
+    background_completed_dummy_tokens: int = 0
+    background_effective_chunks: int = 0
+    background_dynamic_tokens: int = 0
+    background_failed_chunks: int = 0
+    background_failed_tokens: int = 0
+    background_enqueue_seconds: float = 0.0
+    background_completion_seconds: float = 0.0
+    cache_page_baseline: int | None = None
+    cache_page_gate_active: bool = False
 
 
 GenerateCallback = Callable[[AsyncIterator[Any], str], AsyncGenerator[Any, None]]
@@ -103,6 +157,8 @@ class StreamingToolCallPrefillManager:
         max_sessions: int,
         session_ttl_seconds: float,
         stability_margin_tokens: int,
+        max_prompt_tokens: int,
+        cache_page_size_tokens: int | None = None,
     ) -> None:
         if max_sessions < 1:
             raise ValueError("max_sessions must be at least 1")
@@ -110,6 +166,10 @@ class StreamingToolCallPrefillManager:
             raise ValueError("session_ttl_seconds must be positive")
         if stability_margin_tokens < 0:
             raise ValueError("stability_margin_tokens must be non-negative")
+        if max_prompt_tokens < 1:
+            raise ValueError("max_prompt_tokens must be at least 1")
+        if cache_page_size_tokens is not None and cache_page_size_tokens < 1:
+            raise ValueError("cache_page_size_tokens must be positive when set")
 
         self._generate = generate
         self._make_streaming_input = make_streaming_input
@@ -117,11 +177,15 @@ class StreamingToolCallPrefillManager:
         self._max_sessions = max_sessions
         self._session_ttl_seconds = session_ttl_seconds
         self._stability_margin_tokens = stability_margin_tokens
+        self._max_prompt_tokens = max_prompt_tokens
+        self._cache_page_size_tokens = cache_page_size_tokens
         self._sessions: dict[str, _StreamingToolCallSession] = {}
+        self._aborted_sessions: OrderedDict[str, float] = OrderedDict()
         self._lock = asyncio.Lock()
         self._accepting_sessions = True
         self._total_dummy_tokens = 0
         self._total_prefill_tokens = 0
+        self._total_prompt_too_long_rejections = 0
         self._event_loop: asyncio.AbstractEventLoop | None = None
 
     @property
@@ -157,35 +221,58 @@ class StreamingToolCallPrefillManager:
         """Return stable prompt tokens submitted by streaming sessions."""
         return self._total_prefill_tokens
 
-    async def start(
+    @property
+    def total_prompt_too_long_rejections(self) -> int:
+        """Return chunks rejected before exceeding the model context."""
+        return self._total_prompt_too_long_rejections
+
+    @property
+    def cache_page_size_tokens(self) -> int | None:
+        """Return the engine's effective APC page size, when available."""
+        return self._cache_page_size_tokens
+
+    def set_cache_page_size_tokens(self, cache_page_size_tokens: int) -> None:
+        """Set the effective APC page size reported by the loaded vLLM worker."""
+        if cache_page_size_tokens < 1:
+            raise ValueError("cache_page_size_tokens must be positive")
+        self._cache_page_size_tokens = cache_page_size_tokens
+
+    @staticmethod
+    def _validate_initial_candidate(
+        prompt_token_ids: list[int],
+        initial_candidate_token_ids: list[int] | None,
+    ) -> None:
+        if initial_candidate_token_ids is None:
+            return
+        if not initial_candidate_token_ids:
+            raise StreamingToolCallPrefixMismatchError(
+                "the initial candidate token prefix is empty"
+            )
+        if not _has_prefix(prompt_token_ids, initial_candidate_token_ids):
+            raise StreamingToolCallPrefixMismatchError(
+                "the prompt does not extend the initial candidate token prefix"
+            )
+
+    async def _get_or_create_session(
         self,
         *,
         session_id: str,
         prompt_token_ids: list[int],
-        sequence_no: int = 0,
-    ) -> StreamingToolCallAppendResult:
-        """Start a session and record its first tokenization candidate.
-
-        A partial chat-template rendering ends with unstable closing delimiters.
-        The first candidate therefore cannot prove any stable prefix by itself.
-        Prefill starts after a later candidate establishes a common prefix.
-        """
+        initial_candidate_token_ids: list[int] | None,
+    ) -> tuple[_StreamingToolCallSession, bool]:
         self._assert_owner_loop()
+        self._validate_initial_candidate(prompt_token_ids, initial_candidate_token_ids)
         await self.expire_stale_sessions()
         async with self._lock:
             if not self._accepting_sessions:
                 raise StreamingToolCallError("streaming tool-call sessions are paused")
+            if session_id in self._aborted_sessions:
+                raise StreamingToolCallSessionClosedError(
+                    f"streaming tool-call session was aborted: {session_id}"
+                )
             existing_session = self._sessions.get(session_id)
             if existing_session is not None:
-                if (
-                    sequence_no == existing_session.next_sequence_no - 1
-                    and existing_session.last_candidate_token_ids == prompt_token_ids
-                    and existing_session.last_result is not None
-                ):
-                    return existing_session.last_result
-                raise StreamingToolCallError(
-                    f"streaming tool-call session already exists: {session_id}"
-                )
+                return existing_session, False
             if len(self._sessions) >= self._max_sessions:
                 raise StreamingToolCallError(
                     "streaming tool-call session capacity has been reached"
@@ -196,11 +283,49 @@ class StreamingToolCallPrefillManager:
                 request_id=f"streaming-tool-call-{session_id}",
                 input_queue=asyncio.Queue(maxsize=1),
                 append_lock=asyncio.Lock(),
+                last_candidate_token_ids=(
+                    list(initial_candidate_token_ids)
+                    if initial_candidate_token_ids is not None
+                    else None
+                ),
             )
             self._sessions[session_id] = session
             session.task = asyncio.create_task(
                 self._run_session(session),
                 name=f"streaming-tool-call-{session_id}",
+            )
+            return session, True
+
+    async def start(
+        self,
+        *,
+        session_id: str,
+        prompt_token_ids: list[int],
+        sequence_no: int = 0,
+        initial_candidate_token_ids: list[int] | None = None,
+    ) -> StreamingToolCallAppendResult:
+        """Start a session and record its first tokenization candidate.
+
+        A partial chat-template rendering ends with unstable closing delimiters.
+        The first candidate therefore cannot prove any stable prefix by itself.
+        Prefill starts after a later candidate establishes a common prefix. An
+        authoritative model prefix can be supplied as that earlier candidate so
+        the first streamed tool snapshot admits useful prefill immediately.
+        """
+        session, created = await self._get_or_create_session(
+            session_id=session_id,
+            prompt_token_ids=prompt_token_ids,
+            initial_candidate_token_ids=initial_candidate_token_ids,
+        )
+        if not created:
+            if (
+                sequence_no == session.next_sequence_no - 1
+                and session.last_candidate_token_ids == prompt_token_ids
+                and session.last_result is not None
+            ):
+                return session.last_result
+            raise StreamingToolCallError(
+                f"streaming tool-call session already exists: {session_id}"
             )
 
         try:
@@ -216,6 +341,85 @@ class StreamingToolCallPrefillManager:
             await self.abort(session_id=session_id)
             raise
 
+    async def start_background(
+        self,
+        *,
+        session_id: str,
+        prompt_token_ids: list[int],
+        sequence_no: int = 0,
+        initial_candidate_token_ids: list[int] | None = None,
+        dynamic_token_baseline: int = 0,
+    ) -> StreamingToolCallBackgroundStartResult:
+        """Start a session and return after its first chunk is safely enqueued.
+
+        Engine completion remains owned by the manager. A later close reports
+        whether the queued chunk completed before the authoritative tool output
+        arrived, so the HTTP request does not have to race the command runtime.
+        """
+        if dynamic_token_baseline < 0:
+            raise ValueError("dynamic_token_baseline must be non-negative")
+        started_at = time.perf_counter()
+        session, created = await self._get_or_create_session(
+            session_id=session_id,
+            prompt_token_ids=prompt_token_ids,
+            initial_candidate_token_ids=initial_candidate_token_ids,
+        )
+        if not created:
+            if (
+                session.background_start_prompt_token_ids == prompt_token_ids
+                and session.background_start_result is not None
+            ):
+                return session.background_start_result
+            raise StreamingToolCallError(
+                f"streaming tool-call session already exists: {session_id}"
+            )
+
+        session.background_start_prompt_token_ids = list(prompt_token_ids)
+        if self._cache_page_size_tokens is not None:
+            session.cache_page_baseline = dynamic_token_baseline
+            session.cache_page_gate_active = True
+        loop = asyncio.get_running_loop()
+        enqueued: asyncio.Future[int] = loop.create_future()
+        task = asyncio.create_task(
+            self._run_background_append(
+                session=session,
+                prompt_token_ids=prompt_token_ids,
+                sequence_no=sequence_no,
+                dynamic_token_baseline=dynamic_token_baseline,
+                enqueued=enqueued,
+            ),
+            name=f"streaming-tool-call-background-{session_id}-{sequence_no}",
+        )
+        session.background_tasks.add(task)
+        task.add_done_callback(
+            lambda completed_task: self._consume_background_task(
+                session, completed_task
+            )
+        )
+
+        try:
+            scheduled_tokens = await enqueued
+        except asyncio.CancelledError:
+            await self.abort(session_id=session_id)
+            raise
+        except Exception:
+            await self.abort(session_id=session_id)
+            raise
+
+        enqueue_seconds = time.perf_counter() - started_at
+        scheduled_chunks = int(scheduled_tokens > 0)
+        session.background_scheduled_chunks += scheduled_chunks
+        session.background_scheduled_tokens += scheduled_tokens
+        session.background_enqueue_seconds += enqueue_seconds
+        result = StreamingToolCallBackgroundStartResult(
+            sequence_no=sequence_no,
+            scheduled_chunks=scheduled_chunks,
+            scheduled_tokens=scheduled_tokens,
+            enqueue_seconds=enqueue_seconds,
+        )
+        session.background_start_result = result
+        return result
+
     async def append(
         self,
         *,
@@ -224,6 +428,22 @@ class StreamingToolCallPrefillManager:
         sequence_no: int,
     ) -> StreamingToolCallAppendResult:
         """Observe a tokenization and prefill only its proven stable prefix."""
+        return await self._append(
+            session_id=session_id,
+            prompt_token_ids=prompt_token_ids,
+            sequence_no=sequence_no,
+            enqueued=None,
+        )
+
+    async def _append(
+        self,
+        *,
+        session_id: str,
+        prompt_token_ids: list[int],
+        sequence_no: int,
+        enqueued: asyncio.Future[int] | None,
+        cache_page_baseline: int | None = None,
+    ) -> StreamingToolCallAppendResult:
         self._assert_owner_loop()
         session = self._get_session(session_id)
         async with session.append_lock:
@@ -261,10 +481,48 @@ class StreamingToolCallPrefillManager:
                     common_prefix_tokens - self._stability_margin_tokens,
                 )
 
+            if stable_token_count > self._max_prompt_tokens:
+                self._total_prompt_too_long_rejections += 1
+                raise StreamingToolCallPromptTooLongError(
+                    "streaming prefill prompt would exceed its token limit: "
+                    f"{stable_token_count} > {self._max_prompt_tokens}"
+                )
+
+            # Avoid starting GPU work until the proven stable prefix extends
+            # the cacheable prefix by at least one full engine page. If the
+            # first background snapshot is too short, the session retains this
+            # gate across later observations. Once a chunk crosses the page,
+            # later partial pages can accumulate in the same engine request.
+            effective_cache_page_baseline = cache_page_baseline
+            if effective_cache_page_baseline is None and session.cache_page_gate_active:
+                effective_cache_page_baseline = session.cache_page_baseline
+            if (
+                effective_cache_page_baseline is not None
+                and self._cache_page_size_tokens is not None
+                and stable_token_count // self._cache_page_size_tokens
+                <= effective_cache_page_baseline // self._cache_page_size_tokens
+            ):
+                if enqueued is not None and not enqueued.done():
+                    enqueued.set_result(0)
+                result = StreamingToolCallAppendResult(
+                    sequence_no=sequence_no,
+                    committed_tokens=len(session.committed_token_ids),
+                    chunk_tokens=0,
+                    dummy_tokens=session.dummy_tokens,
+                )
+                self._complete_observation(
+                    session,
+                    prompt_token_ids=prompt_token_ids,
+                    result=result,
+                )
+                return result
+
             chunk_token_ids = prompt_token_ids[
                 len(session.committed_token_ids) : stable_token_count
             ]
             if not chunk_token_ids:
+                if enqueued is not None and not enqueued.done():
+                    enqueued.set_result(0)
                 result = StreamingToolCallAppendResult(
                     sequence_no=sequence_no,
                     committed_tokens=len(session.committed_token_ids),
@@ -285,6 +543,12 @@ class StreamingToolCallPrefillManager:
                 acknowledgement=acknowledgement,
             )
             await session.input_queue.put(chunk)
+            # The first admitted chunk has crossed a full APC page. Later
+            # continuation chunks may now accumulate partial pages inside this
+            # same streaming engine request without paying a new request cost.
+            session.cache_page_gate_active = False
+            if enqueued is not None and not enqueued.done():
+                enqueued.set_result(len(chunk_token_ids))
             session.last_activity_monotonic = time.monotonic()
 
             try:
@@ -315,11 +579,51 @@ class StreamingToolCallPrefillManager:
             )
             return result
 
+    async def prime(
+        self,
+        *,
+        session_id: str,
+        prompt_token_ids: list[int],
+    ) -> StreamingToolCallPrimeResult:
+        """Prefill one exact prompt without exposing session round trips."""
+        await self.start(
+            session_id=session_id,
+            prompt_token_ids=prompt_token_ids,
+            sequence_no=0,
+        )
+        try:
+            appended = await self.append(
+                session_id=session_id,
+                prompt_token_ids=prompt_token_ids,
+                sequence_no=1,
+            )
+            closed = await self.close(
+                session_id=session_id,
+                final_prompt_token_ids=prompt_token_ids,
+            )
+        except asyncio.CancelledError:
+            await self.abort(session_id=session_id)
+            raise
+        except StreamingToolCallError:
+            await self.abort(session_id=session_id)
+            raise
+        return StreamingToolCallPrimeResult(
+            committed_tokens=closed.committed_tokens,
+            chunk_tokens=appended.chunk_tokens,
+            completed_chunks=closed.completed_chunks,
+            dummy_tokens=closed.dummy_tokens,
+            prefix_matched=closed.prefix_matched,
+        )
+
     async def close(
         self, *, session_id: str, final_prompt_token_ids: list[int]
     ) -> StreamingToolCallCloseResult:
         """Validate the final prefix and cancel speculative work without waiting."""
         self._assert_owner_loop()
+        # Let an acknowledgement that is already runnable commit before the
+        # zero-grace close snapshots counters. This yields once but never waits
+        # for new engine work.
+        await asyncio.sleep(0)
         async with self._lock:
             session = self._sessions.pop(session_id, None)
         if session is None:
@@ -328,20 +632,53 @@ class StreamingToolCallPrefillManager:
         prefix_matched = _has_prefix(
             final_prompt_token_ids, session.committed_token_ids
         )
+        background_cancelled_chunks = max(
+            0,
+            session.background_scheduled_chunks
+            - session.background_completed_chunks
+            - session.background_failed_chunks,
+        )
+        background_cancelled_tokens = max(
+            0,
+            session.background_scheduled_tokens
+            - session.background_completed_tokens
+            - session.background_failed_tokens,
+        )
         result = StreamingToolCallCloseResult(
             prefix_matched=prefix_matched,
             committed_tokens=len(session.committed_token_ids),
             completed_chunks=session.completed_chunks,
             dummy_tokens=session.dummy_tokens,
+            background_scheduled_chunks=session.background_scheduled_chunks,
+            background_scheduled_tokens=session.background_scheduled_tokens,
+            background_completed_chunks=session.background_completed_chunks,
+            background_completed_tokens=session.background_completed_tokens,
+            background_completed_dummy_tokens=(
+                session.background_completed_dummy_tokens
+            ),
+            background_effective_chunks=session.background_effective_chunks,
+            background_dynamic_tokens=session.background_dynamic_tokens,
+            background_cancelled_chunks=background_cancelled_chunks,
+            background_cancelled_tokens=background_cancelled_tokens,
+            background_failed_chunks=session.background_failed_chunks,
+            background_failed_tokens=session.background_failed_tokens,
+            background_enqueue_seconds=session.background_enqueue_seconds,
+            background_completion_seconds=session.background_completion_seconds,
         )
         self._cancel_session(session)
         return result
 
     async def abort(self, *, session_id: str) -> bool:
-        """Cancel a session if present and return whether it existed."""
+        """Cancel present or late-arriving work for one session ID."""
         self._assert_owner_loop()
         async with self._lock:
             session = self._sessions.pop(session_id, None)
+            self._aborted_sessions.pop(session_id, None)
+            self._aborted_sessions[session_id] = (
+                time.monotonic() + self._session_ttl_seconds
+            )
+            while len(self._aborted_sessions) > self._max_sessions:
+                self._aborted_sessions.popitem(last=False)
         if session is None:
             return False
         self._cancel_session(session)
@@ -367,6 +704,7 @@ class StreamingToolCallPrefillManager:
         for session in sessions:
             self._cancel_session(session)
         tasks = [session.task for session in sessions if session.task is not None]
+        tasks.extend(task for session in sessions for task in session.background_tasks)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(sessions)
@@ -381,6 +719,7 @@ class StreamingToolCallPrefillManager:
         """Cancel sessions that have not made progress within the configured TTL."""
         self._assert_owner_loop()
         cutoff = time.monotonic() - self._session_ttl_seconds
+        now = time.monotonic()
         async with self._lock:
             stale_ids = [
                 session_id
@@ -390,6 +729,11 @@ class StreamingToolCallPrefillManager:
             stale_sessions = [
                 self._sessions.pop(session_id) for session_id in stale_ids
             ]
+            while self._aborted_sessions:
+                session_id, expires_at = next(iter(self._aborted_sessions.items()))
+                if expires_at > now:
+                    break
+                self._aborted_sessions.pop(session_id)
         for session in stale_sessions:
             self._cancel_session(session)
         return len(stale_sessions)
@@ -425,6 +769,66 @@ class StreamingToolCallPrefillManager:
             ) from session.terminal_error
         if session.closed:
             raise StreamingToolCallSessionClosedError(session.session_id)
+
+    async def _run_background_append(
+        self,
+        *,
+        session: _StreamingToolCallSession,
+        prompt_token_ids: list[int],
+        sequence_no: int,
+        dynamic_token_baseline: int,
+        enqueued: asyncio.Future[int],
+    ) -> None:
+        completion_started_at = time.perf_counter()
+        dummy_tokens_before = session.dummy_tokens
+        try:
+            result = await self._append(
+                session_id=session.session_id,
+                prompt_token_ids=prompt_token_ids,
+                sequence_no=sequence_no,
+                enqueued=enqueued,
+                cache_page_baseline=dynamic_token_baseline,
+            )
+        except asyncio.CancelledError:
+            if not enqueued.done():
+                enqueued.cancel()
+            raise
+        except Exception as error:
+            if not enqueued.done():
+                enqueued.set_exception(error)
+            else:
+                scheduled_tokens = enqueued.result()
+                session.background_failed_chunks += int(scheduled_tokens > 0)
+                session.background_failed_tokens += scheduled_tokens
+            raise
+
+        if result.chunk_tokens <= 0:
+            return
+        committed_tokens_before = result.committed_tokens - result.chunk_tokens
+        dynamic_tokens_before = max(0, committed_tokens_before - dynamic_token_baseline)
+        dynamic_tokens_after = max(0, result.committed_tokens - dynamic_token_baseline)
+        dynamic_tokens = dynamic_tokens_after - dynamic_tokens_before
+        completed_dummy_tokens = result.dummy_tokens - dummy_tokens_before
+        session.background_completed_chunks += 1
+        session.background_completed_tokens += result.chunk_tokens
+        session.background_completed_dummy_tokens += completed_dummy_tokens
+        session.background_effective_chunks += int(dynamic_tokens > 0)
+        session.background_dynamic_tokens += dynamic_tokens
+        session.background_completion_seconds += (
+            time.perf_counter() - completion_started_at
+        )
+
+    @staticmethod
+    def _consume_background_task(
+        session: _StreamingToolCallSession,
+        task: asyncio.Task[None],
+    ) -> None:
+        session.background_tasks.discard(task)
+        if task.cancelled():
+            return
+        # Retrieving the exception prevents an unobserved task warning. The
+        # session and close-result counters retain the actionable failure data.
+        task.exception()
 
     async def _run_session(self, session: _StreamingToolCallSession) -> None:
         async def input_stream() -> AsyncGenerator[Any, None]:
@@ -467,6 +871,9 @@ class StreamingToolCallPrefillManager:
                 queued_chunk.acknowledgement.set_exception(error)
         if session.task is not None and not session.task.done():
             session.task.cancel()
+        for task in tuple(session.background_tasks):
+            if not task.done():
+                task.cancel()
 
     @staticmethod
     def _fail_pending(session: _StreamingToolCallSession, error: BaseException) -> None:

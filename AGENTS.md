@@ -42,3 +42,9 @@ When reviewing code, follow these principles:
 ## Kubernetes / nrl-k8s
 
 For launching, monitoring, stopping, and debugging NeMo-RL recipes on Kubernetes, see the skill at @skills/launch-nemo-rl/SKILL.md.
+
+## Slurm / ray.sub
+
+For launching, testing, monitoring, stopping, and debugging with `srun`,
+`sbatch`, or `ray.sub`, see @skills/slurm/SKILL.md. In particular, never pair
+`--exclusive` with a partial-GPU request on an 8-GPU node.

@@ -473,6 +473,7 @@ def setup(
     # ==========================
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    generation_config["tokenizer_name"] = policy_config["tokenizer"]["name"]
 
     if backend == "megatron":
         student_generation = None

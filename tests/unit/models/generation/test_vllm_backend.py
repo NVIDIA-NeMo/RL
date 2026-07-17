@@ -74,6 +74,20 @@ def _make_extension_with_drafter(mtp_start_layer_idx, num_mtp_layers):
     return ext
 
 
+@pytest.mark.vllm
+def test_reports_effective_kv_cache_block_size() -> None:
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(cache_config=SimpleNamespace(block_size=1152))
+    )
+
+    assert ext.report_kv_cache_block_size() == 1152
+
+
 def _patch_vllm_postload(monkeypatch):
     """Stub the vLLM post-load helpers imported inside load_mtp_weights_from_disk."""
     monkeypatch.setattr(

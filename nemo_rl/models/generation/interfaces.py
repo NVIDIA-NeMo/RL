@@ -124,6 +124,9 @@ class GenerationConfig(TypedDict):
     top_p: float
     top_k: int | None
     model_name: NotRequired[str]  # Not Required b/c GRPO writes this
+    # May differ from model_name when training a base checkpoint with an
+    # instruction-tuned tokenizer/chat template.
+    tokenizer_name: NotRequired[str]
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     colocated: NotRequired[ColocationConfig]

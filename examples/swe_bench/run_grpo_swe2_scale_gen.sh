@@ -21,19 +21,18 @@
 # Everything else is auto-derived to hold these invariants constant so that
 # runs at different R are directly comparable:
 #   - per generation-replica workload : samples/replica/step = 2
-#   - per training-GPU workload       : GBS / train_DP       = 32
-#   - train:gen node ratio            : 1:1 (matches the bihu 8+8 baseline)
+#   - train:gen node ratio            : 1:1 by default
 #
-# Derivation (REPLICAS_PER_NODE = gpus_per_node / VLLM_TP = 8/2 = 4):
-#   GEN_NODES   = R / 4
-#   TRAIN_NODES = R / 4                 (linear follow; override with TRAIN_NODES=)
-#   TOTAL_NODES = TRAIN_NODES+GEN_NODES = R/2   -> sbatch --nodes & cluster.num_nodes
+# Nano 3 default derivation
+# (REPLICAS_PER_NODE = gpus_per_node / VLLM_TP = 8/4 = 2):
+#   GEN_NODES   = R / 2
+#   TRAIN_NODES = R / 2                 (linear follow; override with TRAIN_NODES=)
+#   TOTAL_NODES = TRAIN_NODES+GEN_NODES = R     -> sbatch --nodes & cluster.num_nodes
 #   PPS         = 2*R / GPP             = R/4
 #   GBS         = PPS*GPP               = 2*R   (force_on_policy_ratio requires ==)
 #   CONCURRENCY = max(768, GBS*age)
-# R must be a multiple of 16 (train world = 2R must satisfy Megatron
-# model-parallel & expert-parallel divisibility; gen must fill whole nodes).
-# R=32 exactly reproduces the bihu repro (16 nodes = 8+8, PPS=8, GBS=64).
+# With the default Nano training layout (TP=2, CP=4, PP=2, EP=8), R must be a
+# multiple of 4 so both training parallelism and full generation nodes divide.
 #
 # All runs of this sweep share one wandb group (WANDB_GROUP) under project
 # swe-benchmark for easy comparison.
@@ -41,18 +40,32 @@
 # Usage:
 #   NUM_VLLM_REPLICAS=64 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh
 #   NUM_VLLM_REPLICAS=64 DRY_RUN=1 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh   # print config, no submit
-#   SKIP_TRAINING=1 NUM_VLLM_REPLICAS=4 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh  # generation-only (no-op train, 1 node, R%4)
-# Optional env: SKIP_TRAINING, TRAJECTORY_COLLECTION,
+#   SKIP_TRAINING=1 NUM_VLLM_REPLICAS=4 bash examples/swe_bench/run_grpo_swe2_scale_gen.sh  # generation-only (no-op train, R%4)
+# Optional env: SKIP_TRAINING, TRAJECTORY_COLLECTION, ROLLOUT_ONLY_GPP,
 #               TRAJECTORY_COLLECTION_BATCH_SIZE, TRAIN_DATA_PATH, VAL_DATA_PATH,
-#               TRAIN_NODES, TRAIN_TP, WANDB_GROUP, EXP_SUFFIX, MODEL_PATH,
-#               CONTAINER, MAX_NUM_STEPS, SBATCH_TIME, SBATCH_DEPENDENCY, PERSISTENT_CACHE,
+#               TRAIN_NODES, TRAIN_TP, VLLM_TP, CONFIG_FILE, WANDB_GROUP,
+#               EXP_SUFFIX, MODEL_PATH,
+#               CONTAINER, MAX_NUM_STEPS, SBATCH_TIME, SBATCH_DEPENDENCY,
+#               CACHE_NAMESPACE, PERSISTENT_CACHE,
+#               SUBMIT_MODE,
 #               BASE_LOG_DIR, LOGGER_LOG_DIR, STREAMING_TOOL_CALL,
 #               LOG_GYM_RESPONSES, TEMPERATURE, TOP_P,
 #               SNAPSHOT_POLL_INTERVAL_SECONDS,
+#               SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS,
 #               STREAMING_MIN_CHUNK_CHARS,
+#               STREAMING_INITIAL_CHUNK_CHARS,
 #               STREAMING_INCREMENTAL_TOKENIZER_ONLY,
 #               EXACT_INCREMENTAL_TOKENIZER,
+#               FINAL_ONLY_INCREMENTAL_TOKENIZER,
+#               FINAL_ONLY_PREFILL,
+#               FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS,
+#               PREFIX_SEEDED_START,
+#               PREFILL_AFTER_ADMISSION,
+#               BACKGROUND_PREFILL_COMPLETION,
+#               STABLE_FIRST_SNAPSHOT_PREFILL,
+#               COMPACT_REQUEST_CONTEXT,
 #               INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL,
+#               COUNTERFACTUAL_FULL_TOKENIZER_TIMING,
 #               DETAILED_RUNTIME_METRICS, BASE_CONCURRENCY,
 #               SWE_BENCH_ARTIFACT_CACHE_OFFLINE
 # Credentials are NOT sourced here — export HF_HOME / HF_TOKEN / WANDB_API_KEY yourself.
@@ -64,18 +77,24 @@ set -e
 # Auto-detected from this script's location (examples/swe_bench/), so it works from
 # any clone of the repo. Override by exporting REPO_ROOT.
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-CONFIG_FILE="${REPO_ROOT}/examples/swe_bench/grpo_qwen3_30b_async_swe.yaml"
+CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/examples/swe_bench/grpo_nemotron_nano3_30b_async_swe.yaml}"
 CHECKPOINT_ROOT="${REPO_ROOT}/results"
 DEFAULT_DATA_PATH="/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${DEFAULT_DATA_PATH}}"
 VAL_DATA_PATH="${VAL_DATA_PATH:-${TRAIN_DATA_PATH}}"
-# SWE1 step_230 HF checkpoint (exactly what dc3m70us trained from).
-DEFAULT_MODEL_PATH="/lustre/fsw/portfolios/coreai/users/bihu/repos/nemo-rl-async-swe/results/qwen3-30b-thinking-swe1-async-age1-pps64-gpp8-gbs512-lr1e-06/step_230_hf"
+# Training starts from the official Nano 3 Base checkpoint, while rollout-only
+# evaluation must use the instruction checkpoint so the OpenHands policy can
+# emit function calls instead of filling the context window with raw reasoning.
+if [ "${TRAJECTORY_COLLECTION:-0}" = "1" ]; then
+  DEFAULT_MODEL_PATH="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+else
+  DEFAULT_MODEL_PATH="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
+fi
 MODEL_PATH="${1:-${MODEL_PATH:-${DEFAULT_MODEL_PATH}}}"
 
 # ================ Container and mount config ================
-# SWE training container (mcore + apptainer, working hermes tool parser).
-export CONTAINER=${CONTAINER:-/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/docker_images:ruit-swe_bench-6de99f772-x86_64-060326-mcore-apptainer.squashfs}
+# NeMo RL nightly used for Nano 3 streaming-prefill development.
+export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/nemo-rl:nightly-071526.squashfs}"
 GYM_CODE="${REPO_ROOT}/3rdparty/Gym-workspace/Gym"
 export MOUNTS="/lustre:/lustre,$PWD:$PWD,${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 
@@ -97,7 +116,16 @@ fi
 STREAMING_TOOL_CALL="${STREAMING_TOOL_CALL:-0}"
 STREAMING_INCREMENTAL_TOKENIZER_ONLY="${STREAMING_INCREMENTAL_TOKENIZER_ONLY:-0}"
 EXACT_INCREMENTAL_TOKENIZER="${EXACT_INCREMENTAL_TOKENIZER:-0}"
+FINAL_ONLY_INCREMENTAL_TOKENIZER="${FINAL_ONLY_INCREMENTAL_TOKENIZER:-0}"
+FINAL_ONLY_PREFILL="${FINAL_ONLY_PREFILL:-0}"
+FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS="${FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS:-0.0}"
+PREFIX_SEEDED_START="${PREFIX_SEEDED_START:-0}"
+PREFILL_AFTER_ADMISSION="${PREFILL_AFTER_ADMISSION:-0}"
+BACKGROUND_PREFILL_COMPLETION="${BACKGROUND_PREFILL_COMPLETION:-0}"
+STABLE_FIRST_SNAPSHOT_PREFILL="${STABLE_FIRST_SNAPSHOT_PREFILL:-0}"
+COMPACT_REQUEST_CONTEXT="${COMPACT_REQUEST_CONTEXT:-0}"
 INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL="${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL:-8}"
+COUNTERFACTUAL_FULL_TOKENIZER_TIMING="${COUNTERFACTUAL_FULL_TOKENIZER_TIMING:-0}"
 DETAILED_RUNTIME_METRICS="${DETAILED_RUNTIME_METRICS:-0}"
 if [ "${STREAMING_TOOL_CALL}" != "0" ] && [ "${STREAMING_TOOL_CALL}" != "1" ]; then
   echo "ERROR: STREAMING_TOOL_CALL must be 0 or 1." >&2
@@ -119,8 +147,80 @@ if [ "${EXACT_INCREMENTAL_TOKENIZER}" = "1" ] && [ "${STREAMING_INCREMENTAL_TOKE
   echo "ERROR: EXACT_INCREMENTAL_TOKENIZER requires STREAMING_INCREMENTAL_TOKENIZER_ONLY=1." >&2
   exit 1
 fi
+if [ "${FINAL_ONLY_INCREMENTAL_TOKENIZER}" != "0" ] && [ "${FINAL_ONLY_INCREMENTAL_TOKENIZER}" != "1" ]; then
+  echo "ERROR: FINAL_ONLY_INCREMENTAL_TOKENIZER must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${FINAL_ONLY_INCREMENTAL_TOKENIZER}" = "1" ] && [ "${EXACT_INCREMENTAL_TOKENIZER}" != "1" ]; then
+  echo "ERROR: FINAL_ONLY_INCREMENTAL_TOKENIZER requires EXACT_INCREMENTAL_TOKENIZER=1." >&2
+  exit 1
+fi
+if [ "${FINAL_ONLY_PREFILL}" != "0" ] && [ "${FINAL_ONLY_PREFILL}" != "1" ]; then
+  echo "ERROR: FINAL_ONLY_PREFILL must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${FINAL_ONLY_PREFILL}" = "1" ] && [ "${FINAL_ONLY_INCREMENTAL_TOKENIZER}" != "1" ]; then
+  echo "ERROR: FINAL_ONLY_PREFILL requires FINAL_ONLY_INCREMENTAL_TOKENIZER=1." >&2
+  exit 1
+fi
+if ! [[ "${FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "ERROR: FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS must be non-negative." >&2
+  exit 1
+fi
+if [ "${PREFIX_SEEDED_START}" != "0" ] && [ "${PREFIX_SEEDED_START}" != "1" ]; then
+  echo "ERROR: PREFIX_SEEDED_START must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${PREFIX_SEEDED_START}" = "1" ] && [ "${FINAL_ONLY_PREFILL}" != "1" ]; then
+  echo "ERROR: PREFIX_SEEDED_START requires FINAL_ONLY_PREFILL=1." >&2
+  exit 1
+fi
+if [ "${PREFILL_AFTER_ADMISSION}" != "0" ] && [ "${PREFILL_AFTER_ADMISSION}" != "1" ]; then
+  echo "ERROR: PREFILL_AFTER_ADMISSION must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${PREFILL_AFTER_ADMISSION}" = "1" ] && [ "${FINAL_ONLY_PREFILL}" != "1" ]; then
+  echo "ERROR: PREFILL_AFTER_ADMISSION requires FINAL_ONLY_PREFILL=1." >&2
+  exit 1
+fi
+if [ "${BACKGROUND_PREFILL_COMPLETION}" != "0" ] && [ "${BACKGROUND_PREFILL_COMPLETION}" != "1" ]; then
+  echo "ERROR: BACKGROUND_PREFILL_COMPLETION must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${BACKGROUND_PREFILL_COMPLETION}" = "1" ] && [ "${PREFILL_AFTER_ADMISSION}" != "1" ]; then
+  echo "ERROR: BACKGROUND_PREFILL_COMPLETION requires PREFILL_AFTER_ADMISSION=1." >&2
+  exit 1
+fi
+if [ "${STABLE_FIRST_SNAPSHOT_PREFILL}" != "0" ] && [ "${STABLE_FIRST_SNAPSHOT_PREFILL}" != "1" ]; then
+  echo "ERROR: STABLE_FIRST_SNAPSHOT_PREFILL must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${STABLE_FIRST_SNAPSHOT_PREFILL}" = "1" ] && [ "${PREFILL_AFTER_ADMISSION}" != "1" ]; then
+  echo "ERROR: STABLE_FIRST_SNAPSHOT_PREFILL requires PREFILL_AFTER_ADMISSION=1." >&2
+  exit 1
+fi
+if [ "${STABLE_FIRST_SNAPSHOT_PREFILL}" = "1" ] && [ "${PREFIX_SEEDED_START}" != "1" ]; then
+  echo "ERROR: STABLE_FIRST_SNAPSHOT_PREFILL requires PREFIX_SEEDED_START=1." >&2
+  exit 1
+fi
+if [ "${COMPACT_REQUEST_CONTEXT}" != "0" ] && [ "${COMPACT_REQUEST_CONTEXT}" != "1" ]; then
+  echo "ERROR: COMPACT_REQUEST_CONTEXT must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${COMPACT_REQUEST_CONTEXT}" = "1" ] && [ "${EXACT_INCREMENTAL_TOKENIZER}" != "1" ]; then
+  echo "ERROR: COMPACT_REQUEST_CONTEXT requires EXACT_INCREMENTAL_TOKENIZER=1." >&2
+  exit 1
+fi
 if ! [[ "${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL must be a positive integer." >&2
+  exit 1
+fi
+if [ "${COUNTERFACTUAL_FULL_TOKENIZER_TIMING}" != "0" ] && [ "${COUNTERFACTUAL_FULL_TOKENIZER_TIMING}" != "1" ]; then
+  echo "ERROR: COUNTERFACTUAL_FULL_TOKENIZER_TIMING must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${COUNTERFACTUAL_FULL_TOKENIZER_TIMING}" = "1" ] && [ "${EXACT_INCREMENTAL_TOKENIZER}" != "1" ]; then
+  echo "ERROR: COUNTERFACTUAL_FULL_TOKENIZER_TIMING requires EXACT_INCREMENTAL_TOKENIZER=1." >&2
   exit 1
 fi
 if [ "${DETAILED_RUNTIME_METRICS}" != "0" ] && [ "${DETAILED_RUNTIME_METRICS}" != "1" ]; then
@@ -153,26 +253,89 @@ if [ "${EXACT_INCREMENTAL_TOKENIZER}" = "1" ]; then
 else
   EXACT_INCREMENTAL_TOKENIZER_ENABLED=False
 fi
+if [ "${FINAL_ONLY_INCREMENTAL_TOKENIZER}" = "1" ]; then
+  FINAL_ONLY_INCREMENTAL_TOKENIZER_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="-streamtokenizer-final"
+else
+  FINAL_ONLY_INCREMENTAL_TOKENIZER_ENABLED=False
+fi
+if [ "${FINAL_ONLY_PREFILL}" = "1" ]; then
+  FINAL_ONLY_PREFILL_ENABLED=True
+  VLLM_STREAMING_TOOL_CALL_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="-streamtokenizer-final-prefill"
+else
+  FINAL_ONLY_PREFILL_ENABLED=False
+fi
+if [ "${PREFIX_SEEDED_START}" = "1" ]; then
+  PREFIX_SEEDED_START_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="-streamtokenizer-final-prefill-seeded"
+else
+  PREFIX_SEEDED_START_ENABLED=False
+fi
+if [ "${PREFILL_AFTER_ADMISSION}" = "1" ]; then
+  PREFILL_AFTER_ADMISSION_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-continuation"
+else
+  PREFILL_AFTER_ADMISSION_ENABLED=False
+fi
+if [ "${BACKGROUND_PREFILL_COMPLETION}" = "1" ]; then
+  BACKGROUND_PREFILL_COMPLETION_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-background"
+else
+  BACKGROUND_PREFILL_COMPLETION_ENABLED=False
+fi
+if [ "${STABLE_FIRST_SNAPSHOT_PREFILL}" = "1" ]; then
+  STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-stablefirst"
+else
+  STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED=False
+fi
+if [ "${COMPACT_REQUEST_CONTEXT}" = "1" ]; then
+  COMPACT_REQUEST_CONTEXT_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-compact"
+else
+  COMPACT_REQUEST_CONTEXT_ENABLED=False
+fi
+if [ "${COUNTERFACTUAL_FULL_TOKENIZER_TIMING}" = "1" ]; then
+  COUNTERFACTUAL_FULL_TOKENIZER_TIMING_ENABLED=True
+else
+  COUNTERFACTUAL_FULL_TOKENIZER_TIMING_ENABLED=False
+fi
 if [ "${SKIP_TRAINING}" = "1" ]; then
   TP=8; EP=8; CP=1; PP=1; ETP=1     # model_parallel = 8 (fits 1 node), train_DP=1
 else
-  TP="${TRAIN_TP:-4}"; EP=8; CP=4; PP=2; ETP=1
+  TP="${TRAIN_TP:-2}"; EP=8; CP=4; PP=2; ETP=1
 fi
-VLLM_TP=2
+VLLM_TP="${VLLM_TP:-4}"
+if ! [[ "${VLLM_TP}" =~ ^[1-9][0-9]*$ ]] || [ $(( NUM_GPU % VLLM_TP )) -ne 0 ]; then
+  echo "ERROR: VLLM_TP must be a positive divisor of ${NUM_GPU} (got ${VLLM_TP})." >&2
+  exit 1
+fi
 MIN_PAD=1
 if [ ${CP} -gt 1 ]; then MIN_PAD=$((MIN_PAD * CP * 2)); fi
 if [ ${TP} -gt 1 ]; then MIN_PAD=$((MIN_PAD * TP)); fi
 MAKE_SEQ_DIVISIBLE_BY=${MIN_PAD}
 
 # ================= Generation-scaling: derive all sizes from R =================
-GPP=8                                            # generations per prompt (fixed)
+# Training sweeps keep eight generations per prompt. Trajectory collection
+# exits through the validation-only collector before GRPO and emits one result
+# per manifest row, so a smaller setup-only GPP may be used to scale a
+# diagnostic below four replicas without changing collected trajectories.
+GPP=8
+if [ "${TRAJECTORY_COLLECTION}" = "1" ]; then
+  GPP="${ROLLOUT_ONLY_GPP:-8}"
+fi
+if ! [[ "${GPP}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: ROLLOUT_ONLY_GPP must be a positive integer (got ${GPP})." >&2
+  exit 1
+fi
 SAMPLES_PER_REPLICA=2                             # invariant: samples/replica/step
 BASE_CONCURRENCY="${BASE_CONCURRENCY:-768}"       # nemo-gym fan-out floor
 if ! [[ "${BASE_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: BASE_CONCURRENCY must be a positive integer." >&2
   exit 1
 fi
-REPLICAS_PER_NODE=$(( NUM_GPU / VLLM_TP ))        # = 4
+REPLICAS_PER_NODE=$(( NUM_GPU / VLLM_TP ))
 MODEL_PARALLEL=$(( TP * CP * PP ))                # = 32
 EXPERT_TMP=$(( ETP * EP * PP ))                   # = 16
 
@@ -185,15 +348,17 @@ fi
 # Smallest valid step for R.
 gcd() { local a=$1 b=$2 t; while [ ${b} -ne 0 ]; do t=${b}; b=$(( a % b )); a=${t}; done; echo ${a}; }
 lcm() { echo $(( $1 / $(gcd $1 $2) * $2 )); }
+R_STEP_PPS=$(( GPP / $(gcd ${SAMPLES_PER_REPLICA} ${GPP}) ))
 if [ "${SKIP_TRAINING}" = "1" ]; then
   # train fixed at 1 node (train_world=8, divisible by model_parallel=8); only gen
-  # must fill whole nodes -> R need only be a multiple of REPLICAS_PER_NODE (=4).
-  R_STEP=${REPLICAS_PER_NODE}
+  # must fill whole nodes and produce an integral, nonzero PPS.
+  R_STEP=$(lcm ${REPLICAS_PER_NODE} ${R_STEP_PPS})
 else
-  # linear train: train_world=2R must be divisible by model-parallel & expert sizes.
+  # With the default 1:1 train:gen node ratio, train_world=VLLM_TP*R.
+  # It must be divisible by both model-parallel and expert-parallel sizes.
   L=$(lcm ${MODEL_PARALLEL} ${EXPERT_TMP})          # train-world divisor
-  R_STEP_TRAIN=$(( L / $(gcd 2 ${L}) ))             # since train_world = 2R
-  R_STEP=$(lcm ${R_STEP_TRAIN} ${REPLICAS_PER_NODE})
+  R_STEP_TRAIN=$(( L / $(gcd ${VLLM_TP} ${L}) ))
+  R_STEP=$(lcm $(lcm ${R_STEP_TRAIN} ${REPLICAS_PER_NODE}) ${R_STEP_PPS})
 fi
 if [ $(( NUM_VLLM_REPLICAS % R_STEP )) -ne 0 ] || [ ${NUM_VLLM_REPLICAS} -lt ${R_STEP} ]; then
   echo "ERROR: NUM_VLLM_REPLICAS must be a positive multiple of ${R_STEP} (got ${NUM_VLLM_REPLICAS})." >&2
@@ -279,11 +444,17 @@ MOE_ROUTER_BIAS_UPDATE_RATE="1e-3"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 SNAPSHOT_POLL_INTERVAL_SECONDS="${SNAPSHOT_POLL_INTERVAL_SECONDS:-0.1}"
+SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS="${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS:-1.0}"
 STREAMING_MIN_CHUNK_CHARS="${STREAMING_MIN_CHUNK_CHARS:-}"
+STREAMING_INITIAL_CHUNK_CHARS="${STREAMING_INITIAL_CHUNK_CHARS:-}"
 SWE_BENCH_ARTIFACT_CACHE_OFFLINE="${SWE_BENCH_ARTIFACT_CACHE_OFFLINE:-0}"
 
 if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ] && ! [[ "${STREAMING_MIN_CHUNK_CHARS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: STREAMING_MIN_CHUNK_CHARS must be a positive integer when set." >&2
+  exit 1
+fi
+if [ -n "${STREAMING_INITIAL_CHUNK_CHARS}" ] && ! [[ "${STREAMING_INITIAL_CHUNK_CHARS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: STREAMING_INITIAL_CHUNK_CHARS must be a positive integer when set." >&2
   exit 1
 fi
 
@@ -299,7 +470,7 @@ AGENT_TIMEOUT=1800
 # ============================== Logging ==============================
 WANDB_PROJ="swe-benchmark"
 # Shared group for the whole generation-scaling sweep (compare runs by R).
-WANDB_GROUP="${WANDB_GROUP:-swe-gen-scale-linear}"
+WANDB_GROUP="${WANDB_GROUP:-nemotron-nano3-swe-gen-scale-linear}"
 # Log full trajectories to wandb so we can verify function_call items appear.
 LOG_GYM_RESPONSES="${LOG_GYM_RESPONSES:-true}"
 
@@ -308,6 +479,11 @@ SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-nemotron_sw_post}"
 SBATCH_PARTITION="${SBATCH_PARTITION:-batch}"
 SBATCH_TIME="${SBATCH_TIME:-4:0:0}"
 SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-singleton}"
+SUBMIT_MODE="${SUBMIT_MODE:-sbatch}"
+if [ "${SUBMIT_MODE}" != "sbatch" ] && [ "${SUBMIT_MODE}" != "direct" ]; then
+  echo "ERROR: SUBMIT_MODE must be sbatch or direct." >&2
+  exit 1
+fi
 # Optional smoke-test knob: cap training steps (appended as ++grpo.max_num_steps). Empty = use YAML default.
 MAX_NUM_STEPS="${MAX_NUM_STEPS:-}"
 
@@ -317,7 +493,7 @@ if [ "${ASYNC_GRPO_ENABLED}" = "True" ]; then
 else
   SYNC_MODE="sync"
 fi
-EXP_SUFFIX="${EXP_SUFFIX:-swe-genscale-${SYNC_MODE}-genrep${NUM_VLLM_REPLICAS}-nodes${TOTAL_NODES}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}${STREAMING_TOOL_CALL_TAG}}"
+EXP_SUFFIX="${EXP_SUFFIX:-nano3-swe-genscale-${SYNC_MODE}-genrep${NUM_VLLM_REPLICAS}-nodes${TOTAL_NODES}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}${STREAMING_TOOL_CALL_TAG}}"
 WANDB_NAME="${EXP_SUFFIX}"
 CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${EXP_SUFFIX}"
 SNAPSHOT_DIR="${REPO_ROOT}"
@@ -336,11 +512,6 @@ export HUGGINGFACE_TOKEN="${HUGGINGFACE_TOKEN:-${HF_TOKEN}}"
 export GITLAB_TOKEN="${GITLAB_TOKEN:-}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export UV_CACHE_DIR=/tmp/uv_cache
-# Safe TE persistence (option B, seed-style — NO /root/.cache/uv override, so ray is untouched):
-# the SETUP_COMMAND below rsyncs this Lustre seed (a harvested /tmp/uv_cache that already has the
-# compiled transformer-engine wheel) into /tmp/uv_cache before the run, so the COMMAND's uv finds
-# the prebuilt TE and skips the ~20-40min recompile. Empty seed => harmless (falls back to compile).
-export LUSTRE_UV_CACHE_SEED="${LUSTRE_UV_CACHE_SEED:-}"
 export UV_LOCK_TIMEOUT=3600
 export RAY_DEDUP_LOGS=1
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
@@ -349,16 +520,43 @@ export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 export OMP_NUM_THREADS=16
 
 # ========================= Node-local cache config =========================
-PERSISTENT_CACHE="${PERSISTENT_CACHE:-${HOME}/.cache/qwen3_30b_thinking_swe_scale}"
+# Keep incompatible model/container/lock artifacts in separate namespaces.
+CACHE_MODEL_KEY="$(printf '%s' "$(basename "${MODEL_PATH}")" | tr -c '[:alnum:]_.-' '_')"
+CACHE_CONTAINER_KEY="$(printf '%s' "$(basename "${CONTAINER}")" | tr -c '[:alnum:]_.-' '_')"
+CACHE_LOCK_KEY="$(sha256sum "${REPO_ROOT}/uv.lock" | cut -c1-12)"
+CACHE_NAMESPACE="${CACHE_NAMESPACE:-${CACHE_MODEL_KEY}-${CACHE_CONTAINER_KEY}-${CACHE_LOCK_KEY}}"
+PERSISTENT_CACHE="${PERSISTENT_CACHE:-${REPO_ROOT}/results/cache/swe_scale/${CACHE_NAMESPACE}}"
+export PERSISTENT_CACHE
+export LUSTRE_UV_CACHE_SEED="${LUSTRE_UV_CACHE_SEED:-${PERSISTENT_CACHE}/uv_seed}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${PERSISTENT_CACHE}/pip}"
+# Gym launches server processes on arbitrary Ray nodes. Keep their venvs on the
+# shared filesystem rather than a node-local /opt path so every actor sees the
+# environment created by the Gym setup process.
+export NEMO_GYM_VENV_DIR="${PERSISTENT_CACHE}/gym_venvs"
+UV_BIN_DIR="${PERSISTENT_CACHE}/bin"
+UV_BIN="${UV_BIN:-${UV_BIN_DIR}/uv}"
+export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-/opt/ray_venvs}"
+export UV_LINK_MODE=copy
+VLLM_SHARED_VENV="${PERSISTENT_CACHE}/ray_venvs/vllm_shared"
+VLLM_VENV_TARGETS=(
+  nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker
+  nemo_rl.algorithms.async_utils.ReplayBuffer
+  nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector
+)
+mkdir -p "${VLLM_SHARED_VENV}"
+for venv_target in "${VLLM_VENV_TARGETS[@]}"; do
+  MOUNTS+=",${VLLM_SHARED_VENV}:${NEMO_RL_VENV_DIR}/${venv_target}"
+done
+export MOUNTS
 export LUSTRE_VLLM_CACHE="${PERSISTENT_CACHE}/vllm_compile_cache"
 export LUSTRE_INDUCTOR_CACHE="${PERSISTENT_CACHE}/inductor_cache"
 export LUSTRE_TRITON_CACHE="${PERSISTENT_CACHE}/triton_cache"
-export NRL_VLLM_LOCAL_CACHE_DIR="/tmp/nemo_rl_vllm_cache"
-export NRL_VLLM_CACHE_SEED_DIR="/tmp/nemo_rl_vllm_cache_warm"
+export NRL_VLLM_CACHE_ROOT_BASE="/tmp/nemo_rl_vllm_cache"
+export NRL_VLLM_CACHE_WRITEBACK_DIR="${LUSTRE_VLLM_CACHE}"
 export INDUCTOR_CACHE_DIR="/tmp/nemo_rl_inductor_cache"
+export TORCHINDUCTOR_CACHE_DIR="${INDUCTOR_CACHE_DIR}"
 export TRITON_CACHE_DIR="/tmp/nemo_rl_triton_cache"
-export CACHE_SYNC_FREQUENCY=120
-mkdir -p "${LUSTRE_VLLM_CACHE}" "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}"
+mkdir -p "${LUSTRE_UV_CACHE_SEED}" "${PIP_CACHE_DIR}" "${NEMO_GYM_VENV_DIR}" "${UV_BIN_DIR}" "${LUSTRE_VLLM_CACHE}" "${LUSTRE_INDUCTOR_CACHE}" "${LUSTRE_TRITON_CACHE}"
 
 # ============================== Summary ==============================
 echo "=========================================="
@@ -378,54 +576,84 @@ echo "  CONCURRENCY   = ${CONCURRENCY}"
 echo "  invariants    : samples/replica=${PER_REPLICA_SAMPLES}, batch/train-GPU=${PER_GPU_BATCH}"
 echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, pad=${MAKE_SEQ_DIVISIBLE_BY}"
 echo "Model: ${MODEL_PATH}"
+echo "Container: ${CONTAINER}"
+echo "Cache namespace: ${CACHE_NAMESPACE}"
 echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
 echo "Streaming tokenizer-only: ${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED}"
 echo "Detailed OpenHands runtime metrics: ${DETAILED_RUNTIME_METRICS_ENABLED}"
 echo "vLLM streaming prefill: ${VLLM_STREAMING_TOOL_CALL_ENABLED}"
 echo "Exact incremental tokenizer: ${EXACT_INCREMENTAL_TOKENIZER_ENABLED}"
+echo "Final-only incremental tokenizer: ${FINAL_ONLY_INCREMENTAL_TOKENIZER_ENABLED}"
+echo "Final-only prefill: ${FINAL_ONLY_PREFILL_ENABLED}"
+echo "Final-only prefill completion grace: ${FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS}s"
+echo "Background prefill completion: ${BACKGROUND_PREFILL_COMPLETION_ENABLED}"
+echo "Authoritative-prefix seeded start: ${PREFIX_SEEDED_START_ENABLED}"
+echo "Prefill after admission: ${PREFILL_AFTER_ADMISSION_ENABLED}"
+echo "Stable first-snapshot prefill: ${STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED}"
+echo "Compact request context: ${COMPACT_REQUEST_CONTEXT_ENABLED}"
 echo "Incremental tokenizer checkpoint interval: ${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL}"
+echo "Counterfactual full-tokenizer timing: ${COUNTERFACTUAL_FULL_TOKENIZER_TIMING_ENABLED}"
 echo "Streaming snapshot poll interval: ${SNAPSHOT_POLL_INTERVAL_SECONDS}s"
+echo "Streaming snapshot long-poll timeout: ${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS}s"
 if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ]; then
   echo "Streaming min chunk chars: ${STREAMING_MIN_CHUNK_CHARS}"
 fi
+if [ -n "${STREAMING_INITIAL_CHUNK_CHARS}" ]; then
+  echo "Streaming initial chunk chars: ${STREAMING_INITIAL_CHUNK_CHARS}"
+fi
 echo "SWE-bench artifact cache offline: ${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}"
+echo "Package caches: uv-local=${UV_CACHE_DIR} uv-seed=${LUSTRE_UV_CACHE_SEED:-none} pip=${PIP_CACHE_DIR}"
+echo "Gym shared venv: ${NEMO_GYM_VENV_DIR}"
+echo "uv executable: ${UV_BIN}"
+echo "Ray vLLM venv: ${VLLM_SHARED_VENV} -> ${NEMO_RL_VENV_DIR}/{async-worker,replay,collector} (link-mode=${UV_LINK_MODE})"
+echo "HF caches: home=${HF_HOME} datasets=${HF_DATASETS_CACHE}"
+echo "Build caches: vllm-local=${NRL_VLLM_CACHE_ROOT_BASE} vllm-seed=${LUSTRE_VLLM_CACHE} inductor-local=${TORCHINDUCTOR_CACHE_DIR} triton-local=${TRITON_CACHE_DIR}"
 echo "Checkpoint: ${CHECKPOINT_DIR}"
+echo "Submission mode: ${SUBMIT_MODE}"
 echo "=========================================="
 
 cd "${SNAPSHOT_DIR}"
 
 # ================ SETUP_COMMAND (bihu's: install apptainer + seed caches + uv sync) ================
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
-echo "[SETUP] Installing apptainer for SWE sandbox..."
-apt-get update && apt-get install -y git build-essential gcc wget 2>/dev/null || true
+if [ ! -x "${UV_BIN}" ]; then
+  echo "[SETUP] ERROR: compatible uv binary is missing: ${UV_BIN}" >&2
+  echo "[SETUP] Prewarm the nightly container cache before launching." >&2
+  exit 1
+fi
+export PATH="${UV_BIN_DIR}:\$PATH"
+echo "[SETUP] uv version: \$(uv --version)"
+
 RET=1
 RETRIES=3
-for attempt in \$(seq 1 \$RETRIES); do
-  if command -v apptainer >/dev/null 2>&1 || command -v singularity >/dev/null 2>&1; then
-    echo "[SETUP] singularity/apptainer already available"
-    RET=0
-    break
+if command -v apptainer >/dev/null 2>&1 || command -v singularity >/dev/null 2>&1; then
+  echo "[SETUP] singularity/apptainer already available; skipping apt setup"
+  RET=0
+else
+  echo "[SETUP] Installing apptainer for SWE sandbox..."
+  apt-get update && apt-get install -y git build-essential gcc wget 2>/dev/null || true
+  for attempt in \$(seq 1 \$RETRIES); do
+    cd /tmp && \
+    wget --no-check-certificate -q https://github.com/apptainer/apptainer/releases/download/v1.3.1/apptainer_1.3.1_amd64.deb && \
+    apt install -y ./apptainer_1.3.1_amd64.deb && \
+    ln -sf /usr/bin/apptainer /usr/bin/singularity
+    if command -v apptainer >/dev/null 2>&1; then
+      echo "[SETUP] apptainer installed successfully"
+      RET=0
+      break
+    fi
+    echo "[SETUP] apptainer install attempt \$attempt failed, retrying..."
+    sleep 10
+  done
+  if [ \$RET -ne 0 ]; then
+    echo "[SETUP] WARNING: apptainer installation failed after \$RETRIES attempts"
   fi
-  cd /tmp && \
-  wget --no-check-certificate -q https://github.com/apptainer/apptainer/releases/download/v1.3.1/apptainer_1.3.1_amd64.deb && \
-  apt install -y ./apptainer_1.3.1_amd64.deb && \
-  ln -sf /usr/bin/apptainer /usr/bin/singularity
-  if command -v apptainer >/dev/null 2>&1; then
-    echo "[SETUP] apptainer installed successfully"
-    RET=0
-    break
-  fi
-  echo "[SETUP] apptainer install attempt \$attempt failed, retrying..."
-  sleep 10
-done
-if [ \$RET -ne 0 ]; then
-  echo "[SETUP] WARNING: apptainer installation failed after \$RETRIES attempts"
 fi
 
 echo "[CACHE SEED] Clearing stale /tmp caches and seeding from Lustre..."
-rm -rf /tmp/nemo_rl_vllm_cache /tmp/nemo_rl_vllm_cache_*
+rm -rf "${NRL_VLLM_CACHE_ROOT_BASE}"
 rm -rf "${INDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
-mkdir -p "${INDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
+mkdir -p "${NRL_VLLM_CACHE_ROOT_BASE}" "${INDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
 
 find "${LUSTRE_INDUCTOR_CACHE}" -maxdepth 1 -name '.tmp_*' -mmin +30 -exec rm -rf {} + 2>/dev/null || true
 find "${LUSTRE_TRITON_CACHE}" -maxdepth 1 -name '.tmp_*' -mmin +30 -exec rm -rf {} + 2>/dev/null || true
@@ -441,19 +669,35 @@ _seed_cache() {
   fi
 }
 
+_seed_cache "${LUSTRE_VLLM_CACHE}" "${NRL_VLLM_CACHE_ROOT_BASE}" "vLLM compile"
 _seed_cache "${LUSTRE_INDUCTOR_CACHE}" "${INDUCTOR_CACHE_DIR}" "Inductor"
 _seed_cache "${LUSTRE_TRITON_CACHE}" "${TRITON_CACHE_DIR}" "Triton"
 mkdir -p /tmp/uv_cache
 _seed_cache "${LUSTRE_UV_CACHE_SEED}" "/tmp/uv_cache" "uv (prebuilt transformer-engine)"
 echo "[CACHE SEED] Done."
 
+UV_CACHE_DIR=/tmp/uv_cache \
 UV_HTTP_TIMEOUT=3600 \
   uv sync --frozen --extra mcore
+
+# Persist complete uv cache entries after every successful locked sync. A
+# marker records the sync contract but must not suppress future merges: the
+# driver and Ray environment builders can add native wheels after setup.
+(
+  if flock -n 9; then
+    rsync -a --exclude '.tmp*' /tmp/uv_cache/ "${LUSTRE_UV_CACHE_SEED}/"
+    touch "${LUSTRE_UV_CACHE_SEED}/.seed-complete-mcore-v2"
+    echo "[CACHE WRITEBACK] uv setup merge: complete"
+  else
+    echo "[CACHE WRITEBACK] uv setup merge: another node owns the seed lock; skipped"
+  fi
+) 9>"${LUSTRE_UV_CACHE_SEED}.lock"
 SETUPEOF
 export SETUP_COMMAND
 
 # ================ Training command (bihu-style: uv run --frozen, no --extra mcore) ================
-export COMMAND="NRL_VLLM_USE_V1=1 \
+export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
+  NRL_VLLM_USE_V1=1 \
   NRL_WG_USE_RAY_REF=1 \
   WANDB_API_KEY=${WANDB_API_KEY} \
   HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN} \
@@ -463,9 +707,17 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   HF_HOME=${HF_HOME} \
   HF_DATASETS_CACHE=${HF_DATASETS_CACHE} \
   UV_CACHE_DIR=${UV_CACHE_DIR} \
+  UV_LINK_MODE=${UV_LINK_MODE} \
+  PIP_CACHE_DIR=${PIP_CACHE_DIR} \
+  NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR} \
+  NEMO_GYM_VENV_DIR=${NEMO_GYM_VENV_DIR} \
   VLLM_ATTENTION_BACKEND=FLASH_ATTN \
-  VLLM_CACHE_ROOT=${LUSTRE_VLLM_CACHE} \
-  DG_JIT_CACHE_DIR=${LUSTRE_VLLM_CACHE}/deep_gemm \
+  NRL_VLLM_CACHE_ROOT_BASE=${NRL_VLLM_CACHE_ROOT_BASE} \
+  NRL_VLLM_CACHE_WRITEBACK_DIR=${NRL_VLLM_CACHE_WRITEBACK_DIR} \
+  INDUCTOR_CACHE_DIR=${INDUCTOR_CACHE_DIR} \
+  TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR} \
+  TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
+  DG_JIT_CACHE_DIR=${NRL_VLLM_CACHE_ROOT_BASE}/deep_gemm \
   VLLM_DEEP_GEMM_WARMUP=skip \
   NRL_FORCE_REBUILD_VENVS=false \
   NRL_IGNORE_VERSION_MISMATCH=1 \
@@ -527,13 +779,32 @@ export COMMAND="NRL_VLLM_USE_V1=1 \
   policy.generation.vllm_cfg.streaming_tool_call.enabled=${VLLM_STREAMING_TOOL_CALL_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.tokenizer_only=${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.exact_incremental_tokenizer=${EXACT_INCREMENTAL_TOKENIZER_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.final_only_incremental_tokenizer=${FINAL_ONLY_INCREMENTAL_TOKENIZER_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.final_only_prefill=${FINAL_ONLY_PREFILL_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.final_only_prefill_completion_grace_seconds=${FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS} \
+  policy.generation.vllm_cfg.streaming_tool_call.prefix_seeded_start=${PREFIX_SEEDED_START_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.prefill_after_admission=${PREFILL_AFTER_ADMISSION_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.background_prefill_completion=${BACKGROUND_PREFILL_COMPLETION_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.stable_first_snapshot_prefill=${STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.compact_request_context=${COMPACT_REQUEST_CONTEXT_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.incremental_tokenizer_checkpoint_interval=${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL} \
+  policy.generation.vllm_cfg.streaming_tool_call.counterfactual_full_tokenizer_timing=${COUNTERFACTUAL_FULL_TOKENIZER_TIMING_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
+  policy.generation.vllm_cfg.streaming_tool_call.snapshot_long_poll_timeout_seconds=${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS} \
   env.nemo_gym.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
   env.nemo_gym.streaming_tool_call.tokenizer_only=${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED} \
   env.nemo_gym.streaming_tool_call.exact_incremental_tokenizer=${EXACT_INCREMENTAL_TOKENIZER_ENABLED} \
+  env.nemo_gym.streaming_tool_call.final_only_incremental_tokenizer=${FINAL_ONLY_INCREMENTAL_TOKENIZER_ENABLED} \
+  env.nemo_gym.streaming_tool_call.final_only_prefill=${FINAL_ONLY_PREFILL_ENABLED} \
+  env.nemo_gym.streaming_tool_call.final_only_prefill_completion_grace_seconds=${FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS} \
+  env.nemo_gym.streaming_tool_call.prefix_seeded_start=${PREFIX_SEEDED_START_ENABLED} \
+  env.nemo_gym.streaming_tool_call.prefill_after_admission=${PREFILL_AFTER_ADMISSION_ENABLED} \
+  env.nemo_gym.streaming_tool_call.background_prefill_completion=${BACKGROUND_PREFILL_COMPLETION_ENABLED} \
+  env.nemo_gym.streaming_tool_call.stable_first_snapshot_prefill=${STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED} \
+  env.nemo_gym.streaming_tool_call.compact_request_context=${COMPACT_REQUEST_CONTEXT_ENABLED} \
   env.nemo_gym.streaming_tool_call.incremental_tokenizer_checkpoint_interval=${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL} \
   env.nemo_gym.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
+  env.nemo_gym.streaming_tool_call.snapshot_long_poll_timeout_seconds=${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS} \
   ++env.nemo_gym.detailed_runtime_metrics=${DETAILED_RUNTIME_METRICS_ENABLED} \
   loss_fn.reference_policy_kl_penalty=${KL} \
   loss_fn.ratio_clip_min=${CLIP_MIN} \
@@ -558,6 +829,12 @@ if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ]; then
   export COMMAND="${COMMAND} \
   policy.generation.vllm_cfg.streaming_tool_call.min_chunk_chars=${STREAMING_MIN_CHUNK_CHARS} \
   env.nemo_gym.streaming_tool_call.min_chunk_chars=${STREAMING_MIN_CHUNK_CHARS}"
+fi
+
+if [ -n "${STREAMING_INITIAL_CHUNK_CHARS}" ]; then
+  export COMMAND="${COMMAND} \
+  policy.generation.vllm_cfg.streaming_tool_call.initial_chunk_chars=${STREAMING_INITIAL_CHUNK_CHARS} \
+  env.nemo_gym.streaming_tool_call.initial_chunk_chars=${STREAMING_INITIAL_CHUNK_CHARS}"
 fi
 
 if [ "${ASYNC_GRPO_ENABLED}" = "True" ]; then
@@ -586,25 +863,105 @@ if [ "${SKIP_TRAINING}" = "1" ]; then
 fi
 
 # Rollout-only evaluation. Completed batches are appended to
-# trajectory_collection.jsonl under logger.log_dir.
+# trajectory_collection.jsonl under logger.log_dir. Collection consumes the
+# validation dataloader, whose SWE rows target swe_agents_val. Do not start the
+# unused train server: train and val otherwise race to install the same shared
+# Gym venv before either server can observe that it is ready.
 if [ "${TRAJECTORY_COLLECTION}" = "1" ]; then
   export COMMAND="${COMMAND} \
   env.nemo_gym.is_trajectory_collection=true \
-  env.nemo_gym.trajectory_collection_batch_size=${TRAJECTORY_COLLECTION_BATCH_SIZE}"
+  env.nemo_gym.trajectory_collection_batch_size=${TRAJECTORY_COLLECTION_BATCH_SIZE} \
+  env.nemo_gym.swe_agents_train=null"
+fi
+
+# The driver can build native wheels that setup did not need. Merge only
+# complete cache entries after it exits, and preserve the driver's exit code so
+# cache persistence never turns a failed workload into a successful job.
+export COMMAND="${COMMAND}
+_nrl_driver_exit=\$?
+(
+  if flock -w 600 9; then
+    if rsync -a --exclude '.tmp*' /tmp/uv_cache/ '${LUSTRE_UV_CACHE_SEED}/'; then
+      touch '${LUSTRE_UV_CACHE_SEED}/.driver-writeback-mcore-v1'
+      echo '[CACHE WRITEBACK] uv driver merge: complete'
+    else
+      echo '[CACHE WRITEBACK] WARNING: uv driver merge failed' >&2
+    fi
+  else
+    echo '[CACHE WRITEBACK] WARNING: timed out waiting for uv seed lock' >&2
+  fi
+) 9>'${LUSTRE_UV_CACHE_SEED}.lock'
+exit \${_nrl_driver_exit}"
+
+# Validate the fully assembled driver without printing it; the command contains
+# credentials and must never be echoed for diagnostics.
+if ! bash -n <(printf '%s\n' "${COMMAND}"); then
+  echo "ERROR: generated driver command is not valid Bash" >&2
+  exit 1
 fi
 
 # ================ Submit job (skipped under DRY_RUN=1) ================
 if [ "${DRY_RUN:-0}" = "1" ]; then
   echo ""
-  echo "[DRY_RUN] Not submitting. Would run:"
-  echo "[DRY_RUN]   sbatch --nodes=${TOTAL_NODES} --account=${SBATCH_ACCOUNT} --partition=${SBATCH_PARTITION} --time=${SBATCH_TIME} --dependency=${SBATCH_DEPENDENCY} --gres=gpu:${NUM_GPU} ... ray.sub"
+  if [ "${SUBMIT_MODE}" = "direct" ]; then
+    echo "[DRY_RUN] Not launching. Would run ray.sub directly inside an existing ${TOTAL_NODES}-node, ${NUM_GPU}-GPU/node Slurm allocation."
+  else
+    echo "[DRY_RUN] Not submitting. Would run:"
+    echo "[DRY_RUN]   sbatch --nodes=${TOTAL_NODES} --account=${SBATCH_ACCOUNT} --partition=${SBATCH_PARTITION} --time=${SBATCH_TIME} --dependency=${SBATCH_DEPENDENCY} --gpus-per-node=${NUM_GPU} ... ray.sub"
+  fi
   cd - > /dev/null
   exit 0
 fi
 
-# A caller may launch this helper from an existing srun allocation.  Do not
-# propagate its per-task resource bindings into the new independent batch job.
-unset SLURM_CPUS_PER_TASK SLURM_TRES_PER_TASK
+if [ "${SUBMIT_MODE}" = "direct" ]; then
+  if [ -z "${SLURM_JOB_ID:-}" ]; then
+    echo "ERROR: SUBMIT_MODE=direct requires an existing Slurm allocation." >&2
+    exit 1
+  fi
+  ALLOCATED_NODES="${SLURM_NNODES:-${SLURM_JOB_NUM_NODES:-}}"
+  if [ "${ALLOCATED_NODES}" != "${TOTAL_NODES}" ]; then
+    echo "ERROR: direct allocation has ${ALLOCATED_NODES:-unknown} nodes; launcher requires ${TOTAL_NODES}." >&2
+    exit 1
+  fi
+  if [ -n "${SLURM_GPUS_ON_NODE:-}" ] && [[ "${SLURM_GPUS_ON_NODE}" =~ ^[0-9]+$ ]] && [ "${SLURM_GPUS_ON_NODE}" -ne "${NUM_GPU}" ]; then
+    echo "ERROR: direct allocation has ${SLURM_GPUS_ON_NODE} GPUs/node; launcher requires ${NUM_GPU}." >&2
+    exit 1
+  fi
+  if [ -n "${SLURM_JOB_ACCOUNT:-}" ] && [ "${SLURM_JOB_ACCOUNT}" != "${SBATCH_ACCOUNT}" ]; then
+    echo "ERROR: direct allocation account is ${SLURM_JOB_ACCOUNT}; expected ${SBATCH_ACCOUNT}." >&2
+    exit 1
+  fi
+  if [ -n "${SLURM_JOB_PARTITION:-}" ] && [ "${SLURM_JOB_PARTITION}" != "${SBATCH_PARTITION}" ]; then
+    echo "ERROR: direct allocation partition is ${SLURM_JOB_PARTITION}; expected ${SBATCH_PARTITION}." >&2
+    exit 1
+  fi
+
+  # ray.sub normally runs as the batch step. Under an attached srun, its Ray
+  # head/worker steps must explicitly overlap the outer launcher step.
+  export RAY_SUB_OVERLAP_EXISTING_STEP=1
+  echo "Launching directly in Slurm job ${SLURM_JOB_ID}: account=${SLURM_JOB_ACCOUNT:-unknown} partition=${SLURM_JOB_PARTITION:-unknown} nodes=${ALLOCATED_NODES} gpus/node=${SLURM_GPUS_ON_NODE:-unknown}"
+  bash ray.sub
+  echo "Direct Slurm job ${SLURM_JOB_ID} completed: ${EXP_SUFFIX}"
+  cd - > /dev/null
+  exit 0
+fi
+
+# A caller may launch this helper from an existing srun allocation. Do not
+# propagate any of that allocation's SLURM job, step, task, CPU-binding, or GPU
+# variables into the new independent batch job. The scheduler will populate a
+# fresh SLURM_* environment for the submitted job. Keep the client-side cluster
+# configuration needed by sbatch itself.
+SUBMIT_SLURM_CONF="${SLURM_CONF:-}"
+SUBMIT_SLURM_CLUSTER_NAME="${SLURM_CLUSTER_NAME:-}"
+unset "${!SLURM_@}"
+if [ -n "${SUBMIT_SLURM_CONF}" ]; then
+  export SLURM_CONF="${SUBMIT_SLURM_CONF}"
+fi
+if [ -n "${SUBMIT_SLURM_CLUSTER_NAME}" ]; then
+  export SLURM_CLUSTER_NAME="${SUBMIT_SLURM_CLUSTER_NAME}"
+fi
+unset CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES
+unset GPU_DEVICE_ORDINAL
 
 sbatch \
   --nodes="${TOTAL_NODES}" \
@@ -612,7 +969,7 @@ sbatch \
   --job-name="${WANDB_NAME}" \
   --partition="${SBATCH_PARTITION}" \
   --time="${SBATCH_TIME}" \
-  --gres=gpu:${NUM_GPU} \
+  --gpus-per-node="${NUM_GPU}" \
   --output="${BASE_LOG_DIR}/slurm-%j.out" \
   --exclusive \
   --dependency="${SBATCH_DEPENDENCY}" \
