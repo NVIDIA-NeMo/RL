@@ -124,6 +124,7 @@ submit_arm() {
     arm_persistent_cache="${PAIR_PERSISTENT_CACHE_ROOT}/${arm}"
     mkdir -p "${arm_persistent_cache}"
   fi
+  local arm_pip_cache="${PIP_CACHE_DIR:-${arm_persistent_cache:+${arm_persistent_cache}/pip}}"
   if [ "${streaming_enabled}" != "1" ] || [ "${tokenizer_only}" != "1" ]; then
     exact_incremental_tokenizer=0
     final_only_incremental_tokenizer=0
@@ -177,7 +178,7 @@ submit_arm() {
 
   REPO_ROOT="${REPO_ROOT}" \
   PERSISTENT_CACHE="${arm_persistent_cache}" \
-  PIP_CACHE_DIR="${arm_persistent_cache:+${arm_persistent_cache}/pip}" \
+  PIP_CACHE_DIR="${arm_pip_cache}" \
   NUM_VLLM_REPLICAS="${NUM_VLLM_REPLICAS}" \
   TRAJECTORY_COLLECTION=1 \
   TRAJECTORY_COLLECTION_BATCH_SIZE="${TRAJECTORY_COLLECTION_BATCH_SIZE}" \
