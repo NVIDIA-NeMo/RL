@@ -17,12 +17,14 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import requests
 import torch
 import zstandard
 
+from nemo_rl.models.generation.vllm.config import VllmRefitConfig
 from nemo_rl.utils import (
     weight_transfer_http,
     weight_transfer_stream,
@@ -45,8 +47,59 @@ from nemo_rl.utils.weight_transfer_zmq import (
 )
 
 
+def _refit_config(
+    *,
+    encoding: str = "overwrite",
+    bucket_bytes: int = 1024,
+    verify_samples: int = 0,
+    s3_bucket: str | None = None,
+    s3_region: str = "us-east-1",
+    s3_prefix: str = "nemo-rl-refit",
+    s3_export_bytes: int = 64 * 1024**2,
+    zmq_export_bytes: int = 256 * 1024**2,
+    s3_encode_workers: int = 8,
+    zmq_encode_workers: int = 8,
+    s3_transfer_workers: int = 32,
+    zmq_transfer_workers: int = 4,
+    zmq_retries: int = 3,
+) -> VllmRefitConfig:
+    return VllmRefitConfig(
+        delta_compression={
+            "encoding": encoding,
+            "sparse_bucket_size_bytes": bucket_bytes,
+            "export_chunk_bytes": {
+                "s3": s3_export_bytes,
+                "zmq": zmq_export_bytes,
+            },
+        },
+        storage={
+            "s3_bucket": s3_bucket,
+            "s3_region": s3_region,
+            "s3_prefix": s3_prefix,
+        },
+        baseline={"in_memory": True},
+        tuning={
+            "encode_workers": {
+                "s3": s3_encode_workers,
+                "zmq": zmq_encode_workers,
+            },
+            "transfer_workers": {
+                "s3": s3_transfer_workers,
+                "zmq": zmq_transfer_workers,
+            },
+            "zmq_retries": zmq_retries,
+        },
+        verify_samples_per_payload=verify_samples,
+    )
+
+
 class _SparsePipelineTracker:
     sparse_bucket_size_bytes = 1
+    refit_config = _refit_config(
+        bucket_bytes=1,
+        zmq_export_bytes=1,
+        zmq_encode_workers=1,
+    )
 
     @staticmethod
     def prepare_sparse_delta_payload(chunk):
@@ -68,6 +121,7 @@ class _SparsePipelineTracker:
 
 class _BaselineNamesTracker:
     sparse_bucket_size_bytes = 4
+    refit_config = _refit_config(bucket_bytes=4, zmq_export_bytes=4)
 
     def __init__(self) -> None:
         self.names = []
@@ -96,10 +150,10 @@ def _stream_sparse_test_payloads(tensors, send_payload):
         assert cleaned
 
 
-def _delta_tracker(encoding: str = "overwrite") -> DeltaCompressionTracker:
-    return DeltaCompressionTracker(
-        {"encoding": encoding, "sparse_bucket_size_bytes": 1024}
-    )
+def _delta_tracker(
+    encoding: str = "overwrite", **config: Any
+) -> DeltaCompressionTracker:
+    return DeltaCompressionTracker(_refit_config(encoding=encoding, **config))
 
 
 def _baseline_names(tensors, *, rank: int):
@@ -112,11 +166,6 @@ def _baseline_names(tensors, *, rank: int):
         transport="zmq",
     )
     return tracker.names
-
-
-@pytest.fixture(autouse=True)
-def _in_memory_baseline(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
 
 
 def test_delta_tracker_commits_only_successful_syncs() -> None:
@@ -132,9 +181,8 @@ def test_delta_tracker_commits_only_successful_syncs() -> None:
     assert not tracker.prepare_sparse_delta_payload([("weight", tensor)])[0][2]
 
 
-def test_delta_tracker_emits_bounded_verification_budget(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
-    tracker = _delta_tracker()
+def test_delta_tracker_emits_bounded_verification_budget() -> None:
+    tracker = _delta_tracker(verify_samples=2)
     tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
     tracker.snapshot_baseline([("weight", tensor)])
     tensor[[1, 3]] += 1
@@ -221,12 +269,29 @@ def test_sparse_index_encoding_preserves_uint64_locations() -> None:
     assert torch.equal(decoded, locations)
 
 
+def test_sparse_index_encoding_preserves_uint32_locations() -> None:
+    locations = torch.tensor([0, 2**16 + 1])
+    packed, _, metadata = encode_sparse_infos(
+        [
+            (
+                "weight",
+                torch.empty(2),
+                locations,
+                torch.ones(2, dtype=torch.int32),
+                "overwrite",
+            )
+        ],
+    )
+
+    assert metadata[0]["index_encoding"] == "deltas"
+    assert packed.numel() == 2 * 4
+    decoded = sparse_locations_for_item(metadata[0], packed, device="cpu")
+    assert torch.equal(decoded, locations)
+
+
 @pytest.mark.parametrize("encoding", ["xor", "overwrite"])
-def test_delta_tracker_encodes_fp8_weight_and_scale_bits(
-    monkeypatch, encoding: str
-) -> None:
-    monkeypatch.setenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "2")
-    tracker = _delta_tracker(encoding)
+def test_delta_tracker_encodes_fp8_weight_and_scale_bits(encoding: str) -> None:
+    tracker = _delta_tracker(encoding, verify_samples=2)
     weight = torch.tensor([0x38, 0x40, 0x48], dtype=torch.uint8).view(
         torch.float8_e4m3fn
     )
@@ -260,8 +325,8 @@ def test_delta_tracker_encodes_fp8_weight_and_scale_bits(
     )[0][2]
 
 
-def test_delta_tracker_rejects_arithmetic_encoding() -> None:
-    with pytest.raises(ValueError, match="Unsupported sparse-refit operation"):
+def test_refit_config_rejects_arithmetic_encoding() -> None:
+    with pytest.raises(ValueError, match="Input should be 'xor' or 'overwrite'"):
         _delta_tracker("add")
 
 
@@ -318,9 +383,7 @@ def test_refit_http_error_preserves_non_json_status_and_body(monkeypatch) -> Non
         )
 
 
-def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "1")
-    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
+def test_sparse_export_finishes_before_blocked_transfers() -> None:
     exported = threading.Event()
     release_transfers = threading.Event()
     result = []
@@ -349,9 +412,7 @@ def test_sparse_export_finishes_before_blocked_transfers(monkeypatch) -> None:
     assert result == [{"payloads": 4, "changed_elements": 4, "total_elements": 4}]
 
 
-def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "1")
-    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
+def test_sparse_export_finishes_before_transfer_error() -> None:
     exported = []
 
     def tensors():
@@ -368,10 +429,7 @@ def test_sparse_export_finishes_before_transfer_error(monkeypatch) -> None:
     assert exported == list(range(4))
 
 
-def test_sparse_transport_cleanup_runs_on_transfer_workers(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "1")
-    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
-
+def test_sparse_transport_cleanup_runs_on_transfer_workers() -> None:
     class Transport:
         name = "zmq"
         transfer_workers = 2
@@ -402,11 +460,12 @@ def test_sparse_transport_cleanup_runs_on_transfer_workers(monkeypatch) -> None:
     assert transport.send_threads == transport.cleanup_threads
 
 
-def test_sparse_stream_coalesces_export_chunks(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_ZMQ_ENCODE_WORKERS", "2")
-    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
-    tracker = _delta_tracker()
-    tracker.sparse_bucket_size_bytes = 8
+def test_sparse_stream_coalesces_export_chunks() -> None:
+    tracker = _delta_tracker(
+        bucket_bytes=8,
+        zmq_export_bytes=4,
+        zmq_encode_workers=2,
+    )
     tensors = [(f"weight-{index}", torch.zeros(1)) for index in range(4)]
     tracker.snapshot_baseline(tensors)
     for _, tensor in tensors:
@@ -454,28 +513,21 @@ def test_sparse_stream_coalesces_export_chunks(monkeypatch) -> None:
             ].tolist() == [1065353216]
 
 
-def test_sparse_export_chunk_defaults_are_transport_specific(monkeypatch) -> None:
-    monkeypatch.delenv("NRL_REFIT_S3_EXPORT_CHUNK_BYTES", raising=False)
-    monkeypatch.delenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", raising=False)
-    tracker = _delta_tracker()
-    tracker.sparse_bucket_size_bytes = 1024**3
+def test_sparse_export_chunk_defaults_are_transport_specific() -> None:
+    tracker = _delta_tracker(bucket_bytes=1024**3)
 
     assert sparse_export_chunk_size(tracker, "s3") == 64 * 1024**2
     assert sparse_export_chunk_size(tracker, "zmq") == 256 * 1024**2
 
 
-def test_sparse_baseline_snapshots_only_owned_export_chunks(
-    monkeypatch, capsys
-) -> None:
-    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "4")
+def test_sparse_baseline_snapshots_only_owned_export_chunks(capsys) -> None:
     tensors = [(f"weight-{index}", torch.tensor([float(index)])) for index in range(4)]
 
     assert _baseline_names(tensors, rank=1) == ["weight-1", "weight-3"]
     assert "chunks=4" in capsys.readouterr().out
 
 
-def test_sparse_stream_sends_only_owned_export_chunks(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES", "1")
+def test_sparse_stream_sends_only_owned_export_chunks() -> None:
     sent = []
     transport = SparseRefitTransport(
         "zmq",
@@ -499,23 +551,23 @@ def test_sparse_stream_sends_only_owned_export_chunks(monkeypatch) -> None:
 
 
 def test_s3_manifest_transport_validates_configuration(monkeypatch) -> None:
+    tracker = SimpleNamespace(refit_config=_refit_config(s3_bucket="bucket"))
     kwargs = {
         "iterator": (),
-        "delta_tracker": SimpleNamespace(),
+        "delta_tracker": tracker,
         "transfer_id": "transfer",
         "api_key_env_var": None,
         "timeout_s": 1.0,
         "shard_rank": 0,
         "shard_count": 1,
     }
-    monkeypatch.setenv("NRL_REFIT_S3_BUCKET", "bucket")
     with pytest.raises(ValueError, match="URL is required"):
         weight_transfer_stream.stream_sparse_delta_payloads_via_s3_manifest(
             refit_targets=[], **kwargs
         )
 
-    monkeypatch.delenv("NRL_REFIT_S3_BUCKET")
-    with pytest.raises(RuntimeError, match="NRL_REFIT_S3_BUCKET"):
+    tracker.refit_config = _refit_config()
+    with pytest.raises(RuntimeError, match="refit_cfg.storage.s3_bucket"):
         weight_transfer_stream.stream_sparse_delta_payloads_via_s3_manifest(
             refit_targets=["http://receiver"], **kwargs
         )
@@ -536,10 +588,6 @@ def test_s3_manifest_transport_uploads_notifies_and_deletes(monkeypatch) -> None
             operations.append(("delete", key))
 
     store = Store()
-    monkeypatch.setenv("NRL_REFIT_S3_BUCKET", store.bucket)
-    monkeypatch.setenv("NRL_REFIT_S3_REGION", store.region)
-    monkeypatch.setenv("NRL_REFIT_S3_PREFIX", "/prefix/")
-    monkeypatch.setenv("NRL_REFIT_S3_UPLOAD_WORKERS", "3")
     monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
     monkeypatch.setattr(
         weight_transfer_stream,
@@ -569,7 +617,14 @@ def test_s3_manifest_transport_uploads_notifies_and_deletes(monkeypatch) -> None
 
     result = weight_transfer_stream.stream_sparse_delta_payloads_via_s3_manifest(
         [("weight", torch.tensor([1.0]))],
-        delta_tracker=SimpleNamespace(),
+        delta_tracker=SimpleNamespace(
+            refit_config=_refit_config(
+                s3_bucket=store.bucket,
+                s3_region=store.region,
+                s3_prefix="/prefix/",
+                s3_transfer_workers=3,
+            )
+        ),
         refit_targets=[" http://receiver-a/ ", "http://receiver-b"],
         transfer_id="transfer",
         api_key_env_var="NRL_TEST_REFIT_KEY",
@@ -604,7 +659,6 @@ def test_zmq_stream_routes_shards_and_closes_clients(monkeypatch) -> None:
     sent = []
     closed = []
     monkeypatch.setenv("NRL_TEST_REFIT_KEY", "secret")
-    monkeypatch.setenv("NRL_REFIT_ZMQ_SEND_WORKERS", "2")
 
     class Client:
         def __init__(self, address, **kwargs) -> None:
@@ -646,7 +700,9 @@ def test_zmq_stream_routes_shards_and_closes_clients(monkeypatch) -> None:
 
     kwargs = {
         "iterator": (),
-        "delta_tracker": SimpleNamespace(),
+        "delta_tracker": SimpleNamespace(
+            refit_config=_refit_config(zmq_transfer_workers=2)
+        ),
         "refit_targets": ["tcp://receiver-a", " tcp://receiver-b "],
         "transfer_id": "transfer",
         "api_key_env_var": "NRL_TEST_REFIT_KEY",
@@ -666,7 +722,12 @@ def test_zmq_stream_routes_shards_and_closes_clients(monkeypatch) -> None:
     assert created == 2 * [
         (
             "tcp://receiver-b",
-            {"timeout_s": 7.0, "producer_id": 3, "api_key": "secret"},
+            {
+                "timeout_s": 7.0,
+                "producer_id": 3,
+                "retries": 3,
+                "api_key": "secret",
+            },
         )
     ]
     assert closed == [True, True]
@@ -701,6 +762,7 @@ def test_zmq_client_filters_replies_rejects_nack_and_retries(monkeypatch) -> Non
         result._address = "tcp://receiver"
         result._timeout_ms = 1000
         result._producer_id = 4
+        result._retries = 1
         result._api_key = "secret"
         result._socket = socket
         return result
@@ -728,7 +790,6 @@ def test_zmq_client_filters_replies_rejects_nack_and_retries(monkeypatch) -> Non
     with pytest.raises(RuntimeError, match="denied"):
         _send_zmq_payload(client(denied), 7, b"body")
 
-    monkeypatch.setenv("NRL_REFIT_ZMQ_RETRIES", "1")
     with pytest.raises(TimeoutError, match="payload 7"):
         _send_zmq_payload(client(Socket(send_failures=2)), 7, b"body")
 
@@ -800,6 +861,7 @@ def test_zmq_sparse_refit_relay_fans_out_and_rejects_corruption(monkeypatch) -> 
             bind_address="tcp://127.0.0.1:*",
             api_key_env_var="NRL_TEST_REFIT_KEY",
             timeout_s=5.0,
+            tuning=_refit_config().tuning,
         )
         for items in received
     ]
@@ -810,11 +872,13 @@ def test_zmq_sparse_refit_relay_fans_out_and_rejects_corruption(monkeypatch) -> 
         addresses[0],
         timeout_s=5.0,
         producer_id=2,
+        retries=3,
     )
     client = ZmqSparseRefitClient(
         addresses[0],
         timeout_s=5.0,
         producer_id=3,
+        retries=3,
         api_key="secret",
     )
     body = b"compressed sparse payload"

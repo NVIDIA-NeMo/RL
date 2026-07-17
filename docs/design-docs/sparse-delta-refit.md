@@ -18,7 +18,7 @@ Remote sparse refit requires:
 - the same initial HF checkpoint on both clusters;
 - BF16 or FP16 unquantized rollout weights;
 - `kv_cache_dtype: auto`; and
-- a `delta_compression` configuration.
+- `refit_transport: vllm_s3_sparse` or `vllm_zmq_sparse`.
 
 Validation rejects `quant_cfg`, `real_quant`, colocated or non-Megatron
 deployments, FP8 rollout weights, and FP8 KV-cache scales. The codec and
@@ -28,34 +28,55 @@ Synchronous and asynchronous vLLM engines are supported, but the weight-version
 transition remains synchronous: generation pauses until every payload is
 applied and the global flush completes.
 
+The coordinator is currently integrated only with GRPO. PPO and distillation
+reject `refit_transport` during setup; extending them is tracked in
+[#3275](https://github.com/NVIDIA-NeMo/RL/issues/3275).
+
 ## Architecture
 
 ```mermaid
 flowchart LR
+  SYNC["GRPO weight synchronizer"]
+
   subgraph P["Megatron policy cluster"]
-    B["Full canonical Bridge export"]
-    C["Chunk-sharded canonical HF baseline"]
-    E["Compare, encode, and compress"]
-    B --> C
-    C --> E
+    MB["All policy ranks<br/>Megatron Bridge HF export"]
+    OWN["Deterministic chunk owner<br/>chunk_index modulo producers"]
+    BASE["Distributed canonical<br/>CPU or mmap baseline"]
+    PIPE["Shared bounded pipeline<br/>compare, encode, zstd"]
+    MB -->|canonical HF chunks| OWN
+    OWN -->|owned chunks| BASE
+    BASE -->|changed locations and bits| PIPE
   end
 
-  S["S3 object and HTTP manifest"]
-  Z["ZeroMQ relay"]
+  subgraph T["Value plane"]
+    S3["S3 objects<br/>one upload per owned payload"]
+    Z0["ZeroMQ root relay<br/>one cross-cluster send"]
+    ZT["Binary relay tree"]
+    Z0 --> ZT
+  end
 
   subgraph G["vLLM generation cluster"]
-    H["HTTP receiver"]
-    Q["Compact node staging and bounded FIFO apply queue"]
-    A["Reusable dense scratch and native load_weights()"]
-    H --> Q --> A
+    HTTP["HTTP control plane<br/>prepare and global flush"]
+    RX["One receiver per inference node"]
+    STAGE["Compact payload staging<br/>and bounded FIFO queue"]
+    RPC["Node-local collective RPC"]
+    APPLY["Each vLLM rank<br/>reusable scratch + native load_weights()"]
+    HTTP -.-> RX
+    RX --> STAGE --> RPC --> APPLY
   end
 
-  E -->|S3| S --> H
-  E -->|ZeroMQ| Z --> H
+  SYNC -. "prepare, flush, commit" .-> HTTP
+  SYNC -. "start stream" .-> PIPE
+  PIPE -->|compressed body| S3
+  S3 -->|HTTP manifest, then GET| RX
+  PIPE -->|multipart DATA frame| Z0
+  ZT -->|compressed body| RX
+  APPLY -. "success metrics" .-> SYNC
+  SYNC -. "commit exact source bits" .-> BASE
 ```
 
-*Figure 1. S3 and ZeroMQ share the exporter, codec, receiver, native-loader
-apply engine, and commit protocol.*
+*Figure 1. Control traffic is dashed. Payload data is solid. S3 and ZeroMQ
+share every component except the value plane.*
 
 | Responsibility | Implementation |
 |---|---|
@@ -99,7 +120,7 @@ Mamba, padded or tied weights, grouped exports, adapters, and custom Bridge
 postprocessing all follow Bridge's canonical export semantics.
 
 Baselines use file-backed `torch.from_file` tensors by default;
-`NRL_REFIT_BASELINE_IN_MEMORY=1` keeps them in RAM. File backing reduces
+`refit_cfg.baseline.in_memory: true` keeps them in RAM. File backing reduces
 anonymous resident-memory pressure but does not reduce logical baseline bytes.
 
 Baseline initialization also returns each canonical tensor's name, shape, and
@@ -236,6 +257,9 @@ commit exact pending baseline bits in background CPU threads.
 > receiver accepts any payload, reload that receiver from a known-good weight
 > version before retrying. This is mandatory for XOR, because replaying an
 > already-applied XOR reverts those bits. Replaying overwrite is safe.
+> The synchronizer records this state as poisoned and rejects subsequent syncs
+> with recovery instructions. In-place recovery is tracked in
+> [#3274](https://github.com/NVIDIA-NeMo/RL/issues/3274).
 
 ## Payload and native apply
 
@@ -244,6 +268,32 @@ Each serialized payload is:
 ```text
 (packed_location_bytes, packed_value_groups, tensor_metadata)
 ```
+
+```mermaid
+flowchart TB
+  subgraph S3F["S3 transport"]
+    SO["Object body<br/>zstd-compressed torch payload"]
+    SM["HTTP manifest<br/>bucket, region, key, checksum,<br/>verification_candidates"]
+  end
+
+  subgraph ZF["ZeroMQ DATA multipart"]
+    ZK["Frame 1: DATA"]
+    ZM["Frame 2: JSON metadata<br/>transfer, producer, payload IDs,<br/>checksum, samples, optional API key"]
+    ZB["Frame 3: zstd-compressed torch payload"]
+  end
+
+  SO --> DECOMP["Checksum then zstd decode"]
+  SM -. "locates and authenticates object" .-> SO
+  ZK --> ZM --> ZB --> DECOMP
+  DECOMP --> PT["torch payload tuple"]
+  PT --> PI["packed location bytes<br/>range or uint16/32/64 deltas"]
+  PT --> PV["value groups by dtype<br/>XOR or overwrite bits"]
+  PT --> PM["per-tensor metadata<br/>HF name, shape, offsets, operation"]
+```
+
+*Figure 2. S3 separates the object body from its control-plane manifest;
+ZeroMQ carries equivalent identity and body data as multipart frames. Both
+decode into the same codec tuple.*
 
 Contiguous locations use a range encoding. Other sorted locations are
 delta-encoded into the smallest lossless unsigned width among 16, 32, and 64
@@ -285,9 +335,15 @@ policy:
   generation:
     backend: vllm
     refit_transport: vllm_s3_sparse  # or vllm_zmq_sparse
-    delta_compression:
-      encoding: xor  # overwrite is selected automatically for opaque loaders
-      sparse_bucket_size_bytes: 536870912
+    refit_cfg:
+      delta_compression:
+        encoding: xor  # overwrite is selected automatically for opaque loaders
+      storage:
+        s3_bucket: my-refit-bucket  # required only for vllm_s3_sparse
+        s3_region: us-east-1
+      baseline:
+        in_memory: false
+      verify_samples_per_payload: 0
     colocated:
       enabled: false
     vllm_cfg:
@@ -299,31 +355,43 @@ policy:
       zmq_refit_server_port: null
 ```
 
-S3 requires `NRL_REFIT_S3_BUCKET`; region and key prefix default to `us-east-1`
-and `nemo-rl-refit`. ZeroMQ requires routable TCP access to the relay port. The
-HTTP and ZeroMQ servers are plaintext, so use a trusted or encrypted network.
-When `http_refit_api_key_env_var` is set, the named variable must contain the
-same nonempty token on producers and receivers.
+`refit_cfg` is optional; its Pydantic models resolve and log all defaults. S3
+fails during setup unless `refit_cfg.storage.s3_bucket` is nonempty. Its region
+and key prefix default to `us-east-1` and `nemo-rl-refit`. ZeroMQ requires
+routable TCP access to the relay port. The HTTP and ZeroMQ servers are
+plaintext, so use a trusted or encrypted network. When
+`http_refit_api_key_env_var` is set, the named variable must contain the same
+nonempty token on producers and receivers. Binding either server to all
+interfaces without a key emits a warning.
 
 | Control | Default |
 |---|---:|
-| `delta_compression.sparse_bucket_size_bytes` | 512 MiB |
-| `NRL_REFIT_S3_EXPORT_CHUNK_BYTES` | 64 MiB |
-| `NRL_REFIT_ZMQ_EXPORT_CHUNK_BYTES` | 256 MiB |
-| `NRL_REFIT_{S3,ZMQ}_ENCODE_WORKERS` | 2-8 from CPU count |
-| `NRL_REFIT_S3_UPLOAD_WORKERS` | 4-32 from CPU count |
-| `NRL_REFIT_ZMQ_SEND_WORKERS` | 4 |
-| `NRL_REFIT_ZMQ_RELAY_PAYLOAD_WORKERS` | 16 |
-| `NRL_REFIT_ZMQ_RELAY_FORWARD_WORKERS` | 8 |
-| `NRL_REFIT_APPLY_QUEUE_DEPTH` / `NRL_REFIT_APPLY_BATCH_SIZE` | 32 / 8 |
-| `NRL_REFIT_PARTITION_WORKERS` | 2-8 from CPU count |
-| `NRL_REFIT_{S3,ZMQ}_ZSTD_THREADS` | 0 |
-| `NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD` | 0 |
+| `refit_cfg.delta_compression.encoding` | `xor` |
+| `refit_cfg.storage.s3_bucket` | none; required for S3 |
+| `refit_cfg.storage.s3_region` | `us-east-1` |
+| `refit_cfg.baseline.in_memory` | `false` |
+| `refit_cfg.verify_samples_per_payload` | `0` |
 
 Export chunks are capped by `sparse_bucket_size_bytes` and the packed tensor
 limit. The S3 defaults were selected by balanced 120B sweeps. Increase one
 concurrency control at a time; excess parallelism moves the bottleneck into
 host memory, Bridge export, relay-tree forwarding, or receiver apply.
+
+Run the checked-in ZeroMQ recipe with:
+
+```bash
+uv run python examples/run_grpo.py \
+  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.yaml
+```
+
+For a diagnostic run, enable bounded transmitted-delta sampling through the
+logged config:
+
+```bash
+uv run python examples/run_grpo.py \
+  --config examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n8g-megatron-zmq-deltaweight-noncolocated.yaml \
+  policy.generation.refit_cfg.verify_samples_per_payload=32
+```
 
 ## Metrics and profiling
 

@@ -491,7 +491,7 @@ def test_sparse_refit_api_auth_dispatch_and_error_mapping(monkeypatch) -> None:
 
 
 def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
-    monkeypatch,
+    monkeypatch, caplog
 ) -> None:
     import uvicorn
 
@@ -519,6 +519,7 @@ def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
     monkeypatch.setattr(uvicorn, "Server", Server)
     monkeypatch.setattr(refit_module, "_get_free_port_local", lambda *_args: 12345)
     monkeypatch.setattr(refit_module, "_get_node_ip_local", lambda: "10.0.0.1")
+    refit_module._warn_unauthenticated_refit_server.cache_clear()
     config = {
         "vllm_cfg": {"async_engine": False, "http_refit_server_port": None},
         "port_range_low": 10000,
@@ -534,6 +535,7 @@ def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
         assert configs[0].port == 12345
         assert servers[0].ran.wait(timeout=1.0)
         assert receiver.report_refit_server_base_url() == "http://10.0.0.1:12345"
+        assert "binding 0.0.0.0 without an API key" in caplog.text
 
         relay = MagicMock()
         receiver._zmq_refit_server = (relay, "tcp://relay")
@@ -593,6 +595,7 @@ def test_async_sparse_refit_exposes_zmq_relay(monkeypatch) -> None:
             bind_address="tcp://0.0.0.0:12345",
             api_key_env_var=None,
             timeout_s=600.0,
+            tuning=receiver._refit_config.tuning,
         )
         server.start.assert_called_once_with()
         receiver.configure_zmq_sparse_refit_relay(

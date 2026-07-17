@@ -16,7 +16,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.generation.vllm.config import VllmDeltaCompressionConfig
+from nemo_rl.models.generation.vllm.config import VllmRefitConfig
 from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
     VllmRemoteSparseWeightSynchronizer,
     validate_vllm_remote_sparse_refit,
@@ -70,7 +70,10 @@ def _remote_sparse_sync(
 def _valid_config() -> dict:
     return {
         "refit_transport": "vllm_s3_sparse",
-        "delta_compression": {"encoding": "overwrite"},
+        "refit_cfg": {
+            "delta_compression": {"encoding": "overwrite"},
+            "storage": {"s3_bucket": "bucket"},
+        },
         "vllm_cfg": {"precision": "bfloat16", "kv_cache_dtype": "auto"},
     }
 
@@ -83,8 +86,9 @@ def test_validate_remote_sparse_refit_accepts_supported_scope():
         )
         == "s3"
     )
-    assert config["delta_compression"] == VllmDeltaCompressionConfig(
-        encoding="overwrite"
+    assert config["refit_cfg"] == VllmRefitConfig(
+        delta_compression={"encoding": "overwrite"},
+        storage={"s3_bucket": "bucket"},
     )
 
 
@@ -94,7 +98,7 @@ def test_validate_remote_sparse_refit_accepts_supported_scope():
         ({"refit_transport": "unknown"}, {}),
         ({}, {"colocated": True}),
         ({}, {"megatron_enabled": False}),
-        ({"delta_compression": None}, {}),
+        ({"refit_cfg": {"storage": {"s3_bucket": None}}}, {}),
         ({"quant_cfg": "fp8"}, {}),
         ({"vllm_cfg": {"precision": "fp8", "kv_cache_dtype": "auto"}}, {}),
         (
@@ -322,6 +326,9 @@ class TestVllmRemoteSparseWeightSynchronizer:
         )
 
         with pytest.raises(RuntimeError, match="stream failed"):
+            sync.sync_weights()
+
+        with pytest.raises(RuntimeError, match="poisoned by a prior failed sync"):
             sync.sync_weights()
 
         post.assert_called_once_with(

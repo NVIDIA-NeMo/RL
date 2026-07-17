@@ -14,6 +14,7 @@
 
 """Transactional ZeroMQ value plane for remote sparse vLLM refit."""
 
+import hmac
 import json
 import threading
 import time
@@ -26,6 +27,7 @@ from typing import Any
 
 import zmq
 
+from nemo_rl.models.generation.vllm.config import VllmRefitTuningConfig
 from nemo_rl.utils.weight_transfer_http import (
     merge_vllm_refit_metrics,
     vllm_refit_api_key,
@@ -36,7 +38,6 @@ from nemo_rl.utils.weight_transfer_sparse_codec import (
 )
 from nemo_rl.utils.weight_transfer_stream import (
     SparseRefitTransport,
-    refit_env_int,
     sparse_payload_checksum,
     stream_sparse_delta_payloads,
 )
@@ -73,11 +74,13 @@ class ZmqSparseRefitClient:
         *,
         timeout_s: float,
         producer_id: int,
+        retries: int,
         api_key: str | None = None,
     ) -> None:
         self._address = address
         self._timeout_ms = max(1, int(timeout_s * 1000))
         self._producer_id = producer_id
+        self._retries = retries
         self._api_key = api_key
         self._socket = zmq.Context.instance().socket(zmq.DEALER)
         _configure_socket(self._socket, 2)
@@ -113,16 +116,14 @@ class ZmqSparseRefitClient:
         if self._api_key is not None:
             metadata["api_key"] = self._api_key
         metadata_frame = _json_bytes(metadata)
-        retries = refit_env_int("NRL_REFIT_ZMQ_RETRIES", default=3, min_value=0)
-
-        for attempt in range(retries + 1):
+        for attempt in range(self._retries + 1):
             try:
                 self._socket.send_multipart(
                     [_DATA, metadata_frame, body],
                     copy=False,
                 )
             except zmq.Again:
-                if attempt == retries:
+                if attempt == self._retries:
                     break
                 continue
 
@@ -151,7 +152,7 @@ class ZmqSparseRefitClient:
                     return reply
                 raise RuntimeError(f"ZeroMQ sparse refit rejected payload: {reply}")
 
-            if attempt < retries:
+            if attempt < self._retries:
                 time.sleep(min(0.05 * 2**attempt, 0.5))
 
         raise TimeoutError(
@@ -172,19 +173,19 @@ class ZmqSparseRefitServer:
         bind_address: str,
         api_key_env_var: str | None,
         timeout_s: float,
+        tuning: VllmRefitTuningConfig,
     ) -> None:
         self._apply_payload = apply_payload
         self._bind_address = bind_address
         self._token = vllm_refit_api_key(api_key_env_var)
         self._timeout_s = timeout_s
+        self._retries = tuning.zmq_retries
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
         self._endpoint: str | None = None
         self._error: Exception | None = None
-        self._payload_workers = refit_env_int(
-            "NRL_REFIT_ZMQ_RELAY_PAYLOAD_WORKERS", default=16
-        )
+        self._payload_workers = tuning.zmq_relay_payload_workers
         self._transfer_lock = threading.Lock()
         self._transfer_condition = threading.Condition(self._transfer_lock)
         self._transfers: dict[str, _RelayTransfer] = {}
@@ -197,7 +198,7 @@ class ZmqSparseRefitServer:
             thread_name_prefix="nrl-zmq-payload",
         )
         self._forward_executor = ThreadPoolExecutor(
-            max_workers=refit_env_int("NRL_REFIT_ZMQ_RELAY_FORWARD_WORKERS", default=8),
+            max_workers=tuning.zmq_relay_forward_workers,
             thread_name_prefix="nrl-zmq-forward",
         )
 
@@ -318,6 +319,7 @@ class ZmqSparseRefitServer:
                 address,
                 timeout_s=self._timeout_s,
                 producer_id=0,
+                retries=self._retries,
                 api_key=self._token,
             )
             clients[address] = client
@@ -359,7 +361,11 @@ class ZmqSparseRefitServer:
         metadata = json.loads(raw_metadata)
         if metadata.get("protocol") != _PROTOCOL:
             raise ValueError("Unsupported ZeroMQ sparse refit protocol.")
-        if self._token is not None and metadata.get("api_key") != self._token:
+        supplied_token = metadata.get("api_key")
+        if self._token is not None and (
+            not isinstance(supplied_token, str)
+            or not hmac.compare_digest(self._token, supplied_token)
+        ):
             raise PermissionError("ZeroMQ sparse refit producer authentication failed.")
         transfer_id = str(metadata["transfer_id"])
         producer_id = int(metadata["producer_id"])
@@ -494,6 +500,7 @@ def stream_sparse_delta_payloads_via_zmq(
     if not addresses:
         raise ValueError("At least one ZeroMQ sparse refit address is required.")
     address = addresses[shard_rank % len(addresses)]
+    tuning = delta_tracker.refit_config.tuning
     api_key = vllm_refit_api_key(api_key_env_var)
     local = threading.local()
 
@@ -506,6 +513,7 @@ def stream_sparse_delta_payloads_via_zmq(
                 address,
                 timeout_s=timeout_s,
                 producer_id=shard_rank,
+                retries=tuning.zmq_retries,
                 api_key=api_key,
             )
             local.client = client
@@ -533,7 +541,7 @@ def stream_sparse_delta_payloads_via_zmq(
         delta_tracker=delta_tracker,
         transport=SparseRefitTransport(
             name="zmq",
-            transfer_workers=refit_env_int("NRL_REFIT_ZMQ_SEND_WORKERS", default=4),
+            transfer_workers=tuning.transfer_workers["zmq"],
             send=send,
             cleanup=cleanup,
         ),

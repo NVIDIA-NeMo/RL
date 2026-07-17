@@ -16,7 +16,6 @@
 
 import hashlib
 import io
-import os
 import threading
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -30,6 +29,7 @@ from urllib.parse import quote
 import torch
 import zstandard
 
+from nemo_rl.models.generation.vllm.config import VllmRefitTransportName
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
 from nemo_rl.utils.weight_transfer_http import (
     G_VLLM_REFIT_S3_MANIFEST_PATH,
@@ -47,6 +47,8 @@ from nemo_rl.utils.weight_transfer_sparse_codec import (
 )
 
 _STREAM_LOCAL = threading.local()
+# A 64 MiB CRT part and 2 GiB client cap allow 32 in-flight parts, matching the
+# upload concurrency selected by the balanced 120B S3 sweeps while bounding RAM.
 _S3_PART_SIZE = 64 * 1024**2
 _S3_MEMORY_LIMIT = 2 * 1024**3
 
@@ -55,7 +57,7 @@ _S3_MEMORY_LIMIT = 2 * 1024**3
 class SparseRefitTransport:
     """Transport-specific callbacks used by the shared streaming pipeline."""
 
-    name: str
+    name: VllmRefitTransportName
     transfer_workers: int
     send: Callable[[bytes, int, int], dict[str, Any]]
     cleanup: Callable[[], None]
@@ -165,13 +167,6 @@ class _S3ObjectStore:
         )
 
 
-def refit_env_int(name: str, *, default: int, min_value: int = 1) -> int:
-    value = int(os.getenv(name) or default)
-    if value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}.")
-    return value
-
-
 def sparse_payload_checksum(body: bytes | bytearray) -> str:
     return hashlib.blake2b(body, digest_size=16).hexdigest()
 
@@ -221,14 +216,11 @@ def _get_manifest_s3_store(bucket: str, region: str) -> _S3ObjectStore:
 
 def sparse_export_chunk_size(
     delta_tracker: DeltaCompressionTracker,
-    transport: str,
+    transport: VllmRefitTransportName,
 ) -> int:
-    default_mib = 64 if transport == "s3" else 256
-    requested = refit_env_int(
-        f"NRL_REFIT_{transport.upper()}_EXPORT_CHUNK_BYTES",
-        default=default_mib * 1024**2,
-        min_value=1,
-    )
+    requested = delta_tracker.refit_config.delta_compression.export_chunk_bytes[
+        transport
+    ]
     if torch.cuda.is_available():
         requested = min(requested, get_target_packed_tensor_size())
     return min(requested, delta_tracker.sparse_bucket_size_bytes)
@@ -245,7 +237,7 @@ def init_sparse_delta_baseline_from_iterator(
     delta_tracker: DeltaCompressionTracker,
     shard_rank: int,
     shard_count: int,
-    transport: str,
+    transport: VllmRefitTransportName,
 ) -> None:
     start_s = time.perf_counter()
     export_chunk_size = sparse_export_chunk_size(delta_tracker, transport)
@@ -280,10 +272,8 @@ def stream_sparse_delta_payloads(
     shard_count: int,
 ) -> dict[str, int]:
     prefix = transport.name.upper()
-    encode_workers = refit_env_int(
-        f"NRL_REFIT_{prefix}_ENCODE_WORKERS",
-        default=max(2, min(8, os.cpu_count() or 8)),
-    )
+    refit_config = delta_tracker.refit_config
+    encode_workers = refit_config.tuning.encode_workers[transport.name]
     encode_executor = _executor(f"refit-{transport.name}-encode", encode_workers)
     serialize_workers = min(4, encode_workers)
     serialize_executor = _executor(
@@ -322,7 +312,10 @@ def stream_sparse_delta_payloads(
         raw_body = buffer.getvalue()
         serialize_s = time.perf_counter() - started
         started = time.perf_counter()
-        body = zstd_compress(raw_body, f"NRL_REFIT_{prefix}_ZSTD_THREADS")
+        body = zstd_compress(
+            raw_body,
+            refit_config.delta_compression.zstd_threads[transport.name],
+        )
         compress_s = time.perf_counter() - started
         return (
             body,
@@ -524,14 +517,17 @@ def stream_sparse_delta_payloads_via_s3_manifest(
     endpoint_urls = vllm_refit_endpoints(refit_targets, G_VLLM_REFIT_S3_MANIFEST_PATH)
     if not endpoint_urls:
         raise ValueError("At least one vLLM S3 refit URL is required.")
-    bucket = os.getenv("NRL_REFIT_S3_BUCKET", "").strip()
+    refit_config = delta_tracker.refit_config
+    bucket = (refit_config.storage.s3_bucket or "").strip()
     if not bucket:
-        raise RuntimeError("NRL_REFIT_S3_BUCKET must be set for S3 refit.")
-    store = _get_manifest_s3_store(
-        bucket,
-        os.getenv("NRL_REFIT_S3_REGION", "us-east-1").strip() or "us-east-1",
-    )
-    object_prefix = os.getenv("NRL_REFIT_S3_PREFIX", "nemo-rl-refit").strip("/")
+        raise RuntimeError(
+            "policy.generation.refit_cfg.storage.s3_bucket must be set for S3 refit."
+        )
+    region = refit_config.storage.s3_region.strip()
+    if not region:
+        raise ValueError("refit_cfg.storage.s3_region must not be empty.")
+    store = _get_manifest_s3_store(bucket, region)
+    object_prefix = refit_config.storage.s3_prefix.strip("/")
     run_prefix = (
         f"{object_prefix}/{transfer_id}/{shard_rank:06d}"
         if object_prefix
@@ -590,10 +586,7 @@ def stream_sparse_delta_payloads_via_s3_manifest(
         delta_tracker=delta_tracker,
         transport=SparseRefitTransport(
             name="s3",
-            transfer_workers=refit_env_int(
-                "NRL_REFIT_S3_UPLOAD_WORKERS",
-                default=max(4, min(32, os.cpu_count() or 32)),
-            ),
+            transfer_workers=refit_config.tuning.transfer_workers["s3"],
             send=send,
             cleanup=cleanup,
         ),
@@ -611,12 +604,12 @@ def download_s3_refit_payload(
     return decode_sparse_payload(body, str(manifest["checksum"]))
 
 
-def zstd_compress(raw: bytes, threads_env: str) -> bytes:
+def zstd_compress(raw: bytes, threads: int) -> bytes:
     compressor = getattr(_STREAM_LOCAL, "zstd_compressor", None)
     if compressor is None:
         compressor = zstandard.ZstdCompressor(
             level=1,
-            threads=refit_env_int(threads_env, default=0, min_value=0),
+            threads=threads,
         )
         _STREAM_LOCAL.zstd_compressor = compressor
     return compressor.compress(raw)

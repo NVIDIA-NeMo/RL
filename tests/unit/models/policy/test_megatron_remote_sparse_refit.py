@@ -16,13 +16,17 @@ from types import SimpleNamespace
 
 import torch
 
-from nemo_rl.models.generation.vllm.config import VllmDeltaCompressionConfig
+from nemo_rl.models.generation.vllm.config import VllmRefitConfig
 from nemo_rl.models.policy.workers.megatron_remote_sparse_refit import (
     MegatronRemoteSparseRefit,
 )
 
-_DELTA_CONFIG = VllmDeltaCompressionConfig(
-    encoding="overwrite", sparse_bucket_size_bytes=1024
+_REFIT_CONFIG = VllmRefitConfig(
+    delta_compression={
+        "encoding": "overwrite",
+        "sparse_bucket_size_bytes": 1024,
+    },
+    baseline={"in_memory": True},
 )
 
 
@@ -33,13 +37,12 @@ def _worker(weights=()):
     return SimpleNamespace(_iter_params_with_optional_kv_scales=export)
 
 
-def test_remote_sparse_initializes_canonical_hf_baseline(monkeypatch) -> None:
-    monkeypatch.setenv("NRL_REFIT_BASELINE_IN_MEMORY", "1")
+def test_remote_sparse_initializes_canonical_hf_baseline() -> None:
     weights = [
         ("embedding.weight", torch.ones(2, 3)),
         ("linear.weight", torch.ones(4, 3)),
     ]
-    remote_refit = MegatronRemoteSparseRefit(_worker(weights), _DELTA_CONFIG)
+    remote_refit = MegatronRemoteSparseRefit(_worker(weights), _REFIT_CONFIG)
 
     info = remote_refit.initialize_baseline(
         shard_rank=0, shard_count=1, transport="zmq"
@@ -53,7 +56,14 @@ def test_remote_sparse_initializes_canonical_hf_baseline(monkeypatch) -> None:
 
 def test_remote_sparse_preserves_xor_config() -> None:
     remote_refit = MegatronRemoteSparseRefit(
-        _worker(), _DELTA_CONFIG.model_copy(update={"encoding": "xor"})
+        _worker(),
+        VllmRefitConfig(
+            delta_compression={
+                "encoding": "xor",
+                "sparse_bucket_size_bytes": 1024,
+            },
+            baseline={"in_memory": True},
+        ),
     )
 
     assert remote_refit._tracker.encoding == "xor"
@@ -61,7 +71,7 @@ def test_remote_sparse_preserves_xor_config() -> None:
 
 def test_remote_sparse_streams_one_canonical_path_and_drains_cuda(monkeypatch) -> None:
     weights = [("model.weight", torch.ones(2))]
-    remote_refit = MegatronRemoteSparseRefit(_worker(weights), _DELTA_CONFIG)
+    remote_refit = MegatronRemoteSparseRefit(_worker(weights), _REFIT_CONFIG)
     expected = {"payloads": 1, "changed_elements": 2, "total_elements": 2}
     events = []
 
@@ -104,7 +114,7 @@ def test_remote_sparse_streams_one_canonical_path_and_drains_cuda(monkeypatch) -
 
 
 def test_remote_sparse_finishes_single_tracker(monkeypatch) -> None:
-    remote_refit = MegatronRemoteSparseRefit(_worker(), _DELTA_CONFIG)
+    remote_refit = MegatronRemoteSparseRefit(_worker(), _REFIT_CONFIG)
     events = []
     monkeypatch.setattr(
         remote_refit._tracker,

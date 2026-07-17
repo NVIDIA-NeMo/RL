@@ -333,7 +333,7 @@ policy:
     stop_token_ids: null
     stop_strings: null
     refit_transport: null  # Set to "vllm_s3_sparse" or "vllm_zmq_sparse" for remote sparse-delta refit.
-    delta_compression: null  # Set {} for XOR and the 512 MiB bucket; null uses the existing refit path.
+    refit_cfg: null  # Optional tuning and storage settings for remote sparse-delta refit.
     mcore_generation_config:
       async_engine: false
       max_model_len: ${policy.max_total_sequence_length}

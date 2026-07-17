@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import tempfile
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal
 
 import numpy as np
 import torch
+
+from nemo_rl.models.generation.vllm.config import VllmRefitConfig
 
 NamedTensor = tuple[str, torch.Tensor]
 TensorBatch = list[NamedTensor]
@@ -208,20 +209,16 @@ class DeltaCompressionTracker:
 
     def __init__(
         self,
-        config: Mapping[str, Any],
+        config: VllmRefitConfig,
     ) -> None:
-        self.sparse_bucket_size_bytes = int(config["sparse_bucket_size_bytes"])
-        if self.sparse_bucket_size_bytes < 1:
-            raise ValueError("delta_compression.sparse_bucket_size_bytes must be >= 1")
-        self.encoding = sparse_operation(config["encoding"])
+        self.refit_config = config
+        delta_config = config.delta_compression
+        self.sparse_bucket_size_bytes = delta_config.sparse_bucket_size_bytes
+        self.encoding = sparse_operation(delta_config.encoding)
         self.overwrite_names: frozenset[str] = frozenset()
-        self.verification_samples = int(
-            os.getenv("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD", "0")
-        )
-        if self.verification_samples < 0:
-            raise ValueError("NRL_REFIT_VERIFY_SAMPLES_PER_PAYLOAD must be >= 0")
-        self.baseline_in_memory = os.getenv("NRL_REFIT_BASELINE_IN_MEMORY") == "1"
-        self.baseline_mmap_dir = os.getenv("NRL_REFIT_BASELINE_MMAP_DIR")
+        self.verification_samples = config.verify_samples_per_payload
+        self.baseline_in_memory = config.baseline.in_memory
+        self.baseline_mmap_dir = config.baseline.mmap_dir
         self.baseline: dict[str, torch.Tensor] = {}
         self._pending_updates: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self._pending_updates_lock = threading.Lock()

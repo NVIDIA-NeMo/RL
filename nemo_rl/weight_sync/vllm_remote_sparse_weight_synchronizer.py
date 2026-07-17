@@ -24,7 +24,7 @@ import ray
 
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
-    VllmDeltaCompressionConfig,
+    normalize_vllm_refit_config,
 )
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.weight_transfer_http import (
@@ -57,23 +57,26 @@ def validate_vllm_remote_sparse_refit(
     if transport not in _REMOTE_SPARSE_TRANSPORTS:
         raise ValueError(f"Unsupported vLLM refit transport {transport!r}.")
     vllm_cfg = config["vllm_cfg"]
-    delta_config = config.get("delta_compression")
+    refit_config = normalize_vllm_refit_config(config)
+    assert refit_config is not None
     if (
         colocated
         or not megatron_enabled
         or vllm_cfg["precision"] == "fp8"
         or vllm_cfg["kv_cache_dtype"].startswith("fp8")
-        or delta_config is None
         or config.get("quant_cfg")
         or config.get("real_quant")
     ):
         raise ValueError(
             f"{transport} requires a non-colocated Megatron policy, BF16/FP16 "
-            "vLLM, delta compression, and an unquantized rollout."
+            "vLLM, and an unquantized rollout."
         )
-    config["delta_compression"] = VllmDeltaCompressionConfig.model_validate(
-        delta_config
-    )
+    if transport == "vllm_s3_sparse" and not (
+        refit_config.storage.s3_bucket and refit_config.storage.s3_bucket.strip()
+    ):
+        raise ValueError(
+            "vllm_s3_sparse requires policy.generation.refit_cfg.storage.s3_bucket."
+        )
     return _REMOTE_SPARSE_TRANSPORTS[transport]
 
 
@@ -99,6 +102,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         self._baseline_init_refs = list(baseline_init_refs or ())
         self._baseline_commit_refs: list[Any] = []
         self._stale = True
+        self._poisoned = False
 
     def sync_weights(
         self,
@@ -106,6 +110,15 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
         timer: Timer | None = None,
         kv_scales: dict[str, float] | None = None,
     ) -> dict[str, float]:
+        if self._poisoned:
+            raise RuntimeError(
+                "Sparse refit synchronizer was poisoned by a prior failed sync: "
+                "receivers may be partially applied while the trainer baseline is "
+                "uncommitted, so re-applying deltas would double-XOR and corrupt "
+                "weights. Reload the rollout workers from a known-good checkpoint "
+                "and re-initialize the communicator before syncing again. See "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3274."
+            )
         context = (
             timer.time("prepare_for_generation/transfer_and_update_weights")
             if timer
@@ -219,6 +232,7 @@ class VllmRemoteSparseWeightSynchronizer(WeightSynchronizer):
                 succeeded = True
             finally:
                 if not succeeded:
+                    self._poisoned = True
                     if self._transport == "zmq" and not relay_flushed:
                         with suppress(Exception):
                             self._request_receivers(

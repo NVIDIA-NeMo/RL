@@ -101,6 +101,7 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import normalize_vllm_refit_config
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -354,6 +355,8 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for GRPO"
     )
+    if generation_config["backend"] == "vllm":
+        normalize_vllm_refit_config(cast(VllmConfig, generation_config))
 
     # Set seed for all random number generators
     set_seed(grpo_config["seed"])
@@ -1298,6 +1301,8 @@ def setup(
         t0 = time.perf_counter()
         assert isinstance(policy_generation, VllmGeneration)
         assert remote_synchronizer_cls is not None
+        refit_config = generation_config["refit_cfg"]
+        assert refit_config is not None
         policy_generation.weight_synchronizer = remote_synchronizer_cls(
             policy,
             policy_generation,
@@ -1305,6 +1310,7 @@ def setup(
             api_key_env_var=generation_config["vllm_cfg"].get(
                 "http_refit_api_key_env_var"
             ),
+            request_timeout_s=refit_config.request_timeout_s,
             baseline_init_refs=remote_baseline_init_refs,
         )
         policy_generation.weight_synchronizer.init_communicator()

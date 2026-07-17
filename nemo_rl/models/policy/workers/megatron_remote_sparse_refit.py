@@ -18,7 +18,10 @@ from typing import Any
 
 import torch
 
-from nemo_rl.models.generation.vllm.config import VllmDeltaCompressionConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmRefitConfig,
+    VllmRefitTransportName,
+)
 from nemo_rl.utils.weight_transfer_sparse_codec import DeltaCompressionTracker
 from nemo_rl.utils.weight_transfer_stream import (
     init_sparse_delta_baseline_from_iterator,
@@ -28,16 +31,16 @@ from nemo_rl.utils.weight_transfer_zmq import stream_sparse_delta_payloads_via_z
 
 
 class MegatronRemoteSparseRefit:
-    def __init__(self, worker: Any, delta_config: VllmDeltaCompressionConfig) -> None:
+    def __init__(self, worker: Any, refit_config: VllmRefitConfig) -> None:
         self._worker = worker
-        self._tracker = DeltaCompressionTracker(delta_config.model_dump())
+        self._tracker = DeltaCompressionTracker(refit_config)
 
     def initialize_baseline(
         self,
         *,
         shard_rank: int,
         shard_count: int,
-        transport: str,
+        transport: VllmRefitTransportName,
     ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
         init_sparse_delta_baseline_from_iterator(
             self._worker._iter_params_with_optional_kv_scales(),
@@ -53,7 +56,7 @@ class MegatronRemoteSparseRefit:
 
     def stream(
         self,
-        transport: str,
+        transport: VllmRefitTransportName,
         targets: list[str],
         *,
         transfer_id: str,

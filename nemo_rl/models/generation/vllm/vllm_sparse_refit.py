@@ -15,12 +15,15 @@
 """Remote sparse-refit receiver lifecycle for vLLM generation workers."""
 
 import asyncio
+import hmac
+import logging
 import os
 import tempfile
 import threading
 import time
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import cache
 from typing import Any, Literal, NamedTuple, cast
 
 import uvicorn
@@ -33,6 +36,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
 )
+from nemo_rl.models.generation.vllm.config import VllmRefitConfig
 from nemo_rl.utils import weight_transfer_sparse_codec as sparse_codec
 from nemo_rl.utils.weight_transfer_http import (
     G_VLLM_REFIT_API_KEY_HEADER,
@@ -46,11 +50,21 @@ from nemo_rl.utils.weight_transfer_http import (
 from nemo_rl.utils.weight_transfer_stream import (
     decode_sparse_payload,
     download_s3_refit_payload,
-    refit_env_int,
 )
 from nemo_rl.utils.weight_transfer_zmq import (
     ZmqSparseRefitServer,
 )
+
+logger = logging.getLogger(__name__)
+
+
+@cache
+def _warn_unauthenticated_refit_server(transport: str) -> None:
+    logger.warning(
+        "%s sparse-refit server is binding 0.0.0.0 without an API key; "
+        "weight-write endpoints are reachable from the network.",
+        transport,
+    )
 
 
 class _StagedSparsePayload(NamedTuple):
@@ -90,6 +104,10 @@ class VllmSparseRefitReceiver:
 
     def __init__(self, worker: Any) -> None:
         self._worker = worker
+        self._refit_config = VllmRefitConfig.model_validate(
+            worker.cfg.get("refit_cfg") or {}
+        )
+        tuning = self._refit_config.tuning
         self._refit_apply_queue_condition = threading.Condition()
         self._refit_apply_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -101,23 +119,14 @@ class VllmSparseRefitReceiver:
         ] = []
         self._refit_seen_payloads: dict[tuple[str, int, int], str] = {}
         self._refit_workers_share_node = False
-        self._refit_apply_queue_depth = refit_env_int(
-            "NRL_REFIT_APPLY_QUEUE_DEPTH", default=32
-        )
-        self._refit_apply_batch_size = refit_env_int(
-            "NRL_REFIT_APPLY_BATCH_SIZE", default=8
-        )
+        self._refit_apply_queue_depth = tuning.apply_queue_depth
+        self._refit_apply_batch_size = tuning.apply_batch_size
         self._refit_partition_executor = ThreadPoolExecutor(
-            max_workers=refit_env_int(
-                "NRL_REFIT_PARTITION_WORKERS",
-                default=max(2, min(8, os.cpu_count() or 8)),
-            ),
+            max_workers=tuning.partition_workers,
             thread_name_prefix="nrl-vllm-sparse-partition",
         )
         self._refit_verification_candidates = 0
-        self._refit_batch_staging_dir = (
-            os.getenv("NRL_REFIT_BATCH_STAGING_DIR") or "/dev/shm"
-        )
+        self._refit_batch_staging_dir = self._refit_config.storage.staging_dir
         self._refit_http_server: tuple[Any, threading.Thread, str] | None = None
         self._zmq_refit_server: tuple[ZmqSparseRefitServer, str] | None = None
         self._refit_async_loop: asyncio.AbstractEventLoop | None = None
@@ -419,9 +428,9 @@ class VllmSparseRefitReceiver:
         ) -> JSONResponse:
             if cfg["vllm_cfg"]["async_engine"]:
                 self._refit_async_loop = asyncio.get_running_loop()
-            if (
-                token is not None
-                and raw_request.headers.get(G_VLLM_REFIT_API_KEY_HEADER) != token
+            supplied_token = raw_request.headers.get(G_VLLM_REFIT_API_KEY_HEADER)
+            if token is not None and (
+                supplied_token is None or not hmac.compare_digest(token, supplied_token)
             ):
                 return JSONResponse(
                     content={"ok": False, "error": "unauthorized"}, status_code=403
@@ -486,8 +495,14 @@ class VllmSparseRefitReceiver:
             self._apply_zmq_payload,
             bind_address=f"tcp://0.0.0.0:{port}",
             api_key_env_var=cfg["vllm_cfg"].get("http_refit_api_key_env_var"),
-            timeout_s=float(os.getenv("NRL_REFIT_ZMQ_TIMEOUT_S") or 600.0),
+            timeout_s=self._refit_config.request_timeout_s,
+            tuning=self._refit_config.tuning,
         )
+        if (
+            vllm_refit_api_key(cfg["vllm_cfg"].get("http_refit_api_key_env_var"))
+            is None
+        ):
+            _warn_unauthenticated_refit_server("ZeroMQ")
         server.start()
         address = f"tcp://{_get_node_ip_local()}:{port}"
         self._zmq_refit_server = (server, address)
@@ -523,6 +538,11 @@ class VllmSparseRefitReceiver:
             cfg.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
             cfg.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
         )
+        if (
+            vllm_refit_api_key(cfg["vllm_cfg"].get("http_refit_api_key_env_var"))
+            is None
+        ):
+            _warn_unauthenticated_refit_server("HTTP")
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
