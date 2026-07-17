@@ -114,11 +114,17 @@ def validate_and_prepare_config(
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
     cp_size_cfg = config["dtensor_cfg"]["context_parallel_size"]
-    attn_impl = (
-        "flash_attention_2"
-        if (enable_seq_packing and cp_size_cfg == 1)
-        else ("sdpa" if cp_size_cfg > 1 else None)
-    )
+    # For bit-equivalence work, force sdpa (deterministic backward) instead
+    # of flash_attention_2 (non-deterministic backward). Flash Attention's
+    # backward produces different gradients on each run, breaking bit-eq.
+    if os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1":
+        attn_impl = "sdpa"
+    else:
+        attn_impl = (
+            "flash_attention_2"
+            if (enable_seq_packing and cp_size_cfg == 1)
+            else ("sdpa" if cp_size_cfg > 1 else None)
+        )
 
     # Load model config
     model_config = AutoConfig.from_pretrained(

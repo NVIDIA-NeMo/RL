@@ -591,7 +591,12 @@ def sft_train(
                     if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
                         metrics[k] = np.mean(v).item()
                     else:
-                        metrics[k] = np.sum(v).item()
+                        try:
+                            metrics[k] = np.sum(v).item()
+                        except (TypeError, ValueError):
+                            # Skip non-numeric metrics (e.g. string-valued diag keys
+                            # from MultiAdapterLoss like adapter_names)
+                            metrics[k] = v
                 total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 ## Checkpointing

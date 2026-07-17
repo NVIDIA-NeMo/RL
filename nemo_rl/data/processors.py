@@ -168,7 +168,7 @@ def sft_processor(
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
-    loss_multiplier = 1.0
+    loss_multiplier = datum_dict.get("loss_multiplier", 1.0)
     if length > max_seq_length:
         # make smaller and mask out
         for message in message_log:
