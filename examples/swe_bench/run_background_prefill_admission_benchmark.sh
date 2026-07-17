@@ -27,7 +27,7 @@ if ! [[ "${VLLM_TP}" =~ ^[1-9][0-9]*$ ]] || (( 8 % VLLM_TP != 0 )); then
   echo "ERROR: VLLM_TP must be a positive divisor of 8 (got ${VLLM_TP})." >&2
   exit 1
 fi
-CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/nemo-rl:nightly-071526.squashfs}"
+CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/joyang/RL/results/images/nemo-rl-nightly-gym-20260718.squashfs}"
 
 _cache_has_entries() {
   find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .

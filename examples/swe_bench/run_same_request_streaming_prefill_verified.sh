@@ -44,7 +44,7 @@ export STREAMING_INITIAL_CHUNK_CHARS="${STREAMING_INITIAL_CHUNK_CHARS:-256}"
 export PAIR_ARMS="${PAIR_ARMS:-streaming_off:0:0.05:256:0 same_request_prefill:1:0.05:256:1:1:1:1:1:256:1.0:1:1}"
 export SEQUENTIAL_ARMS="${SEQUENTIAL_ARMS:-1}"
 export AUDIT_PYTHON="${AUDIT_PYTHON:-/usr/bin/python3}"
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/nemo-rl:nightly-071526.squashfs}"
+export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/joyang/RL/results/images/nemo-rl-nightly-gym-20260718.squashfs}"
 export SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-nemotron_sw_post}"
 # The artifact prewarmer runs before either arm and provides a portable current
 # uv. Reuse that executable while keeping package/build caches in the shared
