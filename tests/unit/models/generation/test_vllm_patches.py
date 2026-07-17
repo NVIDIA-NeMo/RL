@@ -175,3 +175,94 @@ def test_streaming_session_priority_patch_is_atomic_on_unknown_source(
 
     assert not patches._patch_vllm_streaming_session_priority(logger)
     assert paths["engine/protocol.py"].read_text() == sources["engine/protocol.py"]
+
+
+_ORIGINAL_OUTPUT_PROCESSOR = (
+    "    prompt_token_ids: list[int] | None\n"
+    "    arrival_time: float\n"
+    "    final: bool = False\n"
+    "    def __init__(\n"
+    "        self,\n"
+    "        request_id: str,\n"
+    "    ):\n"
+    "        self.request_id = request_id\n"
+    "        self.external_req_id = external_req_id\n"
+    "    def apply_streaming_update(self, update: StreamingUpdate) -> None:\n"
+    "        # Apply the update to the request state.\n"
+    "        self.streaming_input = not update.final\n"
+    "        # TODO also include relevant output tokens in new prompt here\n"
+    "        #     (match scheduler behavior).\n"
+    "        if update.prompt:\n"
+    "            self.prompt = (\n"
+    "                (self.prompt + update.prompt) if self.prompt else update.prompt\n"
+    "            )\n"
+    "        if self.prompt_token_ids:\n"
+    "            self.prompt_token_ids.extend(update.prompt_token_ids or ())\n"
+    "        else:\n"
+    "            self.prompt_token_ids = update.prompt_token_ids or []\n"
+    "        assert self.prompt_token_ids is not None\n"
+    "        self.prompt_len = len(self.prompt_token_ids)\n"
+    "        if self.stats is not None:\n"
+    "            self.stats.arrival_time = update.arrival_time\n"
+    "        self.is_prefilling = True\n"
+    "        return cls(\n"
+    "            request_id=request.request_id,\n"
+    "        update = StreamingUpdate(\n"
+    "            prompt=prompt,\n"
+    "            prompt_token_ids=request.prompt_token_ids,\n"
+    "            arrival_time=request.arrival_time,\n"
+    "        )\n"
+)
+
+
+def test_streaming_session_output_state_patch_is_guarded_and_idempotent(
+    tmp_path, monkeypatch
+) -> None:
+    output_processor = tmp_path / "output_processor.py"
+    output_processor.write_text(_ORIGINAL_OUTPUT_PROCESSOR)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _: str(output_processor))
+    logger = MagicMock()
+
+    assert patches._patch_vllm_streaming_session_output_state(logger)
+    assert patches._patch_vllm_streaming_session_output_state(logger)
+
+    content = output_processor.read_text()
+    assert content.count("    request: EngineCoreRequest\n") == 1
+    assert content.count("        self.tokenizer = tokenizer\n") == 1
+    assert content.count("            tokenizer=tokenizer,\n") == 1
+    assert content.count("            request=request,\n") == 1
+    assert "request.prompt_token_ids = list(self.prompt_token_ids)" in content
+    assert (
+        "tokenizer = self.tokenizer if sampling_params.detokenize else None" in content
+    )
+    assert "LogprobsProcessor.from_new_request" in content
+    assert "IncrementalDetokenizer.from_new_request" in content
+    assert "sampling_params.output_kind == RequestOutputKind.DELTA" in content
+    assert "TODO also include relevant output tokens" not in content
+
+
+def test_streaming_session_output_state_patch_rejects_unknown_source(
+    tmp_path, monkeypatch
+) -> None:
+    output_processor = tmp_path / "output_processor.py"
+    output_processor.write_text("unexpected future implementation\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _: str(output_processor))
+    logger = MagicMock()
+
+    assert not patches._patch_vllm_streaming_session_output_state(logger)
+    logger.warning.assert_called_once()
+    assert output_processor.read_text() == "unexpected future implementation\n"
+
+
+def test_streaming_session_output_state_patch_is_atomic(tmp_path, monkeypatch) -> None:
+    output_processor = tmp_path / "output_processor.py"
+    source_with_one_unknown_snippet = _ORIGINAL_OUTPUT_PROCESSOR.replace(
+        "        update = StreamingUpdate(\n",
+        "        update = FutureStreamingUpdate(\n",
+    )
+    output_processor.write_text(source_with_one_unknown_snippet)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _: str(output_processor))
+    logger = MagicMock()
+
+    assert not patches._patch_vllm_streaming_session_output_state(logger)
+    assert output_processor.read_text() == source_with_one_unknown_snippet
