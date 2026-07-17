@@ -337,6 +337,7 @@ env:
             VLLM_ATTENTION_BACKEND: TRITON_ATTN
             VLLM_USE_DEEP_GEMM: "0"
             VLLM_MOE_USE_DEEP_GEMM: "0"
+            VLLM_CACHE_DIR: "${oc.env:PERSISTENT_CACHE}/vllm_compile_cache"
           vllm_serve_kwargs:
             data_parallel_size: 8
             tensor_parallel_size: 1
@@ -365,6 +366,7 @@ env:
             VLLM_USE_FLASHINFER_MOE_FP8: "0"
             VLLM_USE_DEEP_GEMM: "0"
             VLLM_MOE_USE_DEEP_GEMM: "0"
+            VLLM_CACHE_DIR: "${oc.env:PERSISTENT_CACHE}/vllm_compile_cache"
           vllm_serve_kwargs:
             attention_backend: TRITON_ATTN
             data_parallel_size: 2
@@ -467,6 +469,7 @@ env:
             VLLM_ATTENTION_BACKEND: TRITON_ATTN
             VLLM_USE_DEEP_GEMM: "0"
             VLLM_MOE_USE_DEEP_GEMM: "0"
+            VLLM_CACHE_DIR: "${oc.env:PERSISTENT_CACHE}/vllm_compile_cache"
           vllm_serve_kwargs:
             attention_backend: TRITON_ATTN
             data_parallel_size: 4

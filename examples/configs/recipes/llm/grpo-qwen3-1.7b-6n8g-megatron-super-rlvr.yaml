@@ -61,17 +61,23 @@ env:
     genrm_model:
       responses_api_models:
         genrm_model:
+          vllm_serve_env_vars:
+            VLLM_CACHE_DIR: "${oc.env:HF_HOME}/vllm_compile_cache"
           vllm_serve_kwargs:
             data_parallel_size: 2  # reduced from 4 to fit within 5 gym nodes (2+2+1)
             max_num_seqs: 16
     nl2bash_judge_model:
       responses_api_models:
         local_vllm_model:
+          vllm_serve_env_vars:
+            VLLM_CACHE_DIR: "${oc.env:HF_HOME}/vllm_compile_cache"
           vllm_serve_kwargs:
             max_num_seqs: 16
     safety_judge_model:
       responses_api_models:
         local_vllm_model:
+          vllm_serve_env_vars:
+            VLLM_CACHE_DIR: "${oc.env:HF_HOME}/vllm_compile_cache"
           vllm_serve_kwargs:
             max_num_seqs: 16
 
