@@ -55,7 +55,6 @@ from nemo_rl.algorithms.grpo import GRPOLoggerConfig
 from nemo_rl.algorithms.staleness_sampler import (
     StalenessSampler,
     count_groups,
-    incomplete_group_indices,
     min_weight_version,
 )
 from nemo_rl.data.interfaces import DatumSpec
@@ -341,7 +340,6 @@ class SingleControllerActor:
 
         self._trainer_version: int = 0
         self._train_steps: int = 0
-        self._rollout_done: bool = False
         # Completed prompt-list passes; only advances when
         # cfg.max_num_epochs is set (see _rollout_pump).
         self._current_epoch: int = 0
@@ -458,8 +456,7 @@ class SingleControllerActor:
                 sem.release()
 
         max_epochs = self._cfg.max_num_epochs
-        epoch = 0
-        while max_epochs is None or epoch < max_epochs:
+        while max_epochs is None or self._current_epoch < max_epochs:
             for prompt_batch in self._dataloader:
                 # over_sampling=False: batch-level gate on max_rollout_version.
                 if not over_sampling:
@@ -491,9 +488,10 @@ class SingleControllerActor:
                     )
                     self._dispatched_rollouts.add(task)
                     task.add_done_callback(self._dispatched_rollouts.discard)
-            epoch += 1
 
-        print(f"rollout_pump: completed {epoch} epoch(s)", flush=True)
+            self._current_epoch += 1
+
+        print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
@@ -568,18 +566,6 @@ class SingleControllerActor:
                         )
 
                     if group_indices is None:
-                        if self._rollout_done:
-                            # No group is selectable and no more samples
-                            # will arrive: flush groups that can never
-                            # complete so the emptiness check fires
-                            # instead of spinning forever.
-                            await self._flush_incomplete_groups()
-                            if (
-                                self._claimed_meta is None
-                                or self._claimed_meta.size == 0
-                            ):
-                                rollout_exhausted = True
-                                break
                         await asyncio.sleep(0.005)
                         continue
 
@@ -878,46 +864,6 @@ class SingleControllerActor:
         )
         self._claimed_meta = self._claimed_meta.drop(indices)
         return evicted_meta
-
-    async def _flush_incomplete_groups(self) -> None:
-        """Drop groups that can never become selectable after rollout shutdown.
-
-        With ``_rollout_done`` set, a group that is uncommitted or short of
-        ``expected_num_samples`` will never receive more rows, yet the sampler
-        neither selects nor evicts it — without this flush the train pump
-        spins forever and ``run()`` hangs. Drain rows still unclaimed at
-        DataPlane first: a group can straddle a ``claim_meta`` batch boundary,
-        so incomplete-in-``_claimed_meta`` does not yet prove
-        incomplete-in-partition.
-        """
-        while True:
-            before = self._claimed_meta.size if self._claimed_meta is not None else 0
-            await self._claim_available_meta()
-            after = self._claimed_meta.size if self._claimed_meta is not None else 0
-            if after == before:
-                break
-        if self._claimed_meta is None or self._claimed_meta.size == 0:
-            return
-        indices = incomplete_group_indices(
-            self._claimed_meta,
-            group_size=self._cfg.group_size,
-        )
-        if not indices:
-            return
-        dropped = self._claimed_meta.subset(indices)
-        print(
-            f"WARNING: rollout done: dropping {dropped.size} sample(s) from "
-            f"incomplete prompt group(s) that can no longer complete",
-            flush=True,
-        )
-        await self._call_dp(
-            "clear_samples",
-            sample_ids=dropped.sample_ids,
-            partition_id=dropped.partition_id,
-        )
-        self._claimed_meta = self._claimed_meta.drop(indices)
-        # No _buffer_capacity release: the rollout pump has exited, so no
-        # dispatcher will acquire again this run.
 
 
 def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
