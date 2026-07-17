@@ -386,26 +386,6 @@ deterministic chunk ownership, transactional baseline updates, transport
 cleanup on success and failure, and unchanged producer/receiver overlap. Do not
 modify Megatron Bridge for a transport-specific hook.
 
-Run the focused suite:
-
-```bash
-uv run --extra vllm pytest -q \
-  tests/unit/utils/test_weight_transfer_stream.py \
-  tests/unit/models/policy/test_megatron_remote_sparse_refit.py \
-  tests/unit/models/generation/test_vllm_sparse_refit.py \
-  tests/unit/weight_sync/test_vllm_remote_sparse_weight_synchronizer.py
-
-uv run --extra vllm pytest -q -m vllm \
-  tests/unit/models/generation/test_vllm_sparse_delta.py
-
-uv run ruff check \
-  nemo_rl/utils/weight_transfer_{http,sparse_codec,stream,zmq}.py \
-  nemo_rl/models/policy/workers/megatron_remote_sparse_refit.py \
-  nemo_rl/models/generation/vllm/vllm_{sparse_refit,sparse_delta}.py \
-  nemo_rl/weight_sync/vllm_remote_sparse_weight_synchronizer.py \
-  tools/refit_bandwidth_calculator.py
-```
-
 On the target topology, verify the exact commit, image digest, and checkpoint
 revision; validate fresh starts and same-version resumes; compare two balanced
 repetitions with an equivalent NCCL or full control; and require the requested
