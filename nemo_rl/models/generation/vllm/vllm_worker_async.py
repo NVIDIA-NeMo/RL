@@ -1259,18 +1259,34 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             asyncio.create_task(process_single_sample(i)) for i in range(batch_size)
         ]
 
-        # Yield results as they become available
-        for completed_task in asyncio.as_completed(sample_tasks):
-            try:
-                result = await completed_task
-                yield result
-            except Exception as e:
-                # Cancel remaining tasks
-                for task in sample_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*sample_tasks, return_exceptions=True)
-                raise e
+        # Yield results as they become available.
+        # NOTE: the inner handler is `except Exception` (not BaseException) on
+        # purpose. The `finally` below is what handles CancelledError: when the
+        # driver aborts a stale in-flight rollout via ray.cancel, CancelledError
+        # is raised into this coroutine (typically at `await completed_task`) and
+        # must be forced into the child `process_single_sample` tasks so their
+        # `async for req_output in vllm_request_generator` loop is cancelled and
+        # vLLM v1 AsyncLLM.generate auto-aborts the engine request. Do not widen
+        # this to `except BaseException` or the abort would run twice / racily.
+        try:
+            for completed_task in asyncio.as_completed(sample_tasks):
+                try:
+                    result = await completed_task
+                    yield result
+                except Exception as e:
+                    # Cancel remaining tasks
+                    for task in sample_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*sample_tasks, return_exceptions=True)
+                    raise e
+        finally:
+            # On cancellation (or generator close), propagate the cancel into the
+            # child tasks so the underlying vLLM request is aborted, not orphaned.
+            for task in sample_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*sample_tasks, return_exceptions=True)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -1360,18 +1376,26 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             asyncio.create_task(process_single_prompt(i)) for i in range(batch_size)
         ]
 
-        # Yield results as they become available
-        for completed_task in asyncio.as_completed(prompt_tasks):
-            try:
-                result = await completed_task
-                yield result
-            except Exception as e:
-                # Cancel remaining tasks
-                for task in prompt_tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*prompt_tasks, return_exceptions=True)
-                raise e
+        # Yield results as they become available. See generate_async for why the
+        # `finally` (not `except BaseException`) is what propagates CancelledError
+        # into the child tasks so the underlying vLLM request is aborted.
+        try:
+            for completed_task in asyncio.as_completed(prompt_tasks):
+                try:
+                    result = await completed_task
+                    yield result
+                except Exception as e:
+                    # Cancel remaining tasks
+                    for task in prompt_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*prompt_tasks, return_exceptions=True)
+                    raise e
+        finally:
+            for task in prompt_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*prompt_tasks, return_exceptions=True)
 
     async def report_device_id_async(self) -> list[str]:
         """Async version of report_device_id."""

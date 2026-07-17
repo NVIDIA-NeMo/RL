@@ -214,6 +214,15 @@ class SingleControllerActor:
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
 
+        # Maps an in-flight rollout's group_id -> (dispatch task, start_weight
+        # version). Populated by RolloutManager.generate_and_push at reserve time
+        # and popped before commit, so it holds only rollouts still generating.
+        # Used by _abort_stale_inflight to stop over-sampled rollouts early once
+        # they age past the staleness window (over_sampling only).
+        self._inflight_by_group_id: dict[str, tuple[asyncio.Task[None], int]] = {}
+        # Share the registry with the writer so generate_and_push can populate it.
+        self._rollout_manager._inflight_registry = self._inflight_by_group_id
+
         # over_sampling=False batch gate: farthest trainer_version covered by
         # already-dispatched batches. Restored as current_step - 1 to preserve
         # the fresh-start invariant _max_rollout_version == _trainer_version - 1
@@ -604,9 +613,7 @@ class SingleControllerActor:
                     elif "val_reward" in save_state:
                         del save_state["val_reward"]
 
-                    full_metric_name = self._master_config.checkpointing[
-                        "metric_name"
-                    ]
+                    full_metric_name = self._master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"
@@ -633,9 +640,7 @@ class SingleControllerActor:
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
+                            save_state[full_metric_name] = metrics_source[metric_name]
 
                     with self._timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {self._train_steps}...")
@@ -723,6 +728,60 @@ class SingleControllerActor:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
 
+    async def _abort_stale_inflight(self) -> None:
+        """Abort in-flight over-sampled rollouts that have aged out of the window.
+
+        A reserved-but-not-yet-committed rollout whose start weight version is
+        older than ``_trainer_version - max_weight_staleness_versions`` can never
+        be selected for training, so its vLLM generation is wasted GPU work.
+        Cancel the dispatch task (which propagates down to vLLM and aborts the
+        request), drop its reserved buffer slot, and hand its buffer-capacity
+        permit back — mirroring what ``sampler.evict`` does for ready slots.
+
+        This whole method runs as one synchronous burst with no ``await`` that
+        yields the event loop between the scan, the cancels, the removal, and the
+        permit releases (``buffer.remove(remove_in_dp=False)`` has no real
+        suspension point). That keeps the accounting exactly-once: a cancelled
+        task cannot resume and commit into a slot the controller is removing.
+        """
+        min_valid = max(
+            0,
+            self._trainer_version - self._async_cfg.max_weight_staleness_versions,
+        )
+        stale_gids = [
+            gid
+            for gid, (_task, start_v) in self._inflight_by_group_id.items()
+            if start_v < min_valid
+        ]
+        if not stale_gids:
+            return
+
+        # Cancel first; .cancel() only schedules delivery, so no target task runs
+        # (and no slot changes) until we next yield below.
+        for gid in stale_gids:
+            self._inflight_by_group_id[gid][0].cancel()
+
+        # Resolve all buffer indices before removing (remove() sorts descending
+        # internally, so a single batched call avoids index shift). A gid in the
+        # registry is always an unready slot (entries are popped before commit),
+        # so evict/select never touched it and index() is safe.
+        idxs = [self._buffer._group_ids.index(gid) for gid in stale_gids]
+        await self._buffer.remove(idxs, remove_in_dp=False)
+        for _ in stale_gids:
+            self._buffer_capacity.release()
+
+        # Drop the registry entries now (the cancelled task also pops itself in
+        # its finally, but that runs later) to preserve the invariant that a
+        # registry entry always has a live buffer slot — a later scan must not
+        # re-select a gid whose slot we just removed.
+        for gid in stale_gids:
+            self._inflight_by_group_id.pop(gid, None)
+
+        print(
+            f"  aborted {len(stale_gids)} stale in-flight rollout(s)",
+            flush=True,
+        )
+
     async def _sync_weights(self) -> None:
         """Drain in-flight rollouts then synchronize weights.
 
@@ -735,6 +794,12 @@ class SingleControllerActor:
           4. _rollout_permitted.set()   — resume
         """
         self._rollout_permitted.clear()
+
+        # The version bump that precedes this call may have pushed some in-flight
+        # over-sampled rollouts past the staleness window. Abort them now instead
+        # of letting them generate to completion only to be evicted afterward.
+        if self._async_cfg.over_sampling:
+            await self._abort_stale_inflight()
 
         # TODO: currently sync_weights is not implemented, comment out for now
         # # Drain: wait for all in-flight rollouts to complete before NCCL
