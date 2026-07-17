@@ -372,6 +372,29 @@ Reference example for training to play a Sliding Puzzle Game:
 uv run python examples/run_grpo_sliding_puzzle.py
 ```
 
+This branch also supports multi-round SWE refinement through NeMo Gym's
+`SWEBenchRefineWrapper`. Each unresolved round passes verifier evidence and the
+previous patch into a fresh repository for the next round. Refine V3
+(`compact_raw`) puts the highest-signal traceback or assertion first, removes
+overlap from the remaining verifier tail, then includes a middle-truncated
+patch. The original V1 handoff remains available as `baseline`.
+
+The recommended Qwen3.5-4B Refine V3 settings are:
+
+```yaml
+max_refine_rounds: 2
+refine_strategy: compact_raw
+carry_over_token_budget: 30000
+refine_verify_feedback_chars: 6000
+refine_failure_snippet_chars: 3000
+```
+
+The wrapper broadcasts chain-level success to all real rounds and pads
+early-resolved chains with `loss_multiplier=0`, preserving a fixed GRPO group
+shape. See
+`3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/configs/swebench_openhands_refine.yaml`
+for the complete train and validation agent configuration.
+
 ## On-policy Distillation
 
 We provide an example on-policy distillation experiment using the [DeepScaler dataset](https://huggingface.co/agentica-org/DeepScaleR-1.5B-Preview).
