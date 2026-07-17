@@ -285,7 +285,6 @@ async def _generate_same_request_final(
     tokenizer: Any,
     stability_margin_tokens: int,
     background_priority: int,
-    expected_dummy_token_id: int,
 ) -> SameRequestFinalMeasurement:
     stable_prefix = _stable_streamed_prefix(
         trace, stability_margin_tokens=stability_margin_tokens
@@ -341,10 +340,6 @@ async def _generate_same_request_final(
                 if len(token_ids) != 1:
                     raise RuntimeError(
                         "prefill phase generated more than one dummy token"
-                    )
-                if token_ids[0] != expected_dummy_token_id:
-                    raise RuntimeError(
-                        "prefill phase did not generate the forced EOS dummy token"
                     )
                 dummy_token_ids.extend(token_ids)
                 dummy_logprobs.extend(logprobs)
@@ -507,6 +502,19 @@ def _paired_summary(
 
 async def _main(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
+    from vllm.logger import init_logger
+
+    from nemo_rl.models.generation.vllm.patches import (
+        _patch_vllm_streaming_session_max_tokens,
+    )
+
+    if not _patch_vllm_streaming_session_max_tokens(
+        init_logger("streaming_final_decode_patch")
+    ):
+        raise RuntimeError(
+            "installed vLLM does not support per-chunk max_tokens updates"
+        )
+
     from vllm import TokensPrompt
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.engine.protocol import StreamingInput
@@ -528,9 +536,6 @@ async def _main(args: argparse.Namespace) -> None:
         raise ValueError("overlap and cleanup delays must be non-negative")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    if tokenizer.eos_token_id is None:
-        raise RuntimeError("same-request benchmark requires an EOS token")
-    eos_token_id = int(tokenizer.eos_token_id)
     traces: dict[int, PromptTrace] = {}
     common_final: list[int] | None = None
     for candidate_tokens in args.candidate_chunk_token_sweep:
@@ -567,20 +572,6 @@ async def _main(args: argparse.Namespace) -> None:
         seed=args.seed,
         max_tokens=1,
         logprobs=0,
-        output_kind=RequestOutputKind.DELTA,
-    )
-    # vLLM fixes Request.max_tokens when the input-streaming session is first
-    # created, even though later chunks can replace SamplingParams. Preserve
-    # the final budget from the start, while allowed_token_ids + EOS makes the
-    # prefill phase terminate after exactly one discardable dummy token.
-    same_request_prefill_sampling_params = SamplingParams(
-        temperature=0,
-        top_p=1,
-        top_k=-1,
-        seed=args.seed,
-        max_tokens=args.max_output_tokens,
-        logprobs=0,
-        allowed_token_ids=[eos_token_id],
         output_kind=RequestOutputKind.DELTA,
     )
     final_delta_sampling_params = SamplingParams(
@@ -689,16 +680,13 @@ async def _main(args: argparse.Namespace) -> None:
                         measurement = await _generate_same_request_final(
                             llm,
                             trace=trace,
-                            prefill_sampling_params=(
-                                same_request_prefill_sampling_params
-                            ),
+                            prefill_sampling_params=prefill_sampling_params,
                             final_sampling_params=final_delta_sampling_params,
                             tokens_prompt_type=TokensPrompt,
                             streaming_input_type=StreamingInput,
                             tokenizer=tokenizer,
                             stability_margin_tokens=args.stability_margin_tokens,
                             background_priority=args.background_priority,
-                            expected_dummy_token_id=eos_token_id,
                         )
                     iteration_results[arm] = measurement
 
@@ -771,7 +759,6 @@ async def _main(args: argparse.Namespace) -> None:
                 )
             no_dummy_leak &= all(
                 len(item.dummy_token_ids) == 1
-                and item.dummy_token_ids[0] == eos_token_id
                 and item.final_generation.output_token_ids == control.output_token_ids
                 for item, control in zip(same_request_final, control_delta, strict=True)
             )
