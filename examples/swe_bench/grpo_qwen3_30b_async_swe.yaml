@@ -255,6 +255,7 @@ policy:
         stable_first_snapshot_prefill: false
         background_prefill_completion: false
         background_prefill_priority: 1
+        same_request_final_decode: false
         compact_request_context: false
         incremental_tokenizer_checkpoint_interval: 8
         counterfactual_full_tokenizer_timing: false

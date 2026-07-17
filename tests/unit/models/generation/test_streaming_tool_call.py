@@ -9,6 +9,7 @@ import pytest
 
 from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallError,
+    StreamingToolCallFinalizationUnavailableError,
     StreamingToolCallPrefillManager,
     StreamingToolCallPrefixMismatchError,
     StreamingToolCallSessionClosedError,
@@ -22,6 +23,8 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 @dataclass(frozen=True)
 class _FakeStreamingInput:
     token_ids: list[int]
+    sampling_params: Any = None
+    final: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,17 +58,36 @@ def _make_manager(
     stability_margin_tokens: int = 0,
     max_prompt_tokens: int = 1024,
     cache_page_size_tokens: int | None = None,
+    require_cache_page_crossing: bool = True,
 ) -> StreamingToolCallPrefillManager:
     return StreamingToolCallPrefillManager(
         generate=engine.generate,
         make_streaming_input=lambda token_ids: _FakeStreamingInput(token_ids),
+        make_final_streaming_input=lambda token_ids, sampling_params: (
+            _FakeStreamingInput(
+                token_ids,
+                sampling_params=sampling_params,
+                final=True,
+            )
+        ),
         count_output_tokens=lambda output: output.token_count,
         max_sessions=max_sessions,
         session_ttl_seconds=session_ttl_seconds,
         stability_margin_tokens=stability_margin_tokens,
         max_prompt_tokens=max_prompt_tokens,
         cache_page_size_tokens=cache_page_size_tokens,
+        require_cache_page_crossing=require_cache_page_crossing,
     )
+
+
+async def _wait_for_prefill_completion(
+    manager: StreamingToolCallPrefillManager,
+) -> None:
+    async def wait() -> None:
+        while manager.total_prefill_tokens == 0:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait(), timeout=1)
 
 
 def test_worker_records_streaming_and_prefix_cache_metrics() -> None:
@@ -170,6 +192,63 @@ async def test_prefills_only_new_monotonic_suffix() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sealed_session_streams_authoritative_final_suffix() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine)
+
+    await manager.start(session_id="session", prompt_token_ids=[1, 2, 3], sequence_no=0)
+    await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        sequence_no=1,
+    )
+    sealed = await manager.seal(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+    )
+    final_outputs = await manager.finalize(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+        final_sampling_params="final-params",
+    )
+
+    outputs = [output async for output in final_outputs]
+
+    assert sealed.prefix_matched
+    assert sealed.committed_tokens == 3
+    assert engine.received_chunks == [[1, 2, 3], [4, 5]]
+    assert len(outputs) == 1
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_seal_fails_open_without_waiting_for_inflight_prefill() -> None:
+    engine = _FakeEngine()
+    engine.block_outputs = True
+    manager = _make_manager(engine)
+
+    await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        initial_candidate_token_ids=[1, 2, 3],
+    )
+
+    with pytest.raises(
+        StreamingToolCallFinalizationUnavailableError,
+        match="in-flight work",
+    ):
+        await asyncio.wait_for(
+            manager.seal(
+                session_id="session",
+                final_prompt_token_ids=[1, 2, 3, 4, 5],
+            ),
+            timeout=0.1,
+        )
+
+    assert await manager.abort(session_id="session")
+
+
+@pytest.mark.asyncio
 async def test_first_snapshot_prefills_authoritative_model_prefix() -> None:
     engine = _FakeEngine()
     manager = _make_manager(engine, stability_margin_tokens=1)
@@ -238,8 +317,7 @@ async def test_background_completion_is_settled_once_at_close() -> None:
         dynamic_token_baseline=2,
     )
     engine.release_output.set()
-    while manager.total_prefill_tokens == 0:
-        await asyncio.sleep(0)
+    await _wait_for_prefill_completion(manager)
 
     closed = await manager.close(
         session_id="session",
@@ -310,8 +388,7 @@ async def test_background_prefill_admits_exact_cache_page_boundary() -> None:
         initial_candidate_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
         dynamic_token_baseline=6,
     )
-    while manager.total_prefill_tokens == 0:
-        await asyncio.sleep(0)
+    await _wait_for_prefill_completion(manager)
     closed = await manager.close(
         session_id="session",
         final_prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9],
@@ -324,6 +401,34 @@ async def test_background_prefill_admits_exact_cache_page_boundary() -> None:
     assert closed.committed_tokens == 8
     assert closed.background_completed_chunks == 1
     assert closed.background_cancelled_chunks == 0
+
+
+@pytest.mark.asyncio
+async def test_same_request_prefill_admits_without_crossing_cache_page() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(
+        engine,
+        cache_page_size_tokens=4,
+        require_cache_page_crossing=False,
+    )
+
+    started = await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        initial_candidate_token_ids=[1, 2, 3],
+        dynamic_token_baseline=3,
+    )
+    await _wait_for_prefill_completion(manager)
+    closed = await manager.close(
+        session_id="session",
+        final_prompt_token_ids=[1, 2, 3, 4, 5],
+    )
+
+    assert started.scheduled_chunks == 1
+    assert started.scheduled_tokens == 3
+    assert engine.received_chunks == [[1, 2, 3]]
+    assert closed.committed_tokens == 3
+    assert closed.prefix_matched
 
 
 @pytest.mark.asyncio

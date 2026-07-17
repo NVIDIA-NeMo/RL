@@ -53,8 +53,11 @@ from nemo_rl.models.generation.vllm.incremental_tokenizer import (
 from nemo_rl.models.generation.vllm.cache_utils import writeback_vllm_cache
 from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallError,
+    StreamingToolCallFinalizationUnavailableError,
     StreamingToolCallPrefillManager,
+    StreamingToolCallPrefixMismatchError,
     StreamingToolCallPromptTooLongError,
+    StreamingToolCallSessionClosedError,
     StreamingToolCallSessionNotFoundError,
 )
 from nemo_rl.models.generation.vllm.utils import (
@@ -344,6 +347,26 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from vllm.v1.metrics.loggers import PrometheusStatLogger
 
         streaming_tool_call_config = self.cfg["vllm_cfg"].get("streaming_tool_call")
+        if streaming_tool_call_config and streaming_tool_call_config.get(
+            "same_request_final_decode", False
+        ):
+            required_patches = {
+                "streaming_session_max_tokens",
+                "streaming_session_priority",
+            }
+            available_patches = {
+                name
+                for name, available in getattr(
+                    self, "vllm_patch_capabilities", {}
+                ).items()
+                if available
+            }
+            missing_patches = required_patches - available_patches
+            if missing_patches:
+                raise RuntimeError(
+                    "same-request final decode requires compatible vLLM streaming "
+                    f"session patches; missing {sorted(missing_patches)}"
+                )
         background_prefill_priority = _configure_background_prefill_scheduling(
             llm_kwargs, streaming_tool_call_config
         )
@@ -410,6 +433,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     sampling_params=prefill_sampling_params,
                 )
 
+            def make_final_streaming_input(token_ids, sampling_params):
+                return StreamingInput(
+                    prompt=TokensPrompt(prompt_token_ids=token_ids),
+                    sampling_params=sampling_params,
+                    priority=0,
+                )
+
             def count_output_tokens(output):
                 return sum(
                     len(completion_output.token_ids)
@@ -419,6 +449,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.streaming_tool_call_manager = StreamingToolCallPrefillManager(
                 generate=generate_prefill,
                 make_streaming_input=make_streaming_input,
+                make_final_streaming_input=make_final_streaming_input,
                 count_output_tokens=count_output_tokens,
                 max_sessions=streaming_tool_call_config["max_sessions"],
                 session_ttl_seconds=streaming_tool_call_config["session_ttl_seconds"],
@@ -427,6 +458,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 ],
                 # Each submitted streaming chunk produces one dummy decode token.
                 max_prompt_tokens=self.llm_async_engine_args.max_model_len - 1,
+                require_cache_page_crossing=not streaming_tool_call_config.get(
+                    "same_request_final_decode", False
+                ),
             )
 
         self.server_thread, self.base_url, self.http_server = None, None, None
@@ -648,9 +682,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from vllm.entrypoints.openai.chat_completion.serving import (
             OpenAIServingChat,
         )
-        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.openai.engine.protocol import (
+            ErrorResponse,
+            RequestResponseMetadata,
+        )
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.utils import get_max_tokens
         from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
@@ -668,6 +706,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
+        from vllm.sampling_params import RequestOutputKind
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
         if maybe_tool_parser_plugin:
@@ -981,6 +1020,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ):
             required_prefix_token_ids: Optional[List[int]] = None
             required_full_prompt_token_ids: Optional[List[int]] = None
+            streaming_tool_call_session_id: Optional[str] = None
 
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
@@ -988,6 +1028,135 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         worker_self = self
 
         class NeMoRLOpenAIServingChatMixin:
+            async def create_chat_completion_from_streaming_tool_call(
+                self,
+                request,
+                raw_request,
+                *,
+                manager,
+                session_id,
+            ):
+                """Format one same-request final decode through vLLM OpenAI APIs."""
+                if (
+                    request.stream
+                    or request.use_beam_search
+                    or request.n
+                    not in (
+                        None,
+                        1,
+                    )
+                ):
+                    raise StreamingToolCallFinalizationUnavailableError(
+                        "same-request final decode requires non-streaming n=1 sampling"
+                    )
+
+                tokenizer = self.renderer.tokenizer
+                assert tokenizer is not None
+                chat_template_kwargs = self._effective_chat_template_kwargs(request)
+                reasoning_parser = None
+                if self.reasoning_parser_cls:
+                    reasoning_parser = self.reasoning_parser_cls(
+                        tokenizer,
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
+
+                rendered = await self.render_chat_request(request)
+                if isinstance(rendered, ErrorResponse):
+                    return rendered
+                conversation, engine_inputs = rendered
+                if len(engine_inputs) != 1:
+                    raise StreamingToolCallFinalizationUnavailableError(
+                        "same-request final decode requires exactly one rendered prompt"
+                    )
+                engine_input = engine_inputs[0]
+                prompt_token_ids = self._extract_prompt_components(
+                    engine_input
+                ).token_ids
+                if prompt_token_ids is None:
+                    raise StreamingToolCallFinalizationUnavailableError(
+                        "same-request final decode requires prompt token IDs"
+                    )
+
+                lora_request = self._maybe_get_adapters(
+                    request,
+                    supports_default_mm_loras=True,
+                )
+                if lora_request is not None:
+                    raise StreamingToolCallFinalizationUnavailableError(
+                        "same-request final decode does not support LoRA adapters"
+                    )
+                if self._get_data_parallel_rank(raw_request) is not None:
+                    raise StreamingToolCallFinalizationUnavailableError(
+                        "same-request final decode does not support routed DP ranks"
+                    )
+
+                max_tokens = get_max_tokens(
+                    self.model_config.max_model_len,
+                    (
+                        request.max_completion_tokens
+                        if request.max_completion_tokens is not None
+                        else request.max_tokens
+                    ),
+                    self._extract_prompt_len(engine_input),
+                    self.default_sampling_params,
+                    self.override_max_tokens,
+                )
+                sampling_params = request.to_sampling_params(
+                    max_tokens,
+                    self.default_sampling_params,
+                )
+                if sampling_params.stop or sampling_params.structured_outputs:
+                    raise StreamingToolCallFinalizationUnavailableError(
+                        "same-request final decode does not support stop strings or "
+                        "structured output"
+                    )
+                sampling_params.output_kind = RequestOutputKind.DELTA
+
+                result_generator = await manager.finalize(
+                    session_id=session_id,
+                    final_prompt_token_ids=list(prompt_token_ids),
+                    final_sampling_params=sampling_params,
+                )
+
+                async def aggregate_final_outputs():
+                    final_output = None
+                    async for output in result_generator:
+                        if not output.outputs:
+                            continue
+                        if final_output is None:
+                            final_output = output
+                        else:
+                            final_output.add(output, aggregate=True)
+                            final_output.num_cached_tokens = output.num_cached_tokens
+                            final_output.metrics = output.metrics
+                            final_output.kv_transfer_params = output.kv_transfer_params
+                    if final_output is not None:
+                        final_output.prompt_token_ids = list(prompt_token_ids)
+                        yield final_output
+
+                request_id = (
+                    f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+                )
+                request_metadata = RequestResponseMetadata(request_id=request_id)
+                if raw_request:
+                    raw_request.state.request_metadata = request_metadata
+                model_name = self.models.model_name(lora_request)
+                response = await self.chat_completion_full_generator(
+                    request,
+                    aggregate_final_outputs(),
+                    request_id,
+                    model_name,
+                    conversation,
+                    tokenizer,
+                    request_metadata,
+                    reasoning_parser,
+                )
+                if isinstance(response, ErrorResponse) and response.error.code >= 500:
+                    raise StreamingToolCallSessionClosedError(
+                        "same-request final decode produced no usable output"
+                    )
+                return response
+
             async def chat_completion_full_generator(
                 self,
                 request,
@@ -1079,10 +1248,80 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
 
+            same_request_status = None
+            same_request_session_id = request.streaming_tool_call_session_id
+            same_request_enabled = bool(
+                same_request_session_id
+                and streaming_config
+                and streaming_config.get("same_request_final_decode", False)
+            )
             try:
-                generator = await openai_serving_chat.create_chat_completion(
-                    request, raw_request
-                )
+                if same_request_enabled:
+                    assert same_request_session_id is not None
+                    manager = get_streaming_tool_call_manager()
+                    fallback_request = request.model_copy(deep=True)
+                    try:
+                        generator = await openai_serving_chat.create_chat_completion_from_streaming_tool_call(
+                            request,
+                            raw_request,
+                            manager=manager,
+                            session_id=same_request_session_id,
+                        )
+                    except StreamingToolCallError as error:
+                        await manager.abort(session_id=same_request_session_id)
+                        request = fallback_request
+                        request.streaming_tool_call_session_id = None
+                        if isinstance(
+                            error,
+                            StreamingToolCallSessionNotFoundError,
+                        ):
+                            same_request_status = "fallback_missing"
+                        elif isinstance(
+                            error,
+                            (
+                                StreamingToolCallFinalizationUnavailableError,
+                                StreamingToolCallPrefixMismatchError,
+                            ),
+                        ):
+                            same_request_status = "fallback_incompatible"
+                        elif isinstance(
+                            error,
+                            StreamingToolCallSessionClosedError,
+                        ):
+                            same_request_status = "fallback_engine_error"
+                        else:
+                            same_request_status = "fallback_error"
+                        LOGGER.warning(
+                            "Same-request final decode fell back (%s): %s",
+                            same_request_status,
+                            error,
+                        )
+                        generator = await openai_serving_chat.create_chat_completion(
+                            request,
+                            raw_request,
+                        )
+                    except Exception as error:
+                        await manager.abort(session_id=same_request_session_id)
+                        request = fallback_request
+                        request.streaming_tool_call_session_id = None
+                        same_request_status = "fallback_error"
+                        LOGGER.exception(
+                            "Same-request final decode failed open after an "
+                            "unexpected integration error: %s",
+                            error,
+                        )
+                        generator = await openai_serving_chat.create_chat_completion(
+                            request,
+                            raw_request,
+                        )
+                    else:
+                        same_request_status = "used"
+                        if isinstance(generator, ErrorResponse):
+                            await manager.abort(session_id=same_request_session_id)
+                else:
+                    generator = await openai_serving_chat.create_chat_completion(
+                        request, raw_request
+                    )
             except VLLMValidationError as e:
                 # vLLM 0.20 raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
@@ -1105,9 +1344,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(
-                    content=model_dump_chat_response_with_routed_experts(generator)
+                response_content = model_dump_chat_response_with_routed_experts(
+                    generator
                 )
+                if same_request_status is not None:
+                    response_content["streaming_tool_call_same_request_status"] = (
+                        same_request_status
+                    )
+                return JSONResponse(content=response_content)
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
 
@@ -1707,6 +1951,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             prefill_background_failed_tokens = 0
             prefill_background_enqueue_seconds = 0.0
             prefill_background_completion_seconds = 0.0
+            prefill_same_request_session_sealed = 0
             if request.prefill:
                 prefill_manager = get_streaming_tool_call_manager()
                 background_prefill_completion = bool(
@@ -1717,10 +1962,19 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 try:
                     if request.final:
                         assert result.tokens is not None
-                        prefill_close_result = await prefill_manager.close(
-                            session_id=request.session_id,
-                            final_prompt_token_ids=result.tokens,
-                        )
+                        if streaming_config and streaming_config.get(
+                            "same_request_final_decode", False
+                        ):
+                            prefill_close_result = await prefill_manager.seal(
+                                session_id=request.session_id,
+                                final_prompt_token_ids=result.tokens,
+                            )
+                            prefill_same_request_session_sealed = 1
+                        else:
+                            prefill_close_result = await prefill_manager.close(
+                                session_id=request.session_id,
+                                final_prompt_token_ids=result.tokens,
+                            )
                     else:
                         prefill_prompt_token_ids = authoritative_token_ids
                         if prefill_prompt_token_ids is None:
@@ -1950,6 +2204,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     ),
                     "prefill_background_completion_seconds": (
                         prefill_background_completion_seconds
+                    ),
+                    "prefill_same_request_session_sealed": (
+                        prefill_same_request_session_sealed
                     ),
                     "prefix_seed_attempts": prefix_seed_attempts,
                     "prefix_seed_successes": prefix_seed_successes,

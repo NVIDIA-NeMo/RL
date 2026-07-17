@@ -217,7 +217,8 @@ stickiness.
 
 ## vLLM Execution Strategy
 
-vLLM 0.17.1 accepts an `AsyncGenerator[StreamingInput, None]` and represents
+The currently validated vLLM 0.20.0 runtime accepts an
+`AsyncGenerator[StreamingInput, None]` and represents
 each input chunk as a continuation of one resumable request. Prompt token IDs
 from later chunks are appended to the active session, allowing their KV state
 to remain resident without starting an independent request for every chunk.
@@ -236,8 +237,10 @@ The v1 resumable prefill request is fixed as follows:
 - Output kind is `DELTA`.
 - Intermediate output text is ignored; only generated token IDs acknowledge
   submitted chunks and contribute to dummy-token accounting.
-- The normal final request remains responsible for output text, tool parsing,
-  generated token IDs, and log probabilities.
+- By default, the normal separate final request remains responsible for output
+  text, tool parsing, generated token IDs, and log probabilities. The optional
+  same-request extension below preserves those responsibilities through the
+  same native formatter while continuing the existing engine request.
 
 The intermediate dummy decode is a performance cost. Chunk sizes must be large
 enough to amortize it. If profiling shows that the dummy decode materially
@@ -248,6 +251,76 @@ independent shadow requests is a fallback, not the preferred architecture.
 vLLM's own chunked-prefill scheduling remains enabled. Application chunks are
 availability and correctness boundaries; `max_num_batched_tokens` continues to
 control the amount of work scheduled in each engine iteration.
+
+### Same-request final-decode extension
+
+Automatic prefix caching only exposes complete physical cache pages to a new
+request. Short tool outputs can therefore complete a valid streaming session
+without making any additional KV reusable by the default separate final
+request. When `same_request_final_decode=true`, the authoritative decode
+continues the already-live resumable engine request instead:
+
+```mermaid
+sequenceDiagram
+    participant Tool as OpenHands command
+    participant Gym as NeMo Gym proxy
+    participant HTTP as NeMo-RL OpenAI server
+    participant Engine as vLLM request
+
+    Tool->>Gym: Stable cumulative output snapshot
+    Gym->>HTTP: Background prefill append
+    HTTP->>Engine: DELTA chunk, priority > 0
+    Engine-->>HTTP: Dummy decode acknowledgement
+    Tool-->>Gym: Final observation
+    Gym->>HTTP: Authoritative final tokenization
+    HTTP->>HTTP: Seal exact settled session
+    Gym->>HTTP: Normal chat request + one-shot session ID
+    HTTP->>HTTP: Render normal authoritative prompt
+    HTTP->>Engine: Append exact final suffix, priority = 0
+    Engine-->>HTTP: Final DELTA outputs
+    HTTP->>HTTP: Aggregate with native full chat formatter
+    HTTP-->>Gym: Normal chat completion + reuse status
+```
+
+`seal` is a zero-wait operation. It succeeds only after at least one prefill
+chunk completed, with no append, acknowledgement, queued input, or background
+task still in flight. It stores the exact authoritative final prompt token IDs
+but leaves the vLLM request live. The next model call independently renders the
+normal chat request and must produce exactly the sealed token IDs. The manager
+then appends only the uncommitted suffix and streams the authoritative decode.
+
+The final continuation uses the request's ordinary sampling parameters with
+`RequestOutputKind.DELTA`. DELTA outputs are aggregated and passed through
+vLLM's native non-streaming chat formatter, preserving reasoning/tool parsing,
+generated token IDs, logprobs, usage, and finish reasons. Intermediate dummy
+outputs remain manager-private and never enter that aggregate.
+
+Background prefill starts at a lower scheduler priority. Two guarded vLLM 0.20
+compatibility patches update the live request's `max_tokens` and priority from
+each continuation chunk, so the final suffix restores foreground priority and
+the full output-token budget. The multi-file priority patch validates every
+expected source snippet under one feature lock before writing any file. If
+either compatibility patch is unavailable, same-request mode refuses to start;
+ordinary generation remains available.
+
+Same-request continuation does not require a complete APC page: partial-page
+KV remains owned by the live engine request. This mode therefore disables only
+the physical cache-page crossing admission gate. Character thresholds, stable
+prefix proof, token holdback, bounded session count, prompt-length checks,
+background scheduling, and fail-open behavior remain unchanged. The default
+separate-final-request mode retains the page-crossing gate.
+
+The extension is currently restricted to non-streaming, single-sequence,
+non-beam requests without stop strings, structured output, LoRA, or routed
+data-parallel rank selection. Missing/expired sessions, unsettled background
+work, prompt mismatch, unsupported parameters, engine errors, and unexpected
+integration exceptions abort the old session and execute the unchanged normal
+request. `asyncio.CancelledError` is not swallowed.
+
+The response reports one of `used`, `fallback_missing`,
+`fallback_incompatible`, `fallback_engine_error`, or `fallback_error`.
+OpenHands and NeMo-RL aggregate attempts, successes, fallbacks, per-status
+counts, and model-call count/time/token totals for used versus fallback calls.
 
 ## Authoritative Prompt and Token Invariants
 

@@ -69,6 +69,20 @@ def _locked_file_patch(file_path: str):
         lock_fd.close()
 
 
+@contextmanager
+def _exclusive_patch_lock(lock_path: str):
+    """Serialize one logical patch that spans multiple source files."""
+    import fcntl
+
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
 def _patch_vllm_init_workers_ray(
     py_executable: str, extra_env_vars: list[str] | None
 ) -> None:
@@ -331,9 +345,122 @@ def _patch_vllm_streaming_session_max_tokens(logger) -> bool:
     return True
 
 
+def _patch_vllm_streaming_session_priority(logger) -> bool:
+    """Allow a final streaming-input chunk to promote its session priority.
+
+    Background prefill uses a lower scheduler priority than foreground model
+    calls. vLLM 0.20 fixes streaming-input priority at request creation, so a
+    same-request final decode would otherwise remain background work. Extend
+    the public ``StreamingInput`` value and the internal continuation update so
+    the authoritative final chunk can explicitly restore priority zero.
+    """
+    try:
+        protocol_file = _get_vllm_file("engine/protocol.py")
+        async_llm_file = _get_vllm_file("v1/engine/async_llm.py")
+        request_file = _get_vllm_file("v1/request.py")
+        scheduler_file = _get_vllm_file("v1/core/sched/scheduler.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate vLLM streaming-input sources for priority patch."
+        )
+        return False
+
+    replacements = (
+        (
+            protocol_file,
+            "    prompt: EngineInput\n"
+            "    sampling_params: SamplingParams | None = None\n",
+            "    prompt: EngineInput\n"
+            "    sampling_params: SamplingParams | None = None\n"
+            "    priority: int | None = None\n",
+        ),
+        (
+            async_llm_file,
+            "                    # TODO(nick): Avoid re-validating reused sampling parameters\n"
+            "                    req = self.input_processor.process_inputs(\n"
+            "                        request_id=internal_req_id,\n"
+            "                        prompt=input_chunk.prompt,\n"
+            "                        params=sp,\n"
+            "                        resumable=True,\n"
+            "                        **inputs,  # type: ignore[arg-type]\n"
+            "                    )\n",
+            "                    chunk_inputs = inputs\n"
+            "                    if input_chunk.priority is not None:\n"
+            "                        chunk_inputs = dict(\n"
+            "                            inputs, priority=input_chunk.priority\n"
+            "                        )\n"
+            "                    # TODO(nick): Avoid re-validating reused sampling parameters\n"
+            "                    req = self.input_processor.process_inputs(\n"
+            "                        request_id=internal_req_id,\n"
+            "                        prompt=input_chunk.prompt,\n"
+            "                        params=sp,\n"
+            "                        resumable=True,\n"
+            "                        **chunk_inputs,  # type: ignore[arg-type]\n"
+            "                    )\n",
+        ),
+        (
+            request_file,
+            "    sampling_params: SamplingParams | None\n\n    @classmethod\n",
+            "    sampling_params: SamplingParams | None\n"
+            "    priority: int\n\n"
+            "    @classmethod\n",
+        ),
+        (
+            request_file,
+            "            arrival_time=request.arrival_time,\n"
+            "            sampling_params=request.sampling_params,\n"
+            "        )\n",
+            "            arrival_time=request.arrival_time,\n"
+            "            sampling_params=request.sampling_params,\n"
+            "            priority=request.priority,\n"
+            "        )\n",
+        ),
+        (
+            scheduler_file,
+            "        assert update.sampling_params.max_tokens is not None\n"
+            "        session.max_tokens = update.sampling_params.max_tokens\n"
+            "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n",
+            "        assert update.sampling_params.max_tokens is not None\n"
+            "        session.max_tokens = update.sampling_params.max_tokens\n"
+            "        session.priority = update.priority\n"
+            "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n",
+        ),
+    )
+
+    # All vLLM worker processes patch the same shared environment. A single
+    # feature-level lock both serializes them and lets us preflight every file
+    # before changing any of them.
+    lock_path = protocol_file + ".streaming_session_priority_patch_lock"
+    with _exclusive_patch_lock(lock_path):
+        source_contents = {}
+        for file_path, old_snippet, new_snippet in replacements:
+            with open(file_path) as source_file:
+                content = source_file.read()
+            source_contents[file_path] = content
+            if new_snippet in content:
+                continue
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply vLLM streaming-session priority patch: "
+                    "expected snippet not found in %s.",
+                    file_path,
+                )
+                return False
+
+        for file_path, old_snippet, new_snippet in replacements:
+            content = source_contents[file_path]
+            if new_snippet in content:
+                continue
+            with open(file_path, "w") as source_file:
+                source_file.write(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Successfully patched vLLM streaming-session priority updates.")
+    return True
+
+
 def _apply_vllm_patches(
     py_executable: str, *, extra_env_vars: list[str] | None = None
-) -> None:
+) -> dict[str, bool]:
     # Import lazily so importing the worker module does not import vLLM.
     from vllm.logger import init_logger
 
@@ -344,4 +471,9 @@ def _apply_vllm_patches(
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)
-    _patch_vllm_streaming_session_max_tokens(patch_logger)
+    max_tokens_supported = _patch_vllm_streaming_session_max_tokens(patch_logger)
+    priority_supported = _patch_vllm_streaming_session_priority(patch_logger)
+    return {
+        "streaming_session_max_tokens": max_tokens_supported,
+        "streaming_session_priority": priority_supported,
+    }
