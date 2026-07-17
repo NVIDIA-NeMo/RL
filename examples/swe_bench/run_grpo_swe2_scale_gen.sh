@@ -549,8 +549,8 @@ export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${PERSISTENT_CACHE}/pip}"
 # shared filesystem rather than a node-local /opt path so every actor sees the
 # environment created by the Gym setup process.
 export NEMO_GYM_VENV_DIR="${PERSISTENT_CACHE}/gym_venvs"
-UV_BIN_DIR="${PERSISTENT_CACHE}/bin"
-UV_BIN="${UV_BIN:-${UV_BIN_DIR}/uv}"
+UV_BIN="${UV_BIN:-${PERSISTENT_CACHE}/bin/uv}"
+UV_BIN_DIR="$(dirname "${UV_BIN}")"
 export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-/opt/ray_venvs}"
 export UV_LINK_MODE=copy
 VLLM_SHARED_VENV="${PERSISTENT_CACHE}/ray_venvs/vllm_shared"
