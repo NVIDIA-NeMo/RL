@@ -57,6 +57,26 @@ def test_streaming_session_max_tokens_patch_rejects_unknown_scheduler(
     assert scheduler.read_text() == "unexpected future implementation\n"
 
 
+def test_streaming_session_max_tokens_patch_accepts_priority_extension(
+    tmp_path, monkeypatch
+) -> None:
+    scheduler = tmp_path / "scheduler.py"
+    priority_extended_update = (
+        "        session.arrival_time = update.arrival_time\n"
+        "        session.sampling_params = update.sampling_params\n"
+        "        assert update.sampling_params.max_tokens is not None\n"
+        "        session.max_tokens = update.sampling_params.max_tokens\n"
+        "        session.priority = update.priority\n"
+        "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n"
+    )
+    scheduler.write_text(priority_extended_update)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _: str(scheduler))
+    logger = MagicMock()
+
+    assert patches._patch_vllm_streaming_session_max_tokens(logger)
+    assert scheduler.read_text() == priority_extended_update
+
+
 def test_streaming_session_priority_patch_is_guarded_and_idempotent(
     tmp_path, monkeypatch
 ) -> None:

@@ -327,9 +327,17 @@ def _patch_vllm_streaming_session_max_tokens(logger) -> bool:
         "        session.max_tokens = update.sampling_params.max_tokens\n"
         "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n"
     )
+    priority_extended_snippet = (
+        "        session.arrival_time = update.arrival_time\n"
+        "        session.sampling_params = update.sampling_params\n"
+        "        assert update.sampling_params.max_tokens is not None\n"
+        "        session.max_tokens = update.sampling_params.max_tokens\n"
+        "        session.priority = update.priority\n"
+        "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n"
+    )
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_snippet in content:
+        if new_snippet in content or priority_extended_snippet in content:
             logger.info("vLLM streaming-session max_tokens patch already applied.")
             return True
         if old_snippet not in content:
