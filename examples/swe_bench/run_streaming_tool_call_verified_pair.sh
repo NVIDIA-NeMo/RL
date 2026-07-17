@@ -217,7 +217,11 @@ submit_arm() {
   bash "${LAUNCHER}"
 
   if [ "${DRY_RUN:-0}" != "1" ]; then
-    cp "${REPO_ROOT}/latest_scale_gen_job_id.txt" "${PAIR_DIR}/${arm}_job_id.txt"
+    if [ "${SUBMIT_MODE:-sbatch}" = "direct" ]; then
+      printf '%s\n' "${SLURM_JOB_ID}" > "${PAIR_DIR}/${arm}_job_id.txt"
+    else
+      cp "${REPO_ROOT}/latest_scale_gen_job_id.txt" "${PAIR_DIR}/${arm}_job_id.txt"
+    fi
   fi
 }
 
@@ -244,7 +248,7 @@ for arm_spec in ${PAIR_ARMS}; do
     exit 1
   fi
   submit_arm "${arm}" "${streaming_enabled}" "${snapshot_poll_interval_seconds}" "${min_chunk_chars}" "${tokenizer_only}" "${final_only_prefill}" "${prefix_seeded_start}" "${prefill_after_admission}" "${compact_request_context}" "${initial_chunk_chars}" "${snapshot_long_poll_timeout_seconds}" "${stable_first_snapshot_prefill}" "${same_request_final_decode}"
-  if [ "${SEQUENTIAL_ARMS}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
+  if [ "${SEQUENTIAL_ARMS}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ] && [ "${SUBMIT_MODE:-sbatch}" != "direct" ]; then
     previous_job_id="$(cat "${REPO_ROOT}/latest_scale_gen_job_id.txt")"
     SBATCH_DEPENDENCY="afterany:${previous_job_id}"
   fi
