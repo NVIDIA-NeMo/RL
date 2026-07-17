@@ -104,6 +104,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional OpenTelemetry instrumentation via nemo-lens (resolved from PyPI).
+# When this extra is not installed, every telemetry site degrades to a ~0-cost
+# no-op through nemo_rl/telemetry/_fallbacks.py.
+telemetry = [
+  "nemo-lens[sdk]>=0.1.0",
+]
 fsdp = [
   # +cu13 wheels from GitHub match torch cu130; PyPI often resolves to +cu12 (libcudart.so.12).
   # https://github.com/Dao-AILab/flash-attention/releases/tag/v2.8.1
