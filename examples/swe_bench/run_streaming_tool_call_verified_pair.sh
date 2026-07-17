@@ -46,7 +46,7 @@ COUNTERFACTUAL_FULL_TOKENIZER_TIMING="${COUNTERFACTUAL_FULL_TOKENIZER_TIMING:-0}
 DETAILED_RUNTIME_METRICS="${DETAILED_RUNTIME_METRICS:-1}"
 BASE_CONCURRENCY="${BASE_CONCURRENCY:-${EXPECTED_COUNT}}"
 # Each PAIR_ARMS entry accepts
-# name:streaming_enabled[:snapshot_poll_seconds[:min_chunk_chars[:tokenizer_only[:final_only_prefill[:prefix_seeded_start[:prefill_after_admission[:compact_request_context[:initial_chunk_chars[:snapshot_long_poll_timeout_seconds[:stable_first_snapshot_prefill]]]]]]]]]].
+# name:streaming_enabled[:snapshot_poll_seconds[:min_chunk_chars[:tokenizer_only[:final_only_prefill[:prefix_seeded_start[:prefill_after_admission[:compact_request_context[:initial_chunk_chars[:snapshot_long_poll_timeout_seconds[:stable_first_snapshot_prefill[:same_request_final_decode]]]]]]]]]]].
 SNAPSHOT_POLL_INTERVAL_SECONDS="${SNAPSHOT_POLL_INTERVAL_SECONDS:-0.1}"
 SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS="${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS:-1.0}"
 STREAMING_INITIAL_CHUNK_CHARS="${STREAMING_INITIAL_CHUNK_CHARS:-256}"
@@ -104,6 +104,7 @@ submit_arm() {
   local requested_initial_chunk_chars="${10:-}"
   local requested_snapshot_long_poll_timeout_seconds="${11:-}"
   local requested_stable_first_snapshot_prefill="${12:-}"
+  local requested_same_request_final_decode="${13:-}"
   local exact_incremental_tokenizer="${EXACT_INCREMENTAL_TOKENIZER}"
   local final_only_incremental_tokenizer="${FINAL_ONLY_INCREMENTAL_TOKENIZER}"
   local final_only_prefill="${requested_final_only_prefill:-${FINAL_ONLY_PREFILL}}"
@@ -114,6 +115,7 @@ submit_arm() {
   local initial_chunk_chars="${requested_initial_chunk_chars:-${STREAMING_INITIAL_CHUNK_CHARS}}"
   local snapshot_long_poll_timeout_seconds="${requested_snapshot_long_poll_timeout_seconds:-${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS}}"
   local stable_first_snapshot_prefill="${requested_stable_first_snapshot_prefill:-${STABLE_FIRST_SNAPSHOT_PREFILL}}"
+  local same_request_final_decode="${requested_same_request_final_decode:-0}"
   local arm_persistent_cache=""
   if [ -n "${PAIR_SHARED_PERSISTENT_CACHE}" ]; then
     arm_persistent_cache="${PAIR_SHARED_PERSISTENT_CACHE}"
@@ -130,6 +132,7 @@ submit_arm() {
     prefill_after_admission=0
     background_prefill_completion=0
     stable_first_snapshot_prefill=0
+    same_request_final_decode=0
     compact_request_context=0
   elif [ "${exact_incremental_tokenizer}" != "1" ]; then
     final_only_incremental_tokenizer=0
@@ -138,6 +141,7 @@ submit_arm() {
     prefill_after_admission=0
     background_prefill_completion=0
     stable_first_snapshot_prefill=0
+    same_request_final_decode=0
     compact_request_context=0
   elif [ "${final_only_incremental_tokenizer}" != "1" ]; then
     final_only_prefill=0
@@ -145,14 +149,25 @@ submit_arm() {
     prefill_after_admission=0
     background_prefill_completion=0
     stable_first_snapshot_prefill=0
+    same_request_final_decode=0
   elif [ "${final_only_prefill}" != "1" ]; then
     prefix_seeded_start=0
     prefill_after_admission=0
     background_prefill_completion=0
     stable_first_snapshot_prefill=0
+    same_request_final_decode=0
   elif [ "${prefill_after_admission}" != "1" ] || [ "${prefix_seeded_start}" != "1" ]; then
     background_prefill_completion=0
     stable_first_snapshot_prefill=0
+    same_request_final_decode=0
+  fi
+  if [ "${requested_same_request_final_decode:-0}" = "1" ] && [ "${same_request_final_decode}" != "1" ]; then
+    echo "ERROR: same-request final decode arm '${arm}' does not enable the complete prefill path" >&2
+    exit 1
+  fi
+  if [ "${same_request_final_decode}" = "1" ] && [ "${background_prefill_completion}" != "1" ]; then
+    echo "ERROR: same-request final decode arm '${arm}' requires background prefill completion" >&2
+    exit 1
   fi
   local counterfactual_full_tokenizer_timing="${COUNTERFACTUAL_FULL_TOKENIZER_TIMING}"
   if [ "${exact_incremental_tokenizer}" != "1" ]; then
@@ -179,6 +194,7 @@ submit_arm() {
   PREFIX_SEEDED_START="${prefix_seeded_start}" \
   PREFILL_AFTER_ADMISSION="${prefill_after_admission}" \
   BACKGROUND_PREFILL_COMPLETION="${background_prefill_completion}" \
+  SAME_REQUEST_FINAL_DECODE="${same_request_final_decode}" \
   STABLE_FIRST_SNAPSHOT_PREFILL="${stable_first_snapshot_prefill}" \
   COMPACT_REQUEST_CONTEXT="${compact_request_context}" \
   FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS="${FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS:-0.0}" \
@@ -218,15 +234,16 @@ for arm_spec in ${PAIR_ARMS}; do
   initial_chunk_chars=""
   snapshot_long_poll_timeout_seconds=""
   stable_first_snapshot_prefill=""
+  same_request_final_decode=""
   extra=""
-  IFS=':' read -r arm streaming_enabled snapshot_poll_interval_seconds min_chunk_chars tokenizer_only final_only_prefill prefix_seeded_start prefill_after_admission compact_request_context initial_chunk_chars snapshot_long_poll_timeout_seconds stable_first_snapshot_prefill extra <<< "${arm_spec}"
+  IFS=':' read -r arm streaming_enabled snapshot_poll_interval_seconds min_chunk_chars tokenizer_only final_only_prefill prefix_seeded_start prefill_after_admission compact_request_context initial_chunk_chars snapshot_long_poll_timeout_seconds stable_first_snapshot_prefill same_request_final_decode extra <<< "${arm_spec}"
   snapshot_poll_interval_seconds="${snapshot_poll_interval_seconds:-${SNAPSHOT_POLL_INTERVAL_SECONDS}}"
   tokenizer_only="${tokenizer_only:-0}"
-  if [ -z "${arm}" ] || [ -n "${extra}" ] || { [ "${streaming_enabled}" != "0" ] && [ "${streaming_enabled}" != "1" ]; } || { [ -n "${min_chunk_chars}" ] && ! [[ "${min_chunk_chars}" =~ ^[1-9][0-9]*$ ]]; } || { [ "${tokenizer_only}" != "0" ] && [ "${tokenizer_only}" != "1" ]; } || { [ "${tokenizer_only}" = "1" ] && [ "${streaming_enabled}" != "1" ]; } || { [ -n "${final_only_prefill}" ] && [ "${final_only_prefill}" != "0" ] && [ "${final_only_prefill}" != "1" ]; } || { [ "${final_only_prefill:-0}" = "1" ] && [ "${tokenizer_only}" != "1" ]; } || { [ -n "${prefix_seeded_start}" ] && [ "${prefix_seeded_start}" != "0" ] && [ "${prefix_seeded_start}" != "1" ]; } || { [ "${prefix_seeded_start:-0}" = "1" ] && [ "${final_only_prefill:-0}" != "1" ]; } || { [ -n "${prefill_after_admission}" ] && [ "${prefill_after_admission}" != "0" ] && [ "${prefill_after_admission}" != "1" ]; } || { [ "${prefill_after_admission:-0}" = "1" ] && [ "${final_only_prefill:-0}" != "1" ]; } || { [ -n "${compact_request_context}" ] && [ "${compact_request_context}" != "0" ] && [ "${compact_request_context}" != "1" ]; } || { [ "${compact_request_context:-0}" = "1" ] && [ "${tokenizer_only}" != "1" ]; } || { [ -n "${initial_chunk_chars}" ] && ! [[ "${initial_chunk_chars}" =~ ^[1-9][0-9]*$ ]]; } || { [ -n "${snapshot_long_poll_timeout_seconds}" ] && ! [[ "${snapshot_long_poll_timeout_seconds}" =~ ^(0\.[0-9]*[1-9][0-9]*|[1-4](\.[0-9]+)?|5(\.0+)?)$ ]]; } || { [ -n "${stable_first_snapshot_prefill}" ] && [ "${stable_first_snapshot_prefill}" != "0" ] && [ "${stable_first_snapshot_prefill}" != "1" ]; } || { [ "${stable_first_snapshot_prefill:-0}" = "1" ] && { [ "${prefill_after_admission:-0}" != "1" ] || [ "${prefix_seeded_start:-0}" != "1" ]; }; }; then
-    echo "ERROR: invalid PAIR_ARMS entry '${arm_spec}'; expected name:streaming_enabled[:poll_seconds[:min_chunk_chars[:tokenizer_only[:final_only_prefill[:prefix_seeded_start[:prefill_after_admission[:compact_request_context[:initial_chunk_chars[:snapshot_long_poll_timeout_seconds[:stable_first_snapshot_prefill]]]]]]]]]]" >&2
+  if [ -z "${arm}" ] || [ -n "${extra}" ] || { [ "${streaming_enabled}" != "0" ] && [ "${streaming_enabled}" != "1" ]; } || { [ -n "${min_chunk_chars}" ] && ! [[ "${min_chunk_chars}" =~ ^[1-9][0-9]*$ ]]; } || { [ "${tokenizer_only}" != "0" ] && [ "${tokenizer_only}" != "1" ]; } || { [ "${tokenizer_only}" = "1" ] && [ "${streaming_enabled}" != "1" ]; } || { [ -n "${final_only_prefill}" ] && [ "${final_only_prefill}" != "0" ] && [ "${final_only_prefill}" != "1" ]; } || { [ "${final_only_prefill:-0}" = "1" ] && [ "${tokenizer_only}" != "1" ]; } || { [ -n "${prefix_seeded_start}" ] && [ "${prefix_seeded_start}" != "0" ] && [ "${prefix_seeded_start}" != "1" ]; } || { [ "${prefix_seeded_start:-0}" = "1" ] && [ "${final_only_prefill:-0}" != "1" ]; } || { [ -n "${prefill_after_admission}" ] && [ "${prefill_after_admission}" != "0" ] && [ "${prefill_after_admission}" != "1" ]; } || { [ "${prefill_after_admission:-0}" = "1" ] && [ "${final_only_prefill:-0}" != "1" ]; } || { [ -n "${compact_request_context}" ] && [ "${compact_request_context}" != "0" ] && [ "${compact_request_context}" != "1" ]; } || { [ "${compact_request_context:-0}" = "1" ] && [ "${tokenizer_only}" != "1" ]; } || { [ -n "${initial_chunk_chars}" ] && ! [[ "${initial_chunk_chars}" =~ ^[1-9][0-9]*$ ]]; } || { [ -n "${snapshot_long_poll_timeout_seconds}" ] && ! [[ "${snapshot_long_poll_timeout_seconds}" =~ ^(0\.[0-9]*[1-9][0-9]*|[1-4](\.[0-9]+)?|5(\.0+)?)$ ]]; } || { [ -n "${stable_first_snapshot_prefill}" ] && [ "${stable_first_snapshot_prefill}" != "0" ] && [ "${stable_first_snapshot_prefill}" != "1" ]; } || { [ "${stable_first_snapshot_prefill:-0}" = "1" ] && { [ "${prefill_after_admission:-0}" != "1" ] || [ "${prefix_seeded_start:-0}" != "1" ]; }; } || { [ -n "${same_request_final_decode}" ] && [ "${same_request_final_decode}" != "0" ] && [ "${same_request_final_decode}" != "1" ]; }; then
+    echo "ERROR: invalid PAIR_ARMS entry '${arm_spec}'; expected name:streaming_enabled[:poll_seconds[:min_chunk_chars[:tokenizer_only[:final_only_prefill[:prefix_seeded_start[:prefill_after_admission[:compact_request_context[:initial_chunk_chars[:snapshot_long_poll_timeout_seconds[:stable_first_snapshot_prefill[:same_request_final_decode]]]]]]]]]]]" >&2
     exit 1
   fi
-  submit_arm "${arm}" "${streaming_enabled}" "${snapshot_poll_interval_seconds}" "${min_chunk_chars}" "${tokenizer_only}" "${final_only_prefill}" "${prefix_seeded_start}" "${prefill_after_admission}" "${compact_request_context}" "${initial_chunk_chars}" "${snapshot_long_poll_timeout_seconds}" "${stable_first_snapshot_prefill}"
+  submit_arm "${arm}" "${streaming_enabled}" "${snapshot_poll_interval_seconds}" "${min_chunk_chars}" "${tokenizer_only}" "${final_only_prefill}" "${prefix_seeded_start}" "${prefill_after_admission}" "${compact_request_context}" "${initial_chunk_chars}" "${snapshot_long_poll_timeout_seconds}" "${stable_first_snapshot_prefill}" "${same_request_final_decode}"
   if [ "${SEQUENTIAL_ARMS}" = "1" ] && [ "${DRY_RUN:-0}" != "1" ]; then
     previous_job_id="$(cat "${REPO_ROOT}/latest_scale_gen_job_id.txt")"
     SBATCH_DEPENDENCY="afterany:${previous_job_id}"

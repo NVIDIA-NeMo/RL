@@ -70,6 +70,12 @@ class StreamingToolCallConfig(TypedDict):
             background prefill requests. Foreground requests use priority zero,
             and larger values run later. Background completion automatically
             enables vLLM's priority scheduler. The recommended default is 1.
+        same_request_final_decode: Whether a settled background prefill session
+            appends the authoritative final prompt suffix and performs final
+            generation in that same vLLM request. Incompatible, missing, or
+            in-flight sessions fail open to the unchanged foreground request.
+            The recommended default is false while this optimization is being
+            validated.
         compact_request_context: Whether sequence-zero tokenizer requests
             register their immutable chat context so later sequence-numbered
             requests send only cumulative tool output. Both HTTP hops rebuild
@@ -126,6 +132,7 @@ class StreamingToolCallConfig(TypedDict):
     stable_first_snapshot_prefill: NotRequired[bool]
     background_prefill_completion: NotRequired[bool]
     background_prefill_priority: int
+    same_request_final_decode: NotRequired[bool]
     compact_request_context: NotRequired[bool]
     incremental_tokenizer_checkpoint_interval: NotRequired[int]
     counterfactual_full_tokenizer_timing: NotRequired[bool]
