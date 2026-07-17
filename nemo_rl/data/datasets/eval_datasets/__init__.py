@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import cast
-
-from nemo_rl.data.datasets.eval_datasets.aime import AIMEDataset, AIMEVariant
 from nemo_rl.data.datasets.eval_datasets.daily_omni import DailyOmniEvalDataset
 from nemo_rl.data.datasets.eval_datasets.gpqa import GPQADataset
 from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathDataset
@@ -52,13 +49,6 @@ def load_eval_dataset(data_config):
             )
     elif dataset_name == "mmlu_pro":
         base_dataset = MMLUProDataset(
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-    # aime
-    elif dataset_name in ["aime2024", "aime2025", "aime2026"]:
-        base_dataset = AIMEDataset(
-            variant=cast(AIMEVariant, dataset_name[4:]),
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
@@ -120,7 +110,6 @@ def load_eval_dataset(data_config):
 
 
 __all__ = [
-    "AIMEDataset",
     "DailyOmniEvalDataset",
     "GPQADataset",
     "LocalMathDataset",

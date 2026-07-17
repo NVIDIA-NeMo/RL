@@ -183,8 +183,8 @@ policy: &POLICY_BASE
         - milestones: [10]
 
     generation:
-        port_range_low: 11001
-        port_range_high: 15000
+        port_range_low: 3000
+        port_range_high: 4999
         backend: "vllm"
         max_new_tokens: ${..max_total_sequence_length} # refer to local policy/teacher config
         temperature: 1.0
@@ -273,6 +273,6 @@ logger:
 cluster:
     gpus_per_node: 8
     num_nodes: 1
-    master_port_range_low: 25000
-    master_port_range_high: 28000
+    master_port_range_low: 1400
+    master_port_range_high: 1999
     segment_size: null

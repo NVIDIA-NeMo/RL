@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -90,6 +91,10 @@ class CheckpointingConfig(TypedDict):
         the metric should be taken from the validation or training metrics.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
+    ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
+    ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
+        When set, a checkpoint is saved every ft_save_period steps for crash recovery.
+        Requires ft_keep_latest_k to control how many of these are retained.
     model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).
     save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
     model_cache_dir (str): Directory for model cache (for safetensors format).
@@ -104,6 +109,8 @@ class CheckpointingConfig(TypedDict):
     higher_is_better: bool
     save_period: int
     keep_top_k: NotRequired[int]
+    ft_keep_latest_k: NotRequired[int | None]
+    ft_save_period: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
@@ -148,6 +155,8 @@ class CheckpointManager:
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+        self.save_period: int = config["save_period"]
+        self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
         self.save_optimizer = config["save_optimizer"]
 
         # Store nemo-automodel specific config options
@@ -166,19 +175,24 @@ class CheckpointManager:
     @staticmethod
     def get_resume_paths(
         last_checkpoint_path: Optional[PathLike],
+        *,
+        model_component: Literal["policy", "value"] = "policy",
     ) -> tuple[Optional[Path], Optional[Path]]:
         """Get weights and optimizer paths for resuming from a checkpoint.
 
         Args:
             last_checkpoint_path: Path to the last checkpoint, or None if starting fresh.
+            model_component: Model subtree to resolve. Policy is the default for
+                backward compatibility with algorithms that only checkpoint a policy.
 
         Returns:
             Tuple of (weights_path, optimizer_path). Both are None if no checkpoint.
             optimizer_path is None if checkpoint exists but optimizer state was not saved.
         """
         if last_checkpoint_path:
-            weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-            optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+            component_path = Path(last_checkpoint_path) / model_component
+            weights_path = component_path / "weights"
+            optimizer_path = component_path / "optimizer"
 
             # DTensor path
             if optimizer_path.exists():
@@ -226,8 +240,14 @@ class CheckpointManager:
         Returns:
             PathLike: Path to the temporary checkpoint directory.
         """
-        # create new step_{step} directory
         save_dir = self.checkpoint_dir / f"tmp_step_{step}"
+        # Remove a stale tmp_step_{step} left behind by an interrupted prior save
+        # so the new save starts clean.
+        if save_dir.exists():
+            t0 = time.monotonic()
+            shutil.rmtree(save_dir)
+            elapsed = time.monotonic() - t0
+            print(f"Removed stale {save_dir.name} in {elapsed:.2f}s")
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # save training info
@@ -390,51 +410,77 @@ class CheckpointManager:
         return self._pending_checkpoint_path is not None
 
     def remove_old_checkpoints(self, exclude_latest: bool = True) -> None:
-        """Remove checkpoints that are not in the top-k or latest based on the (optional) metric.
+        """Remove checkpoints that exceed the configured retention limits.
 
-        If keep_top_k is set, this method removes all checkpoints except the top-k
-        best ones. The "best" checkpoints are determined by:
-        - If a metric is provided: the given metric value and the higher_is_better setting.
-          When multiple checkpoints have the same metric value, more recent checkpoints
-          (higher step numbers) are preferred.
-        - If no metric is provided: the step number. The most recent k checkpoints are kept.
+        Retention rules are applied as a union — a checkpoint survives if any
+        rule retains it:
+
+        Periodic retention: save_period-aligned checkpoints (step % save_period == 0)
+        are always retained. If keep_top_k is set, only the top-k best among them
+        are kept; otherwise all periodic checkpoints survive indefinitely.
+
+        keep_top_k: limits periodic checkpoint retention to the top-k best.
+        The "best" are determined by:
+        - If a metric is provided: the metric value and the higher_is_better setting.
+          When multiple checkpoints share the same metric value, more recent
+          checkpoints (higher step numbers) are preferred.
+        - If no metric is provided: recency. The most recent k are kept.
+
+        ft_keep_latest_k: retains the most recent k checkpoints for crash recovery.
+        Applied to all checkpoints regardless of save_period alignment.
+        Purely recency-based — metrics are not considered.
 
         Args:
-            exclude_latest (bool): Whether to exclude the latest checkpoint from deletion. (may result in K+1 checkpoints)
+            exclude_latest (bool): Whether to protect the most recent checkpoint
+                from deletion.
         """
-        if self.keep_top_k is None:
-            return
         checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
-        latest_step = (
-            max([step for step, _, _ in checkpoint_history])
-            if checkpoint_history
-            else None
-        )
+        if not checkpoint_history:
+            return
+        if self.keep_top_k is None and self.ft_keep_latest_k is None:
+            return
 
-        if self.metric_name is None:
-            checkpoint_history.sort(key=lambda x: x[0], reverse=True)
-        else:
-            # sort by metric value first, then by step number (for equal metrics, prefer more recent)
-            if self.higher_is_better:
-                # For higher_is_better=True: higher metric values first, then higher step numbers
-                checkpoint_history.sort(
-                    key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
-                    reverse=True,
-                )
+        latest_step = max(step for step, _, _ in checkpoint_history)
+        protected_steps: set[int] = set()
+
+        if exclude_latest:
+            protected_steps.add(latest_step)
+
+        periodic_history = [
+            (s, p, m) for s, p, m in checkpoint_history if s % self.save_period == 0
+        ]
+
+        if self.keep_top_k is not None:
+            # keep_top_k limits which periodic checkpoints survive
+            if self.metric_name is None:
+                periodic_history.sort(key=lambda x: x[0], reverse=True)
             else:
-                # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-                checkpoint_history.sort(
-                    key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0])
-                )
+                # sort by metric value first, then by step number (for equal metrics, prefer more recent)
+                if self.higher_is_better:
+                    # For higher_is_better=True: higher metric values first, then higher step numbers
+                    periodic_history.sort(
+                        key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
+                        reverse=True,
+                    )
+                else:
+                    # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
+                    periodic_history.sort(
+                        key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0]),
+                    )
+            protected_steps.update(s for s, _, _ in periodic_history[: self.keep_top_k])
+        else:
+            # Without keep_top_k, all periodic checkpoints are retained
+            protected_steps.update(s for s, _, _ in periodic_history)
 
-        # remove checkpoints that are not in the top-k
-        for checkpoint in checkpoint_history[self.keep_top_k :]:
-            if exclude_latest and checkpoint[0] == latest_step:
-                continue
-            print(
-                f"Removing checkpoint {checkpoint[1]} due to being outside top-{self.keep_top_k}"
-            )
-            shutil.rmtree(checkpoint[1])
+        # ft_keep_latest_k: retain the most recent k checkpoints for crash recovery
+        if self.ft_keep_latest_k is not None:
+            by_step = sorted(checkpoint_history, key=lambda x: x[0], reverse=True)
+            protected_steps.update(s for s, _, _ in by_step[: self.ft_keep_latest_k])
+
+        for step, path, _ in checkpoint_history:
+            if step not in protected_steps:
+                print(f"Removing checkpoint {path} (step {step})")
+                shutil.rmtree(path)
 
     def get_best_checkpoint_path(self) -> Optional[str]:
         """Get the path to the best checkpoint based on the metric.
