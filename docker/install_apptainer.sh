@@ -45,7 +45,6 @@ install_arm64_from_source() {
     local build_packages=(
         autoconf
         automake
-        build-essential
         dh-apparmor
         libfuse3-dev
         liblzo2-dev
@@ -59,6 +58,7 @@ install_arm64_from_source() {
         zlib1g-dev
     )
     local runtime_packages=(
+        build-essential
         ca-certificates
         cryptsetup
         fakeroot
@@ -75,6 +75,13 @@ install_arm64_from_source() {
         uidmap
         zlib1g
     )
+    local new_build_packages=()
+
+    for package in "${build_packages[@]}"; do
+        if ! dpkg-query -W -f='${db:Status-Abbrev}' "${package}" 2>/dev/null | grep -q '^ii '; then
+            new_build_packages+=("${package}")
+        fi
+    done
 
     apt-get update
     apt-get install -y --no-install-recommends "${runtime_packages[@]}" "${build_packages[@]}"
@@ -98,7 +105,9 @@ install_arm64_from_source() {
     rm -rf "${build_dir}"
 
     apt-get install -y --no-install-recommends "${runtime_packages[@]}"
-    apt-get purge -y --auto-remove "${build_packages[@]}"
+    if ((${#new_build_packages[@]} > 0)); then
+        apt-get purge -y --auto-remove "${new_build_packages[@]}"
+    fi
     rm -rf /usr/local/go /root/go /root/.cache/go-build
 }
 
