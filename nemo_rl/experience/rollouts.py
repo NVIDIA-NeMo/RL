@@ -17,7 +17,6 @@
 
 import asyncio
 import copy
-import json
 import statistics
 import warnings
 from collections import defaultdict
@@ -28,7 +27,6 @@ import ray
 import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
-from wandb import Table
 
 from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
@@ -1965,11 +1963,11 @@ def run_async_nemo_gym_rollout(
                         )
                     )
 
-            # Log the full result
-            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
-            per_agent_metrics[f"{agent_name}/full_result"] = Table(
-                data=to_log, columns=["Full result"]
-            )
+            # Full NeMo Gym results are intentionally not logged for this test.
+            # to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
+            # per_agent_metrics[f"{agent_name}/full_result"] = Table(
+            #     data=to_log, columns=["Full result"]
+            # )
 
         rollout_metrics.update(per_agent_metrics)
 
