@@ -671,7 +671,7 @@ class RayWorkerGroup:
     @property
     def worker_metadata(self) -> list[dict[str, Any]]:
         return self._worker_metadata
-    
+
     @property
     def dp_size(self) -> int:
         """Number of data parallel shards."""
@@ -687,6 +687,8 @@ class RayWorkerGroup:
 
         Called after ``ray.kill`` on a shard's actor so subsequent dispatches skip it.
         Also shrinks ``dp_leader_worker_indices`` so ``dp_size`` reflects the new count.
+        ``indices`` must contain ALL workers in the shard (leader + TP followers);
+        passing a partial list leaves followers in the dispatch set and causes RayActorError.
         """
         if not indices:
             return

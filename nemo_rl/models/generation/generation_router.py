@@ -565,6 +565,10 @@ class GenerationRouter:
     async def _pick_shard(
         self, sticky_key: Optional[str], skip: set[str]
     ) -> Optional[ShardEntry]:
+        # Round-robin and sticky routing are both best-effort. When len(ready)
+        # changes between calls (shard added or removed), _rr_index may skip or
+        # repeat shards for one cycle. Sticky routing silently falls back to a
+        # different shard if the pinned one is in skip.
         async with self._table_lock:
             ready = [s for s in self._shards.values() if s.status == "ready" and s.shard_id not in skip]
             if not ready:
