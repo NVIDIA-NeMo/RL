@@ -589,6 +589,35 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
+                # Multi-LoRA: compute per-adapter global valid-token counts
+                # by all-reducing each adapter's local token count across DP
+                # ranks. This gives MultiAdapterLoss the same per-adapter
+                # global denominator that standalone NLLLoss receives via
+                # ``global_valid_toks`` — essential for bit-equivalence under
+                # DP>1 (without it, each rank divides by its local count and
+                # the DP-reduced gradient is scaled by DP_size instead of 1).
+                if "adapter_names" in batch:
+                    import torch.distributed as _dist
+                    _adapter_names = batch["adapter_names"]
+                    _token_mask = batch.get("token_mask")
+                    _sample_mask = batch.get("sample_mask")
+                    if _token_mask is not None and _sample_mask is not None:
+                        _mask = _token_mask[:, 1:] * _sample_mask.unsqueeze(-1)
+                        _adapter_ids = batch.get("adapter_ids")
+                        if _adapter_ids is not None:
+                            from nousnet.rl.lora.multi.loss import (
+                                GLOBAL_ADAPTER_TOKEN_COUNTS_KEY,
+                                adapter_row_ranges,
+                            )
+                            _ranges = adapter_row_ranges(list(_adapter_names))
+                            _global_counts = {}
+                            for _name, _start, _end in _ranges:
+                                _local = _mask[_start:_end].sum()
+                                _t = _local.cuda().clone()
+                                _dist.all_reduce(_t, group=self.dp_mesh.get_group())
+                                _global_counts[_name] = _t
+                            batch[GLOBAL_ADAPTER_TOKEN_COUNTS_KEY] = _global_counts
+
                 self.optimizer.zero_grad()
 
                 # Get microbatch iterator based on batching strategy
