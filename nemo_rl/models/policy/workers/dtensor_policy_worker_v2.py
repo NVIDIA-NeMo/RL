@@ -72,11 +72,9 @@ def _per_adapter_clip_grad_norm(
     from nousnet.rl.lora.multi.adapter import MultiLinearLoRA
 
     # Collect all MultiLinearLoRA modules
-    multi_modules = [
-        m for m in model.modules() if isinstance(m, MultiLinearLoRA)
-    ]
+    multi_modules = [m for m in model.modules() if isinstance(m, MultiLinearLoRA)]
     if not multi_modules:
-        # Not a multi-LoRA model — fall back to stock global clip
+        # Not a multi-LoRA model — fall back to stock global clip.
         return scale_grads_and_clip_grad_norm(
             max_grad_norm,
             [model],
@@ -88,60 +86,43 @@ def _per_adapter_clip_grad_norm(
 
     n_adapters = multi_modules[0].n_adapters
     max_norm_val = float(max_grad_norm)
-
     all_norms = []
+
+    # Match Automodel's stock clipping semantics exactly: use
+    # torch.nn.utils.get_total_norm on the adapter slice list. For DTensor/FSDP
+    # parameters, indexing ``p.grad[i]`` retains the DTensor placements and the
+    # returned norm is itself a DTensor whose ``full_tensor()`` performs the
+    # required shard reduction. The old implementation instead squared local
+    # shards manually and then all-reduced over the *dp* mesh, double-counting
+    # replicated gradients by sqrt(dp)=sqrt(2) in the 2-GPU probe.
     for adapter_idx in range(n_adapters):
-        # Collect grads for this adapter across all modules
         grads = []
         for m in multi_modules:
-            # lora_A: [N, dim, in_f], lora_B: [N, out_f, dim]
             if m.lora_A.grad is not None:
-                ga = m.lora_A.grad[adapter_idx]  # [dim, in_f]
-                grads.append(ga)
+                grads.append(m.lora_A.grad[adapter_idx])
             if m.lora_B.grad is not None:
-                gb = m.lora_B.grad[adapter_idx]  # [out_f, dim]
-                grads.append(gb)
-
+                grads.append(m.lora_B.grad[adapter_idx])
         if not grads:
             continue
 
-        # Compute per-adapter L2 norm (DTensor-aware)
-        total_sq = torch.tensor(0.0, device=grads[0].device, dtype=torch.float32)
-        for g in grads:
-            if isinstance(g, DTensor):
-                local_sq = g.to_local().float().pow(2).sum()
-                total_sq = total_sq + local_sq
-            else:
-                total_sq = total_sq + g.float().pow(2).sum()
-
-        # All-reduce across DP mesh if needed
-        if device_mesh is not None and "dp" in device_mesh.mesh_dim_names:
-            torch.distributed.all_reduce(
-                total_sq, op=torch.distributed.ReduceOp.SUM,
-                group=device_mesh.get_group("dp"),
-            )
-
-        norm_i = total_sq.sqrt().item()
+        total_norm = torch.nn.utils.get_total_norm(
+            grads, norm_type=norm_type, error_if_nonfinite=False, foreach=True
+        )
+        if isinstance(total_norm, DTensor):
+            total_norm = total_norm.full_tensor()
+        total_norm = total_norm.float()
+        norm_i = float(total_norm.item())
         all_norms.append(norm_i)
 
-        # Clip coefficient for this adapter
-        clip_coef = max_norm_val / (norm_i + 1e-6)
-        if clip_coef < 1.0:
-            for m in multi_modules:
-                if m.lora_A.grad is not None:
-                    g = m.lora_A.grad[adapter_idx]
-                    if isinstance(g, DTensor):
-                        g.to_local().mul_(clip_coef)
-                    else:
-                        g.mul_(clip_coef)
-                if m.lora_B.grad is not None:
-                    g = m.lora_B.grad[adapter_idx]
-                    if isinstance(g, DTensor):
-                        g.to_local().mul_(clip_coef)
-                    else:
-                        g.mul_(clip_coef)
+        # Use PyTorch's own coefficient/clamp implementation so epsilon,
+        # device sync, and saturation match the true-single stock path.
+        torch.nn.utils.clip_grads_with_norm_(
+            grads,
+            max_norm=max_norm_val,
+            total_norm=total_norm,
+            foreach=True,
+        )
 
-    # Report the max per-adapter norm as the aggregate grad_norm
     return max(all_norms) if all_norms else 0.0
 from transformers import (
     AutoProcessor,
