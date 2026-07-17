@@ -222,6 +222,27 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Publish this policy's rank-local weights through ModelExpress.
+
+        Args:
+            version: Monotonically increasing model version.
+            mx_config: an :class:`nemo_rl.distributed.mx_helpers.MxConfig`.
+            kv_scales: Optional named FP8 Q/K/V scale values.
+
+        Returns:
+            One Ray object reference per trainer worker.
+        """
+        raise NotImplementedError(
+            "stream_weights_via_mx is not implemented for this policy worker"
+        )
+
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:
         pass

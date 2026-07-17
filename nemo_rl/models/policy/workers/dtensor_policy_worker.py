@@ -1884,6 +1884,72 @@ class DTensorPolicyWorkerImpl(
         )
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_mx")
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Publish this worker's local DTensor shards through ModelExpress."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache scales are only supported on the Megatron MX path"
+            )
+
+        from nemo_rl.distributed.mx_helpers import (
+            build_v2_publisher,
+            get_dtensor_local_shard,
+            reset_v2_publisher_tensors,
+        )
+
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        try:
+            if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+                tp_size = self.tp_size or 1
+                self._mx_publisher = build_v2_publisher(
+                    rank=self.rank,
+                    # Ray exposes one GPU to each worker, so NIXL must use the
+                    # process-local CUDA index rather than the global rank.
+                    device_id=torch.cuda.current_device(),
+                    fsdp_world_size=self.dp_size,
+                    tp_world_size=tp_size,
+                    pp_world_size=1,
+                    ep_world_size=1,
+                    mx_config=mx_config,
+                )
+                self._mx_publisher.initialize(
+                    model_name=self.cfg["model_name"],
+                    dtype=str(self.dtype).removeprefix("torch."),
+                )
+
+            reset_v2_publisher_tensors(self._mx_publisher)
+            for name, tensor in self.model.state_dict().items():
+                shard_spec = None
+                if isinstance(tensor, DTensor):
+                    local, shard_spec = get_dtensor_local_shard(tensor)
+                else:
+                    local = tensor
+                if local.is_floating_point() and local.dtype != self.dtype:
+                    local = local.to(self.dtype, non_blocking=True)
+                local = local.contiguous()
+
+                self._mx_publisher.add_tensor(
+                    name=name,
+                    tensor=local,
+                    shard_spec=shard_spec,
+                )
+
+            self._mx_publisher.publish(version=int(version))
+            self._mx_publisher.mark_ready()
+        finally:
+            if self.cpu_offload:
+                self.model = self.move_to_cpu(self.model)
+
+    @torch.no_grad()
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
