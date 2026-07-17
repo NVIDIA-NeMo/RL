@@ -25,6 +25,7 @@ from megatron.bridge.models.mamba.mamba_provider import (
     modelopt_mamba_stack_spec,
     transformer_engine_mamba_stack_spec,
 )
+from megatron.core import parallel_state
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.utils.dataset_utils import (
@@ -84,10 +85,63 @@ class _DictDataset(Dataset):
 
 
 def get_forward_loop_func(
+    *,
     is_megatron: bool,
-    calib_dataloader: DataLoader,
+    tokenizer,
+    dataset_name: str,
+    batch_size: int,
+    num_samples: int,
+    sample_length: int,
+    device: torch.device,
 ):
-    """Gets the forward loop function for the model."""
+    """Build the calibration forward loop for the requested backend and data."""
+    if is_megatron and dataset_name == "random":
+        # The upstream helper owns CP/DP sharding for named datasets. The local
+        # synthetic loop has no tokenizer/dataset for that helper to partition.
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size > 1:
+            raise RuntimeError(
+                "Random ModelOpt Megatron calibration requires "
+                f"context_parallel_size=1, got {cp_size}; use a named dataset"
+            )
+
+    if dataset_name != "random" and is_megatron:
+        return get_megatron_calibration_forward_loop(
+            tokenizer,
+            dataset_name=dataset_name,
+            batch_size=batch_size,
+            num_samples=num_samples,
+            seq_length=sample_length,
+            device=device,
+            apply_chat_template=False,
+            pack=True,
+        )
+
+    if dataset_name == "random":
+        calib_dataloader = DataLoader(
+            _DictDataset(
+                {
+                    "input_ids": torch.randint(
+                        0,
+                        100,
+                        (num_samples, sample_length),
+                        device=device,
+                    )
+                }
+            ),
+            batch_size=batch_size,
+        )
+    else:
+        calib_dataloader = get_dataset_dataloader(
+            dataset_name=dataset_name,
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            num_samples=num_samples,
+            device=device,
+            include_labels=False,
+            max_sample_length=sample_length,
+        )
+
     if not is_megatron:
         return create_forward_loop(dataloader=calib_dataloader)
 
@@ -147,47 +201,15 @@ def quantize_model(
             if max_sample_length is not None
             else DEFAULT_CALIB_SAMPLE_LENGTH
         )
-        if data == "random":
-            calib_dataloader = DataLoader(
-                _DictDataset(
-                    {
-                        "input_ids": torch.randint(
-                            0,
-                            100,
-                            (calib_size, calib_sample_length),
-                            device=device,
-                        )
-                    }
-                ),
-                batch_size=calib_batch_size,
-            )
-            forward_loop = get_forward_loop_func(is_megatron, calib_dataloader)
-        elif is_megatron:
-            # ModelOpt owns the Megatron calibration loop so TP/PP/CP/DP use
-            # the same sequence partitioning and data sharding as upstream.
-            forward_loop = get_megatron_calibration_forward_loop(
-                tokenizer,
-                dataset_name=data,
-                batch_size=calib_batch_size,
-                num_samples=calib_size,
-                seq_length=calib_sample_length,
-                device=device,
-                apply_chat_template=False,
-                # Fixed-length packed rows are required by context parallelism
-                # and match Megatron pretraining-style calibration upstream.
-                pack=True,
-            )
-        else:
-            calib_dataloader = get_dataset_dataloader(
-                dataset_name=data,
-                tokenizer=tokenizer,
-                batch_size=calib_batch_size,
-                num_samples=calib_size,
-                device=device,
-                include_labels=False,
-                max_sample_length=calib_sample_length,
-            )
-            forward_loop = get_forward_loop_func(False, calib_dataloader)
+        forward_loop = get_forward_loop_func(
+            is_megatron=is_megatron,
+            tokenizer=tokenizer,
+            dataset_name=data,
+            batch_size=calib_batch_size,
+            num_samples=calib_size,
+            sample_length=calib_sample_length,
+            device=device,
+        )
 
     model = mtq.quantize(model, mtq_cfg, forward_loop)
     mtq.print_quant_summary(model)

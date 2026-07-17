@@ -149,16 +149,10 @@ def _set_quantization_model_specs(model_config, disable_modelopt_layer_spec: boo
 class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
-        if not self._use_real_quant_refit():
-            super().maybe_init_zmq()
-            return
-        if not hasattr(self, "zmq_socket"):
-            self.zmq_context = zmq.Context()
-            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+        super().maybe_init_zmq()
+        if self._use_real_quant_refit():
             self.zmq_socket.setsockopt(zmq.SNDTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
             self.zmq_socket.setsockopt(zmq.RCVTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
-            self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.bind(self.get_zmq_address())
 
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""

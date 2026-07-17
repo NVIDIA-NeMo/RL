@@ -87,54 +87,34 @@ def build_vllm_modelopt_nvfp4_config(
     ``mtq.quantize``. vLLM expects the deployment/export-side
     ``quantization_config`` shape instead.
     """
+    from modelopt.torch.export.convert_hf_config import (
+        convert_hf_quant_config_format,
+    )
+
     if mode not in _NVFP4_REAL_QUANT_MODES:
         raise ValueError(
             f"Unsupported NVFP4 real-quant mode {mode!r}; expected 'w4a4' or 'w4a16'."
         )
-
-    input_activations = None
-    if mode == "w4a4":
-        input_activations = {
-            "dynamic": False,
-            "num_bits": 4,
-            "type": "float",
-            "group_size": 16,
+    return convert_hf_quant_config_format(
+        {
+            "producer": {"name": "modelopt"},
+            "quantization": {
+                "quant_algo": "NVFP4" if mode == "w4a4" else "W4A16_NVFP4",
+                "group_size": 16,
+                "exclude_modules": (
+                    ignore if ignore is not None else list(DEFAULT_NVFP4_IGNORE)
+                ),
+            },
         }
-
-    return {
-        "quant_method": "modelopt",
-        "config_groups": {
-            "group_0": {
-                "input_activations": input_activations,
-                "weights": {
-                    "dynamic": False,
-                    "num_bits": 4,
-                    "type": "float",
-                    "group_size": 16,
-                },
-                "targets": ["Linear"],
-            }
-        },
-        "ignore": ignore if ignore is not None else list(DEFAULT_NVFP4_IGNORE),
-        "quant_algo": "NVFP4",
-        "quant_mode": f"{mode}_nvfp4",
-        "weight_only": mode == "w4a16",
-        "group_size": 16,
-        "producer": {"name": "modelopt"},
-    }
+    )
 
 
 def _resolve_effective_quantizer_formats(
-    quant_cfg: object,
+    quant_cfg: Sequence[Mapping[str, Any]],
     *,
     source: str,
 ) -> tuple[list[object], list[object]]:
     """Resolve enabled weight and input formats from ordered ModelOpt entries."""
-    if not isinstance(quant_cfg, Sequence) or isinstance(quant_cfg, (str, bytes)):
-        raise ValueError(
-            f"Quantization config {source!r} must contain a list-valued 'quant_cfg'."
-        )
-
     states: dict[str, dict[str, tuple[bool, object | None]]] = {
         "weight_quantizer": {},
         "input_quantizer": {},
@@ -142,46 +122,16 @@ def _resolve_effective_quantizer_formats(
 
     def _updated_state(
         current: tuple[bool, object | None],
-        entry: Mapping,
-        *,
-        pattern: str,
+        entry: Mapping[str, Any],
     ) -> tuple[bool, object | None]:
         enabled, format_cfg = current
-        has_format = entry.get("cfg") is not None
-        has_enable = "enable" in entry
-        if not has_format and not has_enable:
-            raise ValueError(
-                f"Quantization config {source!r} has an ineffective entry for "
-                f"{pattern!r}; expected 'cfg', 'enable', or both."
-            )
-
-        if has_format:
+        if entry.get("cfg") is not None:
             format_cfg = entry["cfg"]
-        if has_enable:
-            enable = entry["enable"]
-            if not isinstance(enable, bool):
-                raise ValueError(
-                    f"Quantization config {source!r} has non-boolean 'enable' for "
-                    f"{pattern!r}."
-                )
-            enabled = enable
-        else:
-            enabled = True
+        enabled = entry["enable"]
         return enabled, format_cfg
 
-    for index, entry in enumerate(quant_cfg):
-        if not isinstance(entry, Mapping):
-            raise ValueError(
-                f"Quantization config {source!r} has a non-mapping quant_cfg entry "
-                f"at index {index}."
-            )
-
-        pattern = entry.get("quantizer_name")
-        if not isinstance(pattern, str):
-            raise ValueError(
-                f"Quantization config {source!r} has a quant_cfg entry without a "
-                f"string 'quantizer_name' at index {index}."
-            )
+    for entry in quant_cfg:
+        pattern = entry["quantizer_name"]
 
         # Parent-scoped overrides describe exclusions, not a model-wide format.
         if entry.get("parent_class") is not None:
@@ -198,7 +148,6 @@ def _resolve_effective_quantizer_formats(
                     kind_states[existing_pattern] = _updated_state(
                         current,
                         entry,
-                        pattern=pattern,
                     )
             continue
 
@@ -219,12 +168,10 @@ def _resolve_effective_quantizer_formats(
                 kind_states[existing_pattern] = _updated_state(
                     current,
                     entry,
-                    pattern=pattern,
                 )
         kind_states[pattern] = _updated_state(
             kind_states.get(pattern, (False, None)),
             entry,
-            pattern=pattern,
         )
 
     weight_formats = [
@@ -298,8 +245,14 @@ def resolve_nvfp4_real_quant_mode(quant_cfg: str) -> NVFP4RealQuantMode:
     if not isinstance(quant_cfg, str) or not quant_cfg:
         raise ValueError("NVFP4 real quantization requires a non-empty quant_cfg.")
 
+    from modelopt.torch.quantization.config import QuantizeConfig
+
     resolved = resolve_quant_cfg(quant_cfg)
-    entries = resolved["quant_cfg"]
+    normalized = QuantizeConfig(**resolved)
+    entries = [
+        entry.model_dump(mode="python", exclude_none=True)
+        for entry in normalized.quant_cfg
+    ]
 
     weight_formats, input_formats = _resolve_effective_quantizer_formats(
         entries, source=quant_cfg

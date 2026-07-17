@@ -131,10 +131,12 @@ def test_modelopt_policy_worker_uses_real_quant_refit_timeout(monkeypatch):
     timeout = megatron_quant_policy_worker.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
     assert events == [
         ("socket", megatron_quant_policy_worker.zmq.REQ),
-        ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, timeout),
-        ("setsockopt", megatron_quant_policy_worker.zmq.RCVTIMEO, timeout),
+        ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, 120_000),
+        ("setsockopt", megatron_quant_policy_worker.zmq.RCVTIMEO, 120_000),
         ("setsockopt", megatron_quant_policy_worker.zmq.LINGER, 0),
         ("bind", "ipc:///tmp/modelopt-test.sock"),
+        ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, timeout),
+        ("setsockopt", megatron_quant_policy_worker.zmq.RCVTIMEO, timeout),
     ]
 
 
@@ -274,7 +276,7 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
 @requires_weight_folding
 def test_iter_real_quant_refit_params_exports_w4a4_mode():
     worker = _make_real_quant_worker()
-    quant_cfg = "examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml"
+    quant_cfg = "NVFP4_EXPERTS_ONLY_CFG"
     worker.cfg["quant_cfg"] = quant_cfg
     worker.cfg["generation"]["quant_cfg"] = quant_cfg
 
@@ -287,9 +289,7 @@ def test_iter_real_quant_refit_params_exports_w4a4_mode():
 @requires_weight_folding
 def test_iter_real_quant_refit_params_rejects_policy_generation_mode_mismatch():
     worker = _make_real_quant_worker()
-    worker.cfg["generation"]["quant_cfg"] = (
-        "examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml"
-    )
+    worker.cfg["generation"]["quant_cfg"] = "NVFP4_EXPERTS_ONLY_CFG"
 
     with pytest.raises(ValueError, match="matching policy and generation"):
         list(worker._iter_real_quant_refit_params())

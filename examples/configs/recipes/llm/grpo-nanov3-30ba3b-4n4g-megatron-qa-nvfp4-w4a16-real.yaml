@@ -8,8 +8,6 @@ policy:
   model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
   tokenizer:
     name: ${policy.model_name}
-  quant_calib_size: 16
-  quant_sequence_length: 1024
   generation:
     real_quant: true
     # Nano3-specific paths that stay in BF16 during real-quant rollout.

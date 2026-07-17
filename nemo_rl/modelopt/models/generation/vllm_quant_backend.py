@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
 import os
-import re
 import types
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
@@ -28,48 +27,23 @@ from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     matches_quant_ignore_pattern,
 )
-from nemo_rl.models.generation.vllm.vllm_backend import VllmInternalWorkerExtension
-from nemo_rl.models.policy.utils import (
-    IPCProtocol,
-    calculate_aligned_size,
-    rebuild_cuda_tensor_from_ipc,
+from nemo_rl.models.generation.vllm.vllm_backend import (
+    IPCWeightManifestError,
+    VllmInternalWorkerExtension,
+    WeightUpdateFinalizer,
+    WeightUpdateTransport,
 )
-from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
 _FUSED_MODELOPT_MOE_SUFFIXES = {
     ".experts.w13_weight": "w13_weight",
     ".experts.w13_weight_scale": "w13_weight_scale",
     ".experts.w13_weight_scale_2": "w13_weight_scale_2",
-    ".experts.up_proj": "up_proj.weight",
-    ".experts.up_proj_scale": "up_proj.weight_scale",
-    ".experts.up_proj_scale_2": "up_proj.weight_scale_2",
-    ".experts.up_proj_input_scale": "up_proj.input_scale",
     ".experts.w2_weight": "down_proj.weight",
     ".experts.w2_weight_scale": "down_proj.weight_scale",
     ".experts.w2_weight_scale_2": "down_proj.weight_scale_2",
     ".experts.w13_input_scale": "w13_input_scale",
     ".experts.w2_input_scale": "w2_input_scale",
 }
-_FUSED_MODELOPT_MOE_DIRECT_SCALE_SUFFIXES = {
-    ".experts.w13_weight_scale_2": "w13_weight_scale_2",
-    ".experts.w2_weight_scale_2": "w2_weight_scale_2",
-    ".experts.up_proj_scale_2": "w13_weight_scale_2",
-    ".experts.up_proj_input_scale": "w13_input_scale",
-    ".experts.w13_input_scale": "w13_input_scale",
-    ".experts.w2_input_scale": "w2_input_scale",
-}
-_EXPERT_MODELOPT_SCALE_RE = re.compile(
-    r"^(?P<prefix>.+)\.experts\.(?P<expert>\d+)\."
-    r"(?P<projection>gate_proj|up_proj|down_proj)\."
-    r"(?P<scale>input_scale|weight_scale_2)$"
-)
-
-
-def _format_refit_key_error(label: str, keys: set[str]) -> str:
-    """Format a bounded refit-key diagnostic."""
-    ordered = sorted(keys)
-    suffix = " ..." if len(ordered) > 8 else ""
-    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
 
 
 def _match_fused_modelopt_moe_weight(name: str) -> tuple[str, str] | None:
@@ -81,10 +55,6 @@ def _match_fused_modelopt_moe_weight(name: str) -> tuple[str, str] | None:
         ),
         None,
     )
-
-
-def _is_fused_modelopt_moe_weight(name: str) -> bool:
-    return _match_fused_modelopt_moe_weight(name) is not None
 
 
 def _w13_num_shards_from_state_dict_info(
@@ -102,9 +72,7 @@ def _w13_num_shards_from_state_dict_info(
             continue
         suffix, target = matched
         prefix = name[: -len(suffix)]
-        if target.startswith("up_proj."):
-            target = "w13_" + target.removeprefix("up_proj.")
-        elif target.startswith("down_proj."):
+        if target.startswith("down_proj."):
             target = "w2_" + target.removeprefix("down_proj.")
         targets_by_prefix.setdefault(prefix, set()).add(target)
         if target == "w13_input_scale":
@@ -213,7 +181,7 @@ def _batch_fused_modelopt_moe_weights(
             batched.extend(
                 (
                     f"{prefix}.experts.0.{projection}.{target_suffix}",
-                    shard.contiguous(),
+                    shard,
                 )
                 for projection, shard in (
                     ("gate_proj", gate),
@@ -252,20 +220,6 @@ def _batch_fused_modelopt_moe_weights(
                         expert_scale[1],
                     )
                 )
-            continue
-
-        if target == "up_proj.input_scale":
-            if tensor.ndim == 2 and tensor.shape[1] == 1:
-                tensor = tensor[:, 0]
-            if tensor.ndim != 1:
-                raise ValueError(
-                    f"Expected one non-gated up-projection input scale per "
-                    f"expert for {name}, got {tuple(tensor.shape)}"
-                )
-            batched.extend(
-                (f"{prefix}.experts.{expert_id}.up_proj.input_scale", scale)
-                for expert_id, scale in enumerate(tensor.unbind(0))
-            )
             continue
 
         if target == "w2_input_scale":
@@ -336,176 +290,242 @@ def _batch_fused_modelopt_moe_weights(
     return batched
 
 
-def _supports_batched_modelopt_moe_load(model: torch.nn.Module) -> bool:
-    """Return whether every ModelOpt MoE layer owns the complete expert set."""
-    found_modelopt_moe = False
-    for module in model.modules():
-        quant_method = getattr(module, "quant_method", None)
-        quant_method = getattr(quant_method, "old_quant_method", quant_method)
-        if quant_method.__class__.__name__ != "ModelOptNvFp4FusedMoE":
-            continue
-        found_modelopt_moe = True
-        expert_map = getattr(
-            module,
-            "expert_map",
-            getattr(module, "_expert_map", None),
-        )
-        if expert_map is not None:
-            return False
-        local_num_experts = getattr(module, "local_num_experts", None)
-        global_num_experts = getattr(module, "global_num_experts", None)
-        if (
-            not isinstance(local_num_experts, int)
-            or local_num_experts != global_num_experts
-        ):
-            return False
-    return found_modelopt_moe
-
-
-def _stash_fused_modelopt_moe_scales(
-    extension: object,
-    weights: list[tuple[str, torch.Tensor]],
+def _detach_pending_layerwise_weights(
+    reload_roots: tuple[torch.nn.Module, ...],
+    source_storage_ptrs: set[int],
 ) -> None:
-    stash = getattr(extension, "_nrl_fused_moe_scales", None)
-    if stash is None:
-        stash = {}
-        extension._nrl_fused_moe_scales = stash
-    for name, tensor in weights:
-        for suffix, attr in _FUSED_MODELOPT_MOE_DIRECT_SCALE_SUFFIXES.items():
-            if name.endswith(suffix):
-                prefix = name[: -len(suffix)]
-                if (
-                    suffix
-                    in {
-                        ".experts.up_proj_scale_2",
-                        ".experts.up_proj_input_scale",
-                    }
-                    and tensor.ndim == 1
-                ):
-                    tensor = tensor[:, None]
-                stash[(prefix, attr)] = tensor.detach().clone()
-                break
-        else:
-            match = _EXPERT_MODELOPT_SCALE_RE.match(name)
-            if match is None:
-                continue
-            projection = match.group("projection")
-            scale = match.group("scale")
-            prefix_name = "w2" if projection == "down_proj" else "w13"
-            attr = f"{prefix_name}_{scale}"
-            # ``up_proj`` is w3 for gated MoE and the sole w1 projection for
-            # non-gated MoE.  The last column selects the right slot in both
-            # vLLM layouts without coupling this transport code to the model.
-            column = {"gate_proj": 0, "up_proj": -1, "down_proj": 0}[projection]
-            stash[
-                (
-                    match.group("prefix"),
-                    attr,
-                    int(match.group("expert")),
-                    column,
-                )
-            ] = tensor.detach().clone()
+    """Own deferred weights before a transport buffer may be reused.
+
+    Completed layers have already released their buffered arguments, so this
+    clones only tensors from a layer split across transport batches. Only the
+    cached layerwise-reload subgraphs are inspected.
+    """
+    if not source_storage_ptrs:
+        return
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    for reload_root in reload_roots:
+        for module in reload_root.modules():
+            info = get_layerwise_info(module)
+            for _, arguments in info.loaded_weights:
+                loaded_weight = arguments.arguments.get("loaded_weight")
+                if not isinstance(loaded_weight, torch.Tensor):
+                    continue
+                if loaded_weight.untyped_storage().data_ptr() in source_storage_ptrs:
+                    arguments.arguments["loaded_weight"] = loaded_weight.clone()
 
 
-def _restore_fused_modelopt_moe_scales(extension: object) -> None:
-    stash = getattr(extension, "_nrl_fused_moe_scales", {})
-    if not stash:
+def _iter_modelopt_quant_modules(
+    model: torch.nn.Module,
+) -> list[tuple[str, torch.nn.Module]]:
+    """Return modules whose runtime layout is owned by vLLM ModelOpt methods."""
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptNvFp4FusedMoE,
+        ModelOptNvFp4LinearMethod,
+    )
+
+    method_types = (ModelOptNvFp4FusedMoE, ModelOptNvFp4LinearMethod)
+    return [
+        (module_name, module)
+        for module_name, module in model.named_modules()
+        if isinstance(getattr(module, "quant_method", None), method_types)
+    ]
+
+
+def _modelopt_layerwise_reload_roots(
+    model: torch.nn.Module,
+    *,
+    include_fp8_kv_cache: bool,
+) -> list[torch.nn.Module]:
+    """Select disjoint roots that require vLLM's native reload lifecycle.
+
+    Ordinary parameters are already updated in place by vLLM's checkpoint
+    loaders.  Restricting layerwise reconstruction to ModelOpt runtime layouts
+    and attention scale owners avoids materializing unrelated non-persistent
+    buffers.  In vLLM 0.20, whole-model reconstruction can otherwise break a
+    derived buffer that aliases a child parameter (for example Nemotron-H's
+    ``conv_weights`` view of ``conv1d.weight``).
+    """
+    from vllm.model_executor.layers.attention import Attention, MLAAttention
+    from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+
+    modelopt_modules = {module for _, module in _iter_modelopt_quant_modules(model)}
+    attention_types = (Attention, MLAAttention)
+    quant_roots: list[torch.nn.Module] = []
+    attention_roots: list[torch.nn.Module] = []
+    visited: set[torch.nn.Module] = set()
+
+    def collect(module: torch.nn.Module) -> None:
+        if module in visited:
+            return
+        visited.add(module)
+        if (
+            include_fp8_kv_cache
+            and isinstance(module, attention_types)
+            and isinstance(getattr(module, "quant_method", None), BaseKVCacheMethod)
+            and "fp8" in str(getattr(module, "kv_cache_dtype", "auto")).lower()
+        ):
+            attention_roots.append(module)
+            return
+        if module in modelopt_modules:
+            quant_roots.append(module)
+            return
+        for child in module.children():
+            collect(child)
+
+    collect(model)
+    # Match vLLM's ordering contract: process quantized modules before the
+    # attention owners that finalize KV-cache scales.
+    return quant_roots + attention_roots
+
+
+def _require_complete_modelopt_layerwise_reload(model: torch.nn.Module) -> None:
+    """Reject ModelOpt layers that vLLM would otherwise finalize partially."""
+    candidates = _iter_modelopt_quant_modules(model)
+
+    if not candidates:
         return
 
-    model = extension.model_runner.model
-    modules = dict(model.named_modules())
-    mapper = getattr(model, "hf_to_vllm_mapper", None)
-    for key, source in stash.items():
-        prefix, attr, *index = key
-        mapped_prefix = prefix
-        if mapper is not None:
-            mapped_prefixes = mapper.apply_list([prefix])
-            if len(mapped_prefixes) != 1:
-                raise RuntimeError(
-                    f"Expected vLLM weight mapper to preserve ModelOpt MoE "
-                    f"prefix {prefix}, got {mapped_prefixes}"
-                )
-            mapped_prefix = mapped_prefixes[0]
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
 
-        candidates = []
-        for name in (mapped_prefix, f"{mapped_prefix}.experts"):
-            module = modules.get(name)
-            if module is None:
-                continue
-            quant_method = getattr(
-                getattr(module, "quant_method", None),
-                "old_quant_method",
-                getattr(module, "quant_method", None),
-            )
-            if quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoE":
-                candidates.append(module)
-        if len(candidates) != 1:
-            raise RuntimeError(
-                f"Expected one vLLM ModelOpt MoE layer for {prefix} "
-                f"(mapped to {mapped_prefix}), found {len(candidates)}"
-            )
-        destination = getattr(candidates[0], attr, None)
-        if not isinstance(destination, torch.Tensor):
-            raise RuntimeError(f"vLLM ModelOpt MoE layer is missing {prefix}.{attr}")
-        source = source.to(device=destination.device, dtype=destination.dtype)
-        if index:
-            expert, column = index
-            if attr in {"w13_input_scale", "w13_weight_scale_2"}:
-                target = destination.data[expert, column]
-            else:
-                target = destination.data[expert]
-            if source.numel() != 1:
-                raise RuntimeError(
-                    f"Expected scalar ModelOpt MoE {attr} for expert {expert}, "
-                    f"got {tuple(source.shape)}"
-                )
-            target.copy_(source.reshape_as(target))
-        else:
-            if tuple(destination.shape) != tuple(source.shape):
-                raise RuntimeError(
-                    f"ModelOpt MoE {attr} shape mismatch for {prefix}: expected "
-                    f"{tuple(destination.shape)}, got {tuple(source.shape)}"
-                )
-            destination.data.copy_(source)
-    extension._nrl_fused_moe_scales = {}
+    incomplete = []
+    for module_name, module in candidates:
+        info = get_layerwise_info(module)
+        if info.load_numel_total is None:
+            # A completed layer is processed and reset immediately by vLLM.
+            continue
+        if info.load_numel == info.load_numel_total:
+            continue
+        buffered = sorted({name for name, _ in info.loaded_weights})
+        incomplete.append(
+            f"{module_name or '<root>'}: {info.load_numel}/"
+            f"{info.load_numel_total} elements, buffered={buffered}"
+        )
+
+    if incomplete:
+        details = "; ".join(incomplete[:8])
+        suffix = "; ..." if len(incomplete) > 8 else ""
+        raise RuntimeError(
+            "ModelOpt layerwise reload is incomplete for "
+            f"{len(incomplete)} layer(s): {details}{suffix}"
+        )
 
 
 if os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1":
-    from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
-        apply_modelopt_nvfp4_patches,
+    from nemo_rl.modelopt.models.generation.vllm_modelopt import (
+        register_nemo_modelopt_nvfp4,
     )
 
-    apply_modelopt_nvfp4_patches()
+    register_nemo_modelopt_nvfp4()
 
 
 class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
+    _nrl_w13_num_shards_by_prefix: dict[str, int]
+    _nrl_modelopt_reload_roots: tuple[torch.nn.Module, ...] | None = None
+
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
-        if not self._is_real_quant_model():
-            super().maybe_init_zmq()
-            return
-        if not hasattr(self, "zmq_socket"):
-            self.zmq_context = zmq.Context()
-            self.zmq_socket = self.zmq_context.socket(zmq.REP)
+        super().maybe_init_zmq()
+        if self._is_real_quant_model():
             self.zmq_socket.setsockopt(zmq.SNDTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
             self.zmq_socket.setsockopt(zmq.RCVTIMEO, MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS)
-            self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.connect(self.get_zmq_address())
 
     def _is_real_quant_model(self) -> bool:
         return os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1"
+
+    def _get_modelopt_reload_roots(self) -> tuple[torch.nn.Module, ...]:
+        """Return the invariant ModelOpt layerwise-reload subgraphs."""
+        if self._nrl_modelopt_reload_roots is None:
+            self._nrl_modelopt_reload_roots = tuple(
+                _modelopt_layerwise_reload_roots(
+                    self.model_runner.model,
+                    include_fp8_kv_cache=self._uses_fp8_kv_cache(),
+                )
+            )
+        return self._nrl_modelopt_reload_roots
+
+    @contextmanager
+    def _weight_update_lifecycle(
+        self, transport: WeightUpdateTransport
+    ) -> Iterator[WeightUpdateFinalizer]:
+        """Use vLLM's native layerwise reload lifecycle for real quantization."""
+        if not self._is_real_quant_model():
+            with super()._weight_update_lifecycle(transport) as finalize:
+                yield finalize
+            return
+
+        from vllm.model_executor.model_loader.reload import (
+            finalize_layerwise_reload,
+            initialize_layerwise_reload,
+        )
+
+        model = self.model_runner.model
+        reload_roots = self._get_modelopt_reload_roots()
+
+        def finalize() -> None:
+            try:
+                with torch.device(self.device):
+                    _require_complete_modelopt_layerwise_reload(model)
+                    for reload_root in reload_roots:
+                        finalize_layerwise_reload(reload_root, self.model_config)
+                # Fence completion for both collective return and the IPC
+                # COMPLETE acknowledgment. Data-batch ACKs use the hook below.
+                torch.accelerator.synchronize()
+            except Exception as error:
+                if transport == "ipc":
+                    raise RuntimeError(
+                        f"ModelOpt real-quant refit post-processing failed: {error}"
+                    ) from error
+                raise
+
+        try:
+            with torch.device(self.device):
+                for reload_root in reload_roots:
+                    initialize_layerwise_reload(reload_root)
+            yield finalize
+        except IPCWeightManifestError as error:
+            raise RuntimeError(
+                f"ModelOpt real-quant refit rejected: {error}"
+            ) from error
+        except Exception as error:
+            if transport == "collective":
+                raise RuntimeError(
+                    "ModelOpt real-quant collective refit failed"
+                ) from error
+            raise
+
+    def _weight_update_errors_are_fatal(self) -> bool:
+        return self._is_real_quant_model()
+
+    def _synchronize_before_ipc_data_ack(self) -> None:
+        """Fence all accelerator streams used by ModelOpt post-load methods."""
+        if self._is_real_quant_model():
+            torch.accelerator.synchronize()
+            return
+        super()._synchronize_before_ipc_data_ack()
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         super().prepare_refit_info(state_dict_info)
         if not self._is_real_quant_model():
             return
+        self._get_modelopt_reload_roots()
         quant_config = (
             self.model_runner.vllm_config.model_config.hf_config.quantization_config
         )
         self._nrl_w13_num_shards_by_prefix = _w13_num_shards_from_state_dict_info(
             state_dict_info,
-            require_input_scales=quant_config.get("quant_mode") == "w4a4_nvfp4",
+            require_input_scales=(
+                str(quant_config.get("quant_algo", "")).upper() == "NVFP4"
+            ),
         )
+        if (
+            self._nrl_w13_num_shards_by_prefix
+            and self.model_runner.vllm_config.parallel_config.enable_expert_parallel
+        ):
+            raise RuntimeError(
+                "Fused ModelOpt MoE refits require all experts local; "
+                "vLLM expert parallelism is unsupported"
+            )
 
     @contextmanager
     def _patch_named_parameters_to_include_buffers(self, model):
@@ -547,6 +567,10 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         applied during export), so no fold_weight step is needed here.
         """
         if self._is_real_quant_model():
+            weights = list(weights)
+            source_storage_ptrs = {
+                tensor.untyped_storage().data_ptr() for _, tensor in weights
+            }
             quant_config = (
                 self.model_runner.vllm_config.model_config.hf_config.quantization_config
             )
@@ -563,23 +587,10 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                     continue
 
                 filtered.append((name, weight))
-            _stash_fused_modelopt_moe_scales(self, filtered)
-            if any(_is_fused_modelopt_moe_weight(name) for name, _ in filtered):
-                supports_batched_moe = getattr(
-                    self,
-                    "_nrl_supports_batched_modelopt_moe_load",
-                    None,
-                )
-                if supports_batched_moe is None:
-                    supports_batched_moe = _supports_batched_modelopt_moe_load(
-                        self.model_runner.model
-                    )
-                    self._nrl_supports_batched_modelopt_moe_load = supports_batched_moe
-                if not supports_batched_moe:
-                    raise RuntimeError(
-                        "Fused ModelOpt MoE refits require all experts local; "
-                        "vLLM expert parallelism is unsupported"
-                    )
+            if any(
+                _match_fused_modelopt_moe_weight(name) is not None
+                for name, _ in filtered
+            ):
                 weights = _batch_fused_modelopt_moe_weights(
                     filtered,
                     w13_num_shards_by_prefix=self._nrl_w13_num_shards_by_prefix,
@@ -588,7 +599,15 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 weights = filtered
             if not weights:
                 return None
-            return super()._load_weights(weights)
+            try:
+                with torch.device(self.device):
+                    return super()._load_weights(weights)
+            finally:
+                with torch.device(self.device):
+                    _detach_pending_layerwise_weights(
+                        self._get_modelopt_reload_roots(),
+                        source_storage_ptrs,
+                    )
 
         with ExitStack() as contexts:
             for _, child in self.model_runner.model.named_children():
@@ -596,164 +615,6 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                     self._patch_named_parameters_to_include_buffers(child)
                 )
             return super()._load_weights(weights)
-
-    def update_weights_via_ipc_zmq(self) -> bool:
-        """Receive and update weights through CUDA IPC."""
-        if not self._is_real_quant_model():
-            return super().update_weights_via_ipc_zmq()
-
-        from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
-            modelopt_process_weights_after_loading,
-            prepare_modelopt_for_weight_reload,
-        )
-
-        self._nrl_fused_moe_scales = {}
-        prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
-        self.maybe_init_zmq()
-        expected_keys = set(self.state_dict_info)
-        loaded_keys: set[str] = set()
-        key_errors: list[str] = []
-        buffer = None
-        weight = None
-        weights = None
-        while True:
-            payload = self.zmq_socket.recv_pyobj()
-
-            if payload == IPCProtocol.COMPLETE:
-                missing_keys = expected_keys - loaded_keys
-                if missing_keys or key_errors:
-                    details = list(key_errors)
-                    if missing_keys:
-                        details.append(
-                            _format_refit_key_error("missing keys", missing_keys)
-                        )
-                    message = "ModelOpt real-quant refit rejected: " + "; ".join(
-                        details
-                    )
-                    self._nrl_fused_moe_scales = {}
-                    self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-                    raise RuntimeError(message)
-                try:
-                    _restore_fused_modelopt_moe_scales(self)
-                    modelopt_process_weights_after_loading(self.model_runner.model)
-                    torch.cuda.synchronize()
-                except Exception as error:
-                    self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-                    raise RuntimeError(
-                        "ModelOpt real-quant refit post-processing failed"
-                    ) from error
-                self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-                break
-
-            ipc_handle, list_keys, used_bytes = payload
-            batch_keys: set[str] = set()
-            duplicate_keys: set[str] = set()
-            for key in list_keys:
-                if key in batch_keys:
-                    duplicate_keys.add(key)
-                batch_keys.add(key)
-            duplicate_keys.update(loaded_keys & batch_keys)
-            unexpected_keys = batch_keys - expected_keys
-            if duplicate_keys:
-                key_errors.append(
-                    _format_refit_key_error("duplicate keys", duplicate_keys)
-                )
-            if unexpected_keys:
-                key_errors.append(
-                    _format_refit_key_error("unexpected keys", unexpected_keys)
-                )
-            if key_errors:
-                self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-                continue
-
-            try:
-                buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
-
-                weights = []
-                offset = 0
-                for key in list_keys:
-                    shape, dtype = self.state_dict_info[key]
-                    if isinstance(shape, list):
-                        shape = torch.Size(shape)
-
-                    size_in_bytes = dtype.itemsize * shape.numel()
-                    weight = (
-                        buffer[offset : offset + size_in_bytes]
-                        .view(dtype=dtype)
-                        .view(shape)
-                    )
-                    weights.append((key, weight))
-
-                    offset += calculate_aligned_size(size_in_bytes)
-
-                assert offset == used_bytes, (
-                    "Offset is not equal to used bytes, usually indicate inaccurate "
-                    "info like keys or cached dtype in state_dict_info"
-                )
-
-                self._load_weights(weights)
-                torch.cuda.synchronize()
-                loaded_keys.update(batch_keys)
-            except Exception as error:
-                message = f"{type(error).__name__}: {error}"
-                if len(message) > 512:
-                    message = message[:512] + " ..."
-                key_errors.append(f"weight load failed: {message}")
-            finally:
-                # Match the base vLLM receiver: the loop variable is the final IPC
-                # tensor view and must be dropped together with the list and base
-                # buffer before ACK permits the sender to reuse or release storage.
-                del weight, weights, buffer
-                weight = None
-                weights = None
-                buffer = None
-            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-
-        self._maybe_process_fp8_kv_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-        return True
-
-    def update_weights_from_collective(self) -> bool:
-        """Receive and update weights through collective communication."""
-        if not self._is_real_quant_model():
-            return super().update_weights_from_collective()
-
-        from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
-            modelopt_process_weights_after_loading,
-            prepare_modelopt_for_weight_reload,
-        )
-
-        assert self.state_dict_info is not None, (
-            "state_dict_info is not prepared. "
-            "Please call prepare_refit_info when initializing the worker."
-        )
-
-        self._nrl_fused_moe_scales = {}
-        prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
-        try:
-            # Mirror the IPC refit ordering instead of reusing
-            # super().update_weights_from_collective(): consume the broadcast
-            # without vLLM's post-load conversion, restore the per-expert scales
-            # stashed during _load_weights, and only then run the ModelOpt
-            # conversion. The base override converts first, which rewrites the
-            # scales out of their HF layout and makes the restore fail.
-            packed_broadcast_consumer(
-                iterator=iter(self.state_dict_info.items()),
-                group=self.model_update_group,
-                src=0,
-                post_unpack_func=self._load_weights,
-            )
-            _restore_fused_modelopt_moe_scales(self)
-            modelopt_process_weights_after_loading(self.model_runner.model)
-            self._maybe_process_fp8_kv_cache()
-        except Exception as error:
-            self._nrl_fused_moe_scales = {}
-            raise RuntimeError("ModelOpt real-quant collective refit failed") from error
-
-        gc.collect()
-        torch.cuda.empty_cache()
-        return True
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:
         """Return a CPU copy of a named parameter for before/after comparison."""

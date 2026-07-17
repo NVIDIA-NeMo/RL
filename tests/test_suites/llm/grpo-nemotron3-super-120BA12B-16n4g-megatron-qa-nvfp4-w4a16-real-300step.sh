@@ -41,7 +41,7 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
 grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
 grep -q "quantization=modelopt" "$RUN_LOG"
-grep -q "super120b_nvfp4_weightonly.yaml" "$RUN_LOG"
+grep -q "nvfp4_experts_weightonly.yaml" "$RUN_LOG"
 ! grep -q "FakeQuantWorker" "$RUN_LOG"
 ! grep -q "VLLM_QUANT_CFG" "$RUN_LOG"
 

@@ -5,13 +5,9 @@ checkpointing:
 
 policy:
   disable_modelopt_layer_spec: true
-  quant_cfg: examples/modelopt/quant_configs/super120b_nvfp4_weightonly.yaml
-  quant_calib_data: random
-  quant_calib_size: 16
-  quant_batch_size: 1
-  quant_sequence_length: 1024
+  quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
   generation:
-    quant_cfg: examples/modelopt/quant_configs/super120b_nvfp4_weightonly.yaml
+    quant_cfg: examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml
     real_quant: true
     real_quant_ignore:
       - lm_head

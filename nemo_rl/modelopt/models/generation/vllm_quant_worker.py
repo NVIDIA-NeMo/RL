@@ -50,8 +50,9 @@ def _configure_quant_engine_kwargs(
     )
     real_quant = bool(cfg.get("real_quant"))
     if real_quant:
-        from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
-            apply_modelopt_nvfp4_patches,
+        from nemo_rl.modelopt.models.generation.vllm_modelopt import (
+            quantization_method_for_mode,
+            register_nemo_modelopt_nvfp4,
         )
         from nemo_rl.modelopt.utils import (
             build_vllm_modelopt_nvfp4_config,
@@ -62,7 +63,7 @@ def _configure_quant_engine_kwargs(
         if not quant_cfg:
             raise ValueError("NVFP4 real quantization requires a non-empty quant_cfg.")
         mode = resolve_nvfp4_real_quant_mode(quant_cfg)
-        apply_modelopt_nvfp4_patches()
+        register_nemo_modelopt_nvfp4()
         os.environ.pop("VLLM_QUANT_CFG", None)
         os.environ["VLLM_MODELOPT_REAL_QUANT"] = "1"
 
@@ -71,7 +72,7 @@ def _configure_quant_engine_kwargs(
             mode=mode,
             ignore=cfg.get("real_quant_ignore"),
         )
-        llm_kwargs["quantization"] = "modelopt"
+        llm_kwargs["quantization"] = quantization_method_for_mode(mode)
     else:
         llm_kwargs["worker_cls"] = (
             "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
