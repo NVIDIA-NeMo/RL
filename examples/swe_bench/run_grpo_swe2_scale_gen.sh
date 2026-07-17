@@ -964,9 +964,14 @@ if [ "${SUBMIT_MODE}" = "direct" ]; then
     echo "ERROR: direct allocation account is ${SLURM_JOB_ACCOUNT}; expected ${SBATCH_ACCOUNT}." >&2
     exit 1
   fi
-  if [ -n "${SLURM_JOB_PARTITION:-}" ] && [ "${SLURM_JOB_PARTITION}" != "${SBATCH_PARTITION}" ]; then
-    echo "ERROR: direct allocation partition is ${SLURM_JOB_PARTITION}; expected ${SBATCH_PARTITION}." >&2
-    exit 1
+  if [ -n "${SLURM_JOB_PARTITION:-}" ]; then
+    IFS=',' read -r -a ALLOCATED_PARTITIONS <<< "${SLURM_JOB_PARTITION}"
+    for ALLOCATED_PARTITION in "${ALLOCATED_PARTITIONS[@]}"; do
+      if [[ ",${SBATCH_PARTITION}," != *",${ALLOCATED_PARTITION},"* ]]; then
+        echo "ERROR: direct allocation partition is ${SLURM_JOB_PARTITION}; expected one of ${SBATCH_PARTITION}." >&2
+        exit 1
+      fi
+    done
   fi
 
   # ray.sub normally runs as the batch step. Under an attached srun, its Ray
