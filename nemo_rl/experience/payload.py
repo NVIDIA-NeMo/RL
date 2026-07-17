@@ -22,6 +22,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import pack_jagged_fields
+from nemo_rl.data_plane.column_io import TOKEN_ALIGNED_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -111,7 +112,9 @@ def pack_payload(
         if isinstance(v, torch.Tensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
-    fields_td = pack_jagged_fields(tensor_fields, lengths=lengths)
+    fields_td = pack_jagged_fields(
+        tensor_fields, lengths=lengths, token_aligned_fields=TOKEN_ALIGNED_FIELDS
+    )
     sample_ids = [f"{group_id}_g{i}" for i in range(n)]
     tags = [{"weight_version": weight_version} for _ in range(n)]
     return sample_ids, fields_td, tags
