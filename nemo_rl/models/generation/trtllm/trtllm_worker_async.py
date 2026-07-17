@@ -193,9 +193,12 @@ class TrtllmAsyncGenerationWorkerImpl:
         # Colocated: share each bundle's GPU 0.5/0.5 with the policy actor.
         # RayWorkerWrapper does ray.get_gpu_ids()[0], so num_gpus must be > 0.
         if self._colocated:
+            # NeMo-RL's validation does sleep+wakeup without a refit, so freeing
+            # the weights ("NONE") leaves them unrestored. Drop this memory
+            # optimization for now.
             llm_kwargs["sleep_config"] = SleepConfig(
                 restore_modes={
-                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "NONE",
+                    # ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "NONE",
                     ExecutorMemoryType.KV_CACHE: "NONE",
                 }
             )
