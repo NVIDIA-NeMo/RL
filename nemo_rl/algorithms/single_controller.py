@@ -28,11 +28,11 @@ DataPlane. Model tensors still move through DataPlane or NCCL.
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
                      GenWorker → dp_client.put_samples(...)
-  _train_pump    → dp_client.claim_meta(...) → StalenessSampler
+  _train_pump    → sampler.evict/select against TQReplayBuffer
                  → _advantage_stage(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
-                 → trainer.begin/train_microbatch/finish_train_step (split API,
+                 → trainer.begin/train_microbatches/finish_train_step (split API,
                      driver-side TQPolicy via asyncio.to_thread)
                      Trainer → dp_client.get_samples(...)   (via its own client)
                  → dp_client.clear_samples(...)             ← SC clears after train
@@ -182,7 +182,7 @@ def warn_if_staleness_window_below_minibatches(
     the step started on therefore ages by up to ``num_minibatches - 1``
     versions before the next sync. When the effective staleness window is
     smaller than that, such groups become unselectable mid-step — the
-    sampler skips them and ``_evict_stale_claimed`` may drop them as stale —
+    sampler skips them and ``sampler.evict`` may drop them as stale —
     so the pump can spin or thrash instead of consuming them.
 
     Warns rather than raises: a run may intentionally accept the resulting
@@ -564,8 +564,8 @@ class SingleControllerActor:
           2. sampler.select returns K prompt groups (or None) and drops them from the
              buffer; DP rows survive so the trainer can read them. Already trainable —
              buffer wrote training-shaped rows at rollout time.
-          3. _advantage_pump(train_meta).
-          4. trainer.train_microbatch_from_meta + finish_train_step.
+          3. _advantage_stage(train_meta).
+          4. trainer.train_microbatches_from_meta + finish_train_step.
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
         """
