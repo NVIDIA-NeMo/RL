@@ -19,7 +19,6 @@ from typing import Any, Optional
 
 import torch
 from transformers import PreTrainedTokenizerBase
-from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -34,6 +33,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
 from nemo_rl.utils.timer import Timer
+from wandb import Table
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -659,6 +659,13 @@ class RolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
+        # Optional controller-owned registry mapping in-flight group_id ->
+        # (dispatch asyncio.Task, start_weight_version). Populated at reserve and
+        # popped before commit so it holds only rollouts whose generation is still
+        # in flight — the SingleController uses it to abort stale rollouts early.
+        self._inflight_registry: Optional[
+            dict[str, tuple["asyncio.Task[Any]", int]]
+        ] = None
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -688,7 +695,18 @@ class RolloutManager:
             weight_version=start_version, target_step=target_step
         )
 
-        record = await self.run_rollout(input_sample)
+        # Register this in-flight rollout so the controller can abort it if it
+        # turns stale. Popped in the finally below — before commit — so the
+        # registry never names a rollout whose generation has already finished
+        # (which would let a cancel land mid-commit / corrupt a partial write).
+        reg = self._inflight_registry
+        if reg is not None:
+            reg[group_id] = (asyncio.current_task(), start_version)  # type: ignore[assignment]
+        try:
+            record = await self.run_rollout(input_sample)
+        finally:
+            if reg is not None:
+                reg.pop(group_id, None)
         end_version = self._weight_version
 
         await self._tq_buffer.commit(
