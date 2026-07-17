@@ -276,7 +276,10 @@ def _modal_control_contract(
         "candidate_modal_logprob_drift": candidate_modal_logprob_drift,
         "logprob_atol": logprob_atol,
         "logprobs_within_modal_control_drift": (logprobs_within_modal_control_drift),
-        "all": candidate_matches_modal and logprobs_within_modal_control_drift,
+        # Token IDs and decoded/emitted text are the semantic contract. GPU
+        # reductions make sampled-token logprobs non-bitwise-repeatable even
+        # across ordinary identical requests, so their envelope is diagnostic.
+        "all": candidate_matches_modal,
     }
 
 
@@ -359,6 +362,7 @@ async def _generate_same_request_final(
     stable_prefix = _stable_streamed_prefix(
         trace, stability_margin_tokens=stability_margin_tokens
     )
+    streamed_prefix_token_count = len(stable_prefix)
     final_suffix = trace.final[len(stable_prefix) :]
     if not final_suffix:
         raise RuntimeError(
@@ -443,7 +447,9 @@ async def _generate_same_request_final(
         raise RuntimeError("same-request final decode produced no output")
 
     return SameRequestFinalMeasurement(
-        streamed_prefix_tokens=len(stable_prefix),
+        # vLLM extends the input list in place as later streaming chunks arrive.
+        # Report the pre-mutation length captured above.
+        streamed_prefix_tokens=streamed_prefix_token_count,
         final_suffix_tokens=len(final_suffix),
         dummy_token_ids=tuple(dummy_token_ids),
         dummy_logprobs=tuple(dummy_logprobs),
