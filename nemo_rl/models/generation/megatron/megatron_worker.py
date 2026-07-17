@@ -672,7 +672,7 @@ class MegatronGenerationRefitMixin:
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             rank_offset: Offset for this side's ranks (`train_world_size` for inference).
-            refit_backend: Copy-service backend ("gloo" or "nvshmem").
+            refit_backend: Copy-service backend ("gloo", "nccl", or "nvshmem").
         """
         from torch.distributed.distributed_c10d import (
             PrefixStore,
@@ -710,6 +710,29 @@ class MegatronGenerationRefitMixin:
             gloo_backend,
         )
         pg._set_default_backend(ProcessGroup.BackendType.GLOO)
+
+        # The NCCL copy service moves the actual weight bytes with CUDA-tensor P2P
+        # (`torch.distributed.batch_isend_irecv`), which needs an NCCL backend
+        # registered for the cuda device on this cross-world PG. GLOO stays the
+        # default backend so the object collectives in `prepare_swap_model_weights`
+        # (all_gather_object / broadcast_object_list) keep using CPU tensors.
+        if refit_backend == "nccl":
+            from torch.distributed.distributed_c10d import ProcessGroupNCCL
+
+            # Ensure the NCCL communicator binds to this rank's own GPU.
+            torch.cuda.set_device(torch.cuda.current_device())
+            nccl_store = PrefixStore("cuda/", pg_prefix_store)
+            nccl_options = ProcessGroupNCCL.Options()
+            nccl_backend = ProcessGroupNCCL(
+                nccl_store, global_rank, world_size, nccl_options
+            )
+            nccl_backend._set_sequence_number_for_group()
+            pg._register_backend(
+                torch.device("cuda"),
+                ProcessGroup.BackendType.NCCL,
+                nccl_backend,
+            )
+
         pg._set_group_name(group_name)
 
         self.refit_pg = pg
@@ -726,6 +749,12 @@ class MegatronGenerationRefitMixin:
             )
 
             self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
+        elif refit_backend == "nccl":
+            from megatron.core.resharding.copy_services.nccl_copy_service import (
+                NCCLCopyService,
+            )
+
+            self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
         else:
             from megatron.core.resharding.copy_services.gloo_copy_service import (
                 GlooCopyService,
