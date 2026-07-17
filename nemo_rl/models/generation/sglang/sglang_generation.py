@@ -162,6 +162,38 @@ class SGLangGeneration(GenerationInterface):
         return [self.num_gpus_per_engine for _ in self.engines]
 
     @property
+    def cfg(self):
+        """Full generation config dict (parity with ``VllmGeneration.cfg``).
+
+        Shared rollout code (``nemo_rl.experience.rollouts``) inspects
+        ``policy_generation.cfg`` to find the backend-specific sub-config; return
+        the same full ``SGLangConfig`` the engines were built from so the
+        ``"sglang_cfg"`` branch resolves.
+        """
+        return self.sglang_cfg
+
+    # --- pickling support -------------------------------------------------
+    # Async GRPO ships this handle into the trajectory-collector Ray actor.
+    # ``_http_client`` (aiohttp) and ``_async_loop`` (a live thread + asyncio
+    # loop) hold contextvars/threads and cannot pickle; ``_health_monitor``
+    # owns engine-liveness threads that belong to the driver only. Drop all
+    # three and rebuild the client/loop lazily after unpickle (the collector
+    # never runs health monitoring, so ``_health_monitor`` stays ``None``).
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_http_client"] = None
+        state["_async_loop"] = None
+        state["_health_monitor"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.__dict__.get("_async_loop") is None:
+            self._async_loop = AsyncLoopThread()
+        if self.__dict__.get("_http_client") is None:
+            self._http_client = HttpClient(self.sglang_cfg)
+
+    @property
     def engine_gpu_offsets(self) -> list[int]:
         return [
             self.gpu_offset + j * self.num_gpus_per_engine
