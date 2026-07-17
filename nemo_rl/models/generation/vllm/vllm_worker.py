@@ -48,6 +48,56 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 logger = logging.getLogger(__name__)
 
 
+def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
+    """Optionally enable vLLM's native OpenTelemetry tracing on the engine.
+
+    Opt-in via ``NEMO_RL_OTEL_VLLM_NATIVE_TRACING`` (plus an OTLP endpoint).
+    vLLM's OTLP span exporter is gRPC-only, so the endpoint must speak OTLP/gRPC
+    (e.g. a collector on ``:4317`` or a gRPC-capable backend) — it will not reach
+    an ``http/protobuf`` OTLP endpoint. Degrades to a no-op if the installed vLLM
+    lacks these engine args.
+    """
+    if os.environ.get(
+        "NEMO_RL_OTEL_VLLM_NATIVE_TRACING", ""
+    ).strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if not endpoint:
+        logger.warning(
+            "nemo-lens: NEMO_RL_OTEL_VLLM_NATIVE_TRACING is set but no OTLP "
+            "endpoint is configured; skipping native vLLM tracing."
+        )
+        return
+    try:
+        import inspect
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        supported = set(getattr(EngineArgs, "__dataclass_fields__", {})) | set(
+            inspect.signature(EngineArgs.__init__).parameters
+        )
+    except Exception:
+        logger.warning(
+            "nemo-lens: could not introspect vLLM EngineArgs; skipping native "
+            "vLLM tracing.",
+            exc_info=True,
+        )
+        return
+    if "otlp_traces_endpoint" not in supported:
+        logger.warning(
+            "nemo-lens: installed vLLM does not support 'otlp_traces_endpoint'; "
+            "skipping native vLLM tracing."
+        )
+        return
+    llm_kwargs.setdefault("otlp_traces_endpoint", endpoint)
+    if "collect_detailed_traces" in supported:
+        llm_kwargs.setdefault("collect_detailed_traces", ["all"])
+    logger.info("nemo-lens: enabled vLLM native OTLP tracing -> %s", endpoint)
+
+
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
     if enable_prefix_caching is None:
@@ -503,6 +553,8 @@ class BaseVllmGenerationWorker:
             logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
+
+        _maybe_enable_vllm_native_tracing(llm_kwargs)
 
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
