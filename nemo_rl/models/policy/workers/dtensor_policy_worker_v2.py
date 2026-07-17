@@ -34,6 +34,115 @@ from nemo_automodel.components.distributed.tensor_utils import (
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from torch import nn
 from torch.distributed.tensor import DTensor
+
+import logging as _logging
+
+_logger = _logging.getLogger(__name__)
+
+
+@torch.no_grad()
+def _per_adapter_clip_grad_norm(
+    model: nn.Module,
+    max_grad_norm: float,
+    *,
+    device_mesh=None,
+    norm_type: float = 2.0,
+) -> float:
+    """Per-adapter gradient clipping for multi-LoRA bit-equivalence.
+
+    Stock ``clip_grad_norm`` computes a GLOBAL norm over all parameters (all N
+    adapters' lora_A + lora_B) and clips by ``max_norm / global_norm``. But each
+    single-LoRA run clips only its own adapter's gradients independently. So the
+    stock global clip coefficient differs from any single run's coefficient,
+    breaking bit-equivalence.
+
+    This function:
+      1. Finds all ``MultiLinearLoRA`` modules in the model.
+      2. For each adapter index ``i`` in ``range(n_adapters)``:
+         - Collects ``lora_A.grad[i]`` and ``lora_B.grad[i]`` across all modules.
+         - Computes per-adapter L2 norm (DTensor-aware: local norm² → all-reduce
+           sum → sqrt).
+         - Computes ``clip_coef_i = max_norm / (norm_i + 1e-6)``.
+         - Scales adapter i's gradients by ``min(clip_coef_i, 1.0)``.
+      3. Returns the max per-adapter norm as the reported grad_norm.
+
+    For non-multi-LoRA models (no MultiLinearLoRA modules), falls back to
+    stock global clip so this is safe to call unconditionally.
+    """
+    from nousnet.rl.lora.multi.adapter import MultiLinearLoRA
+
+    # Collect all MultiLinearLoRA modules
+    multi_modules = [
+        m for m in model.modules() if isinstance(m, MultiLinearLoRA)
+    ]
+    if not multi_modules:
+        # Not a multi-LoRA model — fall back to stock global clip
+        return scale_grads_and_clip_grad_norm(
+            max_grad_norm,
+            [model],
+            norm_type=norm_type,
+            pp_enabled=False,
+            device_mesh=device_mesh,
+            foreach=True,
+        )
+
+    n_adapters = multi_modules[0].n_adapters
+    max_norm_val = float(max_grad_norm)
+
+    all_norms = []
+    for adapter_idx in range(n_adapters):
+        # Collect grads for this adapter across all modules
+        grads = []
+        for m in multi_modules:
+            # lora_A: [N, dim, in_f], lora_B: [N, out_f, dim]
+            if m.lora_A.grad is not None:
+                ga = m.lora_A.grad[adapter_idx]  # [dim, in_f]
+                grads.append(ga)
+            if m.lora_B.grad is not None:
+                gb = m.lora_B.grad[adapter_idx]  # [out_f, dim]
+                grads.append(gb)
+
+        if not grads:
+            continue
+
+        # Compute per-adapter L2 norm (DTensor-aware)
+        total_sq = torch.tensor(0.0, device=grads[0].device, dtype=torch.float32)
+        for g in grads:
+            if isinstance(g, DTensor):
+                local_sq = g.to_local().float().pow(2).sum()
+                total_sq = total_sq + local_sq
+            else:
+                total_sq = total_sq + g.float().pow(2).sum()
+
+        # All-reduce across DP mesh if needed
+        if device_mesh is not None and "dp" in device_mesh.mesh_dim_names:
+            torch.distributed.all_reduce(
+                total_sq, op=torch.distributed.ReduceOp.SUM,
+                group=device_mesh.get_group("dp"),
+            )
+
+        norm_i = total_sq.sqrt().item()
+        all_norms.append(norm_i)
+
+        # Clip coefficient for this adapter
+        clip_coef = max_norm_val / (norm_i + 1e-6)
+        if clip_coef < 1.0:
+            for m in multi_modules:
+                if m.lora_A.grad is not None:
+                    g = m.lora_A.grad[adapter_idx]
+                    if isinstance(g, DTensor):
+                        g.to_local().mul_(clip_coef)
+                    else:
+                        g.mul_(clip_coef)
+                if m.lora_B.grad is not None:
+                    g = m.lora_B.grad[adapter_idx]
+                    if isinstance(g, DTensor):
+                        g.to_local().mul_(clip_coef)
+                    else:
+                        g.mul_(clip_coef)
+
+    # Report the max per-adapter norm as the aggregate grad_norm
+    return max(all_norms) if all_norms else 0.0
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
@@ -328,6 +437,19 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
+        # Exact-init transfer for true single-vs-multi bit-equivalence probes.
+        # This must run after model/FSDP/PEFT setup (so local shard layouts are
+        # final) and before any forward/backward or optimizer step.  It is
+        # environment-gated and a no-op in normal training.
+        import os as _init_xfer_os
+        if (
+            _init_xfer_os.environ.get("NOUSNET_INIT_EXPORT_DIR")
+            or _init_xfer_os.environ.get("NOUSNET_INIT_IMPORT_DIR")
+        ):
+            from nousnet.rl.lora.multi.init_transfer import maybe_transfer_initial_lora
+
+            maybe_transfer_initial_lora(self.model)
+
         # Initialize reference model if requested
         self.reference_model_state_dict = None
         if init_reference_model:
@@ -520,22 +642,39 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
                 grad_norm: Optional[float | torch.Tensor] = None
                 if not eval_mode:
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=False,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
-                    )
+                    # Per-adapter grad clipping for multi-LoRA bit-equivalence.
+                    # When NOUSNET_PER_ADAPTER_GRAD_CLIP=1, clip each adapter's
+                    # lora_A/lora_B gradients INDEPENDENTLY — matching what N
+                    # independent single-LoRA runs do. Stock clip_grad_norm
+                    # computes a GLOBAL norm over all N adapters' params, which
+                    # produces a different clip coefficient than any single run.
+                    import os as _clip_os
+                    _per_adapter_clip = _clip_os.environ.get(
+                        "NOUSNET_PER_ADAPTER_GRAD_CLIP", "0"
+                    ) == "1"
+                    if _per_adapter_clip and self.max_grad_norm is not None:
+                        grad_norm = _per_adapter_clip_grad_norm(
+                            self.model,
+                            self.max_grad_norm,
+                            device_mesh=self.device_mesh,
+                        )
+                    else:
+                        grad_norm = scale_grads_and_clip_grad_norm(
+                            self.max_grad_norm,
+                            [self.model],
+                            norm_type=2.0,
+                            pp_enabled=False,
+                            device_mesh=self.device_mesh,
+                            moe_mesh=self.moe_mesh,
+                            ep_axis_name="ep"
+                            if self.moe_mesh is not None
+                            and "ep" in self.moe_mesh.mesh_dim_names
+                            else None,
+                            pp_axis_name=None,
+                            foreach=True,
+                            num_label_tokens=1,
+                            dp_group_size=self.dp_size * self.cp_size,
+                        )
                     grad_norm = torch.tensor(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
