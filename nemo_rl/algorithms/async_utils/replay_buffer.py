@@ -709,6 +709,13 @@ class TQReplayBuffer:
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
         """
+        # Precondition: reserve() must have registered this group_id. Raise
+        # before any side effects so a stray commit doesn't leak orphan DP rows.
+        if group_id not in self._group_ids:
+            raise ValueError(
+                f"commit called with unknown group_id={group_id!r}; "
+                f"reserve() must precede commit() (or the slot was already removed)"
+            )
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=start_weight_version, group_id=group_id

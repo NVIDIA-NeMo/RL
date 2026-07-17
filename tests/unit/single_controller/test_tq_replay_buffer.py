@@ -200,6 +200,10 @@ class TestTQReplayBufferReserveCommit:
                 )
             )
 
+        # No orphan rows in DataPlane: commit must validate group_id before writing.
+        assert dp.depth() == 0
+        assert dp.put_calls == []
+
     def test_reserve_then_commit_preserves_dispatch_order(self):
         """Reserve in dispatch order, commit out of order; insertion order holds."""
         dp = FakeDataPlaneClient()
