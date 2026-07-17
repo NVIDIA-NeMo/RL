@@ -336,7 +336,7 @@ class SingleControllerActor:
         self._sampler = StalenessSampler(
             self._buffer,
             max_staleness_versions=cfg.max_weight_staleness_versions,
-            require_order=not cfg.over_sampling,
+            strict_weight_fifo=not cfg.over_sampling,
             force_in_order=cfg.force_in_order,
         )
 

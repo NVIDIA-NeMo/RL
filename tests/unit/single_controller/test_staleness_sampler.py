@@ -354,14 +354,14 @@ class TestStalenessSamplerInit:
         with pytest.raises(ValueError):
             StalenessSampler(buf, max_staleness_versions=-1)
 
-    def test_rejects_require_order_with_freshest_first(self):
+    def test_rejects_strict_weight_fifo_with_freshest_first(self):
         buf = FakeBuffer()
         with pytest.raises(ValueError):
             StalenessSampler(
                 buf,
                 max_staleness_versions=0,
                 sample_freshest_first=True,
-                require_order=True,
+                strict_weight_fifo=True,
             )
 
 
@@ -396,13 +396,15 @@ class TestStalenessSamplerReady:
         assert result == (None, 0)
 
 
-class TestStalenessSamplerRequireOrder:
+class TestStalenessSamplerStrictWeightFifo:
     def test_consumes_oldest_batch_first(self):
         buf = FakeBuffer()
-        # Two complete batches: v=4 then v=5; require_order must take v=4 first.
+        # Two complete batches: v=4 then v=5; strict_weight_fifo must take v=4 first.
         for i, w in enumerate((4, 4, 5, 5)):
             buf.add(f"v{w}_{i}", weight=w)
-        sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
+        sampler = StalenessSampler(
+            buf, max_staleness_versions=1, strict_weight_fifo=True
+        )
 
         selected, num_groups = _run(
             sampler.select(
@@ -419,12 +421,14 @@ class TestStalenessSamplerRequireOrder:
     def test_waits_when_oldest_batch_partially_ready(self):
         buf = FakeBuffer()
         # Oldest batch v=4 has 1 ready + 1 unready; v=5 batch is fully ready.
-        # require_order must NOT skip ahead to v=5.
+        # strict_weight_fifo must NOT skip ahead to v=5.
         buf.add("v4_a", weight=4, ready=True)
         buf.add("v4_b", weight=4, ready=False)
         buf.add("v5_a", weight=5, ready=True)
         buf.add("v5_b", weight=5, ready=True)
-        sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
+        sampler = StalenessSampler(
+            buf, max_staleness_versions=1, strict_weight_fifo=True
+        )
 
         result = _run(
             sampler.select(
@@ -440,7 +444,9 @@ class TestStalenessSamplerRequireOrder:
         buf = FakeBuffer()
         buf.add("v4_a", weight=4, ready=True)
         # Only 1 ready in oldest batch; need 2.
-        sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
+        sampler = StalenessSampler(
+            buf, max_staleness_versions=1, strict_weight_fifo=True
+        )
 
         result = _run(
             sampler.select(
@@ -456,7 +462,9 @@ class TestStalenessSamplerRequireOrder:
         buf.add("v7", weight=7, ready=True)
         buf.add("v5_a", weight=5, ready=True)
         buf.add("v5_b", weight=5, ready=True)
-        sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
+        sampler = StalenessSampler(
+            buf, max_staleness_versions=1, strict_weight_fifo=True
+        )
 
         selected, num_groups = _run(
             sampler.select(
