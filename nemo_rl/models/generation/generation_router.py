@@ -11,30 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GenerationRouter — unified ingress for disaggregated vLLM generation.
+"""GenerationRouter — shard table + control plane for disaggregated vLLM.
 
-Exposes data plane (``/v1/{completions,chat/completions}`` proxied to per-shard
-vLLM with cordon + replay) and control plane (weight sync, lifecycle, metrics)
-on a single port (8089). Both training and NemoGym point here; shard failures
-are invisible to clients via round-robin routing with replay.
+Owns the authoritative shard table (health poller, NCCL lifecycle, fault
+eviction) and exposes async control-plane methods (``run_init_collective``,
+``run_update_weights_from_collective``, etc.) that the training side calls
+directly via Ray — no HTTP required when everything runs in the same cluster.
+
+The health poller still uses aiohttp to probe per-shard vLLM HTTP endpoints
+(``/openapi.json``), which is a lightweight in-cluster HTTP call, not an
+inter-cluster hop.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import io
 import threading
 import time
 import traceback
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Optional
+from typing import Any, Literal, Optional
 
 import aiohttp
-import torch
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
 
 ShardStatus = Literal["ready", "draining", "cordoned", "joining"]
 
@@ -50,15 +48,6 @@ _DEFAULT_JOIN_SUCCESS_THRESHOLD = 2
 from nemo_rl.models.generation.ft_constants import (  # noqa: E402
     JOINABLE_MIN_AGE_S as _DEFAULT_JOINABLE_MIN_AGE_S,
 )
-# Require N consecutive proxy errors before cordoning; prevents burst 5xx from evicting a healthy shard.
-_DEFAULT_PROXY_FAILURE_THRESHOLD = 5
-# Raise connection limits well above aiohttp's default (100) to handle large RL batches.
-_DEFAULT_PROXY_POOL_LIMIT_TOTAL = 4096
-_DEFAULT_PROXY_POOL_LIMIT_PER_HOST = 1024
-# Explicit backlog for tuning; keep_alive 120s amortizes TCP setup.
-_DEFAULT_UVICORN_BACKLOG = 4096
-_DEFAULT_UVICORN_KEEP_ALIVE_S = 120
-_DEFAULT_PROXY_TIMEOUT_S = 300.0
 # Bounds NCCL teardown per survivor after a peer is killed; prevents deadlock if abort wedges.
 _DEFAULT_RESET_COLLECTIVE_TIMEOUT_S = 30.0
 
@@ -79,8 +68,6 @@ class ShardEntry:
     inflight: int = 0
     consecutive_failures: int = 0
     consecutive_successes: int = 0
-    # Separate from health-poll failures so burst 5xx doesn't cordon a shard before the probe notices.
-    proxy_consecutive_failures: int = 0
     # Gates joining→ready: requires >=2 successful refits to avoid post-join weight corruption
     # from an incomplete NCCL bootstrap on the first refit.
     successful_refits_since_join: int = 0
@@ -125,35 +112,21 @@ class GenerationRouter:
 
     def __init__(
         self,
-        port: int = 8089,
         *,
         generation: Any = None,
         health_poll_interval_s: float = _DEFAULT_HEALTH_INTERVAL_S,
         health_timeout_s: float = _DEFAULT_HEALTH_TIMEOUT_S,
         failure_threshold: int = _DEFAULT_FAILURE_THRESHOLD,
         join_success_threshold: int = _DEFAULT_JOIN_SUCCESS_THRESHOLD,
-        proxy_timeout_s: float = _DEFAULT_PROXY_TIMEOUT_S,
-        proxy_failure_threshold: int = _DEFAULT_PROXY_FAILURE_THRESHOLD,
-        proxy_pool_limit_total: int = _DEFAULT_PROXY_POOL_LIMIT_TOTAL,
-        proxy_pool_limit_per_host: int = _DEFAULT_PROXY_POOL_LIMIT_PER_HOST,
-        uvicorn_backlog: int = _DEFAULT_UVICORN_BACKLOG,
-        uvicorn_keep_alive_s: int = _DEFAULT_UVICORN_KEEP_ALIVE_S,
         reset_collective_timeout_s: float = _DEFAULT_RESET_COLLECTIVE_TIMEOUT_S,
         joinable_min_age_s: float = _DEFAULT_JOINABLE_MIN_AGE_S,
     ):
-        self.port = port
         self.health_poll_interval_s = health_poll_interval_s
         self.health_timeout_s = health_timeout_s
         self.failure_threshold = failure_threshold
         self.join_success_threshold = join_success_threshold
         # Unproven joining shards must age past this before counting as joinable (cold route warm-up).
         self._joinable_min_age_s = float(joinable_min_age_s)
-        self.proxy_failure_threshold = proxy_failure_threshold
-        self.proxy_pool_limit_total = proxy_pool_limit_total
-        self.proxy_pool_limit_per_host = proxy_pool_limit_per_host
-        self.uvicorn_backlog = uvicorn_backlog
-        self.uvicorn_keep_alive_s = uvicorn_keep_alive_s
-        self.proxy_timeout_s = proxy_timeout_s
         self._reset_collective_timeout_s = reset_collective_timeout_s
 
         # Tracks when the joinable shard count last changed; used by the trainer's debounce logic.
@@ -165,7 +138,6 @@ class GenerationRouter:
         self._comm_reset_epoch: int = 0
 
         self._shards: dict[str, ShardEntry] = {}
-        self._rr_index: int = 0
         self._table_lock = asyncio.Lock()
         # Serializes add_shard / remove_shard. NCCL re-init is global, so
         # only one lifecycle op may be in flight at a time.
@@ -184,18 +156,14 @@ class GenerationRouter:
 
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._health_task: Optional[asyncio.Task[None]] = None
-        # Set during lifespan teardown so background tasks short-circuit instead of
+        # Set during shutdown so background tasks short-circuit instead of
         # scheduling new executor work after the event loop starts shutting down.
         self._shutting_down: bool = False
-        self._app = self._build_app()
 
-        # uvicorn runs in a daemon thread; the loop is owned by uvicorn.
-        self._server_thread: Optional[threading.Thread] = None
-        # Hook for tests / step 2: called after each cordon transition.
-        self.on_cordon: Optional[Callable[[str, str], Awaitable[None]]] = None
+        # Background asyncio event loop (set by start_background()).
+        self._loop: Optional[Any] = None
 
-        # Fault-tolerance metrics scraped by RemoteGeneration via /step_metrics_snapshot.
-        # Reset when the gen daemon restarts.
+        # Fault-tolerance metrics for wandb; reset when the process restarts.
         self._total_shards_at_bootstrap: int = 0
         self._cumulative_shards_removed: int = 0
         self._cumulative_shards_added: int = 0
@@ -255,11 +223,6 @@ class GenerationRouter:
                 "reason": reason,
                 "monotonic_ts": time.monotonic(),
             }
-        if self.on_cordon is not None:
-            try:
-                await self.on_cordon(shard_id, reason)
-            except Exception as e:  # noqa: BLE001 - hook isolation
-                print(f"[router] on_cordon hook raised for {shard_id}: {e}", flush=True)
 
     async def uncordon(self, shard_id: str) -> None:
         async with self._table_lock:
@@ -315,7 +278,7 @@ class GenerationRouter:
                 entry.status = "cordoned"
 
             # Kill the actors. Blocking Ray op; run in executor so the
-            # FastAPI loop keeps serving health checks etc.
+            # event loop keeps serving health checks etc.
             loop = asyncio.get_running_loop()
 
             def _kill_actors() -> None:
@@ -559,127 +522,6 @@ class GenerationRouter:
         return promoted
 
     # =====================================================================
-    # Routing
-    # =====================================================================
-
-    async def _pick_shard(
-        self, sticky_key: Optional[str], skip: set[str]
-    ) -> Optional[ShardEntry]:
-        # Round-robin and sticky routing are both best-effort. When len(ready)
-        # changes between calls (shard added or removed), _rr_index may skip or
-        # repeat shards for one cycle. Sticky routing silently falls back to a
-        # different shard if the pinned one is in skip.
-        async with self._table_lock:
-            ready = [s for s in self._shards.values() if s.status == "ready" and s.shard_id not in skip]
-            if not ready:
-                return None
-            if sticky_key:
-                idx = int(hashlib.blake2b(sticky_key.encode(), digest_size=8).hexdigest(), 16) % len(ready)
-                chosen = ready[idx]
-            else:
-                self._rr_index = (self._rr_index + 1) % len(ready)
-                chosen = ready[self._rr_index]
-            chosen.inflight += 1
-            return chosen
-
-    async def _release_shard(self, entry: ShardEntry) -> None:
-        async with self._table_lock:
-            entry.inflight = max(0, entry.inflight - 1)
-
-    async def _note_proxy_failure(self, shard_id: str, reason: str) -> None:
-        """Record a /v1 proxy failure on this shard; cordon iff threshold breached.
-
-        Distinct from health-poll's `consecutive_failures` because the
-        proxy and the health-poller see different signals (an overloaded
-        worker can return 5xx on /v1/completions while still answering
-        /openapi.json instantly). Burst-induced 5xx no longer evicts a
-        live shard until it's failed `proxy_failure_threshold` proxy
-        round-trips in a row.
-        """
-        async with self._table_lock:
-            entry = self._shards.get(shard_id)
-            if entry is None or entry.status != "ready":
-                return
-            entry.proxy_consecutive_failures += 1
-            if entry.proxy_consecutive_failures < self.proxy_failure_threshold:
-                return
-            # Don't cordon during NCCL re-init; event loop stall causes transient 5xx.
-            if self._nccl_reinit_in_progress:
-                return
-            entry.status = "cordoned"
-            entry.proxy_consecutive_failures = 0
-        # Fire cordon hook outside the lock to avoid re-entrance.
-        asyncio.create_task(self._fire_cordon_hook(shard_id, reason))
-
-    async def _reset_proxy_failures(self, shard_id: str) -> None:
-        async with self._table_lock:
-            entry = self._shards.get(shard_id)
-            if entry is None:
-                return
-            entry.proxy_consecutive_failures = 0
-
-    async def _proxy(self, request: Request, suffix: str, *, strip_v1: bool = False) -> Response:
-        if self._http_session is None or self._http_session.closed:
-            raise HTTPException(status_code=503, detail="router not started")
-
-        sticky_key = request.headers.get("X-NRL-Session-Id")
-        body = await request.body()
-        forward_headers = {
-            k: v
-            for k, v in request.headers.items()
-            if k.lower() in {"content-type", "accept"}
-        }
-
-        attempted: set[str] = set()
-        last_status = 502
-        last_text = "no ready shard"
-        timeout = aiohttp.ClientTimeout(total=self.proxy_timeout_s)
-
-        while True:
-            entry = await self._pick_shard(sticky_key, attempted)
-            if entry is None:
-                return JSONResponse(
-                    status_code=last_status,
-                    content={"error": last_text},
-                )
-            attempted.add(entry.shard_id)
-            base = entry.url.rstrip("/")
-            if strip_v1 and base.endswith("/v1"):
-                base = base[:-3]
-            target = f"{base}{suffix}"
-            try:
-                async with self._http_session.post(
-                    target,
-                    data=body,
-                    headers=forward_headers,
-                    timeout=timeout,
-                ) as resp:
-                    text = await resp.read()
-                    if resp.status >= 500:
-                        last_status, last_text = resp.status, text.decode("utf-8", "replace")
-                        await self._note_proxy_failure(
-                            entry.shard_id,
-                            f"5xx from /v1: status={resp.status}",
-                        )
-                        await self._release_shard(entry)
-                        continue
-                    # 2xx/4xx counts as a successful round-trip — reset the
-                    # per-shard proxy failure counter so a future single 5xx
-                    # doesn't piggyback on an old burst.
-                    await self._reset_proxy_failures(entry.shard_id)
-                    await self._release_shard(entry)
-                    return Response(
-                        content=text,
-                        status_code=resp.status,
-                        media_type=resp.headers.get("Content-Type", "application/json"),
-                    )
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                last_status, last_text = 502, f"transport error: {type(e).__name__}: {e}"
-                await self._note_proxy_failure(entry.shard_id, last_text)
-                await self._release_shard(entry)
-                continue
-
-    # =====================================================================
     # Health poller
     # =====================================================================
 
@@ -753,7 +595,7 @@ class GenerationRouter:
                             ):
                                 entry.status = "cordoned"
                                 # Fire cordon hook outside the lock to avoid
-                                # re-entrance from on_cordon callbacks.
+                                # re-entrance from cordon callbacks.
                                 asyncio.create_task(
                                     self._fire_cordon_hook(shard_id, "health threshold breached")
                                 )
@@ -1120,17 +962,7 @@ class GenerationRouter:
             )
             return
 
-        # Custom override path: fault injector or tests want full control
-        # over what happens after a cordon (e.g. http-error mode keeps the
-        # cordon reversible, no removal).
-        if self.on_cordon is not None:
-            try:
-                await self.on_cordon(shard_id, reason)
-            except Exception as e:  # noqa: BLE001
-                print(f"[router] on_cordon hook raised for {shard_id}: {e}", flush=True)
-            return
-
-        # Default: drive remove_shard so the actor + PG come down and the pod is reclaimed.
+        # Drive remove_shard so the actor + PG come down and the pod is reclaimed.
         if self._generation is None:
             # No lifecycle ownership — this is a unit-test or cordon-only
             # mode where the router doesn't know how to kill anything.
@@ -1173,648 +1005,321 @@ class GenerationRouter:
             return False
 
     # =====================================================================
-    # FastAPI app — data plane + status + admin + control plane.
+    # Control-plane methods (called directly via Ray, no HTTP).
+    # Each is an async coroutine that mirrors the body of the old HTTP
+    # endpoint handler.  Call them via call_async() from a non-async context.
     # =====================================================================
 
-    def _build_app(self) -> FastAPI:
-        @asynccontextmanager
-        async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
-            # Explicit limits to avoid bottleneck under burst load; limit_per_host prevents one slow shard starving others.
-            connector = aiohttp.TCPConnector(
-                limit=self.proxy_pool_limit_total,
-                limit_per_host=self.proxy_pool_limit_per_host,
-                keepalive_timeout=60,
-            )
-            self._http_session = aiohttp.ClientSession(connector=connector)
-            self._health_task = asyncio.create_task(self._health_poll_loop())
-            try:
-                yield
-            finally:
-                # Set flag first so in-flight cordon hooks short-circuit before hitting
-                # run_in_executor (which would raise "cannot schedule new futures") and leave
-                # the shard table in a half-removed state. The next
-                # daemon process starts from a clean register_shards call
-                # so we don't need to finish in-flight removes here.
-                self._shutting_down = True
-                if self._health_task is not None:
-                    self._health_task.cancel()
-                    try:
-                        await self._health_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                if self._http_session is not None:
-                    await self._http_session.close()
+    async def run_init_collective(
+        self, ip: str, port: int, world_size: int, train_world_size: int
+    ) -> dict:
+        """Gen-side init_collective: rendezvous the joinable cohort.
 
-        app = FastAPI(title="Generation Router", lifespan=_lifespan)
+        Returns ``{"success": True}`` on success.  On recoverable failure
+        (503 in the old HTTP path) returns ``{"success": False, "error": ...}``.
+        Raises ``RuntimeError`` for unrecoverable errors.
+        """
+        generation = self._generation
+        if generation is None:
+            raise RuntimeError("no generation wired")
 
-        # ---- Status / health ----------------------------------------------
-
-        @app.get("/health")
-        async def health() -> dict[str, Any]:
-            return {"status": "ok"}
-
-        @app.get("/shards")
-        async def shards() -> list[dict[str, Any]]:
-            async with self._table_lock:
-                return [
-                    {
-                        "shard_id": s.shard_id,
-                        "url": s.url,
-                        "status": s.status,
-                        "inflight": s.inflight,
-                        "last_health_ok_at": s.last_health_ok_at,
-                        "consecutive_failures": s.consecutive_failures,
-                    }
-                    for s in self._shards.values()
-                ]
-
-        @app.get("/refit_ready")
-        async def refit_ready() -> dict[str, Any]:
-            ready, reason = self.refit_ready_state()
-            return {"ready": ready, "reason": reason}
-
-        @app.get("/refit_count")
-        async def refit_count() -> dict[str, Any]:
-            """Number of weight-refit broadcasts handled so far. The
-            FaultInjector polls this and waits for >=1 before starting its
-            trigger countdown, anchoring fault timing to 'training has started
-            refitting' instead of a wall-clock guess (setup time varies)."""
-            return {"refit_attempts": self._refit_attempts}
-
-        @app.get("/current_gen_world_size")
-        async def current_gen_world_size() -> dict[str, Any]:
-            """Sum of per-shard world sizes for shards in the NCCL group.
-
-            ``world_size`` is the live dispatch set (``ready`` + ``joining``);
-            the training driver rendezvouses at this. ``joinable_world_size``
-            is the subset whose engines are health-responsive, and
-            ``joinable_stable_for_s`` is how long that subset has held — the
-            trainer uses both to debounce comm growth (only grow once the
-            joinable set == the dispatch set and has settled).
-            """
+        if self.shard_count_alive_for_collective() == 0:
             return {
-                "world_size": self.current_gen_world_size(),
-                "joinable_world_size": self.joinable_world_size(),
-                "joinable_stable_for_s": self.joinable_stable_for_s(),
-                "comm_epoch": self._comm_reset_epoch,
-                # The trainer's quiesce-wait reads this to avoid retrying a
-                # rendezvous while a lifecycle op (add/remove/reset) is mid-flight.
-                "nccl_reinit_in_progress": self._nccl_reinit_in_progress,
+                "success": False,
+                "error": "no shards alive in NCCL group; retry after add_shard",
+                "current_gen_world_size": 0,
+                "failed_indices": [],
+                "evicted_shard_ids": [],
             }
 
-        @app.get("/dp_openai_server_base_urls")
-        async def get_dp_urls() -> list[str]:
-            """Per-shard OpenAI base URLs for clients that want direct routing.
+        prev_flag = self._nccl_reinit_in_progress
+        self._nccl_reinit_in_progress = True
+        try:
+            async with self._table_lock:
+                cohort_sids, cohort_indices = self._joinable_cohort()
+            dispatched_sids = set(cohort_sids)
 
-            Round-robin clients (legacy direct-shard mode) read this once at
-            bring-up. The unified router prefers clients to send to
-            ``/v1/{completions,chat/completions}`` so cordon + replay is
-            invisible, but this endpoint is preserved for back-compat /
-            diagnostics. Returns the URLs of every shard the router knows
-            about — including non-ready ones — because the legacy clients
-            don't track status.
-            """
-            return [s.url for s in self._shards.values() if s.url]
+            if not cohort_indices:
+                self._nccl_reinit_in_progress = prev_flag
+                return {
+                    "success": False,
+                    "error": "no joinable shards yet; retry after warm-up",
+                    "current_gen_world_size": self.current_gen_world_size(),
+                    "failed_indices": [],
+                    "evicted_shard_ids": [],
+                }
 
-        @app.get("/config")
-        async def get_config() -> dict[str, Any]:
-            """Return the gen-side ``policy.cfg`` so train can fetch it.
-
-            ``RemoteGeneration._fetch_remote_config`` polls this during
-            bring-up to discover sampling defaults, the model name, etc.
-            503 when no generation is wired (fake / cordon-only mode).
-            """
-            if self._generation is None:
-                raise HTTPException(status_code=503, detail="no generation wired")
-            return dict(self._generation.cfg)
-
-        @app.get("/metrics")
-        async def metrics() -> dict[str, Any]:
-            """Router-side fault-tolerance + traffic snapshot for wandb."""
-            return self.metrics_snapshot()
-
-        # ---- Admin --------------------------------------------------------
-
-        @app.post("/admin/cordon")
-        async def admin_cordon(payload: dict[str, str]) -> dict[str, str]:
-            shard_id = payload.get("shard_id")
-            reason = payload.get("reason", "manual")
-            if not shard_id:
-                raise HTTPException(status_code=400, detail="shard_id required")
-            await self.cordon(shard_id, reason)
-            return {"shard_id": shard_id, "status": "cordoned"}
-
-        @app.post("/admin/uncordon")
-        async def admin_uncordon(payload: dict[str, str]) -> dict[str, str]:
-            shard_id = payload.get("shard_id")
-            if not shard_id:
-                raise HTTPException(status_code=400, detail="shard_id required")
-            await self.uncordon(shard_id)
-            return {"shard_id": shard_id, "status": "joining"}
-
-        @app.post("/admin/remove_shard")
-        async def admin_remove_shard(payload: dict[str, Any]) -> dict[str, Any]:
-            shard_id = payload.get("shard_id")
-            reason = payload.get("reason", "admin /admin/remove_shard")
-            if not shard_id:
-                raise HTTPException(status_code=400, detail="shard_id required")
-            # ``drain_timeout_s`` is opt-in via payload; default keeps the
-            # graceful 30s drain. Stress-test/fault-injection callers
-            # pass a smaller value (e.g. 5s) so in-flight rollouts on
-            # the dying shard fail fast and the proxy replays them on
-            # survivors instead of blocking the next training step.
-            kwargs: dict[str, Any] = {"reason": reason}
-            if "drain_timeout_s" in payload:
-                kwargs["drain_timeout_s"] = float(payload["drain_timeout_s"])
-            return await self.remove_shard(shard_id, **kwargs)
-
-        @app.post("/admin/add_shard")
-        async def admin_add_shard(
-            payload: Optional[dict[str, str]] = None,
-        ) -> dict[str, Any]:
-            """Allocate + spawn a new DP shard.
-
-            Body (optional): ``{"reason": "..."}``. Reason is logged into
-            the router's last_fault_event for wandb attribution.
-            """
-            reason = (payload or {}).get("reason", "admin /admin/add_shard")
-            return await self.add_shard(reason=reason)
-
-        # ---- Data plane ---------------------------------------------------
-
-        @app.post("/v1/completions")
-        async def v1_completions(request: Request) -> Response:
-            return await self._proxy(request, "/completions")
-
-        @app.post("/v1/chat/completions")
-        async def v1_chat_completions(request: Request) -> Response:
-            return await self._proxy(request, "/chat/completions")
-
-        # /tokenize and /detokenize live at the vLLM server root (no /v1
-        # prefix). NemoGym's vllm_model gym sub-server hits /tokenize after
-        # every chat completion to recover prompt token ids — see
-        # responses_api_models/vllm_model/app.py:402.
-        @app.post("/tokenize")
-        async def tokenize(request: Request) -> Response:
-            return await self._proxy(request, "/tokenize", strip_v1=True)
-
-        @app.post("/detokenize")
-        async def detokenize(request: Request) -> Response:
-            return await self._proxy(request, "/detokenize", strip_v1=True)
-
-        # ---- Control plane (weight sync + lifecycle) ---------------------
-
-        # All control-plane handlers use run_in_executor to avoid blocking
-        # the uvicorn event loop. Blocking ray.get() or synchronous GPU
-        # ops in async handlers would deadlock the NCCL warmup broadcast
-        # (uvicorn's loop is also where the proxy + health poll run).
-        async def _run_blocking(fn: Callable[..., Any], *args: Any) -> Any:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, fn, *args)
 
-        def _require_generation() -> Any:
-            if self._generation is None:
-                raise HTTPException(status_code=503, detail="no generation wired")
-            return self._generation
-
-        @app.post("/init_collective")
-        async def init_collective(request: Request) -> Any:
-            generation = _require_generation()
-            body = await request.json()
-            # Cascade-to-zero guard: if no shards are alive in the NCCL
-            # group, init_collective on the underlying generation would
-            # raise "Data parallel size is zero" → caller catches as 500
-            # → train treats as fatal. Return 503 (recoverable) so the
-            # train-side ensure_collective_synced retry loop polls
-            # /refit_ready (which is also gated on shard_count > 0) and
-            # waits for add_shard recovery instead of fast-failing.
-            if self.shard_count_alive_for_collective() == 0:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "success": False,
-                        "error": "no shards alive in NCCL group; retry after add_shard",
-                        "current_gen_world_size": 0,
-                        "failed_indices": [],
-                        "evicted_shard_ids": [],
-                    },
+            def _dispatch() -> list:
+                return generation._raw_init_collective(
+                    ip=ip,
+                    port=port,
+                    world_size=world_size,
+                    train_world_size=train_world_size,
+                    include_worker_indices=cohort_indices,
                 )
-            # Pause cordon transitions for the duration of the cross-cluster
-            # NCCL rendezvous: the gen workers' event loop can stall while
-            # waiting for the train side to enter init, missing /openapi.json
-            # probes; without this gate the router would cordon every shard
-            # and the next request would get a 502.
-            prev_flag = self._nccl_reinit_in_progress
-            self._nccl_reinit_in_progress = True
-            try:
-                # Dispatch to only the JOINABLE cohort (cold backfills excluded) so a
-                # booting shard can't sabotage the handshake. Per-future tracking
-                # avoids a single bad worker sinking the whole rendezvous.
+
+            futures = await loop.run_in_executor(None, _dispatch)
+
+            failed_idxs, _results, exc_types, failed_fast = (
+                await self._per_worker_results(futures, rendezvous_timeout_s=90.0)
+            )
+
+            if not failed_idxs:
                 async with self._table_lock:
-                    cohort_sids, cohort_indices = self._joinable_cohort()
-                dispatched_sids = set(cohort_sids)
-                if not cohort_indices:
-                    # No shard is joinable yet (e.g. survivors all cold mid-
-                    # recovery). Don't rendezvous an empty cohort — 503 so the
-                    # train retries after the quiesce-wait, by which point a
-                    # shard has warmed.
-                    self._nccl_reinit_in_progress = prev_flag
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "success": False,
-                            "error": "no joinable shards yet; retry after warm-up",
-                            "current_gen_world_size": self.current_gen_world_size(),
-                            "failed_indices": [],
-                            "evicted_shard_ids": [],
-                        },
-                    )
+                    for sid in dispatched_sids:
+                        entry = self._shards.get(sid)
+                        if entry is not None:
+                            entry.in_comm = True
+                            entry.proven = True
+                return {"success": True}
 
-                def _dispatch() -> list[Any]:
-                    return generation.init_collective(
-                        ip=body["ip"],
-                        port=body["port"],
-                        world_size=body["world_size"],
-                        train_world_size=body["train_world_size"],
-                        include_worker_indices=cohort_indices,
-                    )
-
-                futures = await _run_blocking(_dispatch)
-
-                # Wait long enough for stragglers to surface as
-                # DistStoreError (TCPStore timeout in
-                # stateless_process_group is 30s) but bound the total so
-                # we don't pin train indefinitely. 90s = 3x TCPStore
-                # timeout + slack for the actor's task queue to drain.
-                failed_idxs, _results, exc_types, failed_fast = await self._per_worker_results(
-                    futures, rendezvous_timeout_s=90.0
+            if self._is_rendezvous_master_failure(failed_idxs, exc_types):
+                print(
+                    f"[router] run_init_collective: rendezvous-master failure "
+                    f"(all {len(failed_idxs)} gen workers raised "
+                    f"{exc_types[failed_idxs[0]]}); skipping mass-eviction, "
+                    f"returning failure for retry",
+                    flush=True,
                 )
+                return {
+                    "success": False,
+                    "error": "rendezvous master timed out; retry",
+                    "current_gen_world_size": self.current_gen_world_size(),
+                    "failed_indices": failed_idxs,
+                    "evicted_shard_ids": [],
+                    "rendezvous_master_failure": True,
+                }
 
-                if not failed_idxs:
-                    # Rendezvous succeeded: these shards are now in the live
-                    # weight-sync comm. Promotion of a joining shard is gated
-                    # on this (see /update_weights_from_collective).
-                    async with self._table_lock:
-                        for sid in dispatched_sids:
-                            entry = self._shards.get(sid)
-                            if entry is not None:
-                                entry.in_comm = True
-                                # Sticky: this shard's cross-cluster route has
-                                # now rendezvoused → warm. Bypasses the warm-up
-                                # age gate on any future re-add/rejoin.
-                                entry.proven = True
-                    return {"success": True}
+            num_evicted, evicted_ids = await self._evict_failed_workers_inline(
+                failed_idxs,
+                reason="init_collective: per-worker failure",
+                exception_types=exc_types,
+                force_evict_idxs=failed_fast,
+                shard_ids_in_order=cohort_sids,
+            )
+            new_ws = self.current_gen_world_size()
+            msg = (
+                f"{len(failed_idxs)} of {len(futures)} workers failed "
+                f"rendezvous; evicted {num_evicted} (ids={evicted_ids}); "
+                f"current_gen_world_size={new_ws}"
+            )
+            print(f"[router] run_init_collective: {msg}", flush=True)
+            return {
+                "success": False,
+                "error": msg,
+                "current_gen_world_size": new_ws,
+                "failed_indices": failed_idxs,
+                "evicted_shard_ids": evicted_ids,
+            }
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            raise RuntimeError(f"run_init_collective failed: {e}") from e
+        finally:
+            self._nccl_reinit_in_progress = prev_flag
 
-                # Rendezvous-master failure short-circuit: when EVERY gen
-                # worker raises DistStoreError / DistNetworkError, the
-                # train-side TCPStore master timed out. Mass-evicting all
-                # gen workers in this case is wrong — they were healthy,
-                # the master was the single point of failure. Return 503
-                # without evicting; train's retry loop will re-rendezvous
-                # at the same world after a brief settle.
-                if self._is_rendezvous_master_failure(failed_idxs, exc_types):
-                    print(
-                        f"[router] /init_collective: rendezvous-master "
-                        f"failure (all {len(failed_idxs)} gen workers "
-                        f"raised {exc_types[failed_idxs[0]]}); skipping "
-                        f"mass-eviction, returning 503 for retry",
-                        flush=True,
-                    )
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "success": False,
-                            "error": "rendezvous master timed out; retry",
-                            "current_gen_world_size": self.current_gen_world_size(),
-                            "failed_indices": failed_idxs,
-                            "evicted_shard_ids": [],
-                            "rendezvous_master_failure": True,
-                        },
-                    )
+    async def run_update_weights_from_collective(self) -> dict:
+        """Gen-side update_weights_from_collective: broadcast weights to all shards.
 
-                # Per-worker failure path: evict the bad workers, drain
-                # NCCL state on survivors via ``remove_shard`` (which
-                # internally calls ``reset_collective``), and tell train
-                # to re-rendezvous at the smaller world. 503 is a
-                # "transient — try again with the new world" signal;
-                # train's ``ensure_collective_synced`` retry already
-                # re-reads ``/current_gen_world_size`` on each attempt.
+        Returns ``{"success": True, "promoted_shards": [...]}`` on success.
+        """
+        generation = self._generation
+        if generation is None:
+            raise RuntimeError("no generation wired")
+
+        if self.shard_count_alive_for_collective() == 0:
+            return {
+                "success": False,
+                "error": "no shards alive in NCCL group; retry after add_shard",
+                "current_gen_world_size": 0,
+                "failed_indices": [],
+                "evicted_shard_ids": [],
+                "promoted_shards": [],
+            }
+
+        try:
+            self._refit_attempts += 1
+
+            async with self._table_lock:
+                eligible_promote = self._eligible_promote_sids()
+
+            loop = asyncio.get_running_loop()
+
+            def _dispatch() -> list:
+                return generation._raw_update_weights_from_collective()
+
+            futures = await loop.run_in_executor(None, _dispatch)
+
+            failed_idxs, results, exc_types, failed_fast = (
+                await self._per_worker_results(futures, rendezvous_timeout_s=60.0)
+            )
+
+            if failed_idxs and self._is_rendezvous_master_failure(
+                failed_idxs, exc_types
+            ):
+                print(
+                    f"[router] run_update_weights_from_collective: "
+                    f"rendezvous-master failure (all {len(failed_idxs)} "
+                    f"gen workers raised {exc_types[failed_idxs[0]]}); "
+                    f"skipping mass-eviction, returning failure for retry",
+                    flush=True,
+                )
+                return {
+                    "success": False,
+                    "error": "rendezvous master timed out; retry",
+                    "current_gen_world_size": self.current_gen_world_size(),
+                    "failed_indices": failed_idxs,
+                    "evicted_shard_ids": [],
+                    "promoted_shards": [],
+                    "rendezvous_master_failure": True,
+                }
+
+            if failed_idxs:
                 num_evicted, evicted_ids = await self._evict_failed_workers_inline(
                     failed_idxs,
-                    reason="init_collective: per-worker failure",
+                    reason="update_weights_from_collective: per-worker error",
                     exception_types=exc_types,
                     force_evict_idxs=failed_fast,
-                    # Futures cover only the frozen cohort, in cohort order —
-                    # map failed indices back through the SAME order.
-                    shard_ids_in_order=cohort_sids,
                 )
                 new_ws = self.current_gen_world_size()
                 msg = (
                     f"{len(failed_idxs)} of {len(futures)} workers failed "
-                    f"rendezvous; evicted {num_evicted} (ids={evicted_ids}); "
+                    f"weight broadcast; evicted {num_evicted} (ids={evicted_ids}); "
                     f"current_gen_world_size={new_ws}"
                 )
-                print(f"[router] /init_collective: {msg}", flush=True)
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "success": False,
-                        "error": msg,
-                        "current_gen_world_size": new_ws,
-                        "failed_indices": failed_idxs,
-                        "evicted_shard_ids": evicted_ids,
-                    },
+                print(f"[router] run_update_weights_from_collective: {msg}", flush=True)
+                return {
+                    "success": False,
+                    "error": msg,
+                    "current_gen_world_size": new_ws,
+                    "failed_indices": failed_idxs,
+                    "evicted_shard_ids": evicted_ids,
+                    "promoted_shards": [],
+                }
+
+            success = all(r for r in results if r is not None)
+            if not success:
+                raise RuntimeError(
+                    f"One or more workers reported broadcast failure. Results: {results}"
                 )
-            except Exception as e:  # noqa: BLE001 - structured error to caller
-                traceback.print_exc()
-                return JSONResponse(
-                    status_code=500, content={"success": False, "error": str(e)}
+            promoted: list[str] = self.promote_all_joining(
+                eligible_sids=eligible_promote
+            )
+            if promoted:
+                print(
+                    f"[router] refit complete; promoted "
+                    f"{len(promoted)} joining shard(s) -> ready: {promoted}",
+                    flush=True,
                 )
-            finally:
-                self._nccl_reinit_in_progress = prev_flag
+            return {"success": success, "promoted_shards": promoted}
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            raise RuntimeError(f"run_update_weights_from_collective failed: {e}") from e
 
-        @app.post("/reset_collective")
-        async def reset_collective() -> Any:
-            """Tear down the weight-sync NCCL group so a new run can re-init.
+    async def run_reset_collective(self) -> None:
+        """Gen-side reset_collective: tear down weight-sync NCCL group on all shards."""
+        generation = self._generation
+        if generation is None:
+            return
+        if self.shard_count_alive_for_collective() == 0:
+            return  # no-op: nothing to tear down
 
-            Idempotent — safe to call when no collective is currently held.
-            """
-            generation = _require_generation()
-            # 0-shards short-circuit: nothing to tear down (every worker
-            # was evicted), so don't dispatch to the underlying
-            # generation (whose worker_group may be empty and raise on
-            # dispatch). Return 200 success with a no-op note so the
-            # train side's idempotent reset path doesn't trip on a 500.
-            if self.shard_count_alive_for_collective() == 0:
-                return {"success": True, "note": "no shards alive; nothing to reset"}
-            try:
-                import ray
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, generation._raw_reset_collective)
 
-                def _do() -> None:
-                    futures = generation.reset_collective()
-                    if futures:
-                        ray.get(futures)
+    async def run_prepare_for_generation(self) -> bool:
+        """Gen-side prepare_for_generation."""
+        generation = self._generation
+        if generation is None:
+            raise RuntimeError("no generation wired")
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, generation.prepare_for_generation)
+        return bool(result)
 
-                await _run_blocking(_do)
-                return {"success": True}
-            except Exception as e:  # noqa: BLE001
-                traceback.print_exc()
-                # 503 (not 500) so train-side retry treats it as
-                # recoverable. The underlying NCCL state may have been
-                # torn down by the per-refit destroy() in vllm_backend
-                # already; a downstream init_collective will rebuild
-                # cleanly. Surface the actual error for diagnostics.
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "success": False,
-                        "error": f"reset_collective dispatch raised: {e}",
-                    },
+    async def run_finish_generation(self) -> bool:
+        """Gen-side finish_generation."""
+        generation = self._generation
+        if generation is None:
+            raise RuntimeError("no generation wired")
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, generation.finish_generation)
+        return bool(result)
+
+    async def run_prepare_refit_info(self, state_dict_info: dict) -> None:
+        """Gen-side prepare_refit_info: deserialise and push to all workers."""
+        generation = self._generation
+        if generation is None:
+            raise RuntimeError("no generation wired")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, lambda: generation.prepare_refit_info(state_dict_info)
+        )
+
+    # =====================================================================
+    # Background loop lifecycle
+    # =====================================================================
+
+    def start_background(self) -> None:
+        """Start the health-poll loop in a background daemon thread.
+
+        Creates a dedicated asyncio event loop, initialises the aiohttp
+        session for health probing, and runs ``_health_poll_loop`` until
+        the process exits.  ``call_async`` submits coroutines to this loop
+        from any thread.
+        """
+
+        def _run() -> None:
+            import asyncio as _asyncio
+
+            loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(loop)
+            self._loop = loop
+
+            async def _main() -> None:
+                connector = aiohttp.TCPConnector(
+                    limit=256,
+                    limit_per_host=64,
+                    keepalive_timeout=60,
                 )
+                self._http_session = aiohttp.ClientSession(connector=connector)
+                try:
+                    await self._health_poll_loop()
+                finally:
+                    self._shutting_down = True
+                    if self._http_session is not None:
+                        await self._http_session.close()
 
-        @app.post("/update_weights_from_collective")
-        async def update_weights_from_collective() -> Any:
-            generation = _require_generation()
-            # Cascade-to-zero guard (mirror of /init_collective): no
-            # shards in the NCCL group → return 503 so train's retry
-            # path waits for add_shard recovery instead of fast-failing
-            # on a generic 500.
-            if self.shard_count_alive_for_collective() == 0:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "success": False,
-                        "error": "no shards alive in NCCL group; retry after add_shard",
-                        "current_gen_world_size": 0,
-                        "failed_indices": [],
-                        "evicted_shard_ids": [],
-                        "promoted_shards": [],
-                    },
-                )
-            try:
-                # Mark that training has reached (at least) its first refit
-                # broadcast — the FaultInjector waits on this via /refit_count.
-                self._refit_attempts += 1
-                # Per-worker error tracking: a single worker hitting
-                # cudaErrorLaunchFailure during the broadcast would
-                # otherwise sink the whole refit (ray.get raises first
-                # exception → generic 500 → train can't tell which
-                # worker is bad → next refit poisons everyone). Same
-                # pattern as /init_collective above.
-                # Snapshot which shards were ``joining`` at the moment we
-                # dispatched the broadcast. Only THESE shards are eligible
-                # for promotion when the refit succeeds — a shard added
-                # via ``/admin/add_shard`` AFTER dispatch did not
-                # participate in the broadcast and still has stale
-                # ``load_format=dummy`` weights; promoting it would let
-                # the data plane route to it and serve garbage (rewards
-                # collapse to 0 — observed in production once when an
-                # add_shard landed during a long ~410s refit window).
-                async with self._table_lock:
-                    eligible_promote = self._eligible_promote_sids()
+            loop.run_until_complete(_main())
 
-                def _dispatch() -> list[Any]:
-                    return generation.update_weights_from_collective()
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        print(
+            f"GenerationRouter background loop starting "
+            f"(shards={len(self._shards)}, ready={self.shard_count_ready()})",
+            flush=True,
+        )
 
-                futures = await _run_blocking(_dispatch)
-                # Broadcast itself is fast (~3-5s for 30B); a 60s window
-                # is enough for any peer-loss DistStoreError or NCCL
-                # timeout to surface.
-                failed_idxs, results, exc_types, failed_fast = await self._per_worker_results(
-                    futures, rendezvous_timeout_s=60.0
-                )
+    def call_async(self, coro: Any) -> Any:
+        """Run an async coroutine synchronously from a non-async context.
 
-                if failed_idxs and self._is_rendezvous_master_failure(
-                    failed_idxs, exc_types
-                ):
-                    print(
-                        f"[router] /update_weights_from_collective: "
-                        f"rendezvous-master failure (all {len(failed_idxs)} "
-                        f"gen workers raised {exc_types[failed_idxs[0]]}); "
-                        f"skipping mass-eviction, returning 503 for retry",
-                        flush=True,
-                    )
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "success": False,
-                            "error": "rendezvous master timed out; retry",
-                            "current_gen_world_size": self.current_gen_world_size(),
-                            "failed_indices": failed_idxs,
-                            "evicted_shard_ids": [],
-                            "promoted_shards": [],
-                            "rendezvous_master_failure": True,
-                        },
-                    )
+        Submits ``coro`` to the background event loop started by
+        ``start_background()`` and blocks until it completes.  Propagates
+        exceptions raised by the coroutine.
+        """
+        import asyncio as _asyncio
 
-                if failed_idxs:
-                    num_evicted, evicted_ids = await self._evict_failed_workers_inline(
-                        failed_idxs,
-                        reason="update_weights_from_collective: per-worker error",
-                        exception_types=exc_types,
-                        force_evict_idxs=failed_fast,
-                    )
-                    new_ws = self.current_gen_world_size()
-                    msg = (
-                        f"{len(failed_idxs)} of {len(futures)} workers failed "
-                        f"weight broadcast; evicted {num_evicted} (ids={evicted_ids}); "
-                        f"current_gen_world_size={new_ws}"
-                    )
-                    print(
-                        f"[router] /update_weights_from_collective: {msg}",
-                        flush=True,
-                    )
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "success": False,
-                            "error": msg,
-                            "current_gen_world_size": new_ws,
-                            "failed_indices": failed_idxs,
-                            "evicted_shard_ids": evicted_ids,
-                            "promoted_shards": [],
-                        },
-                    )
-
-                success = all(r for r in results if r is not None)
-                if not success:
-                    # All workers responded but at least one returned a
-                    # falsy result (no exception, just refused). Same
-                    # treatment — surface to train so it retries.
-                    raise RuntimeError(
-                        f"One or more workers reported broadcast failure. Results: {results}"
-                    )
-                # Promote joining shards to ready only after refit succeeds (weights are now current).
-                promoted: list[str] = []
-                if success:
-                    promoted = self.promote_all_joining(
-                        eligible_sids=eligible_promote
-                    )
-                    if promoted:
-                        print(
-                            f"[router] refit complete; promoted "
-                            f"{len(promoted)} joining shard(s) -> ready: "
-                            f"{promoted}",
-                            flush=True,
-                        )
-                return {"success": success, "promoted_shards": promoted}
-            except Exception as e:  # noqa: BLE001
-                traceback.print_exc()
-                return JSONResponse(
-                    status_code=500, content={"success": False, "error": str(e)}
-                )
-
-        @app.post("/prepare_for_generation")
-        async def prepare_for_generation() -> Any:
-            generation = _require_generation()
-            try:
-                result = await _run_blocking(generation.prepare_for_generation)
-                return {"success": bool(result)}
-            except Exception as e:  # noqa: BLE001
-                traceback.print_exc()
-                return JSONResponse(
-                    status_code=500, content={"success": False, "error": str(e)}
-                )
-
-        @app.post("/finish_generation")
-        async def finish_generation() -> Any:
-            generation = _require_generation()
-            try:
-                result = await _run_blocking(generation.finish_generation)
-                return {"success": bool(result)}
-            except Exception as e:  # noqa: BLE001
-                traceback.print_exc()
-                return JSONResponse(
-                    status_code=500, content={"success": False, "error": str(e)}
-                )
-
-        @app.post("/prepare_refit_info")
-        async def prepare_refit_info(request: Request) -> Any:
-            generation = _require_generation()
-            try:
-                body_bytes = await request.body()
-
-                def _do() -> None:
-                    state_dict_info = torch.load(
-                        io.BytesIO(body_bytes), weights_only=True
-                    )
-                    generation.prepare_refit_info(state_dict_info)
-
-                await _run_blocking(_do)
-                return {"success": True}
-            except Exception as e:  # noqa: BLE001
-                traceback.print_exc()
-                return JSONResponse(
-                    status_code=500, content={"success": False, "error": str(e)}
-                )
-
-        @app.post("/invalidate_kv_cache")
-        async def invalidate_kv_cache() -> Any:
-            generation = _require_generation()
-            try:
-                result = await _run_blocking(generation.invalidate_kv_cache)
-                return {"success": bool(result)}
-            except Exception as e:  # noqa: BLE001
-                traceback.print_exc()
-                return JSONResponse(
-                    status_code=500, content={"success": False, "error": str(e)}
-                )
-
-        @app.post("/clear_logger_metrics")
-        async def clear_logger_metrics() -> dict[str, bool]:
-            generation = _require_generation()
-            generation.clear_logger_metrics()
-            return {"success": True}
-
-        @app.get("/get_logger_metrics")
-        async def get_logger_metrics() -> dict[str, Any]:
-            generation = _require_generation()
-            return generation.get_logger_metrics()
-
-        @app.post("/snapshot_step_metrics")
-        async def snapshot_step_metrics() -> dict[str, bool]:
-            generation = _require_generation()
-            if hasattr(generation, "snapshot_step_metrics"):
-                generation.snapshot_step_metrics()
-            return {"success": True}
-
-        @app.get("/get_step_metrics")
-        async def get_step_metrics() -> dict[str, Any]:
-            generation = _require_generation()
-            if hasattr(generation, "get_step_metrics"):
-                return generation.get_step_metrics()
-            return {}
-
-        @app.get("/step_metrics_snapshot")
-        async def step_metrics_snapshot() -> dict[str, Any]:
-            """Consolidated, non-destructive gen-side metrics snapshot.
-
-            Bundles two sources the train cluster can't reach directly:
-              * ``vllm_logger_metrics`` — vLLM's PrometheusStatLogger samples
-                (inflight batch sizes, num_pending, kv_cache_usage_perc,
-                generation_tokens) collected on each model-owner actor.
-              * ``router_metrics`` — fault-tolerance counters: number of
-                ready/cordoned/joining shards, cumulative removals, last
-                fault event.
-
-            Spec-decode counters (``vllm/spec_*``) are NOT included here —
-            they're a destructive delta-since-snapshot read consumed by
-            grpo via the existing ``GET /get_step_metrics`` endpoint. The
-            ``spec_decode_metrics`` key is left as ``{}`` so the response
-            shape is stable for clients that index into it.
-
-            Single network round-trip per step. Response is KB-scale (no
-            tensors, no large vectors — vllm_logger lists are timeline
-            samples capped by training step duration).
-            """
-            generation = _require_generation()
-            return {
-                "vllm_logger_metrics": generation.get_logger_metrics(),
-                "spec_decode_metrics": {},
-                "router_metrics": self.metrics_snapshot(),
-            }
-
-        return app
+        # Wait for the loop to be ready (start_background may still be
+        # starting the thread when the first call arrives).
+        deadline = time.monotonic() + 30
+        while self._loop is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if self._loop is None:
+            raise RuntimeError(
+                "GenerationRouter background loop did not start within 30s"
+            )
+        future = _asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=600)
 
     # =====================================================================
     # State accessors
@@ -1993,39 +1498,3 @@ class GenerationRouter:
             "per_shard": per_shard,
         }
 
-    # =====================================================================
-    # Server lifecycle
-    # =====================================================================
-
-    def start(self) -> None:
-        """Start uvicorn in a background thread."""
-        import uvicorn
-
-        config = uvicorn.Config(
-            self._app,
-            host="0.0.0.0",
-            port=self.port,
-            timeout_keep_alive=self.uvicorn_keep_alive_s,
-            # Bump TCP listen backlog from uvicorn's default 2048. Under
-            # an RL burst (2048 concurrent samples), the kernel can drop
-            # incoming SYNs if backlog fills before uvicorn accepts them,
-            # surfacing as `aiohttp.ServerDisconnectedError` on the
-            # client. Doubling gives headroom.
-            backlog=self.uvicorn_backlog,
-            # Cap the request line + headers size at something well above
-            # vLLM's expected payload — defaults are fine, but explicit so
-            # nothing surprising happens with large prompts.
-            h11_max_incomplete_event_size=64 * 1024 * 1024,
-        )
-        server = uvicorn.Server(config)
-        self._server_thread = threading.Thread(target=server.run, daemon=True)
-        self._server_thread.start()
-        print(
-            f"GenerationRouter started on port {self.port} "
-            f"(shards={len(self._shards)}, ready={self.shard_count_ready()})",
-            flush=True,
-        )
-
-    def get_app(self) -> FastAPI:
-        """Expose the FastAPI app (for testing or custom server setup)."""
-        return self._app

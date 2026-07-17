@@ -544,12 +544,6 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    # HTTP-only disagg: gen server is external (separate cluster/process).
-    # Implicitly enabled when not colocated and `remote_generation_url` is set.
-    disagg_http_mode = (
-        not colocated_inference
-        and generation_config.get("remote_generation_url") is not None
-    )
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -713,16 +707,7 @@ def setup(
         inference_nodes = inference_resources["num_nodes"]
 
         # validate and configure resources
-        if disagg_http_mode:
-            # External gen server manages its own GPUs. Training cluster uses
-            # ALL gpus from cluster config — no subtraction.
-            inference_nodes = inference_nodes or 1
-            print(
-                f"  ⚡ Disagg HTTP mode: training uses {train_gpus_per_node} GPUs/node, "
-                f"inference is external ({inference_gpus_per_node}×{inference_nodes} GPUs)",
-                flush=True,
-            )
-        elif policy_nodes == 1:
+        if policy_nodes == 1:
             # When policy_nodes == 1, train and inference are on the same node
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
@@ -769,11 +754,10 @@ def setup(
             )
             train_nodes -= inference_nodes
 
-        if not disagg_http_mode:
-            assert train_nodes > 0 and inference_nodes > 0, (
-                f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
-                f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
-            )
+        assert train_nodes > 0 and inference_nodes > 0, (
+            f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
+            f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
+        )
 
         # Build topology-aware domain constraints for placement groups.
         # Each selected node's bundles are pinned to a specific NVLink domain so
@@ -888,36 +872,28 @@ def setup(
             flush=True,
         )
 
-        if disagg_http_mode:
-            # No local inference cluster — gen server is external
-            inference_cluster = None
-            print(
-                "  ✓ No local inference cluster (disagg HTTP mode)",
-                flush=True,
+        # Create inference cluster with topology constraints so TP groups
+        # stay within NVLink domains. Eagerly initialize PGs when constraints
+        # are set so inference claims domain-aligned nodes first.
+        inference_cluster = RayVirtualCluster(
+            name="grpo_inference_cluster",
+            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+            use_gpus=True,
+            num_gpus_per_node=inference_gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=cluster_config.get("master_port_range_low"),
+            port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=inference_segment_size,
+            node_resource_constraints=inference_node_resource_constraints,
+        )
+        if inference_node_resource_constraints is not None:
+            VllmGeneration.init_cluster_placement_groups(
+                inference_cluster, generation_config
             )
-        else:
-            # Create inference cluster with topology constraints so TP groups
-            # stay within NVLink domains. Eagerly initialize PGs when constraints
-            # are set so inference claims domain-aligned nodes first.
-            inference_cluster = RayVirtualCluster(
-                name="grpo_inference_cluster",
-                bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
-                use_gpus=True,
-                num_gpus_per_node=inference_gpus_per_node,
-                max_colocated_worker_groups=1,
-                port_range_low=cluster_config.get("master_port_range_low"),
-                port_range_high=cluster_config.get("master_port_range_high"),
-                segment_size=inference_segment_size,
-                node_resource_constraints=inference_node_resource_constraints,
-            )
-            if inference_node_resource_constraints is not None:
-                VllmGeneration.init_cluster_placement_groups(
-                    inference_cluster, generation_config
-                )
-            print(
-                f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
-                flush=True,
-            )
+        print(
+            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
+            flush=True,
+        )
 
     # ==========================
     #   Training and Inference
@@ -1208,26 +1184,6 @@ def setup(
             worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
             worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
-        elif disagg_http_mode:
-            # HTTP-only disagg: gen server is external, don't create VllmGeneration.
-            # Only initialize policy training workers.
-            from nemo_rl.models.generation.remote_generation import RemoteGeneration
-
-            remote_url = generation_config["remote_generation_url"]
-            assert remote_url, (
-                "remote_generation_url must be set for disaggregated HTTP mode"
-            )
-            policy_generation = RemoteGeneration(
-                server_url=remote_url,
-                config=generation_config,
-            )
-            print(
-                f"  ✓ Using HTTP-only RemoteGeneration via unified router {remote_url}",
-                flush=True,
-            )
-
-            policy, policy_time = init_policy()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
         else:
             policy_generation, policy = initialize_generation_with_policy(
                 init_generation_fn=init_vllm,
@@ -1279,22 +1235,6 @@ def setup(
         # world includes all training workers and all inference workers
         train_world_size = train_cluster.world_size()
         inference_world_size = inference_nodes * inference_gpus_per_node
-        # In disagg HTTP mode, prefer the gen control server's reported
-        # current_gen_world_size — it reflects any shard already removed by a
-        # fault before train booted.
-        if disagg_http_mode and hasattr(
-            policy_generation, "_fetch_current_gen_world_size"
-        ):
-            dynamic_inf = policy_generation._fetch_current_gen_world_size()
-            if dynamic_inf is not None and dynamic_inf > 0:
-                if dynamic_inf != inference_world_size:
-                    print(
-                        f"  ↻ gen world size has drifted from config "
-                        f"(config={inference_world_size}, current={dynamic_inf}); "
-                        f"using current for init_collective.",
-                        flush=True,
-                    )
-                inference_world_size = dynamic_inf
         world_size = train_world_size + inference_world_size
         # When the train side runs the RefitWorker split-actor path
         # (NRL_USE_REFIT_WORKER), only ONE process on the train side participates
