@@ -42,6 +42,7 @@ from nemo_rl.distributed.model_utils import (
     cp_shift_next,
     group_all_reduce_sum,
     vocab_parallel_full_log_softmax,
+    vocab_parallel_gather_columns,
     vocab_parallel_log_softmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
@@ -1849,15 +1850,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         Top-K columns are selected at the student from the reassembled full-vocab
         teacher logits (``select_teacher_topk_indices`` MAX-reduces across CP so
-        every CP rank agrees on the same columns). The student is gathered to full
-        vocab across TP (``vocab_parallel_full_log_softmax``) *before* slicing —
-        slicing a TP-local shard would pick the wrong columns. Both sides are
-        renormalized within the K-subset (the teacher's subset-softmax and the
-        student's full-then-renorm are mathematically identical, the full-vocab
-        partition function cancels). The masked next-token mean is normalized by
-        the CP/DP-global valid-token count, exactly like the CE term; at CP=1 the
-        ``cp_shift_next`` mask reduces to the ``token_mask[:, 1:]`` next-token
-        shift.
+        every CP rank agrees on the same columns). The student's K columns are
+        gathered TP-aware (``vocab_parallel_gather_columns``) and softmaxed
+        within the subset directly: because both sides renormalize within K,
+        the full-vocab partition function cancels, so
+        ``log_softmax_K(logits[..., idx] / T)`` equals the previous
+        full-vocab-log-softmax-then-renorm form exactly — without materializing
+        the all-gathered ``[B, T, V]`` student log-probs. The masked next-token
+        mean is normalized by the CP/DP-global valid-token count, exactly like
+        the CE term; at CP=1 the ``cp_shift_next`` mask reduces to the
+        ``token_mask[:, 1:]`` next-token shift.
         """
         T = self.temperature
         # Drop HF lm_head padding beyond the shared tokenizer vocab.
@@ -1868,13 +1870,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         vocab_topk = min(self.vocab_topk, teacher.shape[-1])
         topk_idx = select_teacher_topk_indices(teacher, vocab_topk, cp_group=cp_group)
 
-        student_log_probs = vocab_parallel_full_log_softmax(
-            student_logits, T, tp_group=tp_group
+        # [B, T, K] instead of the all-gathered [B, T, V]: the K-subset
+        # renormalization cancels the full-vocab partition function, so the
+        # subset log_softmax is exactly equivalent (see docstring).
+        student_topk_logits = vocab_parallel_gather_columns(
+            student_logits, topk_idx, tp_group=tp_group
         )
-        student_gathered = student_log_probs[..., topk_idx]
-        student_log_probs_k = student_gathered - torch.logsumexp(
-            student_gathered, dim=-1, keepdim=True
-        )
+        student_log_probs_k = torch.log_softmax(student_topk_logits / T, dim=-1)
         teacher_log_probs_k = torch.log_softmax(
             teacher[..., topk_idx].float() / T, dim=-1
         )
