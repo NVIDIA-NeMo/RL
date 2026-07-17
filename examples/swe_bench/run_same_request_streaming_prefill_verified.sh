@@ -46,6 +46,10 @@ export SEQUENTIAL_ARMS="${SEQUENTIAL_ARMS:-1}"
 export AUDIT_PYTHON="${AUDIT_PYTHON:-/usr/bin/python3}"
 export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/nemo-rl:nightly-071526.squashfs}"
 export SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-nemotron_sw_post}"
+# The artifact prewarmer runs before either arm and provides a portable current
+# uv. Reuse that executable while keeping package/build caches in the shared
+# model/container/lock namespace below.
+export UV_BIN="${UV_BIN:-${REPO_ROOT}/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/swe_swebench_artifact_prefetch_setup/uv/uv}"
 # This is a full 8-GPU allocation on each of two nodes, so the launcher's
 # --exclusive flag does not strand GPUs. Never add backfill.
 export SBATCH_PARTITION="${SBATCH_PARTITION:-interactive,batch_short}"
