@@ -43,14 +43,14 @@ def _source_rank_for_rollout(
     train_world_size: int,
     rollout_world_size: int,
 ) -> int:
-    if rollout_rank < 0 or rollout_rank >= rollout_world_size:
-        raise ValueError(
-            f"rollout_rank must be in [0, {rollout_world_size}), got {rollout_rank}."
-        )
     if train_world_size < 1:
         raise ValueError("train_world_size must be >= 1.")
     if rollout_world_size < 1:
         raise ValueError("rollout_world_size must be >= 1.")
+    if rollout_rank < 0 or rollout_rank >= rollout_world_size:
+        raise ValueError(
+            f"rollout_rank must be in [0, {rollout_world_size}), got {rollout_rank}."
+        )
     if train_world_size < rollout_world_size:
         raise ValueError(
             "NIXL checkpoint-engine refit requires train_world_size >= "
@@ -64,7 +64,7 @@ def _create_nixl_agent(
     agent_name: str,
     backend_name: str,
     backend_init_params: dict[str, Any] | None = None,
-) -> Any:  # pragma: no cover
+) -> Any:
     try:
         nixl_api = importlib.import_module("nixl._api")
     except ImportError as exc:
@@ -98,7 +98,7 @@ def preinit_nixl_agent(
     *,
     backend_name: str = NIXL_DEFAULT_BACKEND_NAME,
     backend_init_params: dict[str, Any] | None = None,
-) -> Any:  # pragma: no cover
+) -> Any:
     agent = _create_nixl_agent(
         f"preinit-{uuid.uuid4()}", backend_name, backend_init_params
     )
@@ -106,7 +106,7 @@ def preinit_nixl_agent(
     return agent
 
 
-def _sync_device(device: torch.device) -> None:  # pragma: no cover
+def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elif torch.cuda.is_available():
@@ -117,7 +117,7 @@ def _sync_device(device: torch.device) -> None:  # pragma: no cover
         torch.cuda.current_stream().synchronize()
 
 
-class NixlAgent:  # pragma: no cover
+class NixlAgent:
     def __init__(
         self,
         backend_name: str = NIXL_DEFAULT_BACKEND_NAME,
@@ -191,7 +191,7 @@ class NixlAgent:  # pragma: no cover
             await asyncio.sleep(0)
 
 
-class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
+class NIXLCheckpointEngine(CheckpointEngine):
     def __init__(
         self,
         bucket_size: int,
@@ -360,8 +360,6 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
             previous_key: bytes | None,
             is_last: bool,
         ) -> tuple[int, int, dict[str, TensorMeta], bytes | None]:
-            if bucket_offset == 0 and not is_last:
-                return bucket_buffer_index, bucket_offset, bucket_metadata, previous_key
             _sync_device(self._transfer_device)
             await wait_readers(previous_key)
             notify_key = uuid.uuid4().bytes
