@@ -684,7 +684,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     # The aggregate is per-adapter for multi (using stacked slicing).
                     import os as _diag_os
                     _diag_step_metrics: dict[str, Any] = {}
-                    if _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1":
+                    if (
+                        _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1"
+                        and _diag_os.environ.get("NOUSNET_DIAG_LORA_STEP", "1") == "1"
+                    ):
                         try:
                             from nousnet.rl.lora.multi import diag as _diag
                             # Try to get the canonical adapter order. The
@@ -725,7 +728,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                         except Exception as _e:
                             print(f"[DUMP_EVERYTHING] post_optstep dump failed: {_e}", flush=True)
 
-                    if _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1":
+                    if (
+                        _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1"
+                        and _diag_os.environ.get("NOUSNET_DIAG_LORA_STEP", "1") == "1"
+                    ):
                         try:
                             from nousnet.rl.lora.multi import diag as _diag
                             _diag_adapter_names = _diag_os.environ.get(
