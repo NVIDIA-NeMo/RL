@@ -16,7 +16,12 @@
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-MODEL_PATH="${MODEL_PATH:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16}"
+BENCH_MODE="${BENCH_MODE:-background_prefill}"
+if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
+  MODEL_PATH="${MODEL_PATH:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
+else
+  MODEL_PATH="${MODEL_PATH:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16}"
+fi
 VLLM_TP="${VLLM_TP:-4}"
 if ! [[ "${VLLM_TP}" =~ ^[1-9][0-9]*$ ]] || (( 8 % VLLM_TP != 0 )); then
   echo "ERROR: VLLM_TP must be a positive divisor of 8 (got ${VLLM_TP})." >&2
@@ -99,7 +104,30 @@ _run_worker() {
 
   echo "[CACHE] runtime=${BENCH_RUNTIME_PYTHON} hf=${HF_HOME} hf_datasets=${HF_DATASETS_CACHE} vllm_local=${VLLM_CACHE_ROOT} vllm_persistent=${persistent_vllm_cache} inductor=${INDUCTOR_CACHE_DIR} triton=${TRITON_CACHE_DIR}"
   echo "[PREFLIGHT] validating prewarmed vLLM environment"
-  "${BENCH_RUNTIME_PYTHON}" -c 'import torch, transformers, vllm; from examples.swe_bench import benchmark_background_prefill_admission; assert torch.cuda.is_available(); assert vllm.__version__ == "0.20.0"; print(torch.__version__, transformers.__version__, vllm.__version__, benchmark_background_prefill_admission.__file__)'
+  "${BENCH_RUNTIME_PYTHON}" -c 'import torch, transformers, vllm; from examples.swe_bench import benchmark_background_prefill_admission, benchmark_streaming_final_decode; assert torch.cuda.is_available(); assert vllm.__version__ == "0.20.0"; print(torch.__version__, transformers.__version__, vllm.__version__, benchmark_background_prefill_admission.__file__, benchmark_streaming_final_decode.__file__)'
+
+  if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
+    "${BENCH_RUNTIME_PYTHON}" \
+      examples/swe_bench/benchmark_streaming_final_decode.py \
+      --model "${MODEL_PATH}" \
+      --tensor-parallel-size "${tensor_parallel_size}" \
+      --gpu-memory-utilization 0.7 \
+      --max-model-len 131072 \
+      --immutable-prefix-tokens 32768 \
+      --tool-output-tokens "${BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS}" \
+      --mutable-suffix-tokens 32 \
+      --candidate-chunk-token-sweep "${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP}" \
+      --stability-margin-tokens 8 \
+      --cache-page-size-tokens "${BENCH_CACHE_PAGE_SIZE_TOKENS}" \
+      --background-priority "${BENCH_BACKGROUND_PRIORITY}" \
+      --background-overlap-seconds "${BENCH_FINAL_DECODE_OVERLAP_SECONDS}" \
+      --cleanup-delay-seconds 0.05 \
+      --max-output-tokens "${BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS}" \
+      --warmup-repeats "${BENCH_WARMUP_REPEATS}" \
+      --repeats "${BENCH_REPEATS}" \
+      --output "${BENCH_OUTPUT_JSON}"
+    return
+  fi
 
   size_sweep_args=()
   if [[ -n "${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP}" ]]; then
@@ -144,14 +172,18 @@ fi
 
 : "${HF_HOME:?Export HF_HOME before launching the benchmark}"
 ACCOUNT="${ACCOUNT:-nemotron_sw_post}"
-PARTITION="${PARTITION:-interactive,batch}"
+PARTITION="${PARTITION:-interactive,batch_short}"
 TIME_LIMIT="${TIME_LIMIT:-01:00:00}"
 RESULT_ROOT="${RESULT_ROOT:-${REPO_ROOT}/results/streaming_tool_call_background_prefill_benchmark}"
 BENCH_REPEATS="${BENCH_REPEATS:-5}"
 BENCH_WARMUP_REPEATS="${BENCH_WARMUP_REPEATS:-1}"
 BENCH_CANDIDATE_CHUNK_TOKENS="${BENCH_CANDIDATE_CHUNK_TOKENS:-1024}"
 BENCH_BACKGROUND_PRIORITY="${BENCH_BACKGROUND_PRIORITY:-1}"
-BENCH_CACHE_PAGE_SIZE_TOKENS="${BENCH_CACHE_PAGE_SIZE_TOKENS:-1152}"
+if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
+  BENCH_CACHE_PAGE_SIZE_TOKENS="${BENCH_CACHE_PAGE_SIZE_TOKENS:-1056}"
+else
+  BENCH_CACHE_PAGE_SIZE_TOKENS="${BENCH_CACHE_PAGE_SIZE_TOKENS:-1152}"
+fi
 if ! [[ "${BENCH_CACHE_PAGE_SIZE_TOKENS}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: BENCH_CACHE_PAGE_SIZE_TOKENS must be a non-negative integer." >&2
   exit 1
@@ -160,8 +192,14 @@ BENCH_CONTENTION_REPEATS="${BENCH_CONTENTION_REPEATS:-10}"
 BENCH_CONTENTION_FOREGROUND_TOKENS="${BENCH_CONTENTION_FOREGROUND_TOKENS:-2048}"
 BENCH_OVERLAP_SECONDS="${BENCH_OVERLAP_SECONDS:-0,0.025,0.05,0.075,0.1,0.15,0.25}"
 BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP="${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP:-}"
+if [[ "${BENCH_MODE}" == "same_request_final_decode" && -z "${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP}" ]]; then
+  BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP="256,512,1024,1152"
+fi
 BENCH_SIZE_SWEEP_OVERLAP_SECONDS="${BENCH_SIZE_SWEEP_OVERLAP_SECONDS:-0.075}"
 BENCH_SIZE_SWEEP_REPEATS="${BENCH_SIZE_SWEEP_REPEATS:-5}"
+BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS="${BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS:-4096}"
+BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS="${BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS:-8}"
+BENCH_FINAL_DECODE_OVERLAP_SECONDS="${BENCH_FINAL_DECODE_OVERLAP_SECONDS:-0.1}"
 GPU_ARCH="${GPU_ARCH:-h100-sm90}"
 BENCH_CACHE_LAYOUT_VERSION="${BENCH_CACHE_LAYOUT_VERSION:-stablelocalv1}"
 
@@ -177,19 +215,28 @@ BENCH_RUNTIME_ROOT="${BENCH_RUNTIME_ROOT:-${REPO_ROOT}/results/cache/swe_scale/$
 BENCH_RUNTIME_PYTHON="${BENCH_RUNTIME_PYTHON:-${BENCH_RUNTIME_ROOT}/ray_venvs/vllm_shared/bin/python}"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-BENCH_OUTPUT_JSON="${BENCH_OUTPUT_JSON:-${RESULT_ROOT}/background-prefill-${timestamp}.json}"
+if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
+  output_stem="same-request-final-decode"
+else
+  output_stem="background-prefill"
+fi
+BENCH_OUTPUT_JSON="${BENCH_OUTPUT_JSON:-${RESULT_ROOT}/${output_stem}-${timestamp}.json}"
 mkdir -p "${RESULT_ROOT}" "${BENCH_BUILD_CACHE_ROOT}"
 
 export REPO_ROOT MODEL_PATH VLLM_TP
+export BENCH_MODE
 export BENCH_REPEATS BENCH_WARMUP_REPEATS BENCH_CACHE_NAMESPACE
 export BENCH_BACKGROUND_PRIORITY BENCH_CANDIDATE_CHUNK_TOKENS BENCH_OVERLAP_SECONDS
 export BENCH_CACHE_PAGE_SIZE_TOKENS
 export BENCH_CONTENTION_REPEATS BENCH_CONTENTION_FOREGROUND_TOKENS
 export BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP BENCH_SIZE_SWEEP_OVERLAP_SECONDS
 export BENCH_SIZE_SWEEP_REPEATS
+export BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS
+export BENCH_FINAL_DECODE_OVERLAP_SECONDS
 export BENCH_OUTPUT_JSON BENCH_BUILD_CACHE_ROOT BENCH_RUNTIME_PYTHON
 
 echo "[LAUNCH] account=${ACCOUNT} partition=${PARTITION} nodes=1 gpus_per_node=${VLLM_TP} exclusive=false"
+echo "[LAUNCH] benchmark_mode=${BENCH_MODE} container=${CONTAINER}"
 echo "[LAUNCH] cache_namespace=${BENCH_CACHE_NAMESPACE}"
 echo "[LAUNCH] runtime_namespace=${BENCH_RUNTIME_NAMESPACE}"
 echo "[LAUNCH] output=${BENCH_OUTPUT_JSON}"
@@ -203,9 +250,9 @@ srun \
   --ntasks=1 \
   --gpus-per-node="${VLLM_TP}" \
   --time="${TIME_LIMIT}" \
-  --job-name=background-prefill \
-  --output="${RESULT_ROOT}/background-prefill-%j.out" \
-  --error="${RESULT_ROOT}/background-prefill-%j.err" \
+  --job-name="${output_stem}" \
+  --output="${RESULT_ROOT}/${output_stem}-%j.out" \
+  --error="${RESULT_ROOT}/${output_stem}-%j.err" \
   --container-image="${CONTAINER}" \
   --container-mounts=/lustre:/lustre \
   --container-workdir="${REPO_ROOT}" \
