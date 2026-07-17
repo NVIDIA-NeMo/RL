@@ -79,18 +79,18 @@ from nemo_rl.models.megatron.setup import (
     validate_and_set_config,
     validate_model_paths,
 )
-from nemo_rl.models.megatron.train_microbatch_prefetch import (
-    TQ_SAMPLE_IDS_FIELD,
-    TrainMicrobatchPrefetcher,
-    TrainMicrobatchPrefetchGroup,
-    initialize_train_microbatch_prefetch_group,
-)
 from nemo_rl.models.megatron.train import (
     LogprobsPostProcessor,
     LossPostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
     megatron_forward_backward,
+)
+from nemo_rl.models.megatron.train_microbatch_prefetch import (
+    TQ_SAMPLE_IDS_FIELD,
+    TrainMicrobatchPrefetcher,
+    TrainMicrobatchPrefetchGroup,
+    initialize_train_microbatch_prefetch_group,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
