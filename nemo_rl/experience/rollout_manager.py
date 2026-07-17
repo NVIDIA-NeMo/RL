@@ -51,8 +51,8 @@ class AsyncRolloutImpl:
         env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
+        max_rollout_turns: int,
         policy_generation: GenerationInterface,
-        max_rollout_turns: int = 999999,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -403,8 +403,8 @@ class AsyncNemoGymRolloutImpl:
         env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
-        generation_config: GenerationConfig,
         max_rollout_turns: int,
+        generation_config: GenerationConfig,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -647,7 +647,7 @@ class RolloutManager:
         env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
-        max_rollout_turns: Optional[int] = None,
+        max_rollout_turns: int = 1,
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
@@ -662,8 +662,6 @@ class RolloutManager:
             assert policy_generation is not None, (
                 "policy_generation is required for the native async path"
             )
-            if max_rollout_turns is None:
-                max_rollout_turns = 999999  # use AsyncRolloutImpl's default value
         else:
             rollout_cls = AsyncNemoGymRolloutImpl
             assert generation_config is not None, (
@@ -675,7 +673,7 @@ class RolloutManager:
             env_handles=env_handles,
             num_generations_per_prompt=num_generations_per_prompt,
             max_seq_len=max_seq_len,
-            max_rollout_turns=max_rollout_turns,  # type: ignore
+            max_rollout_turns=max_rollout_turns,
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
         )
