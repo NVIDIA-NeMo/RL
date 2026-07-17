@@ -128,6 +128,7 @@ COMPACT_REQUEST_CONTEXT="${COMPACT_REQUEST_CONTEXT:-0}"
 INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL="${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL:-8}"
 COUNTERFACTUAL_FULL_TOKENIZER_TIMING="${COUNTERFACTUAL_FULL_TOKENIZER_TIMING:-0}"
 DETAILED_RUNTIME_METRICS="${DETAILED_RUNTIME_METRICS:-0}"
+STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT="${STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT:-1}"
 if [ "${STREAMING_TOOL_CALL}" != "0" ] && [ "${STREAMING_TOOL_CALL}" != "1" ]; then
   echo "ERROR: STREAMING_TOOL_CALL must be 0 or 1." >&2
   exit 1
@@ -236,6 +237,10 @@ if [ "${DETAILED_RUNTIME_METRICS}" != "0" ] && [ "${DETAILED_RUNTIME_METRICS}" !
   echo "ERROR: DETAILED_RUNTIME_METRICS must be 0 or 1." >&2
   exit 1
 fi
+if [ "${STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT}" != "0" ] && [ "${STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT}" != "1" ]; then
+  echo "ERROR: STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT must be 0 or 1." >&2
+  exit 1
+fi
 if [ "${DETAILED_RUNTIME_METRICS}" = "1" ]; then
   DETAILED_RUNTIME_METRICS_ENABLED=True
 else
@@ -311,6 +316,13 @@ if [ "${COMPACT_REQUEST_CONTEXT}" = "1" ]; then
   STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-compact"
 else
   COMPACT_REQUEST_CONTEXT_ENABLED=False
+fi
+if [ "${STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT}" = "1" ]; then
+  STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-eventwait"
+else
+  STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT_ENABLED=False
+  STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-pollwait"
 fi
 if [ "${COUNTERFACTUAL_FULL_TOKENIZER_TIMING}" = "1" ]; then
   COUNTERFACTUAL_FULL_TOKENIZER_TIMING_ENABLED=True
@@ -809,6 +821,7 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   policy.generation.vllm_cfg.streaming_tool_call.counterfactual_full_tokenizer_timing=${COUNTERFACTUAL_FULL_TOKENIZER_TIMING_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
   policy.generation.vllm_cfg.streaming_tool_call.snapshot_long_poll_timeout_seconds=${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS} \
+  policy.generation.vllm_cfg.streaming_tool_call.event_driven_snapshot_wait=${STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT_ENABLED} \
   env.nemo_gym.streaming_tool_call.enabled=${STREAMING_TOOL_CALL_ENABLED} \
   env.nemo_gym.streaming_tool_call.tokenizer_only=${STREAMING_INCREMENTAL_TOKENIZER_ONLY_ENABLED} \
   env.nemo_gym.streaming_tool_call.exact_incremental_tokenizer=${EXACT_INCREMENTAL_TOKENIZER_ENABLED} \
@@ -824,6 +837,7 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   env.nemo_gym.streaming_tool_call.incremental_tokenizer_checkpoint_interval=${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL} \
   env.nemo_gym.streaming_tool_call.snapshot_poll_interval_seconds=${SNAPSHOT_POLL_INTERVAL_SECONDS} \
   env.nemo_gym.streaming_tool_call.snapshot_long_poll_timeout_seconds=${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS} \
+  env.nemo_gym.streaming_tool_call.event_driven_snapshot_wait=${STREAMING_EVENT_DRIVEN_SNAPSHOT_WAIT_ENABLED} \
   ++env.nemo_gym.detailed_runtime_metrics=${DETAILED_RUNTIME_METRICS_ENABLED} \
   loss_fn.reference_policy_kl_penalty=${KL} \
   loss_fn.ratio_clip_min=${CLIP_MIN} \

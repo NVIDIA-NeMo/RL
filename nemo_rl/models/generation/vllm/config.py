@@ -114,6 +114,9 @@ class StreamingToolCallConfig(TypedDict):
             shell snapshot to reach the next character target. Long polling
             wakes immediately when the target is reached and avoids periodic
             HTTP polling. The recommended default is 1.0 second.
+        event_driven_snapshot_wait: Whether shell-output updates wake matching
+            snapshot requests immediately. Disable only for polling-baseline
+            experiments or as a fail-open compatibility fallback.
         flush_interval_seconds: Maximum interval between eligible partial-output
             tokenizations. The recommended default is 0.25 seconds.
         request_timeout_seconds: Maximum duration of one streaming prefill HTTP
@@ -143,6 +146,7 @@ class StreamingToolCallConfig(TypedDict):
     initial_chunk_chars: int
     snapshot_poll_interval_seconds: float
     snapshot_long_poll_timeout_seconds: float
+    event_driven_snapshot_wait: NotRequired[bool]
     flush_interval_seconds: float
     request_timeout_seconds: float
 
