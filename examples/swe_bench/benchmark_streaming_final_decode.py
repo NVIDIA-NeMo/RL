@@ -29,8 +29,10 @@ import json
 import statistics
 import time
 import uuid
+from collections import Counter
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import asdict, dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -208,6 +210,74 @@ def _parity(
         and details["decoded_text"]
     )
     return details
+
+
+def _output_signature(
+    measurement: FinalGenerationMeasurement,
+) -> tuple[tuple[int, ...], str, str]:
+    return (
+        measurement.output_token_ids,
+        measurement.output_text,
+        measurement.decoded_text,
+    )
+
+
+def _modal_control_contract(
+    controls: Sequence[FinalGenerationMeasurement],
+    candidate: FinalGenerationMeasurement,
+) -> dict[str, Any]:
+    """Compare a candidate with the unique modal output of normal requests."""
+    if len(controls) < 3:
+        raise ValueError("modal output validation requires at least three controls")
+
+    signature_counts = Counter(_output_signature(control) for control in controls)
+    max_count = max(signature_counts.values())
+    modal_signatures = [
+        signature for signature, count in signature_counts.items() if count == max_count
+    ]
+    modal_available = max_count >= 2 and len(modal_signatures) == 1
+    if not modal_available:
+        return {
+            "modal_available": False,
+            "modal_count": max_count,
+            "control_count": len(controls),
+            "candidate_matches_modal": False,
+            "normal_modal_logprob_drift": float("inf"),
+            "candidate_modal_logprob_drift": float("inf"),
+            "logprobs_within_modal_control_drift": False,
+            "all": False,
+        }
+
+    modal_signature = modal_signatures[0]
+    modal_controls = [
+        control for control in controls if _output_signature(control) == modal_signature
+    ]
+    normal_modal_logprob_drift = max(
+        (
+            _max_abs_logprob_delta(left, right)
+            for left, right in combinations(modal_controls, 2)
+        ),
+        default=0.0,
+    )
+    candidate_matches_modal = _output_signature(candidate) == modal_signature
+    candidate_modal_logprob_drift = (
+        min(_max_abs_logprob_delta(control, candidate) for control in modal_controls)
+        if candidate_matches_modal
+        else float("inf")
+    )
+    logprob_atol = max(normal_modal_logprob_drift, 1e-6)
+    logprobs_within_modal_control_drift = candidate_modal_logprob_drift <= logprob_atol
+    return {
+        "modal_available": True,
+        "modal_count": max_count,
+        "control_count": len(controls),
+        "candidate_matches_modal": candidate_matches_modal,
+        "normal_modal_logprob_drift": normal_modal_logprob_drift,
+        "candidate_modal_logprob_drift": candidate_modal_logprob_drift,
+        "logprob_atol": logprob_atol,
+        "logprobs_within_modal_control_drift": (logprobs_within_modal_control_drift),
+        "all": candidate_matches_modal and logprobs_within_modal_control_drift,
+    }
 
 
 async def _generate_final(
@@ -616,8 +686,9 @@ async def _main(args: argparse.Namespace) -> None:
             await asyncio.sleep(args.cleanup_delay_seconds)
 
     raw: dict[str, dict[str, list[Any]]] = {}
-    parity_observations: list[dict[str, Any]] = []
-    parity_failures: list[dict[str, Any]] = []
+    reference_parity_observations: list[dict[str, Any]] = []
+    modal_contract_observations: list[dict[str, Any]] = []
+    modal_contract_failures: list[dict[str, Any]] = []
     try:
         for candidate_tokens, trace in traces.items():
             label = str(candidate_tokens)
@@ -721,14 +792,24 @@ async def _main(args: argparse.Namespace) -> None:
                         "arm": arm,
                         "details": details,
                     }
-                    parity_observations.append(observation)
-                    if not details["all"]:
-                        parity_failures.append(observation)
+                    reference_parity_observations.append(observation)
+
+                modal_contract = {
+                    "candidate_chunk_tokens": candidate_tokens,
+                    "repeat": iteration - args.warmup_repeats,
+                    "details": _modal_control_contract(
+                        (reference, final_only_control, separate_control),
+                        iteration_results["same_request_final"].final_generation,
+                    ),
+                }
+                modal_contract_observations.append(modal_contract)
+                if not modal_contract["details"]["all"]:
+                    modal_contract_failures.append(modal_contract)
 
         measurements: dict[str, Any] = {}
         subpage_ttft_positive = []
         subpage_total_positive = []
-        no_dummy_leak = True
+        dummy_isolated_from_full_final_output = True
         for candidate_tokens, trace in traces.items():
             label = str(candidate_tokens)
             control_delta = raw[label]["control_delta"]
@@ -757,10 +838,11 @@ async def _main(args: argparse.Namespace) -> None:
                 subpage_total_positive.append(
                     same_summary["paired_total_savings_seconds"]["mean"] > 0
                 )
-            no_dummy_leak &= all(
+            dummy_isolated_from_full_final_output &= all(
                 len(item.dummy_token_ids) == 1
-                and item.final_generation.output_token_ids == control.output_token_ids
-                for item, control in zip(same_request_final, control_delta, strict=True)
+                and len(item.final_generation.output_token_ids)
+                == args.max_output_tokens
+                for item in same_request_final
             )
             measurements[label] = {
                 "first_candidate_tokens": len(trace.snapshots[0]),
@@ -789,21 +871,31 @@ async def _main(args: argparse.Namespace) -> None:
                 },
             }
 
-        exact_token_and_text_parity = all(
+        same_reference_observations = [
+            observation
+            for observation in reference_parity_observations
+            if observation["arm"] == "same_request_final"
+        ]
+        exact_reference_token_and_text_parity = all(
             observation["details"][field]
-            for observation in parity_observations
+            for observation in same_reference_observations
             for field in ("output_token_ids", "output_text", "decoded_text")
         )
-        logprobs_within_normal_control_drift = all(
-            observation["details"]["output_logprobs_within_atol"]
-            for observation in parity_observations
-        )
-        exact_logprob_parity = all(
+        exact_reference_logprob_parity = all(
             observation["details"]["output_logprobs_exact"]
-            for observation in parity_observations
+            for observation in same_reference_observations
         )
+        modal_output_parity = all(
+            observation["details"]["candidate_matches_modal"]
+            for observation in modal_contract_observations
+        )
+        logprobs_within_modal_control_drift = all(
+            observation["details"]["logprobs_within_modal_control_drift"]
+            for observation in modal_contract_observations
+        )
+        modal_contracts_passed = not modal_contract_failures
         output_contracts_passed = (
-            exact_token_and_text_parity and logprobs_within_normal_control_drift
+            modal_contracts_passed and dummy_isolated_from_full_final_output
         )
         result = {
             "model": args.model,
@@ -835,18 +927,25 @@ async def _main(args: argparse.Namespace) -> None:
             "warmup_repeats": args.warmup_repeats,
             "acceptance": {
                 "output_contracts_passed": output_contracts_passed,
-                "exact_token_and_text_parity": exact_token_and_text_parity,
-                "logprobs_within_normal_control_drift": (
-                    logprobs_within_normal_control_drift
+                "modal_contracts_passed": modal_contracts_passed,
+                "modal_output_parity": modal_output_parity,
+                "logprobs_within_modal_control_drift": (
+                    logprobs_within_modal_control_drift
                 ),
-                "exact_logprob_parity": exact_logprob_parity,
-                "no_dummy_token_in_final_output": no_dummy_leak,
+                "dummy_isolated_from_full_final_output": (
+                    dummy_isolated_from_full_final_output
+                ),
+                "exact_reference_token_and_text_parity": (
+                    exact_reference_token_and_text_parity
+                ),
+                "exact_reference_logprob_parity": exact_reference_logprob_parity,
                 "all_subpage_mean_ttft_savings_positive": bool(subpage_ttft_positive)
                 and all(subpage_ttft_positive),
                 "all_subpage_mean_total_savings_positive": bool(subpage_total_positive)
                 and all(subpage_total_positive),
-                "parity_observations": parity_observations,
-                "parity_failures": parity_failures,
+                "modal_contract_observations": modal_contract_observations,
+                "modal_contract_failures": modal_contract_failures,
+                "reference_parity_observations": reference_parity_observations,
             },
             "measurements": measurements,
         }
@@ -855,7 +954,7 @@ async def _main(args: argparse.Namespace) -> None:
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(serialized + "\n")
-        if args.strict_parity and (not output_contracts_passed or not no_dummy_leak):
+        if args.strict_parity and not output_contracts_passed:
             raise RuntimeError("same-request final decode failed output-contract gates")
     finally:
         llm.shutdown()

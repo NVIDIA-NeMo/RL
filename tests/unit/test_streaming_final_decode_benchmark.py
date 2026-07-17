@@ -21,6 +21,7 @@ from examples.swe_bench.benchmark_streaming_final_decode import (
     FinalGenerationMeasurement,
     _extract_completion_delta,
     _max_abs_logprob_delta,
+    _modal_control_contract,
     _paired_summary,
     _parity,
     _parse_positive_ints,
@@ -109,6 +110,40 @@ def test_max_abs_logprob_delta_rejects_incompatible_lengths() -> None:
     assert _max_abs_logprob_delta(
         _measurement(), _measurement(logprobs=(-0.1,))
     ) == float("inf")
+
+
+def test_modal_control_contract_accepts_candidate_matching_normal_majority() -> None:
+    modal_a = _measurement(logprobs=(-0.1, -0.2))
+    modal_b = _measurement(logprobs=(-0.11, -0.25))
+    ordinary_outlier = _measurement(
+        token_ids=(7, 9),
+        output_text="other",
+        decoded_text="other",
+    )
+    candidate = _measurement(logprobs=(-0.105, -0.23))
+
+    details = _modal_control_contract((ordinary_outlier, modal_a, modal_b), candidate)
+
+    assert details["modal_available"]
+    assert details["modal_count"] == 2
+    assert details["candidate_matches_modal"]
+    assert details["normal_modal_logprob_drift"] == pytest.approx(0.05)
+    assert details["candidate_modal_logprob_drift"] == pytest.approx(0.02)
+    assert details["logprobs_within_modal_control_drift"]
+    assert details["all"]
+
+
+def test_modal_control_contract_rejects_three_way_control_split() -> None:
+    controls = (
+        _measurement(token_ids=(1,), logprobs=(-0.1,), output_text="a"),
+        _measurement(token_ids=(2,), logprobs=(-0.1,), output_text="b"),
+        _measurement(token_ids=(3,), logprobs=(-0.1,), output_text="c"),
+    )
+
+    details = _modal_control_contract(controls, controls[0])
+
+    assert not details["modal_available"]
+    assert not details["all"]
 
 
 def test_stable_streamed_prefix_drops_mutable_suffix_and_margin() -> None:
