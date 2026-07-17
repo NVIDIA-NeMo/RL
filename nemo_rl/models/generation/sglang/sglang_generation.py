@@ -145,6 +145,27 @@ class SGLangGeneration(GenerationInterface):
         return [self.num_gpus_per_engine for _ in self.engines]
 
     @property
+    def cfg(self):
+        """Generation config dict (parity with VllmGeneration.cfg for shared rollout code)."""
+        return self.sglang_cfg
+
+    # --- pickling support (async-GRPO ships this object into the trajectory
+    # collector actor; the aiohttp-based HttpClient holds contextvars and
+    # cannot pickle — drop it and rebuild lazily after unpickle) ---
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_http_client"] = None
+        state["_async_loop"] = None  # running thread + asyncio loop: unpicklable
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.__dict__.get("_async_loop") is None:
+            self._async_loop = AsyncLoopThread()
+        if self.__dict__.get("_http_client") is None:
+            self._http_client = HttpClient(self.sglang_cfg)
+
+    @property
     def engine_gpu_offsets(self) -> list[int]:
         return [
             self.gpu_offset + j * self.num_gpus_per_engine
