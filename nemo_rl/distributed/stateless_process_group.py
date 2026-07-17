@@ -35,6 +35,14 @@ _RENDEZVOUS_TIMEOUT = timedelta(
 # us poll ``get_async_error`` and surface failures as clean Python exceptions.
 _NCCL_BOOTSTRAP_TIMEOUT = timedelta(seconds=30)
 
+# Backstop timeout for waiting on an in-flight weight-broadcast collective.
+# The primary failure signal is the comm's async-error state; this only
+# fires if NCCL never reports the death (e.g. a peer GPU hang with the
+# socket still alive).
+_BROADCAST_SYNC_TIMEOUT = timedelta(
+    seconds=float(os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "60"))
+)
+
 
 
 class StatelessProcessGroup:
@@ -181,6 +189,74 @@ class StatelessProcessGroup:
             _nccl_bindings.comm_abort(comm_ptr)
         except Exception:  # noqa: BLE001
             pass
+
+    def _poll_until_done(
+        self,
+        done_fn,
+        comm_ptr: int,
+        phase: str,
+        timeout: timedelta,
+        poll_interval_s: float = 0.005,
+    ) -> None:
+        """Block until ``done_fn()`` is truthy, watching the comm's async-error state.
+
+        On peer death or timeout, aborts the comm and raises so the caller can
+        recover rather than wedging forever.
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + timeout.total_seconds()
+        success = int(_nccl_bindings.Result.Success)
+        in_progress = int(_nccl_bindings.Result.InProgress)
+        while not done_fn():
+            state = int(_nccl_bindings.comm_get_async_error(comm_ptr))
+            if state != success and state != in_progress:
+                try:
+                    err_msg = _nccl_bindings.get_last_error(comm_ptr)
+                except Exception:  # noqa: BLE001
+                    err_msg = "<get_last_error failed>"
+                self._abort_raw_quietly(comm_ptr)
+                raise RuntimeError(
+                    f"NCCL {phase} failed (rank={self.rank}/{self.world_size}, "
+                    f"async_state={state}): {err_msg} — peer likely died mid-collective"
+                )
+            if _time.monotonic() > deadline:
+                self._abort_raw_quietly(comm_ptr)
+                raise RuntimeError(
+                    f"NCCL {phase} timed out after {timeout.total_seconds()}s "
+                    f"(rank={self.rank}/{self.world_size}) — peer likely died mid-collective"
+                )
+            _time.sleep(poll_interval_s)
+
+    def synchronize_or_abort(
+        self,
+        stream: Optional[torch.cuda.Stream] = None,
+        timeout: Optional[timedelta] = None,
+    ) -> None:
+        """Interruptible replacement for ``stream.synchronize()`` on a stream
+        carrying this group's NCCL collectives.
+
+        Polls a CUDA completion event together with the comm's async-error
+        state. On peer death or timeout, aborts the comm (unblocking the hung
+        kernel) and raises so ``update_weights_from_collective`` can return
+        and the engine RPC thread is freed for the recovery ``init_collective``.
+        """
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        comm = getattr(self, "nccl_communicator", None)
+        if comm is None:
+            stream.synchronize()
+            return
+        if timeout is None:
+            timeout = _BROADCAST_SYNC_TIMEOUT
+        event = torch.cuda.Event()
+        event.record(stream)
+        self._poll_until_done(
+            done_fn=event.query,
+            comm_ptr=comm._comm,
+            phase="broadcast_sync",
+            timeout=timeout,
+        )
 
     def broadcast(
         self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None

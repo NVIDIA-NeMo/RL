@@ -346,6 +346,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
 
+        # Cross-cluster weight-sync NCCL group runs in a sibling Ray actor
+        # (RefitWorker) so a gen peer dying mid-broadcast only poisons that
+        # actor's CUDA context, not the train workers' Megatron NCCL groups.
+        # Lazily spawned on first ``init_collective``.
+        self._refit_worker: Optional[Any] = None
+        self._refit_worker_zmq_address: Optional[str] = None
+        self._refit_worker_node_id: Optional[str] = None
+        self._cross_cluster_world_size: Optional[int] = None
+        # Gate on Megatron backend; DTensor uses a different broadcast hook.
+        # Set NRL_USE_REFIT_WORKER=0 to disable for debugging.
+        self._use_refit_worker: bool = (
+            megatron_enable
+            and os.getenv("NRL_USE_REFIT_WORKER", "1") == "1"
+        )
+
     @property
     def data_parallel_size(self) -> int:
         """Data-parallel degree, read from the policy's sharding annotations."""
@@ -389,19 +404,103 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def _ensure_refit_worker(self, target_node_id: str, gpu_index: int) -> Any:
+        """Ensure a RefitWorker actor is running on ``target_node_id``.
+
+        Reuses an existing actor if alive and on the right node; kills and
+        respawns otherwise.
+        """
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        from nemo_rl.models.policy.workers.refit_worker import RefitWorker
+
+        if self._refit_worker is not None:
+            if self._refit_worker_node_id == target_node_id:
+                try:
+                    ray.get(self._refit_worker.is_alive.remote(), timeout=10)
+                    return self._refit_worker
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"[lm_policy] RefitWorker liveness ping failed "
+                        f"({type(e).__name__}: {e}); respawning",
+                        flush=True,
+                    )
+            try:
+                ray.kill(self._refit_worker)
+            except Exception:  # noqa: BLE001
+                pass
+            self._refit_worker = None
+            self._refit_worker_zmq_address = None
+            self._refit_worker_node_id = None
+
+        print(
+            f"[lm_policy] spawning RefitWorker on node_id={target_node_id} "
+            f"gpu_index={gpu_index}",
+            flush=True,
+        )
+        self._refit_worker = RefitWorker.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=target_node_id, soft=False
+            ),
+            runtime_env={
+                "env_vars": {
+                    "CUDA_VISIBLE_DEVICES": str(gpu_index),
+                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                }
+            },
+        ).remote(gpu_index=gpu_index)
+        actual_node = ray.get(self._refit_worker.get_node_id.remote(), timeout=60)
+        if actual_node != target_node_id:
+            raise RuntimeError(
+                f"RefitWorker landed on {actual_node!r}, expected {target_node_id!r}"
+            )
+        self._refit_worker_node_id = actual_node
+        self._refit_worker_zmq_address = ray.get(
+            self._refit_worker.start_zmq_server.remote(), timeout=60
+        )
+        print(
+            f"[lm_policy] RefitWorker ready, zmq={self._refit_worker_zmq_address}",
+            flush=True,
+        )
+        return self._refit_worker
+
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
-        """Initialize the collective communication."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "init_collective",
-            ip=ip,
-            port=port,
-            world_size=world_size,
-            train_world_size=train_world_size,
+        """Initialize the cross-cluster weight-sync collective.
+
+        On the RefitWorker path (Megatron backend), the cross-cluster group
+        is owned by the RefitWorker sidecar alone — train workers don't
+        participate and their CUDA contexts stay insulated. The effective world
+        is ``1 (RefitWorker) + gen_world_size``.
+
+        Legacy path (DTensor): all train ranks join the cross-cluster group.
+        """
+        if not self._use_refit_worker:
+            futures = self.worker_group.run_all_workers_single_data(
+                "init_collective",
+                ip=ip,
+                port=port,
+                world_size=world_size,
+                train_world_size=train_world_size,
+            )
+            return futures
+
+        gen_world_size = world_size - train_world_size
+        cross_cluster_world = 1 + gen_world_size
+        self._cross_cluster_world_size = cross_cluster_world
+
+        rank0 = self.worker_group.workers[0]
+        target_node_id = ray.get(rank0.get_node_id.remote(), timeout=30)
+        rank0_gpu_info = ray.get(rank0.report_node_ip_and_gpu_id.remote(), timeout=30)
+        gpu_index = int(rank0_gpu_info[1])
+
+        self._ensure_refit_worker(target_node_id=target_node_id, gpu_index=gpu_index)
+
+        future = self._refit_worker.init_collective.remote(
+            ip, port, cross_cluster_world, 0
         )
-        # this function should co-work with vllm, so we should wait for all futures to complete outside
-        return futures
+        return [future]
 
     def init_collective_mcore_generation(
         self,
@@ -421,6 +520,49 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             rank_offset=rank_offset,
             refit_backend=refit_backend,
         )
+
+    def abort_collective(self) -> list[ray.ObjectRef]:
+        """Abort the cross-cluster NCCL group.
+
+        RefitWorker path: ray.kill the sidecar actor — its poisoned CUDA
+        context dies with it. Returns [] (no per-worker futures to await).
+        Legacy path: dispatch abort_collective on every train worker.
+        """
+        if not self._use_refit_worker:
+            return self.worker_group.run_all_workers_single_data("abort_collective")
+
+        if self._refit_worker is not None:
+            print(
+                "[lm_policy] ray.kill RefitWorker (poisoned context dies with process)",
+                flush=True,
+            )
+            stale = self._refit_worker
+            try:
+                ray.kill(stale)
+            except Exception as e:  # noqa: BLE001
+                print(f"[lm_policy] ray.kill raised {type(e).__name__}: {e}", flush=True)
+            # Confirm kill propagated (expect RayActorError).
+            try:
+                ray.get(stale.is_alive.remote(), timeout=10)
+            except Exception:  # noqa: BLE001
+                pass
+            self._refit_worker = None
+            self._refit_worker_zmq_address = None
+            self._refit_worker_node_id = None
+            self._cross_cluster_world_size = None
+        return []
+
+    def reset_collective(self) -> bool:
+        """Soft reset without killing the RefitWorker.
+
+        Used when rendezvous timed out (no NCCL comm was created, so the
+        RefitWorker's context is clean). Returns True if a live actor remains
+        to be reused; False if the caller must fall back to abort+respawn.
+        """
+        if not self._use_refit_worker:
+            self.worker_group.run_all_workers_single_data("abort_collective")
+            return True
+        return self._refit_worker is not None
 
     def preinit_nvshmem(self) -> list[ray.ObjectRef]:
         """Pre-initialize NVSHMEM on this policy's workers (no-op when not using nvshmem)."""
@@ -1066,13 +1208,45 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> list[ray.ObjectRef]:
-        """Broadcast the weights for collective communication."""
-        futures = self.worker_group.run_all_workers_single_data(
+        """Broadcast weights for collective communication.
+
+        RefitWorker path: train rank 0 streams weights to the RefitWorker via
+        ZMQ; RefitWorker broadcasts to gen ranks via NCCL. Other train ranks
+        no-op. Returns sender futures + the RefitWorker receiver future.
+        Legacy path: all train workers broadcast directly.
+        """
+        if not self._use_refit_worker:
+            futures = self.worker_group.run_all_workers_single_data(
+                "broadcast_weights_for_collective",
+                kv_scales=kv_scales,
+            )
+            return futures
+
+        if self._refit_worker is None or self._refit_worker_zmq_address is None:
+            raise RuntimeError(
+                "broadcast_weights_for_collective called before init_collective "
+                "spawned the RefitWorker"
+            )
+        # Pre-flight liveness ping to catch a dead actor before dispatching
+        # senders (a dead ZMQ socket would cause senders to wedge).
+        try:
+            ray.get(self._refit_worker.is_alive.remote(), timeout=10)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"RefitWorker liveness ping failed before broadcast "
+                f"({type(e).__name__}: {e}) — caller must abort_collective + "
+                f"re-run ensure_collective_synced"
+            ) from e
+
+        sender_futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",
             kv_scales=kv_scales,
+            refit_worker_zmq_address=self._refit_worker_zmq_address,
         )
-        # this function should co-work with vllm, so we should wait for all futures to complete outside
-        return futures
+        receiver_future = self._refit_worker.broadcast_weights_until_complete.remote(
+            kv_scales=kv_scales
+        )
+        return list(sender_futures) + [receiver_future]
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""

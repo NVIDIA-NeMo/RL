@@ -1935,10 +1935,102 @@ class MegatronPolicyWorkerImpl(
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_worker_zmq_address: Optional[str] = None,
     ) -> None:
-        """Broadcast the weights for collective communication."""
-        # param_iterator will return (name, tensor), we only need tensor.
+        """Broadcast the weights for collective communication.
+
+        RefitWorker path (``refit_worker_zmq_address`` provided): rank 0
+        streams packed weight buffers to the RefitWorker via ZMQ IPC handles;
+        other ranks drain the param iterator to service Megatron's internal
+        TP/EP/PP all-gathers but discard the tensors.
+
+        Legacy path: all train ranks broadcast directly via
+        ``self.model_update_group`` (DTensor or NRL_USE_REFIT_WORKER=0).
+        """
+        if refit_worker_zmq_address is not None:
+            if self.rank != 0:
+                # Drain to participate in Megatron's internal all-gathers.
+                for _ in self._iter_params_with_optional_kv_scales(
+                    kv_scales=kv_scales
+                ):
+                    pass
+                return
+
+            import zmq as _zmq
+
+            from nemo_rl.models.policy.utils import (
+                IPCProtocol,
+                get_handle_from_tensor,
+            )
+
+            ctx = _zmq.Context()
+            sock = None
+            try:
+                sock = ctx.socket(_zmq.REQ)
+                sock.setsockopt(_zmq.SNDTIMEO, 600000)
+                sock.setsockopt(_zmq.RCVTIMEO, 600000)
+                sock.setsockopt(_zmq.LINGER, 0)
+                sock.connect(refit_worker_zmq_address)
+
+                class _ZmqIpcForwardGroup:
+                    """Duck-typed substitute for StatelessProcessGroup.
+
+                    Intercepts each packed chunk from packed_broadcast_producer,
+                    exports a CUDA IPC handle, and forwards it to the
+                    RefitWorker via ZMQ REQ/ACK. The RefitWorker then
+                    NCCL-broadcasts the buffer to the gen ranks.
+                    """
+
+                    def __init__(self, zmq_socket: Any) -> None:
+                        self._sock = zmq_socket
+
+                    def broadcast(self, tensor: torch.Tensor, src: int) -> None:
+                        # Full device sync required: Megatron's internal gathers
+                        # run on side streams; current-stream-only sync produces
+                        # silent corruption via CUDA IPC.
+                        torch.cuda.synchronize()
+                        handle = get_handle_from_tensor(tensor)
+                        used_bytes = int(tensor.numel())
+                        self._sock.send_pyobj((handle, [], used_bytes))
+                        ack = self._sock.recv()
+                        if ack != IPCProtocol.ACK.value.encode():
+                            raise RuntimeError(
+                                f"RefitWorker ACK mismatch: got {ack!r}"
+                            )
+
+                forward_group = _ZmqIpcForwardGroup(sock)
+                packed_broadcast_producer(
+                    iterator=self._iter_params_with_optional_kv_scales(
+                        kv_scales=kv_scales
+                    ),
+                    group=forward_group,
+                    src=0,
+                    post_iter_func=lambda x: x[1],
+                )
+                sock.send_pyobj(IPCProtocol.COMPLETE)
+                final_ack = sock.recv()
+                if final_ack != IPCProtocol.ACK.value.encode():
+                    raise RuntimeError(
+                        f"RefitWorker COMPLETE ACK mismatch: got {final_ack!r}"
+                    )
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    ctx.term()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+
+        # Legacy direct NCCL path. No-op if no group (RefitWorker mode skips
+        # init_collective on train workers).
+        if getattr(self, "model_update_group", None) is None:
+            return
         packed_broadcast_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
             group=self.model_update_group,

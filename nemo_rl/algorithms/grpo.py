@@ -1342,9 +1342,6 @@ def setup(
                 ip, port, effective_world_size, train_world_size=effective_train_ws
             )  # type: ignore
             ray.get(futures_train + futures_inference)
-        # Spawn the RefitWorker sidecar if this policy uses it
-        if hasattr(policy, "_ensure_refit_worker"):
-            policy._ensure_refit_worker()
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     state_dict_info = policy.prepare_refit_info()
