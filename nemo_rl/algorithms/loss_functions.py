@@ -75,6 +75,14 @@ def _nllloss_diag_metrics(
             token_logprobs=token_logprobs,
             loss_mask=loss_mask,
         ))
+        _diag.append_loss_trace(
+            step=step,
+            rank=rank,
+            who=who,
+            input_ids=input_ids,
+            token_logprobs=token_logprobs,
+            loss_mask=loss_mask,
+        )
         _diag.dump_tensors(step, rank, who,
             input_ids=input_ids,
             token_logprobs=token_logprobs,
