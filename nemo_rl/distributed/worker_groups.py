@@ -669,6 +669,10 @@ class RayWorkerGroup:
         return self._workers
 
     @property
+    def worker_metadata(self) -> list[dict[str, Any]]:
+        return self._worker_metadata
+    
+    @property
     def dp_size(self) -> int:
         """Number of data parallel shards."""
         return len(self.dp_leader_worker_indices)
