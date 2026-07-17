@@ -16,6 +16,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, fields
 from functools import partial
+from typing import Optional
 
 import numpy as np
 import torch
@@ -42,6 +43,15 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+
+try:
+    from nemo.lens.helpers import managed_span, trace_fn
+except ImportError:
+    from nemo_rl.telemetry._fallbacks import managed_span, trace_fn
+
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 
 @dataclass
@@ -80,6 +90,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    telemetry: Optional[TelemetryConfig] = None
 
 
 @dataclass
@@ -354,8 +365,17 @@ def validate_one_dataset(
         return
 
     timer = Timer()
+    _telemetry = get_telemetry()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
 
-    with timer.time("total_validation_time"):
+    with (
+        timer.time("total_validation_time"),
+        managed_span(
+            RLSpanGroup.EVALUATE,
+            "rl.rm.evaluate",
+            tracer=_tracer,
+        ),
+    ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
         # Show a progress indicator for validation
@@ -460,6 +480,7 @@ def validate_one_dataset(
     return val_metrics, timing_metrics
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.rm.job")
 def rm_train(
     policy,
     train_dataloader,
@@ -473,6 +494,8 @@ def rm_train(
 ):
     # Run basic rm training
     timer = Timer()
+    _telemetry = get_telemetry()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -523,7 +546,15 @@ def rm_train(
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.rm.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": total_steps + 1},
+                ),
+            ):
                 # Prepare batch and generate responses
                 print("▶ Taking a training step...")
 
@@ -651,7 +682,14 @@ def rm_train(
                                 metrics_source[metric_name],
                             )
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.rm.save_checkpoint",
+                            tracer=_tracer,
+                        ),
+                    ):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
                             total_steps + 1, vars(rm_save_state), master_config

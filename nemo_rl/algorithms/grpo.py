@@ -70,6 +70,7 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
@@ -115,6 +116,14 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+
+try:
+    from nemo.lens.helpers import managed_span, trace_fn
+except ImportError:
+    from nemo_rl.telemetry._fallbacks import managed_span, trace_fn
+
+from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 
 # ===============================================================================
 # Configuration
@@ -292,6 +301,7 @@ class MasterConfig(BaseModel, extra="allow"):
     reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
+    telemetry: Optional[TelemetryConfig] = None
 
 
 # ===============================================================================
@@ -2296,6 +2306,7 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2312,6 +2323,8 @@ def grpo_train(
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer(context={"worker": "driver"})
+    _telemetry = get_telemetry()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -2425,10 +2438,25 @@ def grpo_train(
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.grpo.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                ),
+            ):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.grpo.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
@@ -2500,7 +2528,19 @@ def grpo_train(
                     policy_generation, "snapshot_step_metrics"
                 ):
                     policy_generation.snapshot_step_metrics()
-                with timer.time("generation"):
+                with (
+                    timer.time("generation"),
+                    managed_span(
+                        RLSpanGroup.ROLLOUT,
+                        "rl.grpo.collect_rollouts",
+                        tracer=_tracer,
+                        **{
+                            "rl.num_generations_per_prompt": master_config.grpo[
+                                "num_generations_per_prompt"
+                            ],
+                        },
+                    ),
+                ):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
@@ -2594,7 +2634,12 @@ def grpo_train(
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
                 print("▶ Processing rewards...,", flush=True)
-                with timer.time("reward_calculation"):
+                with (
+                    timer.time("reward_calculation"),
+                    managed_span(
+                        RLSpanGroup.REWARD, "rl.grpo.compute_rewards", tracer=_tracer
+                    ),
+                ):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
 
@@ -2778,7 +2823,12 @@ def grpo_train(
                         policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
-                with timer.time("policy_and_reference_logprobs"):
+                with (
+                    timer.time("policy_and_reference_logprobs"),
+                    managed_span(
+                        RLSpanGroup.LOGPROB, "rl.grpo.compute_logprobs", tracer=_tracer
+                    ),
+                ):
                     # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
@@ -2858,7 +2908,14 @@ def grpo_train(
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
-                with timer.time("advantage_calculation"):
+                with (
+                    timer.time("advantage_calculation"),
+                    managed_span(
+                        RLSpanGroup.ADVANTAGE,
+                        "rl.grpo.compute_advantages",
+                        tracer=_tracer,
+                    ),
+                ):
                     print("▶ Computing advantages...", flush=True)
                     # Get token-level mask: token_mask * sample_mask
                     token_mask = train_data["token_mask"]
@@ -2903,7 +2960,15 @@ def grpo_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
-                with timer.time("policy_training"):
+                with (
+                    timer.time("policy_training"),
+                    managed_span(
+                        RLSpanGroup.POLICY_UPDATE,
+                        "rl.grpo.policy_update",
+                        tracer=_tracer,
+                        **{"rl.iteration": total_steps + 1},
+                    ),
+                ):
                     train_results = policy.train(
                         train_data,
                         loss_fn,
@@ -3105,7 +3170,14 @@ def grpo_train(
                                 metric_name
                             ]
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.grpo.save_checkpoint",
+                            tracer=_tracer,
+                        ),
+                    ):
                         # Finalize the previous (possibly async) checkpoint before
                         # starting a new one. No-op with sync save / nothing pending.
                         checkpointer.finalize_pending()
@@ -3362,7 +3434,17 @@ def validate(
         return {}, {}
 
     timer = Timer(context={"worker": "validator"})
-    with timer.time("total_validation_time"):
+    _telemetry = get_telemetry()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
+    with (
+        timer.time("total_validation_time"),
+        managed_span(
+            RLSpanGroup.EVALUATE,
+            "rl.grpo.evaluate",
+            tracer=_tracer,
+            **{"rl.step": step},
+        ),
+    ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []
@@ -3540,6 +3622,7 @@ def aggregate_rollout_metrics(
     return aggregated
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.grpo.job")
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -3609,6 +3692,8 @@ def async_grpo_train(
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
     timer = Timer(context={"worker": "driver"})
+    _telemetry = get_telemetry()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -3894,12 +3979,27 @@ def async_grpo_train(
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.grpo.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": step + 1},
+                ),
+            ):
                 num_mask_sample_filtered = 0
 
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
-                with timer.time("exposed_generation"):
+                with (
+                    timer.time("exposed_generation"),
+                    managed_span(
+                        RLSpanGroup.ROLLOUT,
+                        "rl.grpo.collect_rollouts",
+                        tracer=_tracer,
+                    ),
+                ):
                     buffer_size_current = ray.get(replay_buffer.size.remote())
                     print(
                         f"📊 Step coordination: training_step={step}, max_age={max_trajectory_age_steps}, buffer_size={buffer_size_current}"
@@ -4037,7 +4137,12 @@ def async_grpo_train(
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
 
                 print("▶ Processing rewards...")
-                with timer.time("reward_calculation"):
+                with (
+                    timer.time("reward_calculation"),
+                    managed_span(
+                        RLSpanGroup.REWARD, "rl.grpo.compute_rewards", tracer=_tracer
+                    ),
+                ):
                     # Extract original prompt messages using the length field
                     # This correctly handles multi-turn prompts that contain assistant messages
                     initial_prompt_message_logs = extract_initial_prompt_messages(
@@ -4060,7 +4165,14 @@ def async_grpo_train(
                     )
 
                 # Prepare training data (same as sync version)
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.grpo.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
                         use_overlong_filtering = master_config.grpo[
@@ -4133,7 +4245,12 @@ def async_grpo_train(
                         policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
-                with timer.time("policy_and_reference_logprobs"):
+                with (
+                    timer.time("policy_and_reference_logprobs"),
+                    managed_span(
+                        RLSpanGroup.LOGPROB, "rl.grpo.compute_logprobs", tracer=_tracer
+                    ),
+                ):
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             train_data, timer=timer
@@ -4191,7 +4308,14 @@ def async_grpo_train(
                     )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
-                with timer.time("advantage_calculation"):
+                with (
+                    timer.time("advantage_calculation"),
+                    managed_span(
+                        RLSpanGroup.ADVANTAGE,
+                        "rl.grpo.compute_advantages",
+                        tracer=_tracer,
+                    ),
+                ):
                     print("▶ Computing advantages...", flush=True)
                     # Get token-level mask: token_mask * sample_mask
                     token_mask = train_data["token_mask"]
@@ -4252,7 +4376,15 @@ def async_grpo_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...")
-                with timer.time("policy_training"):
+                with (
+                    timer.time("policy_training"),
+                    managed_span(
+                        RLSpanGroup.POLICY_UPDATE,
+                        "rl.grpo.policy_update",
+                        tracer=_tracer,
+                        **{"rl.iteration": step + 1},
+                    ),
+                ):
                     train_results = policy.train(
                         train_data,
                         loss_fn,
@@ -4462,7 +4594,14 @@ def async_grpo_train(
                                 metric_name
                             ]
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.grpo.save_checkpoint",
+                            tracer=_tracer,
+                        ),
+                    ):
                         # Finalize the previous (possibly async) checkpoint before
                         # starting a new one. No-op with sync save / nothing pending.
                         checkpointer.finalize_pending()
