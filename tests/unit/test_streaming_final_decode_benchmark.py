@@ -146,6 +146,21 @@ def test_modal_control_contract_rejects_three_way_control_split() -> None:
     assert not details["all"]
 
 
+def test_modal_control_contract_keeps_logprob_drift_diagnostic() -> None:
+    controls = (
+        _measurement(logprobs=(-0.1, -0.2)),
+        _measurement(logprobs=(-0.11, -0.21)),
+        _measurement(logprobs=(-0.12, -0.22)),
+    )
+    candidate = _measurement(logprobs=(-0.5, -0.6))
+
+    details = _modal_control_contract(controls, candidate)
+
+    assert details["candidate_matches_modal"]
+    assert not details["logprobs_within_modal_control_drift"]
+    assert details["all"]
+
+
 def test_stable_streamed_prefix_drops_mutable_suffix_and_margin() -> None:
     trace = PromptTrace(
         immutable_prefix_tokens=3,
