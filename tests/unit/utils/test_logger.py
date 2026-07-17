@@ -30,6 +30,7 @@ from nemo_rl.utils.logger import (
     flatten_dict,
     log_container_init_timing,
     print_message_log_samples,
+    should_log_nemo_gym_full_result_tables,
 )
 
 
@@ -114,6 +115,32 @@ class TestFlattenDict:
         assert merged["loss"] == 0.5
         # Input is not mutated (other backends still see per-worker data).
         assert metrics["generation_logger_metrics"]["kv"] == {0: [1, 2], 1: [3]}
+
+
+@pytest.mark.parametrize(
+    ("wandb_enabled", "table_flag", "expected"),
+    [
+        (False, None, False),
+        (True, None, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_should_log_nemo_gym_full_result_tables(
+    wandb_enabled, table_flag, expected
+):
+    """Full-result Tables require both an active W&B logger and explicit opt-in."""
+    wandb_config = {}
+    if table_flag is not None:
+        wandb_config["log_nemo_gym_full_result_tables"] = table_flag
+
+    assert (
+        should_log_nemo_gym_full_result_tables(
+            wandb_enabled=wandb_enabled, wandb_config=wandb_config
+        )
+        is expected
+    )
 
 
 class TestTensorboardLogger:
@@ -303,6 +330,7 @@ class TestWandbLogger:
             "entity": "custom-entity",
             "group": "custom-group",
             "tags": ["tag1", "tag2"],
+            "log_nemo_gym_full_result_tables": True,
         }
         WandbLogger(cfg, log_dir=temp_dir)
 

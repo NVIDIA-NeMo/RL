@@ -33,7 +33,19 @@ env:
     config_paths:
       - resources_servers/math/configs/math.yaml
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
+
+logger:
+  wandb:
+    # Optional debugging aid. Keep disabled for normal training because complete
+    # result payloads can produce many large W&B Table artifacts.
+    log_nemo_gym_full_result_tables: false
 ```
+
+When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
+the per-agent `full_result` Tables. This prevents those payloads from entering
+the async replay buffer and avoids uploading them to W&B. Numeric per-agent
+rollout metrics are unaffected. Set the flag to `true` only when the complete
+Gym result payloads are needed for a short debugging run.
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 

@@ -171,6 +171,8 @@ def mock_components():
             },
             "logger": {
                 "num_val_samples_to_print": 5,
+                "wandb_enabled": False,
+                "wandb": {"log_nemo_gym_full_result_tables": False},
             },
             "cluster": {
                 "num_nodes": 1,
@@ -512,7 +514,6 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
         rollout_metrics={
             "mean_gen_tokens_per_sample": 2.0,
             "score": 0.5,
-            "full_result_debug": {"large_response": True},
         },
     )
 
@@ -543,13 +544,13 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert rollout_kwargs["max_seq_len"] is None
     assert rollout_kwargs["max_rollout_turns"] is None
     assert rollout_kwargs["greedy"] is False
+    assert rollout_kwargs["log_full_result_tables"] is False
     mock_async_rollout.assert_not_called()
     mock_rollout.assert_not_called()
     assert val_metrics["accuracy"] == 1.0
     assert val_metrics["avg_length"] == 2.0
     assert val_metrics["mean_gen_tokens_per_sample"] == 2.0
     assert val_metrics["score"] == 0.5
-    assert "full_result_debug" not in val_metrics
     assert isinstance(validation_timings, dict)
 
 

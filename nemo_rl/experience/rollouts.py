@@ -1984,6 +1984,7 @@ async def run_async_nemo_gym_rollout(
     task_to_env: dict[str, EnvironmentInterface],
     generation_config: GenerationConfig,
     num_generations: int,
+    log_full_result_tables: bool,
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
@@ -2007,6 +2008,8 @@ async def run_async_nemo_gym_rollout(
         task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
         num_generations: Number of contiguous rows belonging to each prompt group.
+        log_full_result_tables: Whether to include complete per-agent result
+            payloads as W&B Tables in the rollout metrics.
         max_seq_len: Policy sequence-length limit used for compatibility validation.
             NeMo-Gym still relies on the generation engine's configured limit.
         max_rollout_turns: Must be ``None`` because NeMo-Gym owns turn limits.
@@ -2135,6 +2138,7 @@ async def run_async_nemo_gym_rollout(
                             (completed_group.group_index + 1) * num_generations,
                         ),
                         tokenizer=tokenizer,
+                        log_full_result_tables=log_full_result_tables,
                         effort_config=effort_config,
                         reward_penalty_config=reward_penalty_config,
                         thinking_tags=thinking_tags,
@@ -2167,6 +2171,7 @@ def run_nemo_gym_rollout_sync(
     tokenizer: TokenizerType,
     task_to_env: dict[str, EnvironmentInterface],
     generation_config: GenerationConfig,
+    log_full_result_tables: bool,
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
@@ -2187,6 +2192,8 @@ def run_nemo_gym_rollout_sync(
         tokenizer: Tokenizer used by the NeMo-Gym actor and local postprocessing.
         task_to_env: Environment mapping containing the ``"nemo_gym"`` actor.
         generation_config: Sampling parameters forwarded to every NeMo-Gym row.
+        log_full_result_tables: Whether to include complete per-agent result
+            payloads as W&B Tables in the rollout metrics.
         max_seq_len: Policy sequence-length limit used for compatibility validation.
         max_rollout_turns: Must be ``None`` because NeMo-Gym owns turn limits.
         greedy: Must be ``False`` because this path does not support greedy mode.
@@ -2215,6 +2222,7 @@ def run_nemo_gym_rollout_sync(
             task_to_env=task_to_env,
             generation_config=generation_config,
             num_generations=input_batch.size,
+            log_full_result_tables=log_full_result_tables,
             max_seq_len=max_seq_len,
             max_rollout_turns=max_rollout_turns,
             greedy=greedy,
@@ -2239,6 +2247,7 @@ def _postprocess_single_nemo_gym_group(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
+    log_full_result_tables: bool,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
@@ -2371,11 +2380,13 @@ def _postprocess_single_nemo_gym_group(
                         )
                     )
 
-            # Log the full result
-            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
-            per_agent_metrics[f"{agent_name}/full_result"] = Table(
-                data=to_log, columns=["Full result"]
-            )
+            if log_full_result_tables:
+                to_log = [
+                    [json.dumps(r, separators=((",", ":")))] for r in agent_results
+                ]
+                per_agent_metrics[f"{agent_name}/full_result"] = Table(
+                    data=to_log, columns=["Full result"]
+                )
 
         rollout_metrics.update(per_agent_metrics)
 

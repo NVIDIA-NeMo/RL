@@ -41,6 +41,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -759,6 +760,10 @@ class AsyncTrajectoryCollector:
                 max_seq_len=self.master_config.policy["max_total_sequence_length"],
                 generation_config=generation_config,
                 num_generations=num_generations,
+                log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                    wandb_enabled=self.master_config.logger["wandb_enabled"],
+                    wandb_config=self.master_config.logger["wandb"],
+                ),
                 max_rollout_turns=None,
                 greedy=False,
                 reward_penalty_config=self.master_config.reward_penalties,

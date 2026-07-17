@@ -114,6 +114,7 @@ from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
     print_message_log_samples,
+    should_log_nemo_gym_full_result_tables,
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -1884,15 +1885,13 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
-    """Whether NeMo Gym is responsible for full response logging (wandb/metrics paths).
+    """Whether NeMo Gym is responsible for full response logging.
 
-    When **True**, we **skip** the expensive per-step ``train_data_step*.jsonl`` dump and
-    **keep** ``full_result``-style keys in rollout metrics (large payloads).
+    When **True**, skip the expensive per-step ``train_data_step*.jsonl`` dump.
+    When **False** (the default if unset), write the local JSONL file.
 
-    When **False** (default if unset), we **strip** ``full_result`` from rollout metrics and
-    **write** the ``train_data_step*.jsonl`` file (can be very large for Gym).
-
-    Set via ``env.should_log_nemo_gym_responses`` in the master config.
+    W&B full-result Tables are controlled independently by
+    ``logger.wandb.log_nemo_gym_full_result_tables``.
     """
     env_config = master_config.env
     should_log_nemo_gym_responses = bool(
@@ -2547,6 +2546,10 @@ def grpo_train(
                                 "max_total_sequence_length"
                             ],
                             generation_config=generation_config,
+                            log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                                wandb_enabled=master_config.logger["wandb_enabled"],
+                                wandb_config=master_config.logger["wandb"],
+                            ),
                             max_rollout_turns=None,
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
@@ -2557,12 +2560,6 @@ def grpo_train(
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
-
-                        # NeMo Gym responses can be very large and expensive to log. Here we have logic to opt-in to logging.
-                        if not _should_log_nemo_gym_responses(master_config):
-                            for key in list(rollout_metrics):
-                                if "full_result" in key:
-                                    rollout_metrics.pop(key)
 
                     # Use async rollouts when enabled by config/backend defaults.
                     elif _should_use_async_rollouts(master_config):
@@ -3413,6 +3410,10 @@ def validate(
                     task_to_env=val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
                     generation_config=generation_config,
+                    log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                        wandb_enabled=master_config.logger["wandb_enabled"],
+                        wandb_config=master_config.logger["wandb"],
+                    ),
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),

@@ -331,6 +331,7 @@ logger:
   wandb:
     project: "grpo-workplace-assistant"
     name: "nemotron-nano-v2-9b-workplace-assistant"
+    log_nemo_gym_full_result_tables: false
   tensorboard: {}
   mlflow:
     experiment_name: "grpo-workplace-assistant"

@@ -95,6 +95,8 @@ def collect_trajectories(
             task_to_env=val_task_to_env,
             max_seq_len=master_config.policy["max_total_sequence_length"],
             generation_config=generation_config,
+            # This utility consumes the Tables below to write its trajectory JSONL.
+            log_full_result_tables=True,
             max_rollout_turns=None,
             greedy=False,
         )

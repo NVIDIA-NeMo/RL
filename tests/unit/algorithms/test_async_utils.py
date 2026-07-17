@@ -1306,6 +1306,10 @@ class TestAsyncTrajectoryCollector:
                 "make_sequence_length_divisible_by": 1,
             },
             "env": {"should_use_nemo_gym": False},
+            "logger": {
+                "wandb_enabled": False,
+                "wandb": {"log_nemo_gym_full_result_tables": False},
+            },
         }
         return MasterConfig.model_construct(**config)
 
@@ -1880,6 +1884,7 @@ class TestAsyncTrajectoryCollector:
             nonlocal rollout_calls
             assert kwargs["generation_config"]["stop_token_ids"] is None
             assert kwargs["generation_config"]["stop_strings"] is None
+            assert kwargs["log_full_result_tables"] is False
             rollout_calls += 1
             yield _rollout_result(7)
             if rollout_calls == 1:

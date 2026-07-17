@@ -898,6 +898,7 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             task_to_env={},
             generation_config={"stop_strings": "x", "max_new_tokens": 50},
             num_generations=1,
+            log_full_result_tables=False,
             max_seq_len=200,
             max_rollout_turns=None,
         ):
@@ -1152,6 +1153,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     captured_groups = []
 
     def _postprocess_group(**kwargs):
+        assert kwargs["log_full_result_tables"] is False
         task_index = int(kwargs["nemo_gym_rows"][0]["_ng_task_index"])
         captured_groups.append(
             (task_index, [result["rowidx"] for result in kwargs["results"]])
@@ -1190,6 +1192,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
                 "max_new_tokens": 32,
             },
             num_generations=2,
+            log_full_result_tables=False,
         ):
             results.append(result)
             if len(results) == 1:
@@ -1246,7 +1249,8 @@ def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
         accumulator.add(1, {"row": 1})
 
 
-def test_postprocess_nemo_gym_group_returns_task_index():
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
     rows = [
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
         {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
@@ -1286,10 +1290,14 @@ def test_postprocess_nemo_gym_group_returns_task_index():
         )(),
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=log_full_result_tables,
     )
 
     assert rollout_result.task_index == 42
     assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert (
+        "agent/full_result" in rollout_result.rollout_metrics
+    ) is log_full_result_tables
 
 
 def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
@@ -1304,6 +1312,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
     async def fake_stream(**kwargs):
         assert kwargs["num_generations"] == input_batch.size
         assert kwargs["returns_entire_batch"] is True
+        assert kwargs["log_full_result_tables"] is False
         yield expected
 
     monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_stream)
@@ -1314,6 +1323,7 @@ def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
         tokenizer=None,
         task_to_env={},
         generation_config={},
+        log_full_result_tables=False,
     )
 
     assert actual is expected
@@ -1483,6 +1493,7 @@ def test_run_async_nemo_gym_rollout(
         task_to_env={"nemo_gym": nemo_gym},
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
+        log_full_result_tables=True,
         max_rollout_turns=None,
     )
     for row in rows:
@@ -2095,6 +2106,7 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         generation_config=nemo_gym_vllm_generation.cfg,
+        log_full_result_tables=False,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         max_rollout_turns=None,
     )
