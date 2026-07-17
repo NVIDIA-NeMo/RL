@@ -37,6 +37,10 @@ from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.cache_utils import (
+    worker_vllm_cache_root,
+    writeback_vllm_cache,
+)
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
@@ -49,6 +53,11 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_tokenizer_name(config: VllmConfig) -> str:
+    """Resolve the tokenizer independently from the model checkpoint."""
+    return config.get("tokenizer_name", config["model_name"])
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -139,10 +148,7 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = (
-                os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
-                + f"_{seed}"
-            )
+            env_vars["VLLM_CACHE_ROOT"] = worker_vllm_cache_root(seed)
 
             # Give each vLLM engine a deterministic starting VLLM_PORT for the
             # TP/DP rendezvous. vLLM's _get_open_port() reads VLLM_PORT and
@@ -267,6 +273,7 @@ class BaseVllmGenerationWorker:
         self.model_name = self.cfg["model_name"]
         # Refined from the model's expert count in _load_model.
         self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
+        self.tokenizer_name = _resolve_tokenizer_name(self.cfg)
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -491,6 +498,7 @@ class BaseVllmGenerationWorker:
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
+            tokenizer=self.tokenizer_name,
             load_format=load_format,
             # Set in nemo_rl.models.generation.configure_generation_config
             skip_tokenizer_init=self.cfg["vllm_cfg"]["skip_tokenizer_init"],
@@ -1108,6 +1116,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            writeback_vllm_cache()
 
 
 @ray.remote(

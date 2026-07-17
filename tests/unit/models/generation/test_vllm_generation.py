@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 import types
 from copy import deepcopy
 from pathlib import Path
@@ -41,12 +42,82 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _configure_background_prefill_scheduling,
+    _materialize_message_tool_calls,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+def test_background_prefill_scheduling_protects_foreground_requests():
+    llm_kwargs = {}
+
+    priority = _configure_background_prefill_scheduling(
+        llm_kwargs,
+        {
+            "background_prefill_completion": True,
+            "background_prefill_priority": 1,
+        },
+    )
+
+    assert priority == 1
+    assert llm_kwargs["scheduling_policy"] == "priority"
+
+
+@pytest.mark.parametrize("priority", [True, 0, -1, 1.5])
+def test_background_prefill_scheduling_rejects_invalid_priority(priority):
+    with pytest.raises(ValueError, match="positive integer"):
+        _configure_background_prefill_scheduling(
+            {},
+            {
+                "background_prefill_completion": True,
+                "background_prefill_priority": priority,
+            },
+        )
+
+
+def test_background_prefill_scheduling_rejects_fcfs_override():
+    with pytest.raises(ValueError, match="scheduling_policy='priority'"):
+        _configure_background_prefill_scheduling(
+            {"scheduling_policy": "fcfs"},
+            {
+                "background_prefill_completion": True,
+                "background_prefill_priority": 1,
+            },
+        )
+
+
+def test_materialize_message_tool_calls_supports_deepcopy():
+    tool_calls = (
+        tool_call
+        for tool_call in [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "execute", "arguments": "{}"},
+            }
+        ]
+    )
+    messages = [{"role": "assistant", "tool_calls": tool_calls}]
+
+    with pytest.raises(TypeError):
+        deepcopy(messages)
+
+    _materialize_message_tool_calls(messages)
+
+    assert messages[0]["tool_calls"] == [
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "execute", "arguments": "{}"},
+        }
+    ]
+    assert deepcopy(messages) == messages
+
+
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {
     "backend": "vllm",
@@ -1550,15 +1621,27 @@ def test_vllm_http_server(cluster, tokenizer):
     # Set to greedy for test reproducibility.
     generation_config["temperature"] = 0.0
     generation_config["vllm_cfg"]["streaming_tool_call"] = {
-        "enabled": False,
+        "enabled": True,
         "tokenizer_only": True,
         "exact_incremental_tokenizer": True,
+        "final_only_incremental_tokenizer": True,
+        "final_only_prefill": True,
+        "final_only_prefill_completion_grace_seconds": 0.0,
+        "prefix_seeded_start": True,
+        "prefill_after_admission": True,
+        "stable_first_snapshot_prefill": True,
+        "background_prefill_completion": True,
+        "background_prefill_priority": 1,
+        "compact_request_context": True,
         "incremental_tokenizer_checkpoint_interval": 8,
+        "counterfactual_full_tokenizer_timing": True,
         "max_sessions": 8,
         "session_ttl_seconds": 60,
         "stability_margin_tokens": 8,
         "min_chunk_chars": 16,
+        "initial_chunk_chars": 8,
         "snapshot_poll_interval_seconds": 0.05,
+        "snapshot_long_poll_timeout_seconds": 1.0,
         "flush_interval_seconds": 0.25,
         "request_timeout_seconds": 60,
     }
@@ -1710,6 +1793,435 @@ def test_vllm_http_server(cluster, tokenizer):
     assert final_step["checkpoint_count"] == 0
     assert final_step["checkpoint_mismatches"] == 0
     assert final_step["incremental_valid"] is True
+    assert final_step["counterfactual_full_tokenizer_requests"] == 1
+    assert final_step["counterfactual_full_tokenizer_seconds"] > 0
+    assert final_step["counterfactual_full_tokenizer_tokens"] == len(final_tokens)
+    assert final_step["counterfactual_full_tokenizer_mismatches"] == 0
+    assert final_step["counterfactual_full_tokenizer_failures"] == 0
+    assert final_step["server_materialize_seconds"] >= 0
+    assert final_step["server_render_seconds"] > 0
+    assert final_step["server_prefix_render_seconds"] == 0
+    assert final_step["server_incremental_tokenizer_seconds"] > 0
+    assert final_step["server_authoritative_tokenizer_seconds"] == 0
+    assert final_step["server_request_handler_seconds"] > 0
+
+    # Compact request context registers the immutable chat request once. Later
+    # calls send only cumulative tool output and reconstruct the same prompt.
+    compact_body = {
+        "model": generation_config["model_name"],
+        "messages": [
+            {"role": "user", "content": "Inspect the repository."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "compact-call",
+                        "type": "function",
+                        "function": {
+                            "name": "execute_bash",
+                            "arguments": '{"command":"ls"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "partial output",
+                "tool_call_id": "compact-call",
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_bash",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                        },
+                        "required": ["command"],
+                    },
+                },
+            }
+        ],
+        "session_id": "compact-context-http-test",
+        "sequence_no": 0,
+        "compact_context": True,
+        "max_contexts": 8,
+        "context_ttl_seconds": 60,
+    }
+    compact_start = requests.post(
+        url=incremental_url,
+        json=compact_body,
+    ).json()
+    compact_final_output = "partial output followed by final output"
+    compact_final = requests.post(
+        url=f"{incremental_url}/compact",
+        json={
+            "session_id": compact_body["session_id"],
+            "sequence_no": 1,
+            "tool_output": compact_final_output,
+            "final": True,
+        },
+    ).json()
+    compact_messages = deepcopy(compact_body["messages"])
+    compact_messages[-1]["content"] = compact_final_output
+    compact_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": compact_messages,
+            "tools": compact_body["tools"],
+        },
+    ).json()["tokens"]
+
+    assert compact_start["server_compact_context_registrations"] == 1
+    assert compact_start["server_compact_context_hits"] == 0
+    assert compact_start["server_compact_context_registration_seconds"] >= 0
+    assert compact_start["server_compact_context_rebuild_seconds"] == 0
+    assert compact_final["server_compact_context_registrations"] == 0
+    assert compact_final["server_compact_context_hits"] == 1
+    assert compact_final["server_compact_context_registration_seconds"] == 0
+    assert compact_final["server_compact_context_rebuild_seconds"] >= 0
+    assert compact_final["tokens"] == compact_tokens
+    expired_compact_response = requests.post(
+        url=f"{incremental_url}/compact",
+        json={
+            "session_id": compact_body["session_id"],
+            "sequence_no": 2,
+            "tool_output": "too late",
+        },
+    )
+    assert expired_compact_response.status_code == 409
+
+    # The final-only runtime path seeds the rendered prompt with an empty tool
+    # output and sends the authoritative output directly as sequence 1.
+    final_only_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an agent working in a software repository. "
+                "Inspect the available files before proposing a change."
+            ),
+        },
+        {"role": "user", "content": "Inspect the repository."},
+        {
+            "role": "assistant",
+            "content": ("<think>\nInspecting the repository.\n</think>\n\n"),
+            "tool_calls": [
+                {
+                    "id": "final-only-call",
+                    "type": "function",
+                    "function": {
+                        "name": "execute_bash",
+                        "arguments": '{"command":"ls"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "",
+            "tool_call_id": "final-only-call",
+        },
+    ]
+    template_prefix_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": final_only_messages[:-1],
+            "tools": compact_body["tools"],
+            "add_generation_prompt": False,
+        },
+    ).json()["tokens"]
+    template_eos_index = max(
+        index
+        for index, token_id in enumerate(template_prefix_tokens)
+        if token_id == tokenizer.eos_token_id
+    )
+    authoritative_prefix_tokens = template_prefix_tokens[: template_eos_index + 1]
+    final_only_body = {
+        "model": generation_config["model_name"],
+        "messages": final_only_messages,
+        "tools": compact_body["tools"],
+        "required_prefix_token_ids": authoritative_prefix_tokens,
+        "session_id": "final-only-incremental-http-test",
+        "sequence_no": 0,
+        "prefill": True,
+    }
+    final_only_start = requests.post(url=incremental_url, json=final_only_body).json()
+    final_only_start_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": final_only_body["messages"],
+            "tools": compact_body["tools"],
+            "required_prefix_token_ids": authoritative_prefix_tokens,
+        },
+    ).json()["tokens"]
+    final_only_body["messages"][-1]["content"] = "complete command output"
+    final_only_body["sequence_no"] = 1
+    final_only_body["final"] = True
+    final_only_body["prefill"] = False
+    final_only_step = requests.post(url=incremental_url, json=final_only_body).json()
+    final_only_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": final_only_body["messages"],
+            "tools": compact_body["tools"],
+            "required_prefix_token_ids": authoritative_prefix_tokens,
+        },
+    ).json()["tokens"]
+
+    assert final_only_start["prefix_seed_attempts"] == 1
+    assert final_only_start["prefix_seed_successes"] == 1, final_only_start[
+        "prefix_seed_fallback_reason"
+    ]
+    assert final_only_start["prefix_seed_fallbacks"] == 0
+    assert final_only_start["prefix_seed_seconds"] > 0
+    assert final_only_start["prefix_seed_fallback_reason"] is None
+    assert final_only_start["checkpoint_count"] == 0
+    assert final_only_start["tokens"] is None
+    assert final_only_start["server_materialize_seconds"] >= 0
+    assert final_only_start["server_render_seconds"] > 0
+    assert final_only_start["server_prefix_render_seconds"] > 0
+    assert final_only_start["server_incremental_tokenizer_seconds"] > 0
+    assert final_only_start["server_authoritative_tokenizer_seconds"] == 0
+    assert final_only_start["server_request_handler_seconds"] > 0
+    assert final_only_start["prefill_sessions_started"] == 1
+    assert final_only_start["prefill_requests"] == 1
+    assert final_only_start["prefill_control_plane_requests"] == 0
+    assert final_only_start["prefill_tokens"] == len(final_only_start_tokens) - 8
+    assert final_only_start["prefill_completed_chunks"] == 1
+    assert final_only_start["prefill_dummy_tokens"] == 1
+    assert final_only_start["prefill_prefix_matched"] is True
+    assert final_only_start["prefill_failures"] == 0
+    assert final_only_start["prefill_seconds"] > 0
+    assert final_only_step["tokens"] == final_only_tokens
+    assert final_only_step["encoded_chars"] > 0
+    assert final_only_step["reused_tokens"] > 0
+    assert final_only_step["checkpoint_count"] == 0
+    assert final_only_step["checkpoint_mismatches"] == 0
+    assert final_only_step["incremental_valid"] is True
+
+    # Continuation mode keeps the admitted prefill session open. Two growing
+    # snapshots are needed before the first snapshot's mutable tokens become a
+    # proven common prefix that can be prefetched safely.
+    continuation_body = deepcopy(final_only_body)
+    continuation_body["session_id"] = "prefill-continuation-http-test"
+    continuation_body["messages"][-1]["content"] = ""
+    continuation_body["sequence_no"] = 0
+    continuation_body["final"] = False
+    continuation_body["prefill"] = True
+    continuation_body["prefill_continuation"] = True
+    continuation_start = requests.post(
+        url=incremental_url, json=continuation_body
+    ).json()
+
+    continuation_body["messages"][-1]["content"] = "x" * 300
+    continuation_body["sequence_no"] = 1
+    continuation_first = requests.post(
+        url=incremental_url, json=continuation_body
+    ).json()
+
+    continuation_body["messages"][-1]["content"] = "x" * 600
+    continuation_body["sequence_no"] = 2
+    continuation_second = requests.post(
+        url=incremental_url, json=continuation_body
+    ).json()
+
+    continuation_body["messages"][-1]["content"] = "x" * 600 + " done"
+    continuation_body["sequence_no"] = 3
+    continuation_body["final"] = True
+    continuation_final = requests.post(
+        url=incremental_url, json=continuation_body
+    ).json()
+    continuation_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": continuation_body["messages"],
+            "required_prefix_token_ids": authoritative_prefix_tokens,
+        },
+    ).json()["tokens"]
+
+    assert continuation_start["prefill_sessions_started"] == 1
+    assert continuation_start["prefill_requests"] == 0
+    assert continuation_start["prefill_tokens"] == 0
+    assert continuation_start["prefill_completed_chunks"] == 0
+    assert continuation_start["prefill_dummy_tokens"] == 0
+    assert continuation_start["prefill_background_scheduled_chunks"] == 0
+    assert continuation_start["prefill_prefix_matched"] is False
+    assert continuation_start["prefill_failures"] == 0
+    assert continuation_first["prefill_sessions_started"] == 0
+    assert continuation_first["prefill_requests"] == 1
+    assert continuation_first["prefill_tokens"] > 0
+    assert continuation_first["prefill_completed_chunks"] == 1
+    assert continuation_first["prefill_dummy_tokens"] == 1
+    assert continuation_first["prefill_failures"] == 0
+    assert continuation_second["prefill_requests"] == 1
+    assert continuation_second["prefill_tokens"] > 0
+    assert continuation_second["prefill_completed_chunks"] == 1
+    assert continuation_second["prefill_dummy_tokens"] == 1
+    assert continuation_final["tokens"] == continuation_tokens
+    assert continuation_final["prefill_requests"] == 0
+    assert continuation_final["prefill_prefix_matched"] is True
+    assert continuation_final["prefill_failures"] == 0
+
+    # Deferred admission skips the empty-output request. The first nonempty
+    # bucket starts prefill from the authoritative model prefix and is already
+    # a useful engine request.
+    deferred_body = deepcopy(final_only_body)
+    deferred_body["session_id"] = "deferred-prefill-http-test"
+    deferred_body["messages"][-1]["content"] = "x" * 300
+    deferred_body["sequence_no"] = 0
+    deferred_body["final"] = False
+    deferred_body["prefill"] = True
+    deferred_body["prefill_continuation"] = True
+    deferred_body["prefill_from_required_prefix"] = True
+    deferred_start = requests.post(url=incremental_url, json=deferred_body).json()
+    # The response proves enqueue rather than engine completion. Give the tiny
+    # test model time to finish so close deterministically settles the success.
+    time.sleep(0.25)
+
+    deferred_body["messages"][-1]["content"] = "x" * 300 + " done"
+    deferred_body["sequence_no"] = 1
+    deferred_body["final"] = True
+    deferred_body.pop("prefill_from_required_prefix")
+    deferred_final = requests.post(url=incremental_url, json=deferred_body).json()
+    deferred_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": deferred_body["messages"],
+            "required_prefix_token_ids": authoritative_prefix_tokens,
+        },
+    ).json()["tokens"]
+
+    assert deferred_start["prefill_sessions_started"] == 1
+    assert deferred_start["prefill_requests"] == 0
+    assert deferred_start["prefill_tokens"] == 0
+    assert deferred_start["prefill_dynamic_tokens"] == 0
+    assert deferred_start["prefill_effective_requests"] == 0
+    assert deferred_start["prefill_background_scheduled_chunks"] == 1
+    assert deferred_start["prefill_background_scheduled_tokens"] > 0
+    assert deferred_start["stable_first_snapshot_prefill_attempts"] == 1
+    assert deferred_start["stable_first_snapshot_prefill_successes"] == 1
+    assert deferred_start["stable_first_snapshot_prefill_fallbacks"] == 0
+    assert deferred_start["stable_first_snapshot_prefill_dynamic_tokens"] > 0
+    assert deferred_start["deferred_prefill_admissions"] == 1
+    assert deferred_start["final_prefix_tokenizations"] == 0
+    assert deferred_final["tokens"] == deferred_tokens
+    assert deferred_final["prefill_prefix_matched"] is True
+    assert deferred_final["prefill_requests"] == 1
+    assert deferred_final["prefill_tokens"] > 0
+    assert deferred_final["prefill_dynamic_tokens"] > 0
+    assert deferred_final["prefill_effective_requests"] == 1
+    assert deferred_final["prefill_background_completed_chunks"] == 1
+    assert deferred_final["prefill_background_scheduled_chunks"] == 0
+    assert deferred_final["prefill_background_scheduled_tokens"] == 0
+    assert deferred_final["prefill_background_enqueue_seconds"] == 0
+    assert deferred_final["prefill_background_cancelled_chunks"] == 0
+    assert deferred_final["prefill_background_failed_chunks"] == 0
+
+    # A command that finishes below the admission bucket still reuses exact
+    # tokens. It seeds and finalizes from the model prefix in one request.
+    short_final_body = deepcopy(final_only_body)
+    short_final_body["session_id"] = "short-final-prefix-http-test"
+    short_final_body["messages"][-1]["content"] = "short command output"
+    short_final_body["sequence_no"] = 0
+    short_final_body["final"] = True
+    short_final_body["prefill"] = False
+    short_final_body["finalize_from_required_prefix"] = True
+    short_final = requests.post(url=incremental_url, json=short_final_body).json()
+    short_final_tokens = requests.post(
+        url=f"{base_urls[0]}/../tokenize",
+        json={
+            "model": generation_config["model_name"],
+            "messages": short_final_body["messages"],
+            "required_prefix_token_ids": authoritative_prefix_tokens,
+        },
+    ).json()["tokens"]
+
+    assert short_final["tokens"] == short_final_tokens
+    assert short_final["prefix_seed_successes"] == 1
+    assert short_final["final_prefix_tokenizations"] == 1
+    assert short_final["deferred_prefill_admissions"] == 0
+
+    # A command can finish before its concurrently submitted prefill reaches
+    # the server.  The combined abort endpoint must therefore reject both a
+    # late incremental-tokenizer start and a late direct-prefill start for the
+    # same session ID.
+    late_start_session_id = "aborted-before-start-http-test"
+    abort_response = requests.post(
+        url=f"{base_urls[0]}/../incremental_tokenize/abort",
+        json={"session_id": late_start_session_id},
+    )
+    assert abort_response.status_code == 200
+    assert abort_response.json() == {"aborted": False}
+
+    late_incremental_body = deepcopy(final_only_body)
+    late_incremental_body["session_id"] = late_start_session_id
+    late_incremental_body["messages"][-1]["content"] = ""
+    late_incremental_body["sequence_no"] = 0
+    late_incremental_body["final"] = False
+    late_incremental_body["prefill"] = True
+    late_incremental_response = requests.post(
+        url=incremental_url,
+        json=late_incremental_body,
+    )
+    assert late_incremental_response.status_code == 409
+
+    late_prefill_response = requests.post(
+        url=f"{base_urls[0]}/../v1/streaming_tool_call/start",
+        json={
+            "session_id": late_start_session_id,
+            "sequence_no": 0,
+            "prompt_token_ids": final_only_start_tokens,
+        },
+    )
+    assert late_prefill_response.status_code == 409
+
+    # A speculative prefill candidate that would leave no room for its dummy
+    # decode token is rejected before vLLM receives the chunk. The session is
+    # aborted and the engine remains healthy for ordinary model requests.
+    max_model_len = generation_config["vllm_cfg"]["max_model_len"]
+    stability_margin_tokens = generation_config["vllm_cfg"]["streaming_tool_call"][
+        "stability_margin_tokens"
+    ]
+    overlength_session_id = "overlength-prefill-http-test"
+    overlength_body = {
+        "session_id": overlength_session_id,
+        "sequence_no": 0,
+        "prompt_token_ids": [1] * (max_model_len + stability_margin_tokens),
+    }
+    overlength_start = requests.post(
+        url=f"{base_urls[0]}/../v1/streaming_tool_call/start",
+        json=overlength_body,
+    )
+    assert overlength_start.status_code == 200
+    overlength_body["sequence_no"] = 1
+    overlength_append = requests.post(
+        url=f"{base_urls[0]}/../v1/streaming_tool_call/append",
+        json=overlength_body,
+    )
+    assert overlength_append.status_code == 409
+    assert "exceed its token limit" in overlength_append.json()["detail"]
+    overlength_body["sequence_no"] = 2
+    after_abort_append = requests.post(
+        url=f"{base_urls[0]}/../v1/streaming_tool_call/append",
+        json=overlength_body,
+    )
+    assert after_abort_append.status_code == 404
+    healthy_chat_response = requests.post(
+        url=f"{base_urls[0]}/chat/completions",
+        json=body,
+    )
+    assert healthy_chat_response.status_code == 200
 
     # Clean up
     vllm_generation.shutdown()

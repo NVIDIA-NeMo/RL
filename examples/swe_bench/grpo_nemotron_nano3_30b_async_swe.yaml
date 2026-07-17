@@ -1,0 +1,75 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Nemotron Nano 3 model overrides for the async SWE workload. The parent recipe
+# remains the source of truth for the SWE dataset, agent, rollout-only, and
+# streaming-tool-call settings so Qwen and Nano experiments stay comparable.
+defaults: grpo_qwen3_30b_async_swe.yaml
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-nano3-30b-swe-rl"
+
+policy:
+  # Match the official Nano 3 GRPO recipes: optimize the Base checkpoint while
+  # rendering conversations with the instruction-tuned tokenizer/template.
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    chat_template_kwargs: null
+
+  megatron_cfg:
+    use_fused_weighted_squared_relu: false
+
+  generation:
+    vllm_cfg:
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        enable_prompt_tokens_details: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        # Explicitly disable the Qwen-only inline template inherited from the
+        # shared SWE workload. NeMo-RL passes policy.tokenizer.name separately
+        # to vLLM, whose instruction-tuned tokenizer bundles the Nano template.
+        chat_template: null
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+
+    vllm_kwargs:
+      max_num_batched_tokens: 8480
+      mamba_ssm_cache_dtype: "float32"
+      mamba_cache_mode: align
+      compilation_config:
+        # This selects vLLM's eager compilation backend for kernel accuracy; it
+        # does not enable engine-wide enforce_eager mode or disable CUDA graphs.
+        backend: eager
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+
+logger:
+  wandb:
+    name: "nemotron-nano3-30b-swe-rl"
+  mlflow:
+    experiment_name: "nemotron-nano3-30b-swe-rl"
+    run_name: "nemotron-nano3-30b-swe-rl"

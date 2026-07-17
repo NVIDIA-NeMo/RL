@@ -92,6 +92,13 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    def report_kv_cache_block_size(self) -> int:
+        """Return the effective APC page size after backend/Mamba alignment."""
+        block_size = self.model_runner.vllm_config.cache_config.block_size
+        if not isinstance(block_size, int) or block_size < 1:
+            raise RuntimeError(f"invalid vLLM KV cache block size: {block_size!r}")
+        return block_size
+
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
 

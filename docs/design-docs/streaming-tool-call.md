@@ -11,8 +11,10 @@ OpenHands checkout used by the SWE harness:
 - `BashSession` publishes revisioned cumulative output snapshots without
   changing the final `CmdOutputObservation`.
 - `LocalRuntime` polls snapshots only for eligible single `CmdRunAction` tool
-  calls. It holds the first non-empty snapshot locally and starts remote work
-  only after a second extending snapshot reaches `min_chunk_chars`.
+  calls. With stable-first admission it starts remote work when the first
+  snapshot reaches `initial_chunk_chars`; the legacy two-snapshot path holds
+  the first snapshot until a second extending snapshot reaches
+  `min_chunk_chars`.
 - `LocalRuntime` requires strict append-only snapshot growth. A terminal-screen
   rewrite or any streaming exception falls back to the baseline path.
 - The Gym model proxy preserves its existing sticky client cookie. Legacy
@@ -44,19 +46,41 @@ OpenHands checkout used by the SWE harness:
 - The tokenizer request retains only the newest assistant token-logging triplet
   so NeMo-RL's authoritative historical-prefix replacement still runs. A
   separate canonical comparison copy removes all token-logging fields.
+- An optional diagnostic repeats authoritative full tokenization after a
+  checkpoint-free exact finalization, records its server-side duration and
+  token count, and verifies exact equality. It is disabled by default because
+  it deliberately adds work and invalidates E2E performance comparisons.
+- An optional final-only exact tokenizer mode starts sequence zero from an
+  empty tool output while the command runs, skips snapshot polling, and sends
+  the authoritative final output as sequence one. It covers every eligible
+  command without issuing generation or prefill work.
+- Optional deferred continuation prefill waits for the first non-empty output
+  bucket, seeds exact tokenizer state from the previous model call's
+  authoritative token IDs, and keeps the prefill session open for later
+  buckets. Stable-first mode can prove useful tokens in that first snapshot
+  instead of waiting for a second snapshot.
+- Optional background completion returns after the first continuation chunk is
+  enqueued and leaves engine completion under manager ownership. Final close
+  cancels unfinished work without a grace wait and reports completion,
+  cancellation, failure, and dynamic-token counters exactly once.
+- Background completion enables vLLM priority scheduling. Ordinary foreground
+  model requests retain priority zero; only speculative background prefill uses
+  the configured positive `background_prefill_priority` (default 1).
+- Every non-final continuation tokenizer/prefill request races command
+  completion. If the command wins, OpenHands cancels the HTTP task, sends the
+  combined tokenizer/prefill abort, and uses the unchanged normal final model
+  path instead of adding post-command speculative latency.
 
 The OpenHands integration is stored as an ordered patch chain in
 `responses_api_agents/swe_agents/patches/`, ending with
-`streaming_tool_call_exact_incremental_tokenizer.patch`. The setup path applies
-the compatible missing suffix to a new or cached checkout without forcing a
-venv rebuild.
+`streaming_tool_call_cached_token_metrics.patch`. The setup path
+applies the compatible missing suffix to a new or cached checkout without
+forcing a venv rebuild.
 
 The following items from the broader design are not implemented in v1:
 
 - a global pending-token limit or KV-cache/queue high-water admission control,
 - a maximum application chunk size or background TTL cleanup task,
-- cancellation of an already in-flight HTTP prefill request when the tool
-  finishes, and
 - the complete planned observability and deterministic-parity test matrix.
 
 ## Summary
@@ -315,8 +339,160 @@ The original tokenizer-only implementation fully retokenized each admitted
 cumulative prompt. The optional exact incremental mode described below now
 replaces that intermediate work with mutable-tail repair and passes the exact
 incrementally constructed final IDs to one-shot prompt reuse. A periodic or
-invalid-session final revision still uses the authoritative full tokenizer. It
-does not issue speculative generation or prefill requests.
+invalid-session final revision still uses the authoritative full tokenizer. By
+default it does not issue speculative generation or prefill requests.
+
+### Final-only exact tokenizer path
+
+Snapshot admission is useful for speculative prefill, but it unnecessarily
+limits tokenizer-only coverage. In two July 10 first-16 runs, 2,571 of 3,201
+eligible command actions (80.3%) exposed only one non-empty snapshot before
+completion. Only 11 actions (0.34%) reached multiple snapshots but remained
+below 256 characters. Lowering `min_chunk_chars` therefore cannot materially
+raise tokenizer-only coverage.
+
+The optional
+`streaming_tool_call.final_only_incremental_tokenizer=false` path removes the
+snapshot gate while retaining the exact tokenizer and unchanged generation
+request:
+
+1. OpenHands starts the command request as an asynchronous task.
+2. It immediately starts sequence 0 of an exact tokenizer session with an empty
+   tool output. This full checkpoint contains the system prompt, conversation,
+   assistant tool call, empty tool message, and next-assistant template suffix.
+3. The command and sequence-0 tokenization run concurrently. OpenHands does not
+   read `shell_stream_snapshot` in this mode.
+4. When the authoritative `CmdOutputObservation` returns, OpenHands applies the
+   same `max_message_chars` truncation used by conversation memory and sends it
+   directly as final sequence 1.
+5. The backend repairs the changed prompt frontier and re-encodes only the
+   mutable tail. Sequence 1 is not checkpoint-due at the default interval of
+   eight, so a valid session returns exact incremental token IDs.
+6. The resulting one-shot `reuse_id` follows the existing canonical prompt and
+   complete-token equality gates on the next normal model request.
+
+This path sends exactly two tokenizer requests per eligible action and zero
+snapshot requests. With `final_only_prefill=false`, it sends zero
+generation/prefill requests. It does not stream intermediate command output;
+“final-only” describes the update cadence, while the tokenizer-only performance
+opportunity comes from overlapping the initial full prompt tokenization with
+command execution and avoiding the later full final encode.
+
+### Optional final-only prefill
+
+`streaming_tool_call.final_only_prefill=false` adds one speculative vLLM engine
+request to sequence 0 without changing the authoritative final request:
+
+1. The model proxy keeps the exact token IDs returned by the sequence-0
+   incremental-tokenizer checkpoint.
+2. It starts the existing resumable-prefill manager with those IDs, then sends
+   the identical candidate as sequence 1. Two identical candidates prove all
+   but `stability_margin_tokens` stable and submit that prefix to one vLLM
+   `StreamingInput` request.
+3. After the manager acknowledges the chunk and drains its single dummy token,
+   the proxy closes the speculative session against the same exact candidate.
+4. The request runs while the command is in flight. The final sequence-1
+   tokenizer revision and one-shot prompt reuse remain unchanged.
+
+This does not hand speculative KV state directly to the final generation.
+Instead, it primes vLLM automatic prefix caching. The empty-output and final
+prompts may diverge at the tool-content boundary; APC reuses only identical
+full prefix blocks and cannot consume the divergent suffix. The exact final
+tokenizer's `reused_tokens` value gives a stronger client-side bound:
+
+```text
+final_only_prefill_reused_tokens = min(prefill_tokens, final_reused_tokens)
+```
+
+A prefill counts as valid only when a chunk completed, the speculative close
+matched, this final reusable-token bound is positive, and no prefill operation
+failed. A prefill HTTP failure is caught in the model proxy, the speculative
+session is aborted, and the exact tokenizer result is still returned. Thus a
+prefill failure does not disable final prompt reuse or change the command
+observation.
+
+### Deferred continuation and stable-first snapshot prefill
+
+`prefill_after_admission=true` changes final-only prefill from an empty-output
+prime into bucketed continuation. OpenHands waits for
+`initial_chunk_chars`, sends that first non-final snapshot as sequence zero,
+and sends later snapshots only after another `min_chunk_chars`. The final
+authoritative prompt and sampling request remain unchanged.
+
+If the command completes before the first bucket is admitted, OpenHands
+returns the ordinary observation immediately. It does not remotely tokenize
+the completed prompt and does not register one-shot prompt reuse, because no
+streaming prefill could benefit from that work. The next ordinary model call
+remains the authoritative tokenizer fallback. Once a session is admitted, the
+final exact incremental update and reuse registration are still mandatory.
+
+The original deferred start used the prior model tokens as the manager's
+initial candidate. That admits a session, but its first engine request usually
+contains no new tool-prompt tokens: the longest common token prefix ends at the
+authoritative model prefix and the manager still subtracts
+`stability_margin_tokens`. `stable_first_snapshot_prefill=true` provides a
+conservative proof for the first non-empty snapshot:
+
+1. Render the real chat request containing the current tool-output snapshot.
+2. Render an alternate copy with only the last tool message's content replaced
+   by an empty string. All history, tool-call metadata, template options, and
+   next-assistant suffix remain identical.
+3. Normalize both strings with the tokenizer's actual normalizer. Find their
+   common character prefix and a non-overlapping common suffix. The suffix
+   identifies the chat-template text following the mutable tool output.
+4. Treat the end of the real string before that suffix as the next possible
+   mutation frontier. `_repair_start()` moves it backward across partial added
+   tokens, the containing pre-tokenizer segment, and any token whose offset
+   crosses that segment boundary.
+5. `_retained_token_count()` returns only token IDs ending before the repair
+   frontier. Unmapped historical model IDs are retained only while the mapped
+   suffix proves that the frontier cannot cross them.
+6. Give the prefill manager this proven prefix plus up to
+   `stability_margin_tokens` following tokens. Those following tokens are
+   sacrificial holdback: the manager subtracts the same margin, so it commits
+   no token beyond the exact tokenizer proof.
+7. If the alternate render has no distinct output, no shared template suffix,
+   or crosses an unsupported mapped boundary, fall back to the prior
+   authoritative-prefix candidate.
+
+This prevents streamed tokens from changing after commitment in three layers:
+the offset-aware tokenizer excludes the mutable pre-token segment, the prefill
+manager holds back the configured margin and rejects any later candidate that
+changes a committed token, and finalization still requires the committed IDs
+to prefix-match the authoritative final prompt. Periodic complete checkpoints
+remain the independent equality guard for incremental tokenization.
+
+Every non-final continuation request also races `post_task`, which owns command
+execution. A request that finishes first contributes its metrics and may admit
+another bucket. If `post_task` finishes first, OpenHands starts a deferred
+`/incremental_tokenize/abort` request concurrently with cancelling the losing
+HTTP request. It waits only for the local cancellation drain and the Gym abort
+acknowledgement. Gym removes the compact tokenization context before returning
+that acknowledgement and schedules the vLLM tokenizer/prefill cleanup as a
+FastAPI background task. The tokenizer and prefill managers retain bounded
+abort tombstones, so a late sequence-zero request cannot recreate the cancelled
+session. Remote cleanup therefore remains mandatory without placing the vLLM
+abort round trip on the command-to-final-generation critical path.
+
+The race timers deliberately separate three different quantities:
+
+- `streaming_tool_call_prefill_race_cancelled_request_seconds` is the age of
+  the losing request from creation until cancellation. Most of this interval
+  overlaps command execution and is diagnostic, not additive overhead.
+- `streaming_tool_call_prefill_race_cancel_drain_seconds` is the time spent
+  after `Task.cancel()` waiting for the local task to settle.
+- `streaming_tool_call_prefill_race_abort_seconds` is the time to receive the
+  deferred Gym acknowledgement; it excludes server-owned background cleanup.
+
+Only cancellation drain plus abort acknowledgement are added to
+`streaming_tool_call_overhead_seconds`. Counting the whole cancelled-request
+age would double-count work already hidden under the command.
+
+If start, finalization, exact-tail repair, HTTP transport, or prompt reuse fails,
+the existing broad action-level fallback aborts the session and returns the
+unchanged command observation. The next model request then performs ordinary
+full preprocessing. A failed optimization therefore cannot remove or alter a
+tool result.
 
 ## Implemented Tokenizer-Only Prompt Reuse
 
@@ -636,21 +812,27 @@ V1 implements the following controls:
 - Hold the first non-empty cumulative candidate locally. Admit a remote session
   only after a second distinct snapshot extends it and cumulative output reaches
   `min_chunk_chars`, then send the held candidate as `start` and the latest
-  candidate as `append`. Commands that complete with one output snapshot pay no
-  tokenization, HTTP, or vLLM session setup overhead, and a below-threshold
-  command is never admitted remotely. `flush_interval_seconds` applies only to
-  later appends after admission.
+  candidate as `append`. This is the legacy proof path. With stable-first
+  admission, render the real and empty-tool prompts to prove the immutable
+  prefix, then admit the first snapshot at `initial_chunk_chars`; later appends
+  require `min_chunk_chars`. Commands that complete before either path admits
+  pay no remote final tokenization, HTTP, reuse-registration, or vLLM session
+  overhead. `flush_interval_seconds` applies only to later appends after
+  admission.
 - HTTP work is bounded by `request_timeout_seconds` and any error returns the
   unchanged baseline action response.
 - Stale sessions are expired lazily before admitting a new session. Weight,
   cache, sleep, and shutdown transitions pause admission and invalidate active
   sessions.
+- Background completion does not wait for an engine acknowledgement on the
+  command path. It uses a lower vLLM scheduler priority than foreground model
+  requests, then final close cancels unfinished speculative work immediately.
 
 V1 does not yet enforce a global pending-token limit, maximum application chunk
 size, KV-cache/queue/prefill-latency high-water mark, or background TTL cleanup.
-It also awaits an already in-flight HTTP prefill request if the tool completes
-during that request. These are follow-up controls required before considering
-default enablement at larger scale.
+The synchronous prefill mode can still await an already in-flight HTTP request
+if the tool completes during that request. These are follow-up controls
+required before considering default enablement at larger scale.
 
 ## Weight Updates and Cache Validity
 
@@ -687,12 +869,24 @@ policy:
         enabled: false
         tokenizer_only: false
         exact_incremental_tokenizer: false
+        final_only_incremental_tokenizer: false
+        final_only_prefill: false
+        final_only_prefill_completion_grace_seconds: 0.0
+        prefix_seeded_start: false
+        prefill_after_admission: false
+        stable_first_snapshot_prefill: false
+        background_prefill_completion: false
+        background_prefill_priority: 1
+        compact_request_context: false
         incremental_tokenizer_checkpoint_interval: 8
+        counterfactual_full_tokenizer_timing: false
         max_sessions: 256
         session_ttl_seconds: 900
         stability_margin_tokens: 8
-        min_chunk_chars: 256
+        min_chunk_chars: 512
+        initial_chunk_chars: 256
         snapshot_poll_interval_seconds: 0.1
+        snapshot_long_poll_timeout_seconds: 1.0
         flush_interval_seconds: 0.25
         request_timeout_seconds: 60
 
@@ -717,13 +911,35 @@ V1 exports these per-sample metrics through the SWE agent result and W&B:
   character threshold, or tool completion before admission,
 - sessions started,
 - prefill requests and accepted prefill tokens,
+- committed-token high-water mark, dynamic tokens committed beyond the prior
+  authoritative model prefix, and effective requests that committed at least
+  one such dynamic token,
+- stable-first attempts, successes, structural fallbacks, proof time, proven
+  stable tokens, committable tokens after holdback, and dynamic candidate
+  tokens,
+- continuation request/command races, including request-first, command-first,
+  cancellation, synchronous existing-session aborts, deferred abort
+  acknowledgements, request age at cancellation, local cancellation drain,
+  and abort-acknowledgement duration totals,
 - valid prefill actions with at least one completed chunk and an exact final
   committed-prefix match,
 - exact incremental-tokenizer actions and valid tokenizer-only actions whose
   ordered requests completed without mismatch or fallback,
+- final-only incremental-tokenizer attempts and valid final-only actions,
+- final-only prefill attempts, valid actions, failures, server-side seconds,
+  and the exact final reusable-token bound,
+- background scheduled, completed, cancelled, and failed chunks/tokens;
+  enqueue and engine-completion seconds; effective chunks and dynamic tokens,
+- prompt-token cache details for the next model call, including the required
+  authoritative prefix and extra cached tokens attributable to streaming
+  prefill. This observed KV metric remains valid when a zero-grace cancellation
+  arrives after the engine has already populated automatic prefix cache,
 - incremental requests, cumulative full-prompt token counts, actually encoded
   characters/tokens, reused tokens, mutable-tail rollback tokens, checkpoints,
   checkpoint tokens, and checkpoint mismatches,
+- separate sequence-0 start and authoritative-final tokenizer request seconds,
+- optional counterfactual authoritative full-tokenizer requests, server-side
+  seconds, token counts, exact-result mismatches, and failures,
 - final tokenizer candidates, next-call reuse requests, canonical exact
   matches, token-equivalent matches, true prompt/token mismatches, and
   missing/expired one-shot candidates,
@@ -759,16 +975,17 @@ The following planned observability is not implemented yet:
 - enabled tool calls by action type,
 - fallback reason labels (the aggregate fallback count is implemented),
 - snapshot byte distributions,
-- server-side tokenizer CPU time separated from HTTP/rendering time (the
-  client-side incremental request duration is implemented),
-- stable and committed token distributions,
+- tokenizer encode time separated from server-side chat rendering (the
+  combined authoritative rendering-plus-tokenization timer and client-side
+  incremental request duration are implemented),
+- stable and committed token percentile distributions,
 - chunk size distribution,
 - prefill request queue and execution time,
 - tool execution time overlapped by prefill,
 - tool-completion-to-first-model-token latency,
 - final APC cached-token count,
 - KV-cache utilization and eviction count,
-- cancellation and TTL cleanup count, and
+- TTL cleanup count, and
 - session model-weight epoch.
 
 ## Testing Status and Remaining Plan
@@ -1057,6 +1274,30 @@ invalid runs. Mechanically, 741/12,499 eligible actions are valid (5.93%), all
 735 consumed reuse requests are exact matches, and 1,111 checkpoints report
 zero mismatch. The standalone evaluation report contains full runtime,
 transport, work-count, and admission tables.
+
+On 2026-07-16, the deferred-abort implementation completed the frozen first-16
+SWE-Verified validation with a 128-character first bucket. All 306 command-first
+cancellations received a deferred Gym acknowledgement, none failed, and the
+local cancellation drain totalled 0.268 seconds, or 0.88 ms per cancellation.
+The acknowledgement path totalled 49.20 seconds, or 160.8 ms per cancellation;
+the prior synchronous-abort arm spent 97.72 seconds across 195 cancellations,
+or 501.1 ms each, while waiting through remote cleanup. The new arm reported
+49 model calls with observed streaming-prefill KV out of 733 tool calls
+(6.68%), compared with 35/615 (5.69%) in the prior arm. It emitted all 16 rows
+with zero response, infrastructure, abort-acknowledgement, or background-prefill
+failure counters.
+
+Strict resolved was 1/16 deferred versus 0/16 synchronous, and timeout counts
+were 12 versus 13. Those differences are not attributable to the optimization:
+all 16 trajectory hashes differ and the arms execute different call counts.
+The result validates removal of synchronous remote cleanup from the command
+critical path, not accuracy parity or model-call latency. The implementation
+also passed 51 main streaming/tokenizer tests, two direct Gym abort-endpoint
+tests, 12 OpenHands client/runtime tests, and two final patch-chain harness
+tests. One main vLLM policy test could not run in the one-GPU diagnostic
+allocation because its fixture explicitly requires two GPUs; this is a
+resource exclusion rather than a product failure. Full accuracy, runtime, and
+metric-semantics details are in the standalone evaluation report.
 
 An earlier canonical attempt removed token-logging fields from both comparison
 and tokenizer requests. That made raw prompts compare equal but disabled
@@ -1376,16 +1617,63 @@ Status: implementation, focused correctness tests, fixed-trace equality, and
 two repeated first64 rollout/W&B trials and their strict paired audits are
 complete. Intermediate BPE encoding uses exact mutable-tail repair, periodic
 complete checkpoints, checkpoint-free fast finalization for valid sessions,
-and fail-open fallback. It creates no generation or prefill request of its own;
-exact final IDs are handed to the unchanged next generation request through
-one-shot prompt reuse.
+and fail-open fallback. Exact final IDs are handed to the unchanged next
+generation request through one-shot prompt reuse. The optional final-only
+prefill extension primes APC from sequence 0 but never replaces those final
+IDs.
+
+The final-only extension is implemented and its focused unit/patch-chain tests
+pass. It removes snapshot admission from tokenizer-only mode by performing an
+empty-output checkpoint concurrently with the command and one exact final
+revision. The frozen first-16 rollout admitted 2,007/2,024 eligible actions
+(99.16%), with zero checkpoint mismatch and zero snapshot/prefill request. It
+also added 478.18 s of aggregate post-command tail and encountered one
+trajectory at 1,801.41 s, so the flag remains disabled while duration-gated
+admission or sequence-zero token reuse is evaluated.
+
+The optional final-only prefill extension is implemented behind a second
+disabled-by-default flag. Focused Gym tests cover successful start/append/close
+and prefill fail-open; patched OpenHands tests cover request propagation,
+prefill/tokenizer metric separation, and unchanged final prompt reuse. Its
+frozen first-16 rollout admitted 1,490/1,490 eligible actions with zero prefill
+or tokenizer-checkpoint failures and produced matching server-side totals of
+72,763,148 prefill tokens and 1,490 dummy tokens. The prefill arm executed 450
+more tool calls, all 16 trajectories differed, strict accuracy changed from
+3/16 to 2/16. Neither arm had an OpenHands trajectory at or above 1,800
+seconds. Over the resulting 16-row no-timeout cohort, mean / P50 / P95
+OpenHands time changed from 381.28 / 231.76 / 1040.67 seconds to 514.10 /
+543.83 / 1093.33 seconds. Those timing and accuracy deltas are path-confounded,
+so the flag remains disabled pending a fixed-trace performance test and larger
+repeated accuracy evaluation. Batch E2E is retained only as historical
+diagnostic evidence; the current performance gate uses timeout-excluded
+per-trajectory OpenHands, model-call, command, and tool-call distributions. The
+detailed record is in `docs/streaming-tool-call-evaluation.md`.
 
 ### Phase 3: Performance tuning
 
-Status: in progress. Progressive two-snapshot admission removed the measured
-short-command regression and produced a faster eight-sample smoke, but global
-pending-token limits, cache high-water admission, and larger repeated benchmarks
-remain.
+Status: in progress. Background completion raised observed SWE prefill admission
+from 1.81% to 6.82% in one 16-row diagnostic, but all trajectories diverged and
+the timeout union retained only one row. A controlled Qwen3-30B benchmark
+measured about 16--18 ms of model-call TTFT savings for admitted work. Priority
+scheduling protects foreground requests from background prefill without a
+measurable median penalty in a 20-repeat contention smoke. A later clean
+candidate-size sweep found that 16 dynamic tokens did not produce an observable
+cache block, 32 did not repay control-plane cost, and 64 won all five paired
+model-call measurements. The current experimental recipe therefore starts at
+256 output characters (approximately 66 tokens in the measured SWE workload)
+and keeps 512 characters for later buckets.
+
+Commands that finish before admission now skip remote final tokenization and
+reuse registration. In the corresponding first-16 smoke this removed all 417
+previously observed unadmitted final-prefix tokenizations, reduced incremental
+tokenizer requests by 83.1%, streaming overhead per tool call by 47.2%, and
+post-command tail per tool call by 55.3%. Observed prefill admission also fell
+from 10.90% to 5.67% because the first bucket increased from 128 to 256
+characters. Every trajectory differed and only 2/16 survived the paired timeout
+union, so these are mechanism/overhead results rather than a causal runtime or
+accuracy result. Global pending-token limits, cache high-water admission, and
+larger repeated accuracy/performance benchmarks remain. Full artifacts and
+distribution tables are in `docs/streaming-tool-call-evaluation.md`.
 
 ### Phase 4: Optional direct final generation
 
