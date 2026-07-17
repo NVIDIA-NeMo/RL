@@ -1308,6 +1308,15 @@ def setup(
             flush=True,
         )
 
+        if enable_nemo_gym:
+            # Engines are up (initialize_generation_with_policy blocks on init),
+            # so their HTTP base URLs are resolvable now.
+            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
+                policy_generation.get_rollout_engine_urls(),
+                generation_config["model_name"],
+            )
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+
     elif backend == "trtllm":
         generation_config = cast(TrtllmConfig, generation_config)
 
@@ -2039,6 +2048,10 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         should_expose_http_server = generation_config["mcore_generation_config"].get(
             "expose_http_server"
         )
+    elif generation_config["backend"] == "sglang":
+        # SGLang rollout engines are native HTTP servers
+        # (see SGLangGeneration.get_rollout_engine_urls); always exposed.
+        should_expose_http_server = True
     elif generation_config["backend"] == "trtllm":
         raise NotImplementedError(
             "NeMo-Gym is not supported with the TRT-LLM generation backend "
@@ -3836,16 +3849,22 @@ def async_grpo_train(
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO (with in-flight weight updates) supports vLLM, Megatron, and TRT-LLM;
-    # SGLang async rollouts do not support the async GRPO replay path.
+    # All HTTP-capable backends can feed the async replay loop. SGLang pauses
+    # generation at each refit boundary; it does not overlap in-flight weight
+    # updates with generation.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm") and _should_use_async_rollouts(
-        master_config
-    ), (
-        "Async GRPO requires an async vLLM, Megatron, or TRT-LLM generation engine. "
-        "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
+    assert backend in (
+        "vllm",
+        "megatron",
+        "sglang",
+        "trtllm",
+    ) and _should_use_async_rollouts(master_config), (
+        "Async GRPO requires an async vLLM, Megatron, SGLang, or TRT-LLM "
+        "generation engine. Set policy.generation.vllm_cfg.async_engine=true "
+        "(vLLM), "
         "policy.generation.mcore_generation_config.async_engine=true (Megatron), or "
+        "policy.generation.use_async_rollouts=true (SGLang), or "
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM)."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
