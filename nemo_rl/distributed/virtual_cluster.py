@@ -245,6 +245,20 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
     """
+    # Strip MPI/PMIx/SLURM launcher vars from the driver env before they get
+    # captured into runtime_env (both by `dict(os.environ)` below and by
+    # RayWorkerGroup, which re-reads os.environ). Otherwise they are forwarded
+    # into every actor, where they cause two failures in the TRT-LLM generation
+    # worker: (1) PMIX_/SLURM_STEP_ID make OMPI's MPI_Init abort with "OMPI was
+    # not built with SLURM's PMI support"; (2) any residual OMPI_/MPI_/SLURM_
+    # var makes TRT-LLM think it runs under an MPI launcher and pick the MPI
+    # orchestrator (MPI_Comm_Spawn -> MPI_ERR_SPAWN) instead of the Ray
+    # orchestrator. init_ray() runs before any worker group is built, so
+    # popping here cleans the env for all downstream captures.
+    for _k in list(os.environ):
+        if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
+            os.environ.pop(_k, None)
+
     # Set up runtime environment
     env_vars = dict(os.environ)
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
