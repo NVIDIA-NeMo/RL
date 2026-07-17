@@ -72,6 +72,12 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     def mark_stale(self) -> None:
         self._stale = True
 
+    def _release_after_refit(self) -> bool:
+        cfg = self._checkpoint_engine_config
+        return bool(
+            cfg["engine_kwargs"][cfg["backend"]].get("release_after_refit", False)
+        )
+
     def _run_policy(
         self, checkpoint_method: str, **method_kwargs: Any
     ) -> list[ray.ObjectRef]:
@@ -171,23 +177,29 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             else nullcontext()
         )
 
-        with context:
-            policy_refs = self._run_policy(
-                "send_weights_via_checkpoint_engine", kv_scales=kv_scales
-            )
-            results = ray.get(
-                policy_refs
-                + self._run_generation("update_weights_from_checkpoint_engine")
-            )
-            if not all(
-                result for result in results[len(policy_refs) :] if result is not None
-            ):
-                raise RuntimeError(
-                    "Weight transfer failed during "
-                    f"{self._checkpoint_engine_config['backend']} "
-                    "checkpoint-engine sync."
+        try:
+            with context:
+                policy_refs = self._run_policy(
+                    "send_weights_via_checkpoint_engine", kv_scales=kv_scales
                 )
-            self._stale = False
+                results = ray.get(
+                    policy_refs
+                    + self._run_generation("update_weights_from_checkpoint_engine")
+                )
+                if not all(
+                    result
+                    for result in results[len(policy_refs) :]
+                    if result is not None
+                ):
+                    raise RuntimeError(
+                        "Weight transfer failed during "
+                        f"{self._checkpoint_engine_config['backend']} "
+                        "checkpoint-engine sync."
+                    )
+                self._stale = False
+        finally:
+            if self._release_after_refit():
+                self.shutdown()
 
     def shutdown(self) -> None:
         if not self._checkpoint_engine_ready:

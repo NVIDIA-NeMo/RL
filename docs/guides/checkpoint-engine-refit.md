@@ -36,7 +36,7 @@ policy:
       engine_kwargs:
         nixl:
           device: cuda
-          cleanup_after_load: false
+          release_after_refit: false
           backend_name: UCX
           backend_init_params:
             engine_config: MAX_RMA_RAILS=8
@@ -47,9 +47,9 @@ Key settings:
 
 | Key | Meaning |
 |---|---|
-| `update_weights_bucket_megabytes` | Reusable transfer-buffer size per participating worker. Start with `2048`; tune only after measuring. |
+| `update_weights_bucket_megabytes` | Size of each transfer buffer. NIXL allocates two per participating engine, so `4096` requires about 8 GiB. Start with `2048`; tune only after measuring. |
 | `device` | `cuda` uses GPU RDMA buffers. `cpu` uses host-pinned buffers and is mainly a fallback. |
-| `cleanup_after_load` | Set `false` to avoid extra `torch.cuda.empty_cache()` overhead after each refit when memory is stable. |
+| `release_after_refit` | When `true`, deregister and free transfer buffers after every refit. The next refit allocates and registers them again. Default `false` retains them for throughput. |
 | `shard_expert_weights` | Sends destination-local MoE expert shards for TP/EP and omits weights absent from each vLLM PP stage. |
 | `backend_init_params` | NIXL backend parameters such as UCX peer error handling, device lists, and UCX engine config. |
 
@@ -110,7 +110,7 @@ policy:
       engine_kwargs:
         nixl:
           device: cuda
-          cleanup_after_load: false
+          release_after_refit: false
           shard_expert_weights: true
 ```
 
@@ -137,6 +137,29 @@ only unquantized Triton expert storage; FP8 and backends that transpose or
 shuffle expert weights are rejected during setup. This includes FlashInfer
 TRT-LLM MXFP8 layouts that reorder W13 to W31 and shuffle weights and scales.
 
+### FP8 Compatibility
+
+FP8 model weights and FP8 KV-cache scales are separate features:
+
+| Configuration | Status |
+|---|---|
+| NIXL with `shard_expert_weights: false` and FP8 vLLM weights | Supported through the existing full-weight `fp8.load_weights` path. |
+| NIXL with `shard_expert_weights: true` and FP8 or MXFP8 vLLM weights | Unsupported. Setup or loading fails explicitly because destination-local expert loading does not yet implement quantized, transposed, or shuffled weight-and-scale layouts. |
+| Megatron policy with FP8 KV-cache scales | Supported; the scales are appended to the checkpoint-engine weight stream and processed after loading. |
+| DTensor or DTensor v2 policy with FP8 KV-cache scales | Unsupported; the policy worker raises `NotImplementedError`. |
+
+Sharded FP8 expert refit is a loader-layout limitation, not a NIXL transport
+limitation. Supporting it requires a versioned destination-layout adapter for
+the quantized weights, scales, and any vLLM post-load transpose or shuffle.
+
+A full-weight FP8 end-to-end validation on 2026-07-17 used a BF16 Megatron
+Qwen2.5-0.5B policy, an FP8 vLLM rollout model, two eight-GPU nodes, asynchronous
+rollout, CUDA-buffer NIXL, and a 256 MiB bucket. Two refits completed in 1.116 s
+and 0.195 s. `tools/refit_verifier.py` reported mean/max absolute logprob
+differences of 0.09474/0.18032 and an average probability multiplier of 1.10153.
+These differences include BF16-to-FP8 quantization error, so this validates the
+full-weight FP8 control and transfer path rather than bitwise transport parity.
+
 Only destination-local expert tensors use this direct-copy path. Dense and
 unhandled tensors continue through vLLM's standard `load_weights` path. CUDA
 NIXL still stages transfers through GPU RDMA buffers, but tensors spanning
@@ -151,6 +174,14 @@ Expert sharding requires HF expert names that map to vLLM `w13_weight` and
 
 Avoid `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` for CUDA-buffer NIXL
 refit unless that workload has been explicitly validated with it.
+
+Set `release_after_refit: true` when the two registered buffers must be returned
+between refits. Finalization then deregisters both buffers, releases their
+dedicated CuPy pool, and retains the NIXL agent and control endpoint. Before the
+next refit, `prepare()` allocates and registers two new buffers. This saves
+`2 * update_weights_bucket_megabytes` of resident GPU memory between refits at
+the cost of allocation, registration, and metadata exchange on every refit.
+Leave it `false` for the benchmark path below.
 
 ### DeepSeek-V3 Benchmark
 

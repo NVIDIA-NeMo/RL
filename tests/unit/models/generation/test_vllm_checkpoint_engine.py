@@ -30,7 +30,7 @@ import torch
         (2, 1, 2, 4, 3),
     ],
 )
-def test_global_rollout_rank_handles_external_and_engine_local_dp(
+def test_resolve_rollout_rank_handles_external_and_engine_local_dp(
     monkeypatch,
     rank_prefix,
     rank,
@@ -38,12 +38,12 @@ def test_global_rollout_rank_handles_external_and_engine_local_dp(
     rollout_world_size,
     expected,
 ):
-    from nemo_rl.models.generation.vllm.checkpoint_engine import global_rollout_rank
+    from nemo_rl.models.generation.vllm.checkpoint_engine import resolve_rollout_rank
 
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: group_world_size)
 
-    assert global_rollout_rank(rank_prefix, rollout_world_size) == expected
+    assert resolve_rollout_rank(rank_prefix, rollout_world_size) == expected
 
 
 @pytest.mark.vllm
@@ -69,6 +69,24 @@ def test_checkpoint_engine_worker_lifecycle(monkeypatch):
 
     worker.finalize_checkpoint_engine()
     worker.checkpoint_engine.finalize.assert_called_once_with()
+
+
+@pytest.mark.vllm
+def test_checkpoint_engine_methods_only_exist_on_configured_extension():
+    from nemo_rl.models.generation.vllm.checkpoint_engine import (
+        VllmCheckpointEngineMixin,
+    )
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+    )
+
+    assert not issubclass(VllmInternalWorkerExtension, VllmCheckpointEngineMixin)
+    assert not hasattr(VllmInternalWorkerExtension, "prepare_checkpoint_engine")
+    assert issubclass(
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+        VllmCheckpointEngineMixin,
+    )
 
 
 @pytest.mark.vllm

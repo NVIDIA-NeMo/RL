@@ -24,6 +24,7 @@ import torch
 
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
+    PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.utils.checkpoint_engines import nixl as nixl_mod
@@ -116,7 +117,7 @@ class _RecordingCheckpointEngine(CheckpointEngine):
         pass
 
 
-class _CheckpointPolicyWorker(AbstractPolicyWorker):
+class _CheckpointPolicyWorker(PolicyCheckpointEngineMixin, AbstractPolicyWorker):
     def __init__(self) -> None:
         self.rank = 3
         self.events = []
@@ -159,6 +160,11 @@ class TestCheckpointEngineABC:
             IncompleteEngine()  # type: ignore[abstract]
 
 
+def test_abstract_policy_worker_does_not_enable_checkpoint_engine():
+    assert not issubclass(AbstractPolicyWorker, PolicyCheckpointEngineMixin)
+    assert not hasattr(AbstractPolicyWorker, "checkpoint_engine_rpc")
+
+
 def test_checkpoint_engine_helpers():
     engine = create_checkpoint_engine(
         f"{__name__}:_PluginCheckpointEngine",
@@ -167,7 +173,6 @@ def test_checkpoint_engine_helpers():
     )
     assert isinstance(engine, _PluginCheckpointEngine)
     assert (engine.bucket_size, engine.marker) == (16, "ok")
-    assert engine.cleanup_after_load
     assert not engine.shard_expert_weights
     assert engine.get_target_weight_layout() is None
 
@@ -425,6 +430,8 @@ def test_nixl_cuda_transfer_buffer_falls_back_without_cupy(monkeypatch):
     engine.bucket_size = 16
     engine._transfer_device = torch.device("cuda", 0)
     engine._cupy_buffers = []
+    engine._cupy_memory_pool = None
+    engine._uses_torch_cuda_buffers = False
     set_device_calls = []
     zeros_calls = []
 
@@ -449,6 +456,7 @@ def test_nixl_cuda_transfer_buffer_falls_back_without_cupy(monkeypatch):
         )
     ]
     assert engine._cupy_buffers == []
+    assert engine._uses_torch_cuda_buffers
 
 
 def test_nixl_finalize_disconnects_peers():
@@ -464,6 +472,7 @@ def test_nixl_finalize_disconnects_peers():
     engine.prev_agent = "policy"
     engine.next_agent = "rollout"
     engine._target_weight_layout = {"layer": {}}
+    engine.release_after_refit = False
 
     engine.finalize()
 
@@ -471,6 +480,79 @@ def test_nixl_finalize_disconnects_peers():
     assert engine.prev_agent is None
     assert engine.next_agent is None
     assert engine.get_target_weight_layout() is None
+
+
+def test_nixl_release_after_refit_deregisters_and_reregisters_buffers(monkeypatch):
+    class FakeBackend:
+        def __init__(self):
+            self.registered = []
+            self.deregistered = []
+
+        def register_memory(self, buffer):
+            registration = f"registration-{len(self.registered)}"
+            self.registered.append((registration, buffer))
+            return registration
+
+        def get_xfer_descs(self, buffer):
+            return f"xfer-{len(self.registered)}-{buffer.numel()}"
+
+        def deregister_memory(self, registration):
+            self.deregistered.append(registration)
+
+    class FakeAgent:
+        instances = []
+
+        def __init__(self, backend_name, backend_init_params):
+            self.backend_name = backend_name
+            self.backend_init_params = backend_init_params
+            self.agent = FakeBackend()
+            self.instances.append(self)
+
+        def get_agent_metadata(self):
+            return {"agent": len(self.instances)}
+
+    monkeypatch.setattr(nixl_mod, "NixlAgent", FakeAgent)
+    engine = NIXLCheckpointEngine(
+        bucket_size=16,
+        device="cpu",
+        backend_name="UCX",
+        backend_init_params={"device_list": "mlx5_0:1"},
+        release_after_refit=True,
+    )
+
+    first_agent = engine.agent
+    assert engine.prepare() == {"agent": 1}
+    assert len(first_agent.agent.registered) == 2
+    assert len(engine.buffers) == len(engine.registration_descs) == 2
+
+    engine.finalize()
+
+    assert first_agent.agent.deregistered == ["registration-0", "registration-1"]
+    assert engine.agent is first_agent
+    assert engine.buffers == []
+    assert engine.registration_descs == []
+    assert engine.xfer_descs == []
+
+    assert engine.prepare() == {"agent": 1}
+    assert engine.agent is first_agent
+    assert len(engine.agent.agent.registered) == 4
+
+
+def test_nixl_default_finalize_retains_registered_resources(monkeypatch):
+    agent = MagicMock()
+    agent.get_agent_metadata.return_value = {"agent": "retained"}
+    agent.agent.register_memory.side_effect = ["registration-0", "registration-1"]
+    agent.agent.get_xfer_descs.side_effect = ["xfer-0", "xfer-1"]
+    monkeypatch.setattr(nixl_mod, "NixlAgent", lambda *_args: agent)
+    engine = NIXLCheckpointEngine(bucket_size=16, device="cpu")
+
+    engine.prepare()
+    buffers = engine.buffers
+    engine.finalize()
+
+    assert engine.agent is agent
+    assert engine.buffers is buffers
+    agent.agent.deregister_memory.assert_not_called()
 
 
 def test_nixl_agent_binds_zmq_socket_atomically(monkeypatch):

@@ -13,20 +13,21 @@
 # limitations under the License.
 
 import asyncio
-import gc
 import time
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from nemo_rl.models.generation.vllm.refit_loader import VllmRefitLoaderMixin
+from nemo_rl.models.generation.vllm.refit_loader import (
+    VllmShardedExpertRefitMixin,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 if TYPE_CHECKING:
     from nemo_rl.utils.checkpoint_engines.base import CheckpointEngine
 
 
-NEMO_RL_VLLM_WORKER = "nemo_rl.models.generation.vllm.vllm_backend.NemoRLVllmWorker"
+NIXL_VLLM_WORKER = "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker"
 _NIXL_CONFIG_KEY = "nemo_rl_checkpoint_engine"
 
 
@@ -40,11 +41,11 @@ def configure_nixl_worker(config: dict[str, Any], vllm_kwargs: dict[str, Any]) -
     ):
         return
 
-    worker_cls = vllm_kwargs.setdefault("worker_cls", NEMO_RL_VLLM_WORKER)
-    if worker_cls != NEMO_RL_VLLM_WORKER:
+    worker_cls = vllm_kwargs.setdefault("worker_cls", NIXL_VLLM_WORKER)
+    if worker_cls != NIXL_VLLM_WORKER:
         raise ValueError(
             "NIXL checkpoint-engine refit requires vllm_kwargs.worker_cls to "
-            f"be unset or {NEMO_RL_VLLM_WORKER}."
+            f"be unset or {NIXL_VLLM_WORKER}."
         )
 
     additional_config = dict(vllm_kwargs.get("additional_config") or {})
@@ -71,17 +72,24 @@ def preinit_nixl_from_vllm_config(vllm_config: Any) -> Any:
     )
 
 
-def global_rollout_rank(rank_prefix: int, rollout_world_size: int) -> int:
+def resolve_rollout_rank(rank_prefix: int, rollout_world_size: int) -> int:
     rank = torch.distributed.get_rank()
     if torch.distributed.get_world_size() == rollout_world_size:
+        # External DP ranks are already global; adding the prefix would double-count.
         return rank
     return rank_prefix + rank
 
 
-class VllmCheckpointEngineMixin(VllmRefitLoaderMixin):
+class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
     """Checkpoint-engine lifecycle for vLLM workers."""
 
     checkpoint_engine: "CheckpointEngine"
+
+    def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
+        if self.checkpoint_engine.shard_expert_weights:
+            self._load_sharded_expert_weights(policy_weights)
+            return
+        super()._load_hf_weights(policy_weights)
 
     def init_checkpoint_engine(
         self, backend: str, bucket_size_bytes: int, engine_kwargs: dict[str, Any]
@@ -113,7 +121,7 @@ class VllmCheckpointEngineMixin(VllmRefitLoaderMixin):
         metadata: list[Any],
     ) -> None:  # pragma: no cover
         self.checkpoint_engine.init_rollout_process_group(
-            rollout_rank=global_rollout_rank(rank_prefix, rollout_world_size),
+            rollout_rank=resolve_rollout_rank(rank_prefix, rollout_world_size),
             train_world_size=train_world_size,
             rollout_world_size=rollout_world_size,
             metadata=metadata,
@@ -145,10 +153,6 @@ class VllmCheckpointEngineMixin(VllmRefitLoaderMixin):
             del weight_batch
 
         self._maybe_process_fp8_kv_cache()
-
-        if self.checkpoint_engine.cleanup_after_load:
-            gc.collect()
-            torch.cuda.empty_cache()
 
         total_time = time.time() - start_time
         loaded_gib = loaded_bytes / (1024 * 1024 * 1024)

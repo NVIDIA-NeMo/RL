@@ -38,7 +38,6 @@ class TensorMeta:
 
 
 class CheckpointEngine(ABC):
-    cleanup_after_load: bool = True
     shard_expert_weights: bool = False
 
     def get_target_weight_layout(self) -> dict[str, Any] | None:

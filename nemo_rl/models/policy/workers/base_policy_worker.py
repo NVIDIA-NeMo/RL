@@ -19,13 +19,10 @@ import zmq
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
-from nemo_rl.models.policy.workers.checkpoint_engine import (
-    PolicyCheckpointEngineMixin,
-)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
-class AbstractPolicyWorker(PolicyCheckpointEngineMixin):
+class AbstractPolicyWorker:
     """Base class for policy workers with shared functionality."""
 
     def init_collective(

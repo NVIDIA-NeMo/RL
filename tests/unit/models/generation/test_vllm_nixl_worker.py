@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
-    NEMO_RL_VLLM_WORKER,
+    NIXL_VLLM_WORKER,
     configure_nixl_worker,
     preinit_nixl_from_vllm_config,
 )
@@ -56,7 +56,7 @@ def test_configure_nixl_worker_uses_vllm_extension_points():
 
     configure_nixl_worker({"checkpoint_engine": checkpoint_config}, vllm_kwargs)
 
-    assert vllm_kwargs["worker_cls"] == NEMO_RL_VLLM_WORKER
+    assert vllm_kwargs["worker_cls"] == NIXL_VLLM_WORKER
     assert vllm_kwargs["additional_config"] == {
         "existing": True,
         "nemo_rl_checkpoint_engine": checkpoint_config,
@@ -101,7 +101,7 @@ def test_preinit_nixl_from_vllm_config_is_disabled_without_nixl_config():
 
 
 @pytest.mark.vllm
-def test_nemo_rl_worker_preinitializes_before_vllm_worker(monkeypatch):
+def test_nixl_worker_preinitializes_before_vllm_worker(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     calls = []
@@ -111,14 +111,14 @@ def test_nemo_rl_worker_preinitializes_before_vllm_worker(monkeypatch):
         "preinit_nixl_from_vllm_config",
         lambda config: calls.append(("preinit", config)) or agent,
     )
-    base_worker = vllm_backend.NemoRLVllmWorker.__bases__[0]
+    base_worker = vllm_backend.NixlVllmWorker.__bases__[0]
     monkeypatch.setattr(
         base_worker,
         "__init__",
         lambda self, config, *args, **kwargs: calls.append(("vllm", config)),
     )
     config = object()
-    worker = vllm_backend.NemoRLVllmWorker(config)
+    worker = vllm_backend.NixlVllmWorker(config)
 
     assert calls == [("preinit", config), ("vllm", config)]
     assert worker._nrl_nixl_preinit_agent is agent

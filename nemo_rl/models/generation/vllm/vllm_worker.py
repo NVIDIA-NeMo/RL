@@ -39,7 +39,6 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
-    configure_nixl_worker,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
@@ -56,6 +55,9 @@ from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    enabled_checkpoint_engine_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -340,7 +342,13 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
-        configure_nixl_worker(self.cfg, vllm_kwargs)
+        checkpoint_engine_config = enabled_checkpoint_engine_config(self.cfg)
+        if checkpoint_engine_config is not None:
+            from nemo_rl.models.generation.vllm.checkpoint_engine import (
+                configure_nixl_worker,
+            )
+
+            configure_nixl_worker(self.cfg, vllm_kwargs)
 
         # Calculate total parallel size (TP * PP)
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
@@ -530,7 +538,13 @@ class BaseVllmGenerationWorker:
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
-            worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
+            worker_extension_cls=(
+                "nemo_rl.models.generation.vllm.vllm_backend."
+                "VllmInternalWorkerExtensionWithCheckpointEngine"
+                if checkpoint_engine_config is not None
+                else "nemo_rl.models.generation.vllm.vllm_backend."
+                "VllmInternalWorkerExtension"
+            ),
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
@@ -832,14 +846,14 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
             if hasattr(generation, "logprobs") and generation.logprobs:
                 try:
-                    for idx, logprob_dict in enumerate(generation.logprobs):
-                        if logprob_dict and idx < len(generated_tokens):
-                            token_id = generated_tokens[idx]
-                            logprob = generated_token_logprob(logprob_dict, token_id)
-                            if logprob is None:
-                                continue
-                            position = sequence_length + idx
-                            full_logprobs[position] = logprob
+                    for idx, (token_id, logprob_dict) in enumerate(
+                        zip(generated_tokens, generation.logprobs)
+                    ):
+                        if not logprob_dict:
+                            continue
+                        logprob = generated_token_logprob(logprob_dict, token_id)
+                        if logprob is not None:
+                            full_logprobs[sequence_length + idx] = logprob
                 except Exception:
                     import traceback
 

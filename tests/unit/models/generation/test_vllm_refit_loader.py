@@ -65,7 +65,7 @@ def test_destination_local_copy_matches_vllm_full_weight_tp_loading():
     from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     owner = FusedMoE.__new__(FusedMoE)
@@ -76,7 +76,9 @@ def test_destination_local_copy_matches_vllm_full_weight_tp_loading():
     reference_w2 = _expert_param((2, 6, 4), owner)
     destination_w13 = _expert_param((2, 8, 6), owner)
     destination_w2 = _expert_param((2, 6, 4), owner)
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     full_w1 = torch.arange(64, dtype=torch.float32).reshape(2, 8, 4)
     full_w3 = full_w1 + 100
     full_w2 = torch.arange(64, dtype=torch.float32).reshape(2, 4, 8) + 200
@@ -139,11 +141,13 @@ def test_refit_load_weights_uses_full_weight_path_by_default():
 @pytest.mark.vllm
 def test_refit_load_weights_dispatches_to_sharded_path_when_enabled():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     loaded = []
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext.checkpoint_engine = SimpleNamespace(shard_expert_weights=True)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
@@ -160,14 +164,39 @@ def test_refit_load_weights_dispatches_to_sharded_path_when_enabled():
 
 
 @pytest.mark.vllm
-def test_refit_load_weights_preserves_nonsharded_fp8_path(monkeypatch):
-    from nemo_rl.models.generation.vllm.quantization import fp8
+def test_checkpoint_refit_worker_falls_back_to_full_loader():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     loaded = []
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    ext.checkpoint_engine = SimpleNamespace(shard_expert_weights=False)
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(load_weights=lambda *, weights: loaded.extend(weights)),
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[])),
+    )
+    weight = torch.ones(2, 2)
+
+    ext._load_weights([("model.weight", weight)])
+
+    assert loaded == [("model.weight", weight)]
+
+
+@pytest.mark.vllm
+def test_checkpoint_refit_preserves_nonsharded_fp8_path(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+    )
+
+    loaded = []
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    ext.checkpoint_engine = SimpleNamespace(shard_expert_weights=False)
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             load_weights=lambda **_kwargs: pytest.fail("used full loader")
@@ -189,9 +218,32 @@ def test_refit_load_weights_preserves_nonsharded_fp8_path(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_refit_load_weights_rejects_sharded_fp8_path(monkeypatch):
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+    )
+
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    ext.checkpoint_engine = SimpleNamespace(shard_expert_weights=True)
+    ext.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            load_weights=lambda **_kwargs: pytest.fail("used full loader")
+        ),
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[])),
+    )
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+
+    with pytest.raises(ValueError, match="not supported for FP8"):
+        ext._load_weights([("model.weight", torch.ones(2, 2))])
+
+
+@pytest.mark.vllm
 def test_checkpoint_engine_weight_layout_reports_ep_and_pp_ownership(monkeypatch):
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     owner = _FakeExpertOwner(
@@ -199,7 +251,9 @@ def test_checkpoint_engine_weight_layout_reports_ep_and_pp_ownership(monkeypatch
     )
     w13 = _expert_param((2, 8, 4), owner)
     w2 = _expert_param((2, 4, 4), owner)
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [
@@ -226,12 +280,14 @@ def test_checkpoint_engine_weight_layout_reports_ep_and_pp_ownership(monkeypatch
 @pytest.mark.vllm
 def test_checkpoint_engine_weight_layout_rejects_shuffled_backend():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     owner = _FakeExpertOwner(use_ep=True, backend_name="FLASHINFER_TRTLLM")
     param = _expert_param((2, 8, 4), owner)
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
@@ -244,13 +300,15 @@ def test_checkpoint_engine_weight_layout_rejects_shuffled_backend():
 @pytest.mark.vllm
 def test_checkpoint_engine_weight_layout_rejects_transposed_experts():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     owner = _FakeExpertOwner(use_ep=True)
     param = _expert_param((2, 8, 4), owner)
     param.is_transposed = True
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
@@ -263,7 +321,7 @@ def test_checkpoint_engine_weight_layout_rejects_transposed_experts():
 @pytest.mark.vllm
 def test_sharded_refit_directly_loads_full_ep_owned_experts():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     owner = _FakeExpertOwner(
@@ -271,7 +329,9 @@ def test_sharded_refit_directly_loads_full_ep_owned_experts():
     )
     w13 = _expert_param((2, 8, 4), owner)
     w2 = _expert_param((2, 4, 4), owner)
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [
@@ -341,12 +401,14 @@ def test_sharded_refit_directly_loads_full_ep_owned_experts():
 @pytest.mark.vllm
 def test_sharded_refit_loads_sparse_local_expert_ids_individually():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     owner = _FakeExpertOwner(use_ep=False)
     param = _expert_param((3, 8, 4), owner)
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     expert_0 = torch.full((4, 4), 1.0)
     expert_2 = torch.full((4, 4), 2.0)
 
@@ -365,12 +427,14 @@ def test_sharded_refit_loads_sparse_local_expert_ids_individually():
 @pytest.mark.vllm
 def test_sharded_refit_keeps_full_tp_weight_for_standard_loader():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     owner = _FakeExpertOwner(use_ep=False, tp_rank=0, tp_size=2)
     param = _expert_param((4, 8, 4), owner)
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
@@ -391,14 +455,16 @@ def test_sharded_refit_keeps_full_tp_weight_for_standard_loader():
 @pytest.mark.vllm
 def test_sharded_refit_requires_bound_vllm_expert_loader():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     param_name = "model.layers.0.mlp.experts.w13_weight"
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     param = torch.nn.Parameter(torch.zeros(1, 8, 4), requires_grad=False)
     param.weight_loader = lambda *args, **kwargs: None
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext._nrl_named_parameters = {param_name: param}
     ext.state_dict_info = {weight_name: (torch.Size([8, 4]), torch.float32)}
 
@@ -409,14 +475,16 @@ def test_sharded_refit_requires_bound_vllm_expert_loader():
 @pytest.mark.vllm
 def test_sharded_refit_rejects_noncanonical_expert_dimensions():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     param_name = "model.layers.0.mlp.experts.w13_weight"
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     owner = _FakeExpertOwner(use_ep=False)
     param = _expert_param((8, 4), owner)
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext._nrl_named_parameters = {param_name: param}
     ext.state_dict_info = {weight_name: (torch.Size([8, 4]), torch.float32)}
 
@@ -427,14 +495,16 @@ def test_sharded_refit_rejects_noncanonical_expert_dimensions():
 @pytest.mark.vllm
 def test_sharded_refit_validates_source_shape_against_reported_tp_size():
     from nemo_rl.models.generation.vllm.vllm_backend import (
-        VllmInternalWorkerExtension,
+        VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
     param_name = "model.layers.0.mlp.experts.w13_weight"
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     owner = _FakeExpertOwner(use_ep=False, tp_size=2)
     param = _expert_param((1, 8, 4), owner)
-    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
     ext._nrl_named_parameters = {param_name: param}
     ext.state_dict_info = {weight_name: (torch.Size([8, 4]), torch.float32)}
 

@@ -755,13 +755,38 @@ def test_quant_worker_forwards_snapshot_pythonpath_to_inner_vllm_workers():
     assert "PYTHONPATH" in worker_mod._EXTRA_ENV_VARS
 
 
-def test_fake_quant_worker_inherits_nemo_rl_worker():
+def test_configure_quant_engine_kwargs_preserves_checkpoint_extension(monkeypatch):
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
+    monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
+    cfg = {
+        "quant_cfg": "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml",
+        "checkpoint_engine": {
+            "enabled": True,
+            "backend": "nixl",
+            "update_weights_bucket_megabytes": 16,
+            "engine_kwargs": {"nixl": {}},
+        },
+    }
+    llm_kwargs = {}
+
+    worker_mod._configure_quant_engine_kwargs(cfg, llm_kwargs)
+
+    assert llm_kwargs["worker_extension_cls"] == (
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend."
+        "VllmQuantInternalWorkerExtensionWithCheckpointEngine"
+    )
+
+
+def test_fake_quant_worker_inherits_nixl_worker():
     patch_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_patch"
     )
-    from nemo_rl.models.generation.vllm.vllm_backend import NemoRLVllmWorker
+    from nemo_rl.models.generation.vllm.vllm_backend import NixlVllmWorker
 
-    assert issubclass(patch_mod.FakeQuantWorker, NemoRLVllmWorker)
+    assert issubclass(patch_mod.FakeQuantWorker, NixlVllmWorker)
 
 
 def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):

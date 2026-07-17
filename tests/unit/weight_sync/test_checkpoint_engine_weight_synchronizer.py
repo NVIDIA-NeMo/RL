@@ -62,12 +62,17 @@ def _mock_generation(**overrides):
     return gen
 
 
-def _checkpoint_engine_cfg():
+def _checkpoint_engine_cfg(*, release_after_refit=False):
     return {
         "enabled": True,
         "backend": "test_backend",
         "update_weights_bucket_megabytes": 4,
-        "engine_kwargs": {"test_backend": {"device": "cpu"}},
+        "engine_kwargs": {
+            "test_backend": {
+                "device": "cpu",
+                "release_after_refit": release_after_refit,
+            }
+        },
     }
 
 
@@ -91,7 +96,14 @@ class _CheckpointWorkerGroup:
         return ["generation-init"]
 
 
-def _checkpoint_sync(mock_ray, *, async_engine=False, update_success=True):
+def _checkpoint_sync(
+    mock_ray,
+    *,
+    async_engine=False,
+    update_success=True,
+    release_after_refit=False,
+    cycles=1,
+):
     # One return value per ray.get() call, in order:
     #   1. init_checkpoint_engine (policy + generation)
     #   2. prepare_checkpoint_engine (policy refs first, then generation refs;
@@ -105,13 +117,15 @@ def _checkpoint_sync(mock_ray, *, async_engine=False, update_success=True):
         [],
         ["policy-send", update_success],
         [],
-    ]
+    ] * cycles
     policy = _mock_policy()
     policy.worker_group = _CheckpointWorkerGroup()
     gen = _mock_generation(
         cfg={
             "vllm_cfg": {"async_engine": async_engine},
-            "checkpoint_engine": _checkpoint_engine_cfg(),
+            "checkpoint_engine": _checkpoint_engine_cfg(
+                release_after_refit=release_after_refit
+            ),
         }
     )
     gen.dp_size = 2
@@ -183,6 +197,29 @@ class TestCheckpointEngineWeightSynchronizer:
         assert sync._policy.worker_group.calls[-1] == (
             "checkpoint_engine_rpc",
             "finalize_checkpoint_engine",
+        )
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_release_after_refit_reprepares_each_sync(self, mock_ray):
+        sync = _checkpoint_sync(mock_ray, release_after_refit=True, cycles=2)
+
+        sync.init_communicator()
+        sync.sync_weights()
+        assert not sync._checkpoint_engine_ready
+
+        sync.sync_weights()
+        assert not sync._checkpoint_engine_ready
+        assert (
+            sync._policy.worker_group.calls.count(
+                ("checkpoint_engine_rpc", "prepare_checkpoint_engine")
+            )
+            == 2
+        )
+        assert (
+            sync._policy.worker_group.calls.count(
+                ("checkpoint_engine_rpc", "finalize_checkpoint_engine")
+            )
+            == 2
         )
 
     @patch(

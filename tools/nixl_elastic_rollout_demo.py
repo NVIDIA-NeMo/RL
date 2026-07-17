@@ -126,7 +126,7 @@ def _build_engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "backend_init_params": {
             "ucx_error_handling_mode": args.ucx_error_handling_mode,
         },
-        "cleanup_after_load": False,
+        "release_after_refit": True,
     }
 
 

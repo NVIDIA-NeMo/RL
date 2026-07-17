@@ -61,7 +61,7 @@ policy:
       engine_kwargs:
         nixl:
           device: cuda
-          cleanup_after_load: false
+          release_after_refit: false
           backend_name: UCX
           backend_init_params:
             engine_config: MAX_RMA_RAILS=8
@@ -105,8 +105,6 @@ from nemo_rl.utils.checkpoint_engines.base import CheckpointEngine
 
 
 class MyCheckpointEngine(CheckpointEngine):
-    cleanup_after_load = True
-
     def __init__(self, bucket_size: int, transport: str) -> None:
         self.bucket_size = bucket_size
         self.transport = transport
@@ -168,17 +166,21 @@ A backend that enables `shard_expert_weights` must implement
 rollout peer; otherwise it returns the destination layout used to filter and
 slice the policy iterator.
 
-`cleanup_after_load` is read by the vLLM worker after the receive loop. Set it
-to `False` when the backend keeps stable buffers and avoiding extra
-`torch.cuda.empty_cache()` calls is safe for the run.
+The built-in NIXL backend accepts `release_after_refit`. When enabled,
+`finalize()` deregisters and frees its transfer buffers. A subsequent
+`prepare()` allocates and registers new buffers before returning metadata. The
+agent remains live, and the default retains the buffers as well for lower
+latency.
 
 ## Worker Integration
 
-Policy workers expose `checkpoint_engine_rpc()` from `AbstractPolicyWorker`.
-The synchronizer invokes this RPC for each lifecycle step: creating the
-backend, preparing metadata, joining the backend topology, sending weights, and
-finalizing the backend. Each concrete policy worker supplies the iterator used
-by `send_weights_via_checkpoint_engine()`:
+Concrete policy workers opt into `PolicyCheckpointEngineMixin` beside their
+backend-specific send mixin. `AbstractPolicyWorker` does not expose
+checkpoint-engine methods, so value workers and other subclasses do not inherit
+unused RPCs. The synchronizer invokes `checkpoint_engine_rpc()` for each
+lifecycle step: creating the backend, preparing metadata, joining the backend
+topology, sending weights, and finalizing the backend. Each concrete policy
+worker supplies the iterator used by `send_weights_via_checkpoint_engine()`:
 
 - Megatron streams `_iter_params_with_optional_kv_scales()`.
 - DTensor/FSDP2 streams the same local DTensor conversion path used by IPC and
@@ -189,11 +191,14 @@ checkpoint backend must still drain the iterator on policy ranks without a
 rollout peer so those collectives are entered by every required rank.
 
 vLLM generation workers forward checkpoint-engine calls through
-`collective_rpc()` into vLLM internal workers. The internal worker extension
-creates the backend, prepares rollout metadata, receives weight batches, and
-loads each batch. Its explicit full-weight path delegates complete HF tensors
-to `model.load_weights()` and is selected when `shard_expert_weights` is false.
-With sharded-expert refit, it instead loads supported local expert shards through
+`collective_rpc()` into vLLM internal workers. A normal vLLM worker uses
+`VllmInternalWorkerExtension`, which contains the generic full and FP8 loaders
+but no checkpoint-engine lifecycle methods. Enabling checkpoint-engine refit
+selects `VllmInternalWorkerExtensionWithCheckpointEngine`, which adds backend
+creation, metadata preparation, receiving, and sharded-expert dispatch. Its
+explicit full-weight path delegates complete HF tensors to
+`model.load_weights()` when `shard_expert_weights` is false. With
+sharded-expert refit, it instead loads supported local expert shards through
 validated destination-local views of canonical vLLM expert parameters. Dense
 or otherwise unhandled tensors use the full-weight path. Before advertising a
 sharded layout, the worker checks the physical expert storage shape and
@@ -274,14 +279,15 @@ selects `backend: nixl`:
 - vLLM internal worker construction, via vLLM's `worker_cls` hook
 
 NeMo RL passes the checkpoint-engine settings through
-`VllmConfig.additional_config`. `NemoRLVllmWorker` creates and retains the
+`VllmConfig.additional_config`. `NixlVllmWorker` creates and retains the
 preinit agent before calling vLLM's worker constructor. The preinit path uses
 the configured `backend_name` and `backend_init_params`; logs usually show
 NIXL agents named `preinit-...` during worker setup.
 
-`worker_extension_cls` remains the RPC extension point. It cannot intercept
-construction in vLLM 0.20 because vLLM appends it after `WorkerBase`, whose
-constructor does not continue the `super()` chain.
+`worker_cls` remains the early-construction hook for NIXL preinitialization.
+`worker_extension_cls` is selected separately: the base extension is used
+without checkpoint-engine refit, and the checkpoint-engine subclass is used
+when the feature is enabled.
 
 ## How NIXL Supports Fault Tolerance
 
@@ -296,10 +302,10 @@ In NeMo RL, NIXL supports fault tolerance in three concrete ways:
 - **Failed refits are propagated.** The NIXL backend raises when a read cannot
   start or when `check_xfer_state()` reports `ERR`; vLLM reports the failed
   weight update, and `CheckpointEngineWeightSynchronizer` raises for the refit.
-- **A restarted synchronizer can use fresh peers.** `shutdown()` releases the
-  current backend state. Recreating the synchronizer or calling
-  `init_communicator()` after shutdown exchanges new `prepare()` metadata and
-  installs a new policy-to-rollout mapping.
+- **A restarted synchronizer can use fresh peers.** `shutdown()` disconnects
+  the current peers. With `release_after_refit: true`, it also deregisters and
+  frees transfer buffers. The next `init_communicator()` registers new buffers,
+  exchanges `prepare()` metadata, and installs a new policy-to-rollout mapping.
 
 So the recovery model is fail the current refit, change the rollout actor set
 outside NIXL, rebuild the checkpoint-engine communicator, then run a full refit

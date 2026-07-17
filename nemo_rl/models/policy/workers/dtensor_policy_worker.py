@@ -89,6 +89,7 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
@@ -183,6 +184,7 @@ def get_cpu_state_dict(
 class DTensorPolicyWorkerImpl(
     TQWorkerMixin,
     DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
 ):

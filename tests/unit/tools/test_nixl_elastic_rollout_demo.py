@@ -49,7 +49,7 @@ def test_build_engine_kwargs_uses_current_checkpoint_engine_schema():
         "device": "cuda",
         "backend_name": "UCX",
         "backend_init_params": {"ucx_error_handling_mode": "peer"},
-        "cleanup_after_load": False,
+        "release_after_refit": True,
     }
 
 

@@ -197,26 +197,29 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         bucket_size: int,
         device: str | torch.device = "cuda",
         backend_name: str = NIXL_DEFAULT_BACKEND_NAME,
-        cleanup_after_load: bool = True,
         backend_init_params: dict[str, Any] | None = None,
         shard_expert_weights: bool = False,
+        release_after_refit: bool = False,
     ) -> None:
         if bucket_size < 1:
             raise ValueError("NIXL checkpoint-engine bucket_size must be >= 1 byte.")
         self.bucket_size = bucket_size
-        self.cleanup_after_load = cleanup_after_load
         self.shard_expert_weights = shard_expert_weights
+        self.release_after_refit = release_after_refit
         self._target_weight_layout: dict[str, Any] | None = None
         self.agent = NixlAgent(backend_name, backend_init_params)
         self.prev_agent: str | None = None
         self.next_agent: str | None = None
         self.buffers: list[torch.Tensor] = []
+        self.registration_descs: list[Any] = []
         self.xfer_descs: list[Any] = []
         transfer_device = torch.device(device)
         if transfer_device.type == "cuda" and transfer_device.index is None:
             transfer_device = torch.device("cuda", torch.cuda.current_device())
         self._transfer_device = transfer_device  # pyrefly: ignore[read-only]
         self._cupy_buffers: list[Any] = []
+        self._cupy_memory_pool: Any | None = None
+        self._uses_torch_cuda_buffers = False
 
     def _allocate_transfer_buffer(self) -> torch.Tensor:
         device = self._transfer_device
@@ -232,8 +235,14 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         try:
             cupy = importlib.import_module("cupy")
         except ImportError:
+            self._uses_torch_cuda_buffers = True
             return torch.zeros(self.bucket_size, dtype=torch.uint8, device=device)
-        with cupy.cuda.Device(device.index):
+        if self._cupy_memory_pool is None:
+            self._cupy_memory_pool = cupy.cuda.MemoryPool()
+        with (
+            cupy.cuda.Device(device.index),
+            cupy.cuda.using_allocator(self._cupy_memory_pool.malloc),
+        ):
             cupy_buffer = cupy.zeros(self.bucket_size, dtype=cupy.uint8)
         self._cupy_buffers.append(cupy_buffer)
         return torch.as_tensor(cupy_buffer, dtype=torch.uint8, device=device)
@@ -242,7 +251,7 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         if not self.buffers:
             self.buffers = [self._allocate_transfer_buffer() for _ in range(2)]
             for buffer in self.buffers:
-                self.agent.agent.register_memory(buffer)
+                self.registration_descs.append(self.agent.agent.register_memory(buffer))
                 self.xfer_descs.append(self.agent.agent.get_xfer_descs(buffer))
         return self.agent.get_agent_metadata()
 
@@ -298,8 +307,26 @@ class NIXLCheckpointEngine(CheckpointEngine):  # pragma: no cover
         self.next_agent = None
         self._target_weight_layout = None
 
+    def _release_transfer_buffers(self) -> None:
+        _sync_device(self._transfer_device)
+        for registration_desc in self.registration_descs:
+            self.agent.agent.deregister_memory(registration_desc)
+        self.registration_descs.clear()
+        self.xfer_descs.clear()
+        self.buffers.clear()
+        self._cupy_buffers.clear()
+
+        if self._cupy_memory_pool is not None:
+            self._cupy_memory_pool.free_all_blocks()
+            self._cupy_memory_pool = None
+        elif self._uses_torch_cuda_buffers:
+            torch.cuda.empty_cache()
+        self._uses_torch_cuda_buffers = False
+
     def finalize(self) -> None:
         self._disconnect_peers()
+        if self.release_after_refit:
+            self._release_transfer_buffers()
 
     @torch.no_grad()
     async def send_weights(

@@ -26,6 +26,9 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    enabled_checkpoint_engine_config,
+)
 
 _EXTRA_ENV_VARS = (
     "VLLM_QUANT_CFG",
@@ -45,8 +48,11 @@ def _configure_quant_engine_kwargs(
     cfg: VllmConfig,
     llm_kwargs: dict[str, Any],
 ) -> None:
+    extension_name = "VllmQuantInternalWorkerExtension"
+    if enabled_checkpoint_engine_config(cfg) is not None:
+        extension_name += "WithCheckpointEngine"
     llm_kwargs["worker_extension_cls"] = (
-        "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend." + extension_name
     )
     real_quant = bool(cfg.get("real_quant"))
     if real_quant:

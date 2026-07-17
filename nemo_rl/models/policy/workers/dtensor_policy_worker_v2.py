@@ -74,6 +74,7 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import (
@@ -204,6 +205,7 @@ def get_train_context(
 class DTensorPolicyWorkerV2Impl(
     TQWorkerMixin,
     DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
 ):

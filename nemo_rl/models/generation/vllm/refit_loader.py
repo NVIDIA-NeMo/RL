@@ -23,10 +23,8 @@ from nemo_rl.models.generation.vllm.refit_layout import (
 )
 
 
-class VllmRefitLoaderMixin:
-    """Load full or destination-local HF weights into vLLM storage."""
-
-    _nrl_named_parameters: dict[str, torch.nn.Parameter]
+class VllmShardedExpertRefitMixin:
+    """Load destination-local expert shards into vLLM storage."""
 
     def _is_sharded_refit_weight(self, name: str, tensor: torch.Tensor) -> bool:
         param_names = self._sharded_refit_param_names(name)
@@ -42,13 +40,6 @@ class VllmRefitLoaderMixin:
     def _sharded_refit_param_names(self, name: str) -> list[str]:
         expert_weight = parse_hf_expert_weight(name)
         return [] if expert_weight is None else [expert_weight.parameter_name]
-
-    def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
-        params = getattr(self, "_nrl_named_parameters", None)
-        if params is None:
-            params = dict(self.model_runner.model.named_parameters())
-            self._nrl_named_parameters = params
-        return params
 
     def _checkpoint_engine_weight_layout(self) -> VllmWeightLayout:
         from vllm.model_executor.models.utils import get_pp_missing_layer_names
@@ -256,29 +247,6 @@ class VllmRefitLoaderMixin:
             )
 
         return remaining_weights
-
-    def _use_sharded_expert_refit(self) -> bool:
-        checkpoint_engine = getattr(self, "checkpoint_engine", None)
-        return bool(getattr(checkpoint_engine, "shard_expert_weights", False))
-
-    def _load_full_hf_weights(
-        self, policy_weights: list[tuple[str, torch.Tensor]]
-    ) -> None:
-        """Reference path for complete HF weights and the sharded fallback."""
-        self.model_runner.model.load_weights(weights=policy_weights)
-
-    def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
-        if self._use_sharded_expert_refit():
-            self._load_sharded_expert_weights(policy_weights)
-            return
-
-        from nemo_rl.models.generation.vllm.quantization import fp8
-
-        if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
-            return
-
-        self._load_full_hf_weights(policy_weights)
 
     def _load_sharded_expert_weights(
         self, policy_weights: list[tuple[str, torch.Tensor]]

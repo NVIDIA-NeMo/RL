@@ -94,6 +94,7 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.checkpoint_engine import (
     MegatronCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
@@ -151,6 +152,7 @@ class MegatronPolicyWorkerImpl(
     MegatronGenerationRefitMixin,
     TQWorkerMixin,
     MegatronCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
 ):

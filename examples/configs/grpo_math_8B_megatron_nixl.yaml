@@ -18,7 +18,8 @@ policy:
       engine_kwargs:
         nixl:
           device: cuda
-          cleanup_after_load: false
+          # Free registered transfer buffers between refits. Keep false for throughput.
+          release_after_refit: false
           shard_expert_weights: false
           backend_name: UCX
           backend_init_params: null
