@@ -114,14 +114,16 @@ def _per_adapter_clip_grad_norm(
         norm_i = float(total_norm.item())
         all_norms.append(norm_i)
 
-        # Use PyTorch's own coefficient/clamp implementation so epsilon,
-        # device sync, and saturation match the true-single stock path.
-        torch.nn.utils.clip_grads_with_norm_(
-            grads,
-            max_norm=max_norm_val,
-            total_norm=total_norm,
-            foreach=True,
-        )
+        # In-place scale.  torch.nn.utils.clip_grads_with_norm_ expects
+        # parameter objects (it reads ``p.grad``), so we cannot pass raw
+        # gradient slices.  Replicate its coefficient math exactly instead.
+        clip_coef = max_norm_val / (total_norm + 1e-6)
+        clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+        for g in grads:
+            if isinstance(g, DTensor):
+                g.to_local().mul_(clip_coef_clamped)
+            else:
+                g.mul_(clip_coef_clamped)
 
     return max(all_norms) if all_norms else 0.0
 from transformers import (
