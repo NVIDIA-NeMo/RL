@@ -68,30 +68,45 @@ This recipe had never run end-to-end; the following are in the branch/config (ke
 > If you **rebase onto main**, verify #2924/#3178/#3182 land (or are already upstream) and re-check
 > `cluster.segment_size` and the NCCL env survive. mcore submodule is already at main's latest (554c7b9).
 
-## Known open issue (as of this writing)
-Intermittent **training-step NCCL collective stall** (distributed-optimizer `_REDUCE_SCATTER_BASE`/
-`_ALLGATHER_BASE`) → 600s watchdog → actor dies. It moves *later* with each fix (step 0 → 1 → 2),
-i.e. it's **intermittent**, not a deterministic deadlock. Root cause is topology/rank placement
-(addressed by segment=8 + #3178 + #2924 + NCCL GIN/NVLS). Two candidate residual mechanisms:
-cross-rack transport flakiness vs async-GRPO straggler. To diagnose, enable the flight recorder and
-force a fast abort so it dumps before walltime:
+## Training-step stall — ROOT CAUSE (resolved) + results
+The training-step NCCL stall is a **context-parallel `all_to_all` desync** (`OpType=ALLTOALL_BASE`,
+`NumelIn=8388608 = 65536×128` on `CONTEXT_PARALLEL_GROUP` — the CP attention all-to-all, NOT MoE/optim,
+per the flight-recorder dump; analyzer: `tools/analyze_fr.py`). It is tied to
+**sequence packing at 65536**: non-uniform packs across CP ranks → the CP all-to-all falls out of
+lockstep → 600s watchdog → deadlock. **Running at 190k (`max_total_sequence_length: 196608`) makes
+packs ~uniform → CP stays in lockstep → trains cleanly.** (What is proven; the exact why — pack
+non-uniformity — is the best-supported hypothesis.)
 
-```bash
-# already wired in ray.sub BAKED_ENV: TORCH_NCCL_TRACE_BUFFER_SIZE, TORCH_NCCL_DUMP_ON_TIMEOUT=1,
-# TORCH_NCCL_DEBUG_INFO_TEMP_FILE=<...>/results/nan-debug/fr_e2e/fr_
-# NOTE: keep NCCL_DEBUG=WARN (INFO floods 155MB/876k lines at 48 nodes and throttles the run).
-```
+| Run | seq | GBS | CP/nodes | Status | Mechanism |
+|---|---|---|---|---|---|
+| 5331363 / 5355697 | 65k | 128 | CP16/48 | ❌ STALL | non-uniform packs → CP all_to_all desync |
+| **5372801** | 190k | 4 | CP16/48 | ✅ trained→step2 | uniform packs → CP in lockstep |
+| **5388072** | 190k | 32 | CP16/48 | ✅ trained→step3 | uniform packs → CP in lockstep |
+| 5431701 / 5435756 | 190k | 128 | CP32/80 | ❌ CRASH (rollout) | vLLM generation bugs (see below) |
+
+**Working config = 5388072:** `swe_teacher_cp16.yaml` at 190k, GBS 32 (8×4), CP16, 48 nodes.
+80-node `swe_teacher_cp32.yaml` (CP32) is untested past rollout — see the generation caveat.
+
+## Generation-side (vLLM) — GBS-128 concurrency bugs
+GBS 128 (16 gen/prompt) saturates `concurrency: 64` (~64 in-flight vs GBS-32's ~32) and exposes two
+07-13-vLLM bugs that GBS 4/32 never hit:
+- **context overflow** — a trajectory exceeding `max_model_len` raised a fatal `ValueError` in the HTTP
+  chat path. **Fixed:** `vllm_worker_async.py` broadened `except (ValueError, VLLMValidationError)` →
+  returns HTTP 400 (Gym handles gracefully) instead of killing the EngineCore.
+- **deque race** (unfixed vLLM lib bug) — `output_processor.put()` → `asyncio.Event.set()` iterates the
+  `_waiters` deque, mutated mid-iteration under high concurrency → `RuntimeError: deque mutated during
+  iteration` → EngineDeadError storm.
+Mitigation for GBS-128: `concurrency: 32`, or a newer vLLM. For a clean run, use **GBS 32**.
 
 ## Monitor / success
 ```bash
 JOB=<jobid>; LD=results/ultra-swe-teacher-cp16/ray_logs/$JOB-logs
-squeue -j $JOB -o "%T %M"
-grep -aoE "step=[0-9]+|Watchdog caught|Duplicate GPU detected|Collecting rollouts" "$LD/ray-driver.log" | sort | uniq -c
+grep -aoE "training_step=[0-9]+|Watchdog caught|EngineDeadError|Out of range float" "$LD/ray-driver.log" | sort | uniq -c
 ```
-- Healthy: `number of parameters on` (load, no OOM) → `Collecting rollouts` → `step=0` → `step=1` → …
-- **Success = it advances past step 2/3 with zero `Watchdog caught` and zero `Duplicate GPU detected`.**
-- Failure signatures: `OutOfMemoryError` (memory), `Out of range float values` (NaN — should be gone),
-  `Too many open files` (ulimit), `Watchdog caught` (the open collective-stall issue).
+- Healthy: `number of parameters on` (no OOM) → `Collecting rollouts` → `training_step=0` → `1` → …
+- **Success = advances past step 1 with zero `Watchdog caught` and zero `EngineDeadError`.**
+- Failure: `Watchdog caught` (CP stall — use 190k), `EngineDeadError` (GBS-128 gen bugs — use GBS 32),
+  `OutOfMemoryError`, `Out of range float` (NaN — gone via `moe_backend: triton`).
 
 ## Security note
 `HF_TOKEN` must be sourced on the login node and redacted from all output (`grep -v HF_TOKEN`); do not

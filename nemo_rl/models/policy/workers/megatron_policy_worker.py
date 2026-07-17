@@ -560,6 +560,23 @@ class MegatronPolicyWorkerImpl(
             "Megatron does not run cross-tokenizer distillation."
         )
         self.timer.start("train")
+        # Opt-in diagnostic (NRL_TRAIN_PG_TIMEOUT_S): shorten the distributed PG timeout for the
+        # TRAINING phase so a stalled collective trips the NCCL watchdog fast and DUMPS the flight
+        # recorder with walltime to spare (vs the 10-min mcore default that fires too late). Applied
+        # on the 2nd real train step so step-0 kernel warmup keeps the safe long timeout. Unset =>
+        # leave default. See SWE_TEACHER_CP16_REPRO.md.
+        if not eval_mode:
+            self._train_step_count = getattr(self, "_train_step_count", 0) + 1
+            _pg_to = os.environ.get("NRL_TRAIN_PG_TIMEOUT_S")
+            if _pg_to and self._train_step_count == 2:
+                from datetime import timedelta
+
+                parallel_state.update_pg_timeout(timedelta(seconds=int(_pg_to)))
+                print(
+                    f"[NRL] training-phase NCCL PG timeout -> {_pg_to}s "
+                    "(fast watchdog + flight-recorder dump on stall)",
+                    flush=True,
+                )
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):

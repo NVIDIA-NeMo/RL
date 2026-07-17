@@ -16,8 +16,8 @@ WRITE_ROOT="${WRITE_ROOT:-/lustre/fsw/portfolios/llmservice/users/${USER:-$(whoa
 source /lustre/fs1/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/zhiyul/secrets.sh > >(grep -v HF_TOKEN) 2>&1 || true
 export HF_HOME="$WRITE_ROOT/hf_cache"   # WRITE: HF cache (model itself is local at MODEL_PATH)
 
-export EXP_NAME="ultra-swe-teacher-cp16"   # was ...-nancap (leftover from the NaN investigation, now fixed via moe_backend: triton)
-export CONFIG_PATH="examples/configs/ultra/swe_teacher_cp16.yaml"
+export EXP_NAME="ultra-swe-teacher-cp32"
+export CONFIG_PATH="examples/configs/ultra/swe_teacher_cp32.yaml"
 export MODEL_PATH="$Z/hf_home/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
 export TRAIN_PATH="$Z/RL/ultra_data/swe.train.jsonl"
 export VAL_PATH="$Z/RL/ultra_data/swe.val.jsonl"
@@ -27,12 +27,12 @@ export SIF_DIR="$Z/swe_sifs"
 export PERSISTENT_CACHE="$WRITE_ROOT/persistent_cache"   # WRITE: compile/uv caches
 export SLURM_PARTITION="batch"
 export SLURM_ACCOUNT="nemotron_sw_post"
-export SLURM_QOS="short"    # QOS 'short' = priority 200 (2x 'normal'=100), NO reservation needed.
-                            # Limits: MaxWall=2:00:00, MaxNodes=64 -> our 1:59h/48N job fits. This
-                            # jumped the job from mid-pack (Reason=Priority) to rank #1 (Reason=Resources).
-export WALLTIME="1:59:00"   # <2h to stay strictly under 'short' MaxWall=2:00:00. Ample to load 550B
-                            # + refit + reach rollouts and observe zero-500s (engine init ~20min).
-export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-32}"   # cp16: 32 train
+export SLURM_QOS="normal"   # 80 nodes EXCEEDS short QOS cap (node=64) -> must use 'normal' (cap 1280, no MaxWall).
+                            # Loses the short-QOS priority boost; may queue longer.
+export WALLTIME="1:59:00"   # kept ~2h per request. NOTE: GBS128 rollout is slow -> may only reach load+rollout
+                            # (not a training step) in 2h. normal QOS has no MaxWall, so bump to 3-4h to actually
+                            # reach the training step + measure step time / test the CP32 desync.
+export NUM_TRAIN_NODES="${NUM_TRAIN_NODES:-64}"   # cp32: 64 train (256 GPU = TP8 x CP32)
 export NUM_GEN_NODES="${NUM_GEN_NODES:-16}"       # 16 gen = 48 nodes
 # Topology-aware placement (NVIDIA-NeMo/RL PR #2986 / issue #2937): keep each EP group (EP32 = 8
 # nodes) within one NVLink rack so the MoE all-to-all avoids cross-rack NCCL transport (which

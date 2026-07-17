@@ -70,10 +70,9 @@ checkpointing:
 grpo:
   # DIAGNOSTIC (CP-desync CONFIRMATION): hold 190k seq, raise batch GBS4->32 (8 prompts x 4 gen) so
   # multiple variable-length sequences pack per bin again -> expect uneven CP all_to_all count -> stall
-  # returns (proves multi-seq packing is the lever, not the long seq). 32 < concurrency 64 => rollout
-  # stays parallel/fast.
+  # 80-node CP32 run: original SWE batch (GBS 128 = 8 prompts x 16 gen).
   num_prompts_per_step: 8
-  num_generations_per_prompt: 4
+  num_generations_per_prompt: 16
   num_val_generations_per_prompt: 2
   max_rollout_turns: 1
   max_num_epochs: 4
@@ -162,12 +161,12 @@ policy:
     chat_template_kwargs: null
   hf_config_overrides: {}
 
-  train_global_batch_size: 32
+  train_global_batch_size: 128   # 8 prompts x 16 gen (original SWE batch)
   train_micro_batch_size: 1
   generation_batch_size: 64
   logprob_batch_size: 1
-  max_total_sequence_length: 196608   # DIAGNOSTIC: 190k (was 65536). Long seq + tiny batch -> ~1 seq/pack
-                                       # -> uniform CP all_to_all count. 196608/256=768 (div OK); /16 CP=12288/rank.
+  max_total_sequence_length: 196608   # 190k. Validated to avoid the 65k CP all_to_all stall (cp16 run 5372801/5388072).
+                                       # 196608/512=384 (div OK for CP32); /32 CP = 6144 tok/rank.
   precision: "bfloat16"
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: false
@@ -200,7 +199,7 @@ policy:
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 16   # was 32; 64K ctx (was 192K) frees activation mem -> half the train nodes (64->32)
+    context_parallel_size: 32   # 80-node CP32: 190k/32 = 6144 tok/rank (half of cp16's 12288) -> faster steps, less mem
     pipeline_dtype: ${policy.precision}
     sequence_parallel: true
 
@@ -325,9 +324,9 @@ policy:
 
   # Must be a multiple of the model's minimum_pad_factor (256 for this nemotron_h hybrid +
   # hybridep MoE dispatcher). TP=8 (the old value) is NOT a multiple of 256 -> vLLM EngineCore
-  # AssertionError at generation -> EngineDeadError storm (job 4753175 died at step 0). 256 is a
-  # multiple of 256, TP=8, and 2*CP=32; 65536 is divisible by 256 -> clean for train + generation.
-  make_sequence_length_divisible_by: 256
+  # CP32: must be a multiple of 2*CP*TP = 2*32*8 = 512 (and vLLM's 256 pad factor). 196608/512=384 OK.
+  # (cp16 used 256 = 2*16*8; CP32 needs 512.)
+  make_sequence_length_divisible_by: 512
   max_grad_norm: 1.0
   optimizer: null
   scheduler: null

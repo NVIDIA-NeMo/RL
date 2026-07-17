@@ -581,6 +581,22 @@ fi
 log_phase() { local t0="\${NRL_JOB_START_EPOCH:-0}"; echo "[NRL_PHASE][\$(date '+%Y-%m-%dT%H:%M:%S%z')][+\$(( \$(date +%s) - \${t0%.*} ))s] \$*"; }
 log_phase "head container started on \$(hostname)"
 
+# --- HSG/GB200 NCCL transport tuning (a55b set_env.sh) + hybridep cache + fd cap. Forward-ported
+# from the pre-rebase ray.sub (main removed the BAKED_ENV heredoc these lived in). Stabilizes the
+# cross-rack NCCL collectives on GB200; NVLS is the in-network path. Ignored on NCCL builds w/o GIN. ---
+export NCCL_DEBUG=\${NCCL_DEBUG:-WARN}
+export NCCL_NET=\${NCCL_NET:-IB}
+export NCCL_NVLS_ENABLE=\${NCCL_NVLS_ENABLE:-1}
+export NCCL_GIN_ENABLE=\${NCCL_GIN_ENABLE:-1}
+export NCCL_GIN_TYPE=\${NCCL_GIN_TYPE:-2}
+export NCCL_GIN_GDAKI_NIC_HANDLER=\${NCCL_GIN_GDAKI_NIC_HANDLER:-0}
+export NCCL_SYM_GIN_KERNELS_ENABLE=\${NCCL_SYM_GIN_KERNELS_ENABLE:-1}
+export NCCL_SYM_CE_THRESHOLD=\${NCCL_SYM_CE_THRESHOLD:-1099511627776}
+export HYBRID_EP_CACHE_DIR=\${HYBRID_EP_CACHE_DIR:-/tmp/hybrid_ep_cache_\${SLURM_NODEID:-0}}
+ulimit -Sn "\$(ulimit -Hn)" 2>/dev/null || true
+${NRL_NCCL_FLIGHT_RECORDER:+export TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE:-30000}; export TORCH_NCCL_DUMP_ON_TIMEOUT=1;}
+${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=$TORCH_NCCL_DEBUG_INFO_TEMP_FILE}
+
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
     pkill -P $$ || true
@@ -782,6 +798,20 @@ if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
 echo "[INFO] Worker \$SLURM_PROCID on node \$SLURMD_NODENAME"
+
+# --- HSG/GB200 NCCL transport tuning (a55b set_env.sh) + hybridep cache + fd cap (see head_cmd). ---
+export NCCL_DEBUG=\${NCCL_DEBUG:-WARN}
+export NCCL_NET=\${NCCL_NET:-IB}
+export NCCL_NVLS_ENABLE=\${NCCL_NVLS_ENABLE:-1}
+export NCCL_GIN_ENABLE=\${NCCL_GIN_ENABLE:-1}
+export NCCL_GIN_TYPE=\${NCCL_GIN_TYPE:-2}
+export NCCL_GIN_GDAKI_NIC_HANDLER=\${NCCL_GIN_GDAKI_NIC_HANDLER:-0}
+export NCCL_SYM_GIN_KERNELS_ENABLE=\${NCCL_SYM_GIN_KERNELS_ENABLE:-1}
+export NCCL_SYM_CE_THRESHOLD=\${NCCL_SYM_CE_THRESHOLD:-1099511627776}
+export HYBRID_EP_CACHE_DIR=\${HYBRID_EP_CACHE_DIR:-/tmp/hybrid_ep_cache_\${SLURM_NODEID:-0}}
+ulimit -Sn "\$(ulimit -Hn)" 2>/dev/null || true
+${NRL_NCCL_FLIGHT_RECORDER:+export TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE:-30000}; export TORCH_NCCL_DUMP_ON_TIMEOUT=1;}
+${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=$TORCH_NCCL_DEBUG_INFO_TEMP_FILE}
 
 # Fail fast if LOG_DIR is not actually shared with the submit host -- the worker
 # gates on STARTED_RAY_HEAD and other signal files that would otherwise never appear.
