@@ -282,6 +282,55 @@ def _patch_vllm_hermes_tool_parser_thread_safety(logger) -> None:
     logger.info("Successfully patched hermes tool parser for thread-safety.")
 
 
+def _patch_vllm_streaming_session_max_tokens(logger) -> bool:
+    """Make per-chunk max_tokens effective for vLLM streaming input sessions.
+
+    vLLM 0.20 updates ``session.sampling_params`` when a resumable request gets
+    another input chunk, but ``Request.max_tokens`` remains fixed to the first
+    chunk. A one-token prefill phase therefore also limits the authoritative
+    final decode to one token. Keep the request's scheduler budget consistent
+    with the sampling parameters that vLLM already replaces.
+
+    Returns whether the installed source already contains or accepted the
+    guarded patch. A false result lets feature-specific callers fail closed
+    while unrelated vLLM generation remains usable on future versions.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/core/sched/scheduler.py")
+    except RuntimeError:
+        logger.warning("Could not locate vLLM scheduler for streaming-input patch.")
+        return False
+
+    old_snippet = (
+        "        session.arrival_time = update.arrival_time\n"
+        "        session.sampling_params = update.sampling_params\n"
+        "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n"
+    )
+    new_snippet = (
+        "        session.arrival_time = update.arrival_time\n"
+        "        session.sampling_params = update.sampling_params\n"
+        "        assert update.sampling_params.max_tokens is not None\n"
+        "        session.max_tokens = update.sampling_params.max_tokens\n"
+        "        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if new_snippet in content:
+            logger.info("vLLM streaming-session max_tokens patch already applied.")
+            return True
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply vLLM streaming-session max_tokens patch: "
+                "expected scheduler snippet not found in %s.",
+                file_to_patch,
+            )
+            return False
+        write_back(content.replace(old_snippet, new_snippet, 1))
+
+    logger.info("Successfully patched vLLM streaming-session max_tokens updates.")
+    return True
+
+
 def _apply_vllm_patches(
     py_executable: str, *, extra_env_vars: list[str] | None = None
 ) -> None:
@@ -295,3 +344,4 @@ def _apply_vllm_patches(
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)
+    _patch_vllm_streaming_session_max_tokens(patch_logger)
