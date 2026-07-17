@@ -60,6 +60,17 @@ def _nllloss_diag_metrics(
     try:
         step = _diag.next_step("NLLLoss")
         rank = int(_os.environ.get("RANK", "0"))
+        trace_only = _os.environ.get("NOUSNET_DIAG_TRACE_ONLY", "0") == "1"
+        if trace_only:
+            _diag.append_loss_trace(
+                step=step,
+                rank=rank,
+                who=who,
+                input_ids=input_ids,
+                token_logprobs=token_logprobs,
+                loss_mask=loss_mask,
+            )
+            return {}
         gvt_val = (
             float(global_valid_toks.item())
             if hasattr(global_valid_toks, "item")
