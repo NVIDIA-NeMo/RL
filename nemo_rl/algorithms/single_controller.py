@@ -50,13 +50,15 @@ from typing import Any, Literal, Optional
 import ray
 import torch
 from pydantic import BaseModel, Field
-from tensordict import TensorDict
 
+from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.algorithms.grpo import GRPOLoggerConfig
-from nemo_rl.algorithms.staleness_sampler import (
-    StalenessSampler,
-    count_groups,
-    min_weight_version,
+from nemo_rl.algorithms.single_controller_utils.utils import (
+    aggregate_step_metrics,
+    fields_for_put,
+    reduce_advantage_pump_metrics,
+    squeeze_trailing_unit_dim,
+    tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
@@ -245,6 +247,7 @@ class SingleControllerActor:
         advantage_estimator: Any | None = None,
         rollout_manager: Any = None,
         dataloader: Any = None,
+        tq_buffer: Any = None,
     ) -> None:
         self._cfg = cfg
         self._prompts = prompts
@@ -256,6 +259,7 @@ class SingleControllerActor:
         self._advantage_estimator = advantage_estimator
         self._rollout_manager = rollout_manager
         self._dataloader = dataloader
+        self._buffer = tq_buffer
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -328,7 +332,13 @@ class SingleControllerActor:
         # trainer_version) between weight syncs; warn if the staleness window
         # cannot keep same-step groups selectable across those bumps.
         warn_if_staleness_window_below_minibatches(cfg)
-        self._sampler = StalenessSampler(cfg.max_weight_staleness_versions)
+
+        self._sampler = StalenessSampler(
+            self._buffer,
+            max_staleness_versions=cfg.max_weight_staleness_versions,
+            require_order=not cfg.over_sampling,
+            force_in_order=cfg.force_in_order,
+        )
 
         # ── asyncio state ──────────────────────────────────────────────────
         # Gate: cleared during _sync_weights, set when generation may proceed
@@ -354,6 +364,12 @@ class SingleControllerActor:
 
         self._trainer_version: int = 0
         self._train_steps: int = 0
+        self._step_log_dict: dict[str, list] = {
+            "rewards": [],
+            "masked_advantages": [],
+            "sequence_lengths": [],
+        }
+
         # Completed prompt-list passes; only advances when
         # cfg.max_num_epochs is set (see _rollout_pump).
         self._current_epoch: int = 0
@@ -786,11 +802,11 @@ class SingleControllerActor:
             select_fields=self._advantage_input_fields(),
         )
 
-        prompt_ids = _tensor_field(data, PROMPT_IDS_FIELD)
-        rewards = _squeeze_trailing_unit_dim(_tensor_field(data, REWARD_FIELD)).float()
-        token_mask = _tensor_field(data, TOKEN_MASK_FIELD).float()
-        sample_mask = _squeeze_trailing_unit_dim(
-            _tensor_field(data, SAMPLE_MASK_FIELD)
+        prompt_ids = tensor_field(data, PROMPT_IDS_FIELD)
+        rewards = squeeze_trailing_unit_dim(tensor_field(data, REWARD_FIELD)).float()
+        token_mask = tensor_field(data, TOKEN_MASK_FIELD).float()
+        sample_mask = squeeze_trailing_unit_dim(
+            tensor_field(data, SAMPLE_MASK_FIELD)
         ).float()
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -798,18 +814,18 @@ class SingleControllerActor:
             "total_reward": rewards,
         }
         for field_name in self._cfg.advantage_repeated_batch_fields:
-            repeated_batch[field_name] = _squeeze_trailing_unit_dim(
-                _tensor_field(data, field_name)
+            repeated_batch[field_name] = squeeze_trailing_unit_dim(
+                tensor_field(data, field_name)
             )
 
         kwargs: dict[str, torch.Tensor] = {}
         if self._cfg.advantage_policy_logprobs_field is not None:
-            kwargs["logprobs_policy"] = _tensor_field(
+            kwargs["logprobs_policy"] = tensor_field(
                 data,
                 self._cfg.advantage_policy_logprobs_field,
             )
         if self._cfg.advantage_reference_logprobs_field is not None:
-            kwargs["logprobs_reference"] = _tensor_field(
+            kwargs["logprobs_reference"] = tensor_field(
                 data,
                 self._cfg.advantage_reference_logprobs_field,
             )
@@ -826,7 +842,7 @@ class SingleControllerActor:
             "put_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            fields=_fields_for_put(
+            fields=fields_for_put(
                 meta,
                 {ADVANTAGE_OUTPUT_FIELD: advantages},
             ),
@@ -848,45 +864,3 @@ class SingleControllerActor:
         if self._cfg.advantage_reference_logprobs_field is not None:
             fields.append(self._cfg.advantage_reference_logprobs_field)
         return list(dict.fromkeys(fields))
-
-
-def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
-    value = data[field_name]
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(
-            f"advantage stage expected tensor field {field_name!r}; got {type(value)}"
-        )
-    if value.is_nested:
-        return torch.nested.to_padded_tensor(value, padding=0)
-    return value
-
-
-def _squeeze_trailing_unit_dim(value: torch.Tensor) -> torch.Tensor:
-    if value.dim() >= 2 and value.shape[-1] == 1:
-        return value.squeeze(-1)
-    return value
-
-
-def _fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> TensorDict:
-    packed: dict[str, torch.Tensor] = {}
-    if meta.sequence_lengths is None:
-        for field_name, value in fields.items():
-            packed[field_name] = value.detach().contiguous()
-        # pyrefly: ignore[bad-argument-type]
-        return TensorDict(packed, batch_size=[meta.size])
-
-    lengths = torch.tensor(meta.sequence_lengths, dtype=torch.long)
-    for field_name, value in fields.items():
-        if value.dim() >= 2 and value.shape[1] == int(lengths.max().item()):
-            rows = [
-                value[i, : int(lengths[i].item())].detach().contiguous()
-                for i in range(meta.size)
-            ]
-            packed[field_name] = torch.nested.as_nested_tensor(
-                rows,
-                layout=torch.jagged,
-            )
-        else:
-            packed[field_name] = value.detach().contiguous()
-    # pyrefly: ignore[bad-argument-type]
-    return TensorDict(packed, batch_size=[meta.size])
