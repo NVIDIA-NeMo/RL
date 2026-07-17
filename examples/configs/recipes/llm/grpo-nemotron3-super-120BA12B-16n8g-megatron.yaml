@@ -35,6 +35,14 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 8
       gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8480
+      mamba_cache_mode: align
+      speculative_config:
+        num_speculative_tokens: 5
+        method: mtp
 logger:
   wandb_enabled: true
   tensorboard_enabled: true

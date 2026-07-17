@@ -121,12 +121,6 @@ tests/test_suites/llm/grpo-qwen3-1.7b-2n8g-megatron-super-rlhf.sh
 tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-megatron.sh
 tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8.sh
 
-# Nemotron 3 Super 120B-A12B MTP speculative-decoding inference (co-trained MTP
-# drafter refit from the policy weight stream): 16n8g colocated (IPC transport)
-# and 8n4g non-colocated (collective transport).
-tests/test_suites/llm/grpo-nemotron3-super-120BA12B-16n8g-megatron-mtp.sh
-tests/test_suites/llm/grpo-nemotron3-super-120BA12B-8n4g-megatron-mtp.sh
-
 # Lora
 tests/test_suites/llm/grpo-qwen3-8B-base-1n8g-fsdp2-lora.sh
 tests/test_suites/llm/grpo-qwen3-8b-base-1n8g-megatron-lora.sh
