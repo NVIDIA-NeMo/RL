@@ -58,6 +58,7 @@ from nemo_rl.algorithms.staleness_sampler import (
     incomplete_group_indices,
     min_weight_version,
 )
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import Timer
