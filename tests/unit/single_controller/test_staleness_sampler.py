@@ -32,6 +32,7 @@ class FakeBuffer:
         self.meta_list: list[KVBatchMeta | None] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
+        self.target_step_list: list[int | None] = []
         self.ready_list: list[bool] = []
         self.remove_calls: list[tuple[list[int], bool]] = []
 
@@ -42,6 +43,7 @@ class FakeBuffer:
         group_size: int = 1,
         ready: bool = True,
         end_weight: int | None = None,
+        target_step: int | None = None,
     ) -> KVBatchMeta:
         sample_ids = [f"{group_id}_g{i}" for i in range(group_size)]
         meta = KVBatchMeta(
@@ -53,6 +55,7 @@ class FakeBuffer:
         self.meta_list.append(meta if ready else None)
         self.start_weight_list.append(weight)
         self.end_weight_list.append(weight if end_weight is None else end_weight)
+        self.target_step_list.append(target_step)
         self.ready_list.append(ready)
         return meta
 
@@ -62,6 +65,7 @@ class FakeBuffer:
             del self.meta_list[i]
             del self.start_weight_list[i]
             del self.end_weight_list[i]
+            del self.target_step_list[i]
             del self.ready_list[i]
         return len(idxs)
 
@@ -464,3 +468,62 @@ class TestStalenessSamplerRequireOrder:
         assert selected.sample_ids == ["v5_a_g0", "v5_b_g0"]
         assert num_groups == 2
         assert buf.start_weight_list == [7]
+
+
+class TestStalenessSamplerForceInOrder:
+    def test_selects_only_groups_whose_target_step_matches_current(self):
+        buf = FakeBuffer()
+        # Two matching-target groups and one future-target group.
+        buf.add("g_match_a", weight=5, target_step=5)
+        buf.add("g_match_b", weight=5, target_step=5)
+        buf.add("g_future", weight=5, target_step=7)
+        sampler = StalenessSampler(buf, max_staleness_versions=0, force_in_order=True)
+
+        selected, num_groups = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=4
+            )
+        )
+
+        assert selected is not None
+        assert selected.sample_ids == ["g_match_a_g0", "g_match_b_g0"]
+        assert num_groups == 2
+        # The future-target group survives; only the two matches were removed.
+        assert buf.target_step_list == [7]
+        assert buf.start_weight_list == [5]
+
+    def test_ignores_stale_target_step(self):
+        buf = FakeBuffer()
+        # Trainer at 5; a slot with target_step=4 must NOT satisfy force_in_order.
+        buf.add("g_stale", weight=4, target_step=4)
+        sampler = StalenessSampler(
+            buf,
+            # Wide staleness window: force_in_order must ignore it entirely.
+            max_staleness_versions=10,
+            force_in_order=True,
+        )
+
+        result = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=4
+            )
+        )
+
+        assert result == (None, 0)
+        # Buffer untouched.
+        assert buf.target_step_list == [4]
+
+    def test_ignores_unready_group_with_matching_target(self):
+        buf = FakeBuffer()
+        buf.add("g_unready", weight=5, target_step=5, ready=False)
+        sampler = StalenessSampler(buf, max_staleness_versions=0, force_in_order=True)
+
+        result = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=4
+            )
+        )
+
+        assert result == (None, 0)
+        # Buffer untouched.
+        assert buf.ready_list == [False]
