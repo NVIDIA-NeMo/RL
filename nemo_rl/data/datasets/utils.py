@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import base64
+import functools
 import importlib
+import inspect
 import io
 import os
+import warnings
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Mapping, Optional, Union
 
 import numpy as np
 import torch
@@ -180,6 +183,72 @@ def resolve_external_dataset_class(dataset_name: str) -> type:
             "which is not a class. Expected a dataset class."
         )
     return dataset_class
+
+
+# Behavioral keys from ResponseDatasetConfig that change *which data* a run
+# sees. If one of these is set but the resolved dataset class does not accept
+# it, the user silently gets different data than they configured.
+_BEHAVIORAL_DATASET_CONFIG_KEYS = ("seed", "split", "split_validation_size", "subset")
+
+
+def warn_on_unsupported_dataset_config_keys(
+    dataset_class: Any, data_config: Mapping[str, Any]
+) -> None:
+    """Warn when behavioral dataset config keys would be silently ignored.
+
+    The dataset dispatchers instantiate with ``dataset_class(**data_config)``
+    and every built-in dataset accepts ``**kwargs``, so a config key the class
+    does not actually support is swallowed without any feedback — e.g.
+    ``subset`` on ``GSM8KDataset`` (which hardcodes the ``main`` config) or
+    ``split_validation_size`` on datasets that never call
+    ``split_train_validation``. For the keys in
+    ``_BEHAVIORAL_DATASET_CONFIG_KEYS``, warn when the resolved class does not
+    declare the parameter anywhere in its ``__init__`` MRO.
+
+    The check walks the MRO because some datasets consume keys via
+    ``**kwargs`` and forward them to a base-class ``__init__`` that declares
+    them (e.g. the intent datasets). ``functools.partial`` registry entries
+    (the AIME variants) are unwrapped first. ``None`` values are skipped
+    (``subset: null`` is the documented default), as is a falsy
+    ``split_validation_size`` (0 means "no validation split" everywhere).
+    """
+    while isinstance(dataset_class, functools.partial):
+        dataset_class = dataset_class.func
+    if not isinstance(dataset_class, type):
+        return
+
+    accepted: set[str] = set()
+    for klass in dataset_class.__mro__:
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            signature = inspect.signature(init)
+        except (TypeError, ValueError):
+            # Signature not introspectable (e.g. C extension): don't guess.
+            return
+        accepted.update(
+            param.name
+            for param in signature.parameters.values()
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        )
+
+    for key in _BEHAVIORAL_DATASET_CONFIG_KEYS:
+        if key not in data_config or key in accepted:
+            continue
+        value = data_config[key]
+        if value is None or (key == "split_validation_size" and not value):
+            continue
+        warnings.warn(
+            f"Dataset config key {key}={value!r} is not supported by "
+            f"{dataset_class.__name__} and will be ignored. Remove the key, or "
+            "use a dataset class that supports it.",
+            stacklevel=3,
+        )
 
 
 def update_single_dataset_config(data_config: dict, default_data_config: dict) -> None:
