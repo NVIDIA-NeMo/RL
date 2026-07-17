@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,6 +27,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -498,6 +500,289 @@ def test_enabled_prefetch_skips_complete_shard_fetch(monkeypatch) -> None:
     assert calls["assert_complete"] is True
     assert calls["closed"] is True
     assert result["train_microbatch_prefetch_metrics"] == {"ready_fraction": 1.0}
+
+
+def test_prefetch_plan_matches_legacy_complete_shard_fetch(
+    monkeypatch,
+    prefetch_module,
+    tq_client_backends,
+) -> None:
+    """Per-MB real TQ reads must equal slices of the legacy full-shard read."""
+    sample_ids = list("ABCDE")
+    partition_id = "train-prefetch-plan-legacy-eq"
+    payload = _payload(sample_ids)
+    payload["input_lengths"] = torch.tensor([3, 7, 4, 6, 2])
+    extra_info = {
+        MICRO_BATCH_INDICES: [[[0, 2], [2, 5]]],
+        MICRO_BATCH_LENGTHS: [[8, 8]],
+        GLOBAL_FORWARD_PAD_SEQLEN: 8,
+        GLOBAL_VALID_SEQS_PER_GB: [5.0],
+        GLOBAL_VALID_TOKS_PER_GB: [22.0],
+    }
+    pad_value_dict = {"input_ids": -1}
+
+    tq_client_backends.register_partition(
+        partition_id=partition_id,
+        fields=list(FIELDS),
+        num_samples=len(sample_ids),
+        consumer_tasks=["train"],
+    )
+    prefetcher = None
+    try:
+        meta = kv_first_write(
+            payload,
+            sample_ids=sample_ids,
+            dp_client=tq_client_backends,
+            partition_id=partition_id,
+            extra_info=extra_info,
+        )
+        full_wire = tq_client_backends.get_samples(
+            sample_ids=sample_ids,
+            partition_id=partition_id,
+            select_fields=list(FIELDS),
+        )
+        assert full_wire["input_ids"].is_nested
+        assert full_wire["routed_experts"].is_nested
+        full_shard = prefetch_module.materialize(
+            full_wire,
+            layout="padded",
+            pad_value_dict=pad_value_dict,
+            pad_to_seqlen=8,
+        )
+
+        group = prefetch_module.TrainMicrobatchPrefetchGroup(
+            replica_group=object(),
+            replica_ranks=(0,),
+            source_rank=0,
+            is_source=True,
+        )
+        monkeypatch.setattr(prefetch_module.torch.distributed, "get_rank", lambda: 0)
+        prefetcher = prefetch_module.TrainMicrobatchPrefetcher(
+            client=tq_client_backends,
+            meta=meta,
+            group=group,
+            pad_value_dict=pad_value_dict,
+            depth=1,
+            item_ready_timeout_s=30,
+        )
+
+        planned_microbatches = list(prefetcher.iter_global_batch(0))
+        assert len(planned_microbatches) == 2
+        for actual, (start, end) in zip(
+            planned_microbatches,
+            ((0, 2), (2, 5)),
+            strict=True,
+        ):
+            expected = full_shard.slice(start, end)
+            assert set(actual) == set(expected) == set(FIELDS)
+            for field in FIELDS:
+                assert actual[field].shape == expected[field].shape
+                assert actual[field].dtype == expected[field].dtype
+                assert torch.equal(actual[field], expected[field]), field
+        prefetcher.assert_complete()
+    finally:
+        try:
+            if prefetcher is not None:
+                prefetcher.close()
+        finally:
+            tq_client_backends.clear_samples(
+                sample_ids=None,
+                partition_id=partition_id,
+            )
+
+
+def _make_prefetch_train_worker(megatron_policy_worker):
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker._train_microbatch_prefetch_enabled = True
+    worker.timer = SimpleNamespace(start=lambda _: None)
+    worker.model = SimpleNamespace(
+        inference_params=None,
+        config=SimpleNamespace(mtp_num_layers=0),
+        modules=lambda: (),
+        eval=lambda: None,
+    )
+    worker.cfg = {
+        "megatron_cfg": {
+            "empty_unused_memory_level": 0,
+            "use_fused_linear_logprobs": False,
+        },
+        "sequence_packing": {"enabled": True},
+    }
+    worker.dp_size = 1
+    worker.fp8_cfg = None
+    worker.should_disable_forward_pre_hook = False
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.delegate_pack_to_model = False
+    worker.sampling_params = None
+    worker.draft_model = None
+    worker.defer_fp32_logits = False
+    worker._router_replay_enabled = False
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker._set_moe_grad_scale_func = lambda _: None
+    worker._set_mtp_grad_scale_func = lambda _: None
+    return worker
+
+
+def _patch_prefetch_train_cpu_prologue(monkeypatch, megatron_policy_worker) -> None:
+    original_tensor = torch.tensor
+
+    def tensor_without_cuda(*args, **kwargs):
+        kwargs = dict(kwargs)
+        if kwargs.get("device") == "cuda":
+            kwargs.pop("device")
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(megatron_policy_worker.torch, "tensor", tensor_without_cuda)
+    monkeypatch.setattr(
+        megatron_policy_worker.torch.distributed,
+        "all_reduce",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        megatron_policy_worker.torch.distributed,
+        "barrier",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        megatron_policy_worker.torch.cuda,
+        "synchronize",
+        lambda: None,
+    )
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(
+        megatron_policy_worker.parallel_state,
+        "get_data_parallel_group",
+        lambda: object(),
+    )
+
+
+def test_train_prefetch_plan_count_mismatch(monkeypatch) -> None:
+    from nemo_rl.models.megatron import train_microbatch_prefetch
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    worker = _make_prefetch_train_worker(megatron_policy_worker)
+    _patch_prefetch_train_cpu_prologue(monkeypatch, megatron_policy_worker)
+    plan = train_microbatch_prefetch.build_train_microbatch_plan(
+        _meta(
+            list("ABCD"),
+            indices=[[[0, 2], [2, 4]]],
+            lengths=[[8, 8]],
+        )
+    )
+    data = BatchedDataDict(
+        {train_microbatch_prefetch.TQ_SAMPLE_IDS_FIELD: list("ABCD")}
+    )
+    prefetcher = SimpleNamespace(plan=plan)
+
+    with pytest.raises(
+        RuntimeError,
+        match="plan has 1, training expects 2",
+    ):
+        worker.train(
+            data,
+            loss_fn=object(),
+            eval_mode=True,
+            gbs=2,
+            mbs=1,
+            microbatch_prefetcher=prefetcher,
+        )
+
+
+def test_train_prefetch_wires_plan_into_megatron_forward_backward(
+    monkeypatch,
+) -> None:
+    from nemo_rl.models.megatron import train_microbatch_prefetch
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    class StopAfterForwardBackward(Exception):
+        pass
+
+    worker = _make_prefetch_train_worker(megatron_policy_worker)
+    _patch_prefetch_train_cpu_prologue(monkeypatch, megatron_policy_worker)
+    plan = train_microbatch_prefetch.build_train_microbatch_plan(
+        _meta(
+            ["A", "B"],
+            indices=[[[0, 1], [1, 2]]],
+            lengths=[[8, 4]],
+            valid_seqs=[3.0],
+            valid_toks=[11.0],
+        )
+    )
+    raw_microbatches = [_payload(["A"]), _payload(["B"])]
+    calls: dict[str, Any] = {"iter_global_batch": []}
+
+    class FakePrefetcher:
+        def __init__(self) -> None:
+            self.plan = plan
+            self.raw_iterator = None
+
+        def iter_global_batch(self, global_batch_index):
+            calls["iter_global_batch"].append(global_batch_index)
+            self.raw_iterator = iter(raw_microbatches)
+            return self.raw_iterator
+
+    prefetcher = FakePrefetcher()
+    processed_iterator = object()
+
+    def fail_legacy_global_batch(*_args, **_kwargs):
+        raise AssertionError("prefetch train path must not process the skeleton batch")
+
+    def capture_microbatch_iterator(*_args, **kwargs):
+        calls["microbatch_iterator"] = kwargs
+        return processed_iterator, 2, 1, 8, 8
+
+    def capture_forward_backward(**kwargs):
+        calls["forward_backward"] = kwargs
+        raise StopAfterForwardBackward
+
+    monkeypatch.setattr(
+        megatron_policy_worker,
+        "process_global_batch",
+        fail_legacy_global_batch,
+    )
+    monkeypatch.setattr(
+        megatron_policy_worker,
+        "get_microbatch_iterator",
+        capture_microbatch_iterator,
+    )
+    monkeypatch.setattr(
+        megatron_policy_worker,
+        "LossPostProcessor",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        megatron_policy_worker,
+        "get_rerun_state_machine",
+        lambda: SimpleNamespace(should_run_forward_backward=lambda _: True),
+    )
+    monkeypatch.setattr(
+        megatron_policy_worker,
+        "megatron_forward_backward",
+        capture_forward_backward,
+    )
+    data = BatchedDataDict({train_microbatch_prefetch.TQ_SAMPLE_IDS_FIELD: ["A", "B"]})
+
+    with pytest.raises(StopAfterForwardBackward):
+        worker.train(
+            data,
+            loss_fn=object(),
+            eval_mode=True,
+            gbs=2,
+            mbs=1,
+            microbatch_prefetcher=prefetcher,
+        )
+
+    assert calls["iter_global_batch"] == [0]
+    iterator_kwargs = calls["microbatch_iterator"]
+    assert iterator_kwargs["prefetched_raw_iterator"] is prefetcher.raw_iterator
+    assert iterator_kwargs["prefetched_microbatch_lengths"] == (8, 4)
+    assert iterator_kwargs["prefetched_forward_pad_seqlen"] == 8
+    forward_kwargs = calls["forward_backward"]
+    assert forward_kwargs["data_iterator"] is processed_iterator
+    assert forward_kwargs["num_microbatches"] == 2
+    assert forward_kwargs["global_valid_seqs"].item() == 3.0
+    assert forward_kwargs["global_valid_toks"].item() == 11.0
 
 
 class _RecordingClient:
