@@ -230,6 +230,9 @@ else
 fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
+if [[ "${RAY_SUB_OVERLAP_EXISTING_STEP:-0}" == "1" ]]; then
+  COMMON_SRUN_ARGS+=" --overlap"
+fi
 COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"

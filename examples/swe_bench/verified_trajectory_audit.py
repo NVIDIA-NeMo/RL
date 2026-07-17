@@ -72,8 +72,20 @@ PERF_FIELDS = (
     "num_turns",
     "num_tool_calls",
     "streaming_tool_call_eligible_actions",
+    "streaming_tool_call_skipped_no_stable_output",
+    "streaming_tool_call_skipped_no_output",
+    "streaming_tool_call_skipped_single_snapshot",
+    "streaming_tool_call_skipped_below_min_chunk_chars",
+    "streaming_tool_call_skipped_completed_before_admission",
+    "streaming_tool_call_snapshot_polls",
+    "streaming_tool_call_snapshot_revisions",
+    "streaming_tool_call_nonempty_snapshots",
+    "streaming_tool_call_snapshots_at_or_above_min_chunk_chars",
+    "streaming_tool_call_snapshots_at_or_above_initial_chunk_chars",
+    "streaming_tool_call_snapshot_wait_cancellations",
     "streaming_tool_call_sessions_started",
     "streaming_tool_call_prefill_requests",
+    "streaming_tool_call_prefill_control_plane_requests",
     "streaming_tool_call_prefill_tokens",
     "streaming_tool_call_valid_prefill_actions",
     "streaming_tool_call_tokenizer_only_actions",
@@ -85,9 +97,85 @@ PERF_FIELDS = (
     "streaming_tool_call_prompt_reuse_token_equivalent_matches",
     "streaming_tool_call_prompt_reuse_mismatches",
     "streaming_tool_call_prompt_reuse_missing",
+    "streaming_tool_call_prefill_reuse_model_call_count",
+    "streaming_tool_call_prefill_reuse_model_call_seconds",
+    "streaming_tool_call_prefill_reuse_model_call_prompt_tokens",
+    "streaming_tool_call_prefill_reuse_model_call_completion_tokens",
+    "streaming_tool_call_prefill_reuse_model_call_reused_prompt_tokens",
+    "streaming_tool_call_prefill_reuse_model_call_cached_prompt_tokens",
+    "streaming_tool_call_prefill_reuse_model_call_required_prefix_tokens",
+    "streaming_tool_call_prefill_reuse_model_call_observed_prefill_cached_tokens",
+    "streaming_tool_call_prefill_reuse_model_call_observed_prefill_actions",
+    "streaming_tool_call_tokenizer_reuse_model_call_count",
+    "streaming_tool_call_tokenizer_reuse_model_call_seconds",
+    "streaming_tool_call_tokenizer_reuse_model_call_prompt_tokens",
+    "streaming_tool_call_tokenizer_reuse_model_call_completion_tokens",
+    "streaming_tool_call_tokenizer_reuse_model_call_cached_prompt_tokens",
+    "streaming_tool_call_prompt_reuse_miss_model_call_count",
+    "streaming_tool_call_prompt_reuse_miss_model_call_seconds",
+    "streaming_tool_call_prompt_reuse_miss_model_call_prompt_tokens",
+    "streaming_tool_call_prompt_reuse_miss_model_call_completion_tokens",
+    "streaming_tool_call_prompt_reuse_miss_model_call_cached_prompt_tokens",
     "streaming_tool_call_incremental_tokenizer_requests",
     "streaming_tool_call_incremental_tokenizer_tokens",
     "streaming_tool_call_exact_incremental_tokenizer_actions",
+    "streaming_tool_call_final_only_incremental_tokenizer_actions",
+    "streaming_tool_call_valid_final_only_incremental_tokenizer_actions",
+    "streaming_tool_call_final_only_prefill_actions",
+    "streaming_tool_call_valid_final_only_prefill_actions",
+    "streaming_tool_call_final_only_prefill_failures",
+    "streaming_tool_call_final_only_prefill_seconds",
+    "streaming_tool_call_final_only_prefill_reused_tokens",
+    "streaming_tool_call_prefill_after_admission_actions",
+    "streaming_tool_call_valid_prefill_after_admission_actions",
+    "streaming_tool_call_effective_prefill_after_admission_actions",
+    "streaming_tool_call_prefill_after_admission_requests",
+    "streaming_tool_call_prefill_after_admission_tokens",
+    "streaming_tool_call_prefill_after_admission_request_seconds",
+    "streaming_tool_call_prefill_committed_tokens",
+    "streaming_tool_call_prefill_dynamic_tokens",
+    "streaming_tool_call_prefill_effective_requests",
+    "streaming_tool_call_prefill_background_scheduled_chunks",
+    "streaming_tool_call_prefill_background_scheduled_tokens",
+    "streaming_tool_call_prefill_background_completed_chunks",
+    "streaming_tool_call_prefill_background_completed_tokens",
+    "streaming_tool_call_prefill_background_completed_dummy_tokens",
+    "streaming_tool_call_prefill_background_effective_chunks",
+    "streaming_tool_call_prefill_background_dynamic_tokens",
+    "streaming_tool_call_prefill_background_cancelled_chunks",
+    "streaming_tool_call_prefill_background_cancelled_tokens",
+    "streaming_tool_call_prefill_background_failed_chunks",
+    "streaming_tool_call_prefill_background_failed_tokens",
+    "streaming_tool_call_prefill_background_enqueue_seconds",
+    "streaming_tool_call_prefill_background_completion_seconds",
+    "streaming_tool_call_deferred_prefill_admissions",
+    "streaming_tool_call_final_prefix_tokenizations",
+    "streaming_tool_call_prefill_race_attempts",
+    "streaming_tool_call_prefill_race_prefill_first",
+    "streaming_tool_call_prefill_race_command_first",
+    "streaming_tool_call_prefill_race_grace_admissions",
+    "streaming_tool_call_prefill_race_cancellations",
+    "streaming_tool_call_prefill_race_abort_requests",
+    "streaming_tool_call_prefill_race_abort_existing_sessions",
+    "streaming_tool_call_prefill_race_abort_failures",
+    "streaming_tool_call_prefill_race_abort_seconds",
+    "streaming_tool_call_prefill_race_cancelled_request_seconds",
+    "streaming_tool_call_prefix_seed_attempts",
+    "streaming_tool_call_prefix_seed_successes",
+    "streaming_tool_call_prefix_seed_fallbacks",
+    "streaming_tool_call_prefix_seed_seconds",
+    "streaming_tool_call_stable_first_snapshot_prefill_attempts",
+    "streaming_tool_call_stable_first_snapshot_prefill_successes",
+    "streaming_tool_call_stable_first_snapshot_prefill_fallbacks",
+    "streaming_tool_call_stable_first_snapshot_prefill_seconds",
+    "streaming_tool_call_stable_first_snapshot_prefill_stable_tokens",
+    "streaming_tool_call_stable_first_snapshot_prefill_committable_tokens",
+    "streaming_tool_call_stable_first_snapshot_prefill_dynamic_tokens",
+    "streaming_tool_call_fallbacks",
+    "streaming_tool_call_fallback_snapshot_errors",
+    "streaming_tool_call_fallback_request_errors",
+    "streaming_tool_call_fallback_output_prefix_changes",
+    "streaming_tool_call_fallback_other_errors",
     "streaming_tool_call_incremental_tokenizer_encoded_chars",
     "streaming_tool_call_incremental_tokenizer_encoded_tokens",
     "streaming_tool_call_incremental_tokenizer_reused_tokens",
@@ -96,10 +184,49 @@ PERF_FIELDS = (
     "streaming_tool_call_incremental_tokenizer_checkpoint_tokens",
     "streaming_tool_call_incremental_tokenizer_checkpoint_mismatches",
     "streaming_tool_call_incremental_tokenizer_seconds",
+    "streaming_tool_call_incremental_tokenizer_start_seconds",
+    "streaming_tool_call_incremental_tokenizer_final_seconds",
+    "streaming_tool_call_server_materialize_seconds",
+    "streaming_tool_call_server_render_seconds",
+    "streaming_tool_call_server_prefix_render_seconds",
+    "streaming_tool_call_server_incremental_tokenizer_seconds",
+    "streaming_tool_call_server_authoritative_tokenizer_seconds",
+    "streaming_tool_call_server_request_handler_seconds",
+    "streaming_tool_call_client_payload_build_seconds",
+    "streaming_tool_call_client_payload_serialize_seconds",
+    "streaming_tool_call_client_request_bytes",
+    "streaming_tool_call_client_compact_context_requests",
+    "streaming_tool_call_client_http_round_trip_seconds",
+    "streaming_tool_call_client_response_json_seconds",
+    "streaming_tool_call_gym_compact_context_registrations",
+    "streaming_tool_call_gym_compact_context_hits",
+    "streaming_tool_call_gym_compact_context_rebuild_seconds",
+    "streaming_tool_call_gym_compact_context_registration_seconds",
+    "streaming_tool_call_gym_preprocess_seconds",
+    "streaming_tool_call_gym_vllm_request_seconds",
+    "streaming_tool_call_gym_request_handler_seconds",
+    "streaming_tool_call_server_compact_context_registrations",
+    "streaming_tool_call_server_compact_context_hits",
+    "streaming_tool_call_server_compact_context_rebuild_seconds",
+    "streaming_tool_call_server_compact_context_registration_seconds",
+    "streaming_tool_call_counterfactual_full_tokenizer_requests",
+    "streaming_tool_call_counterfactual_full_tokenizer_seconds",
+    "streaming_tool_call_counterfactual_full_tokenizer_tokens",
+    "streaming_tool_call_counterfactual_full_tokenizer_mismatches",
+    "streaming_tool_call_counterfactual_full_tokenizer_failures",
     "streaming_tool_call_command_request_seconds",
     "streaming_tool_call_post_command_tail_seconds",
     "streaming_tool_call_snapshot_request_seconds",
     "streaming_tool_call_overhead_seconds",
+)
+TRAJECTORY_DISTRIBUTION_FIELDS = (
+    "openhands_run_time",
+    "openhands_model_api_call_seconds",
+    "openhands_model_api_call_count",
+    "total_model_call_time",
+    "total_model_call_count",
+    "total_command_exec_time",
+    "num_tool_calls",
 )
 INFRASTRUCTURE_ERROR_MARKERS = (
     "NameResolutionError",
@@ -616,6 +743,196 @@ def metric_summary(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def percentile_distribution(values: list[float]) -> dict[str, float | int | None]:
+    """Summarize per-trajectory values with nearest-rank percentiles."""
+    if not values:
+        return {
+            "count": 0,
+            "mean": None,
+            "min": None,
+            "p25": None,
+            "p50": None,
+            "p75": None,
+            "p90": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+        }
+
+    ordered = sorted(values)
+
+    def nearest_rank(fraction: float) -> float:
+        index = max(0, math.ceil(fraction * len(ordered)) - 1)
+        return ordered[index]
+
+    return {
+        "count": len(ordered),
+        "mean": statistics.fmean(ordered),
+        "min": ordered[0],
+        "p25": nearest_rank(0.25),
+        "p50": nearest_rank(0.50),
+        "p75": nearest_rank(0.75),
+        "p90": nearest_rank(0.90),
+        "p95": nearest_rank(0.95),
+        "p99": nearest_rank(0.99),
+        "max": ordered[-1],
+    }
+
+
+def build_timeout_excluded_distribution(
+    manifest_rows: list[dict[str, Any]],
+    baseline_rows: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+    *,
+    expected_count: int,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Compare per-trajectory distributions after excluding timeout union."""
+    if timeout_seconds <= 0:
+        raise AuditError("timeout seconds must be positive")
+
+    manifest = validate_manifest(manifest_rows, expected_count)
+    baseline = index_unique_rows(baseline_rows, "baseline")
+    candidate = index_unique_rows(candidate_rows, "candidate")
+    expected_ids = set(manifest)
+    for name, indexed in (("baseline", baseline), ("candidate", candidate)):
+        missing_ids = sorted(expected_ids - set(indexed))
+        unexpected_ids = sorted(set(indexed) - expected_ids)
+        if missing_ids or unexpected_ids:
+            raise AuditError(
+                f"{name}: membership mismatch; missing={missing_ids[:10]}, "
+                f"unexpected={unexpected_ids[:10]}"
+            )
+
+    timeout_ids = {"baseline": [], "candidate": []}
+    paired_rows = []
+    retained_values = {
+        "baseline": {field: [] for field in TRAJECTORY_DISTRIBUTION_FIELDS},
+        "candidate": {field: [] for field in TRAJECTORY_DISTRIBUTION_FIELDS},
+        "candidate_minus_baseline": {
+            field: [] for field in TRAJECTORY_DISTRIBUTION_FIELDS
+        },
+    }
+    independent_values = {
+        "baseline": {field: [] for field in TRAJECTORY_DISTRIBUTION_FIELDS},
+        "candidate": {field: [] for field in TRAJECTORY_DISTRIBUTION_FIELDS},
+    }
+    for instance_id in sorted(manifest):
+        arm_rows = {
+            "baseline": baseline[instance_id],
+            "candidate": candidate[instance_id],
+        }
+        arm_timeouts = {}
+        for name, row in arm_rows.items():
+            runtime = row.get("openhands_run_time")
+            if not isinstance(runtime, (int, float)) or isinstance(runtime, bool):
+                raise AuditError(
+                    f"{name}: {instance_id} is missing numeric openhands_run_time"
+                )
+            arm_timeouts[name] = float(runtime) >= timeout_seconds
+            if arm_timeouts[name]:
+                timeout_ids[name].append(instance_id)
+
+        excluded = arm_timeouts["baseline"] or arm_timeouts["candidate"]
+        arm_values = {}
+        missing_metric_fields = {}
+        for name, row in arm_rows.items():
+            metrics = {}
+            missing_fields = []
+            for field in TRAJECTORY_DISTRIBUTION_FIELDS:
+                value = row.get(field)
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    if not excluded:
+                        raise AuditError(
+                            f"{name}: {instance_id} is missing numeric {field}"
+                        )
+                    metrics[field] = None
+                    missing_fields.append(field)
+                else:
+                    metrics[field] = float(value)
+            arm_values[name] = metrics
+            missing_metric_fields[name] = missing_fields
+
+        deltas = {
+            field: (
+                arm_values["candidate"][field] - arm_values["baseline"][field]
+                if arm_values["candidate"][field] is not None
+                and arm_values["baseline"][field] is not None
+                else None
+            )
+            for field in TRAJECTORY_DISTRIBUTION_FIELDS
+        }
+        paired_rows.append(
+            {
+                "instance_id": instance_id,
+                "excluded_as_timeout": excluded,
+                "baseline_timeout": arm_timeouts["baseline"],
+                "candidate_timeout": arm_timeouts["candidate"],
+                "baseline_missing_metric_fields": missing_metric_fields["baseline"],
+                "candidate_missing_metric_fields": missing_metric_fields["candidate"],
+                "baseline": arm_values["baseline"],
+                "candidate": arm_values["candidate"],
+                "candidate_minus_baseline": deltas,
+            }
+        )
+        for name in ("baseline", "candidate"):
+            if arm_timeouts[name]:
+                continue
+            for field in TRAJECTORY_DISTRIBUTION_FIELDS:
+                value = arm_values[name][field]
+                if value is None:
+                    raise AuditError(
+                        f"{name}: {instance_id} is missing numeric {field}"
+                    )
+                independent_values[name][field].append(value)
+        if excluded:
+            continue
+        for field in TRAJECTORY_DISTRIBUTION_FIELDS:
+            retained_values["baseline"][field].append(arm_values["baseline"][field])
+            retained_values["candidate"][field].append(arm_values["candidate"][field])
+            retained_values["candidate_minus_baseline"][field].append(deltas[field])
+
+    excluded_ids = sorted(set(timeout_ids["baseline"]) | set(timeout_ids["candidate"]))
+    report = {
+        "protocol": {
+            "expected_instances": expected_count,
+            "timeout_seconds": timeout_seconds,
+            "timeout_rule": "openhands_run_time >= timeout_seconds",
+            "cohort_rule": "exclude union of baseline and candidate timeouts",
+            "percentile_method": "nearest-rank",
+        },
+        "timeout": {
+            "baseline_count": len(timeout_ids["baseline"]),
+            "baseline_instance_ids": timeout_ids["baseline"],
+            "candidate_count": len(timeout_ids["candidate"]),
+            "candidate_instance_ids": timeout_ids["candidate"],
+            "excluded_union_count": len(excluded_ids),
+            "excluded_union_instance_ids": excluded_ids,
+            "retained_count": expected_count - len(excluded_ids),
+        },
+        "metrics": {
+            cohort: {
+                field: percentile_distribution(values)
+                for field, values in cohort_values.items()
+            }
+            for cohort, cohort_values in retained_values.items()
+        },
+        "independent_non_timeout": {
+            "cohort_rule": "exclude each arm's own timeouts independently",
+            "baseline_retained_count": expected_count - len(timeout_ids["baseline"]),
+            "candidate_retained_count": expected_count - len(timeout_ids["candidate"]),
+            "metrics": {
+                cohort: {
+                    field: percentile_distribution(values)
+                    for field, values in cohort_values.items()
+                }
+                for cohort, cohort_values in independent_values.items()
+            },
+        },
+    }
+    return report, paired_rows
+
+
 def summarize_arm(
     name: str,
     rows: list[dict[str, Any]],
@@ -927,6 +1244,18 @@ def parse_args() -> argparse.Namespace:
     compare.add_argument("--expected-count", type=int, default=500)
     compare.add_argument("--expected-temperature", type=float, default=0.0)
     compare.add_argument("--expected-top-p", type=float, default=1.0)
+
+    distribution = subparsers.add_parser(
+        "distribution",
+        help="compare per-trajectory metrics after excluding timeout union",
+    )
+    distribution.add_argument("--manifest", type=Path, required=True)
+    distribution.add_argument("--baseline", type=Path, required=True)
+    distribution.add_argument("--candidate", type=Path, required=True)
+    distribution.add_argument("--output", type=Path, required=True)
+    distribution.add_argument("--paired-output", type=Path, required=True)
+    distribution.add_argument("--expected-count", type=int, default=500)
+    distribution.add_argument("--timeout-seconds", type=float, default=1800.0)
     return parser.parse_args()
 
 
@@ -976,6 +1305,23 @@ def main() -> int:
                 args.expected_count,
                 args.prefix_count,
             )
+        elif args.command == "distribution":
+            summary, paired_rows = build_timeout_excluded_distribution(
+                read_jsonl(args.manifest),
+                read_result_jsonl(args.baseline),
+                read_result_jsonl(args.candidate),
+                expected_count=args.expected_count,
+                timeout_seconds=args.timeout_seconds,
+            )
+            summary["protocol"]["manifest_sha256"] = file_sha256(args.manifest)
+            summary["artifacts"] = {
+                "manifest": str(args.manifest.resolve()),
+                "baseline": str(args.baseline.resolve()),
+                "candidate": str(args.candidate.resolve()),
+                "paired_trajectories": str(args.paired_output.resolve()),
+            }
+            atomic_write_json(args.output, summary)
+            atomic_write_jsonl(args.paired_output, paired_rows)
         else:
             report, outcomes = compare_arms(
                 read_jsonl(args.manifest),

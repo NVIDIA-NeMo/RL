@@ -24,6 +24,7 @@ from examples.swe_bench.verified_trajectory_audit import (
     build_no_timeout_manifest,
     build_prefix_manifest,
     build_subset_manifest,
+    build_timeout_excluded_distribution,
     canonical_json_sha256,
     canonical_trajectory_sha256,
     compare_arms,
@@ -136,6 +137,11 @@ def test_read_result_jsonl_projects_large_trajectory_fields(tmp_path) -> None:
     row = result_row("owner__repo-1", 0)
     row["response"]["output"] = ["Temporary failure in name resolution"]
     row["num_tool_calls"] = 0
+    row["streaming_tool_call_prefill_reuse_model_call_seconds"] = 2.5
+    row["streaming_tool_call_prefill_reuse_model_call_cached_prompt_tokens"] = 384
+    row["streaming_tool_call_prefill_reuse_model_call_observed_prefill_actions"] = 2
+    row["streaming_tool_call_prefill_effective_requests"] = 3
+    row["streaming_tool_call_stable_first_snapshot_prefill_successes"] = 2
     path = tmp_path / "trajectories.jsonl"
     path.write_text(json.dumps(row) + "\n")
 
@@ -144,7 +150,8 @@ def test_read_result_jsonl_projects_large_trajectory_fields(tmp_path) -> None:
         for key, value in row["responses_create_params"].items()
         if key != "input"
     }
-    assert read_result_jsonl(path) == [
+    projected = read_result_jsonl(path)
+    assert projected == [
         {
             "responses_create_params": projected_params,
             "reward": 0,
@@ -160,6 +167,23 @@ def test_read_result_jsonl_projects_large_trajectory_fields(tmp_path) -> None:
             **{field: row.get(field) for field in PERF_FIELDS},
         }
     ]
+    assert projected[0]["streaming_tool_call_prefill_reuse_model_call_seconds"] == 2.5
+    assert (
+        projected[0][
+            "streaming_tool_call_prefill_reuse_model_call_cached_prompt_tokens"
+        ]
+        == 384
+    )
+    assert (
+        projected[0][
+            "streaming_tool_call_prefill_reuse_model_call_observed_prefill_actions"
+        ]
+        == 2
+    )
+    assert projected[0]["streaming_tool_call_prefill_effective_requests"] == 3
+    assert (
+        projected[0]["streaming_tool_call_stable_first_snapshot_prefill_successes"] == 2
+    )
 
 
 def test_infrastructure_error_ignores_agent_command_output() -> None:
@@ -252,6 +276,84 @@ def test_build_no_timeout_manifest_uses_union_and_preserves_order(tmp_path) -> N
         1,
         1,
     ]
+
+
+def test_timeout_excluded_distribution_uses_paired_timeout_union() -> None:
+    manifest = [
+        manifest_row("owner__repo-1"),
+        manifest_row("owner__repo-2"),
+        manifest_row("owner__repo-3"),
+    ]
+    baseline_rows = []
+    candidate_rows = []
+    for index, row in enumerate(manifest, start=1):
+        baseline = result_row(row["instance_id"], 0)
+        candidate = result_row(row["instance_id"], 0)
+        for result, scale in ((baseline, 1.0), (candidate, 2.0)):
+            result.update(
+                openhands_run_time=100.0 * index,
+                openhands_model_api_call_seconds=10.0 * index * scale,
+                openhands_model_api_call_count=10 * index * scale,
+                total_model_call_time=11.0 * index * scale,
+                total_model_call_count=10 * index * scale,
+                total_command_exec_time=5.0 * index * scale,
+                num_tool_calls=10 * index * scale,
+            )
+        baseline_rows.append(baseline)
+        candidate_rows.append(candidate)
+    baseline_rows[0]["openhands_run_time"] = 1800.0
+    candidate_rows[1]["openhands_run_time"] = 1801.0
+    del baseline_rows[0]["openhands_model_api_call_seconds"]
+    del candidate_rows[1]["total_command_exec_time"]
+
+    report, paired_rows = build_timeout_excluded_distribution(
+        manifest,
+        baseline_rows,
+        candidate_rows,
+        expected_count=3,
+        timeout_seconds=1800.0,
+    )
+
+    assert report["timeout"] == {
+        "baseline_count": 1,
+        "baseline_instance_ids": ["owner__repo-1"],
+        "candidate_count": 1,
+        "candidate_instance_ids": ["owner__repo-2"],
+        "excluded_union_count": 2,
+        "excluded_union_instance_ids": ["owner__repo-1", "owner__repo-2"],
+        "retained_count": 1,
+    }
+    assert report["metrics"]["baseline"]["num_tool_calls"]["mean"] == 30.0
+    assert report["metrics"]["candidate"]["num_tool_calls"]["mean"] == 60.0
+    assert (
+        report["metrics"]["candidate_minus_baseline"]["num_tool_calls"]["mean"] == 30.0
+    )
+    assert report["independent_non_timeout"]["baseline_retained_count"] == 2
+    assert report["independent_non_timeout"]["candidate_retained_count"] == 2
+    assert (
+        report["independent_non_timeout"]["metrics"]["baseline"]["num_tool_calls"][
+            "mean"
+        ]
+        == 25.0
+    )
+    assert (
+        report["independent_non_timeout"]["metrics"]["candidate"]["num_tool_calls"][
+            "mean"
+        ]
+        == 40.0
+    )
+    assert [row["excluded_as_timeout"] for row in paired_rows] == [True, True, False]
+    assert paired_rows[0]["baseline_missing_metric_fields"] == [
+        "openhands_model_api_call_seconds"
+    ]
+    assert (
+        paired_rows[0]["candidate_minus_baseline"]["openhands_model_api_call_seconds"]
+        is None
+    )
+    assert paired_rows[1]["candidate_missing_metric_fields"] == [
+        "total_command_exec_time"
+    ]
+    assert paired_rows[1]["candidate_minus_baseline"]["total_command_exec_time"] is None
 
 
 def test_build_subset_manifest_is_hash_ranked_and_order_independent(tmp_path) -> None:

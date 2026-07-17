@@ -31,11 +31,59 @@ class StreamingToolCallConfig(TypedDict):
         exact_incremental_tokenizer: Whether tokenizer-only mode keeps an exact
             backend session and re-encodes only the mutable prompt tail between
             full checkpoints. The recommended default is false.
+        final_only_incremental_tokenizer: Whether exact tokenizer-only mode
+            starts from an empty tool output while the command runs and then
+            incrementally encodes only the authoritative final output. This
+            removes the snapshot admission requirement. The recommended
+            default is false.
+        final_only_prefill: Whether final-only mode submits the exact
+            empty-tool-output prompt to one speculative vLLM prefill request
+            while the command runs. The request is closed after its stable
+            prefix is cached; the authoritative final request remains
+            unchanged. The recommended default is false.
+        final_only_prefill_completion_grace_seconds: Maximum time to wait for
+            an in-flight final-only prefill after its command finishes. Zero
+            minimizes post-command overhead; a small positive value trades
+            tail latency for higher admission. The recommended default is 0.0.
+        prefix_seeded_start: Whether a final-only prefill session reuses the
+            prior model call's authoritative tokens and encodes only the short
+            chat-template suffix after its final EOS. Structural checks fall
+            back to full tokenization. The recommended default is false while
+            this optimization is being validated.
+        prefill_after_admission: Whether a successfully admitted final-only
+            prefill session remains open and prefills bucketed command-output
+            snapshots while the command is still running. The authoritative
+            final generation request remains unchanged. The recommended
+            default is false while admission overhead is being measured.
+        stable_first_snapshot_prefill: Whether deferred admission proves a
+            stable token boundary in its first nonempty tool-output snapshot
+            by comparing it with an empty-output rendering. This can prefill
+            useful tool-output tokens one snapshot earlier. Structural checks
+            fall back to the authoritative model prefix. The recommended
+            default is false while this optimization is being validated.
+        background_prefill_completion: Whether the first continuation prefill
+            returns after engine enqueue and completes under server ownership
+            while the tool keeps running. Final close reports completed and
+            cancelled work without adding a completion grace. The recommended
+            default is false while this optimization is being validated.
+        background_prefill_priority: vLLM scheduler priority assigned only to
+            background prefill requests. Foreground requests use priority zero,
+            and larger values run later. Background completion automatically
+            enables vLLM's priority scheduler. The recommended default is 1.
+        compact_request_context: Whether sequence-zero tokenizer requests
+            register their immutable chat context so later sequence-numbered
+            requests send only cumulative tool output. Both HTTP hops rebuild
+            the exact request from bounded, expiring state. The recommended
+            default is false while this optimization is being validated.
         incremental_tokenizer_checkpoint_interval: Number of ordered partial
             snapshots between full authoritative tokenizer checkpoints. A
             valid session may finalize from its incrementally constructed
             tokens without an additional checkpoint. The recommended default
             is 8.
+        counterfactual_full_tokenizer_timing: Whether a checkpoint-free final
+            incremental result is also passed through the authoritative full
+            tokenizer for diagnostic timing and exact-token comparison. This
+            duplicates work and must remain false in performance runs.
         max_sessions: Maximum number of concurrent prefill sessions per vLLM
             replica. The recommended default is 256.
         session_ttl_seconds: Idle lifetime of a prefill session before cleanup.
@@ -44,12 +92,22 @@ class StreamingToolCallConfig(TypedDict):
             prefix to protect tokenizer boundary changes. The recommended
             default is 8.
         min_chunk_chars: Minimum new shell-output characters before requesting
-            another tokenization. The recommended default is 256.
+            another tokenization after the first growing snapshot. The
+            recommended default is 512 because the first request captures most
+            reusable history and later requests only add tool-output tokens.
+        initial_chunk_chars: Minimum shell-output characters before the first
+            growing prefill request. The recommended default is 256 so the
+            typical SWE candidate crosses the first profitable cache-block
+            boundary without sacrificing longer-output admission.
         snapshot_poll_interval_seconds: Interval between runtime reads of the
             current shell-output snapshot. This should not be lower than the
             producer's snapshot cadence. The recommended default is 0.1
             seconds; use 0.05 seconds to match OpenHands' current producer
             cadence when measuring admission coverage.
+        snapshot_long_poll_timeout_seconds: Maximum server-side wait for a
+            shell snapshot to reach the next character target. Long polling
+            wakes immediately when the target is reached and avoids periodic
+            HTTP polling. The recommended default is 1.0 second.
         flush_interval_seconds: Maximum interval between eligible partial-output
             tokenizations. The recommended default is 0.25 seconds.
         request_timeout_seconds: Maximum duration of one streaming prefill HTTP
@@ -60,12 +118,24 @@ class StreamingToolCallConfig(TypedDict):
     enabled: bool
     tokenizer_only: bool
     exact_incremental_tokenizer: NotRequired[bool]
+    final_only_incremental_tokenizer: NotRequired[bool]
+    final_only_prefill: NotRequired[bool]
+    final_only_prefill_completion_grace_seconds: float
+    prefix_seeded_start: NotRequired[bool]
+    prefill_after_admission: NotRequired[bool]
+    stable_first_snapshot_prefill: NotRequired[bool]
+    background_prefill_completion: NotRequired[bool]
+    background_prefill_priority: int
+    compact_request_context: NotRequired[bool]
     incremental_tokenizer_checkpoint_interval: NotRequired[int]
+    counterfactual_full_tokenizer_timing: NotRequired[bool]
     max_sessions: int
     session_ttl_seconds: float
     stability_margin_tokens: int
     min_chunk_chars: int
+    initial_chunk_chars: int
     snapshot_poll_interval_seconds: float
+    snapshot_long_poll_timeout_seconds: float
     flush_interval_seconds: float
     request_timeout_seconds: float
 

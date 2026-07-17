@@ -190,6 +190,7 @@ async def _run_streaming_case(
         max_sessions=1,
         session_ttl_seconds=60,
         stability_margin_tokens=stability_margin_tokens,
+        max_prompt_tokens=len(final_prompt_token_ids),
     )
     session_id = f"apc-check-{uuid.uuid4()}"
     candidate_lengths = list(

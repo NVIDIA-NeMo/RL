@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import monotonic
 from typing import Any, Callable
 
@@ -29,6 +29,14 @@ class IncrementalTokenizerError(RuntimeError):
 
 class IncrementalTokenizerSessionNotFoundError(IncrementalTokenizerError):
     """Raised when an incremental-tokenizer session is absent or expired."""
+
+
+class IncrementalTokenizerPrefixSeedError(IncrementalTokenizerError):
+    """Raised when an authoritative-prefix fast seed cannot be proven exact."""
+
+
+class IncrementalTokenizerStablePrefixError(IncrementalTokenizerError):
+    """Raised when a stable token prefix cannot be proven from two renders."""
 
 
 @dataclass(frozen=True)
@@ -48,6 +56,15 @@ class IncrementalTokenizationStep:
     tokens: list[int] | None = None
 
 
+@dataclass(frozen=True)
+class IncrementalTokenizerPrefixSeed:
+    """Work performed while seeding from prior authoritative model tokens."""
+
+    reused_tokens: int
+    encoded_chars: int
+    encoded_tokens: int
+
+
 class ExactIncrementalTokenizer:
     """Incrementally encode a Qwen byte-level-BPE rendered prompt exactly.
 
@@ -65,6 +82,23 @@ class ExactIncrementalTokenizer:
         backend_tokenizer: Any | None = None,
         added_tokens: tuple[str, ...] | None = None,
     ) -> None:
+        self._initialize_tokenizer(
+            tokenizer=tokenizer,
+            backend_tokenizer=backend_tokenizer,
+            added_tokens=added_tokens,
+        )
+        self.reset(
+            rendered_prompt=rendered_prompt,
+            authoritative_token_ids=authoritative_token_ids,
+        )
+
+    def _initialize_tokenizer(
+        self,
+        *,
+        tokenizer: Any,
+        backend_tokenizer: Any | None,
+        added_tokens: tuple[str, ...] | None,
+    ) -> None:
         self._tokenizer = tokenizer
         self._backend_tokenizer = (
             backend_tokenizer
@@ -77,10 +111,37 @@ class ExactIncrementalTokenizer:
             if added_tokens is not None
             else tuple(tokenizer.get_added_vocab())
         )
-        self.reset(
-            rendered_prompt=rendered_prompt,
-            authoritative_token_ids=authoritative_token_ids,
+
+    @classmethod
+    def from_authoritative_prefix(
+        cls,
+        *,
+        tokenizer: Any,
+        rendered_prompt: str,
+        template_prefix_prompt: str,
+        authoritative_prefix_token_ids: list[int],
+        backend_tokenizer: Any | None = None,
+        added_tokens: tuple[str, ...] | None = None,
+    ) -> tuple[ExactIncrementalTokenizer, IncrementalTokenizerPrefixSeed]:
+        """Seed an exact session without encoding the immutable conversation.
+
+        The last chat-template EOS is an added-token boundary. Consequently,
+        tokenization after that boundary is independent of the preceding model
+        output. The prior model tokens remain authoritative and only the short
+        template suffix containing the tool response is encoded.
+        """
+        encoder = cls.__new__(cls)
+        encoder._initialize_tokenizer(
+            tokenizer=tokenizer,
+            backend_tokenizer=backend_tokenizer,
+            added_tokens=added_tokens,
         )
+        seed = encoder._reset_from_authoritative_prefix(
+            rendered_prompt=rendered_prompt,
+            template_prefix_prompt=template_prefix_prompt,
+            authoritative_prefix_token_ids=authoritative_prefix_token_ids,
+        )
+        return encoder, seed
 
     def _validate_tokenizer(self) -> None:
         if not getattr(self._tokenizer, "is_fast", False):
@@ -143,6 +204,25 @@ class ExactIncrementalTokenizer:
                 return index
         return min(len(left), len(right))
 
+    @staticmethod
+    def _common_suffix_chars(
+        left: str,
+        right: str,
+        *,
+        common_prefix_chars: int,
+    ) -> int:
+        max_suffix_chars = min(
+            len(left) - common_prefix_chars,
+            len(right) - common_prefix_chars,
+        )
+        suffix_chars = 0
+        while (
+            suffix_chars < max_suffix_chars
+            and left[-suffix_chars - 1] == right[-suffix_chars - 1]
+        ):
+            suffix_chars += 1
+        return suffix_chars
+
     def _align_authoritative_offsets(
         self,
         *,
@@ -179,7 +259,82 @@ class ExactIncrementalTokenizer:
             template_offsets=template_offsets,
             authoritative_token_ids=authoritative_token_ids,
         )
-        self._pretoken_offsets_cache = self._pretoken_offsets(normalized_prompt)
+        self._mapped_prompt_start = next(
+            offset[0] for offset in self._offsets if offset is not None
+        )
+        self._pretoken_offsets_cache = [
+            offset
+            for offset in self._pretoken_offsets(normalized_prompt)
+            if offset[1] > self._mapped_prompt_start
+        ]
+
+    def _reset_from_authoritative_prefix(
+        self,
+        *,
+        rendered_prompt: str,
+        template_prefix_prompt: str,
+        authoritative_prefix_token_ids: list[int],
+    ) -> IncrementalTokenizerPrefixSeed:
+        if not authoritative_prefix_token_ids:
+            raise IncrementalTokenizerPrefixSeedError(
+                "an authoritative token prefix is required"
+            )
+        eos_token = getattr(self._tokenizer, "eos_token", None)
+        eos_token_id = getattr(self._tokenizer, "eos_token_id", None)
+        if not isinstance(eos_token, str) or eos_token_id is None:
+            raise IncrementalTokenizerPrefixSeedError(
+                "tokenizer EOS text and token ID are required"
+            )
+
+        normalized_prompt = self._normalize(rendered_prompt)
+        normalized_template_prefix = self._normalize(template_prefix_prompt)
+        normalized_eos_token = self._normalize(eos_token)
+        template_cut_start = normalized_template_prefix.rfind(normalized_eos_token)
+        if template_cut_start < 0:
+            raise IncrementalTokenizerPrefixSeedError(
+                "the rendered assistant prefix has no EOS boundary"
+            )
+        template_cut_end = template_cut_start + len(normalized_eos_token)
+        if (
+            normalized_prompt[:template_cut_end]
+            != normalized_template_prefix[:template_cut_end]
+        ):
+            raise IncrementalTokenizerPrefixSeedError(
+                "the full prompt changed before the assistant EOS boundary"
+            )
+
+        encoded_suffix = normalized_prompt[template_cut_start:]
+        suffix_token_ids, suffix_offsets = self._encode_with_offsets(encoded_suffix)
+        if (
+            not suffix_token_ids
+            or suffix_token_ids[0] != eos_token_id
+            or suffix_offsets[0] != (0, len(normalized_eos_token))
+        ):
+            raise IncrementalTokenizerPrefixSeedError(
+                "the assistant EOS is not an isolated tokenizer boundary"
+            )
+
+        model_cut_end = len(authoritative_prefix_token_ids)
+        if authoritative_prefix_token_ids[-1] == eos_token_id:
+            model_cut_end -= 1
+        reused_prefix_token_ids = authoritative_prefix_token_ids[:model_cut_end]
+        adjusted_suffix_offsets = [
+            (start + template_cut_start, end + template_cut_start)
+            for start, end in suffix_offsets
+        ]
+        self._prompt = normalized_prompt
+        self._token_ids = reused_prefix_token_ids + suffix_token_ids
+        self._offsets = [None] * len(reused_prefix_token_ids) + adjusted_suffix_offsets
+        self._mapped_prompt_start = template_cut_start
+        self._pretoken_offsets_cache = [
+            (start + template_cut_start, end + template_cut_start)
+            for start, end in self._pretoken_offsets(encoded_suffix)
+        ]
+        return IncrementalTokenizerPrefixSeed(
+            reused_tokens=len(reused_prefix_token_ids),
+            encoded_chars=len(encoded_suffix),
+            encoded_tokens=len(suffix_token_ids),
+        )
 
     def _added_token_repair_start(self, common_prefix_chars: int) -> int:
         repair_start = common_prefix_chars
@@ -194,7 +349,7 @@ class ExactIncrementalTokenizer:
         return repair_start
 
     def _pretoken_repair_start(self, frontier: int) -> int:
-        repair_start = 0
+        repair_start = self._mapped_prompt_start
         for start, end in self._pretoken_offsets_cache:
             if start < frontier <= end:
                 repair_start = start
@@ -206,14 +361,17 @@ class ExactIncrementalTokenizer:
         return repair_start
 
     def _repair_start(self, common_prefix_chars: int) -> int:
-        if common_prefix_chars <= 0:
+        if common_prefix_chars <= self._mapped_prompt_start:
             raise IncrementalTokenizerError(
-                "the rendered prompt changed before any stable character"
+                "the rendered prompt changed before the mapped suffix"
             )
         repair_start = self._pretoken_repair_start(common_prefix_chars)
-        repair_start = min(
-            repair_start,
-            self._added_token_repair_start(common_prefix_chars),
+        repair_start = max(
+            self._mapped_prompt_start,
+            min(
+                repair_start,
+                self._added_token_repair_start(common_prefix_chars),
+            ),
         )
         while True:
             retained_tokens = self._retained_token_count(repair_start)
@@ -307,6 +465,52 @@ class ExactIncrementalTokenizer:
             incremental_valid=True,
         )
 
+    def stable_prefix_token_ids_before_alternate_suffix(
+        self,
+        alternate_rendered_prompt: str,
+    ) -> list[int]:
+        """Return tokens proven stable before a shared rendered suffix.
+
+        ``alternate_rendered_prompt`` must render the same chat request with
+        only the final tool output replaced. The common suffix identifies the
+        chat-template text after that output. The returned prefix ends before
+        the pre-tokenizer segment that a future tool-output append can revise.
+        """
+        normalized_alternate = self._normalize(alternate_rendered_prompt)
+        if normalized_alternate == self._prompt:
+            raise IncrementalTokenizerStablePrefixError(
+                "the alternate rendering contains no nonempty tool output"
+            )
+        common_prefix_chars = self._common_prefix_chars(
+            self._prompt,
+            normalized_alternate,
+        )
+        common_suffix_chars = self._common_suffix_chars(
+            self._prompt,
+            normalized_alternate,
+            common_prefix_chars=common_prefix_chars,
+        )
+        if not common_suffix_chars:
+            raise IncrementalTokenizerStablePrefixError(
+                "the alternate rendering has no shared template suffix"
+            )
+
+        stable_output_end = len(self._prompt) - common_suffix_chars
+        if stable_output_end <= common_prefix_chars:
+            raise IncrementalTokenizerStablePrefixError(
+                "the alternate rendering contains no nonempty tool output"
+            )
+        try:
+            repair_start = self._repair_start(stable_output_end)
+            retained_tokens = self._retained_token_count(repair_start)
+        except IncrementalTokenizerError as error:
+            raise IncrementalTokenizerStablePrefixError(str(error)) from error
+        if not retained_tokens:
+            raise IncrementalTokenizerStablePrefixError(
+                "the stable tool-output boundary retains no tokens"
+            )
+        return list(self._token_ids[:retained_tokens])
+
     @property
     def token_ids(self) -> list[int]:
         """Return the current incrementally constructed prompt token IDs."""
@@ -357,6 +561,7 @@ class ExactIncrementalTokenizerSessionManager:
         self._checkpoint_interval = checkpoint_interval
         self._clock = clock
         self._sessions: OrderedDict[str, _IncrementalTokenizerSession] = OrderedDict()
+        self._aborted_sessions: OrderedDict[str, float] = OrderedDict()
 
     def _expire_sessions(self) -> None:
         now = self._clock()
@@ -367,6 +572,11 @@ class ExactIncrementalTokenizerSessionManager:
         ]
         for session_id in expired:
             self._sessions.pop(session_id, None)
+        while self._aborted_sessions:
+            session_id, expires_at = next(iter(self._aborted_sessions.items()))
+            if expires_at > now:
+                break
+            self._aborted_sessions.pop(session_id)
 
     def _get_session(self, session_id: str) -> _IncrementalTokenizerSession:
         self._expire_sessions()
@@ -394,6 +604,10 @@ class ExactIncrementalTokenizerSessionManager:
         if sequence_no != 0:
             raise IncrementalTokenizerError(
                 f"first sequence must be 0, got {sequence_no}"
+            )
+        if session_id in self._aborted_sessions:
+            raise IncrementalTokenizerError(
+                f"incremental tokenizer session was aborted: {session_id}"
             )
         existing_session = self._sessions.get(session_id)
         if existing_session is not None:
@@ -438,6 +652,73 @@ class ExactIncrementalTokenizerSessionManager:
         session.last_result = result
         self._sessions[session_id] = session
         return result
+
+    def start_from_authoritative_prefix(
+        self,
+        *,
+        session_id: str,
+        sequence_no: int,
+        rendered_prompt: str,
+        template_prefix_prompt: str,
+        authoritative_prefix_token_ids: list[int],
+    ) -> tuple[IncrementalTokenizationStep, list[int]]:
+        """Start from prior model tokens plus an exactly tokenized suffix."""
+        self._expire_sessions()
+        if sequence_no != 0:
+            raise IncrementalTokenizerError(
+                f"first sequence must be 0, got {sequence_no}"
+            )
+        if session_id in self._aborted_sessions:
+            raise IncrementalTokenizerError(
+                f"incremental tokenizer session was aborted: {session_id}"
+            )
+
+        encoder, seed = ExactIncrementalTokenizer.from_authoritative_prefix(
+            tokenizer=self._tokenizer,
+            rendered_prompt=rendered_prompt,
+            template_prefix_prompt=template_prefix_prompt,
+            authoritative_prefix_token_ids=authoritative_prefix_token_ids,
+            backend_tokenizer=self._backend_tokenizer,
+            added_tokens=self._added_tokens,
+        )
+        authoritative_token_ids = encoder.token_ids
+        existing_session = self._sessions.get(session_id)
+        if existing_session is not None:
+            if (
+                existing_session.sequence_no == sequence_no
+                and existing_session.last_prompt == rendered_prompt
+                and existing_session.encoder is not None
+                and existing_session.encoder.token_ids == authoritative_token_ids
+                and existing_session.last_result is not None
+            ):
+                self._refresh(session_id, existing_session)
+                return existing_session.last_result, authoritative_token_ids
+            raise IncrementalTokenizerError(
+                f"incremental tokenizer session already exists: {session_id}"
+            )
+        if len(self._sessions) >= self._max_sessions:
+            self._sessions.popitem(last=False)
+        session = _IncrementalTokenizerSession(
+            encoder=encoder,
+            sequence_no=sequence_no,
+            expires_at=self._clock() + self._session_ttl_seconds,
+            last_prompt=rendered_prompt,
+        )
+        result = IncrementalTokenizationStep(
+            sequence_no=sequence_no,
+            token_count=len(authoritative_token_ids),
+            encoded_chars=seed.encoded_chars,
+            encoded_tokens=seed.encoded_tokens,
+            reused_tokens=seed.reused_tokens,
+            rollback_tokens=0,
+            checkpoint_count=0,
+            checkpoint_tokens=0,
+            checkpoint_mismatches=0,
+            incremental_valid=True,
+        )
+        session.last_result = result
+        self._sessions[session_id] = session
+        return result, authoritative_token_ids
 
     def requires_checkpoint(self, *, session_id: str, sequence_no: int) -> bool:
         """Return whether an append must include authoritative full tokens."""
@@ -581,6 +862,56 @@ class ExactIncrementalTokenizerSessionManager:
         finally:
             self._sessions.pop(session_id, None)
 
+    def finalize_current(self, session_id: str) -> IncrementalTokenizationStep:
+        """Finalize an exact prefix-seeded session without another snapshot."""
+        session = self._get_session(session_id)
+        try:
+            if not session.incremental_valid or session.encoder is None:
+                raise IncrementalTokenizerError(
+                    "finalization requires a valid incremental session"
+                )
+            if session.last_result is None:
+                raise IncrementalTokenizerError(
+                    "finalization requires a completed tokenizer step"
+                )
+            return replace(
+                session.last_result,
+                tokens=list(session.encoder.token_ids),
+            )
+        finally:
+            self._sessions.pop(session_id, None)
+
+    def current_token_ids(self, session_id: str) -> list[int]:
+        """Return the exact tokens for an active, valid session."""
+        session = self._get_session(session_id)
+        if not session.incremental_valid or session.encoder is None:
+            raise IncrementalTokenizerError(
+                "current tokens require a valid incremental session"
+            )
+        return session.encoder.token_ids
+
+    def stable_prefix_token_ids_before_alternate_suffix(
+        self,
+        *,
+        session_id: str,
+        alternate_rendered_prompt: str,
+    ) -> list[int]:
+        """Return a proven stable prefix for an active exact session."""
+        session = self._get_session(session_id)
+        if not session.incremental_valid or session.encoder is None:
+            raise IncrementalTokenizerStablePrefixError(
+                "stable prefix requires a valid incremental session"
+            )
+        return session.encoder.stable_prefix_token_ids_before_alternate_suffix(
+            alternate_rendered_prompt
+        )
+
     def abort(self, session_id: str) -> bool:
-        """Remove a session, returning whether it existed."""
-        return self._sessions.pop(session_id, None) is not None
+        """Cancel present or late-arriving work for one session ID."""
+        self._expire_sessions()
+        existed = self._sessions.pop(session_id, None) is not None
+        self._aborted_sessions.pop(session_id, None)
+        self._aborted_sessions[session_id] = self._clock() + self._session_ttl_seconds
+        while len(self._aborted_sessions) > self._max_sessions:
+            self._aborted_sessions.popitem(last=False)
+        return existed

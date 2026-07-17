@@ -36,6 +36,7 @@ PROMPT_PREFIX = (
     "</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n"
 )
 PROMPT_SUFFIX = "\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+TEMPLATE_PREFIX = PROMPT_PREFIX[: PROMPT_PREFIX.index("<|im_start|>user")]
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,6 +194,129 @@ def verify_fast_final(tokenizer, prompts: list[str]) -> dict[str, int | bool]:
     }
 
 
+def verify_final_only(tokenizer, tool_output: str) -> dict[str, int | bool]:
+    """Verify the production final-only empty-output-to-final transition."""
+    manager = ExactIncrementalTokenizerSessionManager(
+        tokenizer=tokenizer,
+        max_sessions=1,
+        session_ttl_seconds=60,
+        checkpoint_interval=8,
+    )
+    initial_prompt = prompt("")
+    final_prompt = prompt(tool_output)
+    start_result = manager.start(
+        session_id="final-only",
+        sequence_no=0,
+        rendered_prompt=initial_prompt,
+        authoritative_token_ids=full_tokens(tokenizer, initial_prompt),
+    )
+    final_result = manager.finalize(
+        session_id="final-only",
+        sequence_no=1,
+        rendered_prompt=final_prompt,
+    )
+    expected_tokens = full_tokens(tokenizer, final_prompt)
+    if final_result.tokens != expected_tokens:
+        raise AssertionError("final-only tokens differ from full tokenization")
+    return {
+        "start_checkpoint_count": start_result.checkpoint_count,
+        "final_checkpoint_count": final_result.checkpoint_count,
+        "checkpoint_mismatches": final_result.checkpoint_mismatches,
+        "encoded_chars": final_result.encoded_chars,
+        "encoded_tokens": final_result.encoded_tokens,
+        "reused_tokens": final_result.reused_tokens,
+        "final_token_count": len(final_result.tokens),
+        "final_tokens_match": True,
+    }
+
+
+def verify_authoritative_prefix_seed(
+    tokenizer, tool_output: str
+) -> dict[str, int | bool]:
+    """Verify EOS-bounded seed tokens against full Qwen tokenization."""
+    template_prefix_tokens = full_tokens(tokenizer, TEMPLATE_PREFIX)
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise AssertionError("tokenizer has no EOS token ID")
+    template_eos_index = max(
+        index
+        for index, token_id in enumerate(template_prefix_tokens)
+        if token_id == eos_token_id
+    )
+    authoritative_prefix_tokens = template_prefix_tokens[: template_eos_index + 1]
+    initial_prompt = prompt("")
+    final_prompt = prompt(tool_output)
+    manager = ExactIncrementalTokenizerSessionManager(
+        tokenizer=tokenizer,
+        max_sessions=1,
+        session_ttl_seconds=60,
+        checkpoint_interval=8,
+    )
+    start_result, start_tokens = manager.start_from_authoritative_prefix(
+        session_id="authoritative-prefix-seed",
+        sequence_no=0,
+        rendered_prompt=initial_prompt,
+        template_prefix_prompt=TEMPLATE_PREFIX,
+        authoritative_prefix_token_ids=authoritative_prefix_tokens,
+    )
+    expected_start_tokens = full_tokens(tokenizer, initial_prompt)
+    if start_tokens != expected_start_tokens:
+        raise AssertionError("prefix-seeded start differs from full tokenization")
+    final_result = manager.finalize(
+        session_id="authoritative-prefix-seed",
+        sequence_no=1,
+        rendered_prompt=final_prompt,
+    )
+    expected_final_tokens = full_tokens(tokenizer, final_prompt)
+    if final_result.tokens != expected_final_tokens:
+        raise AssertionError("prefix-seeded final differs from full tokenization")
+
+    mismatched_prefix_tokens = list(authoritative_prefix_tokens)
+    replacement_token = full_tokens(tokenizer, " replacement")[0]
+    mismatch_index = len(mismatched_prefix_tokens) - 2
+    if mismatched_prefix_tokens[mismatch_index] == replacement_token:
+        raise AssertionError("test replacement token unexpectedly matches")
+    mismatched_prefix_tokens[mismatch_index] = replacement_token
+    mismatch_manager = ExactIncrementalTokenizerSessionManager(
+        tokenizer=tokenizer,
+        max_sessions=1,
+        session_ttl_seconds=60,
+        checkpoint_interval=8,
+    )
+    _, mismatched_start_tokens = mismatch_manager.start_from_authoritative_prefix(
+        session_id="mismatched-authoritative-prefix-seed",
+        sequence_no=0,
+        rendered_prompt=initial_prompt,
+        template_prefix_prompt=TEMPLATE_PREFIX,
+        authoritative_prefix_token_ids=mismatched_prefix_tokens,
+    )
+    expected_mismatched_start = (
+        mismatched_prefix_tokens[:-1] + expected_start_tokens[template_eos_index:]
+    )
+    if mismatched_start_tokens != expected_mismatched_start:
+        raise AssertionError("prefix seed did not preserve authoritative model tokens")
+    mismatched_final_result = mismatch_manager.finalize(
+        session_id="mismatched-authoritative-prefix-seed",
+        sequence_no=1,
+        rendered_prompt=final_prompt,
+    )
+    expected_mismatched_final = (
+        mismatched_prefix_tokens[:-1] + expected_final_tokens[template_eos_index:]
+    )
+    if mismatched_final_result.tokens != expected_mismatched_final:
+        raise AssertionError("prefix-seeded final changed authoritative model tokens")
+    return {
+        "start_checkpoint_count": start_result.checkpoint_count,
+        "start_encoded_chars": start_result.encoded_chars,
+        "start_encoded_tokens": start_result.encoded_tokens,
+        "start_reused_tokens": start_result.reused_tokens,
+        "start_token_count": len(start_tokens),
+        "start_tokens_match": True,
+        "final_tokens_match": True,
+        "mismatched_authoritative_prefix_preserved": True,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.output_chars <= 0 or args.chunk_chars <= 0 or args.repeats <= 0:
@@ -221,6 +345,8 @@ def main() -> None:
             raise AssertionError("incremental tokens differ from full tokenization")
         verified_steps += 1
     fast_final = verify_fast_final(tokenizer, prompts)
+    final_only = verify_final_only(tokenizer, tool_output)
+    authoritative_prefix_seed = verify_authoritative_prefix_seed(tokenizer, tool_output)
 
     full_times = []
     incremental_times = []
@@ -243,6 +369,8 @@ def main() -> None:
         "snapshots": len(prompts),
         "verified_incremental_steps": verified_steps,
         "fast_final": fast_final,
+        "final_only": final_only,
+        "authoritative_prefix_seed": authoritative_prefix_seed,
         "final_prompt_tokens": len(full_tokens(tokenizer, prompts[-1])),
         "full": {
             "mean_seconds": full_mean,
