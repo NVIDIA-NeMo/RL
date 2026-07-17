@@ -42,6 +42,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
 
 # Flag to track if rich logging has been configured
 _rich_logging_configured = False
@@ -1028,6 +1029,8 @@ class Logger(LoggerInterface):
         """
         for logger in self.loggers:
             logger.log_metrics(metrics, step, prefix, step_metric, step_finished)
+
+        tee_rl_metrics_to_otel(metrics, prefix)
 
     def log_hyperparams(self, params: Mapping[str, Any]) -> None:
         """Log hyperparameters to all enabled backends.
