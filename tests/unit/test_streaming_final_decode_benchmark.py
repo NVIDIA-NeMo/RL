@@ -20,6 +20,7 @@ import pytest
 from examples.swe_bench.benchmark_streaming_final_decode import (
     FinalGenerationMeasurement,
     _extract_completion_delta,
+    _max_abs_logprob_delta,
     _paired_summary,
     _parity,
     _parse_positive_ints,
@@ -88,17 +89,26 @@ def test_extract_completion_delta_rejects_missing_sampled_token() -> None:
 
 def test_parity_reports_each_exact_output_contract() -> None:
     reference = _measurement()
-    assert _parity(reference, reference)["all"]
+    assert _parity(reference, reference, logprob_atol=0.0)["all"]
 
     changed = _measurement(logprobs=(-0.1, -0.25))
-    details = _parity(reference, changed)
-    assert details == {
-        "output_token_ids": True,
-        "output_logprobs": False,
-        "output_text": True,
-        "decoded_text": True,
-        "all": False,
-    }
+    details = _parity(reference, changed, logprob_atol=0.04)
+    assert details["output_token_ids"]
+    assert not details["output_logprobs_exact"]
+    assert not details["output_logprobs_within_atol"]
+    assert details["max_abs_logprob_delta"] == pytest.approx(0.05)
+    assert details["logprob_atol"] == 0.04
+    assert details["output_text"]
+    assert details["decoded_text"]
+    assert not details["all"]
+
+    assert _parity(reference, changed, logprob_atol=0.05)["all"]
+
+
+def test_max_abs_logprob_delta_rejects_incompatible_lengths() -> None:
+    assert _max_abs_logprob_delta(
+        _measurement(), _measurement(logprobs=(-0.1,))
+    ) == float("inf")
 
 
 def test_stable_streamed_prefix_drops_mutable_suffix_and_margin() -> None:
