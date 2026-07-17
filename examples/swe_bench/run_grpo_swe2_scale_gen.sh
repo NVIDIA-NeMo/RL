@@ -93,8 +93,8 @@ fi
 MODEL_PATH="${1:-${MODEL_PATH:-${DEFAULT_MODEL_PATH}}}"
 
 # ================ Container and mount config ================
-# NeMo RL nightly used for Nano 3 streaming-prefill development.
-export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/nemo-rl:nightly-071526.squashfs}"
+# NeMo RL nightly-gym used for Nano 3 streaming-prefill development.
+export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/joyang/RL/results/images/nemo-rl-nightly-gym-20260718.squashfs}"
 GYM_CODE="${REPO_ROOT}/3rdparty/Gym-workspace/Gym"
 export MOUNTS="/lustre:/lustre,$PWD:$PWD,${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 
@@ -557,6 +557,10 @@ PERSISTENT_CACHE="${PERSISTENT_CACHE:-${REPO_ROOT}/results/cache/swe_scale/${CAC
 export PERSISTENT_CACHE
 export LUSTRE_UV_CACHE_SEED="${LUSTRE_UV_CACHE_SEED:-${PERSISTENT_CACHE}/uv_seed}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${PERSISTENT_CACHE}/pip}"
+# Never let `uv sync` reuse a worktree `.venv` created under another image.
+# The setup and driver run in the same allocation and rebuild this node-local
+# environment from the image/lock-scoped package cache.
+export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/tmp/nemo_rl_driver_venv}"
 # Gym launches server processes on arbitrary Ray nodes. Keep their venvs on the
 # shared filesystem rather than a node-local /opt path so every actor sees the
 # environment created by the Gym setup process.
@@ -631,7 +635,7 @@ if [ -n "${STREAMING_INITIAL_CHUNK_CHARS}" ]; then
   echo "Streaming initial chunk chars: ${STREAMING_INITIAL_CHUNK_CHARS}"
 fi
 echo "SWE-bench artifact cache offline: ${SWE_BENCH_ARTIFACT_CACHE_OFFLINE}"
-echo "Package caches: uv-local=${UV_CACHE_DIR} uv-seed=${LUSTRE_UV_CACHE_SEED:-none} pip=${PIP_CACHE_DIR}"
+echo "Package caches: uv-local=${UV_CACHE_DIR} uv-seed=${LUSTRE_UV_CACHE_SEED:-none} pip=${PIP_CACHE_DIR} driver-venv=${UV_PROJECT_ENVIRONMENT}"
 echo "Gym shared venv: ${NEMO_GYM_VENV_DIR}"
 echo "uv executable: ${UV_BIN}"
 echo "Ray vLLM venv: ${VLLM_SHARED_VENV} -> ${NEMO_RL_VENV_DIR}/{async-worker,replay,collector} (link-mode=${UV_LINK_MODE})"
@@ -702,11 +706,21 @@ _seed_cache "${LUSTRE_VLLM_CACHE}" "${NRL_VLLM_CACHE_ROOT_BASE}" "vLLM compile"
 _seed_cache "${LUSTRE_INDUCTOR_CACHE}" "${INDUCTOR_CACHE_DIR}" "Inductor"
 _seed_cache "${LUSTRE_TRITON_CACHE}" "${TRITON_CACHE_DIR}" "Triton"
 mkdir -p /tmp/uv_cache
+if [ -d /root/.cache/uv ] && [ "\$(ls -A /root/.cache/uv 2>/dev/null)" ]; then
+  rsync -a --exclude '.tmp*' /root/.cache/uv/ /tmp/uv_cache/ 2>/dev/null \
+    && echo "[CACHE SEED] uv (image): seeded from baked cache" \
+    || echo "[CACHE SEED] uv (image): seed failed (non-fatal)"
+else
+  echo "[CACHE SEED] uv (image): no baked cache"
+fi
 _seed_cache "${LUSTRE_UV_CACHE_SEED}" "/tmp/uv_cache" "uv (prebuilt transformer-engine)"
 echo "[CACHE SEED] Done."
 
 UV_CACHE_DIR=/tmp/uv_cache \
 UV_HTTP_TIMEOUT=3600 \
+TORCH_CUDA_ARCH_LIST='9.0 10.0' \
+NVTE_CUDA_ARCHS='90;100' \
+UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT}" \
   uv sync --frozen --extra mcore
 
 # Persist complete uv cache entries after every successful locked sync. A
@@ -736,6 +750,7 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   HF_HOME=${HF_HOME} \
   HF_DATASETS_CACHE=${HF_DATASETS_CACHE} \
   UV_CACHE_DIR=${UV_CACHE_DIR} \
+  UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} \
   UV_LINK_MODE=${UV_LINK_MODE} \
   PIP_CACHE_DIR=${PIP_CACHE_DIR} \
   NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR} \
@@ -754,6 +769,7 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   UV_HTTP_TIMEOUT=3600 \
   UV_LOCK_TIMEOUT=900 \
   TORCH_CUDA_ARCH_LIST='9.0 10.0' \
+  NVTE_CUDA_ARCHS='90;100' \
   NEMO_GYM_SKIP_VENV_IF_PRESENT=1 \
   uv run --frozen --extra mcore ./examples/nemo_gym/run_grpo_nemo_gym.py \
   --config=${CONFIG_FILE} \
