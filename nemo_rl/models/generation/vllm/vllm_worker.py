@@ -287,7 +287,10 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        _apply_vllm_patches(self.py_executable, extra_env_vars=extra_env_vars)
+        self.vllm_patch_capabilities = _apply_vllm_patches(
+            self.py_executable,
+            extra_env_vars=extra_env_vars,
+        )
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
