@@ -24,11 +24,9 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.algorithms.single_controller_utils import (
-    AsyncRLConfig,
-    MasterConfig,
-    SingleControllerBundle,
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    SingleControllerConfig,
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -156,6 +154,7 @@ class _SyncDPAdapter:
 def test_rollout_pump_writes_expected_tq_data(
     multi_step_setup_vllm_async,  # noqa: F811
     single_multi_step_calculator_input_sample,  # noqa: F811
+    tmp_path,
 ):
     """SC._rollout_pump writes max_rollout_prompts * num_generations rows to TQ with the expected fields and tags."""
     vllm_generation, tokenizer, env_handles, _, _ = multi_step_setup_vllm_async
@@ -176,19 +175,25 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     dp_adapter = _SyncDPAdapter(tq_actor)
 
-    mc = MasterConfig.model_construct(
-        grpo={
-            "max_num_steps": 1,
-            "max_num_epochs": None,
-            "num_generations_per_prompt": num_generations,
+    cfg = SingleControllerConfig.model_construct(
+        batch_selection_strategy="strict_on_policy",
+        max_weight_staleness_versions=0,
+        min_groups_per_batch=1,
+        group_size=num_generations,
+        max_inflight_prompts=max_rollout_prompts,
+        max_buffered_rollouts=max_rollout_prompts,
+        max_train_steps=1,
+        max_num_epochs=None,
+        over_sampling=True,
+        partition_id=_PARTITION_ID,
+        logger={
+            "log_dir": str(tmp_path / "logs"),
+            "wandb_enabled": False,
+            "swanlab_enabled": False,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "monitor_gpus": False,
         },
-        async_rl=AsyncRLConfig(
-            batch_selection_strategy="strict_on_policy",
-            max_weight_staleness_versions=0,
-            min_prompt_groups_per_batch=1,
-            max_inflight_prompts=max_rollout_prompts,
-            max_buffered_rollouts=max_rollout_prompts,
-        ),
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
@@ -209,22 +214,18 @@ def test_rollout_pump_writes_expected_tq_data(
         use_nemo_gym=False,
         tq_buffer=tq_buffer,
     )
-    bundle = SingleControllerBundle(
+    ctrl = SingleControllerActor.remote(
+        cfg=cfg,
+        prompts=[],
+        dp_client_handle=dp_adapter,
         gen_handle=vllm_generation,
         trainer_handle=object(),
-        env_handles=env_handles,
-        train_cluster=None,
-        inference_cluster=None,
-        dp_client=dp_adapter,
-        dataloader=dataloader,
         weight_synchronizer=object(),
-        advantage_estimator=None,
         loss_fn=None,
+        advantage_estimator=None,
         rollout_manager=rollout_manager,
-        tq_buffer=tq_buffer,
-        partition_id=_PARTITION_ID,
+        dataloader=dataloader,
     )
-    ctrl = SingleControllerActor.remote(master_config=mc, bundle=bundle)
 
     vllm_generation.prepare_for_generation()
 

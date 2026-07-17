@@ -76,7 +76,13 @@ class _FakeBuffer:
         # reserve(weight_version=X) -> group_id; commit fills the slot.
         self._slots: list[str] = []
 
-    def reserve(self, *, weight_version: int, group_id: str | None = None) -> str:
+    def reserve(
+        self,
+        *,
+        weight_version: int,
+        target_step: int | None = None,
+        group_id: str | None = None,
+    ) -> str:
         if group_id is None:
             group_id = str(uuid.uuid4())
         self.reserve_calls.append(weight_version)

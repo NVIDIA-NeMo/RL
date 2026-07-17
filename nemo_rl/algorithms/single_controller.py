@@ -116,6 +116,13 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     max_inflight_prompts: int = 8
     max_buffered_rollouts: int = 8  # _buffer_capacity semaphore size
 
+    # Rollout dispatch gating (read by _rollout_pump). over_sampling=False
+    # gates each batch on max_rollout_version vs trainer_version; force_in_order
+    # stamps target_step on each dispatch so downstream consumers can match
+    # rollout batches to trainer steps exactly.
+    over_sampling: bool = False
+    force_in_order: bool = False
+
     # Training
     max_train_steps: int = 10
     max_rollout_prompts: int = 32
@@ -236,6 +243,8 @@ class SingleControllerActor:
         weight_synchronizer: Any,
         loss_fn: Any,
         advantage_estimator: Any | None = None,
+        rollout_manager: Any = None,
+        dataloader: Any = None,
     ) -> None:
         self._cfg = cfg
         self._prompts = prompts
@@ -245,6 +254,8 @@ class SingleControllerActor:
         self._weight_synchronizer = weight_synchronizer
         self._loss_fn = loss_fn
         self._advantage_estimator = advantage_estimator
+        self._rollout_manager = rollout_manager
+        self._dataloader = dataloader
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -313,6 +324,14 @@ class SingleControllerActor:
 
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
+
+        # Rollout batch counter — pre-incremented before each dispatch, so start
+        # at -1 to allow the first batch through the strict_on_policy gate.
+        self._max_rollout_version: int = -1
+
+        # Strong refs to dispatched rollout tasks so asyncio doesn't GC them
+        # while they're still running (removed via done_callback on completion).
+        self._dispatched_rollouts: set[asyncio.Task] = set()
 
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released after clear_samples.
@@ -413,10 +432,10 @@ class SingleControllerActor:
              group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
           5. Decrement _inflight_rollouts
         """
-        sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
-        over_sampling = self._async_cfg.over_sampling
-        max_staleness = self._async_cfg.max_weight_staleness_versions
-        force_in_order = self._async_cfg.force_in_order
+        sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
+        over_sampling = self._cfg.over_sampling
+        max_staleness = self._cfg.max_weight_staleness_versions
+        force_in_order = self._cfg.force_in_order
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
@@ -427,7 +446,7 @@ class SingleControllerActor:
                 await self._rollout_manager.generate_and_push(
                     prompt, target_step=target_step
                 )
-                if self._diagnostics:
+                if self._cfg.diagnostics:
                     content = ""
                     for i in range(len(prompt["message_log"])):
                         if prompt["message_log"][i]["role"] == "user":
@@ -438,7 +457,7 @@ class SingleControllerActor:
                 self._inflight_rollouts -= 1
                 sem.release()
 
-        max_epochs = self._master_config.grpo["max_num_epochs"]
+        max_epochs = self._cfg.max_num_epochs
         epoch = 0
         while max_epochs is None or epoch < max_epochs:
             for prompt_batch in self._dataloader:
