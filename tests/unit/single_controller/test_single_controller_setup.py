@@ -238,7 +238,6 @@ class TestSetup:
         )
         assert bundle.dataloader is patched_factories["dataloader"]
         assert bundle.val_dataloader is None
-        assert bundle.validation_rollout_manager is None
         assert bundle.weight_synchronizer is (
             patched_factories["create_weight_synchronizer"].return_value
         )
@@ -251,6 +250,8 @@ class TestSetup:
         assert bundle.rollout_manager is not None
         # rollout_manager binds the same tq_buffer for the writer + sampler.
         assert bundle.rollout_manager._tq_buffer is bundle.tq_buffer
+        assert bundle.rollout_manager._env_handles is bundle.env_handles
+        assert bundle.rollout_manager._val_env_handles is bundle.val_env_handles
         # tq_buffer wires the dp_client + default partition.
         assert bundle.tq_buffer._dp_client is bundle.dp_client
         assert bundle.partition_id == "rollout_data"
@@ -274,13 +275,12 @@ class TestSetup:
             "num_workers": 0,
         }
 
-        validation_manager = bundle.validation_rollout_manager
-        assert validation_manager is not None
-        assert validation_manager._num_generations_per_prompt == 1
-        assert validation_manager._tq_buffer is None
-        assert validation_manager._impl._env_handles is bundle.val_env_handles
+        rollout_manager = bundle.rollout_manager
+        assert rollout_manager._env_handles is bundle.env_handles
+        assert rollout_manager._val_env_handles is bundle.val_env_handles
+        assert rollout_manager._tq_buffer is bundle.tq_buffer
         assert (
-            validation_manager._impl._policy_generation
+            rollout_manager._impl._policy_generation
             is patched_factories["_build_generation"].return_value
         )
 
@@ -345,19 +345,9 @@ class TestSetup:
         nemo_gym_actor = patched_factories["spinup_nemo_gym_actor"].return_value
         assert bundle.env_handles["nemo_gym"] is nemo_gym_actor
         assert bundle.val_env_handles["nemo_gym"] is nemo_gym_actor
-        assert (
-            bundle.rollout_manager._impl._env_handles["nemo_gym"] is nemo_gym_actor
-        )
-        validation_manager = bundle.validation_rollout_manager
-        assert validation_manager is not None
-        assert validation_manager._impl._env_handles["nemo_gym"] is nemo_gym_actor
-        assert type(validation_manager._impl) is type(bundle.rollout_manager._impl)
-        assert (
-            validation_manager._impl._generation_config
-            is bundle.rollout_manager._impl._generation_config
-        )
-        assert validation_manager._num_generations_per_prompt == 1
-        assert validation_manager._tq_buffer is None
+        assert bundle.rollout_manager._env_handles["nemo_gym"] is nemo_gym_actor
+        assert bundle.rollout_manager._val_env_handles["nemo_gym"] is nemo_gym_actor
+        assert bundle.rollout_manager._tq_buffer is bundle.tq_buffer
         val_loader_call = patched_factories["StatefulDataLoader"].call_args_list[1]
         assert val_loader_call.kwargs["batch_size"] == expected_batch_size
         patched_factories["spinup_nemo_gym_actor"].assert_called_once()

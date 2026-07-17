@@ -114,7 +114,6 @@ class SingleControllerActor:
         self._loss_fn = bundle.loss_fn
         self._buffer = bundle.tq_buffer
         self._rollout_manager = bundle.rollout_manager
-        self._validation_rollout_manager = bundle.validation_rollout_manager
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -351,7 +350,7 @@ class SingleControllerActor:
 
     async def _run_validation(self, *, step: int) -> dict[str, Any]:
         """Run one validation pass against the synchronized generator."""
-        if self._val_dataloader is None or self._validation_rollout_manager is None:
+        if self._val_dataloader is None:
             raise RuntimeError(
                 "SingleController validation resources were not initialized."
             )
@@ -384,7 +383,11 @@ class SingleControllerActor:
                     prompts.append(prompt)
                 results = await asyncio.gather(
                     *(
-                        self._validation_rollout_manager.run_rollout(prompt)
+                        self._rollout_manager.run_rollout(
+                            prompt,
+                            num_generations_per_prompt=1,
+                            is_validation=True,
+                        )
                         for prompt in prompts
                     ),
                     return_exceptions=True,
@@ -477,6 +480,9 @@ class SingleControllerActor:
         over_sampling = self._async_cfg.over_sampling
         max_staleness = self._async_cfg.max_weight_staleness_versions
         force_in_order = self._async_cfg.force_in_order
+        num_generations_per_prompt = self._master_config.grpo[
+            "num_generations_per_prompt"
+        ]
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
@@ -485,7 +491,9 @@ class SingleControllerActor:
             self._inflight_rollouts += 1
             try:
                 await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
+                    prompt,
+                    num_generations_per_prompt=num_generations_per_prompt,
+                    target_step=target_step,
                 )
                 if self._diagnostics:
                     content = ""

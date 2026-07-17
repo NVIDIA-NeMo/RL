@@ -327,7 +327,6 @@ def _make_bundle(
         advantage_estimator=None,
         loss_fn=object(),
         rollout_manager=_FakeRolloutManager(),
-        validation_rollout_manager=None,
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),
         partition_id=_PARTITION_ID,
         save_state=(

@@ -229,7 +229,7 @@ def test_rollout_pump_writes_expected_tq_data(
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         env_handles=env_handles,
-        num_generations_per_prompt=num_generations,
+        val_env_handles={},
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
@@ -250,7 +250,6 @@ def test_rollout_pump_writes_expected_tq_data(
         advantage_estimator=None,
         loss_fn=None,
         rollout_manager=rollout_manager,
-        validation_rollout_manager=None,
         tq_buffer=tq_buffer,
         partition_id=_PARTITION_ID,
         save_state=_default_grpo_save_state(),

@@ -329,6 +329,7 @@ class _ValidationRolloutManager:
         self._outcomes = outcomes
         self._releases = releases or {}
         self.calls: list[dict[str, Any]] = []
+        self.call_options: list[tuple[int, bool]] = []
         self.started: dict[int, asyncio.Event] = {
             idx: asyncio.Event() for idx in outcomes
         }
@@ -336,8 +337,17 @@ class _ValidationRolloutManager:
             idx: asyncio.Event() for idx in outcomes
         }
 
-    async def run_rollout(self, prompt: dict[str, Any]) -> PromptGroupRecord:
+    async def run_rollout(
+        self,
+        prompt: dict[str, Any],
+        *,
+        num_generations_per_prompt: int,
+        is_validation: bool = False,
+    ) -> PromptGroupRecord:
+        assert num_generations_per_prompt == 1
+        assert is_validation
         self.calls.append(prompt)
+        self.call_options.append((num_generations_per_prompt, is_validation))
         idx = prompt["idx"]
         self.started[idx].set()
         try:
@@ -363,7 +373,7 @@ def _make_validation_actor(
     actor = object.__new__(_ACTOR_CLS)
     logger = _ValidationLogger()
     actor._val_dataloader = batches
-    actor._validation_rollout_manager = manager
+    actor._rollout_manager = manager
     actor._master_config = SimpleNamespace(
         grpo={"max_val_samples": max_val_samples},
         logger={
@@ -414,6 +424,7 @@ def test_validation_executor_aggregates_and_preserves_input_order(monkeypatch) -
             "num_samples": 3,
         }
         assert [prompt["idx"] for prompt in manager.calls] == [0, 1, 2]
+        assert manager.call_options == [(1, True)] * 3
         assert set(manager.calls[0]) == {
             "idx",
             "message_log",

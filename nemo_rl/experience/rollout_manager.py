@@ -41,35 +41,39 @@ TokenizerType = PreTrainedTokenizerBase
 class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
-    Each run_rollout takes one prompt and returns num_generations_per_prompt completions
+    Each run_rollout takes one prompt and returns the requested number of completions
     generated concurrently via asyncio.gather.
     """
 
     def __init__(
         self,
         tokenizer: TokenizerType,
-        env_handles: dict[str, EnvironmentInterface],
-        num_generations_per_prompt: int,
         max_seq_len: int,
         policy_generation: GenerationInterface,
         max_rollout_turns: int = 999999,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
-        self._env_handles = env_handles
-        self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
         self._policy_generation = policy_generation
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
-        """Run num_generations_per_prompt rollouts for one prompt.
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        *,
+        env_handles: dict[str, EnvironmentInterface],
+        num_generations_per_prompt: int,
+    ) -> PromptGroupRecord:
+        """Run the requested number of rollouts for one prompt.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
+            env_handles: Environments used to score and advance the rollouts.
+            num_generations_per_prompt: Number of completions to generate.
 
         Returns:
-            PromptGroupRecord with num_generations_per_prompt completions.
+            PromptGroupRecord with the requested number of completions.
         """
         timer = Timer()
         timer_prefix = "timing/rollout"
@@ -79,8 +83,12 @@ class AsyncRolloutImpl:
             results = list(
                 await asyncio.gather(
                     *[
-                        self._run_single_rollout(input_sample, traj_idx)
-                        for traj_idx in range(self._num_generations_per_prompt)
+                        self._run_single_rollout(
+                            input_sample,
+                            traj_idx,
+                            env_handles=env_handles,
+                        )
+                        for traj_idx in range(num_generations_per_prompt)
                     ]
                 )
             )
@@ -105,7 +113,11 @@ class AsyncRolloutImpl:
         )
 
     async def _run_single_rollout(
-        self, input_sample: DatumSpec, traj_idx: int
+        self,
+        input_sample: DatumSpec,
+        traj_idx: int,
+        *,
+        env_handles: dict[str, EnvironmentInterface],
     ) -> tuple[Completion, dict]:
         """Run one multi-turn rollout for a single generation index."""
         current_message_log = copy.deepcopy(input_sample["message_log"])
@@ -189,7 +201,7 @@ class AsyncRolloutImpl:
             # step. In this case, need to wrap with asyncio.to_thread to make
             # this function yieldable.
             env_output = await asyncio.to_thread(
-                calculate_rewards, sample_batch, self._env_handles
+                calculate_rewards, sample_batch, env_handles
             )
 
             # Update reward and termination statistics
@@ -393,45 +405,55 @@ class AsyncRolloutImpl:
 class AsyncNemoGymRolloutImpl:
     """Manages per-prompt NeMo-Gym rollouts, producing a PromptGroupRecord per call.
 
-    Each run_rollout takes one prompt and returns num_generations_per_prompt completions
+    Each run_rollout takes one prompt and returns the requested number of completions
     batched through a single NeMo-Gym run_rollouts call.
     """
 
     def __init__(
         self,
         tokenizer: TokenizerType,
-        env_handles: dict[str, EnvironmentInterface],
-        num_generations_per_prompt: int,
         max_seq_len: int,
         generation_config: GenerationConfig,
         max_rollout_turns: int,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
-        self._env_handles = env_handles
-        self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
 
         self._validate_init_params()
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
-        """Run num_generations_per_prompt rollouts for one prompt.
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        *,
+        env_handles: dict[str, EnvironmentInterface],
+        num_generations_per_prompt: int,
+    ) -> PromptGroupRecord:
+        """Run the requested number of rollouts for one prompt.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
+            env_handles: Environments used to execute the rollouts.
+            num_generations_per_prompt: Number of completions to generate.
 
         Returns:
-            PromptGroupRecord with num_generations_per_prompt completions.
+            PromptGroupRecord with the requested number of completions.
         """
         timer = Timer()
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
-        rollout_inputs = self._build_inputs(input_sample)
+        rollout_inputs = self._build_inputs(
+            input_sample,
+            num_generations_per_prompt=num_generations_per_prompt,
+        )
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
-            rollout_inputs, timer, timer_prefix
+            rollout_inputs,
+            timer,
+            timer_prefix,
+            env_handles=env_handles,
         )
 
         timer.stop(f"{timer_prefix}/total")
@@ -460,7 +482,12 @@ class AsyncNemoGymRolloutImpl:
             "Please set `max_rollout_turns` to 1."
         )
 
-    def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
+    def _build_inputs(
+        self,
+        input_sample: DatumSpec,
+        *,
+        num_generations_per_prompt: int,
+    ) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
@@ -482,17 +509,22 @@ class AsyncNemoGymRolloutImpl:
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         rows = []
-        for i in range(self._num_generations_per_prompt):
+        for i in range(num_generations_per_prompt):
             row = copy.deepcopy(template_row)
             row["_rowidx"] = i
             rows.append(row)
         return rows
 
     async def _run_rollouts(
-        self, inputs: list[dict], timer: Timer, timer_prefix: str
+        self,
+        inputs: list[dict],
+        timer: Timer,
+        timer_prefix: str,
+        *,
+        env_handles: dict[str, EnvironmentInterface],
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
-        nemo_gym_env = self._env_handles["nemo_gym"]
+        nemo_gym_env = env_handles["nemo_gym"]
 
         # Run generation.
         with timer.time(f"{timer_prefix}/run_rollouts"):
@@ -620,8 +652,9 @@ class RolloutManager:
     def __init__(
         self,
         tokenizer: TokenizerType,
+        *,
         env_handles: dict[str, EnvironmentInterface],
-        num_generations_per_prompt: int,
+        val_env_handles: dict[str, EnvironmentInterface],
         max_seq_len: int,
         max_rollout_turns: Optional[int] = None,
         policy_generation: Optional[GenerationInterface] = None,
@@ -629,10 +662,6 @@ class RolloutManager:
         use_nemo_gym: bool = False,
         tq_buffer: Optional[TQReplayBuffer] = None,
     ) -> None:
-        assert num_generations_per_prompt >= 1, (
-            "num_generations_per_prompt must be >= 1"
-        )
-
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
             assert policy_generation is not None, (
@@ -648,15 +677,14 @@ class RolloutManager:
 
         self._impl: AsyncRolloutImpl | AsyncNemoGymRolloutImpl = rollout_cls(
             tokenizer=tokenizer,
-            env_handles=env_handles,
-            num_generations_per_prompt=num_generations_per_prompt,
             max_seq_len=max_seq_len,
             max_rollout_turns=max_rollout_turns,  # type: ignore
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
         )
         self._tokenizer = tokenizer
-        self._num_generations_per_prompt = num_generations_per_prompt
+        self._env_handles = env_handles
+        self._val_env_handles = val_env_handles
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
 
@@ -668,18 +696,50 @@ class RolloutManager:
         """
         self._weight_version = int(version)
 
-    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
-        return await self._impl.run_rollout(input_sample)
+    async def run_rollout(
+        self,
+        input_sample: DatumSpec,
+        *,
+        num_generations_per_prompt: int,
+        is_validation: bool = False,
+    ) -> PromptGroupRecord:
+        """Run one prompt against the training or validation environments.
+
+        Args:
+            input_sample: A single prompt (one DatumSpec entry).
+            num_generations_per_prompt: Number of completions to generate.
+            is_validation: Whether to use the validation environment handles.
+
+        Returns:
+            The prompt and its generated completions.
+        """
+        assert num_generations_per_prompt >= 1, (
+            "num_generations_per_prompt must be >= 1"
+        )
+        env_handles = self._val_env_handles if is_validation else self._env_handles
+        return await self._impl.run_rollout(
+            input_sample,
+            env_handles=env_handles,
+            num_generations_per_prompt=num_generations_per_prompt,
+        )
 
     async def generate_and_push(
-        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+        self,
+        input_sample: DatumSpec,
+        *,
+        num_generations_per_prompt: int,
+        target_step: Optional[int] = None,
     ) -> None:
         """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
+            num_generations_per_prompt: Number of completions to generate.
             target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
         """
+        assert num_generations_per_prompt >= 1, (
+            "num_generations_per_prompt must be >= 1"
+        )
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
         )
@@ -688,7 +748,10 @@ class RolloutManager:
             weight_version=start_version, target_step=target_step
         )
 
-        record = await self.run_rollout(input_sample)
+        record = await self.run_rollout(
+            input_sample,
+            num_generations_per_prompt=num_generations_per_prompt,
+        )
         end_version = self._weight_version
 
         await self._tq_buffer.commit(

@@ -78,7 +78,6 @@ class SingleControllerBundle:
     advantage_estimator: Any
     loss_fn: LossFunction
     rollout_manager: RolloutManager
-    validation_rollout_manager: Optional[RolloutManager]
     tq_buffer: TQReplayBuffer
     partition_id: str
     save_state: GRPOSaveState
@@ -510,7 +509,7 @@ def setup_single_controller(
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         env_handles=env_handles,
-        num_generations_per_prompt=grpo_config["num_generations_per_prompt"],
+        val_env_handles=val_env_handles,
         max_seq_len=_generation_max_seq_len(generation_config),
         max_rollout_turns=grpo_config.get("max_rollout_turns"),
         policy_generation=generation,
@@ -518,19 +517,6 @@ def setup_single_controller(
         use_nemo_gym=use_nemo_gym,
         tq_buffer=tq_buffer,
     )
-    validation_rollout_manager: Optional[RolloutManager] = None
-    if validation_enabled:
-        validation_rollout_manager = RolloutManager(
-            tokenizer=tokenizer,
-            env_handles=val_env_handles,
-            num_generations_per_prompt=1,
-            max_seq_len=_generation_max_seq_len(generation_config),
-            max_rollout_turns=grpo_config.get("max_rollout_turns"),
-            policy_generation=generation,
-            generation_config=generation_config,
-            use_nemo_gym=use_nemo_gym,
-            tq_buffer=None,
-        )
 
     return SingleControllerBundle(
         gen_handle=generation,
@@ -546,7 +532,6 @@ def setup_single_controller(
         advantage_estimator=advantage_estimator,
         loss_fn=loss_fn,
         rollout_manager=rollout_manager,
-        validation_rollout_manager=validation_rollout_manager,
         tq_buffer=tq_buffer,
         partition_id=partition_id,
         save_state=save_state,
