@@ -35,6 +35,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 class _FakeWorker(TQWorkerMixin):
     def __init__(self, client: NoOpDataPlaneClient, *, is_leader: bool) -> None:
         self._dp_client = client
+        self._dp_cfg = None
         self._is_leader = is_leader
 
     def _is_replica_leader(self) -> bool:  # type: ignore[override]
@@ -106,6 +107,7 @@ def test_writeback_single_worker_default_is_leader():
     class _SingleWorker(TQWorkerMixin):
         def __init__(self, client: NoOpDataPlaneClient) -> None:
             self._dp_client = client
+            self._dp_cfg = None
 
         def _local_coords(self) -> dict[str, int]:
             # No replicated axes — every axis check trivially True.

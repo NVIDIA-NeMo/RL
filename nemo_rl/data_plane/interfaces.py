@@ -68,6 +68,10 @@ class DataPlaneConfig(TypedDict):
     claim_meta_poll_interval_s: float
     global_segment_size: int
     local_buffer_size: int
+    mooncake_batch_size_limit: NotRequired[int]
+    mooncake_max_worker_threads: NotRequired[int]
+    teacher_topk_logits_dtype: NotRequired[str]
+    teacher_topk_indices_dtype: NotRequired[str]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]

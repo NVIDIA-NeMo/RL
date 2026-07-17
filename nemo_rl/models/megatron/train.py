@@ -533,9 +533,16 @@ class LogprobsPostProcessor:
 
 
 class TopkLogitsPostProcessor:
-    def __init__(self, cfg: PolicyConfig, k: int):
+    def __init__(
+        self,
+        cfg: PolicyConfig,
+        k: int,
+        *,
+        trim_to_input_lengths: bool = False,
+    ):
         self.cfg = cfg
         self.k = k
+        self.trim_to_input_lengths = trim_to_input_lengths
 
     def __call__(
         self,
@@ -560,6 +567,12 @@ class TopkLogitsPostProcessor:
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
+        output_seqlen = unpacked_seqlen
+        if pack and self.trim_to_input_lengths and seq_lengths.numel() > 0:
+            output_seqlen = min(
+                unpacked_seqlen,
+                max(0, int(seq_lengths.max().item())),
+            )
 
         def processor_fn_inner(output_tensor):
             tp_grp = get_tensor_model_parallel_group()
@@ -645,12 +658,12 @@ class TopkLogitsPostProcessor:
             if pack:
                 batch_size = data_dict["input_ids"].shape[0]
                 out_vals = torch.zeros(
-                    (batch_size, unpacked_seqlen, self.k),
+                    (batch_size, output_seqlen, self.k),
                     dtype=topk_vals_full.dtype,
                     device=topk_vals_full.device,
                 )
                 out_idx = torch.zeros(
-                    (batch_size, unpacked_seqlen, self.k),
+                    (batch_size, output_seqlen, self.k),
                     dtype=topk_idx_full.dtype,
                     device=topk_idx_full.device,
                 )
@@ -658,11 +671,12 @@ class TopkLogitsPostProcessor:
                     seq_len = int(seq_lengths[i].item())
                     start_idx = int(cu_seqlens_padded[i].item())
                     if seq_len > 0:
-                        out_vals[i, :seq_len, :] = topk_vals_full[
-                            0, start_idx : start_idx + seq_len, :
+                        copy_len = min(seq_len, output_seqlen)
+                        out_vals[i, :copy_len, :] = topk_vals_full[
+                            0, start_idx : start_idx + copy_len, :
                         ]
-                        out_idx[i, :seq_len, :] = topk_idx_full[
-                            0, start_idx : start_idx + seq_len, :
+                        out_idx[i, :copy_len, :] = topk_idx_full[
+                            0, start_idx : start_idx + copy_len, :
                         ]
                 return output_tensor.new_zeros(()), {
                     "topk_logits": out_vals,

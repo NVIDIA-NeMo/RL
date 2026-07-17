@@ -380,3 +380,11 @@ class PolicyConfig(TypedDict):
     quant_calib_size: NotRequired[int | None]
     quant_batch_size: NotRequired[int | None]
     quant_sequence_length: NotRequired[int | None]
+    # If true, use standard Megatron layer specs while keeping ModelOpt
+    # quantization enabled. Useful for Nano3/QARL paths where the ModelOpt
+    # GPT/MoE layer spec is not compatible with the requested parallel layout.
+    disable_modelopt_layer_spec: NotRequired[bool]
+    # Optional Nano3 Mamba stack override for ModelOpt quantized workers.
+    # "default" uses the Megatron-Bridge TE/default Mamba stack; "modelopt"
+    # uses the ModelOpt Mamba stack.
+    quant_mamba_stack_spec: NotRequired[Literal["default", "modelopt"]]

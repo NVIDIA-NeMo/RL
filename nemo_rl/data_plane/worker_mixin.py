@@ -27,6 +27,7 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
+from math import prod
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
@@ -131,12 +132,14 @@ class TQWorkerMixin:
     """
 
     _dp_client: Optional[DataPlaneClient] = None
+    _dp_cfg: Optional[DataPlaneConfig] = None
 
     def setup_data_plane(self, cfg: DataPlaneConfig) -> None:
         """Connect this worker process's client to the existing TQ controller.
 
         Called once by the driver after worker construction. Idempotent.
         """
+        self._dp_cfg = cfg
         if self._dp_client is not None:
             return
         from nemo_rl.data_plane import build_data_plane_client
@@ -394,6 +397,120 @@ class TQWorkerMixin:
 
         write_columns(self._require_dp_client(), meta, fields)
 
+    def _write_back_per_token(
+        self,
+        meta: "KVBatchMeta",
+        fields: dict[str, torch.Tensor],
+        field_dtypes: dict[str, torch.dtype] | None = None,
+    ) -> None:
+        """Leader-only ``put_samples`` for known per-token write-back fields."""
+        if not self._is_replica_leader() or not fields:
+            return
+        from nemo_rl.data_plane.column_io import write_per_token_columns
+
+        write_per_token_columns(
+            self._require_dp_client(),
+            meta,
+            fields,
+            field_dtypes=field_dtypes,
+        )
+
+    def _teacher_topk_writeback_dtype(self, cfg_key: str) -> Optional[torch.dtype]:
+        cfg = self._dp_cfg or {}
+        raw_dtype = cfg.get(cfg_key)
+        if raw_dtype in (None, "", "none", "None", "null", "Null"):
+            return None
+        dtype_name = str(raw_dtype).lower()
+        dtype_map = {
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "int64": torch.int64,
+            "long": torch.long,
+            "int32": torch.int32,
+        }
+        if dtype_name not in dtype_map:
+            valid = ", ".join(sorted(dtype_map))
+            raise ValueError(
+                f"Unsupported data_plane.{cfg_key}={raw_dtype!r}; "
+                f"expected one of: {valid}."
+            )
+        return dtype_map[dtype_name]
+
+    def _teacher_topk_writeback_dtypes(
+        self,
+        topk_indices: torch.Tensor,
+    ) -> dict[str, torch.dtype]:
+        logits_dtype = self._teacher_topk_writeback_dtype("teacher_topk_logits_dtype")
+        indices_dtype = self._teacher_topk_writeback_dtype("teacher_topk_indices_dtype")
+        field_dtypes: dict[str, torch.dtype] = {}
+
+        if logits_dtype is not None:
+            if not torch.empty((), dtype=logits_dtype).is_floating_point():
+                raise ValueError(
+                    "data_plane.teacher_topk_logits_dtype must be a floating dtype."
+                )
+            field_dtypes[TEACHER_TOPK_LOGITS] = logits_dtype
+
+        if indices_dtype is not None:
+            if indices_dtype not in (torch.int32, torch.int64, torch.long):
+                raise ValueError(
+                    "data_plane.teacher_topk_indices_dtype must be int32 or int64."
+                )
+            if indices_dtype == torch.int32 and topk_indices.numel() > 0:
+                int32_info = torch.iinfo(torch.int32)
+                min_index = int(topk_indices.min().item())
+                max_index = int(topk_indices.max().item())
+                if min_index < int32_info.min or max_index > int32_info.max:
+                    raise ValueError(
+                        "data_plane.teacher_topk_indices_dtype=int32 cannot represent "
+                        f"teacher top-k index range [{min_index}, {max_index}]."
+                    )
+            field_dtypes[TEACHER_TOPK_INDICES] = indices_dtype
+
+        return field_dtypes
+
+    def _topk_payload_nbytes_with_dtypes(
+        self,
+        topk_logits: torch.Tensor,
+        topk_indices: torch.Tensor,
+        sequence_lengths: list[int] | None,
+        field_dtypes: dict[str, torch.dtype],
+    ) -> int:
+        def _field_nbytes(
+            tensor: torch.Tensor,
+            *,
+            field_name: str,
+        ) -> int:
+            dtype = field_dtypes.get(field_name, tensor.dtype)
+            elem_size = torch.empty((), dtype=dtype).element_size()
+            if (
+                sequence_lengths is None
+                or tensor.dim() < 2
+                or tensor.shape[0] != len(sequence_lengths)
+            ):
+                return int(tensor.numel() * elem_size)
+
+            max_seq_len = int(tensor.shape[1])
+            valid_tokens = sum(
+                min(max(int(length), 0), max_seq_len) for length in sequence_lengths
+            )
+            trailing_elems = (
+                prod(int(size) for size in tensor.shape[2:]) if tensor.dim() > 2 else 1
+            )
+            return int(valid_tokens * trailing_elems * elem_size)
+
+        return _field_nbytes(
+            topk_logits,
+            field_name=TEACHER_TOPK_LOGITS,
+        ) + _field_nbytes(
+            topk_indices,
+            field_name=TEACHER_TOPK_INDICES,
+        )
+
     def _write_back_result_field(
         self,
         meta: "KVBatchMeta",
@@ -570,15 +687,45 @@ class TQWorkerMixin:
             if is_writeback_leader
             else 0
         )
+        if not is_writeback_leader:
+            del result, data, topk_logits, topk_indices
+            import gc
+
+            gc.collect()
+            return {
+                "teacher_topk_payload_bytes": 0,
+                "teacher_topk_valid_payload_bytes": 0,
+                "teacher_topk_padding_overhead_bytes": 0,
+                "tq_teacher_topk_payload_bytes": 0,
+                "tq_teacher_topk_valid_payload_bytes": 0,
+                "tq_teacher_topk_padding_overhead_bytes": 0,
+                "tq_teacher_topk_write_bytes": 0,
+                "tq_teacher_topk_write_num_samples": 0,
+                "tq_teacher_topk_write_ms": 0.0,
+            }
+
+        field_dtypes = self._teacher_topk_writeback_dtypes(topk_indices)
+        tq_teacher_topk_valid_payload_bytes = self._topk_payload_nbytes_with_dtypes(
+            topk_logits,
+            topk_indices,
+            meta.sequence_lengths,
+            field_dtypes,
+        )
+        del result, data
         write_start = monotonic()
-        self._write_back(
+        self._write_back_per_token(
             meta,
             {
-                TEACHER_TOPK_LOGITS: topk_logits.detach().to("cpu"),
-                TEACHER_TOPK_INDICES: topk_indices.detach().to("cpu"),
+                TEACHER_TOPK_LOGITS: topk_logits,
+                TEACHER_TOPK_INDICES: topk_indices,
             },
+            field_dtypes=field_dtypes,
         )
-        write_ms = (monotonic() - write_start) * 1000.0 if is_writeback_leader else 0.0
+        write_ms = (monotonic() - write_start) * 1000.0
+        del topk_logits, topk_indices
+        import gc
+
+        gc.collect()
         return {
             "teacher_topk_payload_bytes": teacher_topk_payload_bytes,
             "teacher_topk_valid_payload_bytes": teacher_topk_valid_payload_bytes,
@@ -586,7 +733,10 @@ class TQWorkerMixin:
                 teacher_topk_payload_bytes - teacher_topk_valid_payload_bytes,
                 0,
             ),
-            "tq_teacher_topk_write_bytes": teacher_topk_valid_payload_bytes,
+            "tq_teacher_topk_payload_bytes": tq_teacher_topk_valid_payload_bytes,
+            "tq_teacher_topk_valid_payload_bytes": tq_teacher_topk_valid_payload_bytes,
+            "tq_teacher_topk_padding_overhead_bytes": 0,
+            "tq_teacher_topk_write_bytes": tq_teacher_topk_valid_payload_bytes,
             "tq_teacher_topk_write_num_samples": len(meta.sample_ids)
             if is_writeback_leader
             else 0,

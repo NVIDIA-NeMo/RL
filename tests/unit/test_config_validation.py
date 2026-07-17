@@ -29,6 +29,7 @@ from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
+    parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
 
@@ -90,6 +91,44 @@ configs_dir = Path(
 ).resolve()
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
+
+
+def test_distillation_entropy_loss_overrides_are_declared():
+    """Entropy-aware distillation knobs should work with normal dot overrides."""
+    config = load_config_with_inheritance(str(configs_dir / "distillation_math.yaml"))
+
+    config = parse_hydra_overrides(
+        config,
+        [
+            "loss_fn.sft_weight=0.0",
+            "loss_fn.entropy_diagnostics.enabled=True",
+            "loss_fn.entropy_diagnostics.teacher_entropy_low=0.25",
+            "loss_fn.entropy_diagnostics.teacher_entropy_high=0.75",
+            "loss_fn.entropy_diagnostics.log_position_buckets=False",
+            "loss_fn.entropy_aware.enabled=True",
+            "loss_fn.entropy_aware.teacher_entropy_threshold=0.8",
+            "loss_fn.entropy_aware.weighting_mode=linear_ramp",
+            "loss_fn.entropy_aware.ramp_start=0.3",
+            "loss_fn.entropy_aware.ramp_width=0.6",
+            "loss_fn.entropy_aware.forward_kl_weight=1.0",
+            "loss_fn.entropy_aware.high_entropy_reverse_kl_weight=0.5",
+            "loss_fn.entropy_aware.high_entropy_reverse_kl_threshold=0.7",
+            "loss_fn.entropy_aware.low_entropy_sharpening_enabled=True",
+            "loss_fn.entropy_aware.low_entropy_sharpening_weight=0.03",
+            "loss_fn.entropy_aware.low_entropy_sharpening_temperature=0.9",
+            "loss_fn.entropy_aware.low_entropy_sharpening_support_ratio_threshold=1.0",
+            "loss_fn.entropy_aware.low_entropy_sharpening_requires_support_ratio_above_threshold=True",
+            "loss_fn.entropy_aware.require_sft_weight_zero=True",
+            "loss_fn.entropy_aware.require_zero_outside_topk_false=True",
+        ],
+    )
+
+    assert config.loss_fn.entropy_diagnostics.enabled is True
+    assert config.loss_fn.entropy_diagnostics.log_position_buckets is False
+    assert config.loss_fn.entropy_aware.enabled is True
+    assert config.loss_fn.entropy_aware.weighting_mode == "linear_ramp"
+    assert config.loss_fn.entropy_aware.high_entropy_reverse_kl_weight == 0.5
+    assert config.loss_fn.entropy_aware.low_entropy_sharpening_enabled is True
 
 
 @pytest.mark.parametrize("config_file", config_files)

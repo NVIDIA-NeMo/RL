@@ -108,6 +108,21 @@ def prepare_loss_input(
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
         calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+        active_token_mask = None
+        if "token_mask" in data and "sample_mask" in data:
+            topk_seq_len = int(data["teacher_topk_logits"].shape[1])
+            token_mask = data["token_mask"].to(dtype=torch.bool)
+            sample_mask = data["sample_mask"].to(dtype=torch.bool)
+            active_token_mask = torch.zeros(
+                (token_mask.shape[0], topk_seq_len),
+                device=token_mask.device,
+                dtype=torch.bool,
+            )
+            active_len = min(topk_seq_len - 1, token_mask.shape[1] - 1)
+            if active_len > 0:
+                active_token_mask[:, :active_len] = token_mask[
+                    :, 1 : active_len + 1
+                ] & sample_mask.unsqueeze(-1)
         student_topk_logprobs, teacher_topk_logprobs, H_all = (
             get_distillation_topk_logprobs_from_logits(
                 student_logits=logits,
@@ -115,6 +130,7 @@ def prepare_loss_input(
                 teacher_topk_indices=data["teacher_topk_indices"],
                 zero_outside_topk=loss_fn.zero_outside_topk,
                 calculate_entropy=calculate_entropy,
+                active_token_mask=active_token_mask,
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,

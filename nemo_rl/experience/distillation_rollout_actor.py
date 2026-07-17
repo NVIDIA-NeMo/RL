@@ -22,7 +22,11 @@ import numpy as np
 import ray
 import torch
 
-from nemo_rl.algorithms.grpo import _should_use_async_rollouts
+from nemo_rl.algorithms.grpo import (
+    _should_log_nemo_gym_responses,
+    _should_use_async_rollouts,
+    _should_use_nemo_gym,
+)
 from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
@@ -34,6 +38,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -103,16 +108,34 @@ class DistillationRolloutActor:
             input_batch=input_batch,
             tokenizer=self.tokenizer,
             task_to_env=task_to_env,
-            max_seq_len=cfg.policy["max_total_sequence_length"],
-            max_rollout_turns=cfg.distillation["max_rollout_turns"],
             greedy=False,
         )
-        if _should_use_async_rollouts(cfg):
+        if _should_use_nemo_gym(cfg):
+            nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                **rollout_kwargs,
+                max_seq_len=cfg.policy["max_total_sequence_length"],
+                generation_config=cfg.policy["generation"],
+                max_rollout_turns=None,
+            )
+            final_batch = nemo_gym_rollout_result.final_batch
+            rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+            del nemo_gym_rollout_result
+            if not _should_log_nemo_gym_responses(cfg):
+                for key in list(rollout_metrics):
+                    if "full_result" in key:
+                        rollout_metrics.pop(key)
+        elif _should_use_async_rollouts(cfg):
             final_batch, rollout_metrics = run_async_multi_turn_rollout(
-                **rollout_kwargs
+                **rollout_kwargs,
+                max_seq_len=cfg.policy["max_total_sequence_length"],
+                max_rollout_turns=cfg.distillation["max_rollout_turns"],
             )
         else:
-            final_batch, rollout_metrics = run_multi_turn_rollout(**rollout_kwargs)
+            final_batch, rollout_metrics = run_multi_turn_rollout(
+                **rollout_kwargs,
+                max_seq_len=cfg.policy["max_total_sequence_length"],
+                max_rollout_turns=cfg.distillation["max_rollout_turns"],
+            )
 
         final_batch = final_batch.to("cpu")
         add_loss_mask_to_message_log(final_batch["message_log"])

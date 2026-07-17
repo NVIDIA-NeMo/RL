@@ -20,7 +20,12 @@ import torch
 
 from nemo_rl.algorithms import distillation_sync
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
-from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_columns
+from nemo_rl.data_plane.column_io import (
+    kv_first_write,
+    read_columns,
+    write_columns,
+    write_per_token_columns,
+)
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DISTILLATION_TRAIN_FIELDS,
@@ -34,6 +39,7 @@ from nemo_rl.data_plane.transport_metrics import (
     topk_payload_nbytes,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+from nemo_rl.distributed.model_utils import get_distillation_topk_logprobs_from_logits
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.policy.tq_policy import TQPolicy
 
@@ -91,6 +97,87 @@ def test_teacher_topk_columns_roundtrip_as_bsk() -> None:
     assert fetched[TEACHER_TOPK_INDICES].dtype == torch.long
     assert torch.equal(fetched[TEACHER_TOPK_LOGITS], logits)
     assert torch.equal(fetched[TEACHER_TOPK_INDICES], indices)
+
+
+def test_teacher_topk_writeback_drops_padded_tail() -> None:
+    batch_size, padded_seq_len, k = 3, 8, 4
+    lengths = torch.tensor([3, 5, 4], dtype=torch.long)
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="train",
+        fields=list(DISTILLATION_TRAIN_FIELDS),
+        num_samples=batch_size,
+        consumer_tasks=["teacher_topk", "train"],
+    )
+    seed_batch = _distillation_seed_batch(batch_size, padded_seq_len)
+    seed_batch["input_lengths"] = lengths
+    meta = kv_first_write(
+        seed_batch,
+        sample_ids=[f"u{i}" for i in range(batch_size)],
+        dp_client=client,
+        partition_id="train",
+    )
+    logits = torch.arange(
+        batch_size * padded_seq_len * k, dtype=torch.bfloat16
+    ).reshape(batch_size, padded_seq_len, k)
+    indices = torch.arange(batch_size * padded_seq_len * k, dtype=torch.long).reshape(
+        batch_size, padded_seq_len, k
+    )
+
+    write_per_token_columns(
+        client,
+        meta,
+        fields={
+            TEACHER_TOPK_LOGITS: logits,
+            TEACHER_TOPK_INDICES: indices,
+        },
+    )
+    fetched = read_columns(
+        client,
+        meta,
+        select_fields=[TEACHER_TOPK_LOGITS, TEACHER_TOPK_INDICES],
+    )
+
+    max_len = int(lengths.max().item())
+    assert fetched[TEACHER_TOPK_LOGITS].shape == (batch_size, max_len, k)
+    assert fetched[TEACHER_TOPK_INDICES].shape == (batch_size, max_len, k)
+    for row, length in enumerate(lengths.tolist()):
+        assert torch.equal(
+            fetched[TEACHER_TOPK_LOGITS][row, :length],
+            logits[row, :length],
+        )
+        assert torch.equal(
+            fetched[TEACHER_TOPK_INDICES][row, :length],
+            indices[row, :length],
+        )
+
+
+def test_teacher_topk_writeback_rejects_short_sequence_dim() -> None:
+    batch_size, seq_len, k = 2, 4, 3
+    lengths = torch.tensor([3, 5], dtype=torch.long)
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="train",
+        fields=list(DISTILLATION_TRAIN_FIELDS),
+        num_samples=batch_size,
+        consumer_tasks=["teacher_topk", "train"],
+    )
+    seed_batch = _distillation_seed_batch(batch_size, seq_len)
+    seed_batch["input_lengths"] = lengths
+    meta = kv_first_write(
+        seed_batch,
+        sample_ids=[f"u{i}" for i in range(batch_size)],
+        dp_client=client,
+        partition_id="train",
+    )
+    logits = torch.zeros(batch_size, seq_len, k)
+
+    try:
+        write_per_token_columns(client, meta, fields={TEACHER_TOPK_LOGITS: logits})
+    except ValueError as exc:
+        assert "shorter than max sequence length" in str(exc)
+    else:
+        raise AssertionError("expected short per-token writeback to fail")
 
 
 def test_tq_policy_prepare_step_accepts_custom_fields_and_tasks() -> None:
@@ -191,6 +278,9 @@ class _TopKWorker(TQWorkerMixin):
     def __init__(self, client: NoOpDataPlaneClient) -> None:
         self._dp_client = client
 
+    def _local_coords(self) -> dict[str, int]:
+        return {}
+
     def get_topk_logits(self, *, data, k: int, micro_batch_size=None):
         del micro_batch_size
         batch_size, seq_len = data["input_ids"].shape
@@ -249,6 +339,189 @@ def test_teacher_worker_topk_writeback_returns_only_scalar_ack() -> None:
     )
     assert fetched[TEACHER_TOPK_LOGITS].shape == (batch_size, seq_len, k)
     assert fetched[TEACHER_TOPK_INDICES].shape == (batch_size, seq_len, k)
+
+
+def test_teacher_worker_topk_writeback_drops_padded_tail() -> None:
+    batch_size, padded_seq_len, k = 3, 8, 4
+    lengths = torch.tensor([3, 5, 4], dtype=torch.long)
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="train",
+        fields=list(DISTILLATION_TRAIN_FIELDS),
+        num_samples=batch_size,
+        consumer_tasks=["teacher_topk", "train"],
+    )
+    seed_batch = _distillation_seed_batch(batch_size, padded_seq_len)
+    seed_batch["input_lengths"] = lengths
+    meta = kv_first_write(
+        seed_batch,
+        sample_ids=[f"u{i}" for i in range(batch_size)],
+        dp_client=client,
+        partition_id="train",
+    )
+    worker = _TopKWorker(client)
+
+    result = worker.get_topk_logits_presharded(
+        replace(meta, fields=list(TEACHER_TOPK_SEED_FIELDS)),
+        k=k,
+    )
+
+    expected_raw_bytes = (
+        batch_size
+        * padded_seq_len
+        * k
+        * (
+            torch.tensor([], dtype=torch.float32).element_size()
+            + torch.tensor([], dtype=torch.long).element_size()
+        )
+    )
+    expected_valid_bytes = (
+        int(lengths.sum().item())
+        * k
+        * (
+            torch.tensor([], dtype=torch.float32).element_size()
+            + torch.tensor([], dtype=torch.long).element_size()
+        )
+    )
+    assert result["teacher_topk_payload_bytes"] == expected_raw_bytes
+    assert result["teacher_topk_valid_payload_bytes"] == expected_valid_bytes
+    assert result["teacher_topk_padding_overhead_bytes"] == (
+        expected_raw_bytes - expected_valid_bytes
+    )
+    assert result["tq_teacher_topk_payload_bytes"] == expected_valid_bytes
+    assert result["tq_teacher_topk_valid_payload_bytes"] == expected_valid_bytes
+    assert result["tq_teacher_topk_padding_overhead_bytes"] == 0
+    assert result["tq_teacher_topk_write_bytes"] == expected_valid_bytes
+    fetched = read_columns(
+        client,
+        meta,
+        select_fields=[TEACHER_TOPK_LOGITS, TEACHER_TOPK_INDICES],
+    )
+    assert fetched[TEACHER_TOPK_LOGITS].shape == (
+        batch_size,
+        int(lengths.max().item()),
+        k,
+    )
+    assert fetched[TEACHER_TOPK_INDICES].shape == (
+        batch_size,
+        int(lengths.max().item()),
+        k,
+    )
+
+
+def test_teacher_worker_topk_writeback_can_cast_payload_dtype() -> None:
+    batch_size, seq_len, k = 2, 6, 3
+    client = NoOpDataPlaneClient()
+    client.register_partition(
+        partition_id="train",
+        fields=list(DISTILLATION_TRAIN_FIELDS),
+        num_samples=batch_size,
+        consumer_tasks=["teacher_topk", "train"],
+    )
+    meta = kv_first_write(
+        _distillation_seed_batch(batch_size, seq_len),
+        sample_ids=[f"u{i}" for i in range(batch_size)],
+        dp_client=client,
+        partition_id="train",
+    )
+    worker = _TopKWorker(client)
+    worker._dp_cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "storage_capacity": 100,
+        "num_storage_units": 1,
+        "claim_meta_poll_interval_s": 0.1,
+        "global_segment_size": 1,
+        "local_buffer_size": 1,
+        "teacher_topk_logits_dtype": "bfloat16",
+        "teacher_topk_indices_dtype": "int32",
+    }
+
+    result = worker.get_topk_logits_presharded(
+        replace(meta, fields=list(TEACHER_TOPK_SEED_FIELDS)),
+        k=k,
+    )
+
+    expected_raw_bytes = (
+        batch_size
+        * seq_len
+        * k
+        * (
+            torch.tensor([], dtype=torch.float32).element_size()
+            + torch.tensor([], dtype=torch.long).element_size()
+        )
+    )
+    expected_tq_bytes = (
+        batch_size
+        * seq_len
+        * k
+        * (
+            torch.tensor([], dtype=torch.bfloat16).element_size()
+            + torch.tensor([], dtype=torch.int32).element_size()
+        )
+    )
+    assert result["teacher_topk_payload_bytes"] == expected_raw_bytes
+    assert result["teacher_topk_valid_payload_bytes"] == expected_raw_bytes
+    assert result["tq_teacher_topk_payload_bytes"] == expected_tq_bytes
+    assert result["tq_teacher_topk_valid_payload_bytes"] == expected_tq_bytes
+    assert result["tq_teacher_topk_write_bytes"] == expected_tq_bytes
+    fetched = read_columns(
+        client,
+        meta,
+        select_fields=[TEACHER_TOPK_LOGITS, TEACHER_TOPK_INDICES],
+    )
+    assert fetched[TEACHER_TOPK_LOGITS].dtype == torch.bfloat16
+    assert fetched[TEACHER_TOPK_INDICES].dtype == torch.int32
+
+
+def test_teacher_worker_topk_writeback_rejects_int32_index_overflow() -> None:
+    worker = _TopKWorker(NoOpDataPlaneClient())
+    worker._dp_cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "storage_capacity": 100,
+        "num_storage_units": 1,
+        "claim_meta_poll_interval_s": 0.1,
+        "global_segment_size": 1,
+        "local_buffer_size": 1,
+        "teacher_topk_indices_dtype": "int32",
+    }
+    indices = torch.tensor([[[torch.iinfo(torch.int32).max + 1]]], dtype=torch.long)
+
+    try:
+        worker._teacher_topk_writeback_dtypes(indices)
+    except ValueError as exc:
+        assert "cannot represent" in str(exc)
+    else:
+        raise AssertionError("expected int32 index overflow to fail")
+
+
+def test_distillation_topk_logprobs_accepts_int32_teacher_indices() -> None:
+    student_logits = torch.randn((1, 3, 5), dtype=torch.bfloat16)
+    teacher_logits = torch.randn((1, 3, 3), dtype=torch.bfloat16)
+    teacher_indices = torch.tensor(
+        [[[0, 1, 2], [2, 3, 4], [1, 3, 4]]],
+        dtype=torch.int32,
+    )
+
+    for zero_outside_topk in (False, True):
+        student_topk_logprobs, teacher_topk_logprobs, h_all = (
+            get_distillation_topk_logprobs_from_logits(
+                student_logits=student_logits,
+                teacher_topk_logits=teacher_logits,
+                teacher_topk_indices=teacher_indices,
+                zero_outside_topk=zero_outside_topk,
+                calculate_entropy=zero_outside_topk,
+            )
+        )
+        assert student_topk_logprobs.shape == (1, 2, 3)
+        assert teacher_topk_logprobs.shape == (1, 2, 3)
+        if zero_outside_topk:
+            assert h_all.shape == (1, 2)
+        else:
+            assert h_all is None
 
 
 def test_attach_policy_workers_to_data_plane_after_student_bootstrap(
@@ -344,7 +617,10 @@ def test_teacher_dispatch_aggregates_transport_metrics() -> None:
                     "teacher_topk_payload_bytes": 100,
                     "teacher_topk_valid_payload_bytes": 80,
                     "teacher_topk_padding_overhead_bytes": 20,
-                    "tq_teacher_topk_write_bytes": 80,
+                    "tq_teacher_topk_payload_bytes": 90,
+                    "tq_teacher_topk_valid_payload_bytes": 70,
+                    "tq_teacher_topk_padding_overhead_bytes": 20,
+                    "tq_teacher_topk_write_bytes": 70,
                     "tq_teacher_topk_write_num_samples": 2,
                     "tq_teacher_topk_write_ms": 1.5,
                 },
@@ -352,7 +628,10 @@ def test_teacher_dispatch_aggregates_transport_metrics() -> None:
                     "teacher_topk_payload_bytes": 200,
                     "teacher_topk_valid_payload_bytes": 160,
                     "teacher_topk_padding_overhead_bytes": 40,
-                    "tq_teacher_topk_write_bytes": 160,
+                    "tq_teacher_topk_payload_bytes": 180,
+                    "tq_teacher_topk_valid_payload_bytes": 140,
+                    "tq_teacher_topk_padding_overhead_bytes": 40,
+                    "tq_teacher_topk_write_bytes": 140,
                     "tq_teacher_topk_write_num_samples": 4,
                     "tq_teacher_topk_write_ms": 2.5,
                 },
@@ -386,7 +665,10 @@ def test_teacher_dispatch_aggregates_transport_metrics() -> None:
     assert metrics["driver_tx_teacher_topk_bytes"] == 0
     assert metrics["driver_teacher_topk_bytes"] == 0
     assert metrics["driver_teacher_topk_bytes_avoided"] == 600
-    assert metrics["tq_teacher_topk_write_bytes"] == 240
+    assert metrics["tq_teacher_topk_payload_bytes"] == 270
+    assert metrics["tq_teacher_topk_valid_payload_bytes"] == 210
+    assert metrics["tq_teacher_topk_padding_overhead_bytes"] == 60
+    assert metrics["tq_teacher_topk_write_bytes"] == 210
     assert metrics["tq_teacher_topk_write_num_samples"] == 6
     assert metrics["tq_teacher_topk_write_ms_sum"] == 4.0
     assert metrics["tq_teacher_topk_write_ms_max"] == 2.5

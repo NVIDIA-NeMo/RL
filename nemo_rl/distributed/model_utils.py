@@ -1579,12 +1579,53 @@ def gather_logits_at_global_indices(
     return gathered_logits
 
 
+def _mask_inactive_distillation_topk_logits(
+    name: str,
+    topk_logits: torch.Tensor,
+    active_token_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if active_token_mask is None:
+        return topk_logits
+
+    active_mask = active_token_mask.to(device=topk_logits.device, dtype=torch.bool)
+    if active_mask.ndim != 2:
+        raise ValueError(
+            f"active_token_mask must have shape [B, S], got {tuple(active_mask.shape)}"
+        )
+    if active_mask.shape[0] != topk_logits.shape[0]:
+        raise ValueError(
+            f"active_token_mask batch dim {active_mask.shape[0]} does not match "
+            f"{name} batch dim {topk_logits.shape[0]}"
+        )
+    if active_mask.shape[1] < topk_logits.shape[1]:
+        active_mask = torch.nn.functional.pad(
+            active_mask, (0, topk_logits.shape[1] - active_mask.shape[1]), value=False
+        )
+    elif active_mask.shape[1] > topk_logits.shape[1]:
+        active_mask = active_mask[:, : topk_logits.shape[1]]
+
+    active_topk_mask = active_mask.unsqueeze(-1)
+    invalid_active = active_topk_mask & ~torch.isfinite(topk_logits)
+    if invalid_active.any():
+        raise RuntimeError(
+            f"{name} contains {int(invalid_active.sum().item())} non-finite "
+            "values on active distillation tokens"
+        )
+
+    return torch.where(
+        active_topk_mask,
+        topk_logits,
+        torch.zeros_like(topk_logits),
+    )
+
+
 def get_distillation_topk_logprobs_from_logits(
     student_logits: torch.Tensor,
     teacher_topk_logits: torch.Tensor,
     teacher_topk_indices: torch.Tensor,
     zero_outside_topk: bool,
     calculate_entropy: bool,
+    active_token_mask: Optional[torch.Tensor] = None,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -1598,8 +1639,12 @@ def get_distillation_topk_logprobs_from_logits(
 
     # Ensure float32 for stability
     student_logits = student_logits.to(torch.float32)
-    # Move teacher topk indices to the same device as student logits
-    teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
+    # Move teacher topk indices to the same device as student logits. The TQ
+    # wire format may store indices in int32 to reduce top-k payload size, but
+    # torch gather/scatter paths expect long indices.
+    teacher_topk_indices = teacher_topk_indices.to(
+        student_logits.device, dtype=torch.long
+    )
 
     # CP support: get CP group and size
     cp_group = context_parallel_group
@@ -1726,6 +1771,11 @@ def get_distillation_topk_logprobs_from_logits(
                 dim=-1, index=teacher_topk_indices
             )
 
+        student_topk_logits = _mask_inactive_distillation_topk_logits(
+            "student_topk_logits",
+            student_topk_logits,
+            active_token_mask,
+        )
         student_topk_logprobs = torch.nn.functional.log_softmax(
             student_topk_logits, dim=-1
         )
@@ -1733,6 +1783,11 @@ def get_distillation_topk_logprobs_from_logits(
     # Move teacher tensors to the same device/dtype as student_topk_logits
     teacher_topk_logits = teacher_topk_logits.to(
         student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
+    )
+    teacher_topk_logits = _mask_inactive_distillation_topk_logits(
+        "teacher_topk_logits",
+        teacher_topk_logits,
+        active_token_mask,
     )
     teacher_topk_logprobs = torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1)
 

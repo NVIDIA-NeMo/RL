@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
@@ -950,6 +951,9 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
+    sft_weight: NotRequired[float]
+    entropy_diagnostics: NotRequired[dict[str, Any]]
+    entropy_aware: NotRequired[dict[str, Any]]
 
 
 class DistillationLossDataDict(TypedDict):
@@ -959,6 +963,301 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+
+
+def _topk_support_logprobs(logprobs: torch.Tensor) -> torch.Tensor:
+    logprobs = logprobs.to(torch.float32)
+    return logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
+
+
+def _topk_entropy_and_support(
+    support_logprobs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    raw_entropy = -(support_logprobs.exp() * support_logprobs).sum(dim=-1)
+    k = int(support_logprobs.shape[-1])
+    if k <= 1:
+        return raw_entropy, torch.zeros_like(raw_entropy), torch.ones_like(raw_entropy)
+    return raw_entropy, raw_entropy / math.log(k), raw_entropy.exp()
+
+
+def _support_kl_and_jsd(
+    student_support_logprobs: torch.Tensor,
+    teacher_support_logprobs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    student_probs = student_support_logprobs.exp()
+    teacher_probs = teacher_support_logprobs.exp()
+    reverse_kl = (
+        student_probs * (student_support_logprobs - teacher_support_logprobs)
+    ).sum(dim=-1)
+    forward_kl = (
+        teacher_probs * (teacher_support_logprobs - student_support_logprobs)
+    ).sum(dim=-1)
+    mixture_probs = 0.5 * (student_probs + teacher_probs)
+    mixture_logprobs = mixture_probs.clamp_min(
+        torch.finfo(mixture_probs.dtype).tiny
+    ).log()
+    jsd = 0.5 * (teacher_probs * (teacher_support_logprobs - mixture_logprobs)).sum(
+        dim=-1
+    ) + 0.5 * (student_probs * (student_support_logprobs - mixture_logprobs)).sum(
+        dim=-1
+    )
+    return reverse_kl, forward_kl, jsd
+
+
+def _support_reverse_kl(
+    student_support_logprobs: torch.Tensor,
+    teacher_support_logprobs: torch.Tensor,
+) -> torch.Tensor:
+    student_probs = student_support_logprobs.exp()
+    return (student_probs * (student_support_logprobs - teacher_support_logprobs)).sum(
+        dim=-1
+    )
+
+
+def _metric_value(value: torch.Tensor) -> float:
+    return float(value.detach().to(torch.float32).sum().item())
+
+
+def _assert_finite_on_active_tokens(
+    name: str,
+    values: torch.Tensor,
+    active_mask: torch.Tensor,
+) -> None:
+    active_topk_mask = active_mask.to(device=values.device, dtype=torch.bool)
+    while active_topk_mask.ndim < values.ndim:
+        active_topk_mask = active_topk_mask.unsqueeze(-1)
+    invalid_active = active_topk_mask & ~torch.isfinite(values)
+    if invalid_active.any():
+        raise RuntimeError(
+            f"{name} contains {int(invalid_active.sum().item())} non-finite "
+            "values on active distillation tokens"
+        )
+
+
+def _add_raw_mean_metric(
+    metrics: dict[str, Any],
+    name: str,
+    values: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    weight = mask.to(values.device, dtype=values.dtype)
+    values = torch.where(
+        weight.to(torch.bool),
+        torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0),
+        torch.zeros_like(values),
+    )
+    metrics[f"opd_diag_raw/{name}_sum"] = _metric_value(values)
+    metrics[f"opd_diag_raw/{name}_count"] = _metric_value(weight)
+
+
+def _add_distillation_diagnostic_metrics(
+    metrics: dict[str, Any],
+    *,
+    student_topk_logprobs: torch.Tensor,
+    teacher_topk_logprobs: torch.Tensor,
+    mask: torch.Tensor,
+    data: DistillationLossDataDict,
+    teacher_entropy_low: float,
+    teacher_entropy_high: float,
+    teacher_entropy_threshold: float,
+    log_position_buckets: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    student_topk_logprobs = student_topk_logprobs.to(torch.float32)
+    teacher_topk_logprobs = teacher_topk_logprobs.to(torch.float32)
+    teacher_support_logprobs = _topk_support_logprobs(teacher_topk_logprobs)
+    student_support_logprobs = _topk_support_logprobs(student_topk_logprobs)
+    _, teacher_entropy, teacher_effective_support = _topk_entropy_and_support(
+        teacher_support_logprobs
+    )
+    _, student_entropy, student_effective_support = _topk_entropy_and_support(
+        student_support_logprobs
+    )
+    reverse_kl, forward_kl, jsd = _support_kl_and_jsd(
+        student_support_logprobs,
+        teacher_support_logprobs,
+    )
+
+    active_mask = mask.to(teacher_entropy.device, dtype=teacher_entropy.dtype)
+    support_ratio = student_effective_support / teacher_effective_support.clamp_min(
+        torch.finfo(teacher_effective_support.dtype).tiny
+    )
+    entropy_gap = student_entropy - teacher_entropy
+
+    _add_raw_mean_metric(metrics, "entropy/teacher_topk", teacher_entropy, active_mask)
+    _add_raw_mean_metric(
+        metrics,
+        "entropy/student_on_teacher_topk",
+        student_entropy,
+        active_mask,
+    )
+    _add_raw_mean_metric(
+        metrics,
+        "entropy/gap_student_minus_teacher",
+        entropy_gap,
+        active_mask,
+    )
+    _add_raw_mean_metric(
+        metrics,
+        "support/effective_teacher_topk",
+        teacher_effective_support,
+        active_mask,
+    )
+    _add_raw_mean_metric(
+        metrics,
+        "support/effective_student_on_teacher_topk",
+        student_effective_support,
+        active_mask,
+    )
+    _add_raw_mean_metric(
+        metrics,
+        "support/effective_ratio_student_teacher",
+        support_ratio,
+        active_mask,
+    )
+    _add_raw_mean_metric(metrics, "kl/reverse_topk", reverse_kl, active_mask)
+    _add_raw_mean_metric(metrics, "kl/forward_topk", forward_kl, active_mask)
+    _add_raw_mean_metric(metrics, "kl/jsd_topk", jsd, active_mask)
+
+    bucket_masks = {
+        "low": teacher_entropy < teacher_entropy_low,
+        "mid": (teacher_entropy >= teacher_entropy_low)
+        & (teacher_entropy < teacher_entropy_high),
+        "high": teacher_entropy >= teacher_entropy_high,
+    }
+    for bucket_name, bucket_mask_bool in bucket_masks.items():
+        bucket_flag = bucket_mask_bool.to(active_mask.dtype)
+        bucket_active_mask = active_mask * bucket_flag
+        _add_raw_mean_metric(
+            metrics,
+            f"entropy_bucket/{bucket_name}/active_ratio",
+            bucket_flag,
+            active_mask,
+        )
+        _add_raw_mean_metric(
+            metrics,
+            f"entropy_bucket/{bucket_name}/teacher_entropy",
+            teacher_entropy,
+            bucket_active_mask,
+        )
+        _add_raw_mean_metric(
+            metrics,
+            f"entropy_bucket/{bucket_name}/student_entropy",
+            student_entropy,
+            bucket_active_mask,
+        )
+        _add_raw_mean_metric(
+            metrics,
+            f"entropy_bucket/{bucket_name}/support_ratio",
+            support_ratio,
+            bucket_active_mask,
+        )
+        _add_raw_mean_metric(
+            metrics,
+            f"entropy_bucket/{bucket_name}/reverse_kl",
+            reverse_kl,
+            bucket_active_mask,
+        )
+        _add_raw_mean_metric(
+            metrics,
+            f"entropy_bucket/{bucket_name}/forward_kl",
+            forward_kl,
+            bucket_active_mask,
+        )
+        _add_raw_mean_metric(
+            metrics,
+            f"entropy_bucket/{bucket_name}/jsd",
+            jsd,
+            bucket_active_mask,
+        )
+
+    high_entropy_gate = teacher_entropy >= teacher_entropy_threshold
+    high_entropy_flag = high_entropy_gate.to(active_mask.dtype)
+    high_entropy_mask = active_mask * high_entropy_flag
+    _add_raw_mean_metric(
+        metrics,
+        "mode_collapse/high_teacher_entropy_active_ratio",
+        high_entropy_flag,
+        active_mask,
+    )
+    _add_raw_mean_metric(
+        metrics,
+        "mode_collapse/high_teacher_entropy_support_ratio",
+        support_ratio,
+        high_entropy_mask,
+    )
+    _add_raw_mean_metric(
+        metrics,
+        "mode_collapse/high_teacher_entropy_entropy_gap",
+        entropy_gap,
+        high_entropy_mask,
+    )
+
+    if log_position_buckets and "input_lengths" in data:
+        positions = torch.arange(
+            teacher_entropy.shape[1],
+            device=active_mask.device,
+            dtype=active_mask.dtype,
+        ).unsqueeze(0)
+        positions = positions.expand_as(teacher_entropy)
+        input_lengths = data["input_lengths"].to(
+            active_mask.device, dtype=active_mask.dtype
+        )
+        denominators = (input_lengths - 1).clamp_min(1).unsqueeze(-1)
+        position_ratio = (positions / denominators).clamp(0.0, 1.0)
+        position_buckets = {
+            "early": position_ratio < (1.0 / 3.0),
+            "mid": (position_ratio >= (1.0 / 3.0)) & (position_ratio < (2.0 / 3.0)),
+            "late": position_ratio >= (2.0 / 3.0),
+        }
+        for bucket_name, bucket_mask_bool in position_buckets.items():
+            bucket_flag = bucket_mask_bool.to(active_mask.dtype)
+            bucket_active_mask = active_mask * bucket_flag
+            _add_raw_mean_metric(
+                metrics,
+                f"position_bucket/{bucket_name}/active_ratio",
+                bucket_flag,
+                active_mask,
+            )
+            _add_raw_mean_metric(
+                metrics,
+                f"position_bucket/{bucket_name}/teacher_entropy",
+                teacher_entropy,
+                bucket_active_mask,
+            )
+            _add_raw_mean_metric(
+                metrics,
+                f"position_bucket/{bucket_name}/student_entropy",
+                student_entropy,
+                bucket_active_mask,
+            )
+            _add_raw_mean_metric(
+                metrics,
+                f"position_bucket/{bucket_name}/support_ratio",
+                support_ratio,
+                bucket_active_mask,
+            )
+            _add_raw_mean_metric(
+                metrics,
+                f"position_bucket/{bucket_name}/forward_kl",
+                forward_kl,
+                bucket_active_mask,
+            )
+
+    return (
+        teacher_entropy,
+        high_entropy_gate,
+        forward_kl,
+        support_ratio,
+        student_support_logprobs,
+        teacher_support_logprobs,
+    )
 
 
 class DistillationLossFn(LossFunction):
@@ -971,12 +1270,128 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.sft_weight = cfg.get("sft_weight", 0.0)
         self.log_infinitesimal = -100
+        entropy_diagnostics = cfg.get("entropy_diagnostics") or {}
+        entropy_aware = cfg.get("entropy_aware") or {}
+        self.entropy_diagnostics_enabled = bool(
+            entropy_diagnostics.get("enabled", False)
+        )
+        self.entropy_diagnostics_teacher_entropy_low = float(
+            entropy_diagnostics.get("teacher_entropy_low", 0.3)
+        )
+        self.entropy_diagnostics_teacher_entropy_high = float(
+            entropy_diagnostics.get("teacher_entropy_high", 0.7)
+        )
+        self.entropy_diagnostics_log_position_buckets = bool(
+            entropy_diagnostics.get("log_position_buckets", True)
+        )
+        self.entropy_aware_enabled = bool(entropy_aware.get("enabled", False))
+        self.entropy_aware_teacher_entropy_threshold = float(
+            entropy_aware.get("teacher_entropy_threshold", 0.8)
+        )
+        self.entropy_aware_weighting_mode = str(
+            entropy_aware.get("weighting_mode", "threshold")
+        )
+        self.entropy_aware_ramp_start = float(entropy_aware.get("ramp_start", 0.3))
+        self.entropy_aware_ramp_width = float(entropy_aware.get("ramp_width", 0.6))
+        self.entropy_aware_forward_kl_weight = float(
+            entropy_aware.get("forward_kl_weight", 1.0)
+        )
+        self.entropy_aware_high_entropy_reverse_kl_weight = float(
+            entropy_aware.get("high_entropy_reverse_kl_weight", 1.0)
+        )
+        self.entropy_aware_high_entropy_reverse_kl_threshold = float(
+            entropy_aware.get(
+                "high_entropy_reverse_kl_threshold",
+                self.entropy_diagnostics_teacher_entropy_high,
+            )
+        )
+        self.entropy_aware_low_entropy_sharpening_enabled = bool(
+            entropy_aware.get("low_entropy_sharpening_enabled", False)
+        )
+        self.entropy_aware_low_entropy_sharpening_weight = float(
+            entropy_aware.get("low_entropy_sharpening_weight", 0.0)
+        )
+        self.entropy_aware_low_entropy_sharpening_temperature = float(
+            entropy_aware.get("low_entropy_sharpening_temperature", 0.7)
+        )
+        self.entropy_aware_low_entropy_sharpening_support_ratio_threshold = float(
+            entropy_aware.get(
+                "low_entropy_sharpening_support_ratio_threshold",
+                entropy_aware.get("support_ratio_threshold", 1.0),
+            )
+        )
+        self.entropy_aware_low_entropy_sharpening_requires_support_ratio_above_threshold = bool(
+            entropy_aware.get(
+                "low_entropy_sharpening_requires_support_ratio_above_threshold",
+                True,
+            )
+        )
+        self.entropy_aware_require_sft_weight_zero = bool(
+            entropy_aware.get("require_sft_weight_zero", True)
+        )
+        self.entropy_aware_require_zero_outside_topk_false = bool(
+            entropy_aware.get("require_zero_outside_topk_false", True)
+        )
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+        assert self.sft_weight >= 0, "Invalid SFT loss weight"
+        if self.entropy_diagnostics_enabled or self.entropy_aware_enabled:
+            assert (
+                0
+                <= self.entropy_diagnostics_teacher_entropy_low
+                <= self.entropy_diagnostics_teacher_entropy_high
+                <= 1
+            ), "Invalid entropy diagnostics thresholds"
+            assert 0 <= self.entropy_aware_teacher_entropy_threshold <= 1, (
+                "Invalid entropy-aware teacher entropy threshold"
+            )
+        if self.entropy_aware_enabled:
+            assert self.entropy_aware_weighting_mode in ["threshold", "linear_ramp"], (
+                "Invalid entropy-aware weighting mode"
+            )
+            if self.entropy_aware_weighting_mode == "linear_ramp":
+                assert 0 <= self.entropy_aware_ramp_start <= 1, (
+                    "Invalid entropy-aware ramp start"
+                )
+                assert self.entropy_aware_ramp_width > 0, (
+                    "Invalid entropy-aware ramp width"
+                )
+            assert self.entropy_aware_forward_kl_weight >= 0, (
+                "Invalid entropy-aware forward KL weight"
+            )
+            assert 0 <= self.entropy_aware_high_entropy_reverse_kl_weight <= 1, (
+                "Invalid entropy-aware high entropy reverse KL weight"
+            )
+            assert 0 <= self.entropy_aware_high_entropy_reverse_kl_threshold <= 1, (
+                "Invalid entropy-aware high entropy reverse KL threshold"
+            )
+            assert self.entropy_aware_low_entropy_sharpening_weight >= 0, (
+                "Invalid entropy-aware low entropy sharpening weight"
+            )
+            assert 0 < self.entropy_aware_low_entropy_sharpening_temperature < 1, (
+                "Invalid entropy-aware low entropy sharpening temperature"
+            )
+            assert (
+                self.entropy_aware_low_entropy_sharpening_support_ratio_threshold > 0
+            ), "Invalid entropy-aware low entropy sharpening support ratio threshold"
+            assert self.kl_type == "reverse", (
+                "Entropy-aware OPD is only supported with reverse KL"
+            )
+            if self.entropy_aware_require_sft_weight_zero:
+                assert self.sft_weight == 0, (
+                    "Entropy-aware OPD should not be mixed with SFT in the "
+                    "first implementation"
+                )
+            if self.entropy_aware_require_zero_outside_topk_false:
+                assert not self.zero_outside_topk, (
+                    "Entropy-aware OPD requires zero_outside_topk=false in the "
+                    "first implementation"
+                )
 
     def __call__(
         self,
@@ -988,6 +1403,64 @@ class DistillationLossFn(LossFunction):
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute distillation loss between teacher and student logits."""
+        mask = None
+        if "token_mask" in data and "sample_mask" in data:
+            token_mask = data["token_mask"][:, 1:]
+            sample_mask = data["sample_mask"]
+            max_len = student_topk_logprobs.shape[1]
+            token_mask = token_mask[:, :max_len]
+            mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+            active_mask = mask.to(
+                student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
+            )
+            _assert_finite_on_active_tokens(
+                "student_topk_logprobs",
+                student_topk_logprobs,
+                active_mask,
+            )
+            _assert_finite_on_active_tokens(
+                "teacher_topk_logprobs",
+                teacher_topk_logprobs,
+                active_mask,
+            )
+            if H_all is not None:
+                _assert_finite_on_active_tokens("H_all", H_all, active_mask)
+            active_topk_mask = active_mask.to(torch.bool).unsqueeze(-1)
+            student_topk_logprobs = torch.where(
+                active_topk_mask,
+                student_topk_logprobs,
+                torch.zeros_like(student_topk_logprobs),
+            )
+            teacher_topk_logprobs = torch.where(
+                active_topk_mask,
+                teacher_topk_logprobs,
+                torch.zeros_like(teacher_topk_logprobs),
+            )
+            if H_all is not None:
+                H_all = torch.where(
+                    active_mask.to(torch.bool),
+                    H_all,
+                    torch.zeros_like(H_all),
+                )
+        else:
+            active_mask = torch.ones(
+                student_topk_logprobs.shape[:2],
+                device=student_topk_logprobs.device,
+                dtype=student_topk_logprobs.dtype,
+            )
+            _assert_finite_on_active_tokens(
+                "student_topk_logprobs",
+                student_topk_logprobs,
+                active_mask,
+            )
+            _assert_finite_on_active_tokens(
+                "teacher_topk_logprobs",
+                teacher_topk_logprobs,
+                active_mask,
+            )
+            if H_all is not None:
+                _assert_finite_on_active_tokens("H_all", H_all, active_mask)
+
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
@@ -1019,16 +1492,42 @@ class DistillationLossFn(LossFunction):
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
 
-        per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
+        per_token_kl = per_token_kl.sum(dim=-1)  # [B, S-1]
+        reverse_kl_high_entropy_gate = None
+        reverse_kl_weight = None
+        if (
+            self.entropy_aware_enabled
+            and self.entropy_aware_high_entropy_reverse_kl_weight != 1.0
+        ):
+            teacher_support_logprobs_for_weight = _topk_support_logprobs(
+                teacher_topk_logprobs.to(torch.float32)
+            )
+            _, teacher_entropy_for_weight, _ = _topk_entropy_and_support(
+                teacher_support_logprobs_for_weight
+            )
+            reverse_kl_high_entropy_gate = (
+                teacher_entropy_for_weight
+                >= self.entropy_aware_high_entropy_reverse_kl_threshold
+            )
+            reverse_kl_weight = torch.where(
+                reverse_kl_high_entropy_gate,
+                torch.full_like(
+                    per_token_kl,
+                    self.entropy_aware_high_entropy_reverse_kl_weight,
+                ),
+                torch.ones_like(per_token_kl),
+            )
+            per_token_kl = per_token_kl * reverse_kl_weight
+        per_token_kl = per_token_kl + loss_correction_term
 
         # Masking and reduction
-        if "token_mask" in data and "sample_mask" in data:
-            token_mask = data["token_mask"][:, 1:]
-            sample_mask = data["sample_mask"]
-            # Align mask length to current per_token_kl
-            max_len = per_token_kl.shape[1]
-            token_mask = token_mask[:, :max_len]
-            mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
+        if mask is not None:
+            active_mask = active_mask.to(per_token_kl.device, dtype=per_token_kl.dtype)
+            per_token_kl = torch.where(
+                active_mask.to(torch.bool),
+                per_token_kl,
+                torch.zeros_like(per_token_kl),
+            )
             # align mask shape to per_token_kl
             kl_loss = masked_mean(
                 per_token_kl,
@@ -1036,11 +1535,195 @@ class DistillationLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
         else:
+            active_mask = active_mask.to(per_token_kl.device, dtype=per_token_kl.dtype)
             kl_loss = per_token_kl.mean()
 
+        num_valid_samples = data["input_ids"].shape[0]
+        if "sample_mask" in data:
+            num_valid_samples = _metric_value(data["sample_mask"])
         metrics = {
-            "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
-            "num_valid_samples": data["input_ids"].shape[0],
+            "kl_loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
+            "num_valid_samples": num_valid_samples,
         }
+        if reverse_kl_high_entropy_gate is not None and reverse_kl_weight is not None:
+            _add_raw_mean_metric(
+                metrics,
+                "entropy_aware/high_entropy_reverse_kl_gate_ratio",
+                reverse_kl_high_entropy_gate.to(active_mask.dtype),
+                active_mask,
+            )
+            _add_raw_mean_metric(
+                metrics,
+                "entropy_aware/reverse_kl_weight",
+                reverse_kl_weight.to(active_mask.dtype),
+                active_mask,
+            )
 
-        return kl_loss, metrics
+        if self.entropy_diagnostics_enabled or self.entropy_aware_enabled:
+            (
+                teacher_entropy,
+                entropy_aware_gate,
+                support_forward_kl,
+                support_ratio,
+                student_support_logprobs,
+                teacher_support_logprobs,
+            ) = _add_distillation_diagnostic_metrics(
+                metrics,
+                student_topk_logprobs=student_topk_logprobs,
+                teacher_topk_logprobs=teacher_topk_logprobs,
+                mask=active_mask,
+                data=data,
+                teacher_entropy_low=(self.entropy_diagnostics_teacher_entropy_low),
+                teacher_entropy_high=(self.entropy_diagnostics_teacher_entropy_high),
+                teacher_entropy_threshold=(
+                    self.entropy_aware_teacher_entropy_threshold
+                ),
+                log_position_buckets=(self.entropy_diagnostics_log_position_buckets),
+            )
+        else:
+            teacher_entropy = None
+            entropy_aware_gate = None
+            support_forward_kl = None
+            support_ratio = None
+            student_support_logprobs = None
+            teacher_support_logprobs = None
+
+        entropy_aware_forward_loss = torch.tensor(0.0, device=kl_loss.device)
+        low_entropy_sharpening_loss = torch.tensor(0.0, device=kl_loss.device)
+        if self.entropy_aware_enabled:
+            assert teacher_entropy is not None
+            assert entropy_aware_gate is not None
+            assert support_forward_kl is not None
+            assert support_ratio is not None
+            assert student_support_logprobs is not None
+            assert teacher_support_logprobs is not None
+            if self.entropy_aware_weighting_mode == "threshold":
+                entropy_weight = entropy_aware_gate.to(active_mask.dtype)
+            else:
+                entropy_weight = (
+                    (teacher_entropy - self.entropy_aware_ramp_start)
+                    / self.entropy_aware_ramp_width
+                ).clamp(0.0, 1.0)
+                entropy_weight = entropy_weight.to(active_mask.dtype)
+            entropy_positive_mask = (entropy_weight > 0).to(
+                active_mask.dtype
+            ) * active_mask
+            positive_weight_mask = (entropy_weight > 0).to(
+                active_mask.dtype
+            ) * active_mask
+            weighted_mask = entropy_weight * active_mask
+            normalization = torch.as_tensor(
+                global_valid_toks,
+                device=kl_loss.device,
+                dtype=kl_loss.dtype,
+            ).clamp_min(1)
+            weighted_forward_kl = torch.where(
+                weighted_mask.to(torch.bool),
+                support_forward_kl,
+                torch.zeros_like(support_forward_kl),
+            )
+            entropy_aware_forward_loss = (weighted_forward_kl * weighted_mask).sum()
+            entropy_aware_forward_loss = entropy_aware_forward_loss / normalization
+            metrics["opd_diag_raw/entropy_aware/teacher_entropy_gate_ratio_sum"] = (
+                _metric_value(entropy_positive_mask)
+            )
+            metrics["opd_diag_raw/entropy_aware/teacher_entropy_gate_ratio_count"] = (
+                _metric_value(active_mask)
+            )
+            metrics["opd_diag_raw/entropy_aware/gate_ratio_sum"] = _metric_value(
+                positive_weight_mask
+            )
+            metrics["opd_diag_raw/entropy_aware/gate_ratio_count"] = _metric_value(
+                active_mask
+            )
+            metrics["opd_diag_raw/entropy_aware/weight_mean_sum"] = _metric_value(
+                weighted_mask
+            )
+            metrics["opd_diag_raw/entropy_aware/weight_mean_count"] = _metric_value(
+                active_mask
+            )
+            metrics["opd_diag_raw/entropy_aware/weighted_forward_kl_sum"] = (
+                _metric_value(weighted_forward_kl * weighted_mask)
+            )
+            metrics["opd_diag_raw/entropy_aware/weighted_forward_kl_count"] = (
+                _metric_value(active_mask)
+            )
+
+            if self.entropy_aware_low_entropy_sharpening_enabled:
+                low_entropy_gate = (
+                    teacher_entropy < self.entropy_diagnostics_teacher_entropy_low
+                ).to(active_mask.dtype)
+                broad_support_gate = torch.ones_like(active_mask)
+                if self.entropy_aware_low_entropy_sharpening_requires_support_ratio_above_threshold:
+                    broad_support_gate = (
+                        support_ratio.detach()
+                        > self.entropy_aware_low_entropy_sharpening_support_ratio_threshold
+                    ).to(active_mask.dtype)
+                sharpening_gate = low_entropy_gate * broad_support_gate * active_mask
+                sharpened_teacher_logprobs = torch.nn.functional.log_softmax(
+                    teacher_support_logprobs
+                    / self.entropy_aware_low_entropy_sharpening_temperature,
+                    dim=-1,
+                )
+                per_token_sharpening_kl = _support_reverse_kl(
+                    student_support_logprobs,
+                    sharpened_teacher_logprobs,
+                )
+                weighted_sharpening_kl = torch.where(
+                    sharpening_gate.to(torch.bool),
+                    per_token_sharpening_kl,
+                    torch.zeros_like(per_token_sharpening_kl),
+                )
+                low_entropy_sharpening_loss = (
+                    weighted_sharpening_kl * sharpening_gate
+                ).sum()
+                low_entropy_sharpening_loss = (
+                    low_entropy_sharpening_loss / normalization
+                )
+                metrics[
+                    "opd_diag_raw/entropy_aware/low_entropy_sharpening_gate_ratio_sum"
+                ] = _metric_value(sharpening_gate)
+                metrics[
+                    "opd_diag_raw/entropy_aware/low_entropy_sharpening_gate_ratio_count"
+                ] = _metric_value(active_mask)
+                metrics["opd_diag_raw/entropy_aware/low_entropy_sharpening_kl_sum"] = (
+                    _metric_value(weighted_sharpening_kl * sharpening_gate)
+                )
+                metrics[
+                    "opd_diag_raw/entropy_aware/low_entropy_sharpening_kl_count"
+                ] = _metric_value(active_mask)
+
+        total_loss = kl_loss
+        if self.entropy_aware_enabled:
+            total_loss = (
+                total_loss
+                + self.entropy_aware_forward_kl_weight * entropy_aware_forward_loss
+                + self.entropy_aware_low_entropy_sharpening_weight
+                * low_entropy_sharpening_loss
+            )
+
+        metrics["loss"] = (
+            float(total_loss.item()) if total_loss.ndim == 0 else total_loss
+        )
+        if self.entropy_aware_enabled:
+            weighted_forward_loss = (
+                self.entropy_aware_forward_kl_weight * entropy_aware_forward_loss
+            )
+            weighted_low_entropy_sharpening_loss = (
+                self.entropy_aware_low_entropy_sharpening_weight
+                * low_entropy_sharpening_loss
+            )
+            metrics["opd/entropy_aware/forward_loss"] = float(
+                entropy_aware_forward_loss.item()
+            )
+            metrics["opd/entropy_aware/weighted_forward_loss"] = float(
+                weighted_forward_loss.item()
+            )
+            metrics["opd/entropy_aware/low_entropy_sharpening_loss"] = float(
+                low_entropy_sharpening_loss.item()
+            )
+            metrics["opd/entropy_aware/weighted_low_entropy_sharpening_loss"] = float(
+                weighted_low_entropy_sharpening_loss.item()
+            )
+
+        return total_loss, metrics

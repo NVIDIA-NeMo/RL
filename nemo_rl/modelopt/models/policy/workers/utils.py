@@ -16,6 +16,7 @@
 import os
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -168,7 +169,16 @@ def get_modelopt_checkpoint_dir() -> str:
     return modelopt_checkpoint_dir
 
 
-def get_quantization_layer_spec():
+QuantMambaStackSpec = Literal["default", "modelopt"]
+
+
+def _env_disables_modelopt_layer_spec() -> bool:
+    return bool(int(os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")))
+
+
+def get_quantization_layer_spec(
+    disable_modelopt_layer_spec: bool | None = None,
+):
     """Return a checkpoint-serializable GPT layer-spec callback.
 
     Megatron-Bridge serializes ``transformer_layer_spec`` as the callback's
@@ -176,7 +186,10 @@ def get_quantization_layer_spec():
     configs stay within the built-in target allowlist. The partial keeps the
     sequence-packing requirement of disabling arbitrary attention masks.
     """
-    if int(os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")):
+    if disable_modelopt_layer_spec is None:
+        disable_modelopt_layer_spec = _env_disables_modelopt_layer_spec()
+
+    if disable_modelopt_layer_spec:
         return transformer_engine_layer_spec
     return partial(
         get_gpt_modelopt_spec,
@@ -187,8 +200,35 @@ def get_quantization_layer_spec():
     )
 
 
-def get_quantization_mamba_stack_spec():
+def get_quantization_mamba_stack_spec(
+    disable_modelopt_layer_spec: bool | None = None,
+    quant_mamba_stack_spec: QuantMambaStackSpec | str | None = None,
+):
     """Return a checkpoint-serializable Mamba stack-spec callback."""
-    if int(os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")):
+    if quant_mamba_stack_spec is not None:
+        quant_mamba_stack_spec = quant_mamba_stack_spec.lower()
+        if quant_mamba_stack_spec == "default":
+            print(
+                "Using Mamba stack spec for ModelOpt quantization/checkpoint load: "
+                f"{transformer_engine_mamba_stack_spec.__module__}."
+                f"{transformer_engine_mamba_stack_spec.__name__}"
+            )
+            return transformer_engine_mamba_stack_spec
+        if quant_mamba_stack_spec == "modelopt":
+            print(
+                "Using Mamba stack spec for ModelOpt quantization/checkpoint load: "
+                f"{modelopt_mamba_stack_spec.__module__}."
+                f"{modelopt_mamba_stack_spec.__name__}"
+            )
+            return modelopt_mamba_stack_spec
+        raise ValueError(
+            "policy.quant_mamba_stack_spec must be one of "
+            f"'default' or 'modelopt', got {quant_mamba_stack_spec!r}"
+        )
+
+    if disable_modelopt_layer_spec is None:
+        disable_modelopt_layer_spec = _env_disables_modelopt_layer_spec()
+
+    if disable_modelopt_layer_spec:
         return transformer_engine_mamba_stack_spec
     return modelopt_mamba_stack_spec

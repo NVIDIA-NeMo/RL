@@ -24,6 +24,8 @@ equivalents on ``AbstractPolicyWorker`` (``self._fetch(meta)`` /
     + object-array fields into a :class:`BatchedDataDict`).
   * :func:`write_columns` — pack-to-wire + ``put_samples`` for deltas
     against an existing :class:`KVBatchMeta`.
+  * :func:`write_per_token_columns` — force jagged packing for known
+    per-token deltas that may carry extra sequence padding.
   * :func:`kv_first_write` — pack-to-wire + ``put_samples`` for the
     rollout-actor's first put of a partition. Returns a new
     :class:`KVBatchMeta`.
@@ -33,6 +35,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
@@ -141,6 +144,84 @@ def write_columns(
     seq_lens = meta.sequence_lengths
     lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
     td = pack_jagged_fields(fields, lengths=lengths)
+    dp_client.put_samples(
+        sample_ids=meta.sample_ids,
+        partition_id=meta.partition_id,
+        fields=td,
+    )
+
+
+def write_per_token_columns(
+    dp_client: DataPlaneClient,
+    meta: KVBatchMeta,
+    fields: "dict[str, torch.Tensor]",
+    field_dtypes: dict[str, torch.dtype] | None = None,
+) -> None:
+    """``put_samples`` for known per-token columns with possible pad tails.
+
+    Generic :func:`write_columns` jagged-packs only when a tensor's sequence
+    dimension exactly equals ``max(meta.sequence_lengths)``. Worker forward
+    passes can return wider tensors because Megatron/CP pads to the global
+    forward length. For known per-token fields, slice each row to its own valid
+    length before writing so TQ stores the valid payload, not the padded tail.
+
+    Args:
+        dp_client: Data-plane client used for the underlying put.
+        meta: ``KVBatchMeta`` describing the keys being written. Must carry
+            ``sequence_lengths``.
+        fields: Map of per-token field name to tensor.
+        field_dtypes: Optional per-field dtype to apply after slicing each row
+            to its valid length and before moving it to CPU.
+    """
+    if not fields:
+        return
+    if meta.sequence_lengths is None:
+        raise ValueError("write_per_token_columns requires meta.sequence_lengths")
+
+    lengths = torch.tensor(meta.sequence_lengths, dtype=torch.long)
+    n = int(lengths.shape[0])
+    if n != len(meta.sample_ids):
+        raise ValueError(
+            "write_per_token_columns: sequence_lengths length "
+            f"({n}) must match sample_ids length ({len(meta.sample_ids)})."
+        )
+
+    lens = lengths.tolist()
+    max_len = max((int(length) for length in lens), default=0)
+    packed: dict[str, torch.Tensor] = {}
+    dtype_overrides = field_dtypes or {}
+    for name, value in fields.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"write_per_token_columns: field {name!r} is "
+                f"{type(value).__name__}, expected torch.Tensor."
+            )
+        if value.dim() < 2:
+            raise ValueError(
+                f"write_per_token_columns: field {name!r} must have shape "
+                f"(N, S, ...), got {tuple(value.shape)}."
+            )
+        if value.shape[0] != n:
+            raise ValueError(
+                f"write_per_token_columns: field {name!r} batch dim "
+                f"{value.shape[0]} must match sample_ids length {n}."
+            )
+        if value.shape[1] < max_len:
+            raise ValueError(
+                f"write_per_token_columns: field {name!r} sequence dim "
+                f"{value.shape[1]} is shorter than max sequence length {max_len}."
+            )
+
+        target_dtype = dtype_overrides.get(name)
+        rows: list[torch.Tensor] = []
+        for row_idx, row_len in enumerate(lens):
+            row = value[row_idx, : int(row_len)].detach()
+            if target_dtype is not None:
+                row = row.to(dtype=target_dtype)
+            rows.append(row.to("cpu").contiguous())
+        packed[name] = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    td = TensorDict(packed, batch_size=[n])
     dp_client.put_samples(
         sample_ids=meta.sample_ids,
         partition_id=meta.partition_id,

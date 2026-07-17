@@ -106,7 +106,148 @@ def _connect_existing() -> None:
     tq.init()
 
 
-_TQ_RUNTIME_ENV_PATCHED = False
+def _positive_int_or_none(value: Any, name: str) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return parsed
+
+
+_MOONCAKE_CLIENT_DEFAULTS: tuple[int, int] | None = None
+_MOONCAKE_INDEX_REUSE_PATCHED = False
+_MOONCAKE_CLEAR_SEMANTICS_PATCHED = False
+_MOONCAKE_TQ_ACTOR_SETUP_HOOK = (
+    "nemo_rl.data_plane.adapters.transfer_queue._setup_mooncake_tq_actor_hooks"
+)
+
+
+def _mooncake_client_defaults(mooncake_client: Any) -> tuple[int, int]:
+    global _MOONCAKE_CLIENT_DEFAULTS
+    if _MOONCAKE_CLIENT_DEFAULTS is None:
+        _MOONCAKE_CLIENT_DEFAULTS = (
+            mooncake_client.BATCH_SIZE_LIMIT,
+            mooncake_client.MAX_WORKER_THREADS,
+        )
+    return _MOONCAKE_CLIENT_DEFAULTS
+
+
+def _configure_mooncake_client_limits(cfg: DataPlaneConfig) -> None:
+    """Optionally throttle Mooncake tensor write bursts in TQ's Python client.
+
+    TransferQueue's Mooncake client defaults to batches of 200 tensor keys and
+    four writer threads. That is fine for small per-key tensors, but top-k
+    distillation writes can make each key large. These knobs let large-topk
+    jobs reduce burst size without forking TransferQueue.
+    """
+    if cfg["backend"] != "mooncake_cpu":
+        return
+
+    from transfer_queue.storage.clients import mooncake_client
+
+    default_batch_limit, default_max_threads = _mooncake_client_defaults(
+        mooncake_client
+    )
+    batch_limit_raw = cfg.get("mooncake_batch_size_limit")
+    if batch_limit_raw is None or batch_limit_raw == "":
+        batch_limit_raw = os.environ.get("NRL_TQ_MOONCAKE_BATCH_SIZE_LIMIT")
+    batch_limit = _positive_int_or_none(
+        batch_limit_raw,
+        "mooncake_batch_size_limit",
+    )
+    max_threads_raw = cfg.get("mooncake_max_worker_threads")
+    if max_threads_raw is None or max_threads_raw == "":
+        max_threads_raw = os.environ.get("NRL_TQ_MOONCAKE_MAX_WORKER_THREADS")
+    max_threads = _positive_int_or_none(
+        max_threads_raw,
+        "mooncake_max_worker_threads",
+    )
+
+    mooncake_client.BATCH_SIZE_LIMIT = (
+        batch_limit if batch_limit is not None else default_batch_limit
+    )
+    mooncake_client.MAX_WORKER_THREADS = (
+        max_threads if max_threads is not None else default_max_threads
+    )
+
+
+def _disable_mooncake_index_reuse() -> None:
+    """Avoid recycling TQ global indexes for Mooncake KV keys.
+
+    TransferQueue's KV storage keys are ``"{global_index}@{field}"``. Its
+    controller normally recycles released global indexes, which is fine for
+    mutable KV stores. Mooncake logs a warning that upsert/update is not
+    supported, and large top-k writeback has failed when a later step reused
+    keys such as ``205@teacher_topk_indices``. Keeping indexes monotonic avoids
+    writing over recently removed Mooncake keys while preserving sample cleanup.
+    """
+    global _MOONCAKE_INDEX_REUSE_PATCHED
+    if _MOONCAKE_INDEX_REUSE_PATCHED:
+        return
+
+    from transfer_queue.controller import PartitionIndexManager
+
+    if getattr(PartitionIndexManager, "_nemo_mooncake_no_reuse", False):
+        _MOONCAKE_INDEX_REUSE_PATCHED = True
+        return
+
+    def allocate_indexes(self, partition_id, count=1) -> list[int]:
+        if count <= 0:
+            raise ValueError(
+                f"Number of indexes needed must be larger than 0, but got {count}"
+            )
+
+        start_index = self.global_index_counter
+        end_index = start_index + count
+        indexes = list(range(start_index, end_index))
+
+        self.allocated_indexes.update(indexes)
+        self.global_index_counter = end_index
+        self.partition_to_indexes[partition_id].update(indexes)
+        self.reusable_indexes.clear()
+
+        return indexes
+
+    def release_partition(self, partition_id) -> list[int]:
+        indexes = self.partition_to_indexes.pop(partition_id, set())
+        for idx in indexes:
+            self.allocated_indexes.discard(idx)
+        self.reusable_indexes.clear()
+        return list(indexes)
+
+    def release_indexes(self, partition_id: str, indexes_to_release: list[int]):
+        if partition_id not in self.partition_to_indexes:
+            return []
+
+        partition_indexes = self.partition_to_indexes[partition_id]
+        if not set(indexes_to_release).issubset(partition_indexes):
+            raise ValueError(
+                "Some indexes to release do not belong to the specified partition."
+            )
+
+        partition_indexes.difference_update(indexes_to_release)
+        self.allocated_indexes.difference_update(indexes_to_release)
+        self.reusable_indexes.clear()
+
+        if not partition_indexes:
+            self.partition_to_indexes.pop(partition_id, None)
+
+    PartitionIndexManager.allocate_indexes = allocate_indexes
+    PartitionIndexManager.release_partition = release_partition
+    PartitionIndexManager.release_indexes = release_indexes
+    PartitionIndexManager._nemo_mooncake_no_reuse = True
+    _MOONCAKE_INDEX_REUSE_PATCHED = True
+    print(
+        "Mooncake TQ index reuse disabled: using monotonic global indexes",
+        flush=True,
+    )
+
+
+_TQ_RUNTIME_ENV_PATCH_LEVEL = 0
 
 
 def _resolve_tq_pin() -> str:
@@ -128,7 +269,130 @@ def _resolve_tq_pin() -> str:
     )
 
 
-def _patch_tq_actor_runtime_env() -> None:
+def _patch_mooncake_clear_semantics() -> None:
+    """Clear Mooncake storage before releasing TQ controller indexes.
+
+    Upstream TQ clears controller metadata first, which immediately returns
+    dense global indexes to the reusable pool. For Mooncake, that can make the
+    next step write the same ``global_index@field`` key while the previous
+    key's storage removal is still in progress. Storage-first clear keeps the
+    controller from recycling indexes until Mooncake deletion has completed,
+    and raising on failed removes prevents silent top-k payload leaks.
+    """
+    global _MOONCAKE_CLEAR_SEMANTICS_PATCHED
+    if _MOONCAKE_CLEAR_SEMANTICS_PATCHED:
+        return
+
+    from transfer_queue.client import AsyncTransferQueueClient, logger
+    from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
+
+    if not getattr(MooncakeStoreClient, "_nemo_raise_on_clear_fail", False):
+
+        def clear(self, keys: list[str], custom_backend_meta=None) -> None:
+            ret_codes = self._store.batch_remove(keys, force=True)
+            if len(ret_codes) != len(keys):
+                raise RuntimeError(
+                    f"batch_remove returned {len(ret_codes)} results, "
+                    f"expected {len(keys)}"
+                )
+            failed = [
+                (keys[i], ret)
+                for i, ret in enumerate(ret_codes)
+                if not (ret == 0 or ret == -704)
+            ]
+            if failed:
+                detail = ", ".join(f"{key}:{ret}" for key, ret in failed[:8])
+                suffix = "" if len(failed) <= 8 else f", ... +{len(failed) - 8} more"
+                raise RuntimeError(f"batch_remove failed for {detail}{suffix}")
+
+        MooncakeStoreClient.clear = clear
+        MooncakeStoreClient._nemo_raise_on_clear_fail = True
+
+    if not getattr(AsyncTransferQueueClient, "_nemo_storage_first_clear", False):
+
+        async def async_clear_partition(self, partition_id: str):
+            try:
+                if not hasattr(self, "storage_manager") or self.storage_manager is None:
+                    raise RuntimeError(
+                        f"[{self.client_id}]: Storage manager not initialized. "
+                        "Call initialize_storage_manager() before performing storage operations."
+                    )
+
+                if not self._controller:
+                    raise RuntimeError("No controller registered")
+
+                metadata = await self._get_partition_meta(partition_id)
+
+                if not metadata:
+                    logger.warning(
+                        f"Try to clear an non-exist partition {partition_id}. "
+                        "No action will be taken."
+                    )
+                    return
+
+                await self.storage_manager.clear_data(metadata)
+                await self._clear_partition_in_controller(partition_id)
+
+                logger.debug(
+                    f"[{self.client_id}]: Clear operation for partition_id "
+                    f"{partition_id} completed."
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in clear operation: {str(e)}") from e
+
+        async def async_clear_samples(self, metadata):
+            try:
+                if not hasattr(self, "storage_manager") or self.storage_manager is None:
+                    raise RuntimeError(
+                        f"[{self.client_id}]: Storage manager not initialized. "
+                        "Call initialize_storage_manager() before performing storage operations."
+                    )
+
+                if metadata.size == 0:
+                    logger.warning(
+                        f"[{self.client_id}]: Empty BatchMeta provided to clear_samples. "
+                        "No action taken."
+                    )
+                    return
+
+                if not self._controller:
+                    raise RuntimeError("No controller registered")
+
+                await self.storage_manager.clear_data(metadata)
+                await self._clear_meta_in_controller(metadata)
+
+                logger.debug(
+                    f"[{self.client_id}]: Clear operation for batch {metadata} completed."
+                )
+            except Exception as e:
+                raise RuntimeError(f"Error in clear_samples operation: {str(e)}") from e
+
+        AsyncTransferQueueClient.async_clear_partition = async_clear_partition
+        AsyncTransferQueueClient.async_clear_samples = async_clear_samples
+        AsyncTransferQueueClient._nemo_storage_first_clear = True
+
+    _MOONCAKE_CLEAR_SEMANTICS_PATCHED = True
+    print(
+        "Mooncake TQ clear semantics patched: storage clear before controller release",
+        flush=True,
+    )
+
+
+def _setup_mooncake_tq_actor_hooks() -> None:
+    _disable_mooncake_index_reuse()
+    _patch_mooncake_clear_semantics()
+
+
+def _pythonpath_with_repo_root() -> str:
+    repo_root = "/opt/nemo-rl"
+    current = os.environ.get("PYTHONPATH", "")
+    entries = [entry for entry in current.split(os.pathsep) if entry]
+    if repo_root not in entries:
+        entries.insert(0, repo_root)
+    return os.pathsep.join(entries)
+
+
+def _patch_tq_actor_runtime_env(*, patch_mooncake_semantics: bool = False) -> None:
     """Inject a per-actor ``runtime_env`` pin into TQ's actor ``.options()``.
 
     TQ spawns ``SimpleStorageUnit`` and ``TransferQueueController`` via
@@ -153,11 +417,15 @@ def _patch_tq_actor_runtime_env() -> None:
     container's existing TQ install). Drop the call from
     ``TQDataPlaneClient.__init__`` and delete this function.
     """
-    global _TQ_RUNTIME_ENV_PATCHED
-    if _TQ_RUNTIME_ENV_PATCHED:
+    global _TQ_RUNTIME_ENV_PATCH_LEVEL
+    desired_patch_level = 2 if patch_mooncake_semantics else 1
+    if _TQ_RUNTIME_ENV_PATCH_LEVEL >= desired_patch_level:
         return
 
-    runtime_env = {"pip": [_resolve_tq_pin()]}
+    runtime_env: dict[str, Any] = {"pip": [_resolve_tq_pin()]}
+    if patch_mooncake_semantics:
+        runtime_env["env_vars"] = {"PYTHONPATH": _pythonpath_with_repo_root()}
+        runtime_env["worker_process_setup_hook"] = _MOONCAKE_TQ_ACTOR_SETUP_HOOK
 
     def _install(cls) -> bool:
         if not hasattr(cls, "options"):
@@ -198,7 +466,8 @@ def _patch_tq_actor_runtime_env() -> None:
             RuntimeWarning,
             stacklevel=2,
         )
-    _TQ_RUNTIME_ENV_PATCHED = True
+    if patched_any:
+        _TQ_RUNTIME_ENV_PATCH_LEVEL = desired_patch_level
 
 
 def _init_tq(cfg: DataPlaneConfig) -> None:
@@ -295,7 +564,7 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
     # Inject runtime_env into TQ's actor spawn so SimpleStorageUnit /
     # TransferQueueController land on workers with transfer_queue available
     # — see _patch_tq_actor_runtime_env() docstring for the why.
-    _patch_tq_actor_runtime_env()
+    _patch_tq_actor_runtime_env(patch_mooncake_semantics=backend == "mooncake_cpu")
 
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
@@ -420,6 +689,10 @@ class TQDataPlaneClient(DataPlaneClient):
                 # IP — peers fail with "connection refused".
                 os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             os.environ.setdefault("MC_STORE_MEMCPY", "0")
+            _disable_mooncake_index_reuse()
+            _patch_mooncake_clear_semantics()
+
+        _configure_mooncake_client_limits(cfg)
 
         # Workaround for TQ KVStorageManager's 1D-field schema/data
         # mismatch (only `mooncake_cpu` goes through that path; `simple`

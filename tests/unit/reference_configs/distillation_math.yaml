@@ -17,6 +17,28 @@ loss_fn:
     kl_type: "mixed" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+    sft_weight: 0.0
+    entropy_diagnostics:
+        enabled: false
+        teacher_entropy_low: 0.3
+        teacher_entropy_high: 0.7
+        log_position_buckets: true
+    entropy_aware:
+        enabled: false
+        teacher_entropy_threshold: 0.8
+        weighting_mode: "threshold" # threshold, linear_ramp
+        ramp_start: 0.3
+        ramp_width: 0.6
+        forward_kl_weight: 1.0
+        high_entropy_reverse_kl_weight: 1.0
+        high_entropy_reverse_kl_threshold: 0.7
+        low_entropy_sharpening_enabled: false
+        low_entropy_sharpening_weight: 0.0
+        low_entropy_sharpening_temperature: 0.7
+        low_entropy_sharpening_support_ratio_threshold: 1.0
+        low_entropy_sharpening_requires_support_ratio_above_threshold: true
+        require_sft_weight_zero: true
+        require_zero_outside_topk_false: true
 
 checkpointing:
     enabled: true
@@ -270,3 +292,18 @@ cluster:
     num_nodes: 1
     master_port_range_low: 25000
     master_port_range_high: 28000
+
+# TransferQueue-mediated data plane for on-policy distillation.
+# Off by default; set enabled=true to keep teacher top-k logits in TQ
+# instead of returning them to the driver.
+data_plane:
+    enabled: false
+    impl: transfer_queue
+    backend: "simple"
+    storage_capacity: 1000000
+    num_storage_units: 2
+    claim_meta_poll_interval_s: 0.5
+    global_segment_size: 549755813888
+    local_buffer_size: 68719476736
+    # observability:
+    #   enabled: false

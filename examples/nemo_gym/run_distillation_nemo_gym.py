@@ -47,6 +47,18 @@ from nemo_rl.utils.config import (
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
+def _select_trainer(master_config: MasterConfig):
+    """Pick the NeMo-Gym distillation trainer based on ``data_plane.enabled``."""
+    dp_cfg = master_config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.algorithms.distillation_sync import distillation_train_sync
+
+        print("🚀 Running NeMo-Gym distillation training (TransferQueue)")
+        return distillation_train_sync
+    print("🚀 Running NeMo-Gym distillation training (legacy)")
+    return distillation_train
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -143,6 +155,17 @@ The validation set you pass in will directly be used for validation with no addi
 
     init_ray()
 
+    dp_cfg = config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def make_student_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=dp_cfg)
+
+        student_policy_factory = make_student_policy
+    else:
+        student_policy_factory = None
+
     (
         student_policy,
         teacher_policy,
@@ -154,7 +177,13 @@ The validation set you pass in will directly be used for validation with no addi
         checkpointer,
         distillation_state,
         master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
+    ) = setup(
+        config,
+        tokenizer,
+        train_dataset,
+        val_dataset,
+        student_policy_factory=student_policy_factory,
+    )
 
     if student_generation is None:
         raise ValueError("NeMo-Gym distillation requires a vLLM generation backend")
@@ -173,8 +202,8 @@ The validation set you pass in will directly be used for validation with no addi
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 
-    print("🚀 Running distillation training")
-    distillation_train(
+    trainer = _select_trainer(master_config)
+    trainer(
         student_policy,
         teacher_policy,
         student_generation,

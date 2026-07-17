@@ -1,0 +1,175 @@
+# Experimental Nano3 NVFP4 on-policy distillation recipe using TransferQueue.
+#
+# This preserves the production-shaped topology used while developing streamed
+# teacher top-k writeback. Point data.train.data_path and policy.quant_calib_data
+# at shared files before launching a real run.
+
+defaults: "./qa_distillation_nano3_megatron.yaml"
+
+distillation:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 4
+  max_num_steps: 3000
+  max_num_epochs: 20
+  val_period: 20
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  topk_logits_k: 300
+  data_pipeline:
+    mode: "stream_teacher"
+    log_memory_metrics: true
+
+loss_fn:
+  kl_type: "reverse"
+  mixed_kl_weight: 0.0
+  zero_outside_topk: false
+  sft_weight: 0.0
+  entropy_diagnostics:
+    enabled: true
+    teacher_entropy_low: 0.3
+    teacher_entropy_high: 0.7
+    log_position_buckets: true
+  entropy_aware:
+    enabled: false
+
+policy:
+  train_global_batch_size: 512
+  train_micro_batch_size: 2
+  generation_batch_size: 512
+  logprob_batch_size: 2
+  max_total_sequence_length: 49152
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
+  disable_modelopt_layer_spec: true
+  quant_mamba_stack_spec: "default"
+  quant_sequence_length: 8192
+  quant_force_all_expert_routing: false
+  quant_distributed_sync: false
+  sequence_packing:
+    enabled: true
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    gradient_accumulation_fusion: false
+    optimizer:
+      lr: 1.0e-5
+      min_lr: 2.0e-7
+    scheduler:
+      lr_decay_style: "cosine"
+      lr_decay_iters: ${distillation.max_num_steps}
+      lr_warmup_iters: 20
+      lr_warmup_init: 0
+  make_sequence_length_divisible_by: 32
+  generation:
+    max_new_tokens: 48128
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 4
+      gpu_memory_utilization: 0.32
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: "qwen3_coder"
+        reasoning_parser: "nano_v3"
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        backend: "eager"
+
+teacher:
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+  logprob_chunk_size: ${policy.logprob_chunk_size}
+  offload_optimizer_for_logprob: true
+  sequence_packing:
+    enabled: true
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    empty_unused_memory_level: ${policy.megatron_cfg.empty_unused_memory_level}
+    activation_checkpointing: ${policy.megatron_cfg.activation_checkpointing}
+    tensor_model_parallel_size: ${policy.megatron_cfg.tensor_model_parallel_size}
+    pipeline_model_parallel_size: ${policy.megatron_cfg.pipeline_model_parallel_size}
+    context_parallel_size: ${policy.megatron_cfg.context_parallel_size}
+    expert_tensor_parallel_size: ${policy.megatron_cfg.expert_tensor_parallel_size}
+    expert_model_parallel_size: ${policy.megatron_cfg.expert_model_parallel_size}
+    sequence_parallel: ${policy.megatron_cfg.sequence_parallel}
+    freeze_moe_router: ${policy.megatron_cfg.freeze_moe_router}
+    moe_router_dtype: ${policy.megatron_cfg.moe_router_dtype}
+    moe_router_load_balancing_type: ${policy.megatron_cfg.moe_router_load_balancing_type}
+    moe_router_bias_update_rate: ${policy.megatron_cfg.moe_router_bias_update_rate}
+    moe_permute_fusion: ${policy.megatron_cfg.moe_permute_fusion}
+    moe_enable_deepep: ${policy.megatron_cfg.moe_enable_deepep}
+    moe_token_dispatcher_type: ${policy.megatron_cfg.moe_token_dispatcher_type}
+    moe_shared_expert_overlap: ${policy.megatron_cfg.moe_shared_expert_overlap}
+    apply_rope_fusion: ${policy.megatron_cfg.apply_rope_fusion}
+    bias_activation_fusion: ${policy.megatron_cfg.bias_activation_fusion}
+    defer_fp32_logits: ${policy.megatron_cfg.defer_fp32_logits}
+    gradient_accumulation_fusion: false
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  validation: null
+
+data_plane:
+  enabled: true
+  impl: "transfer_queue"
+  backend: "mooncake_cpu"
+  storage_capacity: 1000000
+  num_storage_units: 2
+  claim_meta_poll_interval_s: 0.5
+  global_segment_size: 549755813888
+  local_buffer_size: 8589934592
+  mooncake_batch_size_limit: 1
+  mooncake_max_worker_threads: 1
+  teacher_topk_logits_dtype: "bfloat16"
+  teacher_topk_indices_dtype: "int32"
+
+checkpointing:
+  checkpoint_dir: "results/qa-distillation-nano3-tq/checkpoints"
+  save_period: 10
+  keep_top_k: 30
+
+logger:
+  log_dir: "results/qa-distillation-nano3-tq/logs"
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+  tensorboard:
+    log_dir: "results/qa-distillation-nano3-tq/tensorboard"
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

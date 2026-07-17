@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 
 import pytest
 import torch
@@ -1822,6 +1823,964 @@ def setup_distillation_test_data(batch_size=2, seq_len=4, vocab_size=8, topk=64)
     student_logits = torch.randn((batch_size, seq_len, vocab_size), device=device)
 
     return data, student_logits
+
+
+def _simple_distillation_data(token_mask, sample_mask=None):
+    batch_size, seq_len_minus_one = token_mask[:, 1:].shape
+    if sample_mask is None:
+        sample_mask = torch.ones(batch_size)
+    return BatchedDataDict(
+        {
+            "input_ids": torch.zeros(
+                (batch_size, seq_len_minus_one + 1), dtype=torch.long
+            ),
+            "input_lengths": torch.full((batch_size,), seq_len_minus_one + 1),
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+        }
+    )
+
+
+def test_distillation_entropy_diagnostics_k1_has_no_nan_cpu():
+    token_mask = torch.ones((1, 3), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    logprobs = torch.zeros((1, 2, 1))
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_diagnostics": {"enabled": True},
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_topk_logprobs=logprobs,
+        teacher_topk_logprobs=logprobs,
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+
+    assert torch.isfinite(loss)
+    assert metrics["opd_diag_raw/entropy/teacher_topk_sum"] == 0.0
+    assert metrics["opd_diag_raw/entropy/teacher_topk_count"] == 2.0
+    assert metrics["opd_diag_raw/support/effective_teacher_topk_sum"] == 2.0
+    for key, value in metrics.items():
+        if key.startswith("opd_diag_raw/"):
+            assert not torch.isnan(torch.tensor(value))
+
+
+def test_distillation_entropy_aware_ignores_masked_nonfinite_logprobs_cpu():
+    token_mask = torch.tensor([[False, True, False, True]], dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor([[[0.5, 0.5], [0.5, 0.5], [0.95, 0.05]]])
+    student_logprobs = torch.tensor(
+        [
+            [
+                [math.log(0.9), math.log(0.1)],
+                [float("nan"), 0.0],
+                [math.log(0.8), math.log(0.2)],
+            ]
+        ],
+        requires_grad=True,
+    )
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_diagnostics": {
+                "enabled": True,
+                "teacher_entropy_low": 0.3,
+                "teacher_entropy_high": 0.7,
+            },
+            "entropy_aware": {
+                "enabled": True,
+                "weighting_mode": "linear_ramp",
+                "ramp_start": 0.3,
+                "ramp_width": 0.6,
+                "forward_kl_weight": 1.0,
+                "high_entropy_reverse_kl_weight": 0.5,
+                "high_entropy_reverse_kl_threshold": 0.7,
+                "low_entropy_sharpening_enabled": True,
+                "low_entropy_sharpening_weight": 0.03,
+                "low_entropy_sharpening_temperature": 0.9,
+                "low_entropy_sharpening_support_ratio_threshold": 1.0,
+            },
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert all(
+        math.isfinite(float(value))
+        for value in metrics.values()
+        if isinstance(value, (float, int))
+    )
+    assert torch.isfinite(student_logprobs.grad[:, [0, 2], :]).all()
+    torch.testing.assert_close(
+        student_logprobs.grad[:, [1], :],
+        torch.zeros_like(student_logprobs.grad[:, [1], :]),
+    )
+
+
+def test_prepare_distillation_masks_inactive_nonfinite_logits_before_logsoftmax_cpu():
+    token_mask = torch.tensor([[False, True, False, True]], dtype=torch.bool)
+    sample_mask = torch.tensor([1.0])
+    teacher_topk_indices = torch.tensor(
+        [[[0, 1], [1, 2], [2, 3], [3, 4]]],
+        dtype=torch.long,
+    )
+    teacher_topk_logits = torch.randn((1, 4, 2))
+    teacher_topk_logits[0, 1, :] = float("nan")
+    teacher_topk_logits[0, 3, :] = float("nan")
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((1, 4), dtype=torch.long),
+            "input_lengths": torch.tensor([4]),
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "teacher_topk_logits": teacher_topk_logits,
+            "teacher_topk_indices": teacher_topk_indices,
+        }
+    )
+    student_logits = torch.randn((1, 4, 5))
+    student_logits[0, 1, :] = float("nan")
+    student_logits[0, 3, :] = float("nan")
+    student_logits.requires_grad_()
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_diagnostics": {"enabled": True},
+            "entropy_aware": {
+                "enabled": True,
+                "weighting_mode": "linear_ramp",
+                "ramp_start": 0.3,
+                "ramp_width": 0.6,
+                "forward_kl_weight": 1.0,
+                "high_entropy_reverse_kl_weight": 0.5,
+                "high_entropy_reverse_kl_threshold": 0.7,
+                "low_entropy_sharpening_enabled": True,
+                "low_entropy_sharpening_weight": 0.03,
+                "low_entropy_sharpening_temperature": 0.9,
+                "low_entropy_sharpening_support_ratio_threshold": 1.0,
+            },
+        }
+    )
+
+    loss_input, data = prepare_loss_input(student_logits, data, loss_fn)
+    assert torch.isfinite(loss_input["student_topk_logprobs"]).all()
+    assert torch.isfinite(loss_input["teacher_topk_logprobs"]).all()
+    loss, metrics = loss_fn(
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+        **loss_input,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert all(
+        math.isfinite(float(value))
+        for value in metrics.values()
+        if isinstance(value, (float, int))
+    )
+    assert torch.isfinite(student_logits.grad).all()
+    torch.testing.assert_close(
+        student_logits.grad[:, [1, 3], :],
+        torch.zeros_like(student_logits.grad[:, [1, 3], :]),
+    )
+
+
+def test_prepare_distillation_rejects_active_nonfinite_logits_cpu():
+    token_mask = torch.tensor([[False, True]], dtype=torch.bool)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.zeros((1, 2), dtype=torch.long),
+            "input_lengths": torch.tensor([2]),
+            "token_mask": token_mask,
+            "sample_mask": torch.tensor([1.0]),
+            "teacher_topk_logits": torch.zeros((1, 2, 2)),
+            "teacher_topk_indices": torch.tensor([[[0, 1], [0, 1]]]),
+        }
+    )
+    student_logits = torch.zeros((1, 2, 3))
+    student_logits[0, 0, 0] = float("nan")
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {"enabled": True},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="student_topk_logits.*active"):
+        prepare_loss_input(student_logits, data, loss_fn)
+
+
+def test_distillation_entropy_aware_rejects_active_nonfinite_logprobs_cpu():
+    token_mask = torch.ones((1, 2), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor([[[0.5, 0.5]]])
+    student_logprobs = torch.tensor([[[float("nan"), 0.0]]])
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {"enabled": True},
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="active distillation tokens"):
+        loss_fn(
+            student_topk_logprobs=student_logprobs,
+            teacher_topk_logprobs=teacher_probs.log(),
+            H_all=None,
+            data=data,
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+
+
+def test_distillation_entropy_diagnostics_respects_dense_mask_cpu():
+    token_mask = torch.tensor([[False, True, False, True]])
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor([[[0.5, 0.5], [0.5, 0.5], [0.999, 0.001]]])
+    student_probs = torch.tensor([[[0.9, 0.1], [0.001, 0.999], [0.999, 0.001]]])
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_diagnostics": {"enabled": True},
+        }
+    )
+
+    _, metrics = loss_fn(
+        student_topk_logprobs=student_probs.log(),
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+
+    assert metrics["opd_diag_raw/entropy/teacher_topk_count"] == 2.0
+    assert (
+        metrics["opd_diag_raw/mode_collapse/high_teacher_entropy_active_ratio_sum"]
+        == 1.0
+    )
+    assert (
+        metrics["opd_diag_raw/mode_collapse/high_teacher_entropy_active_ratio_count"]
+        == 2.0
+    )
+
+
+def test_distillation_entropy_diagnostics_renormalizes_zero_outside_topk_cpu():
+    token_mask = torch.ones((1, 3), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor([[[0.5, 0.5], [0.999, 0.001]]])
+    # Deliberately not support-normalized: this represents gathered full-vocab
+    # probabilities on teacher top-k support.
+    student_gathered_probs = torch.tensor([[[0.2, 0.2], [0.01, 0.01]]])
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "forward",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": True,
+            "entropy_diagnostics": {"enabled": True},
+        }
+    )
+
+    _, metrics = loss_fn(
+        student_topk_logprobs=student_gathered_probs.log(),
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=torch.zeros((1, 2)),
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+
+    assert metrics["opd_diag_raw/entropy/student_on_teacher_topk_sum"] > 0.99
+    assert metrics["opd_diag_raw/entropy/student_on_teacher_topk_count"] == 2.0
+
+
+def test_entropy_aware_distillation_rejects_sft_and_zero_outside_topk_cpu():
+    with pytest.raises(AssertionError, match="should not be mixed with SFT"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "sft_weight": 0.1,
+                "entropy_aware": {"enabled": True},
+            }
+        )
+
+    with pytest.raises(AssertionError, match="zero_outside_topk=false"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": True,
+                "entropy_aware": {"enabled": True},
+            }
+        )
+
+
+def test_entropy_aware_distillation_validates_enabled_config_only_cpu():
+    DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {
+                "enabled": True,
+                "weighting_mode": "threshold",
+                "ramp_width": 0.0,
+            },
+        }
+    )
+
+    with pytest.raises(AssertionError, match="only supported with reverse KL"):
+        DistillationLossFn(
+            {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {"enabled": True},
+            }
+        )
+
+    with pytest.raises(AssertionError, match="weighting mode"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {
+                    "enabled": True,
+                    "weighting_mode": "invalid",
+                },
+            }
+        )
+
+    with pytest.raises(AssertionError, match="ramp start"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {
+                    "enabled": True,
+                    "weighting_mode": "linear_ramp",
+                    "ramp_start": -0.1,
+                },
+            }
+        )
+
+    with pytest.raises(AssertionError, match="ramp width"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {
+                    "enabled": True,
+                    "weighting_mode": "linear_ramp",
+                    "ramp_width": 0.0,
+                },
+            }
+        )
+
+    with pytest.raises(AssertionError, match="forward KL weight"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {
+                    "enabled": True,
+                    "forward_kl_weight": -1.0,
+                },
+            }
+        )
+
+    with pytest.raises(AssertionError, match="high entropy reverse KL weight"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {
+                    "enabled": True,
+                    "high_entropy_reverse_kl_weight": 1.1,
+                },
+            }
+        )
+
+    with pytest.raises(AssertionError, match="high entropy reverse KL threshold"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {
+                    "enabled": True,
+                    "high_entropy_reverse_kl_threshold": -0.1,
+                },
+            }
+        )
+
+    with pytest.raises(AssertionError, match="sharpening temperature"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {
+                    "enabled": True,
+                    "low_entropy_sharpening_temperature": 1.0,
+                },
+            }
+        )
+
+    with pytest.raises(AssertionError, match="sharpening temperature"):
+        DistillationLossFn(
+            {
+                "kl_type": "reverse",
+                "mixed_kl_weight": 0.0,
+                "zero_outside_topk": False,
+                "entropy_aware": {
+                    "enabled": True,
+                    "low_entropy_sharpening_temperature": 1.1,
+                },
+            }
+        )
+
+
+def test_entropy_aware_disabled_config_is_inert_cpu():
+    token_mask = torch.ones((1, 3), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor([[[0.5, 0.5], [0.999, 0.001]]])
+    student_probs = torch.tensor([[[0.9, 0.1], [0.999, 0.001]]])
+    base_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+        }
+    )
+    disabled_entropy_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {
+                "enabled": False,
+                "forward_kl_weight": math.nan,
+                "low_entropy_sharpening_weight": math.nan,
+            },
+        }
+    )
+
+    base_loss, _ = base_loss_fn(
+        student_topk_logprobs=student_probs.log(),
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+    disabled_loss, metrics = disabled_entropy_loss_fn(
+        student_topk_logprobs=student_probs.log(),
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+
+    torch.testing.assert_close(disabled_loss, base_loss)
+    assert torch.isfinite(disabled_loss)
+    assert metrics["loss"] == metrics["kl_loss"]
+    assert "opd/entropy_aware/forward_loss" not in metrics
+
+
+def test_entropy_aware_distillation_adds_gated_forward_gradient_cpu():
+    token_mask = torch.ones((1, 3), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor([[[0.5, 0.5], [0.999, 0.001]]])
+    student_logprobs = torch.tensor(
+        [[[math.log(0.9), math.log(0.1)], [math.log(0.999), math.log(0.001)]]],
+        requires_grad=True,
+    )
+    base_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+        }
+    )
+    entropy_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {
+                "enabled": True,
+                "teacher_entropy_threshold": 0.8,
+                "forward_kl_weight": 1.0,
+            },
+        }
+    )
+
+    base_loss, _ = base_loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+    base_loss.backward(retain_graph=True)
+    base_grad = student_logprobs.grad.detach().clone()
+    student_logprobs.grad.zero_()
+
+    entropy_loss, metrics = entropy_loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+    entropy_loss.backward()
+
+    assert entropy_loss > base_loss
+    assert metrics["opd_diag_raw/entropy_aware/gate_ratio_sum"] == 1.0
+    assert not torch.allclose(student_logprobs.grad, base_grad)
+
+
+def test_entropy_aware_distillation_respects_token_and_sample_masks_cpu():
+    token_mask = torch.tensor(
+        [
+            [False, True, False, True],
+            [False, True, True, True],
+        ],
+        dtype=torch.bool,
+    )
+    sample_mask = torch.tensor([1.0, 0.0])
+    data = _simple_distillation_data(token_mask, sample_mask=sample_mask)
+    teacher_probs = torch.tensor(
+        [
+            [[0.999, 0.001], [0.5, 0.5], [0.5, 0.5]],
+            [[0.5, 0.5], [0.5, 0.5], [0.5, 0.5]],
+        ]
+    )
+    student_gathered_probs = torch.tensor(
+        [
+            [[0.98, 0.01], [0.49, 0.01], [0.49, 0.01]],
+            [[0.01, 0.49], [0.01, 0.49], [0.01, 0.49]],
+        ]
+    )
+    student_logprobs = student_gathered_probs.log().requires_grad_()
+    base_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+        }
+    )
+    entropy_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {
+                "enabled": True,
+                "teacher_entropy_threshold": 0.8,
+                "forward_kl_weight": 1.0,
+            },
+        }
+    )
+
+    base_loss, _ = base_loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+    entropy_loss, metrics = entropy_loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+    )
+
+    teacher_entropy = -(teacher_probs * teacher_probs.log()).sum(dim=-1) / math.log(2)
+    entropy_gate = (teacher_entropy >= 0.8).to(torch.float32)
+    active_mask = token_mask[:, 1:].to(torch.float32) * sample_mask.unsqueeze(-1)
+    student_support_logprobs = student_logprobs.detach() - torch.logsumexp(
+        student_logprobs.detach(), dim=-1, keepdim=True
+    )
+    forward_kl = (teacher_probs * (teacher_probs.log() - student_support_logprobs)).sum(
+        dim=-1
+    )
+    expected_forward_sum = (forward_kl * entropy_gate * active_mask).sum()
+    expected_forward_loss = expected_forward_sum / 2.0
+
+    torch.testing.assert_close(
+        entropy_loss.detach() - base_loss.detach(),
+        expected_forward_loss,
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["opd_diag_raw/entropy_aware/gate_ratio_sum"]),
+        (entropy_gate * active_mask).sum(),
+    )
+    assert metrics["opd_diag_raw/entropy_aware/gate_ratio_count"] == 2.0
+    assert metrics["num_valid_samples"] == 1.0
+    torch.testing.assert_close(
+        torch.tensor(metrics["opd_diag_raw/entropy_aware/weighted_forward_kl_sum"]),
+        expected_forward_sum,
+    )
+
+
+def test_entropy_aware_distillation_linear_ramp_weights_forward_gradient_cpu():
+    token_mask = torch.ones((1, 6), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor(
+        [
+            [
+                [0.999, 0.001],
+                [0.95, 0.05],
+                [0.8, 0.2],
+                [0.65, 0.35],
+                [0.5, 0.5],
+            ]
+        ]
+    )
+    student_gathered_probs = torch.tensor(
+        [
+            [
+                [0.009, 0.001],
+                [0.18, 0.02],
+                [0.4, 0.1],
+                [0.42, 0.08],
+                [0.49, 0.01],
+            ]
+        ]
+    )
+    student_logprobs = student_gathered_probs.log().requires_grad_()
+    teacher_entropy = -(teacher_probs * teacher_probs.log()).sum(dim=-1) / math.log(2)
+    ramp_start = float(teacher_entropy[0, 1].item())
+    ramp_width = float((teacher_entropy[0, 3] - teacher_entropy[0, 1]).item())
+    base_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+        }
+    )
+    entropy_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {
+                "enabled": True,
+                "weighting_mode": "linear_ramp",
+                "ramp_start": ramp_start,
+                "ramp_width": ramp_width,
+                "forward_kl_weight": 1.0,
+            },
+        }
+    )
+
+    base_loss, _ = base_loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(5.0),
+    )
+    base_loss.backward(retain_graph=True)
+    base_grad = student_logprobs.grad.detach().clone()
+    student_logprobs.grad.zero_()
+
+    entropy_loss, metrics = entropy_loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(5.0),
+    )
+    entropy_loss.backward()
+
+    entropy_weight = ((teacher_entropy - ramp_start) / ramp_width).clamp(0.0, 1.0)
+    torch.testing.assert_close(entropy_weight[0, 0], torch.tensor(0.0))
+    torch.testing.assert_close(entropy_weight[0, 1], torch.tensor(0.0))
+    assert 0.0 < entropy_weight[0, 2] < 1.0
+    torch.testing.assert_close(entropy_weight[0, 3], torch.tensor(1.0))
+    torch.testing.assert_close(entropy_weight[0, 4], torch.tensor(1.0))
+    student_support_logprobs = student_logprobs.detach() - torch.logsumexp(
+        student_logprobs.detach(), dim=-1, keepdim=True
+    )
+    forward_kl = (teacher_probs * (teacher_probs.log() - student_support_logprobs)).sum(
+        dim=-1
+    )
+    expected_forward_loss = (forward_kl * entropy_weight).sum() / 5.0
+
+    torch.testing.assert_close(
+        entropy_loss.detach() - base_loss.detach(),
+        expected_forward_loss,
+    )
+    assert metrics["opd_diag_raw/entropy_aware/gate_ratio_sum"] == float(
+        (entropy_weight > 0).sum().item()
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["opd_diag_raw/entropy_aware/weight_mean_sum"]),
+        entropy_weight.sum(),
+    )
+    assert not torch.allclose(student_logprobs.grad, base_grad)
+
+
+def test_entropy_aware_forward_kl_does_not_use_support_ratio_gate_cpu():
+    token_mask = torch.ones((1, 2), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor([[[0.5, 0.25, 0.25]]])
+    student_probs = torch.tensor([[[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]]])
+    student_logprobs = student_probs.log().requires_grad_()
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {
+                "enabled": True,
+                "teacher_entropy_threshold": 0.8,
+                "forward_kl_weight": 1.0,
+            },
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(1.0),
+    )
+    loss.backward()
+
+    teacher_entropy = -(teacher_probs * teacher_probs.log()).sum(dim=-1)
+    student_entropy = -(student_probs * student_probs.log()).sum(dim=-1)
+    assert torch.exp(student_entropy) / torch.exp(teacher_entropy) > 1.0
+    expected_forward_loss = (
+        teacher_probs * (teacher_probs.log() - student_probs.log())
+    ).sum()
+    torch.testing.assert_close(
+        torch.tensor(metrics["opd/entropy_aware/forward_loss"]),
+        expected_forward_loss,
+    )
+    assert metrics["opd_diag_raw/entropy_aware/gate_ratio_sum"] == 1.0
+
+
+def test_entropy_aware_high_entropy_downweights_reverse_kl_cpu():
+    token_mask = torch.ones((1, 4), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor(
+        [
+            [
+                [0.95, 0.05],
+                [0.7, 0.3],
+                [0.5, 0.5],
+            ]
+        ]
+    )
+    student_probs = torch.tensor(
+        [
+            [
+                [0.8, 0.2],
+                [0.9, 0.1],
+                [0.99, 0.01],
+            ]
+        ]
+    )
+    student_logprobs = student_probs.log().requires_grad_()
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_aware": {
+                "enabled": True,
+                "teacher_entropy_threshold": 0.8,
+                "forward_kl_weight": 0.0,
+                "high_entropy_reverse_kl_weight": 0.5,
+                "high_entropy_reverse_kl_threshold": 0.7,
+            },
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(3.0),
+    )
+
+    teacher_entropy = -(teacher_probs * teacher_probs.log()).sum(dim=-1) / math.log(2)
+    high_entropy_gate = teacher_entropy >= 0.7
+    reverse_kl_weight = torch.where(
+        high_entropy_gate,
+        torch.full_like(teacher_entropy, 0.5),
+        torch.ones_like(teacher_entropy),
+    )
+    reverse_kl = (student_probs * (student_probs.log() - teacher_probs.log())).sum(
+        dim=-1
+    )
+    expected_loss = (reverse_kl * reverse_kl_weight).sum() / 3.0
+
+    torch.testing.assert_close(loss.detach(), expected_loss)
+    assert (
+        metrics["opd_diag_raw/entropy_aware/high_entropy_reverse_kl_gate_ratio_sum"]
+        == 2.0
+    )
+    assert (
+        metrics["opd_diag_raw/entropy_aware/high_entropy_reverse_kl_gate_ratio_count"]
+        == 3.0
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["opd_diag_raw/entropy_aware/reverse_kl_weight_sum"]),
+        reverse_kl_weight.sum(),
+    )
+
+
+def test_low_entropy_sharpening_uses_low_bucket_support_ratio_cpu():
+    token_mask = torch.ones((1, 4), dtype=torch.bool)
+    data = _simple_distillation_data(token_mask)
+    teacher_probs = torch.tensor(
+        [
+            [
+                [0.95, 0.05],
+                [0.95, 0.05],
+                [0.5, 0.5],
+            ]
+        ]
+    )
+    student_probs = torch.tensor(
+        [
+            [
+                [0.8, 0.2],
+                [0.99, 0.01],
+                [0.8, 0.2],
+            ]
+        ]
+    )
+    student_logprobs = student_probs.log().requires_grad_()
+    base_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+        }
+    )
+    entropy_loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.0,
+            "zero_outside_topk": False,
+            "entropy_diagnostics": {
+                "enabled": True,
+                "teacher_entropy_low": 0.3,
+                "teacher_entropy_high": 0.7,
+            },
+            "entropy_aware": {
+                "enabled": True,
+                "teacher_entropy_threshold": 0.8,
+                "forward_kl_weight": 0.0,
+                "low_entropy_sharpening_enabled": True,
+                "low_entropy_sharpening_weight": 0.5,
+                "low_entropy_sharpening_temperature": 0.5,
+                "low_entropy_sharpening_support_ratio_threshold": 1.0,
+            },
+        }
+    )
+
+    base_loss, _ = base_loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(3.0),
+    )
+    entropy_loss, metrics = entropy_loss_fn(
+        student_topk_logprobs=student_logprobs,
+        teacher_topk_logprobs=teacher_probs.log(),
+        H_all=None,
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(3.0),
+    )
+
+    teacher_entropy = -(teacher_probs * teacher_probs.log()).sum(dim=-1)
+    student_entropy = -(student_probs * student_probs.log()).sum(dim=-1)
+    support_ratio = torch.exp(student_entropy) / torch.exp(teacher_entropy)
+    low_mask = (
+        teacher_entropy / math.log(2)
+        < entropy_loss_fn.entropy_diagnostics_teacher_entropy_low
+    )
+    sharpening_gate = low_mask & (support_ratio > 1.0)
+    sharpened_teacher_logprobs = torch.nn.functional.log_softmax(
+        teacher_probs.log() / 0.5,
+        dim=-1,
+    )
+    per_token_sharpening_kl = (
+        student_probs * (student_probs.log() - sharpened_teacher_logprobs)
+    ).sum(dim=-1)
+    expected_sharpening_loss = (
+        per_token_sharpening_kl * sharpening_gate.to(torch.float32)
+    ).sum() / 3.0
+
+    torch.testing.assert_close(
+        entropy_loss.detach() - base_loss.detach(),
+        0.5 * expected_sharpening_loss,
+    )
+    torch.testing.assert_close(
+        torch.tensor(metrics["opd_diag_raw/entropy_bucket/low/support_ratio_sum"]),
+        support_ratio[low_mask].sum(),
+    )
+    assert metrics["opd_diag_raw/entropy_bucket/low/support_ratio_count"] == 2.0
+    assert (
+        metrics["opd_diag_raw/entropy_aware/low_entropy_sharpening_gate_ratio_sum"]
+        == 1.0
+    )
 
 
 @pytest.mark.parametrize("kl_type", ["forward", "reverse", "mixed"])

@@ -1055,8 +1055,57 @@ class TestTopkLogitsPostProcessor:
 
         assert "topk_logits" in result
         assert "topk_indices" in result
-        # Output should be unpacked to batch shape
-        assert result["topk_logits"].shape[0] == 1
+        # Output should be unpacked to batch shape.
+        assert result["topk_logits"].shape == (1, 8, k)
+        assert result["topk_indices"].shape == (1, 8, k)
+
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.distributed_vocab_topk")
+    def test_topk_post_processor_with_packing_trimmed(
+        self, mock_topk, mock_tp_rank, mock_tp_grp
+    ):
+        """Test packed top-k can return only valid sequence width."""
+        from nemo_rl.models.megatron.train import TopkLogitsPostProcessor
+
+        mock_tp_grp.return_value = MagicMock()
+
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "megatron_cfg": {"context_parallel_size": 1},
+        }
+        k = 3
+        processor = TopkLogitsPostProcessor(
+            cfg=cfg,
+            k=k,
+            trim_to_input_lengths=True,
+        )
+
+        mock_data_dict = MagicMock()
+        mock_data_dict.__getitem__ = MagicMock(
+            side_effect=lambda key: torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
+            if key == "input_ids"
+            else torch.tensor([5])
+        )
+
+        mock_topk.return_value = (
+            torch.randn(1, 8, k),
+            torch.randint(0, 100, (1, 8, k)),
+        )
+
+        wrapped_fn = processor(
+            data_dict=mock_data_dict,
+            cu_seqlens_padded=torch.tensor([0, 5]),
+        )
+
+        loss, result = wrapped_fn(torch.randn(1, 8, 100))
+
+        assert "topk_logits" in result
+        assert "topk_indices" in result
+        assert result["topk_logits"].shape == (1, 5, k)
+        assert result["topk_indices"].shape == (1, 5, k)
 
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")

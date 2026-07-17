@@ -1,0 +1,80 @@
+# Qwen3 dense-MLP-only NVFP4 W4A4 recipe for QA distillation.
+#
+# This intentionally quantizes only the MLP projection linears and leaves
+# attention, embeddings, lm_head, norms, and all other modules in BF16. Both
+# Megatron/MCore names (linear_fc1/linear_fc2) and Hugging Face/vLLM names
+# (gate_proj/up_proj/down_proj or fused gate_up_proj) are included because QA
+# distillation uses Megatron for training and vLLM for on-policy generation.
+metadata:
+  recipe_type: ptq
+  description: Qwen3 NVFP4 W4A4, MLP projections only.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+
+    # Megatron/MCore dense MLP projection names.
+    - quantizer_name: '*.mlp.linear_fc1.*weight_quantizer'
+      enable: true
+      cfg: &nvfp4_cfg
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*.mlp.linear_fc1.*input_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.linear_fc2.*weight_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.linear_fc2.*input_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+
+    # Hugging Face/vLLM dense MLP projection names.
+    - quantizer_name: '*.mlp.gate_proj.*weight_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.gate_proj.*input_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.up_proj.*weight_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.up_proj.*input_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.gate_up_proj.*weight_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.gate_up_proj.*input_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.down_proj.*weight_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+    - quantizer_name: '*.mlp.down_proj.*input_quantizer'
+      enable: true
+      cfg: *nvfp4_cfg
+
+    # Keep structurally sensitive modules explicitly disabled even though the
+    # top-level deny-all already covers them. These guards make later edits
+    # safer if this recipe is broadened.
+    - quantizer_name: '*lm_head*'
+      enable: false
+    - quantizer_name: '*output_layer*'
+      enable: false
+    - quantizer_name: '*.self_attention.*'
+      enable: false
+    - quantizer_name: '*.self_attn.*'
+      enable: false
+    - quantizer_name: '*.input_layernorm.*'
+      enable: false
+    - quantizer_name: '*.post_attention_layernorm.*'
+      enable: false
+    - quantizer_name: '*.final_layernorm.*'
+      enable: false
+    - quantizer_name: '*.norm.*'
+      enable: false

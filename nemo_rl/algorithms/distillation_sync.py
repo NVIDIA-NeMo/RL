@@ -176,6 +176,9 @@ def _aggregate_teacher_topk_transport_results(
         "driver_tx_teacher_topk_bytes": 0,
         "driver_teacher_topk_bytes": 0,
         "driver_teacher_topk_bytes_avoided": 0,
+        "tq_teacher_topk_payload_bytes": 0,
+        "tq_teacher_topk_valid_payload_bytes": 0,
+        "tq_teacher_topk_padding_overhead_bytes": 0,
         "tq_teacher_topk_write_bytes": 0,
         "tq_teacher_topk_write_num_samples": 0,
         "tq_teacher_topk_write_ms_sum": 0.0,
@@ -203,6 +206,15 @@ def _aggregate_teacher_topk_transport_results(
         )
         transport_metrics["teacher_topk_padding_overhead_bytes"] += int(
             result.get("teacher_topk_padding_overhead_bytes", 0)
+        )
+        transport_metrics["tq_teacher_topk_payload_bytes"] += int(
+            result.get("tq_teacher_topk_payload_bytes", 0)
+        )
+        transport_metrics["tq_teacher_topk_valid_payload_bytes"] += int(
+            result.get("tq_teacher_topk_valid_payload_bytes", 0)
+        )
+        transport_metrics["tq_teacher_topk_padding_overhead_bytes"] += int(
+            result.get("tq_teacher_topk_padding_overhead_bytes", 0)
         )
         transport_metrics["tq_teacher_topk_write_bytes"] += int(
             result.get("tq_teacher_topk_write_bytes", 0)

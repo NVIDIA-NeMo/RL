@@ -17,7 +17,9 @@ import re
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterator, Optional, TypeVar, cast
+from dataclasses import replace
+from time import monotonic
+from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
@@ -46,6 +48,8 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane.schema import TEACHER_TOPK_INDICES, TEACHER_TOPK_LOGITS
+from nemo_rl.data_plane.transport_metrics import topk_payload_nbytes
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -92,6 +96,9 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import KVBatchMeta
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -821,6 +828,197 @@ class MegatronPolicyWorkerImpl(
         return BatchedDataDict.from_batches(
             [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
         )
+
+    def _is_megatron_topk_writeback_leader(self) -> bool:
+        if not torch.distributed.is_initialized():
+            return True
+        return (
+            parallel_state.get_tensor_model_parallel_rank() == 0
+            and parallel_state.get_context_parallel_rank() == 0
+            and parallel_state.get_pipeline_model_parallel_rank()
+            == parallel_state.get_pipeline_model_parallel_world_size() - 1
+        )
+
+    def _topk_microbatch_ranges(
+        self,
+        data: BatchedDataDict[Any],
+        *,
+        num_microbatches: int,
+        micro_batch_size: int,
+    ) -> list[tuple[int, int]]:
+        if data.micro_batch_indices is not None:
+            if len(data.micro_batch_indices) != 1:
+                raise ValueError(
+                    "Megatron TQ top-k streaming expected one local batch of "
+                    f"micro_batch_indices, got {len(data.micro_batch_indices)}."
+                )
+            ranges = [
+                (int(start), int(end)) for start, end in data.micro_batch_indices[0]
+            ]
+        else:
+            ranges = [
+                (idx * micro_batch_size, (idx + 1) * micro_batch_size)
+                for idx in range(num_microbatches)
+            ]
+        if len(ranges) != num_microbatches:
+            raise ValueError(
+                "Megatron TQ top-k streaming microbatch range count "
+                f"{len(ranges)} does not match iterator length {num_microbatches}."
+            )
+        return ranges
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits_presharded")
+    def get_topk_logits_presharded(
+        self,
+        meta: "KVBatchMeta",
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Compute teacher top-k in microbatches and write directly to TQ."""
+        from nemo_rl.data_plane.column_io import write_per_token_columns
+
+        data = self._fetch(meta)
+        data = self._attach_or_repack_pack_metadata(data, meta)
+
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        self.model.eval()
+        (
+            mb_iterator,
+            num_microbatches,
+            processed_micro_batch_size,
+            _seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+        )
+        mb_ranges = self._topk_microbatch_ranges(
+            data,
+            num_microbatches=num_microbatches,
+            micro_batch_size=logprob_batch_size,
+        )
+        is_writeback_leader = self._is_megatron_topk_writeback_leader()
+
+        metrics: dict[str, Any] = {
+            "teacher_topk_payload_bytes": 0,
+            "teacher_topk_valid_payload_bytes": 0,
+            "teacher_topk_padding_overhead_bytes": 0,
+            "tq_teacher_topk_payload_bytes": 0,
+            "tq_teacher_topk_valid_payload_bytes": 0,
+            "tq_teacher_topk_padding_overhead_bytes": 0,
+            "tq_teacher_topk_write_bytes": 0,
+            "tq_teacher_topk_write_num_samples": 0,
+            "tq_teacher_topk_write_ms": 0.0,
+        }
+
+        with torch.no_grad():
+            for processed_mb, (start_idx, end_idx) in zip(mb_iterator, mb_ranges):
+                list_of_outputs = megatron_forward_backward(
+                    model=self.model,
+                    data_iterator=iter([processed_mb]),
+                    seq_length=padded_seq_length,
+                    mbs=processed_micro_batch_size,
+                    num_microbatches=1,
+                    post_processing_fn=TopkLogitsPostProcessor(
+                        cfg=self.cfg,
+                        k=k,
+                        trim_to_input_lengths=True,
+                    ),
+                    forward_only=True,
+                    defer_fp32_logits=self.defer_fp32_logits,
+                    sampling_params=self.sampling_params,
+                    straggler_timer=self.mcore_state.straggler_timer,
+                )
+                if not is_writeback_leader:
+                    del list_of_outputs
+                    continue
+                if len(list_of_outputs) != 1:
+                    raise RuntimeError(
+                        "Megatron TQ top-k streaming expected one output for one "
+                        f"microbatch, got {len(list_of_outputs)}."
+                    )
+                out = list_of_outputs[0]
+                topk_logits = out["topk_logits"]
+                topk_indices = out["topk_indices"]
+
+                mb_sample_ids = meta.sample_ids[start_idx:end_idx]
+                mb_sequence_lengths = (
+                    meta.sequence_lengths[start_idx:end_idx]
+                    if meta.sequence_lengths is not None
+                    else None
+                )
+                mb_tags = (
+                    meta.tags[start_idx:end_idx] if meta.tags is not None else None
+                )
+                mb_meta = replace(
+                    meta,
+                    sample_ids=mb_sample_ids,
+                    fields=[TEACHER_TOPK_LOGITS, TEACHER_TOPK_INDICES],
+                    sequence_lengths=mb_sequence_lengths,
+                    tags=mb_tags,
+                )
+                field_dtypes = self._teacher_topk_writeback_dtypes(topk_indices)
+                teacher_topk_payload_bytes = topk_payload_nbytes(
+                    topk_logits,
+                    topk_indices,
+                )
+                teacher_topk_valid_payload_bytes = topk_payload_nbytes(
+                    topk_logits,
+                    topk_indices,
+                    mb_sequence_lengths,
+                )
+                tq_teacher_topk_valid_payload_bytes = (
+                    self._topk_payload_nbytes_with_dtypes(
+                        topk_logits,
+                        topk_indices,
+                        mb_sequence_lengths,
+                        field_dtypes,
+                    )
+                )
+
+                write_start = monotonic()
+                write_per_token_columns(
+                    self._require_dp_client(),
+                    mb_meta,
+                    {
+                        TEACHER_TOPK_LOGITS: topk_logits,
+                        TEACHER_TOPK_INDICES: topk_indices,
+                    },
+                    field_dtypes=field_dtypes,
+                )
+                write_ms = (monotonic() - write_start) * 1000.0
+
+                metrics["teacher_topk_payload_bytes"] += teacher_topk_payload_bytes
+                metrics["teacher_topk_valid_payload_bytes"] += (
+                    teacher_topk_valid_payload_bytes
+                )
+                metrics["teacher_topk_padding_overhead_bytes"] += max(
+                    teacher_topk_payload_bytes - teacher_topk_valid_payload_bytes,
+                    0,
+                )
+                metrics["tq_teacher_topk_payload_bytes"] += (
+                    tq_teacher_topk_valid_payload_bytes
+                )
+                metrics["tq_teacher_topk_valid_payload_bytes"] += (
+                    tq_teacher_topk_valid_payload_bytes
+                )
+                metrics["tq_teacher_topk_write_bytes"] += (
+                    tq_teacher_topk_valid_payload_bytes
+                )
+                metrics["tq_teacher_topk_write_num_samples"] += len(mb_sample_ids)
+                metrics["tq_teacher_topk_write_ms"] += write_ms
+                del list_of_outputs, out, topk_logits, topk_indices
+
+        del data
+        gc.collect()
+        return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(
