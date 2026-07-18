@@ -1,4 +1,4 @@
-# SingleController + Megatron variant of grpo-qwen2.5-math-1.5b-instruct-1n8g.
+# SingleController + Megatron variant of grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml.
 defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml
 
 logger:
