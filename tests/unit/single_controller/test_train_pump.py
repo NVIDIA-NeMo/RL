@@ -32,7 +32,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
+from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -320,7 +320,7 @@ def test_train_pump_drives_mcore_training_step(
             },
         )
 
-        bundle = SingleControllerBundle(
+        actor_args = SingleControllerActorArgs(
             gen_handle=None,
             trainer_handle=trainer,
             env_handles={},
@@ -338,7 +338,7 @@ def test_train_pump_drives_mcore_training_step(
         ctrl = _RecordingSingleControllerActor.remote(
             metric_log_handle=log,
             master_config=master_config,
-            bundle=bundle,
+            actor_args=actor_args,
         )
 
         # train_steps outer steps, each: sampler.select → advantage stage → begin/microbatches/finish → sync.

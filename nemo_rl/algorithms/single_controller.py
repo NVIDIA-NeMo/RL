@@ -48,7 +48,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     WeightSyncConfig,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
+from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     fields_for_put,
@@ -83,30 +83,29 @@ class SingleControllerActor:
     def __init__(
         self,
         master_config: MasterConfig,
-        bundle: SingleControllerBundle,
+        actor_args: SingleControllerActorArgs,
     ) -> None:
         """Initialize the SingleController actor.
 
         Args:
             master_config: SC MasterConfig.
-            bundle: Pre-built bundle from setup_single_controller. Tests can
-                construct a bundle by hand (or with fakes) to bypass the real factories.
+            actor_args: Pre-built actor args from setup_single_controller.
         """
         self._advantage_cfg = AdvantageConfig()
         self._weight_sync_cfg = WeightSyncConfig()
-        self._partition_id: str = bundle.partition_id
+        self._partition_id: str = actor_args.partition_id
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
-        self._dp_client = bundle.dp_client
-        self._gen: Generation = bundle.gen_handle
-        self._trainer: TQPolicy = bundle.trainer_handle
-        self._dataloader = bundle.dataloader
-        self._weight_synchronizer = bundle.weight_synchronizer
-        self._advantage_estimator = bundle.advantage_estimator
-        self._loss_fn = bundle.loss_fn
-        self._buffer = bundle.tq_buffer
-        self._rollout_manager = bundle.rollout_manager
+        self._dp_client = actor_args.dp_client
+        self._gen: Generation = actor_args.gen_handle
+        self._trainer: TQPolicy = actor_args.trainer_handle
+        self._dataloader = actor_args.dataloader
+        self._weight_synchronizer = actor_args.weight_synchronizer
+        self._advantage_estimator = actor_args.advantage_estimator
+        self._loss_fn = actor_args.loss_fn
+        self._buffer = actor_args.tq_buffer
+        self._rollout_manager = actor_args.rollout_manager
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
@@ -117,8 +116,8 @@ class SingleControllerActor:
         self._timer = Timer()
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
-        self._train_cluster = bundle.train_cluster
-        self._inference_cluster = bundle.inference_cluster
+        self._train_cluster = actor_args.train_cluster
+        self._inference_cluster = actor_args.inference_cluster
 
         num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
         if num_prompts_per_step < self._async_cfg.min_groups_for_streaming_train:

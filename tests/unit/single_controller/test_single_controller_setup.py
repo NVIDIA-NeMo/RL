@@ -24,7 +24,7 @@ import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
-    SingleControllerBundle,
+    SingleControllerActorArgs,
     setup_single_controller,
 )
 
@@ -154,7 +154,7 @@ def patched_factories():
 
 
 class TestSetup:
-    """setup arg validation + bundle assembly."""
+    """setup arg validation + actor_args assembly."""
 
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)
@@ -166,39 +166,44 @@ class TestSetup:
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_returns_bundle(self, patched_factories):
+    def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config(colocated=True)
         tokenizer = MagicMock(pad_token_id=0)
 
-        bundle = setup_single_controller(mc, tokenizer)
+        actor_args = setup_single_controller(mc, tokenizer)
 
-        assert isinstance(bundle, SingleControllerBundle)
-        assert bundle.gen_handle is patched_factories["_build_generation"].return_value
-        assert bundle.trainer_handle is patched_factories["_build_trainer"].return_value
-        assert bundle.env_handles is patched_factories["env_handles"]
+        assert isinstance(actor_args, SingleControllerActorArgs)
         assert (
-            bundle.dp_client
+            actor_args.gen_handle is patched_factories["_build_generation"].return_value
+        )
+        assert (
+            actor_args.trainer_handle
+            is patched_factories["_build_trainer"].return_value
+        )
+        assert actor_args.env_handles is patched_factories["env_handles"]
+        assert (
+            actor_args.dp_client
             is patched_factories["build_data_plane_client"].return_value
         )
-        assert bundle.dataloader is patched_factories["dataloader"]
-        assert bundle.weight_synchronizer is (
+        assert actor_args.dataloader is patched_factories["dataloader"]
+        assert actor_args.weight_synchronizer is (
             patched_factories["create_weight_synchronizer"].return_value
         )
         # Refit depends on init_communicator running exactly once at setup time.
-        bundle.weight_synchronizer.init_communicator.assert_called_once()
-        assert bundle.advantage_estimator is (
+        actor_args.weight_synchronizer.init_communicator.assert_called_once()
+        assert actor_args.advantage_estimator is (
             patched_factories["_create_advantage_estimator"].return_value
         )
-        assert bundle.loss_fn is patched_factories["ClippedPGLossFn"].return_value
+        assert actor_args.loss_fn is patched_factories["ClippedPGLossFn"].return_value
         # tq_buffer + rollout_manager are constructed inline (not mocked).
-        assert bundle.tq_buffer is not None
-        assert bundle.rollout_manager is not None
+        assert actor_args.tq_buffer is not None
+        assert actor_args.rollout_manager is not None
         # rollout_manager binds the same tq_buffer for the writer + sampler.
-        assert bundle.rollout_manager._tq_buffer is bundle.tq_buffer
+        assert actor_args.rollout_manager._tq_buffer is actor_args.tq_buffer
         # tq_buffer wires the dp_client + default partition.
-        assert bundle.tq_buffer._dp_client is bundle.dp_client
-        assert bundle.partition_id == "rollout_data"
-        assert bundle.tq_buffer._partition_id == "rollout_data"
+        assert actor_args.tq_buffer._dp_client is actor_args.dp_client
+        assert actor_args.partition_id == "rollout_data"
+        assert actor_args.tq_buffer._partition_id == "rollout_data"
 
     def test_nemo_gym_not_supported(self):
         """SC path trips the nemo-gym guard until PR #3267 lands."""
@@ -214,11 +219,11 @@ class TestSetup:
         math_env_cfg = {"some": "value"}
         mc = _make_master_config(env={"math": math_env_cfg})
 
-        bundle = setup_single_controller(mc, MagicMock(pad_token_id=0))
+        actor_args = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         _, call_kwargs = patched_factories["setup_response_data"].call_args
         assert call_kwargs["env_configs"] == {"math": math_env_cfg}
-        assert bundle.env_handles is patched_factories["env_handles"]
+        assert actor_args.env_handles is patched_factories["env_handles"]
 
     def test_weight_sync_factory_args(self, patched_factories):
         """create_weight_synchronizer receives policy / generation / topology."""
@@ -242,11 +247,13 @@ class TestSetup:
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=7)
 
-        bundle = setup_single_controller(mc, tokenizer, partition_id="custom_partition")
+        actor_args = setup_single_controller(
+            mc, tokenizer, partition_id="custom_partition"
+        )
 
-        assert bundle.partition_id == "custom_partition"
-        assert bundle.tq_buffer._partition_id == "custom_partition"
-        assert bundle.tq_buffer._pad_value_dict == {
+        assert actor_args.partition_id == "custom_partition"
+        assert actor_args.tq_buffer._partition_id == "custom_partition"
+        assert actor_args.tq_buffer._pad_value_dict == {
             "token_ids": 7,
             "input_ids": 7,
         }

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Driver-side factory for the SingleController (async-RL) training path.
 
-setup builds the full SingleControllerBundle on the driver and the caller passes it to
+setup builds the full SingleControllerActorArgs on the driver and the caller passes it to
 SingleControllerActor.remote. Everything lives on the driver because driver-side
 TQPolicy owns the worker group directly — running this inside another Ray actor nests
 runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
@@ -48,7 +48,7 @@ from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
 @dataclass
-class SingleControllerBundle:
+class SingleControllerActorArgs:
     """All inputs SingleControllerActor needs, built driver-side by setup_single_controller().
 
     Passed as a single arg to SingleControllerActor.remote so the actor's __init__ does
@@ -242,8 +242,8 @@ def setup_single_controller(
     *,
     processor: Optional[AutoProcessor] = None,
     partition_id: str = "rollout_data",
-) -> SingleControllerBundle:
-    """Build the full SC bundle driver-side.
+) -> SingleControllerActorArgs:
+    """Build the full SC actor args driver-side.
 
     Args:
         master_config: SC MasterConfig.
@@ -252,7 +252,7 @@ def setup_single_controller(
         partition_id: TQ partition the rollout writer + sampler share.
 
     Returns:
-        SingleControllerBundle ready to be passed to SingleControllerActor.
+        SingleControllerActorArgs ready to be passed to SingleControllerActor.
     """
     # short names for config sections
     grpo_config = master_config.grpo
@@ -383,7 +383,7 @@ def setup_single_controller(
         tq_buffer=tq_buffer,
     )
 
-    return SingleControllerBundle(
+    return SingleControllerActorArgs(
         gen_handle=generation,
         trainer_handle=policy,
         env_handles=env_handles,

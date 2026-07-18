@@ -14,7 +14,7 @@
 
 """Async GRPO launcher driven by the SingleController actor.
 
-Builds the full SC bundle driver-side via setup_single_controller and hands it
+Builds the full SC actor args driver-side via setup_single_controller and hands them
 to SingleControllerActor. Mirrors run_grpo.py for config loading so the same YAML
 files apply. data_plane.enabled=true is mandatory.
 """
@@ -119,16 +119,16 @@ def main() -> None:
     if bool(config.env.get("should_use_nemo_gym")):
         setup_nemo_gym_config(config, tokenizer)
 
-    bundle = setup_single_controller(config, tokenizer)
+    actor_args = setup_single_controller(config, tokenizer)
 
     print("🚀 Launching SingleControllerActor")
-    sc = SingleControllerActor.remote(master_config=config, bundle=bundle)
+    sc = SingleControllerActor.remote(master_config=config, actor_args=actor_args)
     try:
         result = ray.get(sc.run.remote())
         print(f"SC run complete: {result}")
     finally:
         # Drain env actors before vLLM to avoid in-flight 500 on in-flight requests.
-        for handle in bundle.env_handles.values():
+        for handle in actor_args.env_handles.values():
             ray.get(handle.shutdown.remote())
 
 

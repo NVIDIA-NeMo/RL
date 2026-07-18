@@ -35,7 +35,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
+from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager
 
@@ -329,7 +329,7 @@ def test_rollout_pump_writes_expected_tq_data(
         use_nemo_gym=False,
         tq_buffer=tq_buffer,
     )
-    bundle = SingleControllerBundle(
+    actor_args = SingleControllerActorArgs(
         gen_handle=vllm_generation,
         trainer_handle=object(),
         env_handles={},
@@ -344,7 +344,9 @@ def test_rollout_pump_writes_expected_tq_data(
         tq_buffer=tq_buffer,
         partition_id=_PARTITION_ID,
     )
-    ctrl = SingleControllerActor.remote(master_config=master_config, bundle=bundle)
+    ctrl = SingleControllerActor.remote(
+        master_config=master_config, actor_args=actor_args
+    )
 
     vllm_generation.prepare_for_generation()
     ray.get(ctrl._rollout_pump.remote())
