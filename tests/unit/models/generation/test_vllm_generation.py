@@ -2637,6 +2637,26 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         vllm_http_server_generated_token["token"].removeprefix("token_id:")
     )
 
+    # vLLM validates the shorter chat-template rendering before NeMo RL
+    # replaces it with the authoritative trajectory prefix.  Reject an
+    # oversized replacement before it reaches the engine's fixed token buffer.
+    oversized_authoritative_prefix = [
+        *initial_tokenized_query_ids_prefix,
+        *([initial_tokenized_ids[0]] * 1024),
+    ]
+    oversized_response = requests.post(
+        url=f"{base_urls[0]}/chat/completions",
+        json=body | {"required_prefix_token_ids": oversized_authoritative_prefix},
+    )
+    assert oversized_response.status_code == 400
+    assert "maximum context length" in oversized_response.json()["error"]["message"]
+
+    # The rejection must leave EngineCore healthy for subsequent requests.
+    healthy_response = requests.post(
+        url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
+    )
+    assert healthy_response.status_code == 200
+
     # A prompt tokenized by this server can be reused directly by the next
     # generation request. The chat conversation is still rendered for response
     # and tool parsing, but prompt encoding is bypassed.
