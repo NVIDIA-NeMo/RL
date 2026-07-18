@@ -12,6 +12,7 @@ from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallFinalizationUnavailableError,
     StreamingToolCallPrefillManager,
     StreamingToolCallPrefixMismatchError,
+    StreamingToolCallPromptTooLongError,
     StreamingToolCallSessionClosedError,
     StreamingToolCallSessionNotFoundError,
 )
@@ -219,6 +220,32 @@ async def test_sealed_session_streams_authoritative_final_suffix() -> None:
     assert engine.received_chunks == [[1, 2, 3], [4, 5]]
     assert len(outputs) == 1
     assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_seal_rejects_oversized_final_suffix_before_engine_submission() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine, max_prompt_tokens=4)
+
+    await manager.start(session_id="session", prompt_token_ids=[1, 2, 3], sequence_no=0)
+    await manager.append(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        sequence_no=1,
+    )
+
+    with pytest.raises(
+        StreamingToolCallPromptTooLongError,
+        match="streaming prefill prompt would exceed its token limit: 5 > 4",
+    ):
+        await manager.seal(
+            session_id="session",
+            final_prompt_token_ids=[1, 2, 3, 4, 5],
+        )
+
+    assert engine.received_chunks == [[1, 2, 3]]
+    assert manager.total_prompt_too_long_rejections == 1
+    assert await manager.abort(session_id="session")
 
 
 @pytest.mark.asyncio

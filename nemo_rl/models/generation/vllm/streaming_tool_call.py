@@ -44,6 +44,18 @@ class StreamingToolCallFinalizationUnavailableError(StreamingToolCallError):
     """Raised before final decode when a session cannot be reused safely."""
 
 
+def validate_prompt_token_count(
+    *, prompt_token_count: int, max_prompt_tokens: int
+) -> None:
+    """Reject an engine prompt before it can exceed its fixed token buffer."""
+    if prompt_token_count > max_prompt_tokens:
+        raise StreamingToolCallPromptTooLongError(
+            "streaming prefill prompt would exceed its token limit: "
+            f"{prompt_token_count} > {max_prompt_tokens} "
+            "(maximum context length)"
+        )
+
+
 @dataclass(frozen=True)
 class StreamingToolCallAppendResult:
     """Result returned after one prefill chunk has completed."""
@@ -263,6 +275,16 @@ class StreamingToolCallPrefillManager:
         if cache_page_size_tokens < 1:
             raise ValueError("cache_page_size_tokens must be positive")
         self._cache_page_size_tokens = cache_page_size_tokens
+
+    def _validate_prompt_token_count(self, prompt_token_count: int) -> None:
+        try:
+            validate_prompt_token_count(
+                prompt_token_count=prompt_token_count,
+                max_prompt_tokens=self._max_prompt_tokens,
+            )
+        except StreamingToolCallPromptTooLongError:
+            self._total_prompt_too_long_rejections += 1
+            raise
 
     @staticmethod
     def _validate_initial_candidate(
@@ -515,12 +537,7 @@ class StreamingToolCallPrefillManager:
                     common_prefix_tokens - self._stability_margin_tokens,
                 )
 
-            if stable_token_count > self._max_prompt_tokens:
-                self._total_prompt_too_long_rejections += 1
-                raise StreamingToolCallPromptTooLongError(
-                    "streaming prefill prompt would exceed its token limit: "
-                    f"{stable_token_count} > {self._max_prompt_tokens}"
-                )
+            self._validate_prompt_token_count(stable_token_count)
 
             # Avoid starting GPU work until the proven stable prefix extends
             # the cacheable prefix by at least one full engine page. If the
@@ -705,6 +722,7 @@ class StreamingToolCallPrefillManager:
         await asyncio.sleep(0)
         session = self._get_session(session_id)
         self._raise_if_unavailable(session)
+        self._validate_prompt_token_count(len(final_prompt_token_ids))
         if session.sealed or session.finalizing:
             raise StreamingToolCallFinalizationUnavailableError(
                 f"streaming tool-call session is already finalizing: {session_id}"
@@ -752,6 +770,7 @@ class StreamingToolCallPrefillManager:
             raise StreamingToolCallFinalizationUnavailableError(
                 "same-request final streaming input is not configured"
             )
+        self._validate_prompt_token_count(len(final_prompt_token_ids))
 
         async with self._lock:
             session = self._sessions.get(session_id)
