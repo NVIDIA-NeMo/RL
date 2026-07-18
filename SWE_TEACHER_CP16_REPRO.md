@@ -90,19 +90,27 @@ per the flight-recorder dump; analyzer: `tools/analyze_fr.py`).
 
 | Run | seq | GBS | mtp | CP/nodes | Status |
 |---|---|---|---|---|---|
-| 5331363 / 5355697 | 65k | **128** | 1 | CP16/48 | ❌ STALL (CP watchdog) |
+| **5355697** | 65k | **128** | 1 | CP16/48 | ❌ **CP hang** — 16 `CONTEXT_PARALLEL_GROUP` watchdogs (the real CP `all_to_all` desync) |
+| 5331363 | 65k | 128 | 1 | CP16/48 | ❌ **NaN collapse** (NOT a CP hang) — 2619 `nan`, **0** CP watchdogs; pre-`moe_backend: triton` |
 | 5372801 | 190k | 4 | 1 | CP16/48 | ✅ clean → step 2 |
 | 5388072 | 190k | 32 | 1 | CP16/48 | ✅ clean → step 5 |
-| **5456109** | **65k** | **32** | **5** | CP16/48 | ✅ clean, from scratch → step 2+ (per-step timing) |
+| **5456109** | **65k** | **32** | **5** | CP16/48 | ✅ clean from scratch → **step 4 (5 steps)**, 0 CP watchdog, COMPLETED at walltime |
 
-- **GBS=128 → hang (2/2); GBS≤32 → clean (all), independent of seq len (65k or 190k) and mtp (1 or 5).**
+- **The two GBS=128 "stalls" are DIFFERENT failures — do not conflate them.** Only **5355697** is a
+  confirmed CP hang (16 `CONTEXT_PARALLEL_GROUP` watchdogs; FR showed the off-by-one CP collective_seq_id).
+  **5331363 was a NaN collapse** (2619 `nan`, **0** CP watchdogs, pre-`triton` fix) — its stuck
+  `all_to_all`/`reduce_scatter` are ranks waiting on peers that diverged on NaN, a *symptom* not the CP
+  desync. So the CP-hang-at-GBS-128 evidence is **1 run, not 2**.
+- **The CP hang strikes early — first 1–2 optimizer steps, not mid-training.** 5355697 hung on **step 0**
+  (the first CP-attention all_to_all). It reaches the training loop (load + refit + rollout complete)
+  then deadlocks on an early step → it fails fast (~10 min to the 600 s watchdog), so GBS=128 is a cheap
+  reproducer, and surviving several steps (5456109: 5 clean steps) is strong evidence of clearing it.
 - **mtp is REFUTED as the cause:** 5388072/5372801 are `mtp=1` and clean. mtp=5 is kept because it's the
-  model-correct value + matches the reference working run — it is *not* the hang fix. (An earlier
-  "mtp=1 deviation" claim was wrong.)
-- **The packing-uniformity claim was over-retracted then re-confirmed as the leading mechanism:** at
-  GBS=128 many variable-length sequences pack per microbatch → uneven pack/microbatch counts across CP
-  ranks → the CP `all_to_all` desyncs (the FR signature above). GBS≤32 packs few/uniform → lockstep.
-  Still correlational (2 hung runs); a controlled GBS 128-vs-32 A/B at fixed seq/mtp would nail it.
+  model-correct value + matches the reference working run — it is *not* the hang fix.
+- **Packing-uniformity is the leading (correlational) mechanism:** at GBS=128 many variable-length
+  sequences pack per microbatch → uneven pack/microbatch counts across CP ranks → the CP `all_to_all`
+  desyncs. GBS≤32 packs few/uniform → lockstep. Rests on **ONE confirmed CP-hang run (5355697)**; a
+  controlled GBS 128-vs-32 A/B at fixed seq/mtp/`triton` would nail it.
 
 **Working config = 5456109:** `swe_teacher_cp16.yaml` at **65k, GBS 32, mtp 5**, CP16, 48 nodes (the
 committed defaults). Raising GBS to 128 needs a packing pad-to-CP-max fix first — do not raise blindly.
