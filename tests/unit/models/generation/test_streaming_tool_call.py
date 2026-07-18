@@ -31,6 +31,7 @@ class _FakeStreamingInput:
 @dataclass(frozen=True)
 class _FakeOutput:
     token_count: int
+    prompt_token_count: int
 
 
 class _FakeEngine:
@@ -44,11 +45,16 @@ class _FakeEngine:
         self, inputs: AsyncIterator[_FakeStreamingInput], request_id: str
     ) -> AsyncGenerator[_FakeOutput, None]:
         self.request_ids.append(request_id)
+        prompt_token_count = 0
         async for streaming_input in inputs:
             self.received_chunks.append(streaming_input.token_ids)
+            prompt_token_count += len(streaming_input.token_ids)
             if self.block_outputs:
                 await self.release_output.wait()
-            yield _FakeOutput(token_count=1)
+            yield _FakeOutput(
+                token_count=1,
+                prompt_token_count=prompt_token_count,
+            )
 
 
 def _make_manager(
@@ -72,6 +78,7 @@ def _make_manager(
             )
         ),
         count_output_tokens=lambda output: output.token_count,
+        get_prompt_token_count=lambda output: output.prompt_token_count,
         max_sessions=max_sessions,
         session_ttl_seconds=session_ttl_seconds,
         stability_margin_tokens=stability_margin_tokens,
@@ -245,6 +252,43 @@ async def test_seal_rejects_oversized_final_suffix_before_engine_submission() ->
 
     assert engine.received_chunks == [[1, 2, 3]]
     assert manager.total_prompt_too_long_rejections == 1
+    assert await manager.abort(session_id="session")
+
+
+@pytest.mark.asyncio
+async def test_seal_rejects_engine_tokens_without_append_acknowledgement() -> None:
+    engine = _FakeEngine()
+    engine.block_outputs = True
+    manager = _make_manager(engine)
+
+    await manager.start_background(
+        session_id="session",
+        prompt_token_ids=[1, 2, 3, 4],
+        initial_candidate_token_ids=[1, 2, 3],
+    )
+    while not engine.received_chunks:
+        await asyncio.sleep(0)
+
+    session = manager._sessions["session"]
+    background_task = next(iter(session.background_tasks))
+    background_task.cancel()
+    await asyncio.gather(background_task, return_exceptions=True)
+    engine.release_output.set()
+    while session.pending_acknowledgements:
+        await asyncio.sleep(0)
+
+    with pytest.raises(
+        StreamingToolCallSessionClosedError,
+        match=(
+            "engine prompt accounting diverged: committed=0, submitted=3, observed=3"
+        ),
+    ):
+        await manager.seal(
+            session_id="session",
+            final_prompt_token_ids=[1, 2, 3, 4, 5],
+        )
+
+    assert engine.received_chunks == [[1, 2, 3]]
     assert await manager.abort(session_id="session")
 
 

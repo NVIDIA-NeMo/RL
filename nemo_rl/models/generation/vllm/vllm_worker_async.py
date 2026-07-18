@@ -448,11 +448,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     for completion_output in output.outputs
                 )
 
+            def get_prompt_token_count(output):
+                if output.prompt_token_ids is None:
+                    return None
+                return len(output.prompt_token_ids)
+
             self.streaming_tool_call_manager = StreamingToolCallPrefillManager(
                 generate=generate_prefill,
                 make_streaming_input=make_streaming_input,
                 make_final_streaming_input=make_final_streaming_input,
                 count_output_tokens=count_output_tokens,
+                get_prompt_token_count=get_prompt_token_count,
                 max_sessions=streaming_tool_call_config["max_sessions"],
                 session_ttl_seconds=streaming_tool_call_config["session_ttl_seconds"],
                 stability_margin_tokens=streaming_tool_call_config[
