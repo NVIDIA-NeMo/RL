@@ -93,7 +93,10 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationInterface,
+    resolve_routed_experts_dtype_name_for_model,
+)
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -588,6 +591,11 @@ def setup(
             invalid_tool_call_patterns=invalid_tool_call_patterns,
             thinking_tags=thinking_tags,
             require_routed_experts=router_replay_enabled(policy_config),
+            routed_experts_dtype=(
+                resolve_routed_experts_dtype_name_for_model(model_name)
+                if router_replay_enabled(policy_config)
+                else "int16"
+            ),
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}

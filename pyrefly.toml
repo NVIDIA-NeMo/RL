@@ -10,6 +10,8 @@ replace-imports-with-any = [
   "math_verify.*",
   "sympy.*",
   "torchdata.*",
+  "torchaudio.*",
+  "torchcodec.*",
   "nemo.*",
   "megatron.*",
   "ray.*",
