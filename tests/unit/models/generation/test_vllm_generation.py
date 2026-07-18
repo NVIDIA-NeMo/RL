@@ -1595,6 +1595,9 @@ def test_vllm_http_server(cluster, tokenizer):
         d = deepcopy(d)
         d.pop("id")
         d.pop("created")
+        # vLLM 0.25 populates system_fingerprint with the version + build hash
+        # (e.g. "vllm-0.25.1-<hash>"), which is wheel-specific.
+        d.pop("system_fingerprint", None)
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
 
