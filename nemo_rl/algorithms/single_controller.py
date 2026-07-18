@@ -181,7 +181,7 @@ class SingleControllerActor:
         self._sampler = StalenessSampler(
             self._buffer,
             max_staleness_versions=self._async_cfg.max_weight_staleness_versions,
-            require_order=not self._async_cfg.over_sampling,
+            strict_weight_fifo=not self._async_cfg.over_sampling,
             force_in_order=self._async_cfg.force_in_order,
         )
 
@@ -302,10 +302,10 @@ class SingleControllerActor:
              group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
           5. Decrement _inflight_rollouts
         """
-        sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
-        over_sampling = self._cfg.over_sampling
-        max_staleness = self._cfg.max_weight_staleness_versions
-        force_in_order = self._cfg.force_in_order
+        sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
+        over_sampling = self._async_cfg.over_sampling
+        max_staleness = self._async_cfg.max_weight_staleness_versions
+        force_in_order = self._async_cfg.force_in_order
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
@@ -328,7 +328,7 @@ class SingleControllerActor:
                 self._inflight_rollouts -= 1
                 sem.release()
 
-            if self._cfg.diagnostics:
+            if self._diagnostics:
                 content = ""
                 for i in range(len(prompt["message_log"])):
                     if prompt["message_log"][i]["role"] == "user":
@@ -345,7 +345,7 @@ class SingleControllerActor:
                 self._buffer_capacity.release()
                 sem.release()
 
-        max_epochs = self._cfg.max_num_epochs
+        max_epochs = self._master_config.grpo["max_num_epochs"]
         async with asyncio.TaskGroup() as rollout_tasks:
             while max_epochs is None or self._current_epoch < max_epochs:
                 for prompt_batch in self._dataloader:
@@ -406,24 +406,21 @@ class SingleControllerActor:
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
         """
-        target_groups = (
-            self._cfg.target_groups_per_step or self._cfg.min_groups_per_batch
-        )
+        adv_cfg = self._advantage_cfg
+        grpo_cfg = self._master_config.grpo
 
         # TODO: fix the prev_logprobs_required and reference_logprobs_required logic
-        prev_logprobs_required = self._cfg.advantage_policy_logprobs_field is not None
-        reference_logprobs_required = (
-            self._cfg.advantage_reference_logprobs_field is not None
-        )
+        prev_logprobs_required = adv_cfg.policy_logprobs_field is not None
+        reference_logprobs_required = adv_cfg.reference_logprobs_field is not None
 
-        while self._train_steps < self._cfg.max_train_steps:
+        while self._train_steps < grpo_cfg["max_num_steps"]:
             version_during_step = self._trainer_version
             groups_dispatched = 0
             min_sample_version = None
             step_open = False
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < target_groups:
+                while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -441,9 +438,11 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
 
                         # Select a batch
-                        max_prompt_groups = target_groups - groups_dispatched
+                        max_prompt_groups = (
+                            grpo_cfg["num_prompts_per_step"] - groups_dispatched
+                        )
                         min_prompt_groups = min(
-                            self._cfg.min_groups_per_batch,
+                            self._async_cfg.min_prompt_groups_per_batch,
                             max_prompt_groups,
                         )
                         train_meta, num_groups = await self._sampler.select(
@@ -515,7 +514,7 @@ class SingleControllerActor:
                     await self._call_dp(
                         "clear_samples",
                         sample_ids=list(train_meta.sample_ids),
-                        partition_id=self._cfg.partition_id,
+                        partition_id=self._partition_id,
                     )
 
                     groups_dispatched += num_groups
@@ -584,7 +583,7 @@ class SingleControllerActor:
             # generated with; lag = training version - oldest sample version.
             lag = version_during_step - min_sample_version  # type: ignore
             print(
-                f"train step {self._train_steps}/{self._cfg.max_train_steps}  "
+                f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
                 f"trainer_v={self._trainer_version}  "
                 f"lag={lag}  ",
                 flush=True,

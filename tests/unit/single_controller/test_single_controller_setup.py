@@ -56,6 +56,7 @@ def _make_master_config(
             "train": [{"env_name": "math"}],
         },
         grpo={
+            "seed": 42,
             "max_num_steps": max_num_steps,
             "max_num_epochs": max_num_epochs,
             "num_prompts_per_step": num_prompts_per_step,

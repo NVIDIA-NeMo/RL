@@ -27,11 +27,12 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.async_utils.staleness_sampler import WindowedSamplerConfig
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    MasterConfig,
 )
+from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -154,7 +155,7 @@ def train_cluster():
 
 
 class _FakeAdvEstimator:
-    """Passthrough advantage: returns rewards unchanged."""
+    """Per-token advantage: broadcasts per-sample reward across the token dim."""
 
     def compute_advantage(
         self,
@@ -164,7 +165,7 @@ class _FakeAdvEstimator:
         repeated_batch: dict,
         **kwargs,
     ) -> torch.Tensor:
-        return rewards.unsqueeze(-1).expand(mask.shape).detach().clone()
+        return rewards.detach().unsqueeze(-1).expand_as(mask).clone()
 
 
 @ray.remote(num_cpus=0)  # pragma: no cover
@@ -215,16 +216,6 @@ class _RecordingSingleControllerActor(
     def __init__(self, *, metric_log_handle: Any, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._logger = _RecordingLogger(metric_log_handle)
-
-
-class _FakeWeightSync:
-    """Records the version SC syncs at end-of-step, via a Ray actor log."""
-
-    def __init__(self, log_handle) -> None:
-        self._log = log_handle
-
-    async def sync_weights(self, version: int) -> None:
-        ray.get(self._log.record.remote("sync_weights", {"version": int(version)}))
 
 
 @pytest.mark.mcore
@@ -293,27 +284,33 @@ def test_train_pump_drives_mcore_training_step(
                 _prepopulate_buffer(tq_buffer, meta, weight_version=step)
 
         log = _CallLog.remote()
-        weight_sync = _FakeWeightSync(log)
+        weight_sync = SimpleNamespace(sync_weights=lambda: None)
         adv_est = _FakeAdvEstimator()
         # Rollout manager stub — SC.__init__ only touches ._tq_buffer.
-        rollout_manager = SimpleNamespace(_tq_buffer=None)
+        rollout_manager = SimpleNamespace(
+            _tq_buffer=None,
+            set_weight_version=lambda v: ray.get(
+                log.record.remote("set_weight_version", {"version": int(v)})
+            ),
+        )
 
-        cfg = SingleControllerConfig.model_construct(
-            sampler=WindowedSamplerConfig(max_staleness_versions=1),
-            min_groups_per_batch=num_prompts,
-            target_groups_per_step=num_prompts,
-            group_size=num_generations,
-            max_inflight_prompts=num_prompts,
-            max_buffered_rollouts=num_prompts,
-            max_train_steps=train_steps,
-            max_num_epochs=None,
-            train_global_batch_size=train_gbs,
-            partition_id=_PARTITION_ID,
-            advantage_enabled=True,
-            advantage_repeated_batch_fields=[],
-            advantage_policy_logprobs_field=None,
-            advantage_reference_logprobs_field=None,
-            diagnostics=False,
+        master_config = MasterConfig.model_construct(
+            policy={"train_global_batch_size": train_gbs},
+            grpo={
+                "num_prompts_per_step": num_prompts,
+                "num_generations_per_prompt": num_generations,
+                "max_num_steps": train_steps,
+                "max_num_epochs": None,
+            },
+            async_rl=AsyncRLConfig(
+                batch_selection_strategy="staleness_window",
+                max_weight_staleness_versions=1,
+                min_prompt_groups_per_batch=num_prompts,
+                max_inflight_prompts=num_prompts,
+                max_buffered_rollouts=num_prompts,
+                over_sampling=True,
+                force_in_order=False,
+            ),
             logger={
                 "log_dir": str(tmp_path / "logs"),
                 "wandb_enabled": False,
@@ -324,18 +321,25 @@ def test_train_pump_drives_mcore_training_step(
             },
         )
 
-        ctrl = _RecordingSingleControllerActor.remote(
-            metric_log_handle=log,
-            cfg=cfg,
-            dp_client_handle=dp_client,
+        bundle = SingleControllerBundle(
             gen_handle=None,
             trainer_handle=trainer,
-            weight_synchronizer=weight_sync,
+            env_handles={},
+            train_cluster=None,  # type: ignore[arg-type]
+            inference_cluster=None,  # type: ignore[arg-type]
+            dp_client=dp_client,
+            dataloader=None,  # type: ignore[arg-type]  # _rollout_pump not started
+            weight_synchronizer=weight_sync,  # type: ignore[arg-type]
+            advantage_estimator=adv_est,
             loss_fn=SimpleLossFn(),
             rollout_manager=rollout_manager,
-            advantage_estimator=adv_est,
-            dataloader=None,
             tq_buffer=tq_buffer,
+            partition_id=_PARTITION_ID,
+        )
+        ctrl = _RecordingSingleControllerActor.remote(
+            metric_log_handle=log,
+            master_config=master_config,
+            bundle=bundle,
         )
 
         # train_steps outer steps, each: sampler.select → advantage stage → begin/microbatches/finish → sync.
@@ -346,7 +350,7 @@ def test_train_pump_drives_mcore_training_step(
         assert state["trainer_version"] == train_steps
 
         entries = ray.get(log.get.remote())
-        sync_versions = [p["version"] for k, p in entries if k == "sync_weights"]
+        sync_versions = [p["version"] for k, p in entries if k == "set_weight_version"]
         assert sync_versions == list(range(1, train_steps + 1))
 
         train_metrics = [

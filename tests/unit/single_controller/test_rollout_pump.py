@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -30,12 +29,13 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSampler,
     WeightFifoSampler,
     WindowedSampler,
-    WindowedSamplerConfig,
 )
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils.config import (
+    AsyncRLConfig,
+    MasterConfig,
 )
+from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager
 
@@ -285,15 +285,23 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     dp_adapter = _SyncDPAdapter(tq_actor)
 
-    cfg = SingleControllerConfig.model_construct(
-        sampler=WindowedSamplerConfig(max_staleness_versions=1),
-        min_groups_per_batch=1,
-        group_size=num_generations,
-        max_inflight_prompts=num_prompts,
-        max_buffered_rollouts=num_prompts,
-        max_train_steps=1,
-        max_num_epochs=None,
-        partition_id=_PARTITION_ID,
+    master_config = MasterConfig.model_construct(
+        policy={"train_global_batch_size": expected_samples},
+        grpo={
+            "num_prompts_per_step": num_prompts,
+            "num_generations_per_prompt": num_generations,
+            "max_num_steps": 1,
+            "max_num_epochs": 1,
+        },
+        async_rl=AsyncRLConfig(
+            batch_selection_strategy="staleness_window",
+            max_weight_staleness_versions=1,
+            min_prompt_groups_per_batch=1,
+            max_inflight_prompts=num_prompts,
+            max_buffered_rollouts=num_prompts,
+            over_sampling=True,
+            force_in_order=False,
+        ),
         logger={
             "log_dir": str(tmp_path / "logs"),
             "wandb_enabled": False,
@@ -322,54 +330,33 @@ def test_rollout_pump_writes_expected_tq_data(
         use_nemo_gym=False,
         tq_buffer=tq_buffer,
     )
-    ctrl = SingleControllerActor.remote(
-        cfg=cfg,
-        dp_client_handle=dp_adapter,
+    bundle = SingleControllerBundle(
         gen_handle=vllm_generation,
         trainer_handle=object(),
-        weight_synchronizer=object(),
-        loss_fn=None,
-        rollout_manager=rollout_manager,
-        advantage_estimator=None,
+        env_handles={},
+        train_cluster=None,  # type: ignore[arg-type]  # unused by _rollout_pump
+        inference_cluster=None,  # type: ignore[arg-type]
+        dp_client=dp_adapter,
         dataloader=dataloader,
+        weight_synchronizer=object(),  # type: ignore[arg-type]
+        advantage_estimator=None,
+        loss_fn=None,  # type: ignore[arg-type]
+        rollout_manager=rollout_manager,
         tq_buffer=tq_buffer,
+        partition_id=_PARTITION_ID,
     )
+    ctrl = SingleControllerActor.remote(master_config=master_config, bundle=bundle)
 
     vllm_generation.prepare_for_generation()
-
-    # _rollout_pump runs until cancelled, so poll TQ then cancel.
-    pump_ref = ctrl._rollout_pump.remote()
-    deadline = time.monotonic() + 120.0
-    while time.monotonic() < deadline:
-        if ray.get(tq_actor.peek_count.remote(_PARTITION_ID)) >= expected_samples:
-            break
-        time.sleep(0.5)
-    assert ray.get(tq_actor.peek_count.remote(_PARTITION_ID)) >= expected_samples, (
-        "rollout_pump did not push expected_samples within timeout"
-    )
-    ray.cancel(pump_ref)
-    try:
-        ray.get(pump_ref)
-    except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError):
-        pass
-
+    ray.get(ctrl._rollout_pump.remote())
     vllm_generation.finish_generation()
 
-    meta = ray.get(
-        tq_actor.claim_meta.remote(
-            partition_id=_PARTITION_ID,
-            task_name="train",
-            required_fields=_BULK_FIELDS,
-            batch_size=expected_samples * 4,
-            blocking=False,
-            timeout_s=0.0,
-        )
-    )
-    assert meta.size == expected_samples
+    sample_ids = ray.get(tq_actor.list_sample_ids.remote(_PARTITION_ID))
+    assert len(sample_ids) == expected_samples
 
     # pack_payload stamps sample_ids as ``{group_uuid}_g{i}``.
     group_ids: set[str] = set()
-    for sid in meta.sample_ids:
+    for sid in sample_ids:
         head, _, tail = sid.rpartition("_g")
         assert head and tail.isdigit(), f"unexpected sample_id: {sid}"
         group_ids.add(head)
@@ -377,7 +364,7 @@ def test_rollout_pump_writes_expected_tq_data(
 
     bulk = ray.get(
         tq_actor.get_samples.remote(
-            sample_ids=meta.sample_ids,
+            sample_ids=sample_ids,
             partition_id=_PARTITION_ID,
             select_fields=_BULK_FIELDS,
         )
@@ -418,7 +405,7 @@ def test_rollout_pump_writes_expected_tq_data(
         )
 
     tags = ray.get(
-        tq_actor.get_tags.remote(partition_id=_PARTITION_ID, sample_ids=meta.sample_ids)
+        tq_actor.get_tags.remote(partition_id=_PARTITION_ID, sample_ids=sample_ids)
     )
     for tag in tags:
         assert tag["weight_version"] == 0
