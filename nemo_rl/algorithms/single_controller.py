@@ -95,7 +95,6 @@ class SingleControllerActor:
         self._advantage_cfg = AdvantageConfig()
         self._weight_sync_cfg = WeightSyncConfig()
         self._partition_id: str = bundle.partition_id
-        self._diagnostics: bool = False
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
@@ -320,7 +319,7 @@ class SingleControllerActor:
                 self._inflight_rollouts -= 1
                 sem.release()
 
-            if self._diagnostics:
+            if self._async_cfg.diagnostics:
                 content = ""
                 for i in range(len(prompt["message_log"])):
                     if prompt["message_log"][i]["role"] == "user":

@@ -46,6 +46,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Require each sampled rollout's dispatch-time trainer_version to match the trainer exactly
     # (legacy target_weight semantics). Requires over_sampling=False.
     force_in_order: bool = True
+    # Enable per-rollout diagnostic prints (prompt content / completion previews).
+    diagnostics: bool = False
 
 
 class MasterConfig(BaseModel, extra="allow"):

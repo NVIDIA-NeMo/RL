@@ -21,6 +21,8 @@ async_rl:
   # Require each sampled rollout's dispatch-time trainer_version to match the trainer exactly
   # (legacy target_weight semantics). Requires over_sampling=false.
   force_in_order: true
+  # Enable per-rollout diagnostic prints (prompt content / completion previews).
+  diagnostics: false
 
 # SC does not support checkpointing yet.
 checkpointing:
