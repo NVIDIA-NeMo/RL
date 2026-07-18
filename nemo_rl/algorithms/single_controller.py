@@ -253,9 +253,12 @@ class SingleControllerActor:
         self._weight_synchronizer = weight_synchronizer
         self._loss_fn = loss_fn
         self._advantage_estimator = advantage_estimator
-        self._rollout_manager = rollout_manager
         self._dataloader = dataloader
         self._buffer = tq_buffer
+        self._rollout_manager = rollout_manager
+        # Rebind so writer and sampler share one buffer instance even
+        # when Ray deserializes rollout_manager and tq_buffer separately.
+        self._rollout_manager._tq_buffer = self._buffer
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -555,20 +558,23 @@ class SingleControllerActor:
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
         """
-        adv_cfg = self._advantage_cfg
-        grpo_cfg = self._master_config.grpo
+        target_groups = (
+            self._cfg.target_groups_per_step or self._cfg.min_groups_per_batch
+        )
 
         # TODO: fix the prev_logprobs_required and reference_logprobs_required logic
-        prev_logprobs_required = adv_cfg.policy_logprobs_field is not None
-        reference_logprobs_required = adv_cfg.reference_logprobs_field is not None
+        prev_logprobs_required = self._cfg.advantage_policy_logprobs_field is not None
+        reference_logprobs_required = (
+            self._cfg.advantage_reference_logprobs_field is not None
+        )
 
-        while self._train_steps < grpo_cfg["max_num_steps"]:
+        while self._train_steps < self._cfg.max_train_steps:
             groups_dispatched = 0
             min_sample_version = None
             step_open = False
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
+                while groups_dispatched < target_groups:
                     # Wait for a selectable batch
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -586,11 +592,9 @@ class SingleControllerActor:
                                 self._buffer_capacity.release()
 
                         # Select a batch
-                        max_prompt_groups = (
-                            grpo_cfg["num_prompts_per_step"] - groups_dispatched
-                        )
+                        max_prompt_groups = target_groups - groups_dispatched
                         min_prompt_groups = min(
-                            self._async_cfg.min_prompt_groups_per_batch,
+                            self._cfg.min_groups_per_batch,
                             max_prompt_groups,
                         )
                         train_meta, num_groups = await self._sampler.select(
@@ -662,7 +666,7 @@ class SingleControllerActor:
                     await self._call_dp(
                         "clear_samples",
                         sample_ids=list(train_meta.sample_ids),
-                        partition_id=self._partition_id,
+                        partition_id=self._cfg.partition_id,
                     )
 
                     groups_dispatched += num_groups
@@ -693,9 +697,12 @@ class SingleControllerActor:
             )  # type: ignore
 
             total_time = timing_metrics.get("total_step_time", 0.0)
-            cluster_cfg = self._master_config.cluster
-            total_num_gpus = cluster_cfg["num_nodes"] * cluster_cfg["gpus_per_node"]
-            if total_time > 0 and "global_valid_toks" in step_metrics:
+            total_num_gpus = int(ray.cluster_resources().get("GPU", 0))
+            if (
+                total_time > 0
+                and total_num_gpus > 0
+                and "global_valid_toks" in step_metrics
+            ):
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                     step_metrics["global_valid_toks"] / total_time / total_num_gpus
                 )
@@ -728,7 +735,7 @@ class SingleControllerActor:
             # generated with; lag = current trainer version - oldest sample version.
             lag = self._trainer_version - min_sample_version  # type: ignore
             print(
-                f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
+                f"train step {self._train_steps}/{self._cfg.max_train_steps}  "
                 f"trainer_v={self._trainer_version}  "
                 f"lag={lag}  ",
                 flush=True,

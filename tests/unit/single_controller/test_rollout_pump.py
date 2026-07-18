@@ -24,14 +24,12 @@ from typing import Any
 import pytest
 import ray
 import torch
-from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
-from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager
 
@@ -46,112 +44,12 @@ from tests.unit.experience.test_rollouts import (
     rollout_cluster,  # noqa: F401
     rollout_tokenizer,  # noqa: F401
 )
-
-_PARTITION_ID = "rollout_data"
-# TQReplayBuffer.commit tensorizes each PromptGroupRecord and writes
-# ``generations_per_prompt`` training rows directly to TQ.
-_BULK_FIELDS = [
-    "input_ids",
-    "input_lengths",
-    "generation_logprobs",
-    "token_mask",
-    "sample_mask",
-    "prompt_ids_for_adv",
-    "total_reward",
-]
-
-
-@ray.remote(num_cpus=0)
-class _TQActor:
-    """Ray-wrapped NoOpDataPlaneClient for cross-process TQ inspection."""
-
-    def __init__(
-        self,
-        partition_id: str,
-        fields: list[str],
-        num_samples: int,
-        consumer_tasks: list[str],
-    ) -> None:
-        self._client = NoOpDataPlaneClient()
-        self._client.register_partition(
-            partition_id=partition_id,
-            fields=list(fields),
-            num_samples=int(num_samples),
-            consumer_tasks=list(consumer_tasks),
-        )
-
-    def put_samples(
-        self,
-        sample_ids: list[str],
-        partition_id: str,
-        fields: TensorDict | None = None,
-        tags: list[dict[str, Any]] | None = None,
-    ) -> Any:
-        return self._client.put_samples(
-            sample_ids=sample_ids,
-            partition_id=partition_id,
-            fields=fields,
-            tags=tags,
-        )
-
-    def claim_meta(self, **kwargs: Any) -> Any:
-        return self._client.claim_meta(**kwargs)
-
-    def get_samples(
-        self,
-        sample_ids: list[str],
-        partition_id: str,
-        select_fields: list[str],
-    ) -> TensorDict:
-        return self._client.get_samples(
-            sample_ids=sample_ids,
-            partition_id=partition_id,
-            select_fields=list(select_fields),
-        )
-
-    def get_tags(
-        self, partition_id: str, sample_ids: list[str]
-    ) -> list[dict[str, Any]]:
-        rec = self._client._partitions[partition_id]
-        return [dict(rec.tags.get(sid, {})) for sid in sample_ids]
-
-    def peek_count(self, partition_id: str) -> int:
-        return len(self._client._partitions[partition_id].rows)
-
-
-class _SyncDPAdapter:
-    """Sync DataPlaneClient over a Ray actor handle. Pads nested tensors before transport."""
-
-    def __init__(self, handle: Any) -> None:
-        self._handle = handle
-
-    def put_samples(
-        self,
-        sample_ids: list[str],
-        partition_id: str,
-        fields: TensorDict | None = None,
-        tags: list[dict[str, Any]] | None = None,
-    ) -> Any:
-        if fields is not None:
-            fields = self._padded(fields)
-        return ray.get(
-            self._handle.put_samples.remote(
-                sample_ids=sample_ids,
-                partition_id=partition_id,
-                fields=fields,
-                tags=tags,
-            )
-        )
-
-    @staticmethod
-    def _padded(td: TensorDict) -> TensorDict:
-        out: dict[str, torch.Tensor] = {}
-        for k in td.keys():
-            v = td.get(k)
-            if isinstance(v, torch.Tensor) and v.is_nested:
-                v = torch.nested.to_padded_tensor(v, padding=0)
-            out[k] = v
-        return TensorDict(out, batch_size=td.batch_size)
+from tests.unit.single_controller._dp_fakes import (
+    _BULK_FIELDS,
+    _PARTITION_ID,
+    _SyncDPAdapter,
+    _TQActor,
+)
 
 
 @pytest.mark.parametrize(
@@ -428,6 +326,7 @@ def test_rollout_pump_writes_expected_tq_data(
         advantage_estimator=None,
         rollout_manager=rollout_manager,
         dataloader=dataloader,
+        tq_buffer=tq_buffer,
     )
 
     vllm_generation.prepare_for_generation()
