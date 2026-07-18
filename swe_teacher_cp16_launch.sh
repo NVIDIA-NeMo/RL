@@ -12,6 +12,9 @@ Z=/lustre/fsw/portfolios/llmservice/users/zhiyul
 # are scoped per-user via WRITE_ROOT, which defaults to your own users/<you> dir. For zhiyul it
 # resolves back to $Z, so this launcher is byte-identical for the original author.
 WRITE_ROOT="${WRITE_ROOT:-/lustre/fsw/portfolios/llmservice/users/${USER:-$(whoami)}}"
+# Pin the container-workdir to the /lustre/fsw (mounted) path. SLURM_SUBMIT_DIR can resolve through
+# the users/<u> symlink to /lustre/fs1 (NOT mounted on GB200 compute) -> pyxis "couldn't chdir" fail.
+export NRL_CONTAINER_WORKDIR="${NRL_CONTAINER_WORKDIR:-$WRITE_ROOT/RL}"
 
 source /lustre/fs1/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/zhiyul/secrets.sh > >(grep -v HF_TOKEN) 2>&1 || true
 export HF_HOME="$WRITE_ROOT/hf_cache"   # WRITE: HF cache (model itself is local at MODEL_PATH)

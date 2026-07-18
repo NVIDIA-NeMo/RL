@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Tuple
@@ -198,6 +199,21 @@ def get_microbatch_iterator(
             pack_seq_dim_size,
         )
         micro_batch_size = 1
+        # Diagnostic (NRL_LOG_SEQ_INFO=1): per-rank packing shape. Diff across a CP group --
+        # num_microbatches and pad_full_seq_to MUST match on every CP rank, else the CP attention
+        # all_to_all count diverges and the CONTEXT_PARALLEL_GROUP collective deadlocks.
+        if os.environ.get("NRL_LOG_SEQ_INFO", "0") == "1":
+            _r = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else -1
+            )
+            print(
+                f"[NRL_SEQINFO] rank={_r} cp_rank={get_context_parallel_rank()} "
+                f"num_microbatches={data_iterator_len} max_packed_seq={pack_seq_dim_size} "
+                f"pad_full_seq_to={pad_full_seq_to}",
+                flush=True,
+            )
     else:
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
@@ -1168,6 +1184,9 @@ def _get_pack_sequence_parameters_for_megatron(
         pad_packed_seq_to_multiple_of = 1
 
     # when PP is used, all sequences must have the same length, so we need to pad the packed sequence to the max sequence length in the batch.
+    # (A speculative CP>1 pad extension was reverted here — never validated against a reproduced
+    # hang. Packing/GBS non-uniformity is the suspected CP all_to_all hang trigger; reproduce a
+    # high-GBS hang before re-adding any pad-to-CP-max fix.)
     if pp_size > 1:
         pad_packed_seq_to = max_seq_len_in_batch
     else:

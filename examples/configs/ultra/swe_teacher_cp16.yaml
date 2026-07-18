@@ -162,12 +162,15 @@ policy:
     chat_template_kwargs: null
   hf_config_overrides: {}
 
-  train_global_batch_size: 32
+  train_global_batch_size: 32   # TESTED-CLEAN (= num_prompts_per_step 8 x num_generations 4). The CP
+                                # all_to_all hang tracks THIS knob: GBS=128 hung (2/2 runs), GBS<=32
+                                # clean (4/4), independent of mtp and seq len. GBS=128 needs a
+                                # packing-uniformity fix before it is safe -- do not raise blindly.
   train_micro_batch_size: 1
   generation_batch_size: 64
   logprob_batch_size: 1
-  max_total_sequence_length: 196608   # DIAGNOSTIC: 190k (was 65536). Long seq + tiny batch -> ~1 seq/pack
-                                       # -> uniform CP all_to_all count. 196608/256=768 (div OK); /16 CP=12288/rank.
+  max_total_sequence_length: 65536   # 65k. Tested-clean at GBS=32 (job 5452799: forward-trained
+                                     # step 0->6, zero CONTEXT_PARALLEL_GROUP watchdog).
   precision: "bfloat16"
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: false
@@ -233,16 +236,17 @@ policy:
     calculate_per_token_loss: true
     scale_loss_by_dp_cp_size: false
 
-    # MTP head LOADED but loss-disabled. Nemotron-3-Ultra is a nemotron_h hybrid with a real MTP
-    # head (config num_nextn_predict_layers=1; ckpt has 1040 mtp.layers.1.* tensors). The bridge
-    # sets mtp_num_layers=1 from HF config; setting it to 0 here (while the hybrid layer pattern
-    # still declares MTP -> mtp_process=True) tripped `assert mtp_num_layers>0` in mcore hybrid
-    # forward (hybrid_model.py:544) during get_logprobs (job 4766026). Keep =1 to match the model
-    # (no weight-refit mismatch); loss_scaling 0.0 + detach_heads make MTP a no-op for training,
-    # and get_logprobs only reads main-branch logits so logprobs are unaffected.
-    mtp_loss_scaling_factor: 0.0
+    # MTP head. Nemotron-3-Ultra is a nemotron_h hybrid with a real MTP head. mtp_num_layers=5 +
+    # mtp_use_repeated_layer matches the model's 5-token MTP head AND Yi-Fu's WORKING ultra-v3 run
+    # (grpo-dev-yifu/4dynydd4). Never set mtp_num_layers=0: while the hybrid layer pattern declares
+    # MTP (mtp_process=True) it trips `assert mtp_num_layers>0` in mcore hybrid forward
+    # (hybrid_model.py:544) during get_logprobs (job 4766026).
+    # NOTE: mtp is NOT the CP-hang fix. mtp=1 runs also trained clean (jobs 5388072/5372801); the
+    # hang tracks train_global_batch_size (GBS=128 hung, GBS<=32 clean), not mtp. Keep mtp=5 because
+    # it is the correct training config, not as a hang workaround.
+    mtp_loss_scaling_factor: 0.3
     mtp_use_repeated_layer: true
-    mtp_num_layers: 1
+    mtp_num_layers: 5
     mtp_detach_heads: true
 
     optimizer:
@@ -304,7 +308,11 @@ policy:
       fully_parallel_load_process_group: "ep_dp"
       fully_parallel_load_exchange_algo: "broadcast"
 
-    env_vars: null
+    env_vars: null   # Shipped clean. Debug knobs (NRL_LOG_SEQ_INFO to log per-CP-rank packing shape,
+                     # NRL_TRAIN_PG_TIMEOUT_S to shorten the training watchdog for a fast FR dump) are
+                     # env-gated in nemo_rl/models/megatron/data.py + the megatron worker -- set them
+                     # per-run when investigating the GBS=128 hang, not in the working recipe (a short
+                     # 120s watchdog would kill a legitimately slow step in production).
 
   # ---------------------------------------------------------------------------
   # Sequence Packing
