@@ -40,6 +40,10 @@ class StreamingToolCallSessionClosedError(StreamingToolCallError):
     """Raised when work is submitted to a closed or failed session."""
 
 
+class StreamingToolCallEngineStateMismatchError(StreamingToolCallSessionClosedError):
+    """Raised when local and engine streaming-prompt accounting diverge."""
+
+
 class StreamingToolCallFinalizationUnavailableError(StreamingToolCallError):
     """Raised before final decode when a session cannot be reused safely."""
 
@@ -119,6 +123,7 @@ class _PendingChunk:
 @dataclass
 class _PendingFinal:
     streaming_input: Any
+    token_count: int
 
 
 @dataclass(frozen=True)
@@ -151,6 +156,8 @@ class _StreamingToolCallSession:
     finalizing: bool = False
     final_output_queue: asyncio.Queue[Any] | None = None
     final_output_closed: bool = False
+    engine_submitted_prompt_tokens: int = 0
+    engine_observed_prompt_tokens: int | None = None
     background_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     background_start_prompt_token_ids: list[int] | None = None
     background_start_result: StreamingToolCallBackgroundStartResult | None = None
@@ -173,6 +180,7 @@ GenerateCallback = Callable[[AsyncIterator[Any], str], AsyncGenerator[Any, None]
 MakeStreamingInputCallback = Callable[[list[int]], Any]
 MakeFinalStreamingInputCallback = Callable[[list[int], Any], Any]
 CountOutputTokensCallback = Callable[[Any], int]
+GetPromptTokenCountCallback = Callable[[Any], int | None]
 
 
 class StreamingToolCallPrefillManager:
@@ -190,6 +198,7 @@ class StreamingToolCallPrefillManager:
         make_streaming_input: MakeStreamingInputCallback,
         make_final_streaming_input: MakeFinalStreamingInputCallback | None = None,
         count_output_tokens: CountOutputTokensCallback,
+        get_prompt_token_count: GetPromptTokenCountCallback | None = None,
         max_sessions: int,
         session_ttl_seconds: float,
         stability_margin_tokens: int,
@@ -212,6 +221,7 @@ class StreamingToolCallPrefillManager:
         self._make_streaming_input = make_streaming_input
         self._make_final_streaming_input = make_final_streaming_input
         self._count_output_tokens = count_output_tokens
+        self._get_prompt_token_count = get_prompt_token_count
         self._max_sessions = max_sessions
         self._session_ttl_seconds = session_ttl_seconds
         self._stability_margin_tokens = stability_margin_tokens
@@ -285,6 +295,31 @@ class StreamingToolCallPrefillManager:
         except StreamingToolCallPromptTooLongError:
             self._total_prompt_too_long_rejections += 1
             raise
+
+    @staticmethod
+    def _validate_engine_prompt_accounting(
+        session: _StreamingToolCallSession,
+    ) -> None:
+        """Require the engine session to match the acknowledged token prefix.
+
+        A streaming input is visible to vLLM before its dummy decode output
+        acknowledges the append. If the append task is cancelled in that
+        interval, the engine can retain tokens that were never committed by
+        the manager. Reusing that session would append the final suffix at the
+        wrong offset and can overrun vLLM's fixed prompt buffer.
+        """
+        committed_tokens = len(session.committed_token_ids)
+        submitted_tokens = session.engine_submitted_prompt_tokens
+        observed_tokens = session.engine_observed_prompt_tokens
+        if submitted_tokens != committed_tokens or observed_tokens not in (
+            None,
+            committed_tokens,
+        ):
+            raise StreamingToolCallEngineStateMismatchError(
+                "streaming tool-call engine prompt accounting diverged: "
+                f"committed={committed_tokens}, submitted={submitted_tokens}, "
+                f"observed={observed_tokens}"
+            )
 
     @staticmethod
     def _validate_initial_candidate(
@@ -500,6 +535,7 @@ class StreamingToolCallPrefillManager:
         session = self._get_session(session_id)
         async with session.append_lock:
             self._raise_if_unavailable(session)
+            self._validate_engine_prompt_accounting(session)
             if session.sealed:
                 raise StreamingToolCallSessionClosedError(
                     f"streaming tool-call session is sealed: {session_id}"
@@ -736,6 +772,7 @@ class StreamingToolCallPrefillManager:
             raise StreamingToolCallFinalizationUnavailableError(
                 f"streaming tool-call session still has in-flight work: {session_id}"
             )
+        self._validate_engine_prompt_accounting(session)
         if session.completed_chunks <= 0:
             raise StreamingToolCallFinalizationUnavailableError(
                 f"streaming tool-call session completed no prefill: {session_id}"
@@ -798,6 +835,7 @@ class StreamingToolCallPrefillManager:
                 raise StreamingToolCallFinalizationUnavailableError(
                     f"streaming tool-call session has late in-flight work: {session_id}"
                 )
+            self._validate_engine_prompt_accounting(session)
 
             final_suffix_token_ids = final_prompt_token_ids[
                 len(session.committed_token_ids) :
@@ -812,7 +850,12 @@ class StreamingToolCallPrefillManager:
                 final_suffix_token_ids,
                 final_sampling_params,
             )
-            session.input_queue.put_nowait(_PendingFinal(streaming_input=final_input))
+            session.input_queue.put_nowait(
+                _PendingFinal(
+                    streaming_input=final_input,
+                    token_count=len(final_suffix_token_ids),
+                )
+            )
             session.last_activity_monotonic = time.monotonic()
 
         return self._iterate_final_outputs(session)
@@ -1032,13 +1075,41 @@ class StreamingToolCallPrefillManager:
                 if chunk is None:
                     return
                 if isinstance(chunk, _PendingFinal):
+                    submitted_tokens = (
+                        session.engine_submitted_prompt_tokens + chunk.token_count
+                    )
+                    self._validate_prompt_token_count(submitted_tokens)
+                    session.engine_submitted_prompt_tokens = submitted_tokens
                     yield chunk.streaming_input
                     return
+                submitted_tokens = session.engine_submitted_prompt_tokens + len(
+                    chunk.token_ids
+                )
+                try:
+                    self._validate_prompt_token_count(submitted_tokens)
+                except Exception as error:
+                    if not chunk.acknowledgement.done():
+                        chunk.acknowledgement.set_exception(error)
+                    raise
+                session.engine_submitted_prompt_tokens = submitted_tokens
                 session.pending_acknowledgements.append(chunk.acknowledgement)
                 yield self._make_streaming_input(chunk.token_ids)
 
         try:
             async for output in self._generate(input_stream(), session.request_id):
+                if self._get_prompt_token_count is not None:
+                    observed_prompt_tokens = self._get_prompt_token_count(output)
+                    if observed_prompt_tokens is not None:
+                        session.engine_observed_prompt_tokens = observed_prompt_tokens
+                        if (
+                            observed_prompt_tokens
+                            != session.engine_submitted_prompt_tokens
+                        ):
+                            raise StreamingToolCallEngineStateMismatchError(
+                                "vLLM reported an unexpected streaming prompt length: "
+                                f"submitted={session.engine_submitted_prompt_tokens}, "
+                                f"observed={observed_prompt_tokens}"
+                            )
                 if session.finalizing:
                     assert session.final_output_queue is not None
                     session.final_output_queue.put_nowait(output)
