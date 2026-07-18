@@ -342,7 +342,8 @@ data_plane:
 async_rl:
   batch_selection_strategy: "strict_on_policy"  # or "staleness_window"
   max_weight_staleness_versions: 1
-  min_prompt_groups_per_batch: 2
+  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  min_groups_for_streaming_train: 2
   max_inflight_prompts: 8
   # When over_sampling=false this must equal
   # grpo.num_prompts_per_step * (max_weight_staleness_versions + 1).

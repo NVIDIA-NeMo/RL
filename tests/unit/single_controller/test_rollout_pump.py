@@ -296,7 +296,7 @@ def test_rollout_pump_writes_expected_tq_data(
         async_rl=AsyncRLConfig(
             batch_selection_strategy="staleness_window",
             max_weight_staleness_versions=1,
-            min_prompt_groups_per_batch=1,
+            min_groups_for_streaming_train=1,
             max_inflight_prompts=num_prompts,
             max_buffered_rollouts=num_prompts,
             over_sampling=True,

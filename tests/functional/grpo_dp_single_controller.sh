@@ -41,7 +41,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     data_plane.backend=simple \
     async_rl.batch_selection_strategy=strict_on_policy \
     async_rl.max_weight_staleness_versions=0 \
-    async_rl.min_prompt_groups_per_batch=2 \
+    async_rl.min_groups_for_streaming_train=2 \
     async_rl.max_inflight_prompts=2 \
     async_rl.max_buffered_rollouts=2 \
     $@ \

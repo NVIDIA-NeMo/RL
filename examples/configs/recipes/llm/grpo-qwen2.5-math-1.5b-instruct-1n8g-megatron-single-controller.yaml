@@ -21,8 +21,8 @@ data_plane:
 # SC async-RL runtime knobs.
 async_rl:
   batch_selection_strategy: strict_on_policy
-  # One training step consumes grpo.num_prompts_per_step (=32) prompt groups.
-  min_prompt_groups_per_batch: 32
+  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  min_groups_for_streaming_train: 32
   max_inflight_prompts: 64
   # strict_on_policy auto-sets max_weight_staleness_versions=0 and
   # over_sampling=False. over_sampling=false requires

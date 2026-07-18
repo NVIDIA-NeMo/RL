@@ -122,11 +122,11 @@ class SingleControllerActor:
         self._inference_cluster = bundle.inference_cluster
 
         num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
-        if num_prompts_per_step < self._async_cfg.min_prompt_groups_per_batch:
+        if num_prompts_per_step < self._async_cfg.min_groups_for_streaming_train:
             raise ValueError(
                 f"grpo.num_prompts_per_step ({num_prompts_per_step}) "
-                f"must be >= async_rl.min_prompt_groups_per_batch "
-                f"({self._async_cfg.min_prompt_groups_per_batch})"
+                f"must be >= async_rl.min_groups_for_streaming_train "
+                f"({self._async_cfg.min_groups_for_streaming_train})"
             )
 
         if self._async_cfg.batch_selection_strategy == "strict_on_policy":
@@ -447,7 +447,7 @@ class SingleControllerActor:
                             grpo_cfg["num_prompts_per_step"] - groups_dispatched
                         )
                         min_prompt_groups = min(
-                            self._async_cfg.min_prompt_groups_per_batch,
+                            self._async_cfg.min_groups_for_streaming_train,
                             max_prompt_groups,
                         )
                         train_meta, num_groups = await self._sampler.select(

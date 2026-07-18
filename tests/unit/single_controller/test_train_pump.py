@@ -305,7 +305,7 @@ def test_train_pump_drives_mcore_training_step(
             async_rl=AsyncRLConfig(
                 batch_selection_strategy="staleness_window",
                 max_weight_staleness_versions=1,
-                min_prompt_groups_per_batch=num_prompts,
+                min_groups_for_streaming_train=num_prompts,
                 max_inflight_prompts=num_prompts,
                 max_buffered_rollouts=num_prompts,
                 over_sampling=True,

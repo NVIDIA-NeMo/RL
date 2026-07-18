@@ -37,7 +37,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     ] = "strict_on_policy"
     # Sampler / on-policy enforcement.
     max_weight_staleness_versions: int = 1
-    min_prompt_groups_per_batch: int = 2
+    # Min ready groups the streaming trainer waits for before dispatching a batch.
+    min_groups_for_streaming_train: int = 2
     # Pump concurrency caps.
     max_inflight_prompts: int = 8
     max_buffered_rollouts: int = 8
