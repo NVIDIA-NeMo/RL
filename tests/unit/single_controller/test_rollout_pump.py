@@ -317,7 +317,6 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     ctrl = SingleControllerActor.remote(
         cfg=cfg,
-        prompts=[],
         dp_client_handle=dp_adapter,
         gen_handle=vllm_generation,
         trainer_handle=object(),

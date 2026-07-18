@@ -267,7 +267,6 @@ def test_train_pump_drives_mcore_training_step(
             max_buffered_rollouts=num_prompts,
             max_train_steps=1,
             max_num_epochs=None,
-            max_rollout_prompts=num_prompts,
             over_sampling=True,
             train_global_batch_size=train_gbs,
             partition_id=_PARTITION_ID,
@@ -288,7 +287,6 @@ def test_train_pump_drives_mcore_training_step(
 
         ctrl = SingleControllerActor.remote(
             cfg=cfg,
-            prompts=[],
             dp_client_handle=dp_client,
             gen_handle=None,
             trainer_handle=trainer,
