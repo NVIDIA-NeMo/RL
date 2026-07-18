@@ -57,7 +57,7 @@ project-includes = [
   "nemo_rl/algorithms/opd.py",
   "nemo_rl/algorithms/reward_functions.py",
   "nemo_rl/algorithms/single_controller.py",
-  "nemo_rl/algorithms/staleness_sampler.py",
+  "nemo_rl/algorithms/single_controller_utils/utils.py",
   "nemo_rl/algorithms/utils.py",
   "nemo_rl/algorithms/x_token/__init__.py",
   "nemo_rl/algorithms/x_token/utils.py",
