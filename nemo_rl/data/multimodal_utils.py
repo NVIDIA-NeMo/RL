@@ -20,7 +20,6 @@ from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional, Union
 
-import decord
 import requests
 import torch
 from PIL import Image
@@ -357,17 +356,19 @@ def load_media_from_message(
                         load_audio(aud, **multimodal_load_kwargs["audio"])
                     )
                 except (RuntimeError, FileNotFoundError, OSError) as e:
-                    logger.warning("Audio loading failed. Fall back to decord.")
-                    # use decord
-                    loaded_audio = decord.AudioReader(
-                        aud,
-                        sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"],
-                        mono=True,
-                    )
+                    logger.warning("Audio loading failed. Falling back to torchaudio.")
+                    import torchaudio
+
+                    waveform, sr = torchaudio.load(aud)
+                    target_sr = multimodal_load_kwargs["audio"]["sampling_rate"]
+                    if sr != target_sr:
+                        waveform = torchaudio.functional.resample(
+                            waveform, sr, target_sr
+                        )
+                    if waveform.shape[0] > 1:
+                        waveform = waveform.mean(0, keepdim=True)
                     loaded_media["audio"].append(
-                        loaded_audio[:].asnumpy()[
-                            get_dim_to_pack_along(processor, "audio")
-                        ]
+                        waveform.numpy()[get_dim_to_pack_along(processor, "audio")]
                     )
             else:
                 loaded_media["audio"].append(aud)
@@ -379,9 +380,8 @@ def load_media_from_message(
                     if "video" in multimodal_load_kwargs
                     else {}
                 )
-                # seems decord backend loads video faster with multithread ffmpeg and it is easier to install
                 loaded_media["video"].append(
-                    load_video(vid, backend="decord", **load_video_kwargs)[0]
+                    load_video(vid, backend="torchcodec", **load_video_kwargs)[0]
                 )
             else:
                 loaded_media["video"].append(vid)
