@@ -1,9 +1,9 @@
 # SingleController + Megatron variant of grpo-qwen2.5-math-1.5b-instruct-1n8g.
 # SC currently only supports non-colocated generation; the 8 GPUs on the node
 # are split 4 (train) + 4 (inference). The SC path routes everything through
-# the TransferQueue data plane + SingleControllerActor. strict_on_policy
-# auto-sets max_weight_staleness_versions=0 and over_sampling=False, enforcing
-# a strict per-version dispatch quota.
+# the TransferQueue data plane + SingleControllerActor.
+# max_weight_staleness_versions=0 + over_sampling=false enforces a strict
+# per-version dispatch quota.
 defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml
 
 logger:
@@ -20,12 +20,11 @@ data_plane:
 
 # SC async-RL runtime knobs.
 async_rl:
-  batch_selection_strategy: strict_on_policy
+  max_weight_staleness_versions: 0
   # Min ready groups the streaming trainer waits for before dispatching a batch.
   min_groups_for_streaming_train: 32
   max_inflight_prompts: 64
-  # strict_on_policy auto-sets max_weight_staleness_versions=0 and
-  # over_sampling=False. over_sampling=false requires
+  # over_sampling=false requires
   #   max_buffered_rollouts == grpo.num_prompts_per_step * (max_weight_staleness_versions + 1)
   #   32 * (0 + 1) = 32
   max_buffered_rollouts: 32

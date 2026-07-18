@@ -129,14 +129,6 @@ class SingleControllerActor:
                 f"({self._async_cfg.min_groups_for_streaming_train})"
             )
 
-        if self._async_cfg.batch_selection_strategy == "strict_on_policy":
-            self._async_cfg.max_weight_staleness_versions = 0
-            self._async_cfg.over_sampling = False
-            print(
-                "Using strict_on_policy, auto setting max_weight_staleness_versions to 0 and over_sampling to False.",
-                flush=True,
-            )
-
         if self._async_cfg.over_sampling:
             if self._async_cfg.max_weight_staleness_versions == 0:
                 raise ValueError(

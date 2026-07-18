@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -31,10 +31,6 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
-    batch_selection_strategy: Literal[
-        "strict_on_policy",
-        "staleness_window",
-    ] = "strict_on_policy"
     # Sampler / on-policy enforcement.
     max_weight_staleness_versions: int = 1
     # Min ready groups the streaming trainer waits for before dispatching a batch.

@@ -1,8 +1,8 @@
 # SingleController variant of grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml.
 # Same training topology and async-1off strategy; the SC path routes
 # everything through the TransferQueue data plane + SingleControllerActor.
-# staleness_window + over_sampling=false replicate the per-version dispatch
-# quota of the original async-grpo path.
+# over_sampling=false replicates the per-version dispatch quota of the
+# original async-grpo path.
 defaults: ./performance/grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml
 
 logger:
@@ -19,7 +19,6 @@ data_plane:
 
 # SC async-RL runtime knobs.
 async_rl:
-  batch_selection_strategy: staleness_window
   # Matches grpo.async_grpo.max_trajectory_age_steps=1.
   max_weight_staleness_versions: 1
   # Min ready groups the streaming trainer waits for before dispatching a batch.
