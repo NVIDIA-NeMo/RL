@@ -107,6 +107,10 @@ _run_worker() {
   "${BENCH_RUNTIME_PYTHON}" -c 'import torch, transformers, vllm; from examples.swe_bench import benchmark_background_prefill_admission, benchmark_streaming_final_decode; assert torch.cuda.is_available(); assert vllm.__version__ == "0.20.0"; print(torch.__version__, transformers.__version__, vllm.__version__, benchmark_background_prefill_admission.__file__, benchmark_streaming_final_decode.__file__)'
 
   if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
+    nan_diagnostic_args=()
+    if [[ "${BENCH_DIAGNOSE_NAN_LOGITS}" == "true" ]]; then
+      nan_diagnostic_args=(--diagnose-nan-logits)
+    fi
     "${BENCH_RUNTIME_PYTHON}" \
       examples/swe_bench/benchmark_streaming_final_decode.py \
       --model "${MODEL_PATH}" \
@@ -123,8 +127,12 @@ _run_worker() {
       --background-overlap-seconds "${BENCH_FINAL_DECODE_OVERLAP_SECONDS}" \
       --cleanup-delay-seconds 0.05 \
       --max-output-tokens "${BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS}" \
+      --same-request-prefill-chunks "${BENCH_SAME_REQUEST_PREFILL_CHUNKS}" \
+      --concurrent-same-request-sessions "${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS}" \
+      --prefill-logprobs "${BENCH_FINAL_DECODE_PREFILL_LOGPROBS}" \
       --warmup-repeats "${BENCH_WARMUP_REPEATS}" \
       --repeats "${BENCH_REPEATS}" \
+      "${nan_diagnostic_args[@]}" \
       --output "${BENCH_OUTPUT_JSON}"
     return
   fi
@@ -200,6 +208,20 @@ BENCH_SIZE_SWEEP_REPEATS="${BENCH_SIZE_SWEEP_REPEATS:-5}"
 BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS="${BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS:-4096}"
 BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS="${BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS:-8}"
 BENCH_FINAL_DECODE_OVERLAP_SECONDS="${BENCH_FINAL_DECODE_OVERLAP_SECONDS:-0.1}"
+BENCH_SAME_REQUEST_PREFILL_CHUNKS="${BENCH_SAME_REQUEST_PREFILL_CHUNKS:-1}"
+BENCH_CONCURRENT_SAME_REQUEST_SESSIONS="${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS:-0}"
+BENCH_FINAL_DECODE_PREFILL_LOGPROBS="${BENCH_FINAL_DECODE_PREFILL_LOGPROBS:-none}"
+BENCH_DIAGNOSE_NAN_LOGITS="${BENCH_DIAGNOSE_NAN_LOGITS:-false}"
+if [[ "${BENCH_FINAL_DECODE_PREFILL_LOGPROBS}" != "none" \
+  && "${BENCH_FINAL_DECODE_PREFILL_LOGPROBS}" != "zero" ]]; then
+  echo "ERROR: BENCH_FINAL_DECODE_PREFILL_LOGPROBS must be none or zero." >&2
+  exit 1
+fi
+if [[ "${BENCH_DIAGNOSE_NAN_LOGITS}" != "true" \
+  && "${BENCH_DIAGNOSE_NAN_LOGITS}" != "false" ]]; then
+  echo "ERROR: BENCH_DIAGNOSE_NAN_LOGITS must be true or false." >&2
+  exit 1
+fi
 GPU_ARCH="${GPU_ARCH:-h100-sm90}"
 BENCH_CACHE_LAYOUT_VERSION="${BENCH_CACHE_LAYOUT_VERSION:-stablelocalv1}"
 
@@ -233,6 +255,8 @@ export BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP BENCH_SIZE_SWEEP_OVERLAP_SECONDS
 export BENCH_SIZE_SWEEP_REPEATS
 export BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS BENCH_FINAL_DECODE_MAX_OUTPUT_TOKENS
 export BENCH_FINAL_DECODE_OVERLAP_SECONDS
+export BENCH_SAME_REQUEST_PREFILL_CHUNKS BENCH_CONCURRENT_SAME_REQUEST_SESSIONS
+export BENCH_FINAL_DECODE_PREFILL_LOGPROBS BENCH_DIAGNOSE_NAN_LOGITS
 export BENCH_OUTPUT_JSON BENCH_BUILD_CACHE_ROOT BENCH_RUNTIME_PYTHON
 export BENCH_LOCAL_VLLM_CACHE BENCH_LOCAL_INDUCTOR_CACHE BENCH_LOCAL_TRITON_CACHE
 export BENCH_PERSISTENT_VLLM_CACHE BENCH_PERSISTENT_INDUCTOR_CACHE
@@ -245,6 +269,10 @@ echo "[LAUNCH] runtime_namespace=${BENCH_RUNTIME_NAMESPACE}"
 echo "[LAUNCH] output=${BENCH_OUTPUT_JSON}"
 echo "[LAUNCH] candidate_chunk_token_sweep=${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP:-disabled}"
 echo "[LAUNCH] cache_page_size_tokens=${BENCH_CACHE_PAGE_SIZE_TOKENS} (0 disables page-aware admission)"
+if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
+  echo "[LAUNCH] prefill_logprobs=${BENCH_FINAL_DECODE_PREFILL_LOGPROBS} diagnose_nan_logits=${BENCH_DIAGNOSE_NAN_LOGITS}"
+  echo "[LAUNCH] same_request_prefill_chunks=${BENCH_SAME_REQUEST_PREFILL_CHUNKS} concurrent_same_request_sessions=${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS}"
+fi
 
 srun \
   --account="${ACCOUNT}" \

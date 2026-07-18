@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
+import os
 import statistics
 import time
 import uuid
@@ -85,6 +87,7 @@ class SameRequestFinalMeasurement:
 
     streamed_prefix_tokens: int
     final_suffix_tokens: int
+    prefill_chunks: int
     dummy_token_ids: tuple[int, ...]
     dummy_logprobs: tuple[float, ...]
     dummy_text: str
@@ -125,6 +128,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--background-overlap-seconds", type=float, default=0.1)
     parser.add_argument("--cleanup-delay-seconds", type=float, default=0.05)
     parser.add_argument("--max-output-tokens", type=int, default=8)
+    parser.add_argument("--same-request-prefill-chunks", type=int, default=1)
+    parser.add_argument("--concurrent-same-request-sessions", type=int, default=0)
+    parser.add_argument(
+        "--prefill-logprobs",
+        choices=("none", "zero"),
+        default="none",
+        help=(
+            "Use no sampled-token logprobs for background prefill, matching "
+            "production, or request zero alternatives for transition diagnosis."
+        ),
+    )
+    parser.add_argument(
+        "--diagnose-nan-logits",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ask vLLM to count model-logit NaNs for each generated token.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--warmup-repeats", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
@@ -144,6 +164,8 @@ def _parse_args() -> argparse.Namespace:
 
 def _extract_completion_delta(
     request_output: Any,
+    *,
+    require_logprobs: bool = True,
 ) -> tuple[tuple[int, ...], tuple[float, ...], str]:
     """Extract sampled token IDs/logprobs and emitted text from one output."""
     if len(request_output.outputs) != 1:
@@ -154,6 +176,8 @@ def _extract_completion_delta(
     token_ids = tuple(int(token_id) for token_id in completion.token_ids)
     if not token_ids:
         return (), (), str(completion.text or "")
+    if not require_logprobs and completion.logprobs is None:
+        return token_ids, (), str(completion.text or "")
     if completion.logprobs is None or len(completion.logprobs) != len(token_ids):
         raise RuntimeError("vLLM did not return one logprob entry per output token")
 
@@ -161,7 +185,13 @@ def _extract_completion_delta(
     for token_id, token_logprobs in zip(token_ids, completion.logprobs, strict=True):
         if token_logprobs is None or token_id not in token_logprobs:
             raise RuntimeError(f"vLLM logprobs omitted sampled output token {token_id}")
-        sampled_logprobs.append(float(token_logprobs[token_id].logprob))
+        sampled_logprob = float(token_logprobs[token_id].logprob)
+        if not math.isfinite(sampled_logprob):
+            raise RuntimeError(
+                "vLLM returned a non-finite sampled-token logprob "
+                f"for token {token_id}: {sampled_logprob}"
+            )
+        sampled_logprobs.append(sampled_logprob)
     return token_ids, tuple(sampled_logprobs), str(completion.text or "")
 
 
@@ -220,6 +250,23 @@ def _output_signature(
         measurement.output_text,
         measurement.decoded_text,
     )
+
+
+def _output_histogram(
+    measurements: Sequence[FinalGenerationMeasurement],
+) -> list[dict[str, Any]]:
+    counts = Counter(_output_signature(measurement) for measurement in measurements)
+    return [
+        {
+            "count": count,
+            "output_token_ids": signature[0],
+            "output_text": signature[1],
+            "decoded_text": signature[2],
+        }
+        for signature, count in sorted(
+            counts.items(), key=lambda item: (-item[1], item[0])
+        )
+    ]
 
 
 def _modal_control_contract(
@@ -358,28 +405,54 @@ async def _generate_same_request_final(
     tokenizer: Any,
     stability_margin_tokens: int,
     background_priority: int,
+    prefill_has_logprobs: bool,
+    prefill_chunk_count: int,
 ) -> SameRequestFinalMeasurement:
     stable_prefix = _stable_streamed_prefix(
         trace, stability_margin_tokens=stability_margin_tokens
     )
     streamed_prefix_token_count = len(stable_prefix)
+    dynamic_prefix = stable_prefix[trace.immutable_prefix_tokens :]
+    if not 1 <= prefill_chunk_count <= len(dynamic_prefix):
+        raise ValueError(
+            "same-request prefill chunks must be between one and the stable "
+            f"dynamic-prefix length ({len(dynamic_prefix)})"
+        )
+    dynamic_chunk_size, larger_chunk_count = divmod(
+        len(dynamic_prefix), prefill_chunk_count
+    )
+    prefill_chunks: list[list[int]] = []
+    dynamic_offset = 0
+    for chunk_index in range(prefill_chunk_count):
+        chunk_size = dynamic_chunk_size + (chunk_index < larger_chunk_count)
+        next_dynamic_offset = dynamic_offset + chunk_size
+        if chunk_index == 0:
+            prefill_chunks.append(
+                stable_prefix[: trace.immutable_prefix_tokens + next_dynamic_offset]
+            )
+        else:
+            prefill_chunks.append(dynamic_prefix[dynamic_offset:next_dynamic_offset])
+        dynamic_offset = next_dynamic_offset
+    assert sum(len(chunk) for chunk in prefill_chunks) == len(stable_prefix)
     final_suffix = trace.final[len(stable_prefix) :]
     if not final_suffix:
         raise RuntimeError(
             "same-request final decode requires a non-empty final suffix"
         )
 
-    dummy_observed = asyncio.Event()
+    prefill_chunk_observed = asyncio.Event()
     input_started_at = time.perf_counter()
     final_enqueued_at: float | None = None
 
     async def input_stream() -> AsyncGenerator[Any, None]:
         nonlocal final_enqueued_at
-        yield streaming_input_type(
-            prompt=tokens_prompt_type(prompt_token_ids=stable_prefix),
-            sampling_params=prefill_sampling_params,
-        )
-        await dummy_observed.wait()
+        for prefill_chunk in prefill_chunks:
+            yield streaming_input_type(
+                prompt=tokens_prompt_type(prompt_token_ids=prefill_chunk),
+                sampling_params=prefill_sampling_params,
+            )
+            await prefill_chunk_observed.wait()
+            prefill_chunk_observed.clear()
         final_enqueued_at = time.perf_counter()
         yield streaming_input_type(
             prompt=tokens_prompt_type(prompt_token_ids=final_suffix),
@@ -407,8 +480,13 @@ async def _generate_same_request_final(
 
     try:
         async for request_output in result_generator:
-            token_ids, logprobs, text = _extract_completion_delta(request_output)
-            if not dummy_observed.is_set():
+            token_ids, logprobs, text = _extract_completion_delta(
+                request_output,
+                require_logprobs=(
+                    final_enqueued_at is not None or prefill_has_logprobs
+                ),
+            )
+            if final_enqueued_at is None:
                 if not token_ids:
                     continue
                 if len(token_ids) != 1:
@@ -421,7 +499,7 @@ async def _generate_same_request_final(
                 if request_output.num_cached_tokens is not None:
                     prefill_cached_tokens = int(request_output.num_cached_tokens)
                 dummy_observed_at = time.perf_counter()
-                dummy_observed.set()
+                prefill_chunk_observed.set()
                 continue
 
             if request_output.num_cached_tokens is not None:
@@ -434,11 +512,16 @@ async def _generate_same_request_final(
     finally:
         # Prevent the AsyncLLM input task from waiting forever if output
         # validation raises before the prefill dummy is observed.
-        dummy_observed.set()
+        prefill_chunk_observed.set()
 
     finished_at = time.perf_counter()
     if prefill_cached_tokens is None or dummy_observed_at is None:
         raise RuntimeError("same-request prefill produced no observable dummy token")
+    if len(dummy_token_ids) != prefill_chunk_count:
+        raise RuntimeError(
+            "same-request prefill did not produce exactly one dummy token per "
+            f"chunk: {len(dummy_token_ids)} != {prefill_chunk_count}"
+        )
     if final_enqueued_at is None:
         raise RuntimeError("same-request final suffix was never enqueued")
     if final_cached_tokens is None:
@@ -451,6 +534,7 @@ async def _generate_same_request_final(
         # Report the pre-mutation length captured above.
         streamed_prefix_tokens=streamed_prefix_token_count,
         final_suffix_tokens=len(final_suffix),
+        prefill_chunks=prefill_chunk_count,
         dummy_token_ids=tuple(dummy_token_ids),
         dummy_logprobs=tuple(dummy_logprobs),
         dummy_text="".join(dummy_text),
@@ -577,18 +661,25 @@ def _paired_summary(
 
 
 async def _main(args: argparse.Namespace) -> None:
+    if args.diagnose_nan_logits:
+        os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] = "1"
+
     from transformers import AutoTokenizer
     from vllm.logger import init_logger
 
     from nemo_rl.models.generation.vllm.patches import (
         _patch_vllm_streaming_session_max_tokens,
+        _patch_vllm_streaming_session_output_state,
     )
 
-    if not _patch_vllm_streaming_session_max_tokens(
-        init_logger("streaming_final_decode_patch")
-    ):
+    patch_logger = init_logger("streaming_final_decode_patch")
+    if not _patch_vllm_streaming_session_max_tokens(patch_logger):
         raise RuntimeError(
             "installed vLLM does not support per-chunk max_tokens updates"
+        )
+    if not _patch_vllm_streaming_session_output_state(patch_logger):
+        raise RuntimeError(
+            "installed vLLM does not support streaming output-state updates"
         )
 
     from vllm import TokensPrompt
@@ -599,6 +690,10 @@ async def _main(args: argparse.Namespace) -> None:
 
     if args.repeats <= 0 or args.warmup_repeats < 0:
         raise ValueError("repeats must be positive and warmup_repeats non-negative")
+    if args.same_request_prefill_chunks <= 0:
+        raise ValueError("same_request_prefill_chunks must be positive")
+    if args.concurrent_same_request_sessions < 0:
+        raise ValueError("concurrent_same_request_sessions must be non-negative")
     for name in (
         "max_output_tokens",
         "cache_page_size_tokens",
@@ -641,13 +736,38 @@ async def _main(args: argparse.Namespace) -> None:
             scheduling_policy="priority",
         )
     )
+    nan_logits_by_request: dict[str, int] = {}
+    if args.diagnose_nan_logits:
+        original_process_outputs = llm.output_processor.process_outputs
+
+        def process_outputs_with_nan_diagnostics(
+            engine_core_outputs: list[Any], *process_args: Any, **process_kwargs: Any
+        ) -> Any:
+            for engine_core_output in engine_core_outputs:
+                if engine_core_output.num_nans_in_logits:
+                    nan_logits_by_request[engine_core_output.request_id] = (
+                        nan_logits_by_request.get(engine_core_output.request_id, 0)
+                        + int(engine_core_output.num_nans_in_logits)
+                    )
+                    print(
+                        "MODEL_LOGITS_NAN "
+                        f"request_id={engine_core_output.request_id} "
+                        f"count={engine_core_output.num_nans_in_logits}",
+                        flush=True,
+                    )
+            return original_process_outputs(
+                engine_core_outputs, *process_args, **process_kwargs
+            )
+
+        llm.output_processor.process_outputs = process_outputs_with_nan_diagnostics
+
     prefill_sampling_params = SamplingParams(
         temperature=0,
         top_p=1,
         top_k=-1,
         seed=args.seed,
         max_tokens=1,
-        logprobs=0,
+        logprobs=0 if args.prefill_logprobs == "zero" else None,
         output_kind=RequestOutputKind.DELTA,
     )
     final_delta_sampling_params = SamplingParams(
@@ -764,6 +884,8 @@ async def _main(args: argparse.Namespace) -> None:
                             tokenizer=tokenizer,
                             stability_margin_tokens=args.stability_margin_tokens,
                             background_priority=args.background_priority,
+                            prefill_has_logprobs=(args.prefill_logprobs == "zero"),
+                            prefill_chunk_count=args.same_request_prefill_chunks,
                         )
                     iteration_results[arm] = measurement
 
@@ -812,6 +934,58 @@ async def _main(args: argparse.Namespace) -> None:
                 if not modal_contract["details"]["all"]:
                     modal_contract_failures.append(modal_contract)
 
+        concurrent_control_measurements: list[FinalGenerationMeasurement] = []
+        concurrent_same_request_measurements: list[SameRequestFinalMeasurement] = []
+        if args.concurrent_same_request_sessions:
+            await reset_cache()
+            diagnostic_trace = next(iter(traces.values()))
+            concurrent_same_request_measurements = list(
+                await asyncio.gather(
+                    *(
+                        _generate_same_request_final(
+                            llm,
+                            trace=diagnostic_trace,
+                            prefill_sampling_params=prefill_sampling_params,
+                            final_sampling_params=final_delta_sampling_params,
+                            tokens_prompt_type=TokensPrompt,
+                            streaming_input_type=StreamingInput,
+                            tokenizer=tokenizer,
+                            stability_margin_tokens=args.stability_margin_tokens,
+                            background_priority=args.background_priority,
+                            prefill_has_logprobs=(args.prefill_logprobs == "zero"),
+                            prefill_chunk_count=args.same_request_prefill_chunks,
+                        )
+                        for _ in range(args.concurrent_same_request_sessions)
+                    )
+                )
+            )
+            await reset_cache()
+            concurrent_control_measurements = list(
+                await asyncio.gather(
+                    *(
+                        _generate_final(
+                            llm,
+                            prompt_token_ids=list(diagnostic_trace.final),
+                            sampling_params=final_delta_sampling_params,
+                            tokens_prompt_type=TokensPrompt,
+                            tokenizer=tokenizer,
+                            output_kind="delta",
+                        )
+                        for _ in range(args.concurrent_same_request_sessions)
+                    )
+                )
+            )
+
+        concurrent_control_signatures = {
+            _output_signature(measurement)
+            for measurement in concurrent_control_measurements
+        }
+        concurrent_same_request_matches_control = [
+            _output_signature(measurement.final_generation)
+            in concurrent_control_signatures
+            for measurement in concurrent_same_request_measurements
+        ]
+
         measurements: dict[str, Any] = {}
         subpage_ttft_positive = []
         subpage_total_positive = []
@@ -845,7 +1019,7 @@ async def _main(args: argparse.Namespace) -> None:
                     same_summary["paired_total_savings_seconds"]["mean"] > 0
                 )
             dummy_isolated_from_full_final_output &= all(
-                len(item.dummy_token_ids) == 1
+                len(item.dummy_token_ids) == args.same_request_prefill_chunks
                 and len(item.final_generation.output_token_ids)
                 == args.max_output_tokens
                 for item in same_request_final
@@ -920,6 +1094,7 @@ async def _main(args: argparse.Namespace) -> None:
                 "mutable_suffix_tokens": args.mutable_suffix_tokens,
                 "stability_margin_tokens": args.stability_margin_tokens,
                 "candidate_chunk_token_sweep": args.candidate_chunk_token_sweep,
+                "same_request_prefill_chunks": args.same_request_prefill_chunks,
             },
             "generation": {
                 "max_output_tokens": args.max_output_tokens,
@@ -928,6 +1103,34 @@ async def _main(args: argparse.Namespace) -> None:
                 "top_k": -1,
                 "seed": args.seed,
                 "sampled_token_logprobs": 0,
+                "prefill_sampled_token_logprobs": args.prefill_logprobs,
+            },
+            "diagnostics": {
+                "nan_logits_enabled": args.diagnose_nan_logits,
+                "nan_logits_by_request": nan_logits_by_request,
+                "concurrent_same_request_sessions": (
+                    args.concurrent_same_request_sessions
+                ),
+                "concurrent_control_measurements": [
+                    asdict(item) for item in concurrent_control_measurements
+                ],
+                "concurrent_same_request_measurements": [
+                    asdict(item) for item in concurrent_same_request_measurements
+                ],
+                "concurrent_control_output_histogram": _output_histogram(
+                    concurrent_control_measurements
+                ),
+                "concurrent_same_request_output_histogram": _output_histogram(
+                    [
+                        item.final_generation
+                        for item in concurrent_same_request_measurements
+                    ]
+                ),
+                "concurrent_same_request_matches_control_fraction": (
+                    statistics.fmean(concurrent_same_request_matches_control)
+                    if concurrent_same_request_matches_control
+                    else None
+                ),
             },
             "repeats": args.repeats,
             "warmup_repeats": args.warmup_repeats,
