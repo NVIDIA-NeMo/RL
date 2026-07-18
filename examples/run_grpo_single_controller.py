@@ -71,7 +71,7 @@ def main() -> None:
         args.config = os.path.join(
             os.path.dirname(__file__),
             "configs",
-            "grpo_math_1B_single_controller.yaml",
+            "grpo_math_1B_megatron_single_controller.yaml",
         )
 
     config = load_config(args.config)
