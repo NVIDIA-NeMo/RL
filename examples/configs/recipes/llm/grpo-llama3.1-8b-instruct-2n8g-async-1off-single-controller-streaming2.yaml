@@ -1,8 +1,4 @@
 # SingleController variant of grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml.
-# Same training topology and async-1off strategy; the SC path routes
-# everything through the TransferQueue data plane + SingleControllerActor.
-# over_sampling=false replicates the per-version dispatch quota of the
-# original async-grpo path.
 defaults: ./performance/grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml
 
 logger:
@@ -10,7 +6,12 @@ logger:
   wandb:
     name: grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
 
+# SC does not support validation and checkpointing yet.
+grpo:
+  val_period: 0
+
 checkpointing:
+  enabled: false
   checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
 
 # TransferQueue data plane is mandatory for the SingleController path.

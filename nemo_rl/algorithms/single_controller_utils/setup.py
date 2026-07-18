@@ -254,17 +254,34 @@ def setup_single_controller(
     Returns:
         SingleControllerBundle ready to be passed to SingleControllerActor.
     """
-    dp_cfg = master_config.data_plane
-    if dp_cfg is None or not dp_cfg.get("enabled", False):
+    # short names for config sections
+    grpo_config = master_config.grpo
+    dp_config = master_config.data_plane
+    generation_config = master_config.policy["generation"]
+    data_config = master_config.data
+
+    if (
+        grpo_config["val_period"] > 0
+        or grpo_config["val_at_start"]
+        or grpo_config["val_at_end"]
+    ):
+        raise NotImplementedError(
+            "SingleController doesn't support validation now, will support "
+            "later. Set grpo.val_period=0, val_at_start=false, val_at_end=false."
+        )
+    if master_config.checkpointing["enabled"]:
+        raise NotImplementedError(
+            "SingleController doesn't support checkpointing now, will support "
+            "later. Set checkpointing.enabled=false."
+        )
+
+    if dp_config is None or not dp_config.get("enabled", False):
         raise ValueError(
             "single_controller_utils.setup requires "
             "master_config.data_plane.enabled=True. The async-RL "
             "SingleController path is built on the TransferQueue data plane."
         )
 
-    data_config = master_config.data
-    grpo_config = master_config.grpo
-    generation_config = master_config.policy["generation"]
     assert generation_config is not None, (
         "single_controller_utils.setup requires policy.generation in master_config"
     )
@@ -328,7 +345,7 @@ def setup_single_controller(
     # Setup Data Plane Client & Weight Sync
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
-    dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+    dp_client = build_data_plane_client(dp_config, bootstrap=False)
 
     backend = generation_config["backend"]
     weight_synchronizer = create_weight_synchronizer(

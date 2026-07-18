@@ -1,9 +1,4 @@
 # SingleController + Megatron variant of grpo-qwen2.5-math-1.5b-instruct-1n8g.
-# SC currently only supports non-colocated generation; the 8 GPUs on the node
-# are split 4 (train) + 4 (inference). The SC path routes everything through
-# the TransferQueue data plane + SingleControllerActor.
-# max_weight_staleness_versions=0 + over_sampling=false enforces a strict
-# per-version dispatch quota.
 defaults: ./grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1.v3.yaml
 
 logger:
@@ -11,7 +6,12 @@ logger:
   wandb:
     name: grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
 
+# SC does not support validation and checkpointing yet.
+grpo:
+  val_period: 0
+
 checkpointing:
+  enabled: false
   checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-sc
 
 # TransferQueue data plane is mandatory for the SingleController path.
