@@ -48,7 +48,7 @@ dependencies = [
   "matplotlib",
   "plotly",
   "sympy>=1.14.0",
-  "pillow>=12.1.1",
+  "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
   "torchvision==0.26.0",
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
@@ -101,7 +101,7 @@ dependencies = [
   # build-container runner is aarch64 (uv reports aarch64-unknown-linux-gnu),
   # so the marker must include aarch64 — otherwise mooncake is silently
   # excluded from the resolution during the Docker build.
-  "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "mooncake-transfer-engine-cuda13==0.3.11.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 [project.optional-dependencies]
@@ -396,7 +396,7 @@ constraint-dependencies = [
   "pygments>=2.20.0",         # Address CVE GHSA-5239-wwwm-4pmq
   "cbor2>=5.9.0",             # Address CVE GHSA-3c37-wwvx-h642
   "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
-  "cryptography>=46.0.6",     # Address CVE GHSA-6w46-j5rx-g56g
+  "cryptography>=48.0.1",     # Address CVE GHSA-6w46-j5rx-g56g, GHSA-537c-gmf6-5ccf
   "orjson>=3.11.6",           # Address CVE GHSA-hx9q-6w63-j58v
   "pyjwt>=2.13.0",
   "dulwich>=1.2.5",
