@@ -282,15 +282,6 @@ class TestSetup:
         assert actor_args.partition_id == "rollout_data"
         assert actor_args.tq_buffer._partition_id == "rollout_data"
 
-    def test_nemo_gym_not_supported(self):
-        """SC path trips the nemo-gym guard until PR #3267 lands."""
-        mc = _make_master_config()
-        with (
-            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
-            pytest.raises(NotImplementedError, match="NeMo-Gym"),
-        ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
     def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
         """setup_response_data receives master_config.env and supplies env handles."""
         math_env_cfg = {"some": "value"}
