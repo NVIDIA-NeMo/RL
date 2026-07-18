@@ -35,48 +35,91 @@ reject `refit_transport` during setup; extending them is tracked in
 ## Architecture
 
 ```mermaid
-flowchart LR
-  SYNC["GRPO weight synchronizer"]
+%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 24, "rankSpacing": 30, "diagramPadding": 8}}}%%
+flowchart TB
+  subgraph SYSTEM[" "]
+    direction TB
+    SYNC["VllmRemoteSparseWeightSynchronizer<br/>driver: orchestrates; no payload bytes"]
 
-  subgraph P["Megatron policy cluster"]
-    MB["All policy ranks<br/>Megatron Bridge HF export"]
-    OWN["Deterministic chunk owner<br/>chunk_index modulo producers"]
-    BASE["Distributed canonical<br/>CPU or mmap baseline"]
-    PIPE["Shared bounded pipeline<br/>compare, encode, zstd"]
-    MB -->|canonical HF chunks| OWN
-    OWN -->|owned chunks| BASE
-    BASE -->|changed locations and bits| PIPE
+    subgraph ROW[" "]
+      direction LR
+      subgraph TRAIN["Megatron policy cluster"]
+        direction TB
+        subgraph PACTORS["MegatronPolicyWorker x N - Ray actors"]
+          direction TB
+          REMOTE["MegatronRemoteSparseRefit"]
+          EXPORT["Megatron Bridge HF export<br/>all policy ranks participate<br/>deterministic owner: chunk_index modulo producers"]
+          TRACKER["DeltaCompressionTracker + bounded pipeline<br/>distributed CPU or mmap baseline<br/>compare -> XOR/overwrite -> encode -> zstd"]
+          REMOTE --> EXPORT --> TRACKER
+        end
+      end
+
+      subgraph VALUE["Cross-cluster value plane"]
+        direction TB
+        S3["S3 object<br/>compressed payload bytes<br/>one upload per owned payload"]
+        ZTREE["ZeroMQ binary relay tree<br/>one cross-cluster root send per payload"]
+      end
+
+      subgraph GEN["vLLM generation cluster"]
+        direction TB
+        subgraph GACTORS["VllmGenerationWorker x M - Ray actors; one receiver per node"]
+          direction TB
+          RECEIVER["VllmSparseRefitReceiver"]
+          API["FastAPI control plane<br/>/prepare  /s3-manifest  /zmq-flush  /flush"]
+          ZMQ["ZmqSparseRefitServer<br/>relay node + staged-ACK tree"]
+          QUEUE["Deduplicating bounded FIFO<br/>batch staging + single apply stream"]
+          RECEIVER --> API -->|downloaded S3 body| QUEUE
+          RECEIVER --> ZMQ -->|in-process callback| QUEUE
+        end
+
+        subgraph VPROC["vLLM worker process x TP/PP/EP - reached by collective_rpc"]
+          APPLY["VllmInternalWorkerExtension -> VllmSparseDeltaApplier<br/>decode -> reusable GPU scratch -> native load_weights()"]
+        end
+        QUEUE -->|path when ranks share a node; bytes otherwise| APPLY
+      end
+
+      TRAIN ~~~ VALUE ~~~ GEN
+    end
+
+    SYNC -. "Ray RPC: stream and finish(success)" .-> REMOTE
+    SYNC -. "HTTP: prepare, relay flush, global flush" .-> API
+    TRACKER -->|PUT compressed bytes| S3
+    TRACKER -. "POST manifest pointer" .-> API
+    S3 -->|GET compressed bytes per receiver node| API
+    TRACKER -->|DEALER to ROUTER: DATA bytes| ZTREE
+    ZTREE -->|relay DATA bytes| ZMQ
   end
 
-  subgraph T["Value plane"]
-    S3["S3 objects<br/>one upload per owned payload"]
-    Z0["ZeroMQ root relay<br/>one cross-cluster send"]
-    ZT["Binary relay tree"]
-    Z0 --> ZT
-  end
-
-  subgraph G["vLLM generation cluster"]
-    HTTP["HTTP control plane<br/>prepare and global flush"]
-    RX["One receiver per inference node"]
-    STAGE["Compact payload staging<br/>and bounded FIFO queue"]
-    RPC["Node-local collective RPC"]
-    APPLY["Each vLLM rank<br/>reusable scratch + native load_weights()"]
-    HTTP -.-> RX
-    RX --> STAGE --> RPC --> APPLY
-  end
-
-  SYNC -. "prepare, flush, commit" .-> HTTP
-  SYNC -. "start stream" .-> PIPE
-  PIPE -->|compressed body| S3
-  S3 -->|HTTP manifest, then GET| RX
-  PIPE -->|multipart DATA frame| Z0
-  ZT -->|compressed body| RX
-  APPLY -. "success metrics" .-> SYNC
-  SYNC -. "commit exact source bits" .-> BASE
+  classDef coordinator fill:#f1edff,stroke:#7048e8,color:#3f248f,stroke-width:2px
+  classDef policy fill:#f2f8f2,stroke:#2f7d32,color:#245b27,stroke-width:1.5px
+  classDef s3 fill:#fff8e8,stroke:#9a6500,color:#704900,stroke-width:1.5px
+  classDef zmq fill:#edf9fa,stroke:#267783,color:#1e5962,stroke-width:1.5px
+  classDef receiver fill:#eef4ff,stroke:#2864dc,color:#17418f,stroke-width:1.5px
+  classDef queue fill:#fff1ef,stroke:#c43b31,color:#8d2721,stroke-width:1.5px
+  classDef apply fill:#f2f8f2,stroke:#2f7d32,color:#245b27,stroke-width:1.5px
+  class SYNC coordinator
+  class REMOTE,EXPORT,TRACKER policy
+  class S3 s3
+  class ZTREE,ZMQ zmq
+  class RECEIVER,API receiver
+  class QUEUE queue
+  class APPLY apply
+  style SYSTEM fill:transparent,stroke:transparent
+  style ROW fill:transparent,stroke:transparent
+  style TRAIN fill:#f8fbf8,stroke:#2f7d32,stroke-dasharray:5 5
+  style GEN fill:#f6f8ff,stroke:#2864dc,stroke-dasharray:5 5
 ```
 
-*Figure 1. Control traffic is dashed. Payload data is solid. S3 and ZeroMQ
-share every component except the value plane.*
+*Figure 1. Dashed links are control messages or S3 pointers; solid links carry
+payload bytes or invoke the node-local apply path. Amber components are S3,
+teal components are ZeroMQ, and both transports share the sender pipeline,
+receiver queue, native-loader apply path, verification, and baseline commit.*
+
+| Path | Cross-cluster transfer | Receiver handoff |
+|---|---|---|
+| S3 | One object upload per owned payload; each receiver gets a small manifest pointer and downloads the object | FastAPI callback -> deduplicating FIFO -> `collective_rpc` |
+| ZeroMQ | One producer-to-root DATA send followed by binary-tree relay fanout | In-process relay callback -> the same FIFO -> `collective_rpc` |
+| Within one node | No S3 or ZeroMQ hop | Staged path when ranks share storage; serialized bytes otherwise; no CUDA IPC |
 
 | Responsibility | Implementation |
 |---|---|
@@ -88,6 +131,69 @@ share every component except the value plane.*
 | Run the ZeroMQ transport and relay | [`weight_transfer_zmq.py`](../../nemo_rl/utils/weight_transfer_zmq.py) |
 | Queue receiver work and expose endpoints | [`vllm_sparse_refit.py`](../../nemo_rl/models/generation/vllm/vllm_sparse_refit.py) |
 | Apply canonical updates through native loaders | [`vllm_sparse_delta.py`](../../nemo_rl/models/generation/vllm/vllm_sparse_delta.py) |
+
+The baseline advances only after the receiver version is globally committed:
+
+```mermaid
+%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 24, "rankSpacing": 30, "diagramPadding": 8}}}%%
+flowchart LR
+  subgraph VERSION0["Initialization"]
+    direction TB
+    INIT["Same checkpoint version W0<br/>loaded independently on both clusters"]
+    T0["Trainer GPU<br/>W0"]
+    B0["CPU or mmap baseline<br/>B0 = W0"]
+    V0["vLLM GPU<br/>W0; no baseline copy"]
+    INIT -. "local load" .-> T0
+    INIT -. "local load" .-> V0
+    T0 -->|canonical export to local baseline| B0
+  end
+
+  subgraph VERSION1["Refit after optimizer step 1"]
+    direction TB
+    T1["Trainer GPU<br/>W1"]
+    D1["delta1<br/>changed bits of W1 vs B0<br/>XOR; overwrite where required"]
+    V1["vLLM GPU<br/>apply delta1 -> W1"]
+    A1["All receiver ACKs<br/>relay flush + apply flush + verify"]
+    B1["Baseline commit<br/>B1 = exact W1 source bits"]
+    T1 --> D1 --> V1 --> A1 --> B1
+  end
+
+  subgraph VERSION2["Refit after optimizer step 2"]
+    direction TB
+    T2["Trainer GPU<br/>W2"]
+    D2["delta2<br/>changed bits of W2 vs B1<br/>XOR; overwrite where required"]
+    V2["vLLM GPU<br/>apply delta2 -> W2"]
+    A2["All receiver ACKs<br/>relay flush + apply flush + verify"]
+    B2["Baseline commit<br/>B2 = exact W2 source bits"]
+    T2 --> D2 --> V2 --> A2 --> B2
+  end
+
+  NEXT["..."]
+
+  T0 -->|optimizer step 1| T1 -->|optimizer step 2| T2 --> NEXT
+  B0 -->|comparison reference| D1
+  B1 -->|comparison reference| D2
+  V0 -->|serve rollouts until commit| V1 -->|serve rollouts until commit| V2 --> NEXT
+  B0 -. "advance only after A1" .-> B1
+  B1 -. "advance only after A2" .-> B2
+
+  classDef init fill:#f1edff,stroke:#7048e8,color:#3f248f,stroke-width:1.5px
+  classDef weight fill:#f2f8f2,stroke:#2f7d32,color:#245b27,stroke-width:1.5px
+  classDef delta fill:#fff8e8,stroke:#9a6500,color:#704900,stroke-width:1.5px
+  classDef ack fill:#eef4ff,stroke:#2864dc,color:#17418f,stroke-width:1.5px
+  class INIT init
+  class T0,T1,T2,B0,B1,B2,V0,V1,V2 weight
+  class D1,D2 delta
+  class A1,A2 ack
+  style VERSION0 fill:#f7f8fa,stroke:#c8ced8
+  style VERSION1 fill:#f7f8fa,stroke:#c8ced8
+  style VERSION2 fill:#f7f8fa,stroke:#c8ced8
+```
+
+*Figure 2. One refit follows each configured training cadence, but only changed
+canonical bytes cross the refit value plane. No full checkpoint is transferred
+by this protocol at initialization or periodically. Every policy rank still
+participates in the intra-cluster Megatron Bridge export.*
 
 ## Protocol
 
@@ -270,28 +376,50 @@ Each serialized payload is:
 ```
 
 ```mermaid
-flowchart TB
+%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 24, "rankSpacing": 30, "diagramPadding": 8}}}%%
+flowchart LR
+  CODEC["Shared encoder output<br/>(locations, value groups, tensor metadata)"]
+  SERIAL["torch serialization + zstd<br/>checksum over compressed body"]
+  CODEC --> SERIAL
+
   subgraph S3F["S3 transport"]
-    SO["Object body<br/>zstd-compressed torch payload"]
-    SM["HTTP manifest<br/>bucket, region, key, checksum,<br/>verification_candidates"]
+    direction TB
+    SO["S3 object body<br/>compressed payload bytes"]
+    SM["HTTP manifest pointer<br/>bucket, region, key, checksum,<br/>transfer/producer/payload IDs, samples"]
+    SM -. "locates object" .-> SO
   end
 
   subgraph ZF["ZeroMQ DATA multipart"]
+    direction TB
     ZK["Frame 1: DATA"]
-    ZM["Frame 2: JSON metadata<br/>transfer, producer, payload IDs,<br/>checksum, samples, optional API key"]
+    ZM["Frame 2: JSON metadata<br/>transfer/producer/payload IDs,<br/>checksum, samples, optional API key"]
     ZB["Frame 3: zstd-compressed torch payload"]
+    ZK --> ZM --> ZB
   end
 
-  SO --> DECOMP["Checksum then zstd decode"]
-  SM -. "locates and authenticates object" .-> SO
-  ZK --> ZM --> ZB --> DECOMP
-  DECOMP --> PT["torch payload tuple"]
+  SERIAL -->|PUT bytes once| SO
+  SERIAL -->|DATA body| ZB
+  SERIAL -. "POST pointer" .-> SM
+  SO --> COMMON["Common receiver<br/>checksum -> zstd -> torch deserialize"]
+  SM -. "identity + verification budget" .-> COMMON
+  ZB --> COMMON
+  ZM -. "identity + authentication" .-> COMMON
+  COMMON --> PT["Decoded payload tuple"]
   PT --> PI["packed location bytes<br/>range or uint16/32/64 deltas"]
   PT --> PV["value groups by dtype<br/>XOR or overwrite bits"]
   PT --> PM["per-tensor metadata<br/>HF name, shape, offsets, operation"]
+
+  classDef shared fill:#f1edff,stroke:#7048e8,color:#3f248f,stroke-width:1.5px
+  classDef s3 fill:#fff8e8,stroke:#9a6500,color:#704900,stroke-width:1.5px
+  classDef zmq fill:#edf9fa,stroke:#267783,color:#1e5962,stroke-width:1.5px
+  classDef decoded fill:#f2f8f2,stroke:#2f7d32,color:#245b27,stroke-width:1.5px
+  class CODEC,SERIAL shared
+  class SO,SM s3
+  class ZK,ZM,ZB zmq
+  class COMMON,PT,PI,PV,PM decoded
 ```
 
-*Figure 2. S3 separates the object body from its control-plane manifest;
+*Figure 3. S3 separates the object body from its control-plane manifest;
 ZeroMQ carries equivalent identity and body data as multipart frames. Both
 decode into the same codec tuple.*
 
