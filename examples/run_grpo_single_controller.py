@@ -34,7 +34,6 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.nemo_gym import setup_nemo_gym_config
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -114,10 +113,6 @@ def main() -> None:
         tokenizer,
         has_refit_draft_weights=has_refit_draft_weights,
     )
-
-    # NeMo-Gym specific config setup.
-    if bool(config.env.get("should_use_nemo_gym")):
-        setup_nemo_gym_config(config, tokenizer)
 
     actor_args = setup_single_controller(config, tokenizer)
 
