@@ -193,9 +193,9 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
-        "vllm.entrypoints.serve.render",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
+        "vllm.renderers",
         "vllm.tool_parsers",
         "vllm.v1",
         "vllm.v1.engine",
@@ -218,7 +218,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.registry = "registry"
 
-    class OpenAIServingRender:
+    class OnlineRenderer:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.renderer = kwargs["renderer"]
@@ -230,7 +230,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class OpenAIServingTokenization:
+    class ServingTokenization:
         instances = []
 
         def __init__(self, **kwargs):
@@ -274,12 +274,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         TokenizeResponse=type("TokenizeResponse", (), {}),
     )
     make_module(
-        "vllm.entrypoints.serve.render.serving",
-        OpenAIServingRender=OpenAIServingRender,
+        "vllm.renderers.online_renderer",
+        OnlineRenderer=OnlineRenderer,
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
-        OpenAIServingTokenization=OpenAIServingTokenization,
+        ServingTokenization=ServingTokenization,
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
