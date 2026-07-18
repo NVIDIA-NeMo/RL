@@ -123,13 +123,13 @@ def main() -> None:
 
     print("🚀 Launching SingleControllerActor")
     sc = SingleControllerActor.remote(master_config=config, bundle=bundle)
-    result = ray.get(sc.run.remote())
-    print(f"SC run complete: {result}")
-
-    # Drain env actors before vLLM shutdown to avoid race-condition 500s on
-    # in-flight requests.
-    for handle in bundle.env_handles.values():
-        ray.get(handle.shutdown.remote())
+    try:
+        result = ray.get(sc.run.remote())
+        print(f"SC run complete: {result}")
+    finally:
+        # Drain env actors before vLLM to avoid in-flight 500 on in-flight requests.
+        for handle in bundle.env_handles.values():
+            ray.get(handle.shutdown.remote())
 
 
 if __name__ == "__main__":
