@@ -53,7 +53,8 @@ cd -
 TRAIN_PATH=$DATA_DIR/workplace_assistant_train.jsonl
 VALIDATION_PATH=$DATA_DIR/workplace_assistant_validation.jsonl
 jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/train.jsonl > $TRAIN_PATH
-jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
+jq -c -s '.[0:2][] | .responses_create_params.tools |= (.[0:1])' \
+    3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > $VALIDATION_PATH
 
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo_single_controller.py \
@@ -76,6 +77,10 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=10 \
     grpo.val_period=-1 \
+    grpo.val_at_start=false \
+    grpo.val_at_end=true \
+    grpo.max_val_samples=null \
+    grpo.val_batch_size=null \
     policy.train_global_batch_size=8 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
@@ -109,4 +114,13 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Observed to be between 0.8-1.3
 uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/gen_kl_error"]) < 1.3' \
-    'max(data["train/reward"]) > 0'
+    'max(data["train/reward"]) > 0' \
+    'data["validation/accuracy"]["10"] >= 0.0' \
+    'data["validation/avg_length"]["10"] > 0' \
+    'data["validation/num_samples"]["10"] == 2'
+
+mapfile -t VAL_DATA_FILES < <(
+    find "$LOG_DIR" -type f -name val_data_step10.jsonl -print
+)
+test "${#VAL_DATA_FILES[@]}" -eq 1
+test "$(wc -l < "${VAL_DATA_FILES[0]}")" -eq 2

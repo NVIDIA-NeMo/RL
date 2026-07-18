@@ -238,6 +238,8 @@ def _actor_master_config(
     tmp_path: Path,
     *,
     max_num_steps: int = 4,
+    val_period: int = 0,
+    val_at_end: bool = False,
     save_period: int = 2,
     enabled: bool = True,
     metric_name: Optional[str] = None,
@@ -265,6 +267,9 @@ def _actor_master_config(
             "max_num_epochs": max_num_epochs,
             "num_prompts_per_step": num_prompts_per_step,
             "num_generations_per_prompt": 2,
+            "val_period": val_period,
+            "val_at_start": False,
+            "val_at_end": val_at_end,
             "seed": 42,
         },
         logger={
@@ -312,10 +317,12 @@ def _make_bundle(
         gen_handle=object(),
         trainer_handle=trainer if trainer is not None else _FakeTrainer(),
         env_handles={},
+        val_env_handles={},
         train_cluster=None,
         inference_cluster=None,
         dp_client=_FakeDPClient(),
         dataloader=dataloader if dataloader is not None else _FakeDataloader(),
+        val_dataloader=None,
         weight_synchronizer=_FakeWeightSynchronizer(),
         advantage_estimator=None,
         loss_fn=object(),
@@ -518,6 +525,40 @@ class TestMetricName:
         assert _step_dir_names(ckpt_dir) == {"step_2"}
         assert "val:accuracy" not in _training_info(ckpt_dir, 2)
 
+    def test_validation_metrics_are_scoped_to_the_current_step(
+        self, tmp_path: Path
+    ) -> None:
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=3,
+            val_period=2,
+            save_period=1,
+            metric_name="val:accuracy",
+        )
+
+        async def _main() -> None:
+            actor = _ACTOR_CLS(mc, _make_bundle())
+            actor._sampler = _FakeSampler()
+
+            async def _run_validation(*, step: int) -> dict[str, Any]:
+                assert step == 2
+                return {"accuracy": 0.75}
+
+            actor._run_validation = _run_validation
+            await actor._train_pump()
+
+        with pytest.warns(UserWarning, match="no val metrics were collected"):
+            asyncio.run(_main())
+
+        ckpt_dir = tmp_path / "checkpoints"
+        info_2 = _training_info(ckpt_dir, 2)
+        assert info_2["val_reward"] == 0.75
+        assert info_2["val:accuracy"] == 0.75
+
+        info_3 = _training_info(ckpt_dir, 3)
+        assert "val_reward" not in info_3
+        assert "val:accuracy" not in info_3
+
     def test_train_metric_lands_in_training_info(self, tmp_path):
         mc = _actor_master_config(
             tmp_path, max_num_steps=2, save_period=2, metric_name="train:loss"
@@ -601,6 +642,9 @@ def _setup_master_config(checkpoint_dir: str) -> MasterConfig:
             "num_prompts_per_step": 4,
             "num_generations_per_prompt": 2,
             "max_rollout_turns": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "val_at_end": False,
             "seed": 42,
         },
         policy={

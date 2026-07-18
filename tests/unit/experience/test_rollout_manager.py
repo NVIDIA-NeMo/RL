@@ -76,7 +76,14 @@ class _FakeBuffer:
         # reserve(weight_version=X) -> group_id; commit fills the slot.
         self._slots: list[str] = []
 
-    def reserve(self, *, weight_version: int, group_id: str | None = None) -> str:
+    def reserve(
+        self,
+        *,
+        weight_version: int,
+        group_id: str | None = None,
+        target_step: int | None = None,
+    ) -> str:
+        del target_step
         if group_id is None:
             group_id = str(uuid.uuid4())
         self.reserve_calls.append(weight_version)
@@ -102,8 +109,16 @@ class _FakeImpl:
     def __init__(self, record="sentinel-record", on_run=None) -> None:
         self._record = record
         self._on_run = on_run
+        self.calls: list[tuple[object, dict, int]] = []
 
-    async def run_rollout(self, input_sample):
+    async def run_rollout(
+        self,
+        input_sample,
+        *,
+        env_handles,
+        num_generations_per_prompt,
+    ):
+        self.calls.append((input_sample, env_handles, num_generations_per_prompt))
         if self._on_run is not None:
             await self._on_run(input_sample)
         return self._record
@@ -114,7 +129,8 @@ def _make_manager(buffer: _FakeBuffer, impl: _FakeImpl) -> RolloutManager:
     mgr = object.__new__(RolloutManager)
     mgr._impl = impl
     mgr._tokenizer = None
-    mgr._num_generations_per_prompt = 1
+    mgr._env_handles = {"train": object()}
+    mgr._val_env_handles = {"validation": object()}
     mgr._tq_buffer = buffer
     mgr._weight_version = 0
     return mgr
@@ -146,7 +162,7 @@ class TestGenerateAndPushFlow:
         buf.reserve = _logged_reserve  # type: ignore[method-assign]
         buf.commit = _logged_commit  # type: ignore[method-assign]
 
-        _run(mgr.generate_and_push({"prompt": "p"}))
+        _run(mgr.generate_and_push({"prompt": "p"}, num_generations_per_prompt=2))
 
         assert events == ["reserve", "run", "commit"]
         assert buf.reserve_calls == [0]
@@ -156,6 +172,7 @@ class TestGenerateAndPushFlow:
         assert record == "r0"
         assert start_v == 0
         assert end_v == 0
+        assert impl.calls == [({"prompt": "p"}, mgr._env_handles, 2)]
 
     def test_start_weight_version_pinned_at_reserve_time(self):
         """If set_weight_version is called mid-rollout, start != end."""
@@ -169,7 +186,7 @@ class TestGenerateAndPushFlow:
         mgr = _make_manager(buf, impl)
         mgr.set_weight_version(3)
 
-        _run(mgr.generate_and_push({"prompt": "p"}))
+        _run(mgr.generate_and_push({"prompt": "p"}, num_generations_per_prompt=2))
 
         # reserve happened before run_rollout → captured weight 3.
         assert buf.reserve_calls == [3]
@@ -184,7 +201,7 @@ class TestGenerateAndPushFlow:
         mgr = _make_manager(buf, impl)
         mgr.set_weight_version(7)
 
-        _run(mgr.generate_and_push({"prompt": "p"}))
+        _run(mgr.generate_and_push({"prompt": "p"}, num_generations_per_prompt=2))
 
         _, _, start_v, end_v = buf.commit_calls[0]
         assert start_v == 7
@@ -220,16 +237,25 @@ class TestGenerateAndPushFlow:
         second_mgr = object.__new__(RolloutManager)
         second_mgr._impl = second_impl
         second_mgr._tokenizer = None
-        second_mgr._num_generations_per_prompt = 1
+        second_mgr._env_handles = {"train": object()}
+        second_mgr._val_env_handles = {"validation": object()}
         second_mgr._tq_buffer = buf
         second_mgr._weight_version = 0
 
         async def _drive():
-            t1 = asyncio.create_task(first_mgr.generate_and_push({"prompt": "p1"}))
+            t1 = asyncio.create_task(
+                first_mgr.generate_and_push(
+                    {"prompt": "p1"}, num_generations_per_prompt=2
+                )
+            )
             # Wait until first has reserved before kicking off second so the
             # reserve ordering is deterministic.
             await first_reserved.wait()
-            t2 = asyncio.create_task(second_mgr.generate_and_push({"prompt": "p2"}))
+            t2 = asyncio.create_task(
+                second_mgr.generate_and_push(
+                    {"prompt": "p2"}, num_generations_per_prompt=2
+                )
+            )
             await asyncio.gather(t1, t2)
 
         _run(_drive())
@@ -245,7 +271,7 @@ class TestGenerateAndPushFlow:
         mgr = _make_manager(_FakeBuffer(), _FakeImpl())
         mgr._tq_buffer = None
         with pytest.raises(AssertionError, match="tq_buffer"):
-            _run(mgr.generate_and_push({"prompt": "p"}))
+            _run(mgr.generate_and_push({"prompt": "p"}, num_generations_per_prompt=2))
 
 
 # ---------------------------------------------------------------------------
@@ -253,19 +279,55 @@ class TestGenerateAndPushFlow:
 # ---------------------------------------------------------------------------
 
 
+def test_run_rollout_routes_per_call_count_and_environment():
+    impl = _FakeImpl()
+    manager = _make_manager(_FakeBuffer(), impl)
+    train_sample = {"prompt": "train"}
+    val_sample = {"prompt": "validation"}
+
+    _run(
+        manager.run_rollout(
+            train_sample,
+            num_generations_per_prompt=4,
+        )
+    )
+    _run(
+        manager.run_rollout(
+            val_sample,
+            num_generations_per_prompt=1,
+            is_validation=True,
+        )
+    )
+    _run(
+        manager.run_rollout(
+            train_sample,
+            num_generations_per_prompt=4,
+        )
+    )
+
+    assert impl.calls == [
+        (train_sample, manager._env_handles, 4),
+        (val_sample, manager._val_env_handles, 1),
+        (train_sample, manager._env_handles, 4),
+    ]
+
+
 def test_rollout_manager_raises_without_impl_params():
     """RolloutManager raises AssertionError when required params are missing."""
     common = {
         "tokenizer": None,
         "env_handles": {},
-        "num_generations_per_prompt": 1,
+        "val_env_handles": {},
         "max_seq_len": 1,
     }
 
     with pytest.raises(AssertionError, match="num_generations_per_prompt must be >= 1"):
-        updated_common = common.copy()
-        updated_common["num_generations_per_prompt"] = 0
-        RolloutManager(**updated_common, use_nemo_gym=False)
+        manager = RolloutManager(
+            **common,
+            policy_generation=object(),
+            use_nemo_gym=False,
+        )
+        _run(manager.run_rollout({}, num_generations_per_prompt=0))
 
     with pytest.raises(AssertionError, match="policy_generation is required"):
         RolloutManager(**common, use_nemo_gym=False)
@@ -356,14 +418,19 @@ def test_async_rollout_manager(
         use_nemo_gym=False,
         tokenizer=tokenizer,
         env_handles=env_handles,
-        num_generations_per_prompt=num_generations,
+        val_env_handles=env_handles,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
     )
 
     vllm_generation.prepare_for_generation()
-    record = asyncio.run(manager.run_rollout(input_sample))
+    record = asyncio.run(
+        manager.run_rollout(
+            input_sample,
+            num_generations_per_prompt=num_generations,
+        )
+    )
     vllm_generation.finish_generation()
 
     assert isinstance(record, PromptGroupRecord)
@@ -415,13 +482,18 @@ def test_async_rollout_manager_truncation(
         use_nemo_gym=False,
         tokenizer=tokenizer,
         env_handles=env_handles,
-        num_generations_per_prompt=num_generations,
+        val_env_handles=env_handles,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
     )
     vllm_generation.prepare_for_generation()
-    record = asyncio.run(manager.run_rollout(input_sample))
+    record = asyncio.run(
+        manager.run_rollout(
+            input_sample,
+            num_generations_per_prompt=num_generations,
+        )
+    )
     vllm_generation.finish_generation()
 
     assert len(record.completions) == num_generations
@@ -480,12 +552,17 @@ def test_async_rollout_manager_matches_original(
         use_nemo_gym=False,
         tokenizer=tokenizer,
         env_handles=env_handles,
-        num_generations_per_prompt=num_generations,
+        val_env_handles=env_handles,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
         policy_generation=vllm_generation,
     )
-    record = asyncio.run(manager.run_rollout(input_sample))
+    record = asyncio.run(
+        manager.run_rollout(
+            input_sample,
+            num_generations_per_prompt=num_generations,
+        )
+    )
     vllm_generation.finish_generation()
 
     # Both should produce N results
@@ -614,11 +691,16 @@ def test_async_nemo_gym_rollout_manager(
         use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
         env_handles={"nemo_gym": nemo_gym},
-        num_generations_per_prompt=num_generations,
+        val_env_handles={"nemo_gym": nemo_gym},
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
     )
-    record = asyncio.run(manager.run_rollout(single_prompt))
+    record = asyncio.run(
+        manager.run_rollout(
+            single_prompt,
+            num_generations_per_prompt=num_generations,
+        )
+    )
 
     assert isinstance(record, PromptGroupRecord)
     assert len(record.completions) == num_generations, (
@@ -725,11 +807,16 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
         env_handles={"nemo_gym": nemo_gym},
-        num_generations_per_prompt=num_generations,
+        val_env_handles={"nemo_gym": nemo_gym},
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
     )
-    record = asyncio.run(manager.run_rollout(single_prompt))
+    record = asyncio.run(
+        manager.run_rollout(
+            single_prompt,
+            num_generations_per_prompt=num_generations,
+        )
+    )
 
     # Both should produce N completions
     assert len(original_result.final_batch["message_log"]) == num_generations

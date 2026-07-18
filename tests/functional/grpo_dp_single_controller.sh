@@ -31,6 +31,10 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \
+    grpo.val_period=0 \
+    grpo.val_at_end=true \
+    grpo.max_val_samples=2 \
+    grpo.val_batch_size=2 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
@@ -54,4 +58,14 @@ uv run tests/check_metrics.py $JSON_METRICS \
     'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
     'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
     'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
-    'max(data["train/probs_ratio_clamped_max"]) < 1.21'
+    'max(data["train/probs_ratio_clamped_max"]) < 1.21' \
+    'data["validation/accuracy"]["2"] >= 0.0' \
+    'data["validation/accuracy"]["2"] <= 1.0' \
+    'data["validation/avg_length"]["2"] > 0' \
+    'data["validation/num_samples"]["2"] == 2'
+
+mapfile -t VAL_DATA_FILES < <(
+    find "$LOG_DIR" -type f -name val_data_step2.jsonl -print
+)
+test "${#VAL_DATA_FILES[@]}" -eq 1
+test "$(wc -l < "${VAL_DATA_FILES[0]}")" -eq 2

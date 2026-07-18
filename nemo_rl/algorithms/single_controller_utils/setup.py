@@ -68,10 +68,12 @@ class SingleControllerBundle:
     gen_handle: Any
     trainer_handle: Any  # driver-side TQPolicy
     env_handles: dict[str, EnvironmentInterface]
+    val_env_handles: dict[str, EnvironmentInterface]
     train_cluster: RayVirtualCluster
     inference_cluster: RayVirtualCluster
     dp_client: Any
     dataloader: StatefulDataLoader
+    val_dataloader: Optional[StatefulDataLoader]
     weight_synchronizer: WeightSynchronizer
     advantage_estimator: Any
     loss_fn: LossFunction
@@ -294,6 +296,21 @@ def setup_single_controller(
             "data.use_multiple_dataloader=True yet."
         )
 
+    validation_enabled = (
+        grpo_config["val_period"] > 0
+        or grpo_config["val_at_start"]
+        or grpo_config["val_at_end"]
+    )
+    if (
+        validation_enabled
+        and bool(master_config.env.get("should_use_nemo_gym"))
+        and master_config.env.get("nemo_gym", {}).get("effort_levels") is not None
+    ):
+        raise NotImplementedError(
+            "SingleController NeMo-Gym validation does not support "
+            "env.nemo_gym.effort_levels yet."
+        )
+
     set_seed(grpo_config["seed"])
 
     # ==========================
@@ -311,17 +328,17 @@ def setup_single_controller(
     # ==========================
     # Setup Dataset & Environments
     # ==========================
-    # TODO: add validate dataset wiring.
     use_nemo_gym = _should_use_nemo_gym(master_config)
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
-        dataset, _val_dataset = setup_response_data(
+        dataset, val_dataset = setup_response_data(
             tokenizer, data_config, env_configs=None
         )
         env_handles: dict[str, EnvironmentInterface] = {}
+        val_env_handles: dict[str, EnvironmentInterface] = {}
     else:
-        dataset, _val_dataset, env_handles, _val_env_handles = setup_response_data(
+        dataset, val_dataset, env_handles, val_env_handles = setup_response_data(
             tokenizer, data_config, env_configs=master_config.env
         )
     dataloader = StatefulDataLoader(
@@ -332,6 +349,60 @@ def setup_single_controller(
         drop_last=True,
         num_workers=data_config["num_workers"],
     )
+    val_dataloader: Optional[StatefulDataLoader] = None
+    if validation_enabled:
+        if val_dataset is None or len(val_dataset) == 0:
+            raise ValueError(
+                "A nonempty validation dataset is required when validation is enabled."
+            )
+        val_batch_size = grpo_config["val_batch_size"]
+        max_val_samples = grpo_config["max_val_samples"]
+        if use_nemo_gym:
+            if max_val_samples is not None:
+                raise ValueError(
+                    "grpo.max_val_samples must be None for NeMo-Gym "
+                    "SingleController validation."
+                )
+            if val_batch_size is None:
+                val_batch_size = min(
+                    len(val_dataset), master_config.async_rl.max_inflight_prompts
+                )
+            elif (
+                not isinstance(val_batch_size, int)
+                or isinstance(val_batch_size, bool)
+                or val_batch_size <= 0
+            ):
+                raise ValueError(
+                    "grpo.val_batch_size must be a positive integer or None for "
+                    "NeMo-Gym SingleController validation."
+                )
+        else:
+            if (
+                not isinstance(val_batch_size, int)
+                or isinstance(val_batch_size, bool)
+                or val_batch_size <= 0
+            ):
+                raise ValueError(
+                    "grpo.val_batch_size must be a positive integer for native "
+                    "SingleController validation."
+                )
+            if (
+                not isinstance(max_val_samples, int)
+                or isinstance(max_val_samples, bool)
+                or max_val_samples <= 0
+            ):
+                raise ValueError(
+                    "grpo.max_val_samples must be a positive integer for native "
+                    "SingleController validation."
+                )
+        val_dataloader = StatefulDataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            collate_fn=rl_collate_fn,
+            drop_last=False,
+            num_workers=data_config["num_workers"],
+        )
     if last_checkpoint_path is not None:
         dataloader_state_path = os.path.join(
             last_checkpoint_path, "train_dataloader.pt"
@@ -397,12 +468,14 @@ def setup_single_controller(
                 f"only; got {generation_config['backend']!r}"
             )
         enable_router_replay = router_replay_enabled(master_config.policy)
-        env_handles["nemo_gym"] = spinup_nemo_gym_actor(
+        nemo_gym_actor = spinup_nemo_gym_actor(
             env_configs=master_config.env,
             base_urls=generation.dp_openai_server_base_urls,
             model_name=generation_config["model_name"],
             enable_router_replay=enable_router_replay,
         )
+        env_handles["nemo_gym"] = nemo_gym_actor
+        val_env_handles["nemo_gym"] = nemo_gym_actor
 
     # ==========================
     # Setup Data Plane Client & Weight Sync
@@ -436,7 +509,7 @@ def setup_single_controller(
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         env_handles=env_handles,
-        num_generations_per_prompt=grpo_config["num_generations_per_prompt"],
+        val_env_handles=val_env_handles,
         max_seq_len=_generation_max_seq_len(generation_config),
         max_rollout_turns=grpo_config.get("max_rollout_turns"),
         policy_generation=generation,
@@ -449,10 +522,12 @@ def setup_single_controller(
         gen_handle=generation,
         trainer_handle=policy,
         env_handles=env_handles,
+        val_env_handles=val_env_handles,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
         dp_client=dp_client,
         dataloader=dataloader,
+        val_dataloader=val_dataloader,
         weight_synchronizer=weight_synchronizer,
         advantage_estimator=advantage_estimator,
         loss_fn=loss_fn,

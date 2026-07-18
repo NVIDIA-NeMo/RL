@@ -38,7 +38,7 @@ import asyncio
 import os
 import time
 import warnings
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 import ray
 import torch
@@ -59,12 +59,14 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.interfaces import PromptGroupRecord
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.checkpoint import CheckpointManager
-from nemo_rl.utils.logger import Logger
+from nemo_rl.utils.logger import Logger, print_message_log_samples
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
@@ -106,6 +108,7 @@ class SingleControllerActor:
         self._gen: Generation = bundle.gen_handle
         self._trainer: TQPolicy = bundle.trainer_handle
         self._dataloader = bundle.dataloader
+        self._val_dataloader = bundle.val_dataloader
         self._weight_synchronizer = bundle.weight_synchronizer
         self._advantage_estimator = bundle.advantage_estimator
         self._loss_fn = bundle.loss_fn
@@ -204,7 +207,8 @@ class SingleControllerActor:
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
-        # Gate: cleared during _sync_weights, set when generation may proceed
+        # Gate: cleared during weight sync or validation-only rollout draining,
+        # set when generation may proceed.
         self._rollout_permitted: asyncio.Event = asyncio.Event()
         self._rollout_permitted.set()
 
@@ -251,6 +255,9 @@ class SingleControllerActor:
         """Main entry point. Runs until max_train_steps is reached."""
         # Synchronize weights before starting the pumps
         await self._sync_weights()
+
+        if self._master_config.grpo["val_at_start"] and self._train_steps == 0:
+            await self._run_validation(step=0)
 
         # Restore committed rollout groups from the previous run. Only when
         # over_sampling=True — with the strict quota the restored window can
@@ -341,6 +348,116 @@ class SingleControllerActor:
             return await result
         return result
 
+    async def _run_validation(self, *, step: int) -> dict[str, Any]:
+        """Run one validation pass against the synchronized generator."""
+        if self._val_dataloader is None:
+            raise RuntimeError(
+                "SingleController validation resources were not initialized."
+            )
+
+        max_val_samples = cast(
+            Optional[int], self._master_config.grpo["max_val_samples"]
+        )
+
+        timer = Timer()
+        rewards: list[float] = []
+        lengths: list[float] = []
+        message_logs: list[Any] = []
+
+        print(f"▶ Starting validation at step {step}...", flush=True)
+        with timer.time("total_validation_time"):
+            for val_batch in self._val_dataloader:
+                if max_val_samples is None:
+                    selected_rows = val_batch.size
+                else:
+                    remaining = max_val_samples - len(rewards)
+                    if remaining <= 0:
+                        break
+
+                    selected_rows = min(val_batch.size, remaining)
+                prompts: list[DatumSpec] = []
+                for row_idx in range(selected_rows):
+                    prompt: DatumSpec = {  # type: ignore
+                        key: value[row_idx] for key, value in val_batch.items()
+                    }
+                    prompts.append(prompt)
+                results = await asyncio.gather(
+                    *(
+                        self._rollout_manager.run_rollout(
+                            prompt,
+                            num_generations_per_prompt=1,
+                            is_validation=True,
+                        )
+                        for prompt in prompts
+                    ),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+
+                records = cast(list[PromptGroupRecord], results)
+                for record in records:
+                    if len(record.completions) != 1:
+                        raise ValueError(
+                            "Validation rollouts must return exactly one completion "
+                            "per prompt."
+                        )
+                    completion = record.completions[0]
+                    rewards.append(float(completion.reward))
+                    lengths.append(
+                        float(
+                            record.rollout_metrics["mean_gen_tokens_per_sample"]
+                        )
+                    )
+                    message_logs.append(
+                        get_keys_from_message_log(
+                            completion.message_log,
+                            ["role", "content"],
+                        )
+                    )
+
+        num_samples = len(rewards)
+        metrics: dict[str, Any] = {
+            "accuracy": sum(rewards) / num_samples if num_samples else 0.0,
+            "avg_length": sum(lengths) / num_samples if num_samples else 0.0,
+            "num_samples": num_samples,
+        }
+        timing_metrics = timer.get_timing_metrics(reduction_op="sum")
+        validation_time = float(timing_metrics.get("total_validation_time", 0.0))
+
+        print("\n📊 Validation Results:")
+        print(f"    • Accuracy: {metrics['accuracy']:.4f}")
+        print(f"    • Average response length: {metrics['avg_length']:.1f} tokens")
+        print(f"    • Samples processed: {num_samples}")
+        print(f"    • Total validation time: {validation_time:.2f}s", flush=True)
+
+        try:
+            print_message_log_samples(
+                message_logs,
+                rewards,
+                num_samples=min(
+                    self._master_config.logger["num_val_samples_to_print"],
+                    num_samples,
+                ),
+                step=step,
+            )
+        except Exception as e:
+            print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
+            print("  ⚠️ Continuing validation without displaying samples...", flush=True)
+
+        self._logger.log_batched_dict_as_jsonl(
+            {"content": message_logs, "rewards": rewards},
+            f"val_data_step{step}.jsonl",
+        )
+        self._logger.log_metrics(metrics, step=step, prefix="validation")
+        self._logger.log_metrics(
+            timing_metrics,
+            step=step,
+            prefix="timing/validation",
+        )
+        return metrics
+
     # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
@@ -353,7 +470,7 @@ class SingleControllerActor:
         Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
           2. Acquire sem (cap concurrent in-flight rollouts)
-          3. Wait for _rollout_permitted (paused during weight sync)
+          3. Wait for _rollout_permitted (paused during weight sync or validation)
           4. Call rollout_manager.generate_and_push(prompt) — local async
              RolloutManager reserves a slot, runs the rollout, then commits the
              group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
@@ -363,6 +480,9 @@ class SingleControllerActor:
         over_sampling = self._async_cfg.over_sampling
         max_staleness = self._async_cfg.max_weight_staleness_versions
         force_in_order = self._async_cfg.force_in_order
+        num_generations_per_prompt = self._master_config.grpo[
+            "num_generations_per_prompt"
+        ]
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
@@ -371,7 +491,9 @@ class SingleControllerActor:
             self._inflight_rollouts += 1
             try:
                 await self._rollout_manager.generate_and_push(
-                    prompt, target_step=target_step
+                    prompt,
+                    num_generations_per_prompt=num_generations_per_prompt,
+                    target_step=target_step,
                 )
                 if self._diagnostics:
                     content = ""
@@ -564,15 +686,28 @@ class SingleControllerActor:
 
                 self._trainer_version += 1
                 self._train_steps += 1
-                with self._timer.time("weight_sync"):
-                    await self._sync_weights()
+                val_metrics: Optional[dict[str, Any]] = None
+                is_last_step = self._train_steps >= grpo_cfg["max_num_steps"]
+                should_validate = (
+                    grpo_cfg["val_period"] > 0
+                    and self._train_steps % grpo_cfg["val_period"] == 0
+                ) or (grpo_cfg["val_at_end"] and is_last_step)
+
+                if should_validate:
+                    await self._pause_and_drain_rollouts()
+                    with self._timer.time("weight_sync"):
+                        await self._sync_weights(reopen_rollouts=False)
+                    val_metrics = await self._run_validation(step=self._train_steps)
+                    self._rollout_permitted.set()
+                else:
+                    with self._timer.time("weight_sync"):
+                        await self._sync_weights()
 
                 # Checkpointing (ported from the legacy async loop).
                 self._consumed_samples += grpo_cfg["num_prompts_per_step"]
                 self._total_valid_tokens += step_metrics.get("global_valid_toks", 0)
                 self._timeout.mark_iteration()
 
-                is_last_step = self._train_steps >= grpo_cfg["max_num_steps"]
                 save_period = self._master_config.checkpointing["save_period"]
                 # _train_steps was already incremented above, so it equals the
                 # legacy loop's 1-indexed `step + 1`.
@@ -596,9 +731,6 @@ class SingleControllerActor:
                     # single-threading makes the snapshot race-free); the
                     # slow torch.save happens off-loop below.
                     dataloader_state = self._dataloader.state_dict()
-                    # SC has no validation loop yet; keep the legacy shape so
-                    # wiring it in later only replaces this None.
-                    val_metrics: Optional[dict[str, Any]] = None
                     if val_metrics is not None:
                         save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in save_state:
@@ -723,7 +855,24 @@ class SingleControllerActor:
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
 
-    async def _sync_weights(self) -> None:
+    async def _pause_and_drain_rollouts(self) -> None:
+        """Pause admission and wait for all already-dispatched rollouts.
+
+        All tasks in the snapshot are allowed to settle before the first task
+        error is propagated. The admission gate remains closed on return and
+        on error so the caller can safely proceed to validation or abort.
+        """
+        self._rollout_permitted.clear()
+        dispatched_rollouts = tuple(self._dispatched_rollouts)
+        results = await asyncio.gather(
+            *dispatched_rollouts,
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _sync_weights(self, *, reopen_rollouts: bool = True) -> None:
         """Drain in-flight rollouts then synchronize weights.
 
         SC owns the drain gate (when to sync); WeightSynchronizer owns how.
@@ -733,6 +882,9 @@ class SingleControllerActor:
           2. drain _inflight_rollouts → 0  (5ms poll)
           3. weight_synchronizer.sync_weights(trainer_version)
           4. _rollout_permitted.set()   — resume
+          
+        pass ``reopen_rollouts=False`` to keep the admission gate closed 
+        through validation.
         """
         self._rollout_permitted.clear()
 
@@ -757,7 +909,8 @@ class SingleControllerActor:
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_manager.set_weight_version(self._trainer_version)
-        self._rollout_permitted.set()
+        if reopen_rollouts:
+            self._rollout_permitted.set()
 
     async def _advantage_stage(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.
