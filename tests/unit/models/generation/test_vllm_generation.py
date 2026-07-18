@@ -440,6 +440,12 @@ def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
             self.tokenizer = tokenizer
 
         def extract_reasoning(self, model_output, request):
+            if isinstance(model_output, str):
+                model_output = model_output.partition("<think>")[2] or model_output
+                if "</think>" in model_output:
+                    reasoning, _, content = model_output.partition("</think>")
+                    return reasoning, content or None
+                return model_output, None
             return model_output
 
     abs_reasoning_parsers = types.ModuleType("vllm.reasoning.abs_reasoning_parsers")
@@ -492,6 +498,38 @@ def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
     assert parser.extract_reasoning(("reasoning", "final"), request) == (
         "reasoning",
         "final",
+    )
+
+    request.chat_template_kwargs["enable_thinking"] = True
+    xml_tool_call = (
+        "<tool_call>\n"
+        "<function=execute_bash>\n"
+        "<parameter=command>pwd</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    assert parser.extract_reasoning(
+        f"<think>inspect the repository\n{xml_tool_call}\n</think>", request
+    ) == (
+        "inspect the repository\n",
+        f"{xml_tool_call}\n",
+    )
+
+    # Tool calls already outside reasoning retain the base parser behavior.
+    assert parser.extract_reasoning(
+        f"<think>inspect the repository</think>{xml_tool_call}", request
+    ) == (
+        "inspect the repository",
+        xml_tool_call,
+    )
+
+    # An incomplete call is not promoted into content.
+    incomplete_tool_call = "<tool_call><function=execute_bash>"
+    assert parser.extract_reasoning(
+        f"<think>inspect the repository\n{incomplete_tool_call}</think>", request
+    ) == (
+        f"inspect the repository\n{incomplete_tool_call}",
+        None,
     )
 
 
