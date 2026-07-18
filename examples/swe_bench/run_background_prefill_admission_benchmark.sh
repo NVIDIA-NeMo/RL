@@ -27,6 +27,12 @@ if ! [[ "${VLLM_TP}" =~ ^[1-9][0-9]*$ ]] || (( 8 % VLLM_TP != 0 )); then
   echo "ERROR: VLLM_TP must be a positive divisor of 8 (got ${VLLM_TP})." >&2
   exit 1
 fi
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.7}"
+if ! awk -v value="${VLLM_GPU_MEMORY_UTILIZATION}" \
+  'BEGIN { exit !(value > 0.0 && value < 1.0) }'; then
+  echo "ERROR: VLLM_GPU_MEMORY_UTILIZATION must be between 0 and 1 (got ${VLLM_GPU_MEMORY_UTILIZATION})." >&2
+  exit 1
+fi
 CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/joyang/RL/results/images/nemo-rl-nightly-gym-20260718.squashfs}"
 
 _cache_has_entries() {
@@ -115,7 +121,7 @@ _run_worker() {
       examples/swe_bench/benchmark_streaming_final_decode.py \
       --model "${MODEL_PATH}" \
       --tensor-parallel-size "${tensor_parallel_size}" \
-      --gpu-memory-utilization 0.7 \
+      --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
       --max-model-len 131072 \
       --immutable-prefix-tokens 32768 \
       --tool-output-tokens "${BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS}" \
@@ -154,7 +160,7 @@ _run_worker() {
     examples/swe_bench/benchmark_background_prefill_admission.py \
     --model "${MODEL_PATH}" \
     --tensor-parallel-size "${tensor_parallel_size}" \
-    --gpu-memory-utilization 0.7 \
+    --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" \
     --max-model-len 131072 \
     --immutable-prefix-tokens 32768 \
     --tool-output-tokens 8192 \
@@ -245,7 +251,7 @@ fi
 BENCH_OUTPUT_JSON="${BENCH_OUTPUT_JSON:-${RESULT_ROOT}/${output_stem}-${timestamp}.json}"
 mkdir -p "${RESULT_ROOT}" "${BENCH_BUILD_CACHE_ROOT}"
 
-export REPO_ROOT MODEL_PATH VLLM_TP
+export REPO_ROOT MODEL_PATH VLLM_TP VLLM_GPU_MEMORY_UTILIZATION
 export BENCH_MODE
 export BENCH_REPEATS BENCH_WARMUP_REPEATS BENCH_CACHE_NAMESPACE
 export BENCH_BACKGROUND_PRIORITY BENCH_CANDIDATE_CHUNK_TOKENS BENCH_OVERLAP_SECONDS
@@ -264,6 +270,7 @@ export BENCH_PERSISTENT_TRITON_CACHE
 
 echo "[LAUNCH] account=${ACCOUNT} partition=${PARTITION} nodes=1 gpus_per_node=${VLLM_TP} exclusive=false"
 echo "[LAUNCH] benchmark_mode=${BENCH_MODE} container=${CONTAINER}"
+echo "[LAUNCH] gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION}"
 echo "[LAUNCH] cache_namespace=${BENCH_CACHE_NAMESPACE}"
 echo "[LAUNCH] runtime_namespace=${BENCH_RUNTIME_NAMESPACE}"
 echo "[LAUNCH] output=${BENCH_OUTPUT_JSON}"
