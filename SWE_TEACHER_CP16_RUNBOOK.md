@@ -23,6 +23,9 @@ Then **immediately register the GPU-idle exemption** (below) or the reaper kills
 (`mtp_loss_scaling_factor: 0.3`), CP16 / EP32 / TP8 / PP1, 48 nodes (32 train + 16 gen),
 `SEGMENT_SIZE=8`. This config trains from scratch, CP-clean.
 
+**Reference successful run (W&B):** <https://wandb.ai/nvidia/nemotron-3-ultra/runs/kkb110an>
+(job 5456109 — from scratch, CP-clean forward training, zero `CONTEXT_PARALLEL_GROUP` watchdog).
+
 > **Do not raise `train_global_batch_size` above 32** — GBS=128 triggers a `CONTEXT_PARALLEL_GROUP`
 > `all_to_all` hang (600s watchdog). 65k or 190k seq length both work at GBS ≤ 32.
 
