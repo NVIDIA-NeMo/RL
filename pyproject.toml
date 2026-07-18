@@ -376,10 +376,6 @@ override-dependencies = [
   # extra composes with mcore/automodel without version-mirroring TQ's
   # requirements.txt. Forward-compatible across TQ minor bumps.
   "numpy>=2.1.0",
-  # vLLM 0.25.1 imports openai.types.responses.NamespaceTool, which was added
-  # in openai 2.25.0 (vllm's own floor of >=2.0.0 is too loose). Overrides
-  # nemo-gym's openai<=2.7.2 license-audit pin.
-  "openai>=2.25.0",
 ]
 
 # CVE fixes

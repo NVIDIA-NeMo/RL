@@ -153,6 +153,68 @@ def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
     logger.info("Successfully patched llama_eagle3 lm_head ownership.")
 
 
+def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
+    """Guard vLLM's NamespaceTool import for openai < 2.25.
+
+    vLLM 0.25 imports ``openai.types.responses.NamespaceTool`` (added in
+    openai 2.25.0) at the top of ``tool_parsers/utils.py``, but nemo-gym pins
+    ``openai<=2.7.2`` and its child server venvs must match the parent's
+    openai version exactly. NamespaceTool is only used in isinstance checks
+    for Responses-API namespace tools, which cannot be constructed by an
+    openai client that predates the feature, so a never-matching stub is a
+    faithful fallback.
+    """
+    try:
+        file_to_patch = _get_vllm_file("tool_parsers/utils.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate tool_parsers/utils.py for openai compat patch."
+        )
+        return
+
+    old_snippet = (
+        "from openai.types.responses import (\n"
+        "    FunctionTool,\n"
+        "    NamespaceTool,\n"
+        "    ToolChoiceFunction,\n"
+        ")\n"
+    )
+
+    new_snippet = (
+        "from openai.types.responses import (\n"
+        "    FunctionTool,\n"
+        "    ToolChoiceFunction,\n"
+        ")\n"
+        "\n"
+        "try:\n"
+        "    from openai.types.responses import NamespaceTool\n"
+        "except ImportError:  # openai < 2.25.0 predates namespace tools\n"
+        "\n"
+        "    class NamespaceTool:  # type: ignore[no-redef]\n"
+        '        """Stub: openai<2.25 clients cannot construct namespace tools."""\n'
+        "\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if "except ImportError:  # openai < 2.25.0 predates namespace tools" in content:
+            logger.info("vLLM NamespaceTool openai compat patch already applied.")
+            return
+
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply NamespaceTool openai compat patch: "
+                "expected import block not found in %s. "
+                "The vLLM version may have changed.",
+                file_to_patch,
+            )
+            return
+
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
+
+
 def _apply_vllm_patches(
     py_executable: str, *, extra_env_vars: list[str] | None = None
 ) -> None:
@@ -165,3 +227,4 @@ def _apply_vllm_patches(
     patch_logger.info("Successfully patched vllm _init_workers_ray.")
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
+    _patch_vllm_tool_parser_namespace_tool(patch_logger)
