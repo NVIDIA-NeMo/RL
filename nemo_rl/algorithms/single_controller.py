@@ -391,6 +391,11 @@ class SingleControllerActor:
 
                 self._current_epoch += 1
 
+        # Drain in-flight so return implies "all rollouts in TQ".
+        inflight = list(self._dispatched_rollouts)
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
