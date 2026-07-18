@@ -493,6 +493,23 @@ class TestStalenessSamplerForceInOrder:
         # Buffer untouched.
         assert buf.target_step_list == [4]
 
+    def test_selects_when_target_matches_even_if_weight_outside_window(self):
+        buf = FakeBuffer()
+        # start_weight=100 is well outside any realistic staleness window,
+        # but target_step matches current — force_in_order must ignore the window.
+        buf.add("g_match_stale_weight", weight=100, target_step=5)
+        sampler = StalenessSampler(buf, max_staleness_versions=0, force_in_order=True)
+
+        selected, num_groups = _run(
+            sampler.select(
+                current_train_weight=5, min_prompt_groups=1, max_prompt_groups=4
+            )
+        )
+
+        assert selected is not None
+        assert selected.sample_ids == ["g_match_stale_weight_g0"]
+        assert num_groups == 1
+
     def test_ignores_unready_group_with_matching_target(self):
         buf = FakeBuffer()
         buf.add("g_unready", weight=5, target_step=5, ready=False)
