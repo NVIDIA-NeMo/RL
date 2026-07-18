@@ -184,6 +184,8 @@ class TestSetup:
         assert bundle.weight_synchronizer is (
             patched_factories["create_weight_synchronizer"].return_value
         )
+        # Refit depends on init_communicator running exactly once at setup time.
+        bundle.weight_synchronizer.init_communicator.assert_called_once()
         assert bundle.advantage_estimator is (
             patched_factories["_create_advantage_estimator"].return_value
         )
@@ -197,6 +199,15 @@ class TestSetup:
         assert bundle.tq_buffer._dp_client is bundle.dp_client
         assert bundle.partition_id == "rollout_data"
         assert bundle.tq_buffer._partition_id == "rollout_data"
+
+    def test_nemo_gym_not_supported(self):
+        """SC path trips the nemo-gym guard until PR #3267 lands."""
+        mc = _make_master_config()
+        with (
+            patch.object(sc_setup_mod, "_should_use_nemo_gym", return_value=True),
+            pytest.raises(NotImplementedError, match="NeMo-Gym"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
         """setup_response_data receives master_config.env and supplies env handles."""
