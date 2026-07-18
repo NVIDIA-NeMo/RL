@@ -22,6 +22,7 @@ from examples.swe_bench.benchmark_streaming_final_decode import (
     _extract_completion_delta,
     _max_abs_logprob_delta,
     _modal_control_contract,
+    _output_histogram,
     _paired_summary,
     _parity,
     _parse_positive_ints,
@@ -86,6 +87,36 @@ def test_extract_completion_delta_rejects_missing_sampled_token() -> None:
     )
     with pytest.raises(RuntimeError, match="omitted sampled output token"):
         _extract_completion_delta(SimpleNamespace(outputs=[completion]))
+
+
+def test_extract_completion_delta_allows_missing_optional_logprobs() -> None:
+    completion = SimpleNamespace(token_ids=[7], logprobs=None, text="ok")
+
+    assert _extract_completion_delta(
+        SimpleNamespace(outputs=[completion]), require_logprobs=False
+    ) == ((7,), (), "ok")
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_extract_completion_delta_rejects_nonfinite_logprobs(nonfinite: float) -> None:
+    completion = SimpleNamespace(
+        token_ids=[7],
+        logprobs=[{7: SimpleNamespace(logprob=nonfinite)}],
+        text="",
+    )
+
+    with pytest.raises(RuntimeError, match="non-finite"):
+        _extract_completion_delta(SimpleNamespace(outputs=[completion]))
+
+
+def test_output_histogram_counts_semantic_outputs() -> None:
+    first = _measurement()
+    second = _measurement(token_ids=(9,), output_text="other", decoded_text="other")
+
+    histogram = _output_histogram((first, second, first))
+
+    assert [item["count"] for item in histogram] == [2, 1]
+    assert histogram[0]["output_token_ids"] == (7, 8)
 
 
 def test_parity_reports_each_exact_output_contract() -> None:
