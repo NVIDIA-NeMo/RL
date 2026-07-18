@@ -753,6 +753,23 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
+            def _validate_chat_completion_prompt_token_ids(
+                self, request, prompt_token_ids: list[int]
+            ) -> None:
+                """Validate the final prompt after authoritative token replacement.
+
+                vLLM validates the chat-template rendering before this mixin replaces
+                its prefix with authoritative trajectory tokens.  The replacement can
+                make the actual engine prompt longer than the rendering that vLLM
+                checked, so every chat-completion return path must validate the final
+                token IDs again.  Tokenize requests intentionally remain unrestricted.
+                """
+                if isinstance(request, NeMoRLChatCompletionRequest):
+                    validate_prompt_token_count(
+                        prompt_token_count=len(prompt_token_ids),
+                        max_prompt_tokens=self.model_config.max_model_len - 1,
+                    )
+
             @staticmethod
             def _set_max_tokens(request, max_tokens: int) -> None:
                 """Set the request's max output tokens.
@@ -950,12 +967,16 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     not hasattr(request, "required_prefix_token_ids")
                     or request.required_prefix_token_ids is None
                 ):
+                    final_prompt_token_ids = res[1][0]["prompt_token_ids"]
+                    self._validate_chat_completion_prompt_token_ids(
+                        request, final_prompt_token_ids
+                    )
                     # Clamp the request's max output tokens so that input + output <= max_model_len.
                     if actual_request_max_tokens is not None:
                         self._clamp_max_tokens(
                             request,
                             actual_request_max_tokens,
-                            res[1][0]["prompt_token_ids"],
+                            final_prompt_token_ids,
                         )
                     return res
 
@@ -1005,6 +1026,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                self._validate_chat_completion_prompt_token_ids(
+                    request, final_prompt_token_ids
+                )
 
                 # Clamp after prefix replacement since the prompt length may have changed.
                 if actual_request_max_tokens is not None:
