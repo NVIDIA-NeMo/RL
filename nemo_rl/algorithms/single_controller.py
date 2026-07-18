@@ -29,7 +29,7 @@ Data flow:
                      driver-side TQPolicy via asyncio.to_thread)
                      Trainer → dp_client.get_samples(...)   (via its own client)
                  → dp_client.clear_samples(...)             ← SC clears after train
-  _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights()
+  _sync_weights  → WeightSynchronizer.sync_weights()
 """
 
 from __future__ import annotations
@@ -587,15 +587,16 @@ class SingleControllerActor:
             )
 
     async def _sync_weights(self) -> None:
-        """Drain in-flight rollouts then synchronize weights.
+        """Pause new rollout dispatches, synchronize weights, resume.
 
-        SC owns the drain gate (when to sync); WeightSynchronizer owns how.
+        SC owns the pause gate; in-flight generations continue through the
+        refit — vLLM V1 async engine supports weight updates during pending
+        requests.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
-          2. drain _inflight_rollouts → 0  (5ms poll)
-          3. weight_synchronizer.sync_weights(trainer_version)
-          4. _rollout_permitted.set()   — resume
+          2. weight_synchronizer.sync_weights()
+          3. _rollout_permitted.set()   — resume
         """
         self._rollout_permitted.clear()
 

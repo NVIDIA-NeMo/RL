@@ -257,7 +257,8 @@ def setup_single_controller(
     # short names for config sections
     grpo_config = master_config.grpo
     dp_config = master_config.data_plane
-    generation_config = master_config.policy["generation"]
+    policy_config = master_config.policy
+    generation_config = policy_config["generation"]
     data_config = master_config.data
 
     if (
@@ -355,6 +356,7 @@ def setup_single_controller(
         colocated=colocated,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
+        refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
     )
     weight_synchronizer.init_communicator()
 
