@@ -32,7 +32,7 @@ policy:
     checkpoint_engine:
       enabled: true
       backend: nixl
-      update_weights_bucket_megabytes: 2048
+      update_weights_bucket_memory_ratio: 0.05
       engine_kwargs:
         nixl:
           device: cuda
@@ -47,7 +47,7 @@ Key settings:
 
 | Key | Meaning |
 |---|---|
-| `update_weights_bucket_megabytes` | Size of each transfer buffer. NIXL allocates two per participating engine, so `4096` requires about 8 GiB. Start with `2048`; tune only after measuring. |
+| `update_weights_bucket_memory_ratio` | Fraction of fixed total GPU memory used by each transfer buffer. Defaults to `0.05`. NIXL allocates two buffers, so the default reserves 10% in total. |
 | `device` | `cuda` uses GPU RDMA buffers. `cpu` uses host-pinned buffers and is mainly a fallback. |
 | `release_after_refit` | When `true`, deregister and free transfer buffers after every refit. The next refit allocates and registers them again. Default `false` retains them for throughput. |
 | `shard_expert_weights` | Sends destination-local MoE expert shards for TP/EP and omits weights absent from each vLLM PP stage. |
@@ -55,6 +55,13 @@ Key settings:
 
 The built-in NIXL topology is paired policy-to-rollout transfer, so allocate at
 least as many policy workers as rollout workers.
+
+The driver queries fixed total GPU memory from every policy and vLLM worker
+before creating the engines and uses the smallest capacity. It multiplies that
+capacity by `update_weights_bucket_memory_ratio` and rounds down to a MiB. For
+example, the default `0.05` selects a 4 GiB bucket on an 80 GiB GPU. Because
+NIXL uses two buffers, that configuration reserves about 8 GiB per participating
+engine. The selected size is fixed for the synchronizer lifetime.
 
 ## Runtime Setup
 
@@ -106,7 +113,7 @@ policy:
     vllm_kwargs:
       moe_backend: triton
     checkpoint_engine:
-      update_weights_bucket_megabytes: 4096
+      update_weights_bucket_memory_ratio: 0.05
       engine_kwargs:
         nixl:
           device: cuda
@@ -179,9 +186,10 @@ Set `release_after_refit: true` when the two registered buffers must be returned
 between refits. Finalization then deregisters both buffers, releases their
 dedicated CuPy pool, and retains the NIXL agent and control endpoint. Before the
 next refit, `prepare()` allocates and registers two new buffers. This saves
-`2 * update_weights_bucket_megabytes` of resident GPU memory between refits at
-the cost of allocation, registration, and metadata exchange on every refit.
-Leave it `false` for the benchmark path below.
+twice the resolved bucket size of resident GPU memory between refits at the cost
+of allocation, registration, and metadata exchange on every refit. Reallocation
+uses the size selected when the synchronizer was initialized. Leave it `false`
+for the benchmark path below.
 
 ### DeepSeek-V3 Benchmark
 

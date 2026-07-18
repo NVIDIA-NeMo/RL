@@ -692,6 +692,16 @@ def test_policy_worker_checkpoint_engine_rpc_runs_weight_send():
     assert worker.checkpoint_engine.finalized
 
 
+def test_policy_worker_checkpoint_engine_rpc_reports_total_memory(monkeypatch):
+    worker = _CheckpointPolicyWorker()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    get_device_properties = MagicMock(return_value=SimpleNamespace(total_memory=1234))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", get_device_properties)
+
+    assert _run_checkpoint_rpc(worker, "checkpoint_engine_total_memory_bytes") == 1234
+    get_device_properties.assert_called_once_with(2)
+
+
 def test_policy_worker_checkpoint_engine_rpc_sends_from_running_event_loop():
     worker = _CheckpointPolicyWorker()
     _run_checkpoint_rpc(

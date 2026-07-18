@@ -62,14 +62,20 @@ def _mock_generation(**overrides):
     return gen
 
 
-def _checkpoint_engine_cfg(*, release_after_refit=False):
+def _checkpoint_engine_cfg(
+    *,
+    release_after_refit=False,
+    backend="test_backend",
+    bucket_memory_ratio=0.05,
+    device="cpu",
+):
     return {
         "enabled": True,
-        "backend": "test_backend",
-        "update_weights_bucket_megabytes": 4,
+        "backend": backend,
+        "update_weights_bucket_memory_ratio": bucket_memory_ratio,
         "engine_kwargs": {
-            "test_backend": {
-                "device": "cpu",
+            backend: {
+                "device": device,
                 "release_after_refit": release_after_refit,
             }
         },
@@ -103,29 +109,36 @@ def _checkpoint_sync(
     update_success=True,
     release_after_refit=False,
     cycles=1,
+    checkpoint_engine_config=None,
 ):
     # One return value per ray.get() call, in order:
-    #   1. init_checkpoint_engine (policy + generation)
-    #   2. prepare_checkpoint_engine (policy refs first, then generation refs;
+    #   1. total GPU memory (policy + generation)
+    #   2. init_checkpoint_engine (policy + generation)
+    #   3. prepare_checkpoint_engine (policy refs first, then generation refs;
     #      _CheckpointWorkerGroup returns a single ref per side here)
-    #   3. init_checkpoint_engine_process_group (policy + generation)
-    #   4. send + update_weights_from_checkpoint_engine
-    #   5. finalize_checkpoint_engine (policy + generation)
-    mock_ray.get.side_effect = [
-        [],
-        [["policy-0", "policy-1"], "generation-0", ["generation-1"]],
-        [],
-        ["policy-send", update_success],
-        [],
-    ] * cycles
+    #   4. init_checkpoint_engine_process_group (policy + generation)
+    #   5. send + update_weights_from_checkpoint_engine
+    #   6. finalize_checkpoint_engine (policy + generation)
+    mock_ray.get.side_effect = [[80 * 1024**3, [80 * 1024**3]]] + [
+        item
+        for _ in range(cycles)
+        for item in (
+            [],
+            [["policy-0", "policy-1"], "generation-0", ["generation-1"]],
+            [],
+            ["policy-send", update_success],
+            [],
+        )
+    ]
     policy = _mock_policy()
     policy.worker_group = _CheckpointWorkerGroup()
+    checkpoint_engine_config = checkpoint_engine_config or _checkpoint_engine_cfg(
+        release_after_refit=release_after_refit
+    )
     gen = _mock_generation(
         cfg={
             "vllm_cfg": {"async_engine": async_engine},
-            "checkpoint_engine": _checkpoint_engine_cfg(
-                release_after_refit=release_after_refit
-            ),
+            "checkpoint_engine": checkpoint_engine_config,
         }
     )
     gen.dp_size = 2
@@ -134,6 +147,52 @@ def _checkpoint_sync(
 
 
 class TestCheckpointEngineWeightSynchronizer:
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_bucket_size_defaults_to_five_percent_of_total_memory(self, mock_ray):
+        config = _checkpoint_engine_cfg()
+        del config["update_weights_bucket_memory_ratio"]
+        sync = _checkpoint_sync(mock_ray, checkpoint_engine_config=config)
+
+        assert sync._resolve_bucket_size_bytes() == 4096 * 1024**2
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_bucket_uses_minimum_total_memory_and_is_cached(self, mock_ray, capsys):
+        config = _checkpoint_engine_cfg(bucket_memory_ratio=0.125)
+        sync = _checkpoint_sync(mock_ray, checkpoint_engine_config=config)
+        mock_ray.get.side_effect = None
+        mock_ray.get.return_value = [96 * 1024**3, [64 * 1024**3, 80 * 1024**3]]
+
+        assert sync._resolve_bucket_size_bytes() == 8192 * 1024**2
+        assert sync._resolve_bucket_size_bytes() == 8192 * 1024**2
+        mock_ray.get.assert_called_once()
+        assert sync._policy.worker_group.calls == [
+            ("checkpoint_engine_rpc", "checkpoint_engine_total_memory_bytes")
+        ]
+        assert sync._generation.worker_group.calls == [
+            ("checkpoint_engine_rpc", "checkpoint_engine_total_memory_bytes")
+        ]
+        assert "8192 MiB per buffer" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("memory_ratio", ["invalid", 0, 1])
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_bucket_rejects_invalid_ratio(self, mock_ray, memory_ratio):
+        config = _checkpoint_engine_cfg(bucket_memory_ratio=memory_ratio)
+        sync = _checkpoint_sync(mock_ray, checkpoint_engine_config=config)
+
+        with pytest.raises(ValueError, match="update_weights_bucket_memory_ratio"):
+            sync._resolve_bucket_size_bytes()
+        mock_ray.get.assert_not_called()
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_bucket_rejects_sub_mibibyte_result(self, mock_ray):
+        config = _checkpoint_engine_cfg(bucket_memory_ratio=0.05)
+        sync = _checkpoint_sync(mock_ray, checkpoint_engine_config=config)
+        mock_ray.get.side_effect = None
+        mock_ray.get.return_value = [8 * 1024**2, [8 * 1024**2]]
+
+        with pytest.raises(ValueError, match="less than 1 MiB"):
+            sync._resolve_bucket_size_bytes()
+
     def test_sort_ranked_metadata_orders_by_rank(self):
         metadata = [{"rank": 2}, {"rank": 0}, {"rank": 1}]
 
@@ -183,7 +242,7 @@ class TestCheckpointEngineWeightSynchronizer:
             "checkpoint_engine_rpc",
             "update_weights_from_checkpoint_engine",
         ) in sync._generation.worker_group.calls
-        assert sync._generation.worker_group.calls[2][2] == [
+        assert sync._generation.worker_group.calls[3][2] == [
             (0, 2, 2, ["policy-0", "policy-1", "generation-0", "generation-1"]),
             (2, 2, 2, ["policy-0", "policy-1", "generation-0", "generation-1"]),
         ]

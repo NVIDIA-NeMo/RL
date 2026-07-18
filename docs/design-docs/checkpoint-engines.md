@@ -28,16 +28,18 @@ only for the runtime weight update between policy and generation workers.
 The refit lifecycle is coordinated by `CheckpointEngineWeightSynchronizer`:
 
 1. Read `policy.generation.checkpoint_engine`.
-2. Instantiate the backend on policy workers and vLLM internal workers.
-3. Call `prepare()` and collect Ray-serializable metadata from every backend
+2. Resolve the configured bucket size from the smallest fixed GPU capacity
+   reported by policy and vLLM workers before transfer buffers are allocated.
+3. Instantiate the backend on policy workers and vLLM internal workers.
+4. Call `prepare()` and collect Ray-serializable metadata from every backend
    instance.
-4. Initialize policy and rollout peers with the combined metadata list.
-5. Keep the backend initialized across refits for that synchronizer.
-6. For each refit, ask policy workers to send weights through the backend.
-7. Ask generation workers to receive batches, directly copy supported
+5. Initialize policy and rollout peers with the combined metadata list.
+6. Keep the backend initialized across refits for that synchronizer.
+7. For each refit, ask policy workers to send weights through the backend.
+8. Ask generation workers to receive batches, directly copy supported
    destination-local expert shards, and pass remaining tensors through vLLM's
    normal weight-loading path.
-8. Call `shutdown()` to finalize backend state when the synchronizer is no
+9. Call `shutdown()` to finalize backend state when the synchronizer is no
    longer needed.
 
 Policy metadata appears first in the combined metadata list, followed by
@@ -57,12 +59,13 @@ policy:
     checkpoint_engine:
       enabled: true
       backend: nixl
-      update_weights_bucket_megabytes: 2048
+      update_weights_bucket_memory_ratio: 0.05
       engine_kwargs:
         nixl:
           device: cuda
           release_after_refit: false
           backend_name: UCX
+          # Optional, cluster-specific eight-rail tuning.
           backend_init_params:
             engine_config: MAX_RMA_RAILS=8
             device_list: "mlx5_0,mlx5_1,mlx5_2,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
@@ -82,14 +85,22 @@ policy:
     checkpoint_engine:
       enabled: true
       backend: "my_pkg.refit:MyCheckpointEngine"
-      update_weights_bucket_megabytes: 1024
+      update_weights_bucket_memory_ratio: 0.05
       engine_kwargs:
         "my_pkg.refit:MyCheckpointEngine":
           transport: custom
 ```
 
-The factory passes `bucket_size` in bytes plus the selected backend kwargs to
-the backend constructor.
+`update_weights_bucket_memory_ratio` is the fraction of fixed total GPU memory
+used by each transfer bucket and defaults to `0.05` when omitted. The
+synchronizer queries every policy and rollout worker, uses the smallest reported
+GPU capacity, and computes
+`minimum_total_memory_bytes * update_weights_bucket_memory_ratio`, rounded down
+to a MiB. The resolved size is fixed for the synchronizer lifetime. NIXL owns
+two transfer buffers, so its total allocation is twice the configured ratio.
+
+The factory passes the resolved `bucket_size` in bytes plus the selected backend
+kwargs to the backend constructor.
 
 ## Backend Interface
 
@@ -254,10 +265,23 @@ backend does not accept a source-side target-TP hint.
   wrapped as torch tensors.
 - `cpu`: allocate host buffers, pinned when CUDA is available.
 
-`backend_name` defaults to `UCX`. Values in `backend_init_params` are converted
-to strings before creating the NIXL backend. Use this field for NIXL backend
-parameters such as UCX peer error handling, UCX device lists, and NIXL UCX
-engine config.
+`backend_name` defaults to `UCX`. `device_list` restricts the local UCX network
+devices and is independent of the distributed world size. The same list remains
+valid when adding or removing homogeneous nodes; update it only when the
+per-node HCA names or topology change. Omitting `device_list` lets UCX discover
+available devices, but the NIXL 1.3 runtime used for validation defaults
+`MAX_RMA_RAILS` to `2`, so that portable configuration does not reproduce the
+validated eight-rail performance. For tuned runs, use devices available on
+every participating node and keep `MAX_RMA_RAILS` no larger than the number of
+usable selected rails. Values in `backend_init_params` are converted to strings
+before creating the NIXL backend.
+
+The validated cluster omits `mlx5_3` because it maps to the Ethernet-link-layer
+interface `enp90s0np0` on the `10.65.x.x/31` network, while the eight selected
+HCAs use the InfiniBand link layer and map to `ibp*` interfaces on the
+`100.126.x.x/16` RDMA data fabric. This mapping is cluster-specific; use
+`ibdev2netdev` and inspect each RDMA port's `link_layer` instead of assuming
+that device index 3 should always be excluded.
 
 ### Validated Full-Model Layout
 
@@ -266,7 +290,9 @@ Megatron TP1/PP16/EP16 across 256 policy workers refit vLLM TP32/PP1/EP1 across
 32 rollout workers. The destination-reported layout drove PP filtering and TP
 expert slicing without requiring the policy and rollout rank layouts to match.
 Each rollout rank received 45,395 destination-local tensors in 18 batches, or
-69.95 GiB. Performance and correctness-control results are recorded in the
+69.95 GiB. That cluster was tuned with eight explicitly selected HCAs and
+`MAX_RMA_RAILS=8`; those device names are not portable defaults. Performance
+and correctness-control results are recorded in the
 [user guide](../guides/checkpoint-engine-refit.md#deepseek-v3-benchmark).
 
 ## NIXL Preinit

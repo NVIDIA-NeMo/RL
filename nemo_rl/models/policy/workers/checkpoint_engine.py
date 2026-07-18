@@ -137,6 +137,9 @@ class PolicyCheckpointEngineMixin:
         self, checkpoint_method: str, method_kwargs: Optional[dict[str, Any]] = None
     ) -> Any:
         kwargs = method_kwargs or {}
+        if checkpoint_method == "checkpoint_engine_total_memory_bytes":
+            device = torch.cuda.current_device()
+            return torch.cuda.get_device_properties(device).total_memory
         if checkpoint_method == "init_checkpoint_engine":
             if getattr(self, "checkpoint_engine", None) is None:
                 from nemo_rl.utils.checkpoint_engines.base import (

@@ -35,6 +35,7 @@ from nemo_rl.utils.checkpoint_engines.base import (
 
 NixlAgentMetadata = dict[str, Any]
 NIXL_DEFAULT_BACKEND_NAME = "UCX"
+NIXL_TRANSFER_BUFFER_COUNT = 2
 
 
 def _source_rank_for_rollout(
@@ -249,7 +250,10 @@ class NIXLCheckpointEngine(CheckpointEngine):
 
     def prepare(self) -> NixlAgentMetadata:
         if not self.buffers:
-            self.buffers = [self._allocate_transfer_buffer() for _ in range(2)]
+            self.buffers = [
+                self._allocate_transfer_buffer()
+                for _ in range(NIXL_TRANSFER_BUFFER_COUNT)
+            ]
             for buffer in self.buffers:
                 self.registration_descs.append(self.agent.agent.register_memory(buffer))
                 self.xfer_descs.append(self.agent.agent.get_xfer_descs(buffer))

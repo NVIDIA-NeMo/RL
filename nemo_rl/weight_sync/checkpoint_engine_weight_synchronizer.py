@@ -22,6 +22,8 @@ from nemo_rl.models.generation.interfaces import CheckpointEngineConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
+_MEBIBYTE = 1024 * 1024
+
 
 def _flatten_metadata(results: list[Any]) -> list[Any]:
     return [
@@ -60,6 +62,7 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
     _checkpoint_engine_config: CheckpointEngineConfig
     _stale: bool = True
     _checkpoint_engine_ready: bool = False
+    _bucket_size_bytes: int | None = None
 
     def init_communicator(self) -> None:
         self._generation.prepare_refit_info(self._policy.prepare_refit_info())
@@ -104,13 +107,56 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 
+    def _resolve_bucket_size_bytes(self) -> int:
+        if self._bucket_size_bytes is not None:
+            return self._bucket_size_bytes
+
+        memory_ratio_raw = self._checkpoint_engine_config.get(
+            "update_weights_bucket_memory_ratio", 0.05
+        )
+        try:
+            memory_ratio = float(memory_ratio_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "update_weights_bucket_memory_ratio must be a valid float, got "
+                f"{memory_ratio_raw!r}."
+            ) from exc
+        if not 0 < memory_ratio < 1:
+            raise ValueError(
+                "update_weights_bucket_memory_ratio must be between 0 and 1, got "
+                f"{memory_ratio_raw!r}."
+            )
+
+        total_memory = _flatten_metadata(
+            ray.get(
+                self._run_policy("checkpoint_engine_total_memory_bytes")
+                + self._run_generation("checkpoint_engine_total_memory_bytes")
+            )
+        )
+        minimum_total_bytes = min(int(value) for value in total_memory)
+        bucket_size_bytes = int(minimum_total_bytes * memory_ratio)
+        bucket_size_bytes = bucket_size_bytes // _MEBIBYTE * _MEBIBYTE
+        if bucket_size_bytes < _MEBIBYTE:
+            raise ValueError(
+                "Checkpoint-engine bucket sizing produced less than 1 MiB per buffer."
+            )
+
+        self._bucket_size_bytes = bucket_size_bytes
+        print(
+            "[checkpoint engine] Bucket size: "
+            f"{bucket_size_bytes // _MEBIBYTE} MiB per buffer "
+            f"({memory_ratio:.1%} of {minimum_total_bytes / 1024**3:.2f} GiB "
+            "minimum total GPU memory)."
+        )
+        return bucket_size_bytes
+
     def _ensure_checkpoint_engine_ready(self) -> None:
         if self._checkpoint_engine_ready:
             return
 
         cfg = self._checkpoint_engine_config
         backend = cfg["backend"]
-        bucket_size_bytes = cfg["update_weights_bucket_megabytes"] * 1024 * 1024
+        bucket_size_bytes = self._resolve_bucket_size_bytes()
         engine_kwargs = cfg["engine_kwargs"][backend]
 
         ray.get(

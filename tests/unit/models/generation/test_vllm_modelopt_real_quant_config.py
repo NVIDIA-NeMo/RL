@@ -766,7 +766,7 @@ def test_configure_quant_engine_kwargs_preserves_checkpoint_extension(monkeypatc
         "checkpoint_engine": {
             "enabled": True,
             "backend": "nixl",
-            "update_weights_bucket_megabytes": 16,
+            "update_weights_bucket_memory_ratio": 0.05,
             "engine_kwargs": {"nixl": {}},
         },
     }

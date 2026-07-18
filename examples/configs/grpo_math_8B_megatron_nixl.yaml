@@ -12,8 +12,8 @@ policy:
       enabled: true
       # "nixl" or a "module:ClassName" path to a CheckpointEngine implementation
       backend: nixl
-      # weight-transfer bucket size in megabytes
-      update_weights_bucket_megabytes: 2048
+      # fraction of total GPU memory used by each weight-transfer bucket
+      update_weights_bucket_memory_ratio: 0.05
       # per-backend constructor kwargs, keyed by the configured backend string
       engine_kwargs:
         nixl:

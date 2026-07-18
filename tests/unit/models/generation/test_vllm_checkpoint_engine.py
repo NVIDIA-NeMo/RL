@@ -72,6 +72,20 @@ def test_checkpoint_engine_worker_lifecycle(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_checkpoint_engine_worker_reports_total_memory(monkeypatch):
+    from nemo_rl.models.generation.vllm.checkpoint_engine import (
+        VllmCheckpointEngineMixin,
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    get_device_properties = MagicMock(return_value=SimpleNamespace(total_memory=1234))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", get_device_properties)
+
+    assert VllmCheckpointEngineMixin().checkpoint_engine_total_memory_bytes() == 1234
+    get_device_properties.assert_called_once_with(2)
+
+
+@pytest.mark.vllm
 def test_checkpoint_engine_methods_only_exist_on_configured_extension():
     from nemo_rl.models.generation.vllm.checkpoint_engine import (
         VllmCheckpointEngineMixin,

@@ -190,7 +190,8 @@ class CheckpointEngineConfig(TypedDict):
     enabled: Literal[True]
     # "nixl" or a "module:ClassName" path to a CheckpointEngine implementation
     backend: str
-    update_weights_bucket_megabytes: int
+    # fraction of total GPU memory used by each transfer bucket; defaults to 0.05
+    update_weights_bucket_memory_ratio: NotRequired[float]
     # per-backend constructor kwargs, keyed by the configured backend string
     engine_kwargs: dict[str, dict[str, Any]]
 

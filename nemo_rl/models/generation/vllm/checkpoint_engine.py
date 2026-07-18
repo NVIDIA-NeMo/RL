@@ -85,6 +85,10 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
 
     checkpoint_engine: "CheckpointEngine"
 
+    def checkpoint_engine_total_memory_bytes(self) -> int:
+        device = torch.cuda.current_device()
+        return torch.cuda.get_device_properties(device).total_memory
+
     def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
         if self.checkpoint_engine.shard_expert_weights:
             self._load_sharded_expert_weights(policy_weights)
