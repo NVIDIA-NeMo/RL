@@ -598,7 +598,7 @@ class SingleControllerActor:
         """
         self._rollout_permitted.clear()
 
-        # TODO: currently sync_weights is not implemented, comment out for now
+        # TODO: currently drain is not implemented, comment out for now
         # # Drain: wait for all in-flight rollouts to complete before NCCL
         # # Critical: if GenWorker has queued calls when NCCL init is dispatched,
         # # the init sits behind them — trainer blocks in rendezvous → deadlock
@@ -615,6 +615,8 @@ class SingleControllerActor:
 
         t0 = time.monotonic()
         await asyncio.to_thread(self._weight_synchronizer.sync_weights)
+        if self._async_cfg.max_weight_staleness_versions == 0:
+            self._gen.invalidate_kv_cache()
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
