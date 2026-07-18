@@ -76,6 +76,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     grpo.num_generations_per_prompt=2 \
     grpo.max_num_steps=10 \
     grpo.val_period=-1 \
+    grpo.val_at_start=false \
     policy.train_global_batch_size=8 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
@@ -96,9 +97,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++data_plane.claim_meta_poll_interval_s=0.5 \
     ++data_plane.global_segment_size=549755813888 \
     ++data_plane.local_buffer_size=68719476736 \
-    ++async_rl.batch_selection_strategy=strict_on_policy \
     ++async_rl.max_weight_staleness_versions=0 \
-    ++async_rl.min_prompt_groups_per_batch=4 \
+    ++async_rl.min_groups_for_streaming_train=4 \
     ++async_rl.max_inflight_prompts=4 \
     ++async_rl.max_buffered_rollouts=4 \
     $@ \
