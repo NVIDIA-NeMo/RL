@@ -741,6 +741,112 @@ session on the event loop that created it, or detaches it when that loop is
 already closed at interpreter shutdown. Its loop-bound regression tests passed
 3/3 in Slurm jobs `14094929` and `14095035`.
 
+#### Nano3 same-request final-decode request-copy validation
+
+The July 18 validation reruns the frozen first 16 rows after fixing the vLLM
+same-request continuation bug. The old patch registered the scheduler's mutable
+`EngineCoreRequest` directly with the output processor. Output accumulation
+then mutated the same request object before the scheduler consumed the next
+chunk, duplicating prompt tokens and eventually producing a broadcast-shape
+failure or non-finite final log probabilities. The fix gives output processing
+a shallow request copy while leaving every scheduler request unchanged. The
+focused unit/runtime suite, a four-chunk Nano3 test, and a 16-way paired direct
+vLLM test all pass with no prompt duplication or NaN before this rollout.
+
+Both rollout arms use commit `6c794bc22`, the imported
+`nemo-rl-nightly-gym-20260718.squashfs` image, actual vLLM weights
+`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`, two TP4 replicas, concurrency
+16, temperature zero, top-p one, `shuffle=False`, a 50 ms poll, 256-character
+initial and later buckets, and `enforce_eager=False`. The on arm enables exact
+incremental tokenization, final-only prefill, prefix seeding, prefill after
+admission, stable-first background completion, compact request context, and
+same-request final decode. The `Qwen/Qwen3-Coder-30B-A3B-Instruct` value saved
+in each trajectory's request parameters is the common Gym route alias; the
+driver and vLLM model-load logs identify the actual Nano3 checkpoint above.
+
+- Slurm: `14122479`, `COMPLETED 0:0` on `nemotron_sw_post` / `interactive`,
+  two full eight-GPU nodes; the two arms ran sequentially in the same
+  allocation;
+- streaming off W&B:
+  [`ks5i669r`](https://wandb.ai/nvidia/swe-benchmark/runs/ks5i669r);
+- same-request prefill W&B:
+  [`dkfx6z9k`](https://wandb.ai/nvidia/swe-benchmark/runs/dkfx6z9k);
+- manifest SHA-256:
+  `9309be0ea9dce987fc509d47845abef3fd3d28cce524e030a889f9fdef92b82a`;
+- result directory:
+  `results/streaming_tool_call_verified/20260718-nano3-tool-rich16-same-request-r7-request-copy`.
+
+The strict auditor found all 16 unique rows in both arms, no infrastructure or
+response errors, and no trajectory at or above 1,800 seconds. Thus the timeout-
+union cohort retains all 16 rows.
+
+| Correctness and workload | Streaming off | Same-request prefill | Change |
+| --- | ---: | ---: | ---: |
+| Strict resolved | 5/16 (31.25%) | 4/16 (25.00%) | -6.25 pp |
+| Both / off-only / on-only resolved | 4 / 1 / 0 | 4 / 1 / 0 | `astropy__astropy-7166` is off-only |
+| `openhands_run_time >= 1800s` | 0/16 | 0/16 | unchanged |
+| Exact trajectories / exact final patches | N/A | 0/16 / 1/16 | paths differ |
+| Tool calls | 1,062 | 1,105 | +43 (+4.05%) |
+| Model calls | 1,078 | 1,125 | +47 (+4.36%) |
+
+All 16 agent paths differ, so the one resolved-sample delta does not establish
+an accuracy regression, but it also does not clear an accuracy-parity gate.
+Temperature zero does not make concurrent vLLM agent trajectories
+deterministic. The differing tool/model-call counts likewise confound raw
+rollout timing.
+
+Percentiles below use nearest rank. P99 equals max for 16 rows. The complete
+machine-readable audit and paired rows are `comparison.json`,
+`timeout_excluded_distribution.json`, `paired_outcomes.jsonl`, and
+`paired_runtime_breakdown.jsonl` in the result directory.
+
+| Off, 16 non-timeout trajectories | Mean | P25 | P50 | P75 | P90 | P95 | P99 / max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OpenHands run time (s) | 941.41 | 708.92 | 929.17 | 1,062.05 | 1,357.23 | 1,502.65 | 1,502.65 |
+| OpenHands model API time (s) | 685.01 | 523.80 | 648.98 | 795.95 | 1,169.10 | 1,238.53 | 1,238.53 |
+| Total model-call time (s) | 731.26 | 576.40 | 665.65 | 828.79 | 1,194.90 | 1,285.83 | 1,285.83 |
+| Command execution time (s) | 74.06 | 24.63 | 32.73 | 102.48 | 177.31 | 194.36 | 194.36 |
+| Tool calls | 66.38 | 57 | 71 | 79 | 83 | 83 | 83 |
+
+| On, 16 non-timeout trajectories | Mean | P25 | P50 | P75 | P90 | P95 | P99 / max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OpenHands run time (s) | 984.17 | 668.25 | 979.97 | 1,272.68 | 1,470.22 | 1,511.01 | 1,511.01 |
+| OpenHands model API time (s) | 723.07 | 427.74 | 671.77 | 934.43 | 1,200.84 | 1,271.94 | 1,271.94 |
+| Total model-call time (s) | 782.21 | 440.63 | 725.01 | 982.61 | 1,236.41 | 1,299.56 | 1,299.56 |
+| Command execution time (s) | 67.81 | 30.06 | 51.21 | 99.80 | 117.78 | 168.54 | 168.54 |
+| Tool calls | 69.06 | 50 | 66 | 86 | 111 | 121 | 121 |
+
+Mean OpenHands runtime changes by +42.75 seconds (+4.54%), OpenHands model API
+time by +38.06 seconds (+5.56%), total model-call time by +50.95 seconds
+(+6.97%), command execution by -6.25 seconds (-8.44%), and tool calls by +2.69
+(+4.05%). Command P50 nevertheless increases from 32.73 to 51.21 seconds. The
+large two-sided paired tails and changed call counts mean neither the apparent
+command improvement nor the overall regression is a causal feature estimate.
+
+The on-arm mechanism funnel is more interpretable:
+
+| Same-request mechanism gate | Count | Fraction |
+| --- | ---: | ---: |
+| All tool calls | 1,105 | 100% |
+| Eligible command actions | 541 | 48.96% of all tool calls |
+| Streaming sessions started | 56 | 5.07% of all; 10.35% of eligible |
+| Valid incremental-tokenizer actions | 27 | 2.44% of all; 4.99% of eligible |
+| Same-request attempts / successes / fallbacks | 27 / 25 / 2 | 92.59% success per attempt |
+| Valid prefill actions | 25 | 2.26% of all; 4.62% of eligible |
+| Background completed / effective / failed / cancelled chunks | 25 / 25 / 0 / 0 | no engine failure or cancellation |
+| Exact next-prompt matches / mismatches / missing | 27 / 0 / 0 | no observed token mutation |
+| Incremental-tokenizer checkpoint mismatches | 0 | exact checkpoint contract retained |
+
+The 25 successful same-request model calls are the authoritative handoff count:
+the appended tokens remain on the existing engine request, so APC cached-token
+details from a new request are not the primary success signal. They cover only
+2.26% of all tool calls. The mechanism processed 7,684 dynamic prefill tokens
+and recorded 25 clean background completions, but that coverage is too low for
+the direct fixed-prompt TTFT gain to dominate the divergent full-agent paths.
+This run therefore clears the request-mutation/NaN stability gate and validates
+exact prompt handoff, but it does not clear accuracy or rollout-performance
+acceptance.
+
 ### Partial and excluded records
 
 The following persisted records are listed for completeness but are excluded
@@ -1778,9 +1884,9 @@ unhidden remainder.
 | Dimension | Streaming Tool Call | Streaming Tokenizer |
 | --- | --- | --- |
 | Work performed before final request | Remote resumable prefill; 3,531--10,944 prefill requests in the complete off/on pairs | Exact mutable-tail tokenization plus periodic checkpoints. Tokenizer-only sends no prefill; final-only can prime APC once, while stable-first moves the first useful post-admission snapshot under command execution. |
-| Primary performance observation | Recovered rollout elapsed changed by +0.04% to -14.2%; OpenHands run time improved 10.0--15.6%; command time improved 27.1--47.5% across four complete historical off/on pairs | Fixed trace: tokenizer time -58.36%. Prefix seeding removed 1,598 checkpoints and cut overhead per eligible action 70.90%. Stable-first raised effective admission 4.91x and the fixed 6,136-dynamic-token benchmark cut final TTFT 299.05 ms (67.39%); rollout coverage remains only 10.41% of tool calls, and divergent E2E timing is inconclusive. |
+| Primary performance observation | Recovered rollout elapsed changed by +0.04% to -14.2%; OpenHands run time improved 10.0--15.6%; command time improved 27.1--47.5% across four complete historical off/on pairs. The July 18 Nano3 same-request pair instead changed OpenHands mean by +4.54% with only 25/1,105 (2.26%) valid prefill actions; its divergent paths are inconclusive. | Fixed trace: tokenizer time -58.36%. Prefix seeding removed 1,598 checkpoints and cut overhead per eligible action 70.90%. Stable-first raised effective admission 4.91x and the fixed 6,136-dynamic-token benchmark cut final TTFT 299.05 ms (67.39%); rollout coverage remains only 10.41% of tool calls, and divergent E2E timing is inconclusive. |
 | Model-call observation | -3.7% to +1.1% across historical complete pairs | In the prefix-seed experiment, total model API time per trajectory fell 14.53% while model-call count fell 28.18%. Per-call time rose because completions differed; completion-token throughput improved 4.08% for prefill-reuse calls and 4.57% for tokenizer-reuse calls. This is mechanism evidence, not a fixed-trace latency result. |
-| Strict-accuracy observation | -0.84 to +2.34 pp across historical complete pairs | Earlier fixed first16 was 2/16 in every arm. Two first64 trials over the same instances: off 27/128, on 23/128 (-3.125 pp). Final-only was 2/16 vs 2/16. Two stable-first pairs aggregate to 7/32 in each arm, but every trajectory differed, so parity is not established. |
+| Strict-accuracy observation | -0.84 to +2.34 pp across historical complete pairs. The July 18 Nano3 same-request pair is 5/16 off versus 4/16 on, with zero timeouts and one off-only resolution; all paths differ, so parity remains unestablished. | Earlier fixed first16 was 2/16 in every arm. Two first64 trials over the same instances: off 27/128, on 23/128 (-3.125 pp). Final-only was 2/16 vs 2/16. Two stable-first pairs aggregate to 7/32 in each arm, but every trajectory differed, so parity is not established. |
 | What remains unproven | Accuracy parity and an error-normalized end-to-end gain | Accuracy parity and a causal per-trajectory latency gain. Final-token equality, zero checkpoint mismatches, exact observed prompt reuse, and stable-first 111/111 success with zero fallback are proven; OpenHands/model/command distributions remain path-dependent. |
 
 Neither feature clears an accuracy gate yet. For tokenizer-only, the one-shot
