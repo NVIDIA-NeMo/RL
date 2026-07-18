@@ -22,13 +22,14 @@ data_plane:
 async_rl:
   max_weight_staleness_versions: 0
   # Min ready groups the streaming trainer waits for before dispatching a batch.
-  min_groups_for_streaming_train: 32
-  max_inflight_prompts: 64
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
   # over_sampling=false requires
   #   max_buffered_rollouts == grpo.num_prompts_per_step * (max_weight_staleness_versions + 1)
   #   32 * (0 + 1) = 32
   max_buffered_rollouts: 32
   over_sampling: false
+  force_in_order: true
 
 policy:
   dtensor_cfg:
