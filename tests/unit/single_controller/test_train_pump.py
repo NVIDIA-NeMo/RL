@@ -197,14 +197,14 @@ def test_train_pump_drives_mcore_training_step(
     tmp_path,
 ):
     """SC._train_pump runs one outer step against a real Megatron TQPolicy."""
+    train_steps = 2
+    train_gbs = 4
     num_generations = 2
     num_prompts = 2
-    seq_len = 16
-    train_gbs = num_prompts * num_generations
 
     policy_cfg = create_megatron_test_config(tiny_llama_model_path, tp=1, pp=1)
     policy_cfg["train_global_batch_size"] = train_gbs
-    policy_cfg["train_micro_batch_size"] = num_generations
+    policy_cfg["train_micro_batch_size"] = train_gbs
     tokenizer = get_tokenizer(policy_cfg["tokenizer"])
     policy_cfg["generation"] = configure_generation_config(
         policy_cfg["generation"], tokenizer
@@ -226,30 +226,33 @@ def test_train_pump_drives_mcore_training_step(
         # no double-bootstrap.
         dp_client = trainer.dp_client
 
-        # Register the partition once with the full field union.
+        # Register the partition once with the full field union. All
+        # pre-populated samples across every step live here at once.
         dp_client.register_partition(
             partition_id=_PARTITION_ID,
             fields=_REGISTERED_FIELDS,
-            num_samples=train_gbs * 4,
+            num_samples=train_steps * train_gbs,
             consumer_tasks=["prev_lp", "ref_lp", "train"],
         )
 
-        # Real TQReplayBuffer, pre-populated with 2 ready groups so
-        # StalenessSampler.select fires immediately.
+        # Real TQReplayBuffer, pre-populated with one ready batch (num_prompts
+        # groups of num_generations samples) per step, stamped with the
+        # step's weight_version so the sampler can advance across steps.
         tq_buffer = TQReplayBuffer(
             dp_client,
             partition_id=_PARTITION_ID,
             pad_value_dict={"input_ids": int(tokenizer.pad_token_id or 0)},
         )
-        for g in range(num_prompts):
-            meta = _populate_group(
-                dp_client,
-                group_uuid=f"prompt{g}",
-                group_size=num_generations,
-                seq_len=seq_len,
-                weight_version=0,
-            )
-            _prepopulate_buffer(tq_buffer, meta, weight_version=0)
+        for step in range(train_steps):
+            for g in range(num_prompts):
+                meta = _populate_group(
+                    dp_client,
+                    group_uuid=f"step{step}_prompt{g}",
+                    group_size=num_generations,
+                    seq_len=16,
+                    weight_version=step,
+                )
+                _prepopulate_buffer(tq_buffer, meta, weight_version=step)
 
         log = _CallLog.remote()
         weight_sync = _FakeWeightSync(log)
@@ -265,7 +268,7 @@ def test_train_pump_drives_mcore_training_step(
             batch_selection_strategy="staleness_window",
             max_inflight_prompts=num_prompts,
             max_buffered_rollouts=num_prompts,
-            max_train_steps=1,
+            max_train_steps=train_steps,
             max_num_epochs=None,
             over_sampling=True,
             train_global_batch_size=train_gbs,
@@ -298,16 +301,16 @@ def test_train_pump_drives_mcore_training_step(
             tq_buffer=tq_buffer,
         )
 
-        # One outer step: sampler.select → advantage stage → begin/microbatches/finish → sync.
+        # train_steps outer steps, each: sampler.select → advantage stage → begin/microbatches/finish → sync.
         ray.get(ctrl._train_pump.remote())
 
         state = ray.get(ctrl.ping.remote())
-        assert state["train_steps"] == 1
-        assert state["trainer_version"] == 1
+        assert state["train_steps"] == train_steps
+        assert state["trainer_version"] == train_steps
 
         entries = ray.get(log.get.remote())
         sync_versions = [p["version"] for k, p in entries if k == "sync_weights"]
-        assert sync_versions == [1]
+        assert sync_versions == list(range(1, train_steps + 1))
 
     finally:
         trainer.shutdown()
