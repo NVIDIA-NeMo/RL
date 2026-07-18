@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from contextlib import nullcontext
 from functools import partial
 from typing import Any, Literal, Optional
 
@@ -144,9 +143,6 @@ class SingleControllerConfig(BaseModel, extra="allow"):
 
     # DataPlane partition
     partition_id: str = "rollout_data"
-    consumer_task_name: str = "train"
-    claim_required_fields: list[str] = Field(default_factory=lambda: ["input_ids"])
-    max_claim_groups: int = 8
 
     # Advantage calculation. The TQ partition column names for prompt_ids /
     # reward / token_mask / sample_mask / advantages are fixed conventions
@@ -373,8 +369,6 @@ class SingleControllerActor:
         # Completed prompt-list passes; only advances when
         # cfg.max_num_epochs is set (see _rollout_pump).
         self._current_epoch: int = 0
-        self._claimed_meta: KVBatchMeta | None = None
-        self._step_consumed_sample_ids: list[str] = []
 
         print(
             f"SingleControllerActor: staleness_cap="
@@ -384,14 +378,6 @@ class SingleControllerActor:
             f"transport={cfg.refit_cfg.impl}",
             flush=True,
         )
-
-    def _timed(self, label: str) -> Any:
-        """Time a code block with the SC Timer when a logger is attached.
-
-        No-op when no logger is configured. Use as
-        ``with self._timed("phase"): ...``.
-        """
-        return self._timer.time(label) if self._timer is not None else nullcontext()
 
     # ── public API ─────────────────────────────────────────────────────────
 
