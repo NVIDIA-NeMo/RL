@@ -1045,6 +1045,14 @@ def _create_megatron_config(
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }
+    # OptimizerConfig.__post_init__ treats fp8_recipe=None as "no fp8 params" and
+    # lets the precision-aware optimizer keep fp32 masters inside FusedAdam,
+    # leaving None placeholders in shard_fp32_from_float16_groups; with
+    # reuse_grad_buf_for_mxfp8_param_ag the shared param buffer must be refilled
+    # from those masters each step, so the recipe has to be plumbed to the
+    # optimizer just like Megatron pretrain's get_megatron_optimizer_config does.
+    if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+        optimizer_kwargs["fp8_recipe"] = fp8_cfg.get("fp8_recipe")
 
     # Fused linear logprobs run the decoder but read output_layer.weight directly
     # instead of calling output_layer.forward(). Megatron's distributed-optimizer
