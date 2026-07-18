@@ -331,6 +331,10 @@ def _get_module_from_param_name(model, name: str):
                 current_module = getattr(current_module, part)
     except (AttributeError, IndexError, ValueError) as e:
         print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+    # Fused param names (e.g. "...experts.w13_weight") end the traversal on the
+    # MoERunner itself; normalize to the weight-owning RoutedExperts submodule.
+    if isinstance(current_module, MoERunner):
+        return current_module.routed_experts
     return current_module
 
 

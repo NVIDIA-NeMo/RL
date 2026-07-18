@@ -1556,8 +1556,8 @@ def test_vllm_http_server(cluster, tokenizer):
                     "annotations": None,
                     "audio": None,
                     "function_call": None,
-                    "tool_calls": [],
-                    "reasoning_content": None,
+                    # vLLM 0.25 omits tool_calls when empty and dropped
+                    # reasoning_content in favor of reasoning.
                     "reasoning": None,
                 },
                 "logprobs": {
@@ -1573,6 +1573,7 @@ def test_vllm_http_server(cluster, tokenizer):
                 "finish_reason": "length",
                 "stop_reason": None,
                 "token_ids": None,
+                "routed_experts": None,
             }
         ],
         "service_tier": None,
@@ -1585,7 +1586,9 @@ def test_vllm_http_server(cluster, tokenizer):
         },
         "prompt_logprobs": None,
         "prompt_token_ids": None,
+        "prompt_text": None,
         "kv_transfer_params": None,
+        "metrics": None,
     }
 
     def _standardize(d: dict) -> dict:
