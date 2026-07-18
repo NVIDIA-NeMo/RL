@@ -62,6 +62,9 @@ def _make_master_config(
             "num_prompts_per_step": num_prompts_per_step,
             "num_generations_per_prompt": 2,
             "max_rollout_turns": 1,
+            "val_period": 0,
+            "val_at_start": False,
+            "val_at_end": False,
         },
         policy={
             "max_total_sequence_length": 32,
@@ -71,6 +74,7 @@ def _make_master_config(
                 "colocated": {"enabled": colocated, "resources": {}},
             },
         },
+        checkpointing={"enabled": False},
         loss_fn=ClippedPGLossConfig(),
         env=env if env is not None else {},
     )
