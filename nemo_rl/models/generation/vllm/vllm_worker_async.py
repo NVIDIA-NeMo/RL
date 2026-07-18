@@ -59,6 +59,7 @@ from nemo_rl.models.generation.vllm.streaming_tool_call import (
     StreamingToolCallPromptTooLongError,
     StreamingToolCallSessionClosedError,
     StreamingToolCallSessionNotFoundError,
+    validate_prompt_token_count,
 )
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
@@ -792,6 +793,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 skip_mm_cache: bool,
             ):
                 """Render chat metadata while reusing authoritative prompt tokens."""
+                validate_prompt_token_count(
+                    prompt_token_count=len(request.required_full_prompt_token_ids),
+                    max_prompt_tokens=self.model_config.max_model_len - 1,
+                )
                 renderer = self.renderer
                 mm_config = self.model_config.multimodal_config
                 merged_template_kwargs = merge_kwargs(
@@ -1324,11 +1329,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     generator = await openai_serving_chat.create_chat_completion(
                         request, raw_request
                     )
-            except VLLMValidationError as e:
+            except (VLLMValidationError, StreamingToolCallPromptTooLongError) as e:
                 # vLLM 0.20 raises VLLMValidationError for prompts exceeding
-                # max_model_len during tokenization, instead of returning an
-                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
-                # detect context-length overflow and handle it gracefully.
+                # max_model_len during tokenization. Authoritative incremental
+                # tokens are validated explicitly because vLLM otherwise trusts
+                # them and can overrun its fixed input buffer. Convert either
+                # case to HTTP 400 so the Gym proxy can compact and retry.
                 return JSONResponse(
                     content={
                         "error": {
