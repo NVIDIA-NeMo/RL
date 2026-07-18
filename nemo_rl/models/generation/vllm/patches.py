@@ -477,10 +477,13 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
     requests logprobs and crashes in ``LogprobsProcessor``.
 
     Rebuild the output-side processors from the accumulated authoritative
-    prompt and the new chunk's sampling parameters. This mirrors the scheduler,
-    which discards the last sampled dummy token before applying the update.
-    Guard every replacement so future vLLM versions fail closed instead of
-    receiving a partial source patch.
+    prompt and the new chunk's sampling parameters. Use a shallow request copy
+    for that output-only view: AsyncLLM sends the original request to the
+    scheduler after updating the output processor, and the scheduler must still
+    receive only the incremental chunk. This mirrors the scheduler, which
+    discards the last sampled dummy token before applying the update. Guard
+    every replacement so future vLLM versions fail closed instead of receiving
+    a partial source patch.
     """
     try:
         output_processor_file = _get_vllm_file("v1/engine/output_processor.py")
@@ -490,7 +493,88 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
         )
         return False
 
+    original_apply_snippet = (
+        "    def apply_streaming_update(self, update: StreamingUpdate) -> None:\n"
+        "        # Apply the update to the request state.\n"
+        "        self.streaming_input = not update.final\n"
+        "        # TODO also include relevant output tokens in new prompt here\n"
+        "        #     (match scheduler behavior).\n"
+        "        if update.prompt:\n"
+        "            self.prompt = (\n"
+        "                (self.prompt + update.prompt) if self.prompt else update.prompt\n"
+        "            )\n"
+        "        if self.prompt_token_ids:\n"
+        "            self.prompt_token_ids.extend(update.prompt_token_ids or ())\n"
+        "        else:\n"
+        "            self.prompt_token_ids = update.prompt_token_ids or []\n"
+        "        assert self.prompt_token_ids is not None\n"
+        "        self.prompt_len = len(self.prompt_token_ids)\n"
+        "        if self.stats is not None:\n"
+        "            self.stats.arrival_time = update.arrival_time\n"
+        "        self.is_prefilling = True\n"
+    )
+    unsafe_apply_snippet = (
+        "    def apply_streaming_update(self, update: StreamingUpdate) -> None:\n"
+        "        # Mirror Scheduler._update_request_as_session: the prior chunk's\n"
+        "        # sampled dummy token is not part of the resumed prompt. Recreate\n"
+        "        # output-side state from the accumulated real prompt so neither\n"
+        "        # detokenization nor logprobs retain that discarded token.\n"
+        "        self.streaming_input = not update.final\n"
+        "        if update.prompt:\n"
+        "            self.prompt = (\n"
+        "                (self.prompt + update.prompt) if self.prompt else update.prompt\n"
+        "            )\n"
+        "        if self.prompt_token_ids:\n"
+        "            self.prompt_token_ids.extend(update.prompt_token_ids or ())\n"
+        "        else:\n"
+        "            self.prompt_token_ids = update.prompt_token_ids or []\n"
+        "        assert self.prompt_token_ids is not None\n"
+        "\n"
+        "        request = update.request\n"
+        "        request.prompt_token_ids = list(self.prompt_token_ids)\n"
+        "        request.prompt_embeds = None\n"
+        "        sampling_params = request.sampling_params\n"
+        "        assert sampling_params is not None\n"
+        "        tokenizer = self.tokenizer if sampling_params.detokenize else None\n"
+        "        self.output_kind = sampling_params.output_kind\n"
+        "        self.logprobs_processor = LogprobsProcessor.from_new_request(\n"
+        "            tokenizer=tokenizer, request=request\n"
+        "        )\n"
+        "        self.detokenizer = IncrementalDetokenizer.from_new_request(\n"
+        "            tokenizer=tokenizer, request=request\n"
+        "        )\n"
+        "        self.prompt_embeds = None\n"
+        "        self.prompt_len = len(self.prompt_token_ids)\n"
+        "        self.max_tokens_param = sampling_params.max_tokens\n"
+        "        self.top_p = sampling_params.top_p\n"
+        "        self.n = sampling_params.n\n"
+        "        self.temperature = sampling_params.temperature\n"
+        "        self.sent_tokens_offset = 0\n"
+        "        if self.queue is not None:\n"
+        "            self.queue.aggregate = (\n"
+        "                sampling_params.output_kind == RequestOutputKind.DELTA\n"
+        "            )\n"
+        "        if self.stats is not None:\n"
+        "            self.stats.arrival_time = update.arrival_time\n"
+        "        self.is_prefilling = True\n"
+    )
+    safe_apply_snippet = unsafe_apply_snippet.replace(
+        "        request = update.request\n"
+        "        request.prompt_token_ids = list(self.prompt_token_ids)\n"
+        "        request.prompt_embeds = None\n"
+        "        sampling_params = request.sampling_params\n",
+        "        request = update.request\n"
+        "        output_request = copy(request)\n"
+        "        output_request.prompt_token_ids = list(self.prompt_token_ids)\n"
+        "        output_request.prompt_embeds = None\n"
+        "        sampling_params = request.sampling_params\n",
+    ).replace(
+        "            tokenizer=tokenizer, request=request\n",
+        "            tokenizer=tokenizer, request=output_request\n",
+    )
+
     replacements = (
+        ("import asyncio\n", "import asyncio\nfrom copy import copy\n"),
         (
             "    prompt_token_ids: list[int] | None\n"
             "    arrival_time: float\n"
@@ -516,69 +600,7 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
             "        self.request_id = request_id\n"
             "        self.external_req_id = external_req_id\n",
         ),
-        (
-            "    def apply_streaming_update(self, update: StreamingUpdate) -> None:\n"
-            "        # Apply the update to the request state.\n"
-            "        self.streaming_input = not update.final\n"
-            "        # TODO also include relevant output tokens in new prompt here\n"
-            "        #     (match scheduler behavior).\n"
-            "        if update.prompt:\n"
-            "            self.prompt = (\n"
-            "                (self.prompt + update.prompt) if self.prompt else update.prompt\n"
-            "            )\n"
-            "        if self.prompt_token_ids:\n"
-            "            self.prompt_token_ids.extend(update.prompt_token_ids or ())\n"
-            "        else:\n"
-            "            self.prompt_token_ids = update.prompt_token_ids or []\n"
-            "        assert self.prompt_token_ids is not None\n"
-            "        self.prompt_len = len(self.prompt_token_ids)\n"
-            "        if self.stats is not None:\n"
-            "            self.stats.arrival_time = update.arrival_time\n"
-            "        self.is_prefilling = True\n",
-            "    def apply_streaming_update(self, update: StreamingUpdate) -> None:\n"
-            "        # Mirror Scheduler._update_request_as_session: the prior chunk's\n"
-            "        # sampled dummy token is not part of the resumed prompt. Recreate\n"
-            "        # output-side state from the accumulated real prompt so neither\n"
-            "        # detokenization nor logprobs retain that discarded token.\n"
-            "        self.streaming_input = not update.final\n"
-            "        if update.prompt:\n"
-            "            self.prompt = (\n"
-            "                (self.prompt + update.prompt) if self.prompt else update.prompt\n"
-            "            )\n"
-            "        if self.prompt_token_ids:\n"
-            "            self.prompt_token_ids.extend(update.prompt_token_ids or ())\n"
-            "        else:\n"
-            "            self.prompt_token_ids = update.prompt_token_ids or []\n"
-            "        assert self.prompt_token_ids is not None\n"
-            "\n"
-            "        request = update.request\n"
-            "        request.prompt_token_ids = list(self.prompt_token_ids)\n"
-            "        request.prompt_embeds = None\n"
-            "        sampling_params = request.sampling_params\n"
-            "        assert sampling_params is not None\n"
-            "        tokenizer = self.tokenizer if sampling_params.detokenize else None\n"
-            "        self.output_kind = sampling_params.output_kind\n"
-            "        self.logprobs_processor = LogprobsProcessor.from_new_request(\n"
-            "            tokenizer=tokenizer, request=request\n"
-            "        )\n"
-            "        self.detokenizer = IncrementalDetokenizer.from_new_request(\n"
-            "            tokenizer=tokenizer, request=request\n"
-            "        )\n"
-            "        self.prompt_embeds = None\n"
-            "        self.prompt_len = len(self.prompt_token_ids)\n"
-            "        self.max_tokens_param = sampling_params.max_tokens\n"
-            "        self.top_p = sampling_params.top_p\n"
-            "        self.n = sampling_params.n\n"
-            "        self.temperature = sampling_params.temperature\n"
-            "        self.sent_tokens_offset = 0\n"
-            "        if self.queue is not None:\n"
-            "            self.queue.aggregate = (\n"
-            "                sampling_params.output_kind == RequestOutputKind.DELTA\n"
-            "            )\n"
-            "        if self.stats is not None:\n"
-            "            self.stats.arrival_time = update.arrival_time\n"
-            "        self.is_prefilling = True\n",
-        ),
+        (original_apply_snippet, safe_apply_snippet),
         (
             "        return cls(\n            request_id=request.request_id,\n",
             "        return cls(\n"
@@ -604,6 +626,14 @@ def _patch_vllm_streaming_session_output_state(logger) -> bool:
     with _exclusive_patch_lock(lock_path):
         with open(output_processor_file) as source_file:
             content = source_file.read()
+
+        # Upgrade the first implementation without ever publishing a partial
+        # patch. It rebuilt output state correctly for one continuation, but
+        # mutated the EngineCoreRequest before AsyncLLM sent that same object
+        # to the scheduler, turning later incremental chunks into accumulated
+        # chunks and duplicating the prompt.
+        if unsafe_apply_snippet in content:
+            content = content.replace(unsafe_apply_snippet, safe_apply_snippet, 1)
 
         for old_snippet, new_snippet in replacements:
             if new_snippet in content:

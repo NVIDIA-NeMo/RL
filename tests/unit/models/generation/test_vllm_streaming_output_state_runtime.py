@@ -75,6 +75,38 @@ def _run_streaming_output_state_runtime_check(tmp_path: Path) -> None:
         state.detokenizer.update([999], stop_terminated=False)
         assert state.detokenizer.output_token_ids == [999]
 
+        intermediate_params = SamplingParams(
+            temperature=0,
+            top_p=1,
+            top_k=1,
+            max_tokens=1,
+            output_kind=RequestOutputKind.DELTA,
+        )
+        intermediate_request = EngineCoreRequest(
+            request_id="internal",
+            prompt_token_ids=[12, 13],
+            mm_features=None,
+            sampling_params=intermediate_params,
+            pooling_params=None,
+            arrival_time=2.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            external_req_id="external",
+            resumable=True,
+        )
+        state.apply_streaming_update(
+            module.StreamingUpdate(
+                prompt=None,
+                prompt_token_ids=intermediate_request.prompt_token_ids,
+                arrival_time=intermediate_request.arrival_time,
+                request=intermediate_request,
+            )
+        )
+
+        assert state.prompt_token_ids == [10, 11, 12, 13]
+        assert intermediate_request.prompt_token_ids == [12, 13]
+
         final_params = SamplingParams(
             temperature=0,
             top_p=1,
@@ -85,11 +117,11 @@ def _run_streaming_output_state_runtime_check(tmp_path: Path) -> None:
         )
         final_request = EngineCoreRequest(
             request_id="internal",
-            prompt_token_ids=[12, 13],
+            prompt_token_ids=[14, 15],
             mm_features=None,
             sampling_params=final_params,
             pooling_params=None,
-            arrival_time=2.0,
+            arrival_time=3.0,
             lora_request=None,
             cache_salt=None,
             data_parallel_rank=None,
@@ -105,8 +137,8 @@ def _run_streaming_output_state_runtime_check(tmp_path: Path) -> None:
 
         state.apply_streaming_update(update)
 
-        assert state.prompt_token_ids == [10, 11, 12, 13]
-        assert final_request.prompt_token_ids == state.prompt_token_ids
+        assert state.prompt_token_ids == [10, 11, 12, 13, 14, 15]
+        assert final_request.prompt_token_ids == [14, 15]
         assert state.detokenizer.output_token_ids == []
         assert state.logprobs_processor.num_logprobs == 0
         assert state.logprobs_processor.logprobs == []

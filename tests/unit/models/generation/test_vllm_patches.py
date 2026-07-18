@@ -178,6 +178,7 @@ def test_streaming_session_priority_patch_is_atomic_on_unknown_source(
 
 
 _ORIGINAL_OUTPUT_PROCESSOR = (
+    "import asyncio\n"
     "    prompt_token_ids: list[int] | None\n"
     "    arrival_time: float\n"
     "    final: bool = False\n"
@@ -227,11 +228,17 @@ def test_streaming_session_output_state_patch_is_guarded_and_idempotent(
     assert patches._patch_vllm_streaming_session_output_state(logger)
 
     content = output_processor.read_text()
+    assert content.count("from copy import copy\n") == 1
     assert content.count("    request: EngineCoreRequest\n") == 1
     assert content.count("        self.tokenizer = tokenizer\n") == 1
     assert content.count("            tokenizer=tokenizer,\n") == 1
     assert content.count("            request=request,\n") == 1
-    assert "request.prompt_token_ids = list(self.prompt_token_ids)" in content
+    assert "output_request = copy(request)" in content
+    assert "output_request.prompt_token_ids = list(self.prompt_token_ids)" in content
+    assert (
+        "\n        request.prompt_token_ids = list(self.prompt_token_ids)"
+        not in content
+    )
     assert (
         "tokenizer = self.tokenizer if sampling_params.detokenize else None" in content
     )
@@ -252,6 +259,39 @@ def test_streaming_session_output_state_patch_rejects_unknown_source(
     assert not patches._patch_vllm_streaming_session_output_state(logger)
     logger.warning.assert_called_once()
     assert output_processor.read_text() == "unexpected future implementation\n"
+
+
+def test_streaming_session_output_state_patch_upgrades_mutating_version(
+    tmp_path, monkeypatch
+) -> None:
+    output_processor = tmp_path / "output_processor.py"
+    output_processor.write_text(_ORIGINAL_OUTPUT_PROCESSOR)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _: str(output_processor))
+    logger = MagicMock()
+
+    assert patches._patch_vllm_streaming_session_output_state(logger)
+    unsafe_content = (
+        output_processor.read_text()
+        .replace("from copy import copy\n", "")
+        .replace(
+            "        output_request = copy(request)\n"
+            "        output_request.prompt_token_ids = list(self.prompt_token_ids)\n"
+            "        output_request.prompt_embeds = None\n",
+            "        request.prompt_token_ids = list(self.prompt_token_ids)\n"
+            "        request.prompt_embeds = None\n",
+        )
+        .replace("request=output_request", "request=request")
+    )
+    output_processor.write_text(unsafe_content)
+
+    assert patches._patch_vllm_streaming_session_output_state(logger)
+    upgraded_content = output_processor.read_text()
+    assert upgraded_content.count("from copy import copy\n") == 1
+    assert "output_request = copy(request)" in upgraded_content
+    assert "request=output_request" in upgraded_content
+    assert "\n        request.prompt_token_ids = list(self.prompt_token_ids)" not in (
+        upgraded_content
+    )
 
 
 def test_streaming_session_output_state_patch_is_atomic(tmp_path, monkeypatch) -> None:
