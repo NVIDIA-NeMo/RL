@@ -30,8 +30,11 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
     GenerationOutputSpec,
+    get_num_routed_experts,
+    resolve_routed_experts_dtype,
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -262,6 +265,8 @@ class BaseVllmGenerationWorker:
         """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
         self.model_name = self.cfg["model_name"]
+        # Refined from the model's expert count in _load_model.
+        self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -425,6 +430,9 @@ class BaseVllmGenerationWorker:
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
         hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        self.routed_experts_dtype = resolve_routed_experts_dtype(
+            get_num_routed_experts(hf_config)
+        )
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
                 assert load_format == "dummy", (
@@ -812,6 +820,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 device=input_ids.device,
                 require_complete_routed_experts=return_routed_experts,
                 return_stats=True,
+                routed_experts_dtype=self.routed_experts_dtype,
             )
             if return_routed_experts and full_routed_experts is None:
                 raise RuntimeError(
