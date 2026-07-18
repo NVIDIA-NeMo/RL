@@ -270,11 +270,24 @@ class SingleControllerActor:
         # values at config construction, so no runtime assert is needed here.
         if cfg.batch_selection_strategy == "strict_on_policy":
             cfg.max_weight_staleness_versions = 0
+            cfg.over_sampling = False
             print(
-                "Using strict_on_policy, auto setting "
-                "max_weight_staleness_versions to 0.",
+                "Using strict_on_policy, auto setting max_weight_staleness_versions "
+                "to 0 and over_sampling to False.",
                 flush=True,
             )
+        if cfg.max_weight_staleness_versions == 0 and cfg.over_sampling:
+            raise ValueError(
+                "max_weight_staleness_versions=0 requires over_sampling=False: "
+                "with zero staleness the dispatch gate needs to advance one batch "
+                "per trainer_version, which over_sampling=True bypasses."
+            )
+        if cfg.force_in_order and cfg.over_sampling:
+            raise ValueError(
+                "force_in_order=True requires over_sampling=False so that each "
+                "dispatched batch corresponds to exactly one target training step."
+            )
+
         if cfg.target_groups_per_step is None:
             cfg.target_groups_per_step = cfg.min_groups_per_batch
         if cfg.target_groups_per_step < cfg.min_groups_per_batch:

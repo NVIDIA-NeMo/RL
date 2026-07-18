@@ -176,8 +176,8 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     cfg = SingleControllerConfig.model_construct(
-        batch_selection_strategy="strict_on_policy",
-        max_weight_staleness_versions=0,
+        batch_selection_strategy="staleness_window",
+        max_weight_staleness_versions=1,
         min_groups_per_batch=1,
         group_size=num_generations,
         max_inflight_prompts=max_rollout_prompts,
