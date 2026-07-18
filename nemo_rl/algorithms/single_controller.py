@@ -126,11 +126,9 @@ class SingleControllerConfig(BaseModel, extra="allow"):
 
     # Training
     max_train_steps: int = 10
-    max_rollout_prompts: int = 32
     # Bounded dataset passes, mirroring grpo.py's max_num_epochs loop. One
-    # epoch = one pass over the prompt list. None preserves the unbounded
-    # behavior: max_rollout_prompts alone caps dispatch (cycling through
-    # the prompt list) and no epoch accounting is performed.
+    # epoch = one pass over the dataloader. None = unbounded: the dataloader
+    # is iterated indefinitely until _train_pump reaches max_train_steps.
     max_num_epochs: Optional[int] = None
     # Worker-side optimizer mini-batch size, in samples. SC opens one
     # begin / microbatch×K / finish cycle (= one opt.step) per
@@ -234,7 +232,6 @@ class SingleControllerActor:
     def __init__(
         self,
         cfg: SingleControllerConfig,
-        prompts: list[str],
         dp_client_handle: Any,
         gen_handle: Any,
         trainer_handle: Any,
@@ -246,7 +243,6 @@ class SingleControllerActor:
         tq_buffer: Any = None,
     ) -> None:
         self._cfg = cfg
-        self._prompts = prompts
         self._dp_client = dp_client_handle
         self._gen = gen_handle
         self._trainer = trainer_handle
