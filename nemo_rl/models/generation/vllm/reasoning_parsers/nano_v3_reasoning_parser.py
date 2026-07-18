@@ -25,11 +25,39 @@ class NanoV3ReasoningParser(DeepSeekR1ReasoningParser):
             model_output, request
         )
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
-        if (
+        thinking_enabled = not (
             chat_template_kwargs
             and chat_template_kwargs.get("enable_thinking") is False
-            and final_content is None
-        ):
+        )
+
+        # Nano 3 can close ``</think>`` *after* emitting a complete Qwen-style
+        # XML tool call. vLLM parses tools exclusively from final content, so
+        # leaving this block in reasoning silently turns the tool call into a
+        # plain assistant message. Hoist only a complete tool call that is
+        # demonstrably inside the thinking span; malformed output keeps the
+        # base parser's fail-closed behavior.
+        if thinking_enabled and isinstance(model_output, str):
+            tool_start = model_output.find("<tool_call>")
+            tool_end = model_output.find("</tool_call>", tool_start)
+            think_end = model_output.find("</think>")
+            tool_is_inside_thinking = tool_start >= 0 and (
+                think_end < 0 or tool_start < think_end
+            )
+            tool_is_complete = tool_end >= 0 and (think_end < 0 or tool_end < think_end)
+            if tool_is_inside_thinking and tool_is_complete:
+                reasoning_prefix = model_output[:tool_start]
+                reasoning_content, _ = super().extract_reasoning(
+                    f"{reasoning_prefix}</think>", request
+                )
+                if think_end >= 0:
+                    final_content = (
+                        model_output[tool_start:think_end]
+                        + model_output[think_end + len("</think>") :]
+                    )
+                else:
+                    final_content = model_output[tool_start:]
+
+        if not thinking_enabled and final_content is None:
             return None, reasoning_content
 
         return reasoning_content, final_content
