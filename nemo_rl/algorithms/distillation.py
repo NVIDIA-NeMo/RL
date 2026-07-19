@@ -14,7 +14,8 @@
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from dataclasses import dataclass, fields
+from typing import Any, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -88,44 +89,60 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-class DistillationConfig(TypedDict):
+class DistillationConfig(BaseModel, extra="allow"):
     # Training configuration
-    num_prompts_per_step: int
-    num_generations_per_prompt: int
-    max_rollout_turns: int  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
-    max_num_steps: int  # maximum number of steps to train for
-    max_num_epochs: int  # maximum number of epochs to train for
-    val_batch_size: int
-    val_period: int
-    val_at_start: bool
+    num_prompts_per_step: int = 128
+    num_generations_per_prompt: int = 1
+    max_rollout_turns: int = 1  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+    max_num_steps: int = 1000  # maximum number of steps to train for
+    max_num_epochs: int = 10  # maximum number of epochs to train for
+    val_batch_size: int = 64
+    val_period: int = 20
+    val_at_start: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    max_val_samples: int | None  # None for NeMo-Gym compatibility
-    topk_logits_k: int
-    seed: int
+    val_at_end: bool = False
+    max_val_samples: int | None = 512  # None for NeMo-Gym compatibility
+    topk_logits_k: int = 64
+    seed: int = 42
 
 
-class DistillationSaveState(TypedDict):
+@dataclass
+class DistillationSaveState:
     total_steps: int  # Track total number of steps across all epochs
     current_epoch: int  # Track current epoch
     current_step: int  # Track step within current epoch
-    val_reward: NotRequired[
-        float
-    ]  # Can be any metric. Setted to 'accuracy' by default in validation.
+    val_reward: float  # Can be any metric; defaults to accuracy in validation
     consumed_samples: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
-def _default_distillation_save_state() -> DistillationSaveState:
-    return {
-        "current_epoch": 0,
-        "current_step": 0,
-        "total_steps": 0,
-        "val_reward": -99999999.0,  # Aligned with GRPO
-        "consumed_samples": 0,
-        "total_valid_tokens": 0,
-    }
+def _initial_distillation_save_state() -> DistillationSaveState:
+    return DistillationSaveState(
+        total_steps=0,
+        current_epoch=0,
+        current_step=0,
+        val_reward=-99999999.0,
+        consumed_samples=0,
+        total_valid_tokens=0,
+    )
+
+
+def _load_distillation_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> DistillationSaveState:
+    if loaded_state is None:
+        return _initial_distillation_save_state()
+
+    # Backward compatibility: older checkpoints may not contain these fields.
+    loaded_state = loaded_state.copy()
+    loaded_state.setdefault("total_valid_tokens", 0)
+    loaded_state.setdefault("val_reward", -99999999.0)
+    # Checkpoints may carry dynamic validation metrics; regenerate them after resume.
+    known_fields = {field.name for field in fields(DistillationSaveState)}
+    return DistillationSaveState(
+        **{key: value for key, value in loaded_state.items() if key in known_fields}
+    )
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -227,7 +244,7 @@ def setup(
         # Therefore, we disable SP + packing for distillation.
         dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
         sequence_packing_enabled = (
-            "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
+            "sequence_packing" in cfg and cfg["sequence_packing"].enabled
         )
         sequence_parallel_enabled = (
             "sequence_parallel" in cfg["dtensor_cfg"]
@@ -241,7 +258,7 @@ def setup(
             )
 
     # Set random seed
-    set_seed(distillation_config["seed"])
+    set_seed(distillation_config.seed)
 
     # ==========================
     #         Logger
@@ -254,19 +271,15 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    distillation_save_state: Optional[DistillationSaveState] = cast(
-        Optional[DistillationSaveState],
-        checkpointer.load_training_info(last_checkpoint_path),
-    )
-    if distillation_save_state is None:
-        distillation_save_state = _default_distillation_save_state()
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    distillation_save_state = _load_distillation_save_state(loaded_state)
 
     # ==========================
     #           Data
     # ==========================
     dataloader = StatefulDataLoader(
         train_dataset,
-        batch_size=distillation_config["num_prompts_per_step"],
+        batch_size=distillation_config.num_prompts_per_step,
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
@@ -283,16 +296,16 @@ def setup(
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
     if (
-        distillation_config["val_period"] > 0
-        or distillation_config["val_at_start"]
-        or distillation_config["val_at_end"]
+        distillation_config.val_period > 0
+        or distillation_config.val_at_start
+        or distillation_config.val_at_end
     ):
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=distillation_config["val_batch_size"],
+            batch_size=distillation_config.val_batch_size,
             shuffle=False,
             collate_fn=rl_collate_fn,
         )
@@ -451,8 +464,8 @@ def setup(
     if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
-            distillation_config["max_num_steps"],
-            distillation_config["max_num_epochs"] * len(dataloader),
+            distillation_config.max_num_steps,
+            distillation_config.max_num_epochs * len(dataloader),
         )
         teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -570,8 +583,8 @@ def setup(
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
-            distillation_config["max_num_steps"],
-            distillation_config["max_num_epochs"] * len(dataloader),
+            distillation_config.max_num_steps,
+            distillation_config.max_num_epochs * len(dataloader),
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -668,25 +681,25 @@ def distillation_train(
         print("▶ Using NeMo-Gym rollouts for distillation", flush=True)
 
     # common config/state items
-    current_epoch = distillation_save_state["current_epoch"]  # current epoch
-    current_step = distillation_save_state[
-        "current_step"
-    ]  # current step within current epoch
-    total_steps = distillation_save_state[
-        "total_steps"
-    ]  # total number of steps across all epochs
-    consumed_samples = distillation_save_state["consumed_samples"]
-    total_valid_tokens = distillation_save_state["total_valid_tokens"]
-    val_period = master_config.distillation["val_period"]
-    val_at_start = master_config.distillation["val_at_start"]
-    val_at_end = master_config.distillation["val_at_end"]
+    current_epoch = distillation_save_state.current_epoch  # current epoch
+    current_step = (
+        distillation_save_state.current_step
+    )  # current step within current epoch
+    total_steps = (
+        distillation_save_state.total_steps
+    )  # total number of steps across all epochs
+    consumed_samples = distillation_save_state.consumed_samples
+    total_valid_tokens = distillation_save_state.total_valid_tokens
+    val_period = master_config.distillation.val_period
+    val_at_start = master_config.distillation.val_at_start
+    val_at_end = master_config.distillation.val_at_end
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-    max_epochs = master_config.distillation[
-        "max_num_epochs"
-    ]  # max number of epochs to train for
-    max_steps = master_config.distillation[
-        "max_num_steps"
-    ]  # max number of steps to train for
+    max_epochs = (
+        master_config.distillation.max_num_epochs
+    )  # max number of epochs to train for
+    max_steps = (
+        master_config.distillation.max_num_steps
+    )  # max number of steps to train for
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -739,7 +752,7 @@ def distillation_train(
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
-                            master_config.distillation["num_generations_per_prompt"]
+                            master_config.distillation.num_generations_per_prompt
                         )
                     )
 
@@ -797,9 +810,7 @@ def distillation_train(
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config.distillation[
-                                "max_rollout_turns"
-                            ],
+                            max_rollout_turns=master_config.distillation.max_rollout_turns,
                             greedy=False,
                         )
                     else:
@@ -811,9 +822,7 @@ def distillation_train(
                             max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config.distillation[
-                                "max_rollout_turns"
-                            ],
+                            max_rollout_turns=master_config.distillation.max_rollout_turns,
                             greedy=False,
                         )
                     student_generation.finish_generation()
@@ -871,7 +880,7 @@ def distillation_train(
                 with timer.time("teacher_logprob_inference"):
                     teacher_topk = teacher_policy.get_topk_logits(
                         train_data,
-                        k=master_config.distillation["topk_logits_k"],
+                        k=master_config.distillation.topk_logits_k,
                         timer=timer,
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
@@ -946,7 +955,7 @@ def distillation_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
-                consumed_samples += master_config.distillation["num_prompts_per_step"]
+                consumed_samples += master_config.distillation.num_prompts_per_step
                 timeout.mark_iteration()
 
                 should_save_by_step = (
@@ -967,15 +976,15 @@ def distillation_train(
                 ):
                     student_policy.prepare_for_training()
 
-                    distillation_save_state["current_epoch"] = current_epoch
-                    distillation_save_state["current_step"] = current_step + 1
-                    distillation_save_state["total_steps"] = total_steps + 1
-                    distillation_save_state["total_valid_tokens"] = total_valid_tokens
+                    distillation_save_state.current_epoch = current_epoch
+                    distillation_save_state.current_step = current_step + 1
+                    distillation_save_state.total_steps = total_steps + 1
+                    distillation_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
-                        distillation_save_state["val_reward"] = val_metrics["accuracy"]
-                    elif "val_reward" in distillation_save_state:
-                        del distillation_save_state["val_reward"]
-                    distillation_save_state["consumed_samples"] = consumed_samples
+                        distillation_save_state.val_reward = val_metrics["accuracy"]
+                    elif hasattr(distillation_save_state, "val_reward"):
+                        delattr(distillation_save_state, "val_reward")
+                    distillation_save_state.consumed_samples = consumed_samples
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -995,16 +1004,18 @@ def distillation_train(
                                 "This checkpoint will not be saved as top-k.",
                                 stacklevel=2,
                             )
-                            if full_metric_name in distillation_save_state:
-                                del distillation_save_state[full_metric_name]
+                            if hasattr(distillation_save_state, full_metric_name):
+                                delattr(distillation_save_state, full_metric_name)
                         elif metric_name not in metrics_source:
                             raise ValueError(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            distillation_save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
+                            setattr(
+                                distillation_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
 
                     with timer.time("checkpointing"):
                         print(
@@ -1012,7 +1023,9 @@ def distillation_train(
                             flush=True,
                         )
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, distillation_save_state, master_config
+                            total_steps + 1,
+                            vars(distillation_save_state),
+                            master_config,
                         )
                         student_policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -1164,11 +1177,14 @@ def validate(
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
+        max_val_samples = master_config.distillation.max_val_samples
+        if max_val_samples is None:
+            raise ValueError(
+                "distillation.max_val_samples must be set before validation"
+            )
         max_batches = (
-            master_config.distillation["max_val_samples"]
-            + master_config.distillation["val_batch_size"]
-            - 1
-        ) // master_config.distillation["val_batch_size"]
+            max_val_samples + master_config.distillation.val_batch_size - 1
+        ) // master_config.distillation.val_batch_size
         validation_rollout_metrics: dict[str, list[Any]] = {}
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
@@ -1204,7 +1220,7 @@ def validate(
                     tokenizer,
                     val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=master_config.distillation["max_rollout_turns"],
+                    max_rollout_turns=master_config.distillation.max_rollout_turns,
                     greedy=False,
                 )
             else:
@@ -1214,7 +1230,7 @@ def validate(
                     tokenizer,
                     val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=master_config.distillation["max_rollout_turns"],
+                    max_rollout_turns=master_config.distillation.max_rollout_turns,
                     greedy=False,
                 )
             rewards = val_batch["total_reward"]

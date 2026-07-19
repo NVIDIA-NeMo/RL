@@ -109,7 +109,7 @@ def make_processed_microbatch_iterator(
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
     """
-    pack_sequences = cfg["sequence_packing"]["enabled"]
+    pack_sequences = cfg["sequence_packing"].enabled
 
     for data_dict in raw_iterator:
         # Move to GPU
@@ -177,13 +177,13 @@ def get_microbatch_iterator(
     _, seq_dim_size = get_and_validate_seqlen(data)
 
     # Auto-detect seq_length_key if not provided
-    if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
+    if seq_length_key is None and cfg["sequence_packing"].enabled:
         seq_length_key = "input_lengths"
 
-    if cfg["dynamic_batching"]["enabled"]:
+    if cfg["dynamic_batching"].enabled:
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
-    elif cfg["sequence_packing"]["enabled"]:
+    elif cfg["sequence_packing"].enabled:
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
             data.get_microbatch_iterator_for_packable_sequences_len()

@@ -118,7 +118,7 @@ def main() -> None:
 
     # Validation dataset config setup. Same Gym principle as run_grpo_nemo_gym.py:
     # max_val_samples is derived from len(val_dataset); user-set values are rejected.
-    if config.distillation["max_val_samples"] is not None:
+    if config.distillation.max_val_samples is not None:
         raise ValueError(
             """A non-null `distillation.max_val_samples` parameter is not supported.
 
@@ -131,8 +131,8 @@ The validation set you pass in will directly be used for validation with no addi
         print(
             f"Setting `distillation.max_val_samples` and `distillation.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
         )
-        config.distillation["max_val_samples"] = len(val_dataset)
-        config.distillation["val_batch_size"] = config.distillation["max_val_samples"]
+        config.distillation.max_val_samples = len(val_dataset)
+        config.distillation.val_batch_size = config.distillation.max_val_samples
 
     # Print config
     print("Final config:")

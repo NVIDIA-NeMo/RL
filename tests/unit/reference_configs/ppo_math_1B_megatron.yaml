@@ -90,7 +90,10 @@ policy:
   model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${policy.model_name}
+    chat_template: "default"
     chat_template_kwargs: null
+    audio: null
+    video: null
   hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
@@ -207,6 +210,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    fuse_loss: false
     sequence_length_round: 64
 
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
@@ -259,7 +263,10 @@ value:
   model_name: ${policy.model_name}
   tokenizer:
     name: ${value.model_name}
+    chat_template: "default"
     chat_template_kwargs: null
+    audio: null
+    video: null
   hf_config_overrides: {}
 
   train_global_batch_size: ${policy.train_global_batch_size}

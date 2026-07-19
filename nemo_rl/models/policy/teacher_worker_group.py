@@ -36,6 +36,7 @@ from nemo_rl.distributed.batched_data_dict import (
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.policy import DraftConfigDisabled
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 
 
@@ -162,7 +163,7 @@ class TeacherWorkerGroup:
         if "peft" in cfg["megatron_cfg"]:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         if "draft" in cfg:
-            cfg["draft"]["enabled"] = False
+            cfg["draft"] = DraftConfigDisabled()
         # The teacher uses the plain Megatron worker, so a student-side quant_cfg
         # would be silently ignored. Drop it explicitly and warn instead.
         if cfg.get("quant_cfg") is not None:
@@ -226,13 +227,13 @@ class TeacherWorkerGroup:
         self._micro_batch_size = teacher_cfg.micro_batch_size
 
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
-        self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
-        self.use_dynamic_batches = cfg["dynamic_batching"]["enabled"]
+        self.use_sequence_packing = cfg["sequence_packing"].enabled
+        self.use_dynamic_batches = cfg["dynamic_batching"].enabled
         # SP-forward divisor; the collector reads it to pre-pad non-packed inputs.
         self.sequence_length_pad_multiple = cp * 2 * tp if cp > 1 else tp
         if self.use_sequence_packing:
             self.sequence_packing_args: SequencePackingArgs = {
-                "algorithm": cfg["sequence_packing"]["algorithm"],
+                "algorithm": cfg["sequence_packing"].algorithm,
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": self.sequence_length_pad_multiple,
@@ -248,9 +249,11 @@ class TeacherWorkerGroup:
         mbs = micro_batch_size or self._micro_batch_size
 
         if self.use_sequence_packing:
-            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
-                "sequence_packing"
-            ]["logprob_mb_tokens"]
+            logprob_mb_tokens = self.cfg["sequence_packing"].logprob_mb_tokens
+            assert logprob_mb_tokens is not None, (
+                "sequence_packing.logprob_mb_tokens must be configured for teacher logprob"
+            )
+            self.sequence_packing_args["max_tokens_per_microbatch"] = logprob_mb_tokens
             sharded_data, unsorted_data_indices = data.shard_by_batch_size(
                 dp_size,
                 batch_size=None,

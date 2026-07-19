@@ -17,6 +17,7 @@ from typing import Any, Dict, List, NotRequired, Optional, Tuple, TypedDict
 
 import ray
 import torch
+from pydantic import TypeAdapter
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.interfaces import LLMMessageLogType, TaskDataSpec
@@ -29,7 +30,14 @@ from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluste
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.vllm import VllmConfig
-from nemo_rl.models.policy import DynamicBatchingConfig, SequencePackingConfig
+from nemo_rl.models.policy import (
+    DynamicBatchingConfig,
+    DynamicBatchingConfigDisabled,
+    RewardModelConfig,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
 
 
@@ -56,14 +64,16 @@ class RewardModelEnvironmentConfig(TypedDict):
 
     enabled: bool
     model_name: str
+    tokenizer: TokenizerConfig
     precision: str
     batch_size: int
     checkpoint_path: str
     logprob_batch_size: int
     resources: Dict[str, Any]
+    reward_model_cfg: RewardModelConfig
     dtensor_cfg: Optional[Dict[str, Any]]
-    dynamic_batching: DynamicBatchingConfig = {"enabled": False}
-    sequence_packing: NotRequired[SequencePackingConfig] = {"enabled": False}
+    dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
+    sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     max_grad_norm: Optional[float] = None
     generation: Optional[VllmConfig] = None
 
@@ -98,19 +108,29 @@ class RewardModelEnvironment(EnvironmentInterface):
         print(f"📋 Received config: {config}")
 
         self.config = config
+        self.config["tokenizer"] = TokenizerConfig.model_validate(
+            self.config["tokenizer"]
+        )
+        self.config["reward_model_cfg"] = RewardModelConfig.model_validate(
+            self.config["reward_model_cfg"]
+        )
+        self.config["dynamic_batching"] = TypeAdapter(
+            DynamicBatchingConfig | DynamicBatchingConfigDisabled
+        ).validate_python(self.config["dynamic_batching"])
+        self.config["sequence_packing"] = TypeAdapter(
+            SequencePackingConfig | SequencePackingConfigDisabled
+        ).validate_python(self.config.get("sequence_packing", {"enabled": False}))
 
-        assert self.config["reward_model_cfg"]["enabled"], (
+        assert self.config["reward_model_cfg"].enabled, (
             "Please set reward_model_cfg.enabled = True in the reward model environment config to enable reward model."
         )
-        assert (
-            self.config["reward_model_cfg"]["reward_model_type"] == "bradley_terry"
-        ), (
+        assert self.config["reward_model_cfg"].reward_model_type == "bradley_terry", (
             "Reward model environment currently only support with Bradley-Terry reward model."
         )
-        assert not self.config["dynamic_batching"]["enabled"], (
+        assert not self.config["dynamic_batching"].enabled, (
             "Dynamic batching is currently not supported with reward model environment."
         )
-        assert not self.config["sequence_packing"]["enabled"], (
+        assert not self.config["sequence_packing"].enabled, (
             "Sequence packing is currently not supported with reward model environment."
         )
         assert self.config["dtensor_cfg"]["enabled"], (
@@ -125,15 +145,8 @@ class RewardModelEnvironment(EnvironmentInterface):
         assert not self.config["dtensor_cfg"]["activation_checkpointing"], (
             "Activation checkpointing is currently not supported with reward model environment."
         )
-        # Add values for reward model cfg. reward_model_cfg must be enabled in reward model environment config.
-        self.config.setdefault("reward_model_cfg", {})
-        self.config["reward_model_cfg"]["enabled"] = True
-        self.config["reward_model_cfg"]["reward_model_type"] = "bradley_terry"
-        # Dynamic batching and sequence packing are disabled in reward model environment config.
-        self.config.setdefault("dynamic_batching", {})
-        self.config.setdefault("sequence_packing", {})
-        self.config["dynamic_batching"]["enabled"] = False
-        self.config["sequence_packing"]["enabled"] = False
+        # The validated configs above already carry the required reward-model and
+        # disabled-batching values used by the policy worker.
         self.config["max_grad_norm"] = None
         # Reward model environment is always using DTensor
         self.config["dtensor_cfg"]["enabled"] = True

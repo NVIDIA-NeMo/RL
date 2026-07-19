@@ -77,7 +77,8 @@ class ValueConfig(TypedDict):
     # Optimizer and scheduler
     optimizer: NotRequired[PytorchOptimizerConfig | None]
     scheduler: NotRequired[
-        list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
+        SinglePytorchSchedulerConfig
+        | list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
         | SchedulerMilestones
         | None
     ]

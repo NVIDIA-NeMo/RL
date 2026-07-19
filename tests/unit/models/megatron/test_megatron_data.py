@@ -37,6 +37,12 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.models.policy import (
+    DynamicBatchingConfig,
+    DynamicBatchingConfigDisabled,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+)
 from tests.unit.models.megatron.megatron_data_actors import (
     GetPackSequenceParametersTestActor,
     PackSequencesTestActor,
@@ -874,8 +880,8 @@ class TestGetMicrobatchIterator:
         mock_data.get_microbatch_iterator_dynamic_shapes_len.return_value = 5
 
         cfg = {
-            "dynamic_batching": {"enabled": True},
-            "sequence_packing": {"enabled": False},
+            "dynamic_batching": DynamicBatchingConfig.model_construct(enabled=True),
+            "sequence_packing": SequencePackingConfigDisabled(),
         }
 
         (
@@ -923,8 +929,8 @@ class TestGetMicrobatchIterator:
         )
 
         cfg = {
-            "dynamic_batching": {"enabled": False},
-            "sequence_packing": {"enabled": True},
+            "dynamic_batching": DynamicBatchingConfigDisabled(),
+            "sequence_packing": SequencePackingConfig.model_construct(enabled=True),
             "megatron_cfg": {
                 "tensor_model_parallel_size": 1,
                 "sequence_parallel": False,
@@ -972,8 +978,8 @@ class TestGetMicrobatchIterator:
         mock_data.make_microbatch_iterator.return_value = iter([])
 
         cfg = {
-            "dynamic_batching": {"enabled": False},
-            "sequence_packing": {"enabled": False},
+            "dynamic_batching": DynamicBatchingConfigDisabled(),
+            "sequence_packing": SequencePackingConfigDisabled(),
         }
 
         mbs = 4
@@ -1021,8 +1027,8 @@ class TestGetMicrobatchIterator:
         )
 
         cfg = {
-            "dynamic_batching": {"enabled": False},
-            "sequence_packing": {"enabled": True},
+            "dynamic_batching": DynamicBatchingConfigDisabled(),
+            "sequence_packing": SequencePackingConfig.model_construct(enabled=True),
             "megatron_cfg": {
                 "tensor_model_parallel_size": 1,
                 "sequence_parallel": False,
@@ -1081,7 +1087,7 @@ class TestMakeProcessedMicrobatchIterator:
 
         raw_iterator = iter([mock_data_dict])
 
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {"sequence_packing": SequencePackingConfigDisabled()}
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,
@@ -1127,7 +1133,7 @@ class TestMakeProcessedMicrobatchIterator:
 
         raw_iterator = iter([mock_data_dict])
 
-        cfg = {"sequence_packing": {"enabled": True}}
+        cfg = {"sequence_packing": SequencePackingConfig.model_construct(enabled=True)}
 
         processed_iterator = make_processed_microbatch_iterator(
             raw_iterator=raw_iterator,

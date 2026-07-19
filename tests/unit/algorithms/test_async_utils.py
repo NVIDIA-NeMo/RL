@@ -38,6 +38,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     ReplayBufferNew,
 )
 from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
+    GRPOConfig,
     MasterConfig,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
@@ -1258,19 +1260,18 @@ class TestAsyncTrajectoryCollector:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
-        config = {
-            "grpo": {
-                "num_prompts_per_step": 2,
-                "num_generations_per_prompt": 3,
-                "max_rollout_turns": 1,
-                "async_grpo": {"max_trajectory_age_steps": 2},
-            },
-            "policy": {
+        return MasterConfig.model_construct(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=3,
+                max_rollout_turns=1,
+                async_grpo=AsyncGRPOConfig.model_construct(max_trajectory_age_steps=2),
+            ),
+            policy={
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
             },
-        }
-        return MasterConfig.model_construct(**config)
+        )
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""
@@ -1603,19 +1604,18 @@ class TestAsyncUtilsIntegration:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
-        config = {
-            "grpo": {
-                "num_prompts_per_step": 2,
-                "num_generations_per_prompt": 2,
-                "max_rollout_turns": 1,
-                "async_grpo": {"max_trajectory_age_steps": 1},
-            },
-            "policy": {
+        return MasterConfig.model_construct(
+            grpo=GRPOConfig.model_construct(
+                num_prompts_per_step=2,
+                num_generations_per_prompt=2,
+                max_rollout_turns=1,
+                async_grpo=AsyncGRPOConfig.model_construct(max_trajectory_age_steps=1),
+            ),
+            policy={
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
             },
-        }
-        return MasterConfig.model_construct(**config)
+        )
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""

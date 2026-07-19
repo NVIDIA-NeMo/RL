@@ -253,7 +253,7 @@ def setup(
         # Context parallelism for the Megatron value model requires sequence packing,
         # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
         if value_config["megatron_cfg"]["context_parallel_size"] > 1:
-            assert value_config["sequence_packing"]["enabled"], (
+            assert value_config["sequence_packing"].enabled, (
                 "Context parallelism (CP>1) for the Megatron PPO value model requires "
                 "value.sequence_packing.enabled=true."
             )
@@ -263,7 +263,7 @@ def setup(
             "Exactly one of value.megatron_cfg.enabled or value.dtensor_cfg.enabled "
             "must be true for the PPO value model."
         )
-        assert value_config["sequence_packing"]["enabled"] is False, (
+        assert value_config["sequence_packing"].enabled is False, (
             "Sequence packing is currently not supported for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
@@ -271,7 +271,7 @@ def setup(
             "Context parallelism (CP>1) is currently not supported for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
-        assert value_config["dynamic_batching"]["enabled"] is False, (
+        assert value_config["dynamic_batching"].enabled is False, (
             "Dynamic batching currently has some issue for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2953."
         )
@@ -1100,9 +1100,10 @@ def ppo_train(
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.ppo["reward_scaling"]
                 )
-                if master_config.ppo["reward_shaping"]["enabled"]:
+                reward_shaping_config = master_config.ppo["reward_shaping"]
+                if reward_shaping_config.enabled:
                     repeated_batch = apply_reward_shaping(
-                        repeated_batch, master_config.ppo["reward_shaping"]
+                        repeated_batch, reward_shaping_config
                     )
 
                 # Process rewards and build training data

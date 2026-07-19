@@ -254,6 +254,7 @@ class AsyncRolloutImpl:
             "turn_gen_tokens": turn_gen_tokens,
             "turn_input_tokens": turn_input_tokens,
             "turn_total_tokens": turn_total_tokens,
+            "max_gen_tokens_per_turn": max(turn_gen_tokens, default=0),
             "per_worker_token_counts": per_worker_token_counts,
         }
         return completion, sample_metrics
@@ -329,6 +330,9 @@ class AsyncRolloutImpl:
         total_tokens = [m["total_tokens"] for m in all_sample_metrics]
         assistant_tokens = [m["assistant_tokens"] for m in all_sample_metrics]
         env_tokens = [m["env_tokens"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
         # truncated metrics
         truncated = [c.truncated for c in completions]
         terminated = [m["terminated"] for m in all_sample_metrics]

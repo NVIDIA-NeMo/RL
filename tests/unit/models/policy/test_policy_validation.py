@@ -23,9 +23,141 @@ when the cluster size is insufficient for the specified parallelism configuratio
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import TypeAdapter
 
-from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy import (
+    DraftConfig,
+    DraftConfigDisabled,
+    DynamicBatchingConfig,
+    DynamicBatchingConfigDisabled,
+    PolicyConfig,
+    PytorchOptimizerConfig,
+    RewardModelConfig,
+    RouterReplayConfig,
+    RouterReplayConfigDisabled,
+    SequencePackingConfig,
+    SequencePackingConfigDisabled,
+    SinglePytorchMilestonesConfig,
+    SinglePytorchSchedulerConfig,
+    TokenizerConfig,
+)
 from nemo_rl.models.policy.lm_policy import Policy
+
+
+@pytest.mark.parametrize(
+    "config_type,disabled_type,payload",
+    [
+        (
+            DynamicBatchingConfig,
+            DynamicBatchingConfigDisabled,
+            {"enabled": False, "legacy_key": 17},
+        ),
+        (
+            SequencePackingConfig,
+            SequencePackingConfigDisabled,
+            {"enabled": False, "legacy_key": 17},
+        ),
+        (
+            DraftConfig,
+            DraftConfigDisabled,
+            {"enabled": False, "legacy_key": 17},
+        ),
+        (
+            RouterReplayConfig,
+            RouterReplayConfigDisabled,
+            {"enabled": False, "legacy_key": 17},
+        ),
+    ],
+)
+def test_disabled_policy_leaf_configs_preserve_extra_fields(
+    config_type, disabled_type, payload
+):
+    config = TypeAdapter(config_type | disabled_type).validate_python(payload)
+
+    assert isinstance(config, disabled_type)
+    assert config.model_dump() == payload
+
+
+def test_sequence_packing_defaults_are_centralized():
+    config = SequencePackingConfig(
+        train_mb_tokens=1024,
+        algorithm="modified_first_fit_decreasing",
+    )
+
+    assert config.logprob_mb_tokens is None
+    assert config.fuse_loss is False
+
+
+def test_tokenizer_config_tracks_missing_vs_explicit_null_chat_template():
+    missing = TokenizerConfig(name="model")
+    explicit_null = TokenizerConfig(name="model", chat_template=None)
+
+    assert "chat_template" not in missing.model_fields_set
+    assert "chat_template" in explicit_null.model_fields_set
+
+    missing.use_processor = True
+    assert missing.use_processor is True
+
+
+@pytest.mark.parametrize(
+    "config_type,payload",
+    [
+        (
+            RewardModelConfig,
+            {
+                "enabled": True,
+                "reward_model_type": "bradley_terry",
+                "legacy_key": 17,
+            },
+        ),
+        (
+            TokenizerConfig,
+            {"name": "model", "legacy_key": 17},
+        ),
+        (
+            PytorchOptimizerConfig,
+            {"name": "torch.optim.AdamW", "kwargs": {}, "legacy_key": 17},
+        ),
+        (
+            SinglePytorchSchedulerConfig,
+            {
+                "name": "torch.optim.lr_scheduler.ConstantLR",
+                "kwargs": {},
+                "legacy_key": 17,
+            },
+        ),
+        (
+            SinglePytorchMilestonesConfig,
+            {"milestones": [5], "legacy_key": 17},
+        ),
+    ],
+)
+def test_policy_leaf_configs_preserve_extra_fields(config_type, payload):
+    config = config_type.model_validate(payload)
+
+    assert config.model_dump(exclude_unset=True) == payload
+
+
+def test_scheduler_union_accepts_single_and_sequential_configs():
+    scheduler_adapter = TypeAdapter(
+        SinglePytorchSchedulerConfig
+        | list[SinglePytorchSchedulerConfig | SinglePytorchMilestonesConfig]
+        | None
+    )
+
+    single = scheduler_adapter.validate_python(
+        {"name": "torch.optim.lr_scheduler.ConstantLR", "kwargs": {}}
+    )
+    sequential = scheduler_adapter.validate_python(
+        [
+            {"name": "torch.optim.lr_scheduler.LinearLR", "kwargs": {}},
+            {"milestones": [5]},
+        ]
+    )
+
+    assert isinstance(single, SinglePytorchSchedulerConfig)
+    assert isinstance(sequential[0], SinglePytorchSchedulerConfig)
+    assert isinstance(sequential[1], SinglePytorchMilestonesConfig)
 
 
 def create_mock_cluster(world_size: int):
@@ -60,7 +192,7 @@ def create_dtensor_config(
     """Create a DTensor configuration for testing."""
     return {
         "model_name": model_name,
-        "tokenizer": {"name": model_name},
+        "tokenizer": TokenizerConfig(name=model_name),
         "generation_batch_size": 1,
         "train_global_batch_size": 4,
         "train_micro_batch_size": 1,
@@ -92,21 +224,20 @@ def create_dtensor_config(
             "tensor_parallel_size": tp,
             "context_parallel_size": cp,
         },
-        "dynamic_batching": {
-            "enabled": True,
-            "train_mb_tokens": 128,
-            "logprob_mb_tokens": 128,
-            "sequence_length_round": 4,
-        },
-        "sequence_packing": {
-            "enabled": False,
-        },
-        "optimizer": {
-            "name": "torch.optim.AdamW",
-            "lr": 5e-6,
-            "weight_decay": 0.01,
-            "betas": [0.9, 0.999],
-        },
+        "dynamic_batching": DynamicBatchingConfig(
+            train_mb_tokens=128,
+            logprob_mb_tokens=128,
+            sequence_length_round=4,
+        ),
+        "sequence_packing": SequencePackingConfigDisabled(),
+        "optimizer": PytorchOptimizerConfig(
+            name="torch.optim.AdamW",
+            kwargs={
+                "lr": 5e-6,
+                "weight_decay": 0.01,
+                "betas": [0.9, 0.999],
+            },
+        ),
     }
 
 
@@ -116,7 +247,7 @@ def create_megatron_config(
     """Create a Megatron configuration for testing."""
     return {
         "model_name": model_name,
-        "tokenizer": {"name": model_name},
+        "tokenizer": TokenizerConfig(name=model_name),
         "generation_batch_size": 1,
         "train_global_batch_size": 4,
         "train_micro_batch_size": 1,
@@ -146,21 +277,24 @@ def create_megatron_config(
             "pipeline_model_parallel_size": pp,
             "context_parallel_size": cp,
         },
-        "dynamic_batching": {
-            "enabled": pp == 1,  # Only enable for single pipeline parallel stage
-            "train_mb_tokens": 128,
-            "logprob_mb_tokens": 128,
-            "sequence_length_round": 4,
-        },
-        "sequence_packing": {
-            "enabled": False,
-        },
-        "optimizer": {
-            "name": "torch.optim.AdamW",
-            "lr": 5e-6,
-            "weight_decay": 0.01,
-            "betas": [0.9, 0.999],
-        },
+        "dynamic_batching": (
+            DynamicBatchingConfig(
+                train_mb_tokens=128,
+                logprob_mb_tokens=128,
+                sequence_length_round=4,
+            )
+            if pp == 1
+            else DynamicBatchingConfigDisabled()
+        ),
+        "sequence_packing": SequencePackingConfigDisabled(),
+        "optimizer": PytorchOptimizerConfig(
+            name="torch.optim.AdamW",
+            kwargs={
+                "lr": 5e-6,
+                "weight_decay": 0.01,
+                "betas": [0.9, 0.999],
+            },
+        ),
     }
 
 

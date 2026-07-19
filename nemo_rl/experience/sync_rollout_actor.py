@@ -265,7 +265,7 @@ class SyncRolloutActor:
             final_batch, rollout_metrics = runner(
                 **common,
                 max_seq_len=cfg.policy["max_total_sequence_length"],
-                max_rollout_turns=cfg.grpo["max_rollout_turns"],
+                max_rollout_turns=cfg.grpo.max_rollout_turns,
             )
         fb = final_batch.to("cpu")
         del final_batch
@@ -283,7 +283,8 @@ class SyncRolloutActor:
         )
 
         router_replay_enabled = bool(
-            (cfg.policy.get("router_replay") or {}).get("enabled", False)
+            cfg.policy.get("router_replay") is not None
+            and cfg.policy["router_replay"].enabled
         )
         if router_replay_enabled and ROUTED_EXPERTS_FIELD not in flat:
             raise RuntimeError(

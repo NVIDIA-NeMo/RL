@@ -445,9 +445,13 @@ class LossPostProcessor:
             )
 
         # wrap loss function with loss input preparation
-        pack_sequences = self.cfg["sequence_packing"]["enabled"]
+        pack_sequences = self.cfg["sequence_packing"].enabled
         if pack_sequences and packed_seq_params is not None:
-            fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
+            sequence_packing_config = self.cfg.get("sequence_packing")
+            fuse_loss = (
+                sequence_packing_config is not None
+                and sequence_packing_config.fuse_loss
+            )
             if fuse_loss:
                 # The fused path prepares loss via prepare_packed_loss_input and
                 # cannot honor a custom prepare_fn (e.g. the value model's); guard
@@ -490,7 +494,7 @@ class LossPostProcessor:
                     loss_fn=loss_fn_wrapped,
                     prepare_fn=prepare_loss_input_wrapped,
                     data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"]["loss_weight"]),
+                    loss_weight=float(self.cfg["draft"].loss_weight),
                     vocab_parallel_rank=get_tensor_model_parallel_rank(),
                     vocab_parallel_group=get_tensor_model_parallel_group(),
                     context_parallel_group=get_context_parallel_group(),
@@ -565,7 +569,7 @@ class LogprobsPostProcessor:
             if self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
-            elif self.cfg["sequence_packing"]["enabled"]:
+            elif self.cfg["sequence_packing"].enabled:
                 tp_grp = get_tensor_model_parallel_group()
                 tp_rank = get_tensor_model_parallel_rank()
                 logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
@@ -640,7 +644,7 @@ class TopkLogitsPostProcessor:
             Callable: Function that takes output tensor and returns
                       (dummy_loss, {"topk_logits": values, "topk_indices": indices})
         """
-        pack = self.cfg["sequence_packing"]["enabled"]
+        pack = self.cfg["sequence_packing"].enabled
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]

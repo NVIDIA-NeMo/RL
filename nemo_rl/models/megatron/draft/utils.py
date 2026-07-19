@@ -18,7 +18,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Callable, Mapping
 
 import torch
 import torch.distributed as dist
@@ -27,6 +27,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.utils import unwrap_model
 from torch import Tensor
+
+from nemo_rl.models.policy import DraftConfig, DraftConfigDisabled
 
 StateDict = dict[str, Tensor]
 CheckpointLoader = Callable[[Path], StateDict]
@@ -1205,12 +1207,12 @@ def copy_policy_lm_head_to_draft(
 
 def build_draft_model(
     model_provider,
-    draft_config: dict[str, Any],
+    draft_config: DraftConfig | DraftConfigDisabled,
     pg_collection: ProcessGroupCollection,
     policy_model_chunk: MegatronModule,
 ) -> MegatronModule | None:
     """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
-    if not draft_config["enabled"]:
+    if not draft_config.enabled:
         return None
 
     from transformers import AutoConfig
@@ -1220,9 +1222,9 @@ def build_draft_model(
         get_eagle3_aux_hidden_state_layers,
     )
 
-    model_name = draft_config.get("model_name")
+    model_name = draft_config.model_name
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
-    draft_num_layers = draft_config.get("num_layers")
+    draft_num_layers = draft_config.num_layers
     config = TransformerConfig(
         normalization="RMSNorm",
         activation_func=torch.nn.functional.silu,
@@ -1293,9 +1295,7 @@ def build_draft_model(
             "eagle_aux_hidden_state_layer_ids", []
         )
     else:
-        config.eagle_aux_hidden_state_layer_ids = (
-            draft_config.get("aux_layer_indices") or []
-        )
+        config.eagle_aux_hidden_state_layer_ids = draft_config.aux_layer_indices or []
     if (
         config.use_aux_hidden_state
         and len(config.eagle_aux_hidden_state_layer_ids) == 0

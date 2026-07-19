@@ -111,7 +111,7 @@ def main() -> None:
         assert config.policy["generation"] is not None, (
             "A generation config is required for GRPO"
         )
-        has_refit_draft_weights = bool(config.policy["draft"]["enabled"])
+        has_refit_draft_weights = bool(config.policy["draft"].enabled)
         megatron_cfg = config.policy.get("megatron_cfg") or {}
         trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
         config.policy["generation"] = configure_generation_config(
@@ -175,28 +175,16 @@ def main() -> None:
     print("=" * 60 + "\n", flush=True)
 
     # Check if async mode is enabled
-    if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
+    if config.grpo.async_grpo is not None and config.grpo.async_grpo.enabled:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
-        unsupported_features = [
-            "use_dynamic_sampling",
-            "reward_scaling",
-            "reward_shaping",
-        ]
-
-        for feature in unsupported_features:
-            if feature not in config.grpo:
-                continue
-
-            if feature == "use_dynamic_sampling":
-                if config.grpo[feature]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
-            else:
-                if config.grpo[feature]["enabled"]:
-                    raise NotImplementedError(
-                        f"{feature} is not supported with async GRPO"
-                    )
+        if config.grpo.use_dynamic_sampling:
+            raise NotImplementedError(
+                "use_dynamic_sampling is not supported with async GRPO"
+            )
+        if config.grpo.reward_scaling.enabled:
+            raise NotImplementedError("reward_scaling is not supported with async GRPO")
+        if config.grpo.reward_shaping.enabled:
+            raise NotImplementedError("reward_shaping is not supported with async GRPO")
 
         # Async GRPO does not support multiple dataloaders
         if config.data["use_multiple_dataloader"]:
@@ -208,7 +196,6 @@ def main() -> None:
 
         print("🚀 Running async GRPO training")
 
-        async_config = config.grpo["async_grpo"]
         # Run async GRPO training
         async_grpo_train(
             policy=policy,
@@ -223,7 +210,7 @@ def main() -> None:
             checkpointer=checkpointer,
             grpo_save_state=grpo_state,
             master_config=master_config,
-            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
             teacher_worker_groups=teacher_worker_groups,
             alias_to_group_alias=alias_to_group_alias,
         )

@@ -14,11 +14,12 @@
 
 import math
 from datetime import datetime
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig, MasterConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
@@ -87,6 +88,36 @@ def get_format_with_simple_role_header(messages):
             + "<|eot_id|>"
         )
     return message
+
+
+@pytest.mark.parametrize(
+    "config,expected_chat_template",
+    [
+        ({"name": "model"}, "tokenizer-default"),
+        (
+            {"name": "model", "chat_template": "default"},
+            "tokenizer-default",
+        ),
+        (
+            {"name": "model", "chat_template": None},
+            COMMON_CHAT_TEMPLATES.passthrough_prompt_response,
+        ),
+    ],
+)
+@patch("nemo_rl.algorithms.utils.AutoTokenizer.from_pretrained")
+def test_get_tokenizer_chat_template_semantics_without_hub(
+    from_pretrained, config, expected_chat_template
+):
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.chat_template = "tokenizer-default"
+    from_pretrained.return_value = tokenizer
+
+    result = get_tokenizer(config)
+
+    assert result is tokenizer
+    assert result.chat_template == expected_chat_template
 
 
 @pytest.mark.hf_gated
@@ -241,7 +272,9 @@ def _base_master_config(colocated: bool):
                 },
             }
         },
-        grpo={"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=8, num_generations_per_prompt=10
+        ),
     )
 
 
@@ -352,7 +385,9 @@ def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
 
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
-    master_config.grpo["async_grpo"] = {"enabled": True}
+    master_config.grpo.async_grpo = AsyncGRPOConfig(
+        enabled=True, max_trajectory_age_steps=1
+    )
 
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,

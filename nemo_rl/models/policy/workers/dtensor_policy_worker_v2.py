@@ -248,7 +248,7 @@ class DTensorPolicyWorkerV2Impl(
         # incompatible transformers versions (v4 head node → v5 worker).
         from nemo_rl.models.automodel.setup import get_tokenizer
 
-        use_processor = config["tokenizer"].get("use_processor", False)
+        use_processor = getattr(config["tokenizer"], "use_processor", False)
         result = get_tokenizer(config["tokenizer"], get_processor=use_processor)
         if use_processor:
             self.processor = result

@@ -105,9 +105,12 @@ class AsyncTrajectoryCollector:
 
         # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
         # This value limits the parallelism of the generation requests.
+        async_grpo_config = self.master_config.grpo.async_grpo
+        if async_grpo_config is None:
+            raise ValueError("grpo.async_grpo must be configured in async mode")
         max_inflight = (
-            int(self.master_config.grpo["num_prompts_per_step"])
-            * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
+            self.master_config.grpo.num_prompts_per_step
+            * async_grpo_config.max_trajectory_age_steps
         ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
@@ -141,8 +144,10 @@ class AsyncTrajectoryCollector:
             [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
         """
         # Read async config strictly from grpo.async_grpo
-        async_cfg = self.master_config.grpo.get("async_grpo", {})
-        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+        async_grpo_config = self.master_config.grpo.async_grpo
+        if async_grpo_config is None:
+            raise ValueError("grpo.async_grpo must be configured in async mode")
+        max_trajectory_age = async_grpo_config.max_trajectory_age_steps
         if generation_weight_version == self.initial_weight_version:
             return [
                 i
@@ -159,10 +164,11 @@ class AsyncTrajectoryCollector:
     ) -> Optional[int]:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
-        num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
-        max_age_steps = int(
-            self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
-        )
+        num_prompts = self.master_config.grpo.num_prompts_per_step
+        async_grpo_config = self.master_config.grpo.async_grpo
+        if async_grpo_config is None:
+            raise ValueError("grpo.async_grpo must be configured in async mode")
+        max_age_steps = async_grpo_config.max_trajectory_age_steps
         last_consumed_target = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
@@ -209,10 +215,11 @@ class AsyncTrajectoryCollector:
         """Check if collection should be paused due to generation limits."""
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
-            num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
-            max_age_steps = int(
-                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
-            )
+            num_prompts = self.master_config.grpo.num_prompts_per_step
+            async_grpo_config = self.master_config.grpo.async_grpo
+            if async_grpo_config is None:
+                raise ValueError("grpo.async_grpo must be configured in async mode")
+            max_age_steps = async_grpo_config.max_trajectory_age_steps
             last_consumed_target = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
@@ -290,8 +297,12 @@ class AsyncTrajectoryCollector:
                 if self._should_pause_for_generation_limits() and self.running:
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                        async_grpo_config = self.master_config.grpo.async_grpo
+                        if async_grpo_config is None:
+                            raise ValueError(
+                                "grpo.async_grpo must be configured in async mode"
+                            )
+                        max_trajectory_age = async_grpo_config.max_trajectory_age_steps
                         target_weights = [
                             self.current_weight_version + i
                             for i in range(max_trajectory_age)
@@ -344,12 +355,13 @@ class AsyncTrajectoryCollector:
         target_weight: Optional[int] = None
         try:
             generation_weight_version = self.current_weight_version
-            num_generations = self.master_config.grpo["num_generations_per_prompt"]
+            num_generations = self.master_config.grpo.num_generations_per_prompt
             num_prompts_in_batch = batch.size
-            num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
-            max_age_steps = int(
-                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
-            )
+            num_prompts_per_step = self.master_config.grpo.num_prompts_per_step
+            async_grpo_config = self.master_config.grpo.async_grpo
+            if async_grpo_config is None:
+                raise ValueError("grpo.async_grpo must be configured in async mode")
+            max_age_steps = int(async_grpo_config.max_trajectory_age_steps)
 
             # Get the next target weight that needs generation
             target_weight = self._get_next_target_for_generation(
@@ -525,8 +537,10 @@ class AsyncTrajectoryCollector:
             )
         else:
             is_async_engine = False
-        in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
-            "in_flight_weight_updates", False
+        in_flight_weight_updates = (
+            self.master_config.grpo.async_grpo.in_flight_weight_updates
+            if self.master_config.grpo.async_grpo is not None
+            else False
         )
 
         if is_async_engine and in_flight_weight_updates:
@@ -556,9 +570,11 @@ class AsyncTrajectoryCollector:
         # Invalidate&recompute vLLM caches after the in-flight weight updates if
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
-        async_cfg = self.master_config.grpo.get("async_grpo", {})
-        if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
-            "recompute_kv_cache_after_weight_updates", False
+        async_cfg = self.master_config.grpo.async_grpo
+        if (
+            async_cfg is not None
+            and async_cfg.in_flight_weight_updates
+            and async_cfg.recompute_kv_cache_after_weight_updates
         ):
             try:
                 print("🔄 Invalidating vLLM prefix/KV caches after weight update")
@@ -801,7 +817,7 @@ class AsyncTrajectoryCollector:
                     tokenizer=self.tokenizer,
                     task_to_env=self.task_to_env,
                     max_seq_len=self.master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=self.master_config.grpo["max_rollout_turns"],
+                    max_rollout_turns=self.master_config.grpo.max_rollout_turns,
                     greedy=False,
                 )
 

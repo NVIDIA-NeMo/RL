@@ -110,14 +110,17 @@ def make_processed_microbatch_iterator(
     Args:
         raw_iterator: Iterator yielding raw BatchedDataDict microbatches
         tokenizer: Tokenizer for processing
-        cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"]["enabled"])
+        cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"].enabled)
         cp_size: Context parallel size
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
     """
     # Infer enable_seq_packing from config to mirror mcore pattern
-    enable_seq_packing = cfg.get("sequence_packing", {}).get("enabled", False)
+    sequence_packing_config = cfg.get("sequence_packing")
+    enable_seq_packing = (
+        sequence_packing_config is not None and sequence_packing_config.enabled
+    )
 
     for data_dict in raw_iterator:
         # Store original shapes before processing
@@ -153,7 +156,7 @@ def get_microbatch_iterator(
 
     Args:
         data: Full dataset to iterate over
-        cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"]["enabled"])
+        cfg: Configuration dictionary (enable_seq_packing is inferred from cfg["sequence_packing"].enabled)
         mbs: Microbatch size
         dp_mesh: Data parallel mesh
         tokenizer: Tokenizer for processing
@@ -163,11 +166,14 @@ def get_microbatch_iterator(
         Tuple of (processed_microbatch_iterator, iterator_length)
     """
     # Infer enable_seq_packing from config to mirror mcore pattern
-    enable_seq_packing = cfg.get("sequence_packing", {}).get("enabled", False)
+    sequence_packing_config = cfg.get("sequence_packing")
+    enable_seq_packing = (
+        sequence_packing_config is not None and sequence_packing_config.enabled
+    )
 
     dummy_iterator: Iterator[BatchedDataDict[Any]] = iter([])
 
-    if cfg["dynamic_batching"]["enabled"]:
+    if cfg["dynamic_batching"].enabled:
         mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
     elif enable_seq_packing:
@@ -227,9 +233,9 @@ def process_microbatch(
             ],  # flash attention 2 expects flattened input
             padding_value=tokenizer.eos_token_id,
             return_attention_mask=False,
-            min_seq_len=cfg["sequence_packing"][
-                "train_mb_tokens"
-            ],  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
+            min_seq_len=cfg[
+                "sequence_packing"
+            ].train_mb_tokens,  # TODO: this is a WAR for sequence packing, we should fix this. Without this, backward will fail when TP is enabled.
         )
         seq_len = input_ids.shape[1]
         attention_mask = None

@@ -49,19 +49,19 @@ def test_run_grpo_dispatches_both_trainers():
 
 
 def test_sync_trainer_rejects_message_level_advantage_penalties():
-    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.algorithms.grpo import GRPOConfig, MasterConfig
     from nemo_rl.algorithms.grpo_sync import (
         _raise_if_message_level_advantage_penalties_enabled,
     )
 
-    cfg_disabled = MasterConfig.model_construct(grpo={})
+    cfg_disabled = MasterConfig.model_construct(grpo=GRPOConfig())
     _raise_if_message_level_advantage_penalties_enabled(cfg_disabled)
 
     cfg_enabled = MasterConfig.model_construct(
-        grpo={
-            "invalid_tool_call_advantage": -5.0,
-            "malformed_thinking_advantage": None,
-        }
+        grpo=GRPOConfig(
+            invalid_tool_call_advantage=-5.0,
+            malformed_thinking_advantage=None,
+        )
     )
     with pytest.raises(
         NotImplementedError,
