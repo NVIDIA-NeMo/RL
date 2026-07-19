@@ -215,6 +215,20 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
     logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
 
 
+def ensure_vllm_source_compat() -> None:
+    """Apply interpreter-independent vLLM source-compat patches.
+
+    Safe to call from any process that imports vLLM directly (e.g. the
+    tools/model_diagnostics scripts, which construct ``vllm.LLM`` without
+    going through a NeMo-RL generation worker). Must be called BEFORE the
+    first ``import vllm`` submodule that pulls in ``vllm.tool_parsers``.
+    Worker processes get this via ``_apply_vllm_patches`` at init.
+    """
+    from vllm.logger import init_logger
+
+    _patch_vllm_tool_parser_namespace_tool(init_logger("vllm_patch"))
+
+
 def _apply_vllm_patches(
     py_executable: str, *, extra_env_vars: list[str] | None = None
 ) -> None:
