@@ -97,7 +97,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     ++data_plane.claim_meta_poll_interval_s=0.5 \
     ++data_plane.global_segment_size=549755813888 \
     ++data_plane.local_buffer_size=68719476736 \
-    ++async_rl.max_weight_staleness_versions=0 \
+    ++async_rl.max_staleness_versions=0 \
     ++async_rl.min_groups_for_streaming_train=4 \
     ++async_rl.max_inflight_prompts=4 \
     ++async_rl.max_buffered_rollouts=4 \
