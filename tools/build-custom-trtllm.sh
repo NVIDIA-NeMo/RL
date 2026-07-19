@@ -91,15 +91,15 @@ sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND
     cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
 
 # Build the wheel.
-#   -a 100-real: Blackwell (sm_100) only — gb200 target. Bump to include
-#                90 for Hopper or 100,90 for both.
+#   -a 90-real;100-real: build Hopper (sm_90) and Blackwell (sm_100) kernels.
 #   --nvrtc_dynamic_linking: required so the wheel links against the venv's
 #                            libnvrtc-builtins lazily instead of statically.
 echo "Building TensorRT-LLM wheel (this takes ~30-60 minutes)..."
 python3 scripts/build_wheel.py \
-    -a "80-real;90-real;100-real" \
+    -a "90-real;100-real" \
     -G Ninja \
     --clean \
+    --use_ccache \
     --nvrtc_dynamic_linking \
     -D "ENABLE_UCX=OFF"
 

@@ -35,6 +35,11 @@ on:
         default: ""
         description: Additional Docker build contexts.
         type: string
+      trtllm-ccache-tag:
+        required: false
+        default: ""
+        description: Registry tag used to restore and update the TRT-LLM ccache image. Empty disables it.
+        type: string
       dockerfile:
         required: true
         description: Path to the Dockerfile.
@@ -82,6 +87,19 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Resolve TRT-LLM ccache seed
+        id: trtllm_ccache_seed
+        if: inputs.trtllm-ccache-tag != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="$REGISTRY/$IMAGE_NAME:${{ inputs.trtllm-ccache-tag }}"
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "build-context=trtllm-ccache-seed=docker-image://$REF" >> "$GITHUB_OUTPUT"
+          else
+            echo "No TRT-LLM ccache image found at $REF; starting with an empty cache"
+          fi
 
       - name: Get recently merged PR cache refs
         id: recent_pr_cache_refs
@@ -160,7 +178,9 @@ jobs:
           push: true
           context: .
           platforms: ${{ inputs.platform }}
-          build-contexts: ${{ inputs.build-contexts }}
+          build-contexts: |
+            ${{ inputs.build-contexts }}
+            ${{ steps.trtllm_ccache_seed.outputs.build-context }}
           build-args: ${{ inputs.build-args }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
@@ -170,3 +190,24 @@ jobs:
           tags: |
             ${{ steps.build_meta.outputs.tags }}
           target: ${{ inputs.target }}
+
+      - name: Update TRT-LLM ccache image
+        if: github.ref == 'refs/heads/main' && inputs.trtllm-ccache-tag != ''
+        uses: docker/build-push-action@v5
+        with:
+          file: ${{ inputs.dockerfile }}
+          push: true
+          context: .
+          platforms: ${{ inputs.platform }}
+          build-contexts: |
+            ${{ inputs.build-contexts }}
+            ${{ steps.trtllm_ccache_seed.outputs.build-context }}
+          build-args: |
+            ${{ inputs.build-args }}
+            CCACHE_EXPORT_KEY=${{ github.run_id }}
+          cache-from: |
+            ${{ steps.build_meta.outputs.cache-from }}
+            ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
+          no-cache: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.trtllm-ccache-tag }}
+          target: trtllm-ccache
