@@ -93,6 +93,32 @@ from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+
+
+class SkipTrainingStubPolicy:
+    """No-op policy used only for the explicit generation benchmark mode.
+
+    Avoids loading the full BF16 training model when training is a pure no-op
+    (weights never update and the generation engine keeps its checkpoint
+    weights). This object deliberately owns no Ray workers or GPUs.
+    """
+
+    def print_node_ip_and_gpu_id(self): pass
+    def prepare_for_lp_inference(self): pass
+    def prepare_for_training(self): pass
+    def start_gen_benchmark_keepalive(self): pass
+    def shutdown(self): pass
+    def prepare_refit_info(self): return None
+    def init_collective(self, *args, **kwargs): return []
+    def init_collective_mcore_generation(self, *args, **kwargs): return []
+
+    def get_logprobs(self, train_data, **kwargs):
+        # Return zeroed logprobs — safe because force_on_policy_ratio=True
+        # forces IS ratio to 1.0 regardless of logprob values.
+        return {"logprobs": torch.zeros_like(train_data["generation_logprobs"])}
+
+    def get_reference_policy_logprobs(self, train_data, **kwargs):
+        return {"reference_logprobs": torch.zeros_like(train_data["generation_logprobs"])}
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -881,6 +907,14 @@ def setup(
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
+        # Skip Megatron model load entirely in the explicit generation-only
+        # benchmark. Weight-update transport is irrelevant because there is no
+        # train step and the generation engine keeps its checkpoint weights.
+        _skip_train = grpo_config.get("gen_benchmark_skip_training", False)
+        if _skip_train:
+            print("  ⚡ gen_benchmark_skip_training=True: "
+                  "skipping Megatron policy init (SkipTrainingStubPolicy)", flush=True)
+            return SkipTrainingStubPolicy(), time.perf_counter() - t0
         p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
@@ -1186,7 +1220,8 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    # Skip entirely when using stub policy (no weight sync needed).
+    if not colocated_inference and not isinstance(policy, SkipTrainingStubPolicy):
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -1225,9 +1260,10 @@ def setup(
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+    if not isinstance(policy, SkipTrainingStubPolicy):
+        state_dict_info = policy.prepare_refit_info()
+        if policy_generation is not None:
+            policy_generation.prepare_refit_info(state_dict_info)
 
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
@@ -2281,6 +2317,8 @@ def grpo_train(
         isinstance(policy_generation, MegatronGeneration)
         and master_config.policy["generation"]["colocated"]["enabled"]
     )
+    if isinstance(policy, SkipTrainingStubPolicy):
+        NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None
 
@@ -2881,11 +2919,24 @@ def grpo_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if grpo_config.get("gen_benchmark_skip_training", False):
+                        _valid_toks = int(train_data["token_mask"].sum().item())
+                        _valid_seqs = int(train_data["sample_mask"].sum().item())
+                        train_results = {
+                            "loss": torch.tensor(0.0),
+                            "grad_norm": torch.tensor(0.0),
+                            "all_mb_metrics": {
+                                "global_valid_toks": [_valid_toks],
+                                "global_valid_seqs": [_valid_seqs],
+                                "gen_kl_error": [0.0],
+                            },
+                        }
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
@@ -3596,6 +3647,15 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
+    SKIP_TRAINING_BENCHMARK = master_config.grpo.get("gen_benchmark_skip_training", False)
+    if SKIP_TRAINING_BENCHMARK:
+        print(
+            "⚠️ gen_benchmark_skip_training=True: policy.train() is a no-op; "
+            "weights are frozen and the generation engine keeps its checkpoint weights."
+        )
+        if hasattr(policy, "start_gen_benchmark_keepalive"):
+            policy.start_gen_benchmark_keepalive()
+
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -3606,6 +3666,9 @@ def async_grpo_train(
         isinstance(policy_generation, MegatronGeneration)
         and master_config.policy["generation"]["colocated"]["enabled"]
     )
+    # Stub policy has no weights to refit — TRT-LLM keeps its checkpoint weights.
+    if isinstance(policy, SkipTrainingStubPolicy):
+        NEED_REFIT = False
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
@@ -3989,8 +4052,12 @@ def async_grpo_train(
                     continue
 
                 # Optional sanity: ensure DP divisibility to avoid sharding issues
-                dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
-                if expected_batch_size % dp_size != 0:
+                dp_size = (
+                    None
+                    if isinstance(policy, SkipTrainingStubPolicy)
+                    else policy.sharding_annotations.get_axis_size("data_parallel")
+                )
+                if dp_size is not None and expected_batch_size % dp_size != 0:
                     raise AssertionError(
                         f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
                     )
@@ -4218,11 +4285,24 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if SKIP_TRAINING_BENCHMARK:
+                        _valid_toks = int(train_data["token_mask"].sum().item())
+                        _valid_seqs = int(train_data["sample_mask"].sum().item())
+                        train_results = {
+                            "loss": torch.tensor(0.0),
+                            "grad_norm": torch.tensor(0.0),
+                            "all_mb_metrics": {
+                                "global_valid_toks": [_valid_toks],
+                                "global_valid_seqs": [_valid_seqs],
+                                "gen_kl_error": [0.0],
+                            },
+                        }
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
@@ -4253,6 +4333,18 @@ def async_grpo_train(
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
                         trajectory_collector.resume_after_refit.remote()
+                elif SKIP_TRAINING_BENCHMARK:
+                    # The async collector uses logical weight versions to decide
+                    # which future training step may receive trajectories. In
+                    # skip-training mode there is intentionally no refit, but the
+                    # logical version still has to advance or collection stops
+                    # after the initial max_trajectory_age_steps lookahead window.
+                    # Avoid advancing after the penultimate step: its lookahead
+                    # already supplies the final batch and another update would
+                    # launch trajectories that can never be consumed.
+                    if step + 2 < master_config.grpo["max_num_steps"]:
+                        weight_version += 1
+                        trajectory_collector.set_weight_version.remote(weight_version)
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
