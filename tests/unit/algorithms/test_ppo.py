@@ -1710,6 +1710,7 @@ def _make_async_ppo_config() -> SimpleNamespace:
         },
         data={"use_multiple_dataloader": False},
         env={},
+        checkpointing={"checkpoint_must_save_by": None},
     )
 
 
@@ -1743,11 +1744,11 @@ def _call_async_ppo_until_guard(
     [
         (
             lambda cfg: cfg.policy["generation"].update(backend="sglang"),
-            "async vLLM",
+            "backend=vllm.*async_engine=true",
         ),
         (
             lambda cfg: cfg.policy["generation"]["vllm_cfg"].update(async_engine=False),
-            "async vLLM",
+            "backend=vllm.*async_engine=true",
         ),
         (
             lambda cfg: setattr(
@@ -2094,7 +2095,7 @@ def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
         num_prompts_per_step=1,
         max_rollout_turns=1,
         skip_reference_policy_logprobs_calculation=False,
-        adv_estimator={"name": "raw_reward"},
+        adv_estimator={"name": "raw_reward", "normalize_advantages": False},
     )
     config.checkpointing = {
         "checkpoint_must_save_by": None,
