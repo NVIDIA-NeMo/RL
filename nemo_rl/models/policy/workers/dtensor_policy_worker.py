@@ -65,6 +65,14 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.distributed.mx_helpers import (
+    ModelExpressPublisher,
+    ModelExpressPublisherOptions,
+    build_v2_publisher,
+    finish_model_express_publication,
+    get_dtensor_local_shard,
+    start_model_express_publication,
+)
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -239,6 +247,7 @@ class DTensorPolicyWorkerImpl(
         configure_dynamo_cache()
 
         self.cfg = config
+        self._model_express_publisher: ModelExpressPublisher | None = None
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
@@ -1882,6 +1891,69 @@ class DTensorPolicyWorkerImpl(
             rank=self.rank,
             worker_name=str(self),
         )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("dtensor_policy_worker/publish_weights_for_model_express")
+    def publish_weights_for_model_express(
+        self,
+        *,
+        version: int,
+        publisher_options: ModelExpressPublisherOptions,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Publish this worker's local DTensor shards through ModelExpress."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache scales are only supported on the Megatron MX path"
+            )
+
+        if self.cpu_offload:
+            self.model = self.move_to_cuda(self.model)
+
+        try:
+            if self._model_express_publisher is None:
+                tp_size = self.tp_size or 1
+                self._model_express_publisher = build_v2_publisher(
+                    rank=self.rank,
+                    # Ray exposes one GPU to each worker, so NIXL must use the
+                    # process-local CUDA index rather than the global rank.
+                    device_id=torch.cuda.current_device(),
+                    fsdp_world_size=self.dp_size,
+                    tp_world_size=tp_size,
+                    pp_world_size=1,
+                    ep_world_size=1,
+                    publisher_options=publisher_options,
+                )
+                self._model_express_publisher.initialize(
+                    model_name=self.cfg["model_name"],
+                    dtype=str(self.dtype).removeprefix("torch."),
+                )
+
+            start_model_express_publication(self._model_express_publisher)
+            for name, tensor in self.model.state_dict().items():
+                shard_spec = None
+                if isinstance(tensor, DTensor):
+                    local, shard_spec = get_dtensor_local_shard(tensor)
+                else:
+                    local = tensor
+                if local.is_floating_point() and local.dtype != self.dtype:
+                    local = local.to(self.dtype, non_blocking=True)
+                local = local.contiguous()
+
+                self._model_express_publisher.add_tensor(
+                    name=name,
+                    tensor=local,
+                    shard_spec=shard_spec,
+                )
+
+            finish_model_express_publication(
+                self._model_express_publisher,
+                version=int(version),
+                worker_rank=self.rank,
+            )
+        finally:
+            if self.cpu_offload:
+                self.model = self.move_to_cpu(self.model)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(

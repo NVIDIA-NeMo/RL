@@ -30,6 +30,7 @@ from nemo_rl.distributed.batched_data_dict import (
     SequencePackingArgs,
     SlicedDataDict,
 )
+from nemo_rl.distributed.mx_helpers import ModelExpressPublisherOptions
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
@@ -1073,6 +1074,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
+
+    def publish_weights_for_model_express(
+        self,
+        *,
+        version: int,
+        publisher_options: ModelExpressPublisherOptions,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Publish rank-local weights through ModelExpress."""
+        return self.worker_group.run_all_workers_single_data(
+            "publish_weights_for_model_express",
+            version=int(version),
+            publisher_options=publisher_options,
+            kv_scales=kv_scales,
+        )
 
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
