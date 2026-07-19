@@ -274,6 +274,46 @@ def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
     logger.info("Successfully patched vLLM RayExecutorV2 TCPStore port selection.")
 
 
+def _rebind_tcpstore_port_selection_in_memory(logger) -> None:
+    """Rebind RayExecutorV2._select_tcpstore_port in this process.
+
+    The EngineCore that calls _select_tcpstore_port is a child process of
+    this worker: under "spawn" it re-imports the (file-patched) module, but
+    under "fork" (vLLM's default) it inherits whatever this process already
+    imported, and the file patch alone is not guaranteed to be in effect
+    there (observed: DSv3 CI runs still picking port VLLM_PORT despite the
+    file patch). Importing the module here and rebinding the staticmethod
+    covers both start methods, and also survives upstream file drift that
+    would make the source anchor miss.
+    """
+    try:
+        import vllm.envs as envs
+        from vllm.utils.network_utils import _get_open_port, get_open_port
+        from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+    except ImportError as e:  # pragma: no cover - layout change guard
+        logger.warning("Could not import RayExecutorV2 for in-memory patch: %s", e)
+        return
+
+    if getattr(RayExecutorV2._select_tcpstore_port, "_nrl_port_offset", False):
+        return
+
+    original_select = RayExecutorV2._select_tcpstore_port
+
+    def _select_tcpstore_port_offset(
+        local_dp_rank: int | None, master_port: int
+    ) -> int:
+        if local_dp_rank is None and envs.VLLM_PORT is not None:
+            try:
+                return _get_open_port(start_port=envs.VLLM_PORT + 32, max_attempts=32)
+            except RuntimeError:
+                return get_open_port()
+        return original_select(local_dp_rank, master_port)
+
+    _select_tcpstore_port_offset._nrl_port_offset = True
+    RayExecutorV2._select_tcpstore_port = staticmethod(_select_tcpstore_port_offset)
+    logger.info("Rebound RayExecutorV2._select_tcpstore_port in memory.")
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -302,3 +342,4 @@ def _apply_vllm_patches(
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
+    _rebind_tcpstore_port_selection_in_memory(patch_logger)
