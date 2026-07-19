@@ -833,34 +833,10 @@ class VllmInternalWorkerExtension:
                     # CUTLASS unquantized MoE backend instead stores w13 as
                     # [w3; w1] = [up; gate]
                     P = vllm_param.shape[1] // 2
-                    moe_mod = vllm_modules.get(vllm_name.rsplit(".", 1)[0])
-                    backend = getattr(
-                        getattr(moe_mod, "quant_method", None),
-                        "unquantized_backend",
-                        None,
-                    )
-                    backend = getattr(backend, "name", "")
-                    if backend == "FLASHINFER_TRTLLM":
-                        # TRTLLM also block-reorders w13 (beyond the swap);
-                        # Requires more changes to the refit logic to support.
-                        # TODO: need to support TRTLLM backend in the future.
-                        raise ValueError(
-                            f"nccl_reshard refit: gen MoE backend {backend!r} reorders "
-                            "w13 in a way the refit does not reproduce; run gen with "
-                            "the TRITON or FlashInfer CUTLASS MoE backend."
-                        )
-                    if backend == "FLASHINFER_CUTLASS":  # live w13 is [up; gate]
-                        sl = (
-                            slice(P, 2 * P)
-                            if grouped_proj == "gate_proj"
-                            else slice(0, P)
-                        )
-                    else:  # standard [gate; up]
-                        sl = (
-                            slice(0, P)
-                            if grouped_proj == "gate_proj"
-                            else slice(P, 2 * P)
-                        )
+                    # Write canonical [gate; up], following vLLM's load_weights
+                    # behavior. Per-MoE-backend layout diversity is resolved later by
+                    # process_weights_after_loading at the end of nccl_reshard_refit.
+                    sl = slice(0, P) if grouped_proj == "gate_proj" else slice(P, 2 * P)
                     mapping[hf_name] = (vllm_param, (slice(None), sl, slice(None)))
                 continue
 
@@ -982,6 +958,20 @@ class VllmInternalWorkerExtension:
                 f"{time.perf_counter() - misc_t0:.2f}s",
                 flush=True,
             )
+        torch.cuda.empty_cache()
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
+
+        # Finalize post-load weight processing: dense Linear + attention/MLA, and
+        # crucially the per-MoE-backend w13 layout (FlashInfer CUTLASS/TRTLLM) that
+        # the canonical [gate; up] bulk write above defers to here.
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(
+                self.model_runner.model, self.model_config, self.device
+            )
+
         torch.cuda.empty_cache()
 
         # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast.
