@@ -1267,7 +1267,10 @@ class TestAsyncTrajectoryCollector:
             MasterConfig as PPOMasterConfig,
         )
 
-        async_config = AsyncPPOConfig(max_trajectory_age_steps=3)
+        async_config = AsyncPPOConfig(
+            max_trajectory_age_steps=3,
+            warmup_max_trajectory_age_steps=5,
+        )
         master_config = PPOMasterConfig.model_construct(
             policy={"make_sequence_length_divisible_by": 1},
             ppo={
@@ -1289,6 +1292,41 @@ class TestAsyncTrajectoryCollector:
         assert collector.algorithm_config is master_config.ppo
         assert collector.async_config is async_config
         assert collector.async_config.max_trajectory_age_steps == 3
+
+        collector.set_generation_window(
+            weight_version=2,
+            generation_lead_steps=3,
+            max_trajectory_age_steps=5,
+        )
+        assert collector.current_weight_version == 2
+        assert collector._generation_lead_steps == 3
+        assert collector._max_trajectory_age_steps == 5
+        assert collector._calculate_target_weights(2) == [3, 4, 5]
+
+    def test_collector_grpo_window_remains_fixed(self):
+        collector = self.create_local_collector()
+
+        assert collector.current_weight_version == 0
+        assert collector._generation_lead_steps == 2
+        assert collector._max_trajectory_age_steps == 2
+        assert collector._calculate_target_weights(0) == [0, 1, 2]
+
+        collector.set_weight_version(5)
+
+        assert collector.current_weight_version == 5
+        assert collector._generation_lead_steps == 2
+        assert collector._max_trajectory_age_steps == 2
+        assert collector._calculate_target_weights(5) == [6, 7]
+
+    def test_collector_rejects_generation_lead_above_validity_age(self):
+        collector = self.create_local_collector()
+
+        with pytest.raises(ValueError, match="max_trajectory_age_steps"):
+            collector.set_generation_window(
+                weight_version=1,
+                generation_lead_steps=3,
+                max_trajectory_age_steps=2,
+            )
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""

@@ -32,6 +32,7 @@ TRAIN_CMD=(
     ppo.reward_shaping.enabled=false
     ppo.async_ppo.enabled=true
     ppo.async_ppo.max_trajectory_age_steps=1
+    ppo.async_ppo.warmup_max_trajectory_age_steps=2
     policy.train_global_batch_size=4
     policy.logprob_batch_size=4
     policy.train_micro_batch_size=1
@@ -67,6 +68,8 @@ test -f "${CKPT_DIR}/step_1/replay_buffer.pt"
 test -d "${CKPT_DIR}/step_2/policy/optimizer"
 test -d "${CKPT_DIR}/step_2/value/optimizer"
 test -f "${CKPT_DIR}/step_2/replay_buffer.pt"
+grep -q "Updated generation window: version=0, lead=2, max_age=2" "${EXP_DIR}/run1.log"
+grep -q "Updated generation window: version=1, lead=1, max_age=2" "${EXP_DIR}/run1.log"
 
 "${TRAIN_CMD[@]}" \
     ppo.max_num_steps=4 \
@@ -76,11 +79,12 @@ test -f "${CKPT_DIR}/step_2/replay_buffer.pt"
 
 grep -q "Restoring replay buffer from checkpoint" "${EXP_DIR}/run2.log"
 grep -q "ReplayBuffer restored:" "${EXP_DIR}/run2.log"
+grep -q "Updated generation window: version=3, lead=1, max_age=1" "${EXP_DIR}/run2.log"
 test -d "${CKPT_DIR}/step_4/policy/weights"
 test -d "${CKPT_DIR}/step_4/value/weights"
 
-for run_spec in "run1 1" "run2 2"; do
-    read -r run expected_policy_steps <<< "${run_spec}"
+for run_spec in "run1 1 1" "run2 2 2"; do
+    read -r run expected_policy_steps expected_max_age <<< "${run_spec}"
     metrics="${EXP_DIR}/metrics_${run}.json"
     uv run tests/json_dump_tb_logs.py "${EXP_DIR}/logs_${run}" \
         --output_path "${metrics}"
@@ -98,6 +102,6 @@ for run_spec in "run1 1" "run2 2"; do
         'min(data["train/critic/loss"]) >= 0' \
         'max(data["train/critic/explained_var"]) <= 1.0001' \
         'min(data["train/buffer_size"]) >= 0' \
-        'max(data["train/avg_trajectory_age"]) <= 1' \
+        "max(data[\"train/avg_trajectory_age\"]) <= ${expected_max_age}" \
         'len(data["validation/accuracy"]) == 1'
 done
