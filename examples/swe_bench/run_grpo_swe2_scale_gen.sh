@@ -44,7 +44,7 @@
 # Optional env: SKIP_TRAINING, TRAJECTORY_COLLECTION, ROLLOUT_ONLY_GPP,
 #               TRAJECTORY_COLLECTION_BATCH_SIZE, TRAIN_DATA_PATH, VAL_DATA_PATH,
 #               TRAIN_NODES, TRAIN_TP, VLLM_TP, CONFIG_FILE, WANDB_GROUP,
-#               EXP_SUFFIX, MODEL_PATH,
+#               EXP_SUFFIX, MODEL_PATH, TOKENIZER_PATH,
 #               CONTAINER, MAX_NUM_STEPS, SBATCH_TIME, SBATCH_DEPENDENCY,
 #               CACHE_NAMESPACE, PERSISTENT_CACHE,
 #               UV_CACHE_SEED_MODE,
@@ -92,6 +92,11 @@ else
   DEFAULT_MODEL_PATH="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
 fi
 MODEL_PATH="${1:-${MODEL_PATH:-${DEFAULT_MODEL_PATH}}}"
+# Keep the recipe tokenizer by default because Base-model training may
+# intentionally pair a Base checkpoint with an instruction tokenizer. Set this
+# explicitly when evaluating a different model family or checkpoint whose
+# tokenizer/chat template must follow MODEL_PATH.
+TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 
 # ================ Container and mount config ================
 # NeMo RL nightly-gym used for Nano 3 streaming-prefill development.
@@ -614,6 +619,7 @@ echo "  CONCURRENCY   = ${CONCURRENCY}"
 echo "  invariants    : samples/replica=${PER_REPLICA_SAMPLES}, batch/train-GPU=${PER_GPU_BATCH}"
 echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, pad=${MAKE_SEQ_DIVISIBLE_BY}"
 echo "Model: ${MODEL_PATH}"
+echo "Tokenizer: ${TOKENIZER_PATH:-recipe default}"
 echo "Container: ${CONTAINER}"
 echo "Cache namespace: ${CACHE_NAMESPACE}"
 echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
@@ -895,6 +901,10 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   logger.wandb.name=${WANDB_NAME} \
   logger.wandb.project=${WANDB_PROJ} \
   ++logger.wandb.group=${WANDB_GROUP}"
+
+if [ -n "${TOKENIZER_PATH}" ]; then
+  export COMMAND="${COMMAND} policy.tokenizer.name=${TOKENIZER_PATH}"
+fi
 
 if [ -n "${STREAMING_MIN_CHUNK_CHARS}" ]; then
   export COMMAND="${COMMAND} \
