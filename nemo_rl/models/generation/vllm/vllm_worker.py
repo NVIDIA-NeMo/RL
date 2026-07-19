@@ -247,6 +247,14 @@ class BaseVllmGenerationWorker:
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
+        self._sparse_refit_receiver: Any = None
+        if self.is_model_owner and self.cfg.get("refit_transport") is not None:
+            # Avoid receiver dependencies and threads for existing refit transports.
+            from nemo_rl.models.generation.vllm.vllm_sparse_refit import (
+                VllmSparseRefitReceiver,
+            )
+
+            self._sparse_refit_receiver = VllmSparseRefitReceiver(self)
 
         if not self.is_model_owner:
             return
@@ -650,6 +658,27 @@ class BaseVllmGenerationWorker:
                     metrics[metric.name] = metric.value
         return metrics
 
+    def report_refit_server_base_url(self) -> str | None:
+        receiver = self._sparse_refit_receiver
+        return receiver.report_refit_server_base_url() if receiver is not None else None
+
+    def start_zmq_sparse_refit_relay(self) -> str:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        return receiver.start_zmq_sparse_refit_relay()
+
+    def configure_zmq_sparse_refit_relay(self, relay_addresses: list[str]) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        receiver.configure_zmq_sparse_refit_relay(relay_addresses)
+
+    def stop_zmq_sparse_refit_relay(self) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is not None:
+            receiver.stop_zmq_sparse_refit_relay()
+
 
 class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
@@ -665,6 +694,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
             )
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.start_sync_server()
 
     def init_collective(
         self,
@@ -1090,6 +1121,9 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self._sparse_refit_receiver is not None:
+                self._sparse_refit_receiver.shutdown()
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())

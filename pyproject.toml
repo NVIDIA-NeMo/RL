@@ -66,6 +66,8 @@ dependencies = [
   "nccl4py; sys_platform != 'darwin'",                                                                                       # for non-colocated refit
   "cuda-bindings; sys_platform != 'darwin'",                                                                                 # for non-colocated refit
   "pybase64",                                                                                                                # for sglang refit
+  "awscrt>=0.35.0",                                                                                                          # for parallel S3 refit transport
+  "zstandard",                                                                                                               # for sparse refit body compression
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                                  # for transformer-engine no build isolation
   # tilelang — replacement Triton kernel mamba-ssm requires when
   # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.

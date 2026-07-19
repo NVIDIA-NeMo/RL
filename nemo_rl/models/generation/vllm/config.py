@@ -14,7 +14,11 @@
 
 from typing import Any, Literal, NotRequired, TypedDict
 
+from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
+
 from nemo_rl.models.generation.interfaces import GenerationConfig
+
+VllmRefitTransportName = Literal["s3", "zmq"]
 
 
 class VllmSpecificArgs(TypedDict):
@@ -39,6 +43,12 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Environment variable containing the internal refit API key.
+    http_refit_api_key_env_var: NotRequired[str | None]
+    # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
+    http_refit_server_port: NotRequired[int | None]
+    # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
+    zmq_refit_server_port: NotRequired[int | None]
     # These kwargs are passed to the vllm.LLM HTTP server Chat Completions endpoint config. Typically this will include things like tool parser, chat template, etc
     http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
     # Miscellaneous top level vLLM HTTP server arguments.
@@ -52,9 +62,61 @@ class VllmSpecificArgs(TypedDict):
     reasoning_parser_plugin: NotRequired[str]
 
 
+class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
+    encoding: Literal["xor", "overwrite"] = "xor"
+    sparse_bucket_size_bytes: PositiveInt = 512 * 1024**2
+    export_chunk_bytes: dict[str, PositiveInt] = Field(
+        default_factory=lambda: {"s3": 64 * 1024**2, "zmq": 256 * 1024**2}
+    )
+    zstd_threads: dict[str, NonNegativeInt] = Field(
+        default_factory=lambda: {"s3": 0, "zmq": 0}
+    )
+
+
+class VllmRefitStorageConfig(BaseModel, extra="allow"):
+    s3_bucket: str | None = None
+    s3_region: str = "us-east-1"
+    s3_prefix: str = "nemo-rl-refit"
+    staging_dir: str = "/dev/shm"
+
+
+class VllmRefitBaselineConfig(BaseModel, extra="allow"):
+    in_memory: bool = False
+    mmap_dir: str | None = None
+
+
+class VllmRefitTuningConfig(BaseModel, extra="allow"):
+    encode_workers: dict[str, PositiveInt] = Field(
+        default_factory=lambda: {"s3": 8, "zmq": 8}
+    )
+    transfer_workers: dict[str, PositiveInt] = Field(
+        default_factory=lambda: {"s3": 32, "zmq": 4}
+    )
+    zmq_retries: NonNegativeInt = 3
+    zmq_relay_payload_workers: PositiveInt = 16
+    zmq_relay_forward_workers: PositiveInt = 8
+    apply_queue_depth: PositiveInt = 32
+    apply_batch_size: PositiveInt = 8
+    partition_workers: PositiveInt = 8
+
+
+class VllmRefitConfig(BaseModel, extra="allow"):
+    delta_compression: VllmDeltaCompressionConfig = Field(
+        default_factory=VllmDeltaCompressionConfig
+    )
+    storage: VllmRefitStorageConfig = Field(default_factory=VllmRefitStorageConfig)
+    baseline: VllmRefitBaselineConfig = Field(default_factory=VllmRefitBaselineConfig)
+    tuning: VllmRefitTuningConfig = Field(default_factory=VllmRefitTuningConfig)
+    verify_samples_per_payload: NonNegativeInt = 0
+    request_timeout_s: PositiveFloat = 600.0
+
+
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Null uses NCCL; remote sparse refit supports S3 or ZeroMQ value planes.
+    refit_transport: NotRequired[Literal["vllm_s3_sparse", "vllm_zmq_sparse"] | None]
+    refit_cfg: NotRequired[VllmRefitConfig | None]
 
     # quantization config
     quant_cfg: NotRequired[str | None]
@@ -63,3 +125,12 @@ class VllmConfig(GenerationConfig):
     # modules. This is intended for ModelOpt NVFP4 rollout experiments.
     real_quant: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
+
+
+def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
+    """Resolve sparse-refit defaults into the generation config."""
+    if config.get("refit_transport") is None:
+        return None
+    refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
+    config["refit_cfg"] = refit_config
+    return refit_config
