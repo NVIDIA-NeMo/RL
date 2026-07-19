@@ -39,9 +39,11 @@ class FakeTokenizer:
 
     Tokenization is character-level with a fixed pad token at id 0.
     Texts longer than ``max_length`` are truncated; shorter texts are
-    padded to ``max_length``. Returns the dict shape HF tokenizers
-    produce (``input_ids``, ``attention_mask``) when called with
-    ``return_tensors="pt"``.
+    padded to ``max_length``. Returns the dict shape HF fast tokenizers
+    produce (``input_ids``, ``attention_mask``, and ``offset_mapping`` when
+    ``return_offsets_mapping=True``) when called with ``return_tensors="pt"``.
+    Character-level tokenization makes offsets trivial: content token ``k``
+    covers ``(k, k+1)``; padding covers ``(0, 0)``.
     """
 
     eos_token = "<eos>"
@@ -53,25 +55,40 @@ class FakeTokenizer:
         self.pad_token = "<pad>"
         self._prefix = prefix
 
-    def __call__(self, texts, padding, truncation, max_length, return_tensors):
+    def __call__(
+        self,
+        texts,
+        padding,
+        truncation,
+        max_length,
+        return_tensors,
+        return_offsets_mapping=False,
+    ):
         assert padding == "max_length"
         assert truncation is True
         assert return_tensors == "pt"
         all_ids = []
         all_mask = []
+        all_offsets = []
         for t in texts:
             ids = [2 + (ord(c) % (self.vocab_size - 2)) for c in t][:max_length]
             mask = [1] * len(ids)
+            offsets = [(k, k + 1) for k in range(len(ids))]
             if len(ids) < max_length:
                 pad_n = max_length - len(ids)
                 ids = ids + [self.pad_token_id] * pad_n
                 mask = mask + [0] * pad_n
+                offsets = offsets + [(0, 0)] * pad_n
             all_ids.append(ids)
             all_mask.append(mask)
-        return {
+            all_offsets.append(offsets)
+        out = {
             "input_ids": torch.tensor(all_ids, dtype=torch.long),
             "attention_mask": torch.tensor(all_mask, dtype=torch.long),
         }
+        if return_offsets_mapping:
+            out["offset_mapping"] = torch.tensor(all_offsets, dtype=torch.long)
+        return out
 
     def convert_ids_to_tokens(self, ids):
         # Prefix the tokenizer name into each token id so two FakeTokenizer
