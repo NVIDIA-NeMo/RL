@@ -218,6 +218,24 @@ BENCH_SAME_REQUEST_PREFILL_CHUNKS="${BENCH_SAME_REQUEST_PREFILL_CHUNKS:-1}"
 BENCH_CONCURRENT_SAME_REQUEST_SESSIONS="${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS:-0}"
 BENCH_FINAL_DECODE_PREFILL_LOGPROBS="${BENCH_FINAL_DECODE_PREFILL_LOGPROBS:-none}"
 BENCH_DIAGNOSE_NAN_LOGITS="${BENCH_DIAGNOSE_NAN_LOGITS:-false}"
+if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
+  if ! [[ "${BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS must be a positive integer." >&2
+    exit 1
+  fi
+  IFS=',' read -ra candidate_chunks <<< "${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP}"
+  for raw_candidate_tokens in "${candidate_chunks[@]}"; do
+    candidate_tokens="${raw_candidate_tokens//[[:space:]]/}"
+    if ! [[ "${candidate_tokens}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: candidate chunk sizes must be positive integers." >&2
+      exit 1
+    fi
+    if (( 2 * candidate_tokens >= BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS )); then
+      echo "ERROR: tool output must exceed twice every candidate chunk size (tool_output=${BENCH_FINAL_DECODE_TOOL_OUTPUT_TOKENS}, candidate=${candidate_tokens})." >&2
+      exit 1
+    fi
+  done
+fi
 if [[ "${BENCH_FINAL_DECODE_PREFILL_LOGPROBS}" != "none" \
   && "${BENCH_FINAL_DECODE_PREFILL_LOGPROBS}" != "zero" ]]; then
   echo "ERROR: BENCH_FINAL_DECODE_PREFILL_LOGPROBS must be none or zero." >&2
