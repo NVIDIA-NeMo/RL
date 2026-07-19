@@ -31,6 +31,10 @@ ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 # Empty default; CI overrides with --build-context to inject pre-compiled wheels
 FROM scratch AS uv-cache-seed
 
+# Empty default; CI overrides with --build-context to restore the TRT-LLM
+# compiler cache from a registry image.
+FROM scratch AS trtllm-ccache-seed
+
 # Default custom-setup stage: installs apptainer.
 # Override with: --build-context custom-setup=<your-dir>
 FROM scratch AS custom-setup
@@ -138,6 +142,8 @@ ARG SKIP_SGLANG_BUILD
 ARG SKIP_TRTLLM_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
+ARG TARGETARCH
+ARG TRTLLM_CCACHE_MAXSIZE=200G
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -174,7 +180,17 @@ COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
+    --mount=type=cache,id=trtllm-ccache-${TARGETARCH},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+# These settings are build-only and intentionally do not persist in the final
+# NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
+# between ephemeral CI runners.
+export CCACHE_DIR=/root/.cache/ccache
+export CCACHE_COMPILERCHECK=content
+export CCACHE_COMPRESS=true
+export CCACHE_MAXSIZE="${TRTLLM_CCACHE_MAXSIZE}"
+
 CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
 if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
@@ -184,6 +200,10 @@ elif [ -n "$SEED_KEY" ]; then
     mkdir -p /root/.cache/uv
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
 fi
+
+# Merge the registry seed into the builder-local cache mount. Cache entries
+# are content-addressed, so newer local entries are kept when both exist.
+rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
 
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
@@ -326,3 +346,24 @@ RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+
+# Export the builder-local ccache as a separate scratch image. CI builds this
+# target immediately after the release target with the same Buildx builder, so
+# it can read the cache mount without adding ccache data to the release image.
+FROM base AS trtllm-ccache-export
+ARG CCACHE_EXPORT_KEY
+ARG TARGETARCH
+RUN --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
+    --mount=type=cache,id=trtllm-ccache-${TARGETARCH},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+# Make this copy run once per CI build instead of reusing an older export layer.
+echo "Exporting TRT-LLM ccache for build ${CCACHE_EXPORT_KEY:-local}"
+# The hermetic layer may have been reused from BuildKit without executing its
+# RUN command, leaving this builder-local mount empty. Merge the registry seed
+# again here so an existing remote cache can never be replaced by an empty one.
+rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
+mkdir -p /tmp/trtllm-ccache-export
+cp -a /root/.cache/ccache/. /tmp/trtllm-ccache-export/
+EOF
+
+FROM scratch AS trtllm-ccache
+COPY --from=trtllm-ccache-export /tmp/trtllm-ccache-export/ /
