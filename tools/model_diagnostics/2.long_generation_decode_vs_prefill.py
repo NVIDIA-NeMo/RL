@@ -354,6 +354,11 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         seed=seed,
         gpu_memory_utilization=0.8,
+        # This diagnostic only submits a handful of prompts. vLLM >= 0.25
+        # hard-fails when the default max_num_seqs (1024) exceeds the
+        # available Mamba cache blocks on hybrid models (one block per
+        # decode sequence), so keep the sequence budget small.
+        max_num_seqs=64,
     )
     llm = LLM(**llm_kwargs)
 
