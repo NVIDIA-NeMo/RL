@@ -19,6 +19,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.mx_helpers import ModelExpressPublisherOptions
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
 
@@ -222,25 +223,26 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
-    def stream_weights_via_mx(
+    def publish_weights_for_model_express(
         self,
         *,
         version: int,
-        mx_config: Any,
+        publisher_options: ModelExpressPublisherOptions,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> list[ray.ObjectRef]:
         """Publish this policy's rank-local weights through ModelExpress.
 
         Args:
             version: Monotonically increasing model version.
-            mx_config: an :class:`nemo_rl.distributed.mx_helpers.MxConfig`.
+            publisher_options: Internal publisher settings supplied by the
+                ModelExpress weight synchronizer.
             kv_scales: Optional named FP8 Q/K/V scale values.
 
         Returns:
             One Ray object reference per trainer worker.
         """
         raise NotImplementedError(
-            "stream_weights_via_mx is not implemented for this policy worker"
+            "publish_weights_for_model_express is not implemented for this policy worker"
         )
 
     @abstractmethod

@@ -50,6 +50,18 @@ from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.mx_helpers import (
+    ModelExpressPublisher,
+    ModelExpressPublisherOptions,
+    build_v2_publisher,
+    finish_model_express_publication,
+    start_model_express_publication,
+)
+from nemo_rl.distributed.mx_megatron_helpers import (
+    ROLE_COLUMN,
+    ROLE_REPLICATED,
+    collect_megatron_publish_set,
+)
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
@@ -292,6 +304,8 @@ class MegatronPolicyWorkerImpl(
         bind_to_gpu_numa(local_rank)
 
         self.cfg = config
+        self._model_express_publisher: ModelExpressPublisher | None = None
+        self._model_express_megatron_sidecar: dict[str, Any] | None = None
         self._router_replay_enabled = router_replay_enabled(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
@@ -1954,26 +1968,16 @@ class MegatronPolicyWorkerImpl(
         return False
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_mx")
-    def stream_weights_via_mx(
+    @wrap_with_nvtx_name("megatron_policy_worker/publish_weights_for_model_express")
+    def publish_weights_for_model_express(
         self,
         *,
         version: int,
-        mx_config: Any,
+        publisher_options: ModelExpressPublisherOptions,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
         """Publish this worker's native Megatron shards through ModelExpress."""
         from megatron.core import parallel_state
-
-        from nemo_rl.distributed.mx_helpers import (
-            build_v2_publisher,
-            reset_v2_publisher_tensors,
-        )
-        from nemo_rl.distributed.mx_megatron_helpers import (
-            ROLE_COLUMN,
-            ROLE_REPLICATED,
-            collect_megatron_publish_set,
-        )
 
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -1983,24 +1987,26 @@ class MegatronPolicyWorkerImpl(
         ep_rank = parallel_state.get_expert_model_parallel_rank()
 
         # ---- Lazy-init the publisher (once per worker lifetime). ----
-        if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+        if self._model_express_publisher is None:
             mx_device_id = torch.cuda.current_device()
-            self._mx_publisher = build_v2_publisher(
+            self._model_express_publisher = build_v2_publisher(
                 rank=self.rank,
                 device_id=mx_device_id,
                 fsdp_world_size=self.dp_size,
                 tp_world_size=tp_size,
                 pp_world_size=pp_size,
                 ep_world_size=ep_size,
-                mx_config=mx_config,
+                publisher_options=publisher_options,
                 agent_name=f"nemo-rl-megatron-trainer-r{self.rank}",
             )
-            self._mx_publisher.initialize(
+            self._model_express_publisher.initialize(
                 model_name=self.cfg["model_name"],
                 dtype=str(self.dtype).removeprefix("torch."),
             )
-            self._mx_megatron_sidecar = self._build_megatron_sidecar()
-            self._mx_publisher.set_megatron_sidecar(self._mx_megatron_sidecar)
+            self._model_express_megatron_sidecar = self._build_megatron_sidecar()
+            self._model_express_publisher.set_megatron_sidecar(
+                self._model_express_megatron_sidecar
+            )
 
         # Resolve attention-head metadata for fused-QKV descriptors.
         tcfg = getattr(self.megatron_bridge, "transformer_config", None)
@@ -2026,15 +2032,12 @@ class MegatronPolicyWorkerImpl(
         role_overrides = self._mx_megatron_role_overrides_from_sidecar(
             role=ROLE_COLUMN,
         )
-        role_overrides.update(getattr(mx_config, "megatron_role_overrides", None) or {})
-        publish_kv_scales_on_all_ranks = bool(
-            getattr(mx_config, "same_rank_only", False) and tp_size > 1
-        )
+        role_overrides.update(publisher_options.megatron_role_overrides)
 
-        reset_v2_publisher_tensors(self._mx_publisher)
+        start_model_express_publication(self._model_express_publisher)
 
         # Stamp the publisher's mesh position into source metadata.
-        self._mx_publisher.set_megatron_mesh_position(
+        self._model_express_publisher.set_megatron_mesh_position(
             tp_rank=tp_rank,
             pp_rank=pp_rank,
             ep_rank=ep_rank,
@@ -2053,7 +2056,7 @@ class MegatronPolicyWorkerImpl(
             role_overrides=role_overrides,
             target_dtype=self.dtype,
         ):
-            self._mx_publisher.add_tensor(
+            self._model_express_publisher.add_tensor(
                 name=name,
                 tensor=local,
                 is_expert=spec.is_expert,
@@ -2063,14 +2066,16 @@ class MegatronPolicyWorkerImpl(
                 megatron_extras=spec.descriptor_extras,
             )
 
-        if kv_scales and (tp_rank == 0 or publish_kv_scales_on_all_ranks):
+        # KV scales are small replicated values. Publish them from every TP
+        # rank so each rank-local source set is independently complete.
+        if kv_scales:
             for name, scale_value in sorted(kv_scales.items()):
                 scale_tensor = torch.tensor(
                     float(scale_value),
                     dtype=torch.float32,
                     device="cuda",
                 ).reshape(1)
-                self._mx_publisher.add_tensor(
+                self._model_express_publisher.add_tensor(
                     name=name,
                     tensor=scale_tensor,
                     is_expert=False,
@@ -2080,12 +2085,15 @@ class MegatronPolicyWorkerImpl(
                     megatron_extras={"fp8_kv_scale": "1"},
                 )
 
-        self._mx_publisher.publish(version=int(version))
-        self._mx_publisher.mark_ready()
+        finish_model_express_publication(
+            self._model_express_publisher,
+            version=int(version),
+            worker_rank=self.rank,
+        )
 
     def _mx_megatron_role_overrides_from_sidecar(self, *, role: str) -> dict[str, str]:
         """Derive publish role overrides from Bridge's Megatron-to-HF name map."""
-        sidecar = getattr(self, "_mx_megatron_sidecar", {})
+        sidecar = self._model_express_megatron_sidecar or {}
         name_map = sidecar.get("megatron_hf_name_map", [])
         role_overrides: dict[str, str] = {}
         for entry in name_map:
@@ -2141,72 +2149,62 @@ class MegatronPolicyWorkerImpl(
         # ``export_hf_weights`` so we don't pay the gather/broadcast cost
         # at startup. The receiver only needs the name pairings; head
         # counts come from transformer_config.
-        try:
-            tasks = self.megatron_bridge.get_conversion_tasks([self.model])
-            name_map: defaultdict[str, list[str]] = defaultdict(list)
+        tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+        name_map: defaultdict[str, list[str]] = defaultdict(list)
 
-            def _ordered_hf_names(hf_names: list[str]) -> list[str]:
-                unique: list[str] = []
-                for hf_name in hf_names:
-                    if hf_name not in unique:
-                        unique.append(hf_name)
+        def _ordered_hf_names(hf_names: list[str]) -> list[str]:
+            unique: list[str] = []
+            for hf_name in hf_names:
+                if hf_name not in unique:
+                    unique.append(hf_name)
 
-                def _priority(name: str, markers: tuple[str, ...]) -> int:
-                    for index, marker in enumerate(markers):
-                        if marker in name:
-                            return index
-                    return len(markers)
+            def _priority(name: str, markers: tuple[str, ...]) -> int:
+                for index, marker in enumerate(markers):
+                    if marker in name:
+                        return index
+                return len(markers)
 
-                if any(
-                    marker in name
-                    for name in unique
-                    for marker in ("q_proj", "k_proj", "v_proj")
-                ):
-                    return sorted(
-                        unique,
-                        key=lambda name: _priority(
-                            name, ("q_proj", "k_proj", "v_proj")
-                        ),
-                    )
-                if any(
-                    marker in name
-                    for name in unique
-                    for marker in ("gate_proj", "up_proj")
-                ):
-                    return sorted(
-                        unique,
-                        key=lambda name: _priority(name, ("gate_proj", "up_proj")),
-                    )
-                return unique
+            if any(
+                marker in name
+                for name in unique
+                for marker in ("q_proj", "k_proj", "v_proj")
+            ):
+                return sorted(
+                    unique,
+                    key=lambda name: _priority(name, ("q_proj", "k_proj", "v_proj")),
+                )
+            if any(
+                marker in name for name in unique for marker in ("gate_proj", "up_proj")
+            ):
+                return sorted(
+                    unique,
+                    key=lambda name: _priority(name, ("gate_proj", "up_proj")),
+                )
+            return unique
 
-            for task in tasks:
-                if task is None:
-                    continue
-                m_name = getattr(task, "global_param_name", None) or task.param_name
-                # Each task's mapping declares 1 or more HF names. Resolve
-                # via the mapping's hf_param attribute (str or dict).
-                hf_attr = getattr(task.mapping, "hf_param", None)
-                if isinstance(hf_attr, str):
-                    hf_names = [hf_attr]
-                elif isinstance(hf_attr, dict):
-                    # Order matters for QKV: q, k, v. Bridge's QKVMapping
-                    # uses keys "q", "k", "v" — preserve that ordering.
-                    if set(hf_attr.keys()) == {"q", "k", "v"}:
-                        hf_names = [hf_attr["q"], hf_attr["k"], hf_attr["v"]]
-                    else:
-                        hf_names = list(hf_attr.values())
+        for task in tasks:
+            if task is None:
+                continue
+            m_name = getattr(task, "global_param_name", None) or task.param_name
+            # Each task's mapping declares one or more HF names. Resolve
+            # via the mapping's hf_param attribute (str or dict).
+            hf_attr = getattr(task.mapping, "hf_param", None)
+            if isinstance(hf_attr, str):
+                hf_names = [hf_attr]
+            elif isinstance(hf_attr, dict):
+                # Order matters for QKV: q, k, v. Bridge's QKVMapping
+                # uses keys "q", "k", "v" — preserve that ordering.
+                if set(hf_attr.keys()) == {"q", "k", "v"}:
+                    hf_names = [hf_attr["q"], hf_attr["k"], hf_attr["v"]]
                 else:
-                    continue
-                name_map[m_name].extend(str(hf_name) for hf_name in hf_names)
-            name_map_entries = [
-                (m_name, _ordered_hf_names(hf_names))
-                for m_name, hf_names in name_map.items()
-            ]
-            sidecar["megatron_hf_name_map"] = name_map_entries
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                "failed to build ModelExpress Megatron-to-HF name map"
-            ) from exc
+                    hf_names = list(hf_attr.values())
+            else:
+                continue
+            name_map[m_name].extend(str(hf_name) for hf_name in hf_names)
+        sidecar["megatron_hf_name_map"] = [
+            (m_name, _ordered_hf_names(hf_names))
+            for m_name, hf_names in name_map.items()
+        ]
 
         return sidecar
 

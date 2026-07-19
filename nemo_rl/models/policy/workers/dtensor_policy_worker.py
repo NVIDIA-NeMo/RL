@@ -65,6 +65,14 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
+from nemo_rl.distributed.mx_helpers import (
+    ModelExpressPublisher,
+    ModelExpressPublisherOptions,
+    build_v2_publisher,
+    finish_model_express_publication,
+    get_dtensor_local_shard,
+    start_model_express_publication,
+)
 from nemo_rl.models.dtensor.parallelize import (
     _parallelize_model,
     clip_grad_by_total_norm_,
@@ -239,6 +247,7 @@ class DTensorPolicyWorkerImpl(
         configure_dynamo_cache()
 
         self.cfg = config
+        self._model_express_publisher: ModelExpressPublisher | None = None
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
@@ -1884,12 +1893,12 @@ class DTensorPolicyWorkerImpl(
         )
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_mx")
-    def stream_weights_via_mx(
+    @wrap_with_nvtx_name("dtensor_policy_worker/publish_weights_for_model_express")
+    def publish_weights_for_model_express(
         self,
         *,
         version: int,
-        mx_config: Any,
+        publisher_options: ModelExpressPublisherOptions,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
         """Publish this worker's local DTensor shards through ModelExpress."""
@@ -1898,19 +1907,13 @@ class DTensorPolicyWorkerImpl(
                 "FP8 kvcache scales are only supported on the Megatron MX path"
             )
 
-        from nemo_rl.distributed.mx_helpers import (
-            build_v2_publisher,
-            get_dtensor_local_shard,
-            reset_v2_publisher_tensors,
-        )
-
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
         try:
-            if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+            if self._model_express_publisher is None:
                 tp_size = self.tp_size or 1
-                self._mx_publisher = build_v2_publisher(
+                self._model_express_publisher = build_v2_publisher(
                     rank=self.rank,
                     # Ray exposes one GPU to each worker, so NIXL must use the
                     # process-local CUDA index rather than the global rank.
@@ -1919,14 +1922,14 @@ class DTensorPolicyWorkerImpl(
                     tp_world_size=tp_size,
                     pp_world_size=1,
                     ep_world_size=1,
-                    mx_config=mx_config,
+                    publisher_options=publisher_options,
                 )
-                self._mx_publisher.initialize(
+                self._model_express_publisher.initialize(
                     model_name=self.cfg["model_name"],
                     dtype=str(self.dtype).removeprefix("torch."),
                 )
 
-            reset_v2_publisher_tensors(self._mx_publisher)
+            start_model_express_publication(self._model_express_publisher)
             for name, tensor in self.model.state_dict().items():
                 shard_spec = None
                 if isinstance(tensor, DTensor):
@@ -1937,14 +1940,17 @@ class DTensorPolicyWorkerImpl(
                     local = local.to(self.dtype, non_blocking=True)
                 local = local.contiguous()
 
-                self._mx_publisher.add_tensor(
+                self._model_express_publisher.add_tensor(
                     name=name,
                     tensor=local,
                     shard_spec=shard_spec,
                 )
 
-            self._mx_publisher.publish(version=int(version))
-            self._mx_publisher.mark_ready()
+            finish_model_express_publication(
+                self._model_express_publisher,
+                version=int(version),
+                worker_rank=self.rank,
+            )
         finally:
             if self.cpu_offload:
                 self.model = self.move_to_cpu(self.model)

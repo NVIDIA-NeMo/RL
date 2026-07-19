@@ -1,10 +1,16 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Classify Megatron-Core parameters for rank-local ModelExpress publication."""
 
 from __future__ import annotations
@@ -46,8 +52,8 @@ class MegatronRoleSpec:
 
 
 # Heuristic name patterns for fused-QKV and fused-gate+up linears in
-# mainline Megatron-Core. Override via ``MxConfig.megatron_role_overrides``
-# if your fork uses different names.
+# mainline Megatron-Core. Publisher options can override these roles for
+# deployments with different parameter names.
 _DEFAULT_FUSED_QKV_NAME_PATTERNS = ("linear_qkv", "qkv_proj", "fused_qkv")
 _DEFAULT_FUSED_GATED_MLP_PATTERNS = ("linear_fc1", "gate_up_proj")
 # Vocab / embedding name pattern.
@@ -75,16 +81,17 @@ def _bridge_module_type_registry() -> dict[str, set[str]] | None:
         )
 
         return dict(_AM._MODULE_TYPE_REGISTRY)
-    except Exception:
+    except (ImportError, AttributeError):
         return None
 
 
-def _classify_module_class(mod_class_name: str) -> str | None:
-    """Map ``mod.__class__.__name__`` to a Megatron-Bridge parallelism kind.
+def _classify_module(module: "torch.nn.Module | None") -> str | None:
+    """Map a module to a Megatron-Bridge parallelism kind.
 
     Returns one of ``"column"``, ``"row"``, ``"replicated"``, or ``None``
-    if the class name doesn't match any known parallelism variant.
+    if no verified rule identifies its placement.
     """
+    mod_class_name = _module_class_name(module)
     if not mod_class_name:
         return None
     registry = _bridge_module_type_registry()
@@ -103,6 +110,22 @@ def _classify_module_class(mod_class_name: str) -> str | None:
         return "column"
     if "RowParallel" in mod_class_name:
         return "row"
+    if module is not None:
+        tensor_model_parallel = getattr(module, "tensor_model_parallel", None)
+        if tensor_model_parallel is False:
+            return "replicated"
+        if tensor_model_parallel is True:
+            partition_dim = getattr(module, "partition_dim", None)
+            if partition_dim == 0:
+                return "column"
+            if partition_dim == 1:
+                return "row"
+        if mod_class_name == "TELinear":
+            parallel_mode = getattr(module, "parallel_mode", None)
+            if parallel_mode in ("column", "row"):
+                return parallel_mode
+            if parallel_mode is None:
+                return "replicated"
     if any(
         needle in mod_class_name
         for needle in (
@@ -226,12 +249,9 @@ def detect_megatron_role(
 ) -> MegatronRoleSpec:
     """Classify a Megatron parameter into one of seven roles.
 
-    Returns the role + per-tensor metadata that the publisher should attach
-    to ``extra_parameters``. The classifier is conservative: when we can't
-    determine sharding from the module class, we fall back to
-    ``ROLE_REPLICATED`` (rank 0 publishes, others skip). That's a
-    correctness-preserving default — replicated tensors round-trip via the
-    receiver's passthrough path.
+    Returns the role and per-tensor metadata that the publisher attaches to
+    source metadata. Unknown placement at TP greater than one fails before
+    publication rather than silently treating a sharded tensor as replicated.
 
     Args:
         name: param name from ``model.named_parameters()`` (e.g.
@@ -245,8 +265,7 @@ def detect_megatron_role(
             ``None`` if unknown — the role still classifies but the
             descriptor will be missing fields and the receiver will
             fall back to its default un-interleave assumptions.
-        expert_pattern: substring marker for MoE expert tensors; default
-            ``"experts"`` (matches ``MxConfig.NRL_MX_EXPERT_TENSOR_PATTERN``).
+        expert_pattern: Substring marker for MoE expert tensors.
         role_overrides: optional ``{param_name_substring: role}`` dict
             for forcing a role on a specific tensor (escape hatch for
             non-mainline Megatron forks).
@@ -321,7 +340,7 @@ def detect_megatron_role(
     # AutoMapping._MODULE_TYPE_REGISTRY (or fall back to substring match). ----
     mod = _enclosing_module(name, model)
     mod_class = _module_class_name(mod)
-    parallelism = _classify_module_class(mod_class)
+    parallelism = _classify_module(mod)
 
     # ---- 4. VocabParallelEmbedding / lm_head sharded along rows. ----
     if mod_class == "VocabParallelEmbedding" or (
@@ -355,14 +374,15 @@ def detect_megatron_role(
         return MegatronRoleSpec(role=ROLE_ROW)
 
     # ---- 7. Replicated (LayerNorms, biases, scalars, routers, etc.). ----
-    # Bridge's registry covers TENorm, FusedLayerNorm, WrappedTorchNorm,
-    # LayerNorm, RMSNorm, L2Norm, InferenceTopKRouter, IdentityOp,
-    # LinearForLastLayer, TopKRouter — anything unclassified here also
-    # falls into "replicated" as a safe default (rank 0 publishes; others
-    # skip), since misclassifying a sharded tensor as replicated would
-    # silently produce wrong logits while misclassifying a replicated
-    # tensor stays correct (just wastes one rank's publish bandwidth).
-    return MegatronRoleSpec(role=ROLE_REPLICATED)
+    if parallelism == "replicated" or tp_size <= 1:
+        return MegatronRoleSpec(role=ROLE_REPLICATED)
+
+    raise ValueError(
+        "cannot determine Megatron tensor placement for "
+        f"parameter {name!r} owned by module {mod_class!r}; "
+        "register the module with Megatron Bridge or provide an explicit "
+        "megatron_role_overrides entry"
+    )
 
 
 def collect_megatron_publish_set(
