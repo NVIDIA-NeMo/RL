@@ -76,13 +76,14 @@ second synchronization lifecycle to algorithm code.
 ## Current status
 
 **Partially aligned:** trainer-side rank-local publication and metadata
-construction are implemented. Focused unit tests cover DTensor shard ranges,
-unsupported placements, replicated-tensor ownership, fused QKV classification,
-and global expert IDs.
+construction are implemented for the existing DTensor worker and the Megatron
+worker. Focused unit tests cover DTensor shard ranges, unsupported placements,
+replicated-tensor ownership, fused QKV classification, and global expert IDs.
 
 Generation-side discovery, transfer, translation, installation, and
-end-to-end GPU validation are follow-up work. Existing NeMo RL weight
-synchronizers remain unchanged.
+end-to-end GPU validation are follow-up work. The AutoModel-based
+`DTensorPolicyWorkerV2` does not yet implement MX publication. Existing NeMo RL
+weight synchronizers remain unchanged.
 
 ## Assumptions
 
@@ -115,6 +116,7 @@ synchronizers remain unchanged.
 ## Open questions
 
 - Final user-facing configuration for `ModelExpressWeightSynchronizer`.
+- Rank-local publication for `DTensorPolicyWorkerV2`.
 - The common install-plan contract between MX reshard planning and the
   inference adapter.
 - Retention and read-lease behavior for trainer buffers during long updates.
