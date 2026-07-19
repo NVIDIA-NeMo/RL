@@ -95,7 +95,10 @@ class TrtllmAsyncGenerationWorkerImpl:
         seed: Optional[int] = None,
     ) -> None:
         self.cfg = config
-        self.model_name = self.cfg["model_name"]
+        # Allow gen side to use a quantized checkpoint
+        self.model_name = (
+            self.cfg.get("trtllm_cfg", {}).get("model_name") or self.cfg["model_name"]
+        )
         self.is_model_owner = bundle_indices is not None
         self._bundle_indices = bundle_indices
         self._fraction_of_gpus = fraction_of_gpus
@@ -144,13 +147,11 @@ class TrtllmAsyncGenerationWorkerImpl:
             flush=True,
         )
 
-        # One PG entry per worker (placement_groups=[pg]*N,
-        # placement_bundle_indices=[[i0], [i1], ...]) so the expansion
-        # generalises to multi-PG layouts (cross-node TP) when
-        # configure_worker surfaces per-rank PGs.
-        n_workers = len(self._bundle_indices)
-        placement_groups_list = [pg] * n_workers
-        placement_bundle_indices_list = [[i] for i in self._bundle_indices]
+        # TRT-LLM expects one bundle-index list per placement group. A unified
+        # PG can contain bundles on multiple nodes, allowing one TP replica to
+        # span them while Ray still pins every rank to a specific GPU bundle.
+        placement_groups_list = [pg]
+        placement_bundle_indices_list = [list(self._bundle_indices)]
 
         llm_kwargs: dict[str, Any] = dict(
             model=self.model_name,

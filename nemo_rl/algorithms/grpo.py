@@ -864,6 +864,11 @@ def setup(
                     gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                         "pipeline_parallel_size", 1
                     )
+                elif generation_config["backend"] == "trtllm":
+                    trtllm_cfg = generation_config.get("trtllm_cfg", {})
+                    gpus_per_instance = trtllm_cfg[
+                        "tensor_parallel_size"
+                    ] * trtllm_cfg.get("pipeline_parallel_size", 1)
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)

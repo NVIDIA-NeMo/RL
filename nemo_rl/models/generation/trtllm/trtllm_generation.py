@@ -106,9 +106,9 @@ class TrtllmGeneration(GenerationInterface):
         needs_cross_node_parallelism = (
             self.model_parallel_size > cluster.num_gpus_per_node
         )
-        assert not needs_cross_node_parallelism, (
-            f"TRT-LLM backend does not support cross-node tensor parallelism yet "
-            f"(model_parallel_size={self.model_parallel_size} > GPUs/node={cluster.num_gpus_per_node})."
+        assert not (needs_cross_node_parallelism and self.colocated_enabled), (
+            "TRT-LLM cross-node tensor parallelism is only supported for "
+            "non-colocated generation."
         )
         cluster._init_placement_groups(
             strategy=strategy,
@@ -218,18 +218,20 @@ class TrtllmGeneration(GenerationInterface):
                     "Unable to allocate any worker groups with the available resources."
                 )
 
-            sorted_nodes = sorted(node_bundles)
-            node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
-
-            flat: list[int] = []
-            for nid in sorted_nodes:
-                flat.extend(node_bundles[nid])
+            # RayVirtualCluster records the physical-node bundle order when it
+            # builds a unified PG. Preserve it so TP replicas occupy contiguous
+            # nodes in the topology-aware order selected by the cluster.
+            flat = list(cluster._sorted_bundle_indices or [])
+            if not flat:
+                for nid in sorted(node_bundles):
+                    flat.extend(node_bundles[nid])
 
             tied_groups: list[tuple[int, list[int]]] = []
             for i in range(num_groups):
                 slice_ = flat[i * model_parallel_size : (i + 1) * model_parallel_size]
-                first_node = bundle_to_node[slice_[0]]
-                tied_groups.append((node_idx[first_node], slice_))
+                # The first value is a placement-group index.
+                # A unified cluster has exactly one PG (index 0).
+                tied_groups.append((0, slice_))
         else:
             tied_groups = []
             for pg_idx, pg in enumerate(placement_groups):
