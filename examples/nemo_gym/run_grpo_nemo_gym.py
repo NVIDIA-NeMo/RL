@@ -17,6 +17,7 @@ import json
 import os
 import pprint
 import time
+from pathlib import Path
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
 import wandb.util
@@ -54,6 +55,27 @@ from nemo_rl.utils.config import (
 )
 from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
 from nemo_rl.utils.timer import Timer
+
+
+def _validate_expected_repo_root() -> None:
+    """Fail before allocating workers if Python imported another checkout."""
+    expected_repo_root = os.environ.get("NRL_EXPECTED_REPO_ROOT")
+    if expected_repo_root is None:
+        return
+
+    import nemo_rl
+
+    expected_path = Path(expected_repo_root).resolve()
+    source_path = Path(nemo_rl.__file__).resolve()
+    if not source_path.is_relative_to(expected_path):
+        raise RuntimeError(
+            "NeMo-RL source checkout mismatch: "
+            f"expected a module below {expected_path}, imported {source_path}"
+        )
+    print(
+        f"NeMo-RL source checkout verified: {source_path}",
+        flush=True,
+    )
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -201,6 +223,7 @@ def collect_trajectories(
 def main() -> None:
     """Main entry point."""
     main_start = time.perf_counter()
+    _validate_expected_repo_root()
     log_container_init_timing()
     rl_init_timer = Timer(context={"worker": "driver"})
 

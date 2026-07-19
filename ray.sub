@@ -184,6 +184,12 @@ fi
 # all compute nodes. File-based signaling between the submit host and the containers
 # (STARTED_RAY_HEAD, ray_worker_units, ENDED, sandbox readiness) relies on this.
 BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
+CONTAINER_WORKDIR=${NRL_CONTAINER_WORKDIR:-$SLURM_SUBMIT_DIR}
+if [[ "$CONTAINER_WORKDIR" != /* ]] || [[ ! -d "$CONTAINER_WORKDIR" ]]; then
+  echo "[ERROR] Container workdir must be an existing absolute directory: $CONTAINER_WORKDIR" >&2
+  exit 1
+fi
+echo "[INFO] Container workdir: $CONTAINER_WORKDIR"
 # On a Slurm requeue/restart, suffix the restart count so we don't clobber the
 # previous attempt's logs (and signal files) under the same job ID.
 if [[ -n "${SLURM_RESTART_COUNT:-}" ]]; then
@@ -237,7 +243,7 @@ COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
-COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+COMMON_SRUN_ARGS+=" --container-workdir=$CONTAINER_WORKDIR"
 # Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
@@ -1056,8 +1062,8 @@ else
 
   echo "[INFO][$(date '+%Y-%m-%dT%H:%M:%S%z')] All workers connected!"
 
-  log_phase "generating attach helper (scontrol show job)"
-  CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
+  log_phase "generating attach helper"
+  CONTAINER_CWD=$CONTAINER_WORKDIR
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)

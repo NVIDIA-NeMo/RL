@@ -102,7 +102,7 @@ TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 # NeMo RL nightly-gym used for Nano 3 streaming-prefill development.
 export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/joyang/RL/results/images/nemo-rl-nightly-gym-20260718.squashfs}"
 GYM_CODE="${REPO_ROOT}/3rdparty/Gym-workspace/Gym"
-export MOUNTS="/lustre:/lustre,$PWD:$PWD,${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
+export MOUNTS="/lustre:/lustre,${REPO_ROOT}:${REPO_ROOT},${GYM_CODE}:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 
 # ======================= Cluster / resources =======================
 NUM_GPU=8
@@ -768,6 +768,8 @@ export SETUP_COMMAND
 
 # ================ Training command (bihu-style: uv run --frozen, no --extra mcore) ================
 export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
+  PYTHONPATH=${REPO_ROOT} \
+  NRL_EXPECTED_REPO_ROOT=${REPO_ROOT} \
   NRL_VLLM_USE_V1=1 \
   NRL_WG_USE_RAY_REF=1 \
   WANDB_API_KEY=${WANDB_API_KEY} \
@@ -1029,6 +1031,7 @@ if [ "${SUBMIT_MODE}" = "direct" ]; then
   # ray.sub normally runs as the batch step. Under an attached srun, its Ray
   # head/worker steps must explicitly overlap the outer launcher step.
   export RAY_SUB_OVERLAP_EXISTING_STEP=1
+  export NRL_CONTAINER_WORKDIR="${NRL_CONTAINER_WORKDIR:-${SNAPSHOT_DIR}}"
   echo "Launching directly in Slurm job ${SLURM_JOB_ID}: account=${SLURM_JOB_ACCOUNT:-unknown} partition=${SLURM_JOB_PARTITION:-unknown} nodes=${ALLOCATED_NODES} gpus/node=${SLURM_GPUS_ON_NODE:-unknown}"
   bash ray.sub
   echo "Direct Slurm job ${SLURM_JOB_ID} completed: ${EXP_SUFFIX}"
