@@ -119,6 +119,8 @@ class AsyncTrajectoryCollector:
 
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
+        self._generation_lead_steps = self.async_config.max_trajectory_age_steps
+        self._max_trajectory_age_steps = self.async_config.max_trajectory_age_steps
 
         # Track when generation limits cause collection to pause
         self._last_limit_warning_version = None
@@ -131,11 +133,16 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight requests using the configured trajectory age.
-        # This value limits the parallelism of the generation requests.
+        max_age_ceiling = self.async_config.max_trajectory_age_steps
+        if isinstance(self.async_config, AsyncPPOConfig):
+            max_age_ceiling = max(
+                max_age_ceiling,
+                self.async_config.effective_warmup_max_trajectory_age_steps,
+            )
+
+        # The semaphore is fixed, so size it for the largest configured window.
         max_inflight = (
-            int(self.algorithm_config["num_prompts_per_step"])
-            * self.async_config.max_trajectory_age_steps
+            int(self.algorithm_config["num_prompts_per_step"]) * max_age_ceiling
         ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
@@ -168,7 +175,7 @@ class AsyncTrajectoryCollector:
         Returns:
             [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
         """
-        max_trajectory_age = self.async_config.max_trajectory_age_steps
+        max_trajectory_age = self._generation_lead_steps
         if generation_weight_version == self.initial_weight_version:
             return [
                 i
@@ -186,7 +193,7 @@ class AsyncTrajectoryCollector:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
         num_prompts = int(self.algorithm_config["num_prompts_per_step"])
-        max_age_steps = self.async_config.max_trajectory_age_steps
+        max_age_steps = self._max_trajectory_age_steps
         last_consumed_target = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
@@ -229,12 +236,39 @@ class AsyncTrajectoryCollector:
         else:
             print(f"🔄 Updated weight version to {version}")
 
+    def set_generation_window(
+        self,
+        *,
+        weight_version: int,
+        generation_lead_steps: int,
+        max_trajectory_age_steps: int,
+    ) -> None:
+        """Update the PPO generation version, lead, and buffer-validity age."""
+        if generation_lead_steps < 1:
+            raise ValueError("generation_lead_steps must be at least 1")
+        if max_trajectory_age_steps < generation_lead_steps:
+            raise ValueError(
+                "max_trajectory_age_steps must be greater than or equal to "
+                "generation_lead_steps"
+            )
+
+        with self._generation_check_lock:
+            self.current_weight_version = weight_version
+            self._generation_lead_steps = generation_lead_steps
+            self._max_trajectory_age_steps = max_trajectory_age_steps
+
+        self._generation_limit_cleared.set()
+        print(
+            f"🔄 Updated generation window: version={weight_version}, "
+            f"lead={generation_lead_steps}, max_age={max_trajectory_age_steps}"
+        )
+
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
             num_prompts = int(self.algorithm_config["num_prompts_per_step"])
-            max_age_steps = self.async_config.max_trajectory_age_steps
+            max_age_steps = self._max_trajectory_age_steps
             last_consumed_target = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
@@ -311,11 +345,9 @@ class AsyncTrajectoryCollector:
                 if self._should_pause_for_generation_limits() and self.running:
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        max_trajectory_age = self.async_config.max_trajectory_age_steps
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
+                        target_weights = self._calculate_target_weights(
+                            self.current_weight_version
+                        )
                         print(
                             f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
                             f"already exist in buffer. Waiting for weight update..."
@@ -365,7 +397,7 @@ class AsyncTrajectoryCollector:
             num_generations = self.algorithm_config["num_generations_per_prompt"]
             num_prompts_in_batch = batch.size
             num_prompts_per_step = int(self.algorithm_config["num_prompts_per_step"])
-            max_age_steps = self.async_config.max_trajectory_age_steps
+            max_age_steps = self._max_trajectory_age_steps
 
             # Get the next target weight that needs generation
             target_weight = self._get_next_target_for_generation(

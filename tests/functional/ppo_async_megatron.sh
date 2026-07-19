@@ -37,6 +37,7 @@ uv run coverage run -a \
     ppo.seq_logprob_error_threshold=1000 \
     ppo.async_ppo.enabled=true \
     ppo.async_ppo.max_trajectory_age_steps=1 \
+    ppo.async_ppo.warmup_max_trajectory_age_steps=2 \
     policy.train_global_batch_size=4 \
     policy.logprob_batch_size=4 \
     policy.train_micro_batch_size=1 \
@@ -58,6 +59,8 @@ uv run coverage run -a \
 
 grep -q "Separate PPO clusters initialized" "${RUN_LOG}"
 grep -q "Using vllm in-flight weight update" "${RUN_LOG}"
+grep -q "Updated generation window: version=0, lead=2, max_age=2" "${RUN_LOG}"
+grep -q "Updated generation window: version=1, lead=1, max_age=2" "${RUN_LOG}"
 
 uv run tests/json_dump_tb_logs.py "${LOG_DIR}" --output_path "${METRICS}"
 uv run tests/check_metrics.py "${METRICS}" \

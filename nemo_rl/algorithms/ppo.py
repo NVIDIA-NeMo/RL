@@ -110,6 +110,9 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
     enabled: bool = False
     # Maximum generation-version age accepted for training.
     max_trajectory_age_steps: int = Field(default=1, ge=1)
+    # Maximum generation-version age for rollouts banked by a frozen policy.
+    # None keeps the normal trajectory-age limit throughout warmup.
+    warmup_max_trajectory_age_steps: int | None = Field(default=None, ge=1)
     # Allows weight updates while rollout requests are still in flight.
     in_flight_weight_updates: bool = True
     # Invalidates and rebuilds the generation KV cache after an in-flight update.
@@ -127,7 +130,22 @@ class AsyncPPOConfig(BaseModel, extra="allow"):
                 "recompute_kv_cache_after_weight_updates requires "
                 "in_flight_weight_updates=true"
             )
+        if (
+            self.warmup_max_trajectory_age_steps is not None
+            and self.warmup_max_trajectory_age_steps < self.max_trajectory_age_steps
+        ):
+            raise ValueError(
+                "warmup_max_trajectory_age_steps must be greater than or equal "
+                "to max_trajectory_age_steps"
+            )
         return self
+
+    @property
+    def effective_warmup_max_trajectory_age_steps(self) -> int:
+        """Return the configured warmup age or the normal training age."""
+        if self.warmup_max_trajectory_age_steps is None:
+            return self.max_trajectory_age_steps
+        return self.warmup_max_trajectory_age_steps
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -1952,6 +1970,39 @@ def ppo_train(
     checkpointer.shutdown()
 
 
+def _async_ppo_generation_lead_steps(
+    *,
+    step: int,
+    policy_training_start_step: int,
+    max_trajectory_age_steps: int,
+    warmup_max_trajectory_age_steps: int,
+) -> int:
+    """Return the collector lead without crossing the safe warmup frontier."""
+    if step >= policy_training_start_step:
+        return max_trajectory_age_steps
+
+    max_warmup_target = policy_training_start_step + max_trajectory_age_steps
+    remaining_to_frontier = max_warmup_target - step
+    return max(
+        max_trajectory_age_steps,
+        min(warmup_max_trajectory_age_steps, remaining_to_frontier),
+    )
+
+
+def _async_ppo_buffer_max_age(
+    *,
+    step: int,
+    policy_training_start_step: int,
+    max_trajectory_age_steps: int,
+    warmup_max_trajectory_age_steps: int,
+) -> int:
+    """Keep frozen-policy rollouts valid through their safe training frontier."""
+    warmup_rollout_frontier = policy_training_start_step + max_trajectory_age_steps
+    if policy_training_start_step > 0 and step <= warmup_rollout_frontier:
+        return warmup_max_trajectory_age_steps
+    return max_trajectory_age_steps
+
+
 class _CyclingDataLoader:
     """Repeat a PPO dataloader until collection stops."""
 
@@ -2018,6 +2069,9 @@ def async_ppo_train(
 
     async_config = master_config.ppo["async_ppo"]
     max_trajectory_age_steps = async_config.max_trajectory_age_steps
+    warmup_max_trajectory_age_steps = (
+        async_config.effective_warmup_max_trajectory_age_steps
+    )
     policy_training_start_step = master_config.ppo["policy_training_start_step"]
     if master_config.ppo["ppo_epochs"] < 1:
         raise ValueError("ppo.ppo_epochs must be at least 1")
@@ -2170,12 +2224,15 @@ def async_ppo_train(
     }
 
     late_arrival_slack = 2
-    optimal_buffer_size = (
-        num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
+    buffer_age = max(
+        max_trajectory_age_steps,
+        warmup_max_trajectory_age_steps,
     )
+    optimal_buffer_size = num_prompts_per_step * buffer_age * late_arrival_slack
     print("📊 Async PPO buffer requirements:")
     print(f"   - num_prompts_per_step: {num_prompts_per_step}")
     print(f"   - max_trajectory_age_steps: {max_trajectory_age_steps}")
+    print(f"   - warmup_max_trajectory_age_steps: {warmup_max_trajectory_age_steps}")
     print(f"   - optimal_buffer_size: {optimal_buffer_size}")
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
@@ -2193,12 +2250,18 @@ def async_ppo_train(
             # weights_only=False: trajectories are pickled BatchedDataDict/dicts,
             # not plain tensors. The checkpoint is a trusted same-job artifact.
             replay_buffer_state = torch.load(replay_buffer_path, weights_only=False)
+            restore_max_age = _async_ppo_buffer_max_age(
+                step=step,
+                policy_training_start_step=policy_training_start_step,
+                max_trajectory_age_steps=max_trajectory_age_steps,
+                warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+            )
             ray.get(
                 replay_buffer.load_state_dict.remote(
                     replay_buffer_state,
                     num_prompts_per_step=num_prompts_per_step,
                     current_training_step=step,
-                    max_age_steps=max_trajectory_age_steps,
+                    max_age_steps=restore_max_age,
                 )
             )
             print("✅ Replay buffer restored from checkpoint")
@@ -2277,7 +2340,25 @@ def async_ppo_train(
 
         policy_generation.clear_logger_metrics()
 
-        ray.get(trajectory_collector.set_weight_version.remote(weight_version))
+        initial_generation_lead = _async_ppo_generation_lead_steps(
+            step=step,
+            policy_training_start_step=policy_training_start_step,
+            max_trajectory_age_steps=max_trajectory_age_steps,
+            warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+        )
+        initial_buffer_max_age = _async_ppo_buffer_max_age(
+            step=step,
+            policy_training_start_step=policy_training_start_step,
+            max_trajectory_age_steps=max_trajectory_age_steps,
+            warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+        )
+        ray.get(
+            trajectory_collector.set_generation_window.remote(
+                weight_version=weight_version,
+                generation_lead_steps=initial_generation_lead,
+                max_trajectory_age_steps=initial_buffer_max_age,
+            )
+        )
         ray.get(
             trajectory_collector.start_collection.remote(_CyclingDataLoader(dataloader))
         )
@@ -2289,7 +2370,7 @@ def async_ppo_train(
         while True:
             current_step_ready = ray.get(
                 replay_buffer.has_complete_batch.remote(
-                    step, num_prompts_per_step, max_trajectory_age_steps
+                    step, num_prompts_per_step, initial_buffer_max_age
                 )
             )
             if current_step_ready:
@@ -2328,11 +2409,19 @@ def async_ppo_train(
                 # ---- 1. Sample a fixed batch of trajectories from the buffer ----
                 print("📦 Sampling from replay buffer...")
                 with timer.time("exposed_generation"):
+                    current_buffer_max_age = _async_ppo_buffer_max_age(
+                        step=step,
+                        policy_training_start_step=policy_training_start_step,
+                        max_trajectory_age_steps=max_trajectory_age_steps,
+                        warmup_max_trajectory_age_steps=(
+                            warmup_max_trajectory_age_steps
+                        ),
+                    )
                     sample_result = ray.get(
                         replay_buffer.sample.remote(
                             num_prompt_groups=num_prompts_per_step,
                             current_weight_version=weight_version,
-                            max_age_steps=max_trajectory_age_steps,
+                            max_age_steps=current_buffer_max_age,
                         )
                     )
                     if (
@@ -2564,6 +2653,7 @@ def async_ppo_train(
                 # transfer because the policy has not changed.
                 generation_logger_metrics = None
                 print("🔄 Coordinating with trajectory collector before refit...")
+                next_weight_version = weight_version + 1
                 with timer.time("idle/refit_bubble"):
                     with timer.time("exposed_generation"):
                         ray.get(trajectory_collector.prepare_for_refit.remote())
@@ -2578,10 +2668,28 @@ def async_ppo_train(
                                 "▶ Critic warmup: skipping policy weight transfer "
                                 "(policy frozen; generation already up to date)"
                             )
-                        weight_version += 1
+                        weight_version = next_weight_version
+                        next_generation_lead = _async_ppo_generation_lead_steps(
+                            step=weight_version,
+                            policy_training_start_step=policy_training_start_step,
+                            max_trajectory_age_steps=max_trajectory_age_steps,
+                            warmup_max_trajectory_age_steps=(
+                                warmup_max_trajectory_age_steps
+                            ),
+                        )
+                        next_buffer_max_age = _async_ppo_buffer_max_age(
+                            step=weight_version,
+                            policy_training_start_step=policy_training_start_step,
+                            max_trajectory_age_steps=max_trajectory_age_steps,
+                            warmup_max_trajectory_age_steps=(
+                                warmup_max_trajectory_age_steps
+                            ),
+                        )
                         ray.get(
-                            trajectory_collector.set_weight_version.remote(
-                                weight_version
+                            trajectory_collector.set_generation_window.remote(
+                                weight_version=weight_version,
+                                generation_lead_steps=next_generation_lead,
+                                max_trajectory_age_steps=next_buffer_max_age,
                             )
                         )
                         ray.get(trajectory_collector.resume_after_refit.remote())

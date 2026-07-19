@@ -1804,6 +1804,92 @@ def test_async_ppo_config_rejects_invalid_kv_cache_settings():
         )
 
 
+def test_async_ppo_config_warmup_age_defaults_to_training_age():
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    config = AsyncPPOConfig(max_trajectory_age_steps=3)
+
+    assert config.warmup_max_trajectory_age_steps is None
+    assert config.effective_warmup_max_trajectory_age_steps == 3
+
+
+def test_async_ppo_config_rejects_warmup_age_below_training_age():
+    from pydantic import ValidationError
+
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    with pytest.raises(ValidationError, match="warmup_max_trajectory_age_steps"):
+        AsyncPPOConfig(
+            max_trajectory_age_steps=2,
+            warmup_max_trajectory_age_steps=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("step", "expected_lead", "expected_buffer_age"),
+    [
+        (0, 4, 4),
+        (1, 4, 4),
+        (2, 3, 4),
+        (3, 2, 4),
+        (4, 1, 4),
+        (5, 1, 4),
+        (6, 1, 1),
+    ],
+)
+def test_async_ppo_warmup_window_has_fixed_safe_frontier(
+    step, expected_lead, expected_buffer_age
+):
+    from nemo_rl.algorithms.ppo import (
+        _async_ppo_buffer_max_age,
+        _async_ppo_generation_lead_steps,
+    )
+
+    generation_lead = _async_ppo_generation_lead_steps(
+        step=step,
+        policy_training_start_step=4,
+        max_trajectory_age_steps=1,
+        warmup_max_trajectory_age_steps=4,
+    )
+    buffer_age = _async_ppo_buffer_max_age(
+        step=step,
+        policy_training_start_step=4,
+        max_trajectory_age_steps=1,
+        warmup_max_trajectory_age_steps=4,
+    )
+
+    assert generation_lead == expected_lead
+    if step <= 4:
+        assert step + generation_lead <= 5
+    assert buffer_age == expected_buffer_age
+
+
+def test_async_ppo_warmup_window_is_disabled_without_critic_warmup():
+    from nemo_rl.algorithms.ppo import (
+        _async_ppo_buffer_max_age,
+        _async_ppo_generation_lead_steps,
+    )
+
+    assert (
+        _async_ppo_generation_lead_steps(
+            step=0,
+            policy_training_start_step=0,
+            max_trajectory_age_steps=1,
+            warmup_max_trajectory_age_steps=4,
+        )
+        == 1
+    )
+    assert (
+        _async_ppo_buffer_max_age(
+            step=0,
+            policy_training_start_step=0,
+            max_trajectory_age_steps=1,
+            warmup_max_trajectory_age_steps=4,
+        )
+        == 1
+    )
+
+
 class _EpochListLoader:
     def __init__(self, sizes: list[int]) -> None:
         self.sizes = list(sizes)
