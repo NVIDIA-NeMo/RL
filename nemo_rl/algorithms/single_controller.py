@@ -127,13 +127,21 @@ class SingleControllerActor:
                 f"({self._async_cfg.min_groups_for_streaming_train})"
             )
 
-        if self._async_cfg.over_sampling:
-            if self._async_cfg.max_weight_staleness_versions == 0:
+        if self._async_cfg.max_weight_staleness_versions == 0:
+            if self._async_cfg.over_sampling:
                 raise ValueError(
                     "max_weight_staleness_versions=0 requires over_sampling=False: "
                     "with zero staleness the dispatch gate needs to advance one batch "
                     "per trainer_version, which over_sampling=True bypasses."
                 )
+            print("Running in sync mode (max_weight_staleness_versions=0)", flush=True)
+            if not self._async_cfg.force_in_order:
+                print(
+                    "force_in_order=False is ignored in sync mode",
+                    flush=True,
+                )
+
+        if self._async_cfg.over_sampling:
             if self._async_cfg.force_in_order:
                 raise ValueError(
                     "force_in_order=True requires over_sampling=False so that each "
