@@ -215,6 +215,65 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
     logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
 
 
+def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
+    """Keep RayExecutorV2's TCPStore port out of the VLLM_PORT scan range.
+
+    In vLLM 0.25 ``RayExecutorV2._init_executor`` picks the torch.distributed
+    TCPStore port via a bind-probe (Step 3) but only binds it later, in the
+    rank-0 worker's ``init_process_group``. In between, Step 4 creates the
+    broadcast ``MessageQueue``, whose remote (cross-node) ZMQ socket also
+    allocates via ``get_open_port()``. Both searches start at ``VLLM_PORT``
+    (NeMo-RL assigns one per engine, see virtual_cluster.py), so for an
+    engine that spans nodes the MessageQueue deterministically binds the very
+    port the TCPStore probe just returned, and engine startup dies with
+    EADDRINUSE (observed with DeepSeek-V3 TP=32). Offsetting the TCPStore
+    search window past the MessageQueue's scan range removes the collision
+    while staying inside the engine's 100-port spacing.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/executor/ray_executor_v2.py")
+    except RuntimeError:
+        logger.warning("Could not locate ray_executor_v2.py for TCPStore port patch.")
+        return
+
+    old_snippet = (
+        "        if local_dp_rank is None:\n            return get_open_port()\n"
+    )
+
+    new_snippet = (
+        "        if local_dp_rank is None:\n"
+        "            if envs.VLLM_PORT is not None:\n"
+        "                # NeMo-RL: skip the ports the broadcast MessageQueue\n"
+        "                # allocates from VLLM_PORT before the TCPStore binds.\n"
+        "                try:\n"
+        "                    return _get_open_port(\n"
+        "                        start_port=envs.VLLM_PORT + 32, max_attempts=32\n"
+        "                    )\n"
+        "                except RuntimeError:\n"
+        "                    return get_open_port()\n"
+        "            return get_open_port()\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if "start_port=envs.VLLM_PORT + 32" in content:
+            logger.info("vLLM RayExecutorV2 TCPStore port patch already applied.")
+            return
+
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply RayExecutorV2 TCPStore port patch: "
+                "expected snippet not found in %s. "
+                "The vLLM version may have changed.",
+                file_to_patch,
+            )
+            return
+
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info("Successfully patched vLLM RayExecutorV2 TCPStore port selection.")
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -242,3 +301,4 @@ def _apply_vllm_patches(
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
+    _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
