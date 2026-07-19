@@ -1574,6 +1574,32 @@ def test_noncolocated_vllm_builds_separate_clusters_and_collective(monkeypatch):
     generation.prepare_refit_info.assert_called_once_with({"state": "dict"})
 
 
+@pytest.mark.parametrize(
+    ("async_enabled", "expected_train_iters"),
+    [(False, 3), (True, 30)],
+)
+def test_megatron_train_iters_matches_ppo_training_limit(
+    monkeypatch, async_enabled, expected_train_iters
+):
+    """Async PPO cycles data until max_num_steps; sync PPO also honors epochs."""
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    config = _make_noncolocated_setup_config()
+    config.policy["dtensor_cfg"]["enabled"] = False
+    config.policy["megatron_cfg"]["enabled"] = True
+    config.ppo.update(
+        max_num_steps=10,
+        max_num_epochs=1,
+        ppo_epochs=3,
+        async_ppo=AsyncPPOConfig(enabled=async_enabled),
+    )
+
+    _run_noncolocated_setup(monkeypatch, config)
+
+    assert config.policy["megatron_cfg"]["train_iters"] == expected_train_iters
+    assert config.value["megatron_cfg"]["train_iters"] == expected_train_iters
+
+
 def test_colocated_setup_keeps_single_cluster_and_skips_collective(monkeypatch):
     """The default colocated setup remains unchanged by the cluster split."""
     config = _make_noncolocated_setup_config()
@@ -1890,6 +1916,61 @@ def test_async_ppo_warmup_window_is_disabled_without_critic_warmup():
     )
 
 
+def test_async_ppo_consumes_frozen_policy_rollout_at_safe_warmup_frontier():
+    """A rollout banked at version 0 remains usable through the W+A frontier."""
+    from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
+    from nemo_rl.algorithms.ppo import (
+        _async_ppo_buffer_max_age,
+        _async_ppo_generation_lead_steps,
+    )
+
+    policy_training_start_step = 2
+    max_trajectory_age_steps = 1
+    warmup_max_trajectory_age_steps = 3
+    frontier = policy_training_start_step + max_trajectory_age_steps
+
+    assert (
+        _async_ppo_generation_lead_steps(
+            step=0,
+            policy_training_start_step=policy_training_start_step,
+            max_trajectory_age_steps=max_trajectory_age_steps,
+            warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+        )
+        == frontier
+    )
+
+    buffer = ReplayBufferImpl(max_size=4)
+    frozen_rollout = {
+        "batch": {"data": "frozen-policy"},
+        "rollout_metrics": {},
+    }
+    assert (
+        buffer.add(
+            frozen_rollout,
+            weight_version=0,
+            target_weight_version=frontier,
+        )
+        == "success"
+    )
+
+    frontier_max_age = _async_ppo_buffer_max_age(
+        step=frontier,
+        policy_training_start_step=policy_training_start_step,
+        max_trajectory_age_steps=max_trajectory_age_steps,
+        warmup_max_trajectory_age_steps=warmup_max_trajectory_age_steps,
+    )
+    sample = buffer.sample(
+        num_prompt_groups=1,
+        current_weight_version=frontier,
+        max_age_steps=frontier_max_age,
+    )
+
+    assert sample is not None
+    assert sample["trajectories"] == [frozen_rollout]
+    assert sample["avg_trajectory_age"] == frontier
+    assert buffer.size() == 0
+
+
 class _EpochListLoader:
     def __init__(self, sizes: list[int]) -> None:
         self.sizes = list(sizes)
@@ -1991,6 +2072,90 @@ def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
     )
 
     refit.assert_not_called()
+    checkpointer.shutdown.assert_called_once()
+    generation.shutdown.assert_called_once()
+    policy.shutdown.assert_called_once()
+    value_model.shutdown.assert_called_once()
+
+
+def test_async_ppo_initial_refit_failure_cleans_up_actors(monkeypatch):
+    from unittest.mock import call
+
+    from nemo_rl.algorithms import async_utils, ppo
+
+    config = _make_async_ppo_config()
+    config.policy["make_sequence_length_divisible_by"] = 1
+    config.ppo.update(
+        max_num_steps=2,
+        max_num_epochs=2,
+        val_period=0,
+        val_at_start=False,
+        val_at_end=False,
+        num_prompts_per_step=1,
+        max_rollout_turns=1,
+        skip_reference_policy_logprobs_calculation=False,
+        adv_estimator={"name": "raw_reward"},
+    )
+    config.checkpointing = {
+        "checkpoint_must_save_by": None,
+        "ft_save_period": None,
+    }
+
+    replay_actor = MagicMock()
+    collector_actor = MagicMock()
+    replay_type = MagicMock()
+    replay_type.options.return_value.remote.return_value = replay_actor
+    collector_type = MagicMock()
+    collector_type.options.return_value.remote.return_value = collector_actor
+    monkeypatch.setattr(async_utils, "ReplayBuffer", replay_type)
+    monkeypatch.setattr(async_utils, "AsyncTrajectoryCollector", collector_type)
+    monkeypatch.setattr(
+        ppo,
+        "get_actor_python_env",
+        lambda _actor: "/tmp/fake-venv/bin/python",
+    )
+    monkeypatch.setattr(
+        ppo,
+        "refit_policy_generation",
+        MagicMock(side_effect=RuntimeError("initial refit failed")),
+    )
+    ray_kill = MagicMock()
+    monkeypatch.setattr(ppo.ray, "kill", ray_kill)
+
+    policy = MagicMock()
+    generation = MagicMock()
+    generation.requires_kv_scale_sync = False
+    value_model = MagicMock()
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+
+    with pytest.raises(RuntimeError, match="initial refit failed"):
+        ppo.async_ppo_train(
+            policy=policy,
+            policy_generation=generation,
+            value_model=value_model,
+            dataloader=[MagicMock()],
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            value_loss_fn=MagicMock(),
+            task_to_env={},
+            val_task_to_env=None,
+            logger=MagicMock(),
+            checkpointer=checkpointer,
+            ppo_save_state={
+                "total_steps": 0,
+                "consumed_samples": 0,
+                "current_epoch": 0,
+                "current_step": 0,
+                "total_valid_tokens": 0,
+            },
+            master_config=config,
+        )
+
+    ray_kill.assert_has_calls(
+        [call(collector_actor), call(replay_actor)], any_order=True
+    )
     checkpointer.shutdown.assert_called_once()
     generation.shutdown.assert_called_once()
     policy.shutdown.assert_called_once()

@@ -682,24 +682,20 @@ def setup(
     # Scale train_iters accordingly so the configured warmup/decay horizon
     # matches the actual scheduler-step count.
     ppo_epochs = ppo_config["ppo_epochs"]
-    if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        total_train_iters = (
-            min(
-                ppo_config["max_num_steps"],
-                ppo_config["max_num_epochs"] * len(dataloader),
-            )
-            * ppo_epochs
+    async_config = ppo_config.get("async_ppo")
+    if async_config is not None and async_config.enabled:
+        outer_training_steps = ppo_config["max_num_steps"]
+    else:
+        outer_training_steps = min(
+            ppo_config["max_num_steps"],
+            ppo_config["max_num_epochs"] * len(dataloader),
         )
+    total_train_iters = outer_training_steps * ppo_epochs
+
+    if policy_config.get("megatron_cfg", {}).get("enabled", False):
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        total_train_iters = (
-            min(
-                ppo_config["max_num_steps"],
-                ppo_config["max_num_epochs"] * len(dataloader),
-            )
-            * ppo_epochs
-        )
         value_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths

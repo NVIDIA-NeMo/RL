@@ -1275,6 +1275,7 @@ class TestAsyncTrajectoryCollector:
         assert collector.data_exhausted is False
         status = collector.get_status()
         assert status["errored"] is True
+        assert status["error"] == "RuntimeError: collection blew up"
         assert status["data_exhausted"] is False
         assert status["running"] is False
 
@@ -1615,6 +1616,43 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._spawned_per_target
         assert target_weight not in collector._completed_per_target
         assert target_weight not in collector._buffered_per_target
+        assert collector.running is True
+        assert collector.get_status()["errored"] is False
+        assert collector.get_status()["error"] is None
+
+    def test_prompt_worker_failure_allows_gap_fill(self, monkeypatch):
+        """A failed rollout leaves collection running so a later batch can fill the gap."""
+        from nemo_rl.algorithms import grpo
+
+        collector = self.create_local_collector()
+        collector.running = True
+        collector._generating_targets.add(1)
+        collector._spawned_per_target[1] = 1
+        monkeypatch.setattr(grpo, "_should_use_nemo_gym", lambda _config: False)
+
+        def fail_rollout(**_kwargs):
+            raise RuntimeError("rollout failed")
+
+        monkeypatch.setattr(
+            trajectory_collector_mod,
+            "run_async_multi_turn_rollout",
+            fail_rollout,
+        )
+
+        collector._run_prompt_group_worker(
+            mock.MagicMock(),
+            generation_weight_version=0,
+            target_weight_version=1,
+            prompt_idx=0,
+        )
+
+        status = collector.get_status()
+        assert status["errored"] is False
+        assert status["error"] is None
+        assert status["running"] is True
+        assert 1 not in collector._generating_targets
+        assert 1 not in collector._spawned_per_target
+        assert 1 not in collector._completed_per_target
 
     def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
         """Gap-fill generates only the trajectories still needed for a target."""

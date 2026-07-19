@@ -107,6 +107,8 @@ class AsyncTrajectoryCollector:
         self.running = False
         self.data_exhausted = False
         self.collection_failed = False
+        self.collection_error: Optional[str] = None
+        self._failure_lock: _threading.Lock = _threading.Lock()
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -315,12 +317,27 @@ class AsyncTrajectoryCollector:
         """Return a snapshot of the collector's internal state for driver-side diagnostics."""
         with self._threads_lock:
             inflight_workers = len(self._inflight_threads)
+        with self._failure_lock:
+            collection_failed = self.collection_failed
+            collection_error = self.collection_error
         return {
             "running": self.running,
             "data_exhausted": self.data_exhausted,
-            "errored": self.collection_failed,
+            "errored": collection_failed,
+            "error": collection_error,
             "inflight_workers": inflight_workers,
         }
+
+    def _mark_collection_failed(self, error: Exception) -> None:
+        """Record the first background failure and unblock collector waits."""
+        with self._failure_lock:
+            if not self.collection_failed:
+                self.collection_failed = True
+                self.collection_error = f"{type(error).__name__}: {error}"
+        self.running = False
+        self._manual_pause_cleared.set()
+        self._refit_pause_cleared.set()
+        self._generation_limit_cleared.set()
 
     def _collection_loop(self):
         """Run the collection loop in background thread."""
@@ -376,7 +393,7 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
-            self.collection_failed = True
+            self._mark_collection_failed(e)
         finally:
             self.running = False
             if dataloader_exhausted:
@@ -443,6 +460,8 @@ class AsyncTrajectoryCollector:
                 self._spawning_targets.add(target_weight)
             try:
                 for prompt_idx in range(num_prompts_to_generate):
+                    if not self.running:
+                        break
                     # Wait for refit to complete if in progress
                     if not self._refit_pause_cleared.is_set() and self.running:
                         with self._threads_lock:
@@ -455,6 +474,8 @@ class AsyncTrajectoryCollector:
                         )
                         with self._efficiency_timer.time("idle/refit_event_wait"):
                             self._refit_pause_cleared.wait()
+                        if not self.running:
+                            break
 
                         # After refit finishes if weight version has updated, reflect that in the new trajectories
                         generation_weight_version = self.current_weight_version
@@ -475,6 +496,9 @@ class AsyncTrajectoryCollector:
                         daemon=True,
                     )
                     self._inflight_sema.acquire()
+                    if not self.running:
+                        self._inflight_sema.release()
+                        break
                     registered = False
                     try:
                         with self._threads_lock:
@@ -936,18 +960,16 @@ class AsyncTrajectoryCollector:
                         time.sleep(min(backoff_delay, 0.5))
                         backoff_delay *= 1.5
                     else:
-                        # Unexpected status, wait briefly
-                        time.sleep(0.01)
-            except Exception as e:
-                print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
+                        raise RuntimeError(
+                            f"Unexpected replay buffer add status: {status!r}"
+                        )
+            except Exception:
                 if backoff_start is not None:
                     self._efficiency_timer.record(
                         "idle/buffer_full_backoff",
                         time.perf_counter() - backoff_start,
                     )
-                import traceback
-
-                traceback.print_exc()
+                raise
         except Exception as e:
             print(f"❌ Error in prompt group worker: {e}")
             self._efficiency_timer.record(
