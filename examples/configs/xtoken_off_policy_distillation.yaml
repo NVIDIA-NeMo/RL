@@ -240,6 +240,23 @@ data:
   max_input_seq_length: 2048
   shuffle: true
   num_workers: 4
+  # Collator mode. "text" (default) = raw-text KD; "chat" = per-assistant-message
+  # alignment over each side's rendered chat template (SFT/instruct data). The
+  # knobs below only apply when collator_mode: chat.
+  collator_mode: "text"
+  # Drop the opener content pair per assistant message from the KD alignment
+  # (leaves the CE token mask untouched).
+  drop_first_assistant_chunk_kl: false
+  # Include the reasoning body (thinking) in the loss (chat mode).
+  include_thinking_in_loss: false
+  # Split each assistant message into native reasoning/close/answer regions and
+  # align them independently (requires include_thinking_in_loss). Not yet wired.
+  native_thinking_alignment: false
+  # Restrict KD to a subset of {reasoning, close, answer, eot} (requires
+  # native_thinking_alignment).
+  kd_alignment_regions: null
+  # Lockstep multi-doc packing per row (chat mode). Only 1 is supported for now.
+  num_packed_rows: 1
   train:
     dataset_name: "arrow_text"
     processor: "kd_data_processor"
