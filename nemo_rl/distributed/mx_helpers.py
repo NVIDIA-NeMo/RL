@@ -1,18 +1,25 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Trainer-side helpers for rank-local ModelExpress publication."""
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     import torch
@@ -20,40 +27,56 @@ if TYPE_CHECKING:
 logger = logging.getLogger("nemo_rl.distributed.mx_helpers")
 
 
-@dataclass
-class MxConfig:
-    """Configuration for trainer-side ModelExpress publication.
+@dataclass(frozen=True)
+class ModelExpressPublisherOptions:
+    """Internal settings supplied by a ModelExpress weight synchronizer.
 
     Args:
-        enabled: Master switch for ModelExpress publication.
         mx_server_url: gRPC URL of the MX server.
-        same_rank_only: whether consumers are expected to use same-rank sources.
         nic_pin: NIC pinning strategy passed to ``pin_local_nic``:
-            ``"auto"`` (default) | ``"off"`` | concrete ``"mlx5_<i>"``.
+            ``"auto"`` | ``"off"`` | concrete ``"mlx5_<i>"``.
         megatron_role_overrides: Parameter-name substrings mapped to explicit
             ModelExpress Megatron roles.
+
+    This is not a user-facing configuration schema. The future
+    ``ModelExpressWeightSynchronizer`` will validate user configuration and
+    construct these settings explicitly.
     """
 
-    enabled: bool = False
-    mx_server_url: str = "modelexpress-server:8001"
-    same_rank_only: bool = True
-    nic_pin: str = "auto"
-    megatron_role_overrides: dict[str, str] = field(default_factory=dict)
+    mx_server_url: str
+    nic_pin: str
+    megatron_role_overrides: Mapping[str, str]
 
-    @classmethod
-    def from_dict(cls, d: dict[str, Any] | None) -> "MxConfig":
-        if not d:
-            return cls()
-        return cls(
-            enabled=bool(d.get("enabled", False)),
-            mx_server_url=str(d.get("mx_server_url", "modelexpress-server:8001")),
-            same_rank_only=bool(d.get("same_rank_only", True)),
-            nic_pin=str(d.get("nic_pin", "auto")),
-            megatron_role_overrides={
-                str(name): str(role)
-                for name, role in (d.get("megatron_role_overrides") or {}).items()
-            },
-        )
+
+class ModelExpressPublisher(Protocol):
+    """Publisher operations used by NeMo RL trainer workers."""
+
+    def initialize(self, *, model_name: str, dtype: str) -> None: ...
+
+    def reset_tensors(self) -> None: ...
+
+    def set_megatron_sidecar(self, sidecar: dict[str, Any]) -> None: ...
+
+    def set_megatron_mesh_position(
+        self, *, tp_rank: int, pp_rank: int, ep_rank: int
+    ) -> None: ...
+
+    def add_tensor(
+        self,
+        *,
+        name: str,
+        tensor: "torch.Tensor",
+        is_expert: bool = False,
+        expert_axis: int = 0,
+        owned_expert_ids: tuple[int, ...] | set[int] | list[int] = (),
+        megatron_role: str | None = None,
+        megatron_extras: dict[str, str] | None = None,
+        shard_spec: Any | None = None,
+    ) -> None: ...
+
+    def publish(self, *, version: int) -> str: ...
+
+    def mark_ready(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -122,26 +145,26 @@ def get_dtensor_local_shard(
     )
 
 
-def pin_local_nic(*, device_id: int, mode: str = "auto") -> None:
-    """Best-effort NUMA-local NIC pinning before NIXL initializes.
+def pin_local_nic(*, device_id: int, mode: str) -> None:
+    """Configure the requested NIC policy before NIXL initializes.
 
     Automatic mode delegates topology selection to ModelExpress. A concrete
     device name sets the UCX interface explicitly.
     """
     if mode == "off":
         return
-    try:
-        from modelexpress.ucx_utils import apply_nic_pin_for_device
 
-        if mode == "auto":
-            apply_nic_pin_for_device(device_id=device_id)
-            logger.info("pinned NIC for device %d (auto)", device_id)
-        else:
-            os.environ["UCX_NET_DEVICES"] = mode
-            os.environ["MX_RDMA_NIC_PIN"] = "off"  # explicit override
-            logger.info("pinned NIC explicitly: %s", mode)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("NIC pin failed (mode=%s): %s", mode, exc)
+    # Imported only when MX is selected so normal NeMo RL imports do not
+    # require the external modelexpress package.
+    from modelexpress.ucx_utils import apply_nic_pin_for_device
+
+    if mode == "auto":
+        apply_nic_pin_for_device(device_id=device_id)
+        logger.info("pinned NIC for device %d (auto)", device_id)
+    else:
+        os.environ["UCX_NET_DEVICES"] = mode
+        os.environ["MX_RDMA_NIC_PIN"] = "off"
+        logger.info("pinned NIC explicitly: %s", mode)
 
 
 def build_v2_publisher(
@@ -152,23 +175,25 @@ def build_v2_publisher(
     tp_world_size: int,
     pp_world_size: int,
     ep_world_size: int,
-    mx_config: MxConfig,
+    publisher_options: ModelExpressPublisherOptions,
     agent_name: str | None = None,
-) -> Any:
+) -> ModelExpressPublisher:
     """Construct a :class:`MxV2TrainingPublisher` and pin its NIC.
 
     Returns a :class:`modelexpress.MxV2TrainingPublisher`. Caller must invoke
     ``initialize(model_name=...)``, then ``add_tensor`` per tensor, then
     ``publish(version=...)``, then ``mark_ready()``.
     """
+    # Imported only when MX is selected so normal NeMo RL imports do not
+    # require the external modelexpress package.
     from modelexpress import MxV2TrainingPublisher, TrainerWorldLayout
 
-    pin_local_nic(device_id=device_id, mode=mx_config.nic_pin)
+    pin_local_nic(device_id=device_id, mode=publisher_options.nic_pin)
 
     return MxV2TrainingPublisher(
         agent_name=agent_name or f"nemo-rl-trainer-r{rank}",
         device_id=device_id,
-        mx_server_url=mx_config.mx_server_url,
+        mx_server_url=publisher_options.mx_server_url,
         worker_rank=rank,
         world_layout=TrainerWorldLayout(
             fsdp_world_size=fsdp_world_size,
@@ -180,32 +205,32 @@ def build_v2_publisher(
     )
 
 
-def reset_v2_publisher_tensors(publisher: Any) -> None:
-    """Reset one publisher's per-version tensor registrations.
+def start_model_express_publication(publisher: ModelExpressPublisher) -> None:
+    """Clear per-version tensor registrations before adding the next version."""
+    publisher.reset_tensors()
 
-    Prefer the public lifecycle method when provided by ModelExpress. The
-    private-field fallback supports the currently released v2 publisher and
-    is isolated here so it can be removed when that release is retired.
-    """
-    reset_tensors = getattr(publisher, "reset_tensors", None)
-    if callable(reset_tensors):
-        reset_tensors()
-        return
 
-    registry = getattr(publisher, "_registry", None)
-    registered_tensors = getattr(publisher, "_registered_tensors", None)
-    if registry is None or registered_tensors is None:
+def finish_model_express_publication(
+    publisher: ModelExpressPublisher,
+    *,
+    version: int,
+    worker_rank: int,
+) -> str:
+    """Publish one complete version and require a successful READY transition."""
+    source_id = publisher.publish(version=version)
+    if not publisher.mark_ready():
         raise RuntimeError(
-            "unsupported ModelExpress publisher: expected reset_tensors()"
+            f"ModelExpress failed to mark trainer rank {worker_rank} ready"
         )
-    registry.clear()
-    registered_tensors.clear()
+    return source_id
 
 
 __all__ = [
-    "MxConfig",
+    "ModelExpressPublisher",
+    "ModelExpressPublisherOptions",
     "build_v2_publisher",
+    "finish_model_express_publication",
     "get_dtensor_local_shard",
     "pin_local_nic",
-    "reset_v2_publisher_tensors",
+    "start_model_express_publication",
 ]

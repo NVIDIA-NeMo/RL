@@ -1,23 +1,22 @@
-from types import SimpleNamespace
-
 import pytest
 import torch
-from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from nemo_rl.distributed.mx_helpers import (
-    MxConfig,
+    ModelExpressPublisherOptions,
+    finish_model_express_publication,
     get_dtensor_local_shard,
-    reset_v2_publisher_tensors,
+    start_model_express_publication,
 )
 
 
 class FakeMesh:
-    def __init__(self, coordinate: tuple[int, ...], sizes: tuple[int, ...]):
+    def __init__(self, coordinate: tuple[int, ...] | None, sizes: tuple[int, ...]):
         self._coordinate = coordinate
         self._sizes = sizes
 
-    def get_coordinate(self) -> list[int]:
-        return list(self._coordinate)
+    def get_coordinate(self) -> list[int] | None:
+        return list(self._coordinate) if self._coordinate is not None else None
 
     def size(self, mesh_dim: int) -> int:
         return self._sizes[mesh_dim]
@@ -30,7 +29,7 @@ class FakeDTensor:
         *,
         global_shape: tuple[int, ...],
         placements: tuple[object, ...],
-        coordinate: tuple[int, ...],
+        coordinate: tuple[int, ...] | None,
         mesh_sizes: tuple[int, ...],
     ):
         self._local = local
@@ -42,10 +41,58 @@ class FakeDTensor:
         return self._local
 
 
-def test_mx_config_preserves_megatron_role_overrides():
-    config = MxConfig.from_dict({"megatron_role_overrides": {"linear_fc1": "column"}})
+class FakePublisher:
+    def __init__(self, *, ready: bool = True):
+        self.ready = ready
+        self.reset_count = 0
+        self.published_versions: list[int] = []
 
-    assert config.megatron_role_overrides == {"linear_fc1": "column"}
+    def reset_tensors(self) -> None:
+        self.reset_count += 1
+
+    def publish(self, *, version: int) -> str:
+        self.published_versions.append(version)
+        return f"source-{version}"
+
+    def mark_ready(self) -> bool:
+        return self.ready
+
+
+def test_publisher_options_preserve_megatron_role_overrides():
+    options = ModelExpressPublisherOptions(
+        mx_server_url="modelexpress-server:8001",
+        nic_pin="auto",
+        megatron_role_overrides={"linear_fc1": "column"},
+    )
+
+    assert options.megatron_role_overrides == {"linear_fc1": "column"}
+
+
+def test_model_express_publication_lifecycle_repeats_per_version():
+    publisher = FakePublisher()
+
+    for version in (7, 8):
+        start_model_express_publication(publisher)
+        source_id = finish_model_express_publication(
+            publisher,
+            version=version,
+            worker_rank=3,
+        )
+        assert source_id == f"source-{version}"
+
+    assert publisher.reset_count == 2
+    assert publisher.published_versions == [7, 8]
+
+
+def test_model_express_publication_requires_ready_transition():
+    publisher = FakePublisher(ready=False)
+
+    with pytest.raises(RuntimeError, match="trainer rank 3 ready"):
+        finish_model_express_publication(
+            publisher,
+            version=7,
+            worker_rank=3,
+        )
 
 
 def test_get_dtensor_local_shard_describes_uneven_last_shard():
@@ -94,22 +141,27 @@ def test_get_dtensor_local_shard_rejects_multiple_shard_axes():
         get_dtensor_local_shard(tensor)
 
 
-def test_reset_v2_publisher_tensors_prefers_public_api():
-    calls: list[str] = []
-    publisher = SimpleNamespace(reset_tensors=lambda: calls.append("reset"))
-
-    reset_v2_publisher_tensors(publisher)
-
-    assert calls == ["reset"]
-
-
-def test_reset_v2_publisher_tensors_supports_released_v2_api():
-    publisher = SimpleNamespace(
-        _registry=[object()],
-        _registered_tensors={"weight": object()},
+def test_get_dtensor_local_shard_rejects_partial_placement():
+    tensor = FakeDTensor(
+        torch.ones(2, 4),
+        global_shape=(2, 4),
+        placements=(Partial(),),
+        coordinate=(0,),
+        mesh_sizes=(1,),
     )
 
-    reset_v2_publisher_tensors(publisher)
+    with pytest.raises(NotImplementedError, match="partial DTensors"):
+        get_dtensor_local_shard(tensor)
 
-    assert publisher._registry == []
-    assert publisher._registered_tensors == {}
+
+def test_get_dtensor_local_shard_rejects_rank_outside_mesh():
+    tensor = FakeDTensor(
+        torch.ones(2, 4),
+        global_shape=(4, 4),
+        placements=(Shard(0),),
+        coordinate=None,
+        mesh_sizes=(2,),
+    )
+
+    with pytest.raises(RuntimeError, match="not part of the DTensor device mesh"):
+        get_dtensor_local_shard(tensor)
