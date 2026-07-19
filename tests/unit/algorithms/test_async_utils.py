@@ -38,6 +38,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     ReplayBufferNew,
 )
 from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
     MasterConfig,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
@@ -147,6 +148,26 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_trajectories_needed(2, 2) == 0
         assert buffer.get_trajectories_needed(3, 2) == 1
 
+    def test_local_restore_can_drop_incomplete_frontier(self):
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=True,
+        )
+        state = self._state(
+            trajectory_versions=[1, 1, 2],
+            target_weight_versions=[2, 2, 3],
+            last_target_weight_already_generated=3,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 2]
+        assert buffer.get_trajectories_needed(3, 2) == 2
+
     def test_local_restore_empty_state_resets_generation_watermark(self):
         buffer = ReplayBufferImpl(max_size=10)
         state = self._state(
@@ -184,6 +205,27 @@ class TestReplayBufferImplCheckpointing:
         assert buffer.get_debug_info()["target_weight_versions"] == [5]
         assert not buffer.has_complete_batch(5, 2)
         assert buffer.get_trajectories_needed(5, 2) == 1
+
+    def test_local_restore_drops_target_made_incomplete_by_stale_filter(self):
+        buffer = ReplayBufferImpl(
+            max_size=10,
+            drop_incomplete_targets_on_restore=True,
+        )
+        state = self._state(
+            trajectory_versions=[4, 1],
+            target_weight_versions=[5, 5],
+            last_target_weight_already_generated=5,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        assert buffer.size() == 0
+        assert buffer.get_trajectories_needed(5, 2) == 2
 
     def test_local_restore_truncates_after_resume_cleanup(self):
         buffer = ReplayBufferImpl(max_size=2)
@@ -1200,7 +1242,6 @@ class TestAsyncTrajectoryCollector:
         collector.running = True
 
     def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
-        """for...else path: iterator drains cleanly -> data_exhausted, not errored."""
         collector = self.create_local_collector()
         self._prime_collection_loop(collector)
         processed = []
@@ -1263,7 +1304,7 @@ class TestAsyncTrajectoryCollector:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,
                 "max_rollout_turns": 1,
-                "async_grpo": {"max_trajectory_age_steps": 2},
+                "async_grpo": AsyncGRPOConfig(max_trajectory_age_steps=2),
             },
             "policy": {
                 "max_total_sequence_length": 512,
@@ -1271,6 +1312,38 @@ class TestAsyncTrajectoryCollector:
             },
         }
         return MasterConfig.model_construct(**config)
+
+    def test_collector_selects_ppo_config(self):
+        """The shared collector derives PPO settings from its master config."""
+        from nemo_rl.algorithms.ppo import (
+            AsyncPPOConfig,
+        )
+        from nemo_rl.algorithms.ppo import (
+            MasterConfig as PPOMasterConfig,
+        )
+
+        async_config = AsyncPPOConfig(max_trajectory_age_steps=3)
+        master_config = PPOMasterConfig.model_construct(
+            policy={"make_sequence_length_divisible_by": 1},
+            ppo={
+                "num_prompts_per_step": 2,
+                "num_generations_per_prompt": 4,
+                "max_rollout_turns": 1,
+                "async_ppo": async_config,
+            },
+        )
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        collector = collector_cls(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=master_config,
+            replay_buffer=mock.MagicMock(),
+        )
+
+        assert collector.algorithm_config is master_config.ppo
+        assert collector.async_config is async_config
+        assert collector.async_config.max_trajectory_age_steps == 3
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""
@@ -1608,7 +1681,7 @@ class TestAsyncUtilsIntegration:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 2,
                 "max_rollout_turns": 1,
-                "async_grpo": {"max_trajectory_age_steps": 1},
+                "async_grpo": AsyncGRPOConfig(max_trajectory_age_steps=1),
             },
             "policy": {
                 "max_total_sequence_length": 512,

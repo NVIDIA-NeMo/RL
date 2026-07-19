@@ -247,7 +247,7 @@ The validation set you pass in will directly be used for validation with no addi
             master_config=master_config,
         )
     # Check if async mode is enabled
-    elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
+    elif "async_grpo" in config.grpo and config.grpo["async_grpo"].enabled:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
         unsupported_features = [
             "use_dynamic_sampling",
@@ -295,7 +295,7 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer=checkpointer,
             grpo_save_state=grpo_state,
             master_config=master_config,
-            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            max_trajectory_age_steps=async_config.max_trajectory_age_steps,
             teacher_worker_groups=teacher_worker_groups,
             alias_to_group_alias=alias_to_group_alias,
         )

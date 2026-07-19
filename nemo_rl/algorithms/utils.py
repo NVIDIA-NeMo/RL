@@ -739,7 +739,7 @@ def print_performance_metrics(
     # Idle Time from Training Worker (Async GRPO only)
     grpo_config = getattr(master_config, "grpo", {})
     if (
-        "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
+        "async_grpo" in grpo_config and grpo_config["async_grpo"].enabled
     ) and not colocated_inference:
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (

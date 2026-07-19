@@ -27,13 +27,18 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     """Replay buffer storing per-prompt groups.
 
     A single entry corresponds to 1 prompt repeated by
-    grpo.num_generations_per_prompt (required to compute per-prompt advantages).
+    the algorithm's ``num_generations_per_prompt`` setting.
     """
 
-    def __init__(self, max_size: int):
+    def __init__(
+        self,
+        max_size: int,
+        drop_incomplete_targets_on_restore: bool = False,
+    ) -> None:
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
         self.max_size = max_size
+        self._drop_incomplete_targets_on_restore = drop_incomplete_targets_on_restore
         self.trajectories = []  # List[dict[str, Any]]
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
@@ -396,6 +401,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "last_target_weight_already_generated"
             ]
 
+            # Filter stale rows before checking target completeness. Otherwise a
+            # target can look complete, lose stale rows, and remain partially
+            # restored even when incomplete targets should be dropped.
+            if max_age_steps is not None and self.trajectories:
+                self._remove_stale_trajectories(max_age_steps)
+
             if current_training_step is not None and num_prompts_per_step is not None:
                 self._prepare_for_training_step(
                     current_step=current_training_step,
@@ -403,11 +414,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 )
             elif num_prompts_per_step is not None and self.trajectories:
                 self._remove_incomplete_target_steps(num_prompts_per_step)
-
-            if max_age_steps is not None and self.trajectories:
-                self._remove_stale_trajectories(max_age_steps)
-                if current_training_step is None and num_prompts_per_step is not None:
-                    self._remove_incomplete_target_steps(num_prompts_per_step)
 
             self._truncate_to_max_size(current_training_step)
 
@@ -468,11 +474,32 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             "   Complete targets: "
             f"{sorted(complete_targets) if complete_targets else 'none'}"
         )
-        for target in sorted(incomplete_targets):
+        if incomplete_targets and self._drop_incomplete_targets_on_restore:
             print(
-                f"   Incomplete target {target}: "
-                f"{target_counts[target]}/{num_prompts_per_step}"
+                "   Dropping incomplete restored targets: "
+                + ", ".join(
+                    f"{target}={target_counts[target]}/{num_prompts_per_step}"
+                    for target in sorted(incomplete_targets)
+                )
             )
+            indices_to_keep = [
+                i
+                for i, target in enumerate(self.target_weight_versions)
+                if target not in incomplete_targets
+            ]
+            self.trajectories = [self.trajectories[i] for i in indices_to_keep]
+            self.trajectory_versions = [
+                self.trajectory_versions[i] for i in indices_to_keep
+            ]
+            self.target_weight_versions = [
+                self.target_weight_versions[i] for i in indices_to_keep
+            ]
+        else:
+            for target in sorted(incomplete_targets):
+                print(
+                    f"   Incomplete target {target}: "
+                    f"{target_counts[target]}/{num_prompts_per_step}"
+                )
 
         # Let the collector ask each target from current_step onward how many
         # trajectories are still needed, so incomplete restored batches can be
@@ -683,7 +710,7 @@ class ReplayBufferNew(ReplayBufferImpl):
         Will evict stale rows before sampling, so we will get [current_weight_version - self.max_staleness, current_weight_version] valid trajectories.
 
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None.
+            Dictionary with trajectories and average age, or None.
         """
         with self._lock:
             self._evict(current_weight_version)
