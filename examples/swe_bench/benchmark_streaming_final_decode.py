@@ -1021,8 +1021,10 @@ async def _main(args: argparse.Namespace) -> None:
             dummy_isolated_from_full_final_output &= all(
                 len(item.dummy_token_ids) == args.same_request_prefill_chunks
                 and len(item.final_generation.output_token_ids)
-                == args.max_output_tokens
-                for item in same_request_final
+                == len(reference.output_token_ids)
+                for item, reference in zip(
+                    same_request_final, control_delta, strict=True
+                )
             )
             measurements[label] = {
                 "first_candidate_tokens": len(trace.snapshots[0]),
