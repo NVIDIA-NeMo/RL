@@ -287,3 +287,118 @@ def test_module_exposes_alignment_kernel():
     it directly instead of poking at name-mangled internals).
     """
     assert hasattr(ta, "align_by_offsets_cluster")
+
+
+# ---------------------------------------------------------------------------
+# Chat path: align_one_offset_per_asst (per-assistant-message alignment).
+# ---------------------------------------------------------------------------
+
+
+def _chat_aligner(student_vocab, teacher_vocab):
+    aligner = _make_aligner(student_vocab, teacher_vocab)
+    aligner.alignment_method = "offset_cluster_decode_fix"
+    return aligner
+
+
+def test_per_asst_whole_message_plus_eot():
+    """One assistant turn: content tokens align (per-message rebased) and the
+    end-of-turn marker gets a synthetic 1-1 pair. Positions are full-sequence.
+    """
+    aligner = _chat_aligner(
+        {1: "<s>", 10: "Hello", 11: "Ġworld", 99: "<eot>"},
+        {2: "<s>", 20: "Hello", 21: "Ġworld", 98: "<eot>"},
+    )
+    # scaffold [0,10) / Hello [10,15) / world [15,21) / eot [21,28)
+    s_ids = [1, 10, 11, 99]
+    s_off = [(0, 10), (10, 15), (15, 21), (21, 28)]
+    # teacher renders in its own coordinates
+    t_ids = [2, 20, 21, 98]
+    t_off = [(0, 8), (8, 13), (13, 19), (19, 25)]
+
+    pairs = aligner.align_one_offset_per_asst(
+        s_ids, s_off, [(10, 21)], t_ids, t_off, [(8, 19)]
+    )
+    positions = [(p[2], p[3], p[4], p[5]) for p in pairs]
+    assert positions == [(1, 2, 1, 2), (2, 3, 2, 3), (3, 4, 3, 4)], positions
+    assert pairs[-1][6] is True  # EOT pair is correct
+
+
+def test_per_asst_drop_first_content_pair():
+    """``drop_first_content_pair`` removes the opener content pair, keeping the
+    rest of the message (and the EOT) intact.
+    """
+    aligner = _chat_aligner(
+        {1: "<s>", 10: "Hello", 11: "Ġworld", 99: "<eot>"},
+        {2: "<s>", 20: "Hello", 21: "Ġworld", 98: "<eot>"},
+    )
+    s_ids = [1, 10, 11, 99]
+    s_off = [(0, 10), (10, 15), (15, 21), (21, 28)]
+    t_ids = [2, 20, 21, 98]
+    t_off = [(0, 8), (8, 13), (13, 19), (19, 25)]
+
+    pairs = aligner.align_one_offset_per_asst(
+        s_ids,
+        s_off,
+        [(10, 21)],
+        t_ids,
+        t_off,
+        [(8, 19)],
+        drop_first_content_pair=True,
+    )
+    positions = [(p[2], p[3], p[4], p[5]) for p in pairs]
+    # first content pair (1,2,1,2) dropped; second content + EOT remain
+    assert positions == [(2, 3, 2, 3), (3, 4, 3, 4)], positions
+
+
+def test_per_asst_native_regions_and_included_regions():
+    """Native reasoning/answer regions align independently; ``included_regions``
+    restricts KD without touching the others.
+    """
+    aligner = _chat_aligner(
+        {1: "<s>", 50: "R", 60: "A", 99: "<eot>"},
+        {2: "<s>", 51: "R", 61: "A", 98: "<eot>"},
+    )
+    # scaffold [0,3) / R [3,4) / A [9,10) / eot [10,17)
+    s_ids = [1, 50, 60, 99]
+    s_off = [(0, 3), (3, 4), (9, 10), (10, 17)]
+    t_ids = [2, 51, 61, 98]
+    t_off = [(0, 2), (2, 3), (7, 8), (8, 15)]
+    s_regions = [{"reasoning": (3, 4), "answer": (9, 10)}]
+    t_regions = [{"reasoning": (2, 3), "answer": (7, 8)}]
+
+    all_pairs = aligner.align_one_offset_per_asst(
+        s_ids,
+        s_off,
+        [(3, 10)],
+        t_ids,
+        t_off,
+        [(2, 8)],
+        student_alignment_regions=s_regions,
+        teacher_alignment_regions=t_regions,
+        student_eot_indices=[3],
+        teacher_eot_indices=[3],
+    )
+    assert [(p[2], p[3], p[4], p[5]) for p in all_pairs] == [
+        (1, 2, 1, 2),  # reasoning
+        (2, 3, 2, 3),  # answer
+        (3, 4, 3, 4),  # eot
+    ]
+
+    # Restrict KD to answer + eot: reasoning pair drops out.
+    subset = aligner.align_one_offset_per_asst(
+        s_ids,
+        s_off,
+        [(3, 10)],
+        t_ids,
+        t_off,
+        [(2, 8)],
+        student_alignment_regions=s_regions,
+        teacher_alignment_regions=t_regions,
+        student_eot_indices=[3],
+        teacher_eot_indices=[3],
+        included_regions=["answer", "eot"],
+    )
+    assert [(p[2], p[3], p[4], p[5]) for p in subset] == [
+        (2, 3, 2, 3),  # answer
+        (3, 4, 3, 4),  # eot
+    ]

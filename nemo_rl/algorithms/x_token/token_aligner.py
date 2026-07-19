@@ -36,7 +36,7 @@ Public surface:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Tuple
+from typing import Any, Collection, Dict, List, Tuple
 
 import torch
 
@@ -172,17 +172,34 @@ class TokenAligner:
             their training device via
             :func:`nemo_rl.algorithms.x_token.loss_utils.get_sparse_projection_matrix`
             or :func:`nemo_rl.algorithms.x_token.loss_utils.get_topk_projection`.
+        alignment_method: Alignment strategy the chat path uses.
+            ``"offset_cluster_decode_fix"`` (default) pairs tokens by char
+            offsets; ``"same_tokenizer_identity"`` asserts a 1-1 identity
+            pairing (student and teacher share a tokenizer). The raw-text
+            :meth:`align` path always uses offset-cluster.
     """
+
+    _SUPPORTED_ALIGNMENT_METHODS = (
+        "offset_cluster_decode_fix",
+        "same_tokenizer_identity",
+    )
 
     def __init__(
         self,
         student_tokenizer,
         teacher_tokenizer,
         projection_matrix_path: str,
+        alignment_method: str = "offset_cluster_decode_fix",
     ):
+        if alignment_method not in self._SUPPORTED_ALIGNMENT_METHODS:
+            raise ValueError(
+                f"alignment_method must be one of "
+                f"{self._SUPPORTED_ALIGNMENT_METHODS!r}, got {alignment_method!r}"
+            )
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
         self.projection_matrix_path = projection_matrix_path
+        self.alignment_method = alignment_method
 
     def align(
         self,
@@ -398,6 +415,349 @@ class TokenAligner:
                 )
             )
         return out
+
+    # ------------------------------------------------------------------ #
+    # Chat / instruct path: per-assistant-message alignment.
+    # These return raw 7-tuples (s_tokens, t_tokens, s_start, s_end, t_start,
+    # t_end, is_correct); the chat collator converts them to AlignmentPair.
+    # ------------------------------------------------------------------ #
+    def align_one_offset(
+        self,
+        student_ids: List[int],
+        teacher_ids: List[int],
+        student_offsets: List[Tuple[int, int]],
+        teacher_offsets: List[Tuple[int, int]],
+    ) -> List[Tuple[Any, ...]]:
+        """Single-sample offset-cluster alignment with the decode-fix mask.
+
+        Returns the raw 7-tuple pair list. Used by the chat collator for
+        per-document alignment inside a packed row. ``is_correct`` starts from
+        the canonical-text match; pairs that fail are re-checked against their
+        NFC-decoded text (catches CJK / whitespace-split asymmetry).
+        """
+        pairs = align_by_offsets_cluster(
+            student_ids,
+            student_offsets,
+            self.student_tokenizer,
+            teacher_ids,
+            teacher_offsets,
+            self.teacher_tokenizer,
+        )
+        if pairs:
+            pairs_6 = [(p[0], p[1], p[2], p[3], p[4], p[5]) for p in pairs]
+            mask = _decode_fix_correct_mask(
+                pairs_6,
+                student_ids_seq=student_ids,
+                teacher_ids_seq=teacher_ids,
+                student_tokenizer=self.student_tokenizer,
+                teacher_tokenizer=self.teacher_tokenizer,
+            )
+            pairs = [
+                (p[0], p[1], p[2], p[3], p[4], p[5], m) for p, m in zip(pairs_6, mask)
+            ]
+        return pairs
+
+    def align_one_offset_per_asst(
+        self,
+        student_ids: List[int],
+        student_offsets: List[Tuple[int, int]],
+        student_asst_char_spans: List[Tuple[int, int]],
+        teacher_ids: List[int],
+        teacher_offsets: List[Tuple[int, int]],
+        teacher_asst_char_spans: List[Tuple[int, int]],
+        student_asst_mask: List[int] | None = None,
+        teacher_asst_mask: List[int] | None = None,
+        student_alignment_regions: List[Dict[str, Tuple[int, int]]] | None = None,
+        teacher_alignment_regions: List[Dict[str, Tuple[int, int]]] | None = None,
+        student_eot_indices: List[int] | None = None,
+        teacher_eot_indices: List[int] | None = None,
+        drop_first_content_pair: bool = False,
+        included_regions: Collection[str] | None = None,
+    ) -> List[Tuple[Any, ...]]:
+        """Per-assistant-message offset (or strict-identity) alignment.
+
+        Used by the chat collator where each side has its own rendered text,
+        so full-sequence offsets are in different coordinate systems. For each
+        assistant message:
+
+        1. Find student/teacher tokens whose offsets fall fully inside paired
+           content regions. By default there is one whole-message region;
+           native-thinking mode supplies reasoning, close, and answer regions.
+        2. Rebase each paired region independently so both token slices share
+           the same coordinate system.
+        3. Run :func:`align_by_offsets_cluster` on the slices.
+        4. Translate slice-local positions back to full-sequence positions.
+
+        Scaffold and user-content tokens are not aligned; the caller's
+        ``token_mask = attention_mask * assistant_mask`` zeros them out of loss.
+
+        ``drop_first_content_pair`` omits the first pair with both student and
+        teacher spans per message (removes cross-tokenizer KL on the opener
+        chunk while leaving the CE token mask untouched). ``included_regions``
+        optionally limits KD to a subset of ``reasoning``, ``close``,
+        ``answer``, ``eot``. Returns a flat 7-tuple list with full-sequence
+        position indices.
+        """
+        if len(student_asst_char_spans) != len(teacher_asst_char_spans):
+            raise ValueError(
+                f"asst message count mismatch: "
+                f"{len(student_asst_char_spans)} vs "
+                f"{len(teacher_asst_char_spans)}"
+            )
+        if (student_alignment_regions is None) != (teacher_alignment_regions is None):
+            raise ValueError("student/teacher alignment regions must be paired")
+        if student_alignment_regions is not None and (
+            len(student_alignment_regions) != len(student_asst_char_spans)
+            or len(teacher_alignment_regions or []) != len(teacher_asst_char_spans)
+        ):
+            raise ValueError("alignment-region count must match assistant turns")
+        if (student_eot_indices is None) != (teacher_eot_indices is None):
+            raise ValueError("student/teacher EOT index lists must be paired")
+        if student_eot_indices is not None and (
+            len(student_eot_indices) != len(student_asst_char_spans)
+            or len(teacher_eot_indices or []) != len(teacher_asst_char_spans)
+        ):
+            raise ValueError("EOT index count must match assistant turns")
+
+        included_region_set = (
+            frozenset(included_regions) if included_regions is not None else None
+        )
+        valid_region_names = {"reasoning", "close", "answer", "eot"}
+        if included_region_set is not None:
+            invalid = included_region_set - valid_region_names
+            if invalid:
+                raise ValueError(
+                    "included_regions contains unsupported values: "
+                    f"{sorted(invalid)!r}; expected a subset of "
+                    f"{sorted(valid_region_names)!r}"
+                )
+            if not included_region_set:
+                raise ValueError("included_regions must not be empty")
+            if student_alignment_regions is None:
+                raise ValueError(
+                    "included_regions requires native semantic alignment regions"
+                )
+
+        combined: List[Tuple[Any, ...]] = []
+        for turn_i, ((s_start_c, s_end_c), (t_start_c, t_end_c)) in enumerate(
+            zip(student_asst_char_spans, teacher_asst_char_spans)
+        ):
+            if student_alignment_regions is None:
+                paired_regions = [
+                    ("content", (s_start_c, s_end_c), (t_start_c, t_end_c))
+                ]
+            else:
+                student_turn_regions = student_alignment_regions[turn_i]
+                teacher_turn_regions = (teacher_alignment_regions or [])[turn_i]
+                paired_regions = []
+                for name in ("reasoning", "close", "answer"):
+                    s_region = student_turn_regions.get(name)
+                    t_region = teacher_turn_regions.get(name)
+                    if (s_region is None) != (t_region is None):
+                        raise ValueError(
+                            f"semantic region {name!r} is missing on one side"
+                        )
+                    if (
+                        s_region is not None
+                        and t_region is not None
+                        and (included_region_set is None or name in included_region_set)
+                    ):
+                        paired_regions.append((name, s_region, t_region))
+
+            turn_pairs: List[Tuple[Any, ...]] = []
+            for _region_name, (s_region_start, s_region_end), (
+                t_region_start,
+                t_region_end,
+            ) in paired_regions:
+                # Boundary-crossing tokens are deliberately omitted; in native
+                # mode this keeps template-only formatting whitespace out of KD.
+                s_idx = [
+                    i
+                    for i, (cs, ce) in enumerate(student_offsets)
+                    if cs >= s_region_start
+                    and ce <= s_region_end
+                    and ce > cs
+                    and (student_asst_mask is None or student_asst_mask[i] == 1)
+                ]
+                t_idx = [
+                    j
+                    for j, (cs, ce) in enumerate(teacher_offsets)
+                    if cs >= t_region_start
+                    and ce <= t_region_end
+                    and ce > cs
+                    and (teacher_asst_mask is None or teacher_asst_mask[j] == 1)
+                ]
+                if self.alignment_method == "same_tokenizer_identity" and (
+                    bool(s_idx) != bool(t_idx)
+                ):
+                    raise ValueError(
+                        "same_tokenizer_identity supervised-region presence "
+                        f"mismatch at assistant turn {turn_i}: "
+                        f"student_tokens={len(s_idx)}, teacher_tokens={len(t_idx)}"
+                    )
+                if not s_idx or not t_idx:
+                    continue
+
+                s_slice_ids = [student_ids[i] for i in s_idx]
+                t_slice_ids = [teacher_ids[j] for j in t_idx]
+                s_slice_off = [
+                    (
+                        student_offsets[i][0] - s_region_start,
+                        student_offsets[i][1] - s_region_start,
+                    )
+                    for i in s_idx
+                ]
+                t_slice_off = [
+                    (
+                        teacher_offsets[j][0] - t_region_start,
+                        teacher_offsets[j][1] - t_region_start,
+                    )
+                    for j in t_idx
+                ]
+
+                if self.alignment_method == "same_tokenizer_identity":
+                    if len(s_slice_ids) != len(t_slice_ids):
+                        raise ValueError(
+                            "same_tokenizer_identity supervised token-count "
+                            f"mismatch at assistant turn {turn_i}: "
+                            f"student={len(s_slice_ids)}, teacher={len(t_slice_ids)}"
+                        )
+                    slice_pairs = []
+                    for position, (
+                        student_id,
+                        teacher_id,
+                        student_offset,
+                        teacher_offset,
+                    ) in enumerate(
+                        zip(s_slice_ids, t_slice_ids, s_slice_off, t_slice_off)
+                    ):
+                        if student_id != teacher_id:
+                            raise ValueError(
+                                "same_tokenizer_identity token mismatch at "
+                                f"assistant turn {turn_i}, region position "
+                                f"{position}: student={student_id}, "
+                                f"teacher={teacher_id}"
+                            )
+                        if student_offset != teacher_offset:
+                            raise ValueError(
+                                "same_tokenizer_identity offset mismatch at "
+                                f"assistant turn {turn_i}, region position "
+                                f"{position}: student={student_offset}, "
+                                f"teacher={teacher_offset}"
+                            )
+                        slice_pairs.append(
+                            (
+                                [student_id],
+                                [teacher_id],
+                                position,
+                                position + 1,
+                                position,
+                                position + 1,
+                                True,
+                            )
+                        )
+                else:
+                    slice_pairs = align_by_offsets_cluster(
+                        s_slice_ids,
+                        s_slice_off,
+                        self.student_tokenizer,
+                        t_slice_ids,
+                        t_slice_off,
+                        self.teacher_tokenizer,
+                    )
+                if slice_pairs and self.alignment_method != "same_tokenizer_identity":
+                    pairs_6 = [
+                        (p[0], p[1], p[2], p[3], p[4], p[5]) for p in slice_pairs
+                    ]
+                    correct_mask = _decode_fix_correct_mask(
+                        pairs_6,
+                        student_ids_seq=s_slice_ids,
+                        teacher_ids_seq=t_slice_ids,
+                        student_tokenizer=self.student_tokenizer,
+                        teacher_tokenizer=self.teacher_tokenizer,
+                    )
+                    slice_pairs = [
+                        (p[0], p[1], p[2], p[3], p[4], p[5], is_correct)
+                        for p, is_correct in zip(pairs_6, correct_mask)
+                    ]
+
+                for s_toks, t_toks, s0, s1, t0, t1, ok in slice_pairs:
+                    full_s0 = s_idx[s0] if s0 != -1 else -1
+                    full_s1 = s_idx[s1 - 1] + 1 if s0 != -1 else -1
+                    full_t0 = t_idx[t0] if t0 != -1 else -1
+                    full_t1 = t_idx[t1 - 1] + 1 if t0 != -1 else -1
+                    turn_pairs.append(
+                        (s_toks, t_toks, full_s0, full_s1, full_t0, full_t1, ok)
+                    )
+
+            if drop_first_content_pair:
+                for pair_i, pair in enumerate(turn_pairs):
+                    if pair[2] != -1 and pair[4] != -1:
+                        del turn_pairs[pair_i]
+                        break
+            combined.extend(turn_pairs)
+
+            # Synthetic EOT pair: include the chat-template end-of-turn marker
+            # that terminates each assistant turn. Without it, the predictor
+            # whose label is EOT gets chunk_id=-1 after the kl shift and drops
+            # out of loss, so the model never learns to terminate its turn.
+            # Native-thinking mode passes the index explicitly because some
+            # templates insert whitespace between the answer boundary and EOT.
+            if student_eot_indices is not None:
+                s_eot_idx = student_eot_indices[turn_i]
+                t_eot_idx = (teacher_eot_indices or [])[turn_i]
+                s_eot_idx = s_eot_idx if s_eot_idx >= 0 else None
+                t_eot_idx = t_eot_idx if t_eot_idx >= 0 else None
+            else:
+                s_eot_idx = next(
+                    (
+                        i
+                        for i, (cs, ce) in enumerate(student_offsets)
+                        if cs == s_end_c and ce > cs
+                    ),
+                    None,
+                )
+                t_eot_idx = next(
+                    (
+                        j
+                        for j, (cs, ce) in enumerate(teacher_offsets)
+                        if cs == t_end_c and ce > cs
+                    ),
+                    None,
+                )
+            if self.alignment_method == "same_tokenizer_identity" and (
+                (s_eot_idx is None) != (t_eot_idx is None)
+            ):
+                raise ValueError(
+                    "same_tokenizer_identity EOT presence mismatch at "
+                    f"assistant turn {turn_i}: student={s_eot_idx}, "
+                    f"teacher={t_eot_idx}"
+                )
+            include_eot = included_region_set is None or "eot" in included_region_set
+            if include_eot and s_eot_idx is not None and t_eot_idx is not None:
+                if (
+                    self.alignment_method == "same_tokenizer_identity"
+                    and student_ids[s_eot_idx] != teacher_ids[t_eot_idx]
+                ):
+                    raise ValueError(
+                        "same_tokenizer_identity EOT token mismatch at "
+                        f"assistant turn {turn_i}: "
+                        f"student={student_ids[s_eot_idx]}, "
+                        f"teacher={teacher_ids[t_eot_idx]}"
+                    )
+                combined.append(
+                    (
+                        [student_ids[s_eot_idx]],
+                        [teacher_ids[t_eot_idx]],
+                        s_eot_idx,
+                        s_eot_idx + 1,
+                        t_eot_idx,
+                        t_eot_idx + 1,
+                        True,
+                    )
+                )
+
+        return combined
 
 
 # =====================================================================
@@ -747,3 +1107,72 @@ def align_by_offsets_cluster(
         )
 
     return aligned_pairs
+
+
+def _decode_fix_correct_mask(
+    aligned_pairs: List[Tuple[Any, ...]],
+    student_ids_seq: List[int] | None = None,
+    teacher_ids_seq: List[int] | None = None,
+    student_tokenizer: Any = None,
+    teacher_tokenizer: Any = None,
+) -> List[bool]:
+    r"""is_correct per pair via canonical text, with an NFC-decode fallback.
+
+    Operates on raw 7-tuples (what the chat aligner methods produce). When the
+    four optional args are supplied and the canonical-string compare flags a
+    pair as bad, it re-decodes the original id spans and compares NFC-normalized
+    text in three tiers:
+
+    1. Raw NFC equality — catches byte-encoding diffs where token strings
+       differ but decoded text is identical (e.g. CJK).
+    2. Stripped equality (non-empty) — catches whitespace-split asymmetry like
+       ``['Ġ', '\n']`` vs ``['Ġ\n']``.
+    3. Both-pure-whitespace equivalence — both decoded strings are non-empty
+       whitespace (covers ``▁`` vs ``Ġ`` etc.).
+    """
+    decode_fallback = (
+        student_ids_seq is not None
+        and teacher_ids_seq is not None
+        and student_tokenizer is not None
+        and teacher_tokenizer is not None
+    )
+    out: List[bool] = []
+    for pair in aligned_pairs:
+        s_toks, t_toks, s_start, s_end, t_start, t_end, *_rest = pair
+        s_canon = "".join(canonical_token(tk) for tk in s_toks) if s_toks else ""
+        t_canon = "".join(canonical_token(tk) for tk in t_toks) if t_toks else ""
+        is_correct = _strings_equal_flexible(
+            s_canon, t_canon, ignore_leading_char_diff=False
+        )
+        if (
+            not is_correct
+            and decode_fallback
+            and s_start != -1
+            and t_start != -1
+            and s_start < s_end
+            and t_start < t_end
+        ):
+            try:
+                import unicodedata as _ud
+
+                s_dec = student_tokenizer.decode(
+                    student_ids_seq[s_start:s_end], skip_special_tokens=False
+                )
+                t_dec = teacher_tokenizer.decode(
+                    teacher_ids_seq[t_start:t_end], skip_special_tokens=False
+                )
+                s_norm = _ud.normalize("NFC", s_dec)
+                t_norm = _ud.normalize("NFC", t_dec)
+                if s_norm and s_norm == t_norm:
+                    is_correct = True
+                else:
+                    s_stripped = s_norm.strip()
+                    t_stripped = t_norm.strip()
+                    if s_stripped and s_stripped == t_stripped:
+                        is_correct = True
+                    elif s_norm and t_norm and not s_stripped and not t_stripped:
+                        is_correct = True
+            except Exception:
+                pass
+        out.append(is_correct)
+    return out
