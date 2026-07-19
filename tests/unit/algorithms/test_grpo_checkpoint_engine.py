@@ -33,19 +33,18 @@ def test_nixl_example_is_an_enabled_non_colocated_overlay():
 
 def test_refit_policy_generation_checkpoint_engine_uses_weight_sync(monkeypatch):
     from nemo_rl.algorithms import grpo as grpo_mod
+    from nemo_rl.models.generation.vllm import VllmGeneration
     from nemo_rl.weight_sync import checkpoint_engine_weight_synchronizer
 
     policy = object()
     sync_weights = MagicMock()
     kv_scales = {"layer_0": 1.0}
 
-    class DummyGeneration:
-        cfg = {
-            "backend": "vllm",
-            "checkpoint_engine": {"enabled": True, "backend": "nixl"},
-        }
-
-    generation = DummyGeneration()
+    generation = MagicMock(spec=VllmGeneration)
+    generation.cfg = {
+        "backend": "vllm",
+        "checkpoint_engine": {"enabled": True, "backend": "nixl"},
+    }
     monkeypatch.setattr(
         checkpoint_engine_weight_synchronizer,
         "sync_weights_with_checkpoint_engine",
@@ -67,3 +66,30 @@ def test_refit_policy_generation_checkpoint_engine_uses_weight_sync(monkeypatch)
         timer=None,
         kv_scales=kv_scales,
     )
+
+
+def test_refit_policy_generation_sglang_uses_standard_refit(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+    from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+
+    policy = MagicMock()
+    policy.stream_weights_via_http.return_value = [object()]
+
+    generation = MagicMock(spec=SGLangGeneration)
+    generation.get_rollout_engine_urls.return_value = ["http://rollout"]
+    ray_get = MagicMock()
+    monkeypatch.setattr(grpo_mod.ray, "get", ray_get)
+
+    grpo_mod.refit_policy_generation(
+        policy=policy,
+        policy_generation=generation,
+        colocated_inference=True,
+        _refit_buffer_size_gb=2,
+    )
+
+    policy.stream_weights_via_http.assert_called_once_with(
+        rollout_engine_urls=["http://rollout"],
+        buffer_size_bytes=2 * 1024**3,
+    )
+    ray_get.assert_called_once_with(policy.stream_weights_via_http.return_value)
+    assert generation.prepare_for_generation.call_count == 2

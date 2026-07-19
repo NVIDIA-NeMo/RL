@@ -169,7 +169,7 @@ def _read_mtp_layer_weights_from_checkpoint(
     return weights
 
 
-class VllmInternalWorkerExtension(VllmCheckpointEngineMixin):
+class VllmInternalWorkerExtension:
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
 

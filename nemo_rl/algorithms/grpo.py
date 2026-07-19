@@ -2118,7 +2118,9 @@ def refit_policy_generation(
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
-    if enabled_checkpoint_engine_config(policy_generation.cfg) is not None:
+    if isinstance(policy_generation, VllmGeneration) and (
+        enabled_checkpoint_engine_config(policy_generation.cfg) is not None
+    ):
         from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
             sync_weights_with_checkpoint_engine,
         )
