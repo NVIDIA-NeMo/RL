@@ -33,6 +33,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_mask_sample_filter,
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
+    _initial_policy_generation_stale,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
     _resolve_message_level_advantage_penalties,
     _should_use_async_rollouts,
@@ -113,6 +114,17 @@ class TestMaskSampleFilter:
         assert torch.equal(
             repeated_batch["loss_multiplier"], torch.tensor([1.0, 0.5, 1.0])
         )
+
+
+def test_initial_policy_generation_stale() -> None:
+    generation = MagicMock()
+    generation.weight_synchronizer.is_stale = False
+
+    assert not _initial_policy_generation_stale(generation, completed_steps=0)
+    assert _initial_policy_generation_stale(generation, completed_steps=1)
+
+    generation.weight_synchronizer.is_stale = True
+    assert _initial_policy_generation_stale(generation, completed_steps=0)
 
 
 @pytest.fixture
@@ -1863,7 +1875,9 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
         lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
     )
     monkeypatch.setattr(
-        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: None
+        grpo_mod,
+        "refit_policy_generation",
+        lambda *_args, **_kwargs: {"delta/changed_pct": 4.0},
     )
     monkeypatch.setattr(
         grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
@@ -1913,6 +1927,11 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     assert train_metrics["min_seq_mult_prob_error_after_mask"] == 1.0
     assert train_metrics["num_masked_seqs_by_logprob_error"] == 2
     assert train_metrics["masked_correct_pct"] == 0.5
+    assert any(
+        call.args[0] == {"delta/changed_pct": 4.0}
+        and call.kwargs.get("prefix") == "refit"
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+    )
 
 
 def test_grpo_train_shutdown_on_epoch_completion(mock_grpo_components, tmp_path):
