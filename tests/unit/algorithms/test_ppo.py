@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -1656,3 +1657,290 @@ def test_noncolocated_reward_model_node_leaves_shared_train_inference_node(
     generation.init_collective.assert_called_once_with(
         "127.0.0.1", 1234, 8, train_world_size=6
     )
+
+
+def _make_async_ppo_config() -> SimpleNamespace:
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    return SimpleNamespace(
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "colocated": {"enabled": False},
+                "vllm_cfg": {"async_engine": True},
+            }
+        },
+        loss_fn=ClippedPGLossConfig(
+            use_importance_sampling_correction=True,
+            reference_policy_kl_penalty=0,
+        ),
+        ppo={
+            "async_ppo": AsyncPPOConfig(enabled=True),
+            "policy_training_start_step": 0,
+            "ppo_epochs": 1,
+            "use_dynamic_sampling": False,
+            "reward_scaling": {"enabled": False},
+            "reward_shaping": {"enabled": False},
+        },
+        data={"use_multiple_dataloader": False},
+        env={},
+    )
+
+
+def _call_async_ppo_until_guard(
+    master_config: SimpleNamespace, *, requires_kv_scale_sync: bool = False
+) -> None:
+    from nemo_rl.algorithms.ppo import async_ppo_train
+
+    generation = MagicMock()
+    generation.requires_kv_scale_sync = requires_kv_scale_sync
+    async_ppo_train(
+        policy=MagicMock(),
+        policy_generation=generation,
+        value_model=MagicMock(),
+        dataloader=MagicMock(),
+        val_dataloader=None,
+        tokenizer=MagicMock(),
+        loss_fn=MagicMock(),
+        value_loss_fn=MagicMock(),
+        task_to_env={},
+        val_task_to_env=None,
+        logger=MagicMock(),
+        checkpointer=MagicMock(),
+        ppo_save_state=MagicMock(),
+        master_config=master_config,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda cfg: cfg.policy["generation"].update(backend="sglang"),
+            "async vLLM",
+        ),
+        (
+            lambda cfg: cfg.policy["generation"]["vllm_cfg"].update(async_engine=False),
+            "async vLLM",
+        ),
+        (
+            lambda cfg: setattr(
+                cfg.loss_fn, "use_importance_sampling_correction", False
+            ),
+            "importance_sampling_correction",
+        ),
+        (
+            lambda cfg: setattr(cfg.loss_fn, "force_on_policy_ratio", True),
+            "force_on_policy_ratio",
+        ),
+        (
+            lambda cfg: cfg.policy["generation"]["colocated"].update(enabled=True),
+            "non-colocated",
+        ),
+        (lambda cfg: cfg.ppo.update(ppo_epochs=0), "ppo_epochs"),
+        (
+            lambda cfg: (
+                cfg.ppo.update(skip_reference_policy_logprobs_calculation=True),
+                setattr(cfg.loss_fn, "reference_policy_kl_penalty", 0.1),
+            ),
+            "Skipping reference logprobs",
+        ),
+    ],
+)
+def test_async_ppo_entry_guards(mutate, message):
+    config = _make_async_ppo_config()
+    mutate(config)
+    with pytest.raises(ValueError, match=message):
+        _call_async_ppo_until_guard(config)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda cfg: cfg.ppo.update(use_dynamic_sampling=True),
+            "Dynamic sampling",
+        ),
+        (
+            lambda cfg: cfg.ppo["reward_scaling"].update(enabled=True),
+            "Reward scaling",
+        ),
+        (
+            lambda cfg: cfg.ppo["reward_shaping"].update(enabled=True),
+            "Reward shaping",
+        ),
+        (
+            lambda cfg: cfg.data.update(use_multiple_dataloader=True),
+            "Multiple dataloaders",
+        ),
+        (
+            lambda cfg: cfg.env.update(should_use_nemo_gym=True),
+            "NeMo Gym",
+        ),
+    ],
+)
+def test_async_ppo_rejects_unsupported_features(mutate, message):
+    config = _make_async_ppo_config()
+    mutate(config)
+    with pytest.raises(NotImplementedError, match=message):
+        _call_async_ppo_until_guard(config)
+
+
+def test_async_ppo_rejects_fp8_kv_scale_sync():
+    config = _make_async_ppo_config()
+    with pytest.raises(NotImplementedError, match="FP8 KV-scale"):
+        _call_async_ppo_until_guard(config, requires_kv_scale_sync=True)
+
+
+def test_async_ppo_config_rejects_invalid_kv_cache_settings():
+    from pydantic import ValidationError
+
+    from nemo_rl.algorithms.ppo import AsyncPPOConfig
+
+    with pytest.raises(ValidationError, match="in_flight_weight_updates"):
+        AsyncPPOConfig(
+            in_flight_weight_updates=False,
+            recompute_kv_cache_after_weight_updates=True,
+        )
+
+
+class _EpochListLoader:
+    def __init__(self, sizes: list[int]) -> None:
+        self.sizes = list(sizes)
+        self.iter_count = 0
+
+    def __iter__(self) -> Iterator[int]:
+        size = self.sizes[min(self.iter_count, len(self.sizes) - 1)]
+        self.iter_count += 1
+        return iter(range(size))
+
+    def state_dict(self) -> dict[str, int]:
+        return {"iter_count": self.iter_count}
+
+
+def test_async_ppo_dataloader_cycles_after_resume_boundary():
+    from nemo_rl.algorithms.ppo import _CyclingDataLoader
+
+    dataloader = _EpochListLoader([0, 3])
+    iterator = iter(_CyclingDataLoader(dataloader))
+
+    assert [next(iterator) for _ in range(3)] == [0, 1, 2]
+    assert dataloader.iter_count == 2
+
+
+def test_async_ppo_dataloader_cycles_multiple_epochs():
+    from nemo_rl.algorithms.ppo import _CyclingDataLoader
+
+    dataloader = _EpochListLoader([2])
+    iterator = iter(_CyclingDataLoader(dataloader))
+
+    assert [next(iterator) for _ in range(5)] == [0, 1, 0, 1, 0]
+    assert dataloader.iter_count == 3
+
+
+def test_async_ppo_dataloader_rejects_empty_dataset():
+    from nemo_rl.algorithms.ppo import _CyclingDataLoader
+
+    dataloader = _EpochListLoader([0])
+
+    with pytest.raises(RuntimeError, match="two consecutive epochs"):
+        next(iter(_CyclingDataLoader(dataloader)))
+    assert dataloader.iter_count == 2
+
+
+def test_async_ppo_dataloader_delegates_checkpoint_state():
+    from nemo_rl.algorithms.ppo import _CyclingDataLoader
+
+    dataloader = _EpochListLoader([1])
+
+    assert _CyclingDataLoader(dataloader).state_dict() == {"iter_count": 0}
+
+
+def test_async_ppo_completed_resume_exits_before_actor_start(monkeypatch):
+    from nemo_rl.algorithms import ppo
+
+    config = _make_async_ppo_config()
+    config.ppo.update(
+        max_num_steps=10,
+        max_num_epochs=2,
+        val_period=0,
+        val_at_start=False,
+        val_at_end=False,
+        num_prompts_per_step=1,
+        skip_reference_policy_logprobs_calculation=False,
+    )
+    config.checkpointing = {
+        "checkpoint_must_save_by": None,
+        "ft_save_period": None,
+    }
+    policy = MagicMock()
+    generation = MagicMock()
+    generation.requires_kv_scale_sync = False
+    value_model = MagicMock()
+    checkpointer = MagicMock()
+    refit = MagicMock()
+    monkeypatch.setattr(ppo, "refit_policy_generation", refit)
+
+    ppo.async_ppo_train(
+        policy=policy,
+        policy_generation=generation,
+        value_model=value_model,
+        dataloader=[MagicMock()],
+        val_dataloader=None,
+        tokenizer=MagicMock(),
+        loss_fn=MagicMock(),
+        value_loss_fn=MagicMock(),
+        task_to_env={},
+        val_task_to_env=None,
+        logger=MagicMock(),
+        checkpointer=checkpointer,
+        ppo_save_state={
+            "total_steps": 10,
+            "consumed_samples": 10,
+            "current_epoch": 1,
+            "current_step": 0,
+            "total_valid_tokens": 0,
+        },
+        master_config=config,
+    )
+
+    refit.assert_not_called()
+    checkpointer.shutdown.assert_called_once()
+    generation.shutdown.assert_called_once()
+    policy.shutdown.assert_called_once()
+    value_model.shutdown.assert_called_once()
+
+
+def test_validate_uses_async_rollout_for_async_engine(monkeypatch):
+    from nemo_rl.algorithms import ppo
+
+    async_rollout = MagicMock(
+        return_value=(
+            {
+                "total_reward": torch.tensor([1.0]),
+                "message_log": [[{"role": "assistant", "content": "ok"}]],
+            },
+            {"mean_gen_tokens_per_sample": 1.0},
+        )
+    )
+    sync_rollout = MagicMock()
+    monkeypatch.setattr(ppo, "run_async_multi_turn_rollout", async_rollout)
+    monkeypatch.setattr(ppo, "run_multi_turn_rollout", sync_rollout)
+
+    config = _make_async_ppo_config()
+    config.policy["max_total_sequence_length"] = 16
+    config.ppo.update(max_val_samples=1, val_batch_size=1, max_rollout_turns=1)
+    config.logger = {"num_val_samples_to_print": 0}
+
+    ppo.validate(
+        policy_generation=MagicMock(),
+        val_dataloader=[MagicMock()],
+        tokenizer=MagicMock(),
+        val_task_to_env={},
+        step=1,
+        master_config=config,
+        logger=None,
+    )
+
+    async_rollout.assert_called_once()
+    sync_rollout.assert_not_called()

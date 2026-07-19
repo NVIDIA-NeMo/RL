@@ -27,6 +27,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    AsyncGRPOConfig,
     MasterConfig,
     RewardPenaltyConfig,
     _apply_configured_message_level_advantage_penalties,
@@ -279,10 +280,7 @@ def mock_grpo_components():
                 "reward_scaling": {"enabled": False},
                 "reward_shaping": {"enabled": False},
                 "use_dynamic_sampling": False,
-                "async_grpo": {
-                    "enabled": False,
-                    "max_trajectory_age_steps": 1,
-                },
+                "async_grpo": AsyncGRPOConfig(),
                 "seq_logprob_error_threshold": None,
                 "adv_estimator": {
                     "name": "grpo",
