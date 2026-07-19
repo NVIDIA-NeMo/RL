@@ -29,6 +29,15 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
+# Kept local (not imported from models.generation) so the gym actor stays free of
+# generation-module imports. Must cover every name resolve_routed_experts_dtype
+# can produce.
+_ROUTED_EXPERTS_DTYPES = {
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+}
+
 DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "<tool_call>",
     "</tool_call>",
@@ -80,6 +89,9 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    routed_experts_dtype: NotRequired[
+        str
+    ]  # Carry dtype name for routed_experts tensors ("int8"/"int16"/"int32"), resolved from the model's expert count
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -351,7 +363,12 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
             routed_experts = None
             if routed_experts_raw is not None:
-                routed_experts = torch.as_tensor(routed_experts_raw, dtype=torch.int32)
+                routed_experts_dtype = _ROUTED_EXPERTS_DTYPES[
+                    self.cfg.get("routed_experts_dtype", "int16")
+                ]
+                routed_experts = torch.as_tensor(
+                    routed_experts_raw, dtype=routed_experts_dtype
+                )
                 if routed_experts.dim() != 3:
                     raise ValueError(
                         "NeMo Gym returned routed_experts with invalid shape. "
