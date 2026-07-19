@@ -616,10 +616,30 @@ def process_weights_after_loading(self, layer) -> None:
     weight, weight_scale = process_fp8_weight_block_strategy(
         layer.weight, layer.weight_scale_inv
     )
-    # Rebind .data instead of replace_parameter() so the Parameter objects
-    # (and their weight_loader attributes) are preserved for refit.
-    layer.weight.data = weight.data
-    layer.weight_scale_inv.data = weight_scale.data
+    # Preserve Parameter identity (and weight_loader) for refit, and prefer
+    # in-place copies over .data rebinding once the processed layout is
+    # stable: this runs on every refit, and rebinding every linear layer's
+    # weight/scale to fresh allocations each step slowly fragments GPU
+    # memory until CuMemAllocator wake_up OOMs (observed as
+    # "CUDA Error: out of memory at csrc/cumem_allocator.cpp" ~75 steps
+    # into fp8-rollouts runs). The first call may change shapes (layout
+    # transforms), so fall back to rebinding then.
+    if (
+        layer.weight.data.shape == weight.shape
+        and layer.weight.data.dtype == weight.dtype
+    ):
+        if layer.weight.data.data_ptr() != weight.data_ptr():
+            layer.weight.data.copy_(weight)
+    else:
+        layer.weight.data = weight.data
+    if (
+        layer.weight_scale_inv.data.shape == weight_scale.shape
+        and layer.weight_scale_inv.data.dtype == weight_scale.dtype
+    ):
+        if layer.weight_scale_inv.data.data_ptr() != weight_scale.data_ptr():
+            layer.weight_scale_inv.data.copy_(weight_scale)
+    else:
+        layer.weight_scale_inv.data = weight_scale.data
 
     maybe_post_process_fp8_weight_block(layer)
 
