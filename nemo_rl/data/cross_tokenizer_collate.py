@@ -119,11 +119,13 @@ class CrossTokenizerCollator:
         # message; the collator tokenizes that content for the student and
         # each cross-tokenizer teacher.
         texts = [datum["message_log"][0]["content"] for datum in batch]
-        student_input_ids, student_attention_mask = self._tokenize_batch(
-            texts,
-            self.student_tokenizer,
-            self.ctx_length_student,
-            self.make_seq_div_by_student,
+        student_input_ids, student_attention_mask, student_offsets = (
+            self._tokenize_batch(
+                texts,
+                self.student_tokenizer,
+                self.ctx_length_student,
+                self.make_seq_div_by_student,
+            )
         )
 
         sample_mask = torch.tensor(
@@ -146,15 +148,19 @@ class CrossTokenizerCollator:
                 # Same-tokenizer teacher: no re-tokenization, no projection,
                 # no alignment. Its forward reuses the student tokenization.
                 continue
-            teacher_input_ids, teacher_attention_mask = self._tokenize_batch(
-                texts,
-                self.teacher_tokenizers[i],
-                self.ctx_length_teachers[i],
-                self.make_seq_div_by_teachers[i],
+            teacher_input_ids, teacher_attention_mask, teacher_offsets = (
+                self._tokenize_batch(
+                    texts,
+                    self.teacher_tokenizers[i],
+                    self.ctx_length_teachers[i],
+                    self.make_seq_div_by_teachers[i],
+                )
             )
             alignment = aligner.align(
                 student_input_ids,
                 teacher_input_ids,
+                student_offsets=student_offsets,
+                teacher_offsets=teacher_offsets,
                 student_attention_mask=student_attention_mask,
                 teacher_attention_mask=teacher_attention_mask,
             )
@@ -178,17 +184,25 @@ class CrossTokenizerCollator:
         tokenizer: PreTrainedTokenizerBase,
         ctx_length: int,
         make_seq_div_by: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize a batch and pad to a multiple of ``make_seq_div_by``."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Tokenize a batch and pad to a multiple of ``make_seq_div_by``.
+
+        Also returns per-token character offsets (``offset_mapping``), which
+        :meth:`TokenAligner.align` needs to align the student and teacher
+        tokenizations of the same source text. This requires a *fast* HF
+        tokenizer; special and padding positions carry ``(0, 0)``.
+        """
         encoded = tokenizer(
             texts,
             padding="max_length",
             truncation=True,
             max_length=ctx_length,
+            return_offsets_mapping=True,
             return_tensors="pt",
         )
         input_ids: torch.Tensor = encoded["input_ids"]
         attention_mask: torch.Tensor = encoded["attention_mask"]
+        offset_mapping: torch.Tensor = encoded["offset_mapping"]
 
         b, t = input_ids.shape
         pad = (make_seq_div_by - (t % make_seq_div_by)) % make_seq_div_by
@@ -199,7 +213,9 @@ class CrossTokenizerCollator:
                 dtype=input_ids.dtype,
             )
             pad_mask = torch.zeros((b, pad), dtype=attention_mask.dtype)
+            pad_offsets = torch.zeros((b, pad, 2), dtype=offset_mapping.dtype)
             input_ids = torch.cat([input_ids, pad_ids], dim=1)
             attention_mask = torch.cat([attention_mask, pad_mask], dim=1)
+            offset_mapping = torch.cat([offset_mapping, pad_offsets], dim=1)
 
-        return input_ids, attention_mask
+        return input_ids, attention_mask, offset_mapping
