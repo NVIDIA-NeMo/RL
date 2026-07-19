@@ -359,8 +359,11 @@ override-dependencies = [
   "nvidia-cutlass-dsl[cu13]>=4.5.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
-  "xgrammar==0.1.33",
+  # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3.
+  # Floor raised to 0.2.1 for vLLM 0.25.1, whose tool-choice handling imports
+  # xgrammar.normalize_tool_choice (vLLM requires xgrammar>=0.2.1,<1.0.0; the
+  # override would otherwise force an incompatible downgrade).
+  "xgrammar>=0.2.1,<1.0.0",
   # Override dependencies to address CVEs
   "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
