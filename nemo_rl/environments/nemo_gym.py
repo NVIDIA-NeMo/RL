@@ -504,6 +504,31 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 output_item_dict["prompt_str"] = prompt_str
                 output_item_dict["generation_str"] = generation_str
 
+        if not nemo_rl_message_log and nemo_gym_result.get("agent_timed_out"):
+            input_messages = nemo_gym_result["responses_create_params"]["input"]
+            if not input_messages:
+                raise ValueError(
+                    "NeMo Gym returned an agent timeout with no generation data "
+                    "and did not preserve the original input prompt."
+                )
+            try:
+                prompt_token_ids = tokenizer.apply_chat_template(
+                    input_messages, tokenize=True, add_generation_prompt=True
+                )
+            except Exception as e:
+                raise ValueError(
+                    "NeMo Gym returned an agent timeout with no generation data, "
+                    "but tokenizing its preserved input prompt failed: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
+            nemo_rl_message_log.append(
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.as_tensor(prompt_token_ids),
+                }
+            )
+
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
             try:

@@ -292,6 +292,43 @@ def test_nemo_gym_postprocess_no_generation_data_raises():
     assert "['reasoning', 'function_call']" in msg
 
 
+def test_nemo_gym_postprocess_agent_timeout_preserves_prompt_only_result():
+    """An explicit Gym agent timeout is a valid masked rollout result even when
+    the agent produced no trainable assistant generation."""
+
+    class _Tokenizer:
+        def apply_chat_template(
+            self, input_messages, tokenize=True, add_generation_prompt=False
+        ):
+            assert input_messages == [{"role": "user", "content": "fix it"}]
+            assert tokenize is True
+            assert add_generation_prompt is True
+            return [10, 20, 30]
+
+    nemo_gym_result = {
+        "agent_timed_out": True,
+        "reward": 0.0,
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": "fix it"}]},
+        "instance_config": {"mask_sample": True},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assert len(result["message_log"]) == 1
+    assert result["message_log"][0]["role"] == "user"
+    assert result["message_log"][0]["token_ids"].tolist() == [10, 20, 30]
+    assert result["input_message_log"] == result["message_log"]
+    assert result["full_result"] is nemo_gym_result
+
+
 def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     """If apply_chat_template itself fails while building the error message, the
     postprocess should still raise the original 'no generation data' ValueError with
