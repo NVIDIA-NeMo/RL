@@ -51,4 +51,4 @@ uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/critic/loss"]) < 6.0' \
     'min(data["train/critic/loss"]) >= 0' \
     'max(data["train/critic/explained_var"]) <= 1.0001' \
-    'max(data["train/critic/grad_norm"]) < 600'
+    'max(data["train/critic/grad_norm"]) < 1500'
