@@ -88,3 +88,34 @@ def test_nemo_gym_postprocess_requires_routed_experts_when_configured():
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
             _MockSelf(), nemo_gym_result, _Tokenizer()
         )
+
+
+def test_nemo_gym_postprocess_casts_routed_experts_to_configured_dtype():
+    import torch
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                    "routed_experts": _routes(3),
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _MockSelf:
+        cfg = {"require_routed_experts": True, "routed_experts_dtype": "int8"}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    for message in result["message_log"]:
+        if "routed_experts" in message:
+            assert message["routed_experts"].dtype == torch.int8

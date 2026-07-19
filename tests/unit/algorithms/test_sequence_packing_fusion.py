@@ -414,3 +414,95 @@ def test_sequence_packing_fusion_vs_baseline_with_sampling_params(
         tp_size=tp_size,
     )
     distributed_test_runner(test_fn, world_size=world_size)
+
+
+# ---------------------------------------------------------------------------
+# _pack_input_ids: bin-fill padding regression tests
+#
+# The Megatron packer rounds each packed bin's total length up to a kernel
+# alignment (e.g. 128 * cp*2 * tp for hybridep) and absorbs the deficit into
+# the LAST sequence's effective length in cu_seqlens. Those phantom positions
+# exceed the unpacked [B, S] row width; _pack_input_ids must copy only real
+# tokens and leave the tail zero (it is masked at the loss by token_mask).
+# Regression test for the tiny-Ultra smoke crash:
+#   RuntimeError: The expanded size of the tensor (9472) must match the
+#   existing size (7040) at non-singleton dimension 0.
+# ---------------------------------------------------------------------------
+
+
+def _rolled_padded_seq(row, actual_len, padded_len, roll_shift):
+    seq = torch.zeros(padded_len, dtype=row.dtype)
+    seq[:actual_len] = row[:actual_len]
+    if roll_shift != 0:
+        seq = seq.roll(shifts=roll_shift, dims=0)
+    return seq
+
+
+def test_pack_input_ids_last_seq_inflated_beyond_row_width():
+    """cu_seqlens' last entry exceeds input_ids width (bin-fill deficit)."""
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+    row_width = 7040
+    inflated_len = 9472  # 7040 real tokens + 2432 bin-fill deficit
+    input_ids = torch.arange(2 * row_width).reshape(2, row_width)
+    cu = torch.tensor([0, row_width, row_width + inflated_len])
+
+    packed = _pack_input_ids(input_ids, cu, cu, cp_rank=0, cp_size=1, roll_shift=-1)
+
+    assert packed.shape == (1, row_width + inflated_len)
+    expected_seq0 = _rolled_padded_seq(input_ids[0], row_width, row_width, -1)
+    expected_seq1 = _rolled_padded_seq(input_ids[1], row_width, inflated_len, -1)
+    assert torch.equal(packed[0, :row_width], expected_seq0)
+    assert torch.equal(packed[0, row_width:], expected_seq1)
+    # Phantom bin-fill tail (rolled by -1) must stay zero.
+    assert packed[0, row_width + row_width : -1].eq(0).all()
+
+
+@pytest.mark.parametrize("cp_size", [2, 8])
+def test_pack_input_ids_inflated_last_seq_cp_sharded(cp_size):
+    """CP sharding of the inflated last sequence conserves the real tokens."""
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+    row_width = 64
+    inflated_len = 96  # deficit of 32 absorbed into the last sequence
+    input_ids = torch.arange(1, 2 * row_width + 1).reshape(2, row_width)
+    cu = torch.tensor([0, row_width, row_width + inflated_len])
+    total = row_width + inflated_len
+
+    shards = [
+        _pack_input_ids(input_ids, cu, cu, cp_rank=r, cp_size=cp_size, roll_shift=0)
+        for r in range(cp_size)
+    ]
+    for shard in shards:
+        assert shard.shape == (1, total // cp_size)
+
+    # Union of all CP shards holds exactly the real tokens plus zeros for the
+    # phantom tail, regardless of chunk placement.
+    all_tokens = torch.cat([s[0] for s in shards]).sort().values
+    expected = (
+        torch.cat(
+            [
+                input_ids.flatten(),
+                torch.zeros(inflated_len - row_width, dtype=input_ids.dtype),
+            ]
+        )
+        .sort()
+        .values
+    )
+    assert torch.equal(all_tokens, expected)
+
+
+def test_pack_input_ids_in_bounds_lengths_unchanged():
+    """Sequences within the row width behave as before the clamp."""
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+    input_ids = torch.arange(2 * 64).reshape(2, 64)
+    cu_q = torch.tensor([0, 40, 40 + 64])  # real lengths 40, 64
+    cu_qp = torch.tensor([0, 48, 48 + 64])  # per-seq alignment padding only
+
+    packed = _pack_input_ids(input_ids, cu_q, cu_qp, cp_rank=0, cp_size=1, roll_shift=0)
+
+    assert packed.shape == (1, 48 + 64)
+    assert torch.equal(packed[0, :40], input_ids[0, :40])
+    assert packed[0, 40:48].eq(0).all()
+    assert torch.equal(packed[0, 48:], input_ids[1])

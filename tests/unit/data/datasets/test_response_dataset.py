@@ -323,8 +323,14 @@ def test_build_in_dataset_with_split_validation(dataset_name, output_key, tokeni
             assert (
                 first_example["messages"][1]["content"][:20] == "Let's denote the poi"
             )
+    elif dataset_name == "OpenR1-Math-220k":
+        assert first_example["messages"][1]["content"][:20] == " (n, k) = (5, 2) "
     elif dataset_name == "tulu3_sft_mixture":
         assert first_example["messages"][1]["content"][:20] == "I'm sorry, but I can"
+    else:
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. Please add a test for this dataset."
+        )
 
     # check the combined message
     messages = [first_example["messages"], first_val_example["messages"]]
