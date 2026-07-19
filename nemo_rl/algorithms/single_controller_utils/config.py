@@ -32,13 +32,13 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 class AsyncRLConfig(BaseModel, extra="allow"):
     # Max weight-version gap between the trainer and a consumed rollout.
-    max_weight_staleness_versions: int = 1
+    max_staleness_versions: int = 1
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure);
-    # over_sampling=False requires this == num_prompts_per_step * (max_weight_staleness_versions + 1).
+    # over_sampling=False requires this == num_prompts_per_step * (max_staleness_versions + 1).
     max_buffered_rollouts: int = 64
     # True : rollout pump keeps dispatching; samples aged past the staleness window are wasted.
     # False: pump gates each batch on trainer version — one dispatch batch per trainer step.

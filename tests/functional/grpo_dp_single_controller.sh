@@ -39,7 +39,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     data_plane.enabled=true \
     data_plane.impl=transfer_queue \
     data_plane.backend=simple \
-    async_rl.max_weight_staleness_versions=0 \
+    async_rl.max_staleness_versions=0 \
     async_rl.over_sampling=false \
     async_rl.min_groups_for_streaming_train=2 \
     async_rl.max_inflight_prompts=2 \

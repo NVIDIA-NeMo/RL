@@ -294,7 +294,7 @@ def test_rollout_pump_writes_expected_tq_data(
             "max_num_epochs": 1,
         },
         async_rl=AsyncRLConfig(
-            max_weight_staleness_versions=1,
+            max_staleness_versions=1,
             min_groups_for_streaming_train=1,
             max_inflight_prompts=num_prompts,
             max_buffered_rollouts=num_prompts,

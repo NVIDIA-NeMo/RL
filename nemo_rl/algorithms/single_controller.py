@@ -127,14 +127,14 @@ class SingleControllerActor:
                 f"({self._async_cfg.min_groups_for_streaming_train})"
             )
 
-        if self._async_cfg.max_weight_staleness_versions == 0:
+        if self._async_cfg.max_staleness_versions == 0:
             if self._async_cfg.over_sampling:
                 raise ValueError(
-                    "max_weight_staleness_versions=0 requires over_sampling=False: "
+                    "max_staleness_versions=0 requires over_sampling=False: "
                     "with zero staleness the dispatch gate needs to advance one batch "
                     "per trainer_version, which over_sampling=True bypasses."
                 )
-            print("Running in sync mode (max_weight_staleness_versions=0)", flush=True)
+            print("Running in sync mode (max_staleness_versions=0)", flush=True)
             if not self._async_cfg.force_in_order:
                 print(
                     "force_in_order=False is ignored in sync mode",
@@ -149,13 +149,13 @@ class SingleControllerActor:
                 )
         else:
             expected_buffer = num_prompts_per_step * (
-                self._async_cfg.max_weight_staleness_versions + 1
+                self._async_cfg.max_staleness_versions + 1
             )
             if self._async_cfg.max_buffered_rollouts != expected_buffer:
                 raise ValueError(
                     f"over_sampling=False requires max_buffered_rollouts "
                     f"({self._async_cfg.max_buffered_rollouts}) == "
-                    f"num_prompts_per_step * (max_weight_staleness_versions + 1) "
+                    f"num_prompts_per_step * (max_staleness_versions + 1) "
                     f"({expected_buffer})"
                 )
 
@@ -178,7 +178,7 @@ class SingleControllerActor:
 
         self._sampler = StalenessSampler(
             self._buffer,
-            max_staleness_versions=self._async_cfg.max_weight_staleness_versions,
+            max_staleness_versions=self._async_cfg.max_staleness_versions,
             strict_weight_fifo=not self._async_cfg.over_sampling,
             force_in_order=self._async_cfg.force_in_order,
         )
@@ -216,7 +216,7 @@ class SingleControllerActor:
 
         print(
             f"SingleControllerActor: "
-            f"staleness_cap={self._async_cfg.max_weight_staleness_versions} "
+            f"staleness_cap={self._async_cfg.max_staleness_versions} "
             f"buffer={self._async_cfg.max_buffered_rollouts} "
             f"inflight={self._async_cfg.max_inflight_prompts} "
             f"over_sampling={self._async_cfg.over_sampling} "
@@ -302,7 +302,7 @@ class SingleControllerActor:
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         over_sampling = self._async_cfg.over_sampling
-        max_staleness = self._async_cfg.max_weight_staleness_versions
+        max_staleness = self._async_cfg.max_staleness_versions
         force_in_order = self._async_cfg.force_in_order
         print("rollout_pump: starting", flush=True)
 
@@ -623,7 +623,7 @@ class SingleControllerActor:
 
         t0 = time.monotonic()
         await asyncio.to_thread(self._weight_synchronizer.sync_weights)
-        if self._async_cfg.max_weight_staleness_versions == 0:
+        if self._async_cfg.max_staleness_versions == 0:
             self._gen.invalidate_kv_cache()
         elapsed = time.monotonic() - t0
 
