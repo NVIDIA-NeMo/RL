@@ -19,6 +19,7 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 
 class TrtllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
+    model_name: NotRequired[str]
     gpu_memory_utilization: NotRequired[float]
     max_model_len: int
     precision: str
