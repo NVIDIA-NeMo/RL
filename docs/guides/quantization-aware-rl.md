@@ -26,7 +26,7 @@ The following workflow + quantization recipe combinations have been validated en
 | QA-GRPO | W4A16 | `NVFP4_MLP_WEIGHT_ONLY_CFG` | ✅ Smoke tested on MoE | `examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml` |
 | QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml` with `policy.generation.real_quant: true` | ✅ Converges | `examples/configs/recipes/llm/grpo-qwen3-8b-base-dapo-2n8g-long-megatron-qa-nvfp4-w4a16.yaml` |
 | QA-GRPO real quantization rollout | W4A16 | `examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml` with `policy.generation.real_quant: true` and the model-specific `policy.generation.real_quant_ignore` list in the example | ✅ Converges tested on hybrid MoE/Mamba | `examples/configs/recipes/llm/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real.yaml` |
-| QA-GRPO real quantization rollout | W4A4 | `examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml` with `policy.generation.real_quant: true` | ✅ Completed one 300-step Qwen3-30B-A3B MoE run | `examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.yaml` |
+| QA-GRPO real quantization rollout | W4A4 | `examples/modelopt/quant_configs/nvfp4_experts.yaml` with `policy.generation.real_quant: true` | ✅ Completed one 300-step Qwen3-30B-A3B MoE run | `examples/configs/recipes/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4-w4a4-real.yaml` |
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to the supported MLP/MoE weights while keeping Nano3-sensitive Mamba, attention, gate/router, shared-expert, norm, and selected layer paths in BF16 through the model-specific `real_quant_ignore` list in the example config.
 
@@ -113,11 +113,11 @@ For routed-expert Qwen3 MoE W4A4, use the block-16 E2M1 recipe in both sections:
 
 ```yaml
 policy:
-  quant_cfg: examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml
+  quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
 
   generation:
     backend: vllm
-    quant_cfg: examples/modelopt/quant_configs/qwen3_moe_nvfp4_w4a4.yaml
+    quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
     real_quant: true
 ```
 

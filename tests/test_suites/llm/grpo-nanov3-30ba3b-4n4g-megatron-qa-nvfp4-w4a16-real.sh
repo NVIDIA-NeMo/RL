@@ -39,8 +39,10 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
 grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
 grep -q "quantization=modelopt" "$RUN_LOG"
-! grep -q "FakeQuantWorker" "$RUN_LOG"
-! grep -q "VLLM_QUANT_CFG" "$RUN_LOG"
+assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
+    "Real-quant run unexpectedly used FakeQuantWorker"
+assert_not_grep "VLLM_QUANT_CFG" "$RUN_LOG" \
+    "Real-quant run unexpectedly took the fake-quant VLLM_QUANT_CFG path"
 
 MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' "$JSON_METRICS")
 if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then

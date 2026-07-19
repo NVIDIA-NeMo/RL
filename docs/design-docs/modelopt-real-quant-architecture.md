@@ -64,8 +64,8 @@ to the same mode. Unsupported or mismatched formats fail during setup.
 
 Example routed-expert recipes are provided at:
 
-- `examples/modelopt/quant_configs/nvfp4_experts.yaml` for W4A4;
-- `examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml` for W4A16.
+- [`examples/modelopt/quant_configs/nvfp4_experts.yaml`](../../examples/modelopt/quant_configs/nvfp4_experts.yaml) for W4A4;
+- [`examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml`](../../examples/modelopt/quant_configs/nvfp4_experts_weightonly.yaml) for W4A16.
 
 ## Refit lifecycle
 

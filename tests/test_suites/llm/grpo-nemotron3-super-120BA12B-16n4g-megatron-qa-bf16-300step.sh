@@ -37,8 +37,10 @@ uv run --no-sync examples/run_grpo.py \
 
 uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
-! grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
-! grep -q "FakeQuantWorker" "$RUN_LOG"
+assert_not_grep "VllmQuantInternalWorkerExtension" "$RUN_LOG" \
+    "BF16 baseline unexpectedly loaded the quant rollout worker extension"
+assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
+    "BF16 baseline unexpectedly used FakeQuantWorker"
 
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'data["train/num_valid_samples"]["1"] >= 64' \

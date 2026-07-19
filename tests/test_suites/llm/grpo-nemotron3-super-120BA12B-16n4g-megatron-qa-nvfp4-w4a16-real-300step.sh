@@ -42,8 +42,10 @@ grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
 grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
 grep -q "quantization=modelopt" "$RUN_LOG"
 grep -q "nvfp4_experts_weightonly.yaml" "$RUN_LOG"
-! grep -q "FakeQuantWorker" "$RUN_LOG"
-! grep -q "VLLM_QUANT_CFG" "$RUN_LOG"
+assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
+    "Real-quant run unexpectedly used FakeQuantWorker"
+assert_not_grep "VLLM_QUANT_CFG" "$RUN_LOG" \
+    "Real-quant run unexpectedly took the fake-quant VLLM_QUANT_CFG path"
 
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'data["train/num_valid_samples"]["1"] >= 64' \

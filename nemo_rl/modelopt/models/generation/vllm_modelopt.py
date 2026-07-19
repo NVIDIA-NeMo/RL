@@ -56,7 +56,15 @@ def _load_modelopt_moe_input_scale(
     expert_id: int,
     return_success: bool = False,
 ) -> bool | None:
-    """Load a ModelOpt input scale without losing the gate/up shard."""
+    """Load a ModelOpt input scale without losing the gate/up shard.
+
+    Replaces the ``input_scale`` branch of vLLM v0.20.0's
+    ``FusedMoE.weight_loader``, whose ``_load_single_value`` writes
+    ``param.data[expert_id]`` and drops the gate/up (w1/w3) shard index:
+    https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/model_executor/layers/fused_moe/layer.py#L1025-L1031
+    Delete once upstream loads per-projection ModelOpt MoE input scales
+    correctly.
+    """
     del weight_name
     global_expert_id = expert_id
     local_expert_id = moe_layer._map_global_expert_id_to_local_expert_id(
@@ -265,6 +273,12 @@ def register_nemo_modelopt_nvfp4() -> None:
             super().create_weights(layer, *args, **kwargs)
             del layer.input_scale
 
+        # Adapted from vLLM v0.20.0 ModelOptNvFp4LinearMethod
+        # .process_weights_after_loading/.apply with input-scale/alpha handling
+        # removed for weight-only W4A16:
+        # https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/model_executor/layers/quantization/modelopt.py#L1169-L1208
+        # Re-sync on vLLM bumps; delete if upstream gains a native W4A16
+        # NVFP4 method.
         def process_weights_after_loading(self, layer: Any) -> None:
             layer.weight_global_scale = Parameter(
                 layer.weight_scale_2.max().to(torch.float32),
@@ -289,6 +303,13 @@ def register_nemo_modelopt_nvfp4() -> None:
         moe_quant_config: Any
 
         def __init__(self, quant_config: object, moe_config: object) -> None:
+            # Duplicates vLLM v0.20.0 ModelOptNvFp4FusedMoE.__init__ except
+            # activation_key=None (weight-only); the base hard-wires
+            # kNvfp4Dynamic and offers no hook:
+            # https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/model_executor/layers/quantization/modelopt.py#L1218-L1234
+            # Intentionally calls FusedMoEMethodBase.__init__ to skip the
+            # parent __init__; do not replace it with super().__init__().
+            # Re-sync on vLLM bumps.
             FusedMoEMethodBase.__init__(self, moe_config)
             self.quant_config = quant_config
             self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
