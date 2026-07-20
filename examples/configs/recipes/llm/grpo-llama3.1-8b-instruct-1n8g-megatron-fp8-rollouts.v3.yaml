@@ -34,6 +34,11 @@ policy:
       precision: fp8
       max_model_len: 4096
       use_deep_gemm: true
+      # vLLM >= 0.25 needs more free device memory at sleep/wake-up than 0.20
+      # (larger default cudagraph capture set); at the inherited 0.6 the
+      # CuMemAllocator intermittently fails to re-map its pool mid-run
+      # ("CUDA Error: out of memory at csrc/cumem_allocator.cpp").
+      gpu_memory_utilization: 0.55
 data:
   max_input_seq_length: 4096
 logger:
