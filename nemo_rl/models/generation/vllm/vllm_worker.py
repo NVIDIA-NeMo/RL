@@ -218,6 +218,22 @@ class BaseVllmGenerationWorker:
 
         _apply_vllm_patches(self.py_executable, extra_env_vars=extra_env_vars)
 
+        # vLLM 0.25's RayExecutorV2 picks the torch TCPStore port and the
+        # cross-node broadcast MessageQueue socket from the same VLLM_PORT
+        # scan range, which collides for engines that span nodes (observed
+        # with DeepSeek-V3 TP=32: EADDRINUSE on the TCPStore bind at engine
+        # startup). Vanilla vLLM runs without VLLM_PORT and uses ephemeral
+        # ports with no such collision, so drop the deterministic base for
+        # node-spanning engines; single-node engines keep it (their
+        # MessageQueue is shm-only, so only one consumer scans the range).
+        model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
+        if (
+            self.is_model_owner
+            and bundle_indices is not None
+            and model_parallel_size > len(bundle_indices)
+        ):
+            os.environ.pop("VLLM_PORT", None)
+
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
             self.llm = None
