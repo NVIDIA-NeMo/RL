@@ -13,9 +13,15 @@
 # limitations under the License.
 
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBuffer
-from nemo_rl.algorithms.async_utils.trajectory_collector import AsyncTrajectoryCollector
+from nemo_rl.algorithms.async_utils.trajectory_collector import (
+    AsyncTrajectoryCollector,
+    compute_resume_ng_task_index,
+    save_rollouts_state,
+)
 
 __all__ = [
     "ReplayBuffer",
     "AsyncTrajectoryCollector",
+    "compute_resume_ng_task_index",
+    "save_rollouts_state",
 ]

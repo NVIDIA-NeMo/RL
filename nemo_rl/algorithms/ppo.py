@@ -2448,7 +2448,12 @@ def async_ppo_train(
         )
 
     # Import async utilities only when needed (heavy Ray actors).
-    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+    from nemo_rl.algorithms.async_utils import (
+        AsyncTrajectoryCollector,
+        ReplayBuffer,
+        compute_resume_ng_task_index,
+        save_rollouts_state,
+    )
 
     timer = Timer(context={"worker": "driver"})
     training_wall_start = time.perf_counter()
@@ -2563,6 +2568,7 @@ def async_ppo_train(
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    replay_buffer_state = None
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):
@@ -2584,6 +2590,12 @@ def async_ppo_train(
                 f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
                 "Starting with an empty replay buffer."
             )
+
+    # Resume the NeMo-Gym cohort index counter so post-resume rollouts never
+    # reuse a _ng_task_index still held by a buffered/in-flight cohort.
+    next_ng_task_index = compute_resume_ng_task_index(
+        last_checkpoint_path, replay_buffer_state
+    )
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -2615,6 +2627,7 @@ def async_ppo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        next_ng_task_index=next_ng_task_index,
     )
 
     collection_task = trajectory_collector.start_collection.remote(dataloader)  # noqa: F841
@@ -3263,6 +3276,7 @@ def async_ppo_train(
                             replay_buffer_state,
                             os.path.join(checkpoint_path, "replay_buffer.pt"),
                         )
+                        save_rollouts_state(trajectory_collector, checkpoint_path)
                         checkpointer.finalize_checkpoint(checkpoint_path)
                         _write_latest_checkpoint_status(
                             checkpointer, last_checkpoint_step=step + 1

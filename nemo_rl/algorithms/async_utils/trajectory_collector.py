@@ -50,6 +50,72 @@ TokenizerType = PreTrainedTokenizerBase
 # NRL_ASYNC_VERBOSE=1 additionally enables the O(n) full-list dumps.
 _ASYNC_VERBOSE = os.environ.get("NRL_ASYNC_VERBOSE", "0").lower() in ("1", "true")
 
+# NeMo-Gym cohort grouping. The GenRM verifier buffers rollouts into cohorts keyed
+# by ``_ng_task_index`` (falling back to a content hash of the prompt when it is
+# absent). Giving every prompt group a distinct index keeps duplicate / identical-
+# input prompts — including the same prompt sampled with reasoning on and off, which
+# share an input hash — from landing in one cohort and overflowing
+# ``num_rollouts_per_prompt`` (an AssertionError that 500s the gym and crashes the run).
+_NG_TASK_INDEX_KEY = "_ng_task_index"
+_NEXT_NG_TASK_INDEX_KEY = "next_ng_task_index"
+_ROLLOUTS_STATE_FILENAME = "rollouts.pt"
+
+
+def _stamp_ng_task_index(
+    repeated_batch: BatchedDataDict[DatumSpec], task_index: int
+) -> None:
+    """Stamp every NeMo-Gym row in a prompt group with its cohort task index.
+
+    Rewrites ``extra_env_info`` in place with shallow-copied rows so the index
+    rides along to the gym ``/verify`` request (via the aliased ``task_index``
+    field) without mutating any dict shared by ``repeat_interleave``.
+    """
+    stamped_rows = []
+    for row in repeated_batch["extra_env_info"]:
+        if not isinstance(row, dict):
+            raise TypeError(
+                f"Expected NeMo-Gym extra_env_info row to be a dict, got {type(row).__name__}"
+            )
+        stamped_rows.append({**row, _NG_TASK_INDEX_KEY: task_index})
+    repeated_batch["extra_env_info"] = stamped_rows
+
+
+def compute_resume_ng_task_index(
+    last_checkpoint_path: Optional[str],
+    replay_buffer_state: Optional[dict[str, Any]],
+) -> int:
+    """Recover the next NeMo-Gym cohort index when resuming from a checkpoint.
+
+    Prefer the collector's saved counter (``rollouts.pt``). Also advance past the
+    largest ``_ng_task_index`` still live in the restored replay buffer, so resumed
+    rollouts never reuse an index that a buffered (in-flight) cohort still holds.
+    Returns 0 for a fresh (non-resumed) run.
+    """
+    next_ng_task_index = 0
+    if last_checkpoint_path is not None:
+        rollouts_path = os.path.join(last_checkpoint_path, _ROLLOUTS_STATE_FILENAME)
+        if os.path.exists(rollouts_path):
+            # weights_only=False: a trusted same-job dict of Python ints.
+            rollouts_state = torch.load(rollouts_path, weights_only=False)
+            next_ng_task_index = int(
+                (rollouts_state or {}).get(_NEXT_NG_TASK_INDEX_KEY, 0)
+            )
+    if replay_buffer_state is not None:
+        live_indices = [
+            int(trajectory[_NG_TASK_INDEX_KEY])
+            for trajectory in replay_buffer_state.get("trajectories", [])
+            if trajectory.get(_NG_TASK_INDEX_KEY) is not None
+        ]
+        if live_indices:
+            next_ng_task_index = max(next_ng_task_index, 1 + max(live_indices))
+    return next_ng_task_index
+
+
+def save_rollouts_state(trajectory_collector: Any, checkpoint_path: str) -> None:
+    """Persist the collector's NeMo-Gym cohort counter alongside the checkpoint."""
+    rollouts_state = ray.get(trajectory_collector.get_rollouts_state.remote())
+    torch.save(rollouts_state, os.path.join(checkpoint_path, _ROLLOUTS_STATE_FILENAME))
+
 
 @ray.remote  # pragma: no cover
 class AsyncTrajectoryCollector:
@@ -66,6 +132,7 @@ class AsyncTrajectoryCollector:
         teacher_worker_groups: Optional[dict[str, Any]] = None,
         alias_to_group_alias: Optional[dict[str, str]] = None,
         on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
+        next_ng_task_index: int = 0,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -175,6 +242,9 @@ class AsyncTrajectoryCollector:
         self._completed_per_target: dict[int, int] = {}
         self._spawning_targets: set[int] = set()
         self._counter_lock: _threading.Lock = _threading.Lock()
+        # Monotonic NeMo-Gym cohort index; reserved per prompt group under
+        # _counter_lock in _process_batch. Seeded from checkpoint on resume.
+        self._next_ng_task_index: int = int(next_ng_task_index)
 
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
@@ -461,6 +531,19 @@ class AsyncTrajectoryCollector:
                     f"prompts (need {trajectories_needed} more trajectories)"
                 )
 
+            # Reserve a contiguous block of globally-unique NeMo-Gym cohort
+            # indices for this batch — one per prompt group about to be spawned.
+            # Reserved under _counter_lock so concurrently-processed target
+            # batches never receive overlapping ranges. Only reserve for the
+            # NeMo-Gym path; other envs do not use cohort grouping.
+            from nemo_rl.algorithms.grpo import _should_use_nemo_gym
+
+            prompt_group_base_task_index = None
+            if _should_use_nemo_gym(self.master_config):
+                with self._counter_lock:
+                    prompt_group_base_task_index = self._next_ng_task_index
+                    self._next_ng_task_index += num_prompts_to_generate
+
             # Generate only the prompt groups needed for this target. While the
             # spawn loop is open, workers may finish before later workers start,
             # so reservation release is deferred until spawning closes.
@@ -489,6 +572,11 @@ class AsyncTrajectoryCollector:
                     repeated_batch = single_prompt_batch.repeat_interleave(
                         num_generations
                     )
+                    prompt_group_task_index = (
+                        prompt_group_base_task_index + prompt_idx
+                        if prompt_group_base_task_index is not None
+                        else None
+                    )
 
                     worker = _threading.Thread(
                         target=self._run_prompt_group_worker,
@@ -497,6 +585,7 @@ class AsyncTrajectoryCollector:
                             generation_weight_version,
                             target_weight,
                             prompt_idx,
+                            prompt_group_task_index,
                         ),
                         daemon=True,
                     )
@@ -680,6 +769,11 @@ class AsyncTrajectoryCollector:
             return self.dataloader.state_dict()
         return {}
 
+    def get_rollouts_state(self) -> dict[str, int]:
+        """Collector-side rollout state for checkpointing (NeMo-Gym cohort counter)."""
+        with self._counter_lock:
+            return {_NEXT_NG_TASK_INDEX_KEY: self._next_ng_task_index}
+
     def get_efficiency_metrics(self) -> dict[str, float]:
         """Return accumulated efficiency metrics (sum of durations per category).
 
@@ -843,6 +937,7 @@ class AsyncTrajectoryCollector:
         generation_weight_version: int,
         target_weight_version: int,
         prompt_idx: int,
+        prompt_group_task_index: Optional[int] = None,
     ) -> None:
         worker_start = time.perf_counter()
         try:
@@ -852,6 +947,13 @@ class AsyncTrajectoryCollector:
                 get_nemo_gym_thinking_tags,
                 run_async_nemo_gym_rollout,
             )
+
+            # Stamp every rollout in this prompt group with its cohort index so
+            # the GenRM verifier keys the whole group into a single cohort of
+            # num_generations instead of colliding with an identically-worded
+            # prompt elsewhere in the step (which overflows the cohort assert).
+            if prompt_group_task_index is not None and "extra_env_info" in repeated_batch:
+                _stamp_ng_task_index(repeated_batch, prompt_group_task_index)
 
             # Run rollout for this prompt group
             # Async engine supports concurrent generation; avoid locking
@@ -930,6 +1032,10 @@ class AsyncTrajectoryCollector:
                 "rollout_metrics": rollout_metrics,
                 "timestamp": time.time(),
             }
+            # Record the cohort index on the group so the counter can be resumed
+            # (one past the max live index) after a checkpoint restore.
+            if prompt_group_task_index is not None:
+                trajectory_group[_NG_TASK_INDEX_KEY] = prompt_group_task_index
 
             # Use exponential backoff when buffer is full
             try:

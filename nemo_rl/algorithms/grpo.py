@@ -3620,7 +3620,12 @@ def async_grpo_train(
             )
 
     # Import async utilities only when needed
-    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+    from nemo_rl.algorithms.async_utils import (
+        AsyncTrajectoryCollector,
+        ReplayBuffer,
+        compute_resume_ng_task_index,
+        save_rollouts_state,
+    )
 
     timer = Timer(context={"worker": "driver"})
     training_wall_start = time.perf_counter()
@@ -3715,6 +3720,7 @@ def async_grpo_train(
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    replay_buffer_state = None
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):
@@ -3736,6 +3742,12 @@ def async_grpo_train(
                 f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
                 "Starting with an empty replay buffer."
             )
+
+    # Resume the NeMo-Gym cohort index counter so post-resume rollouts never
+    # reuse a _ng_task_index still held by a buffered/in-flight cohort.
+    next_ng_task_index = compute_resume_ng_task_index(
+        last_checkpoint_path, replay_buffer_state
+    )
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -3772,6 +3784,7 @@ def async_grpo_train(
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
+        next_ng_task_index=next_ng_task_index,
     )
 
     # Start trajectory collection in background
@@ -4483,6 +4496,7 @@ def async_grpo_train(
                             "✅ Saved replay buffer with "
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
                         )
+                        save_rollouts_state(trajectory_collector, checkpoint_path)
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
                         # Record last-successful-checkpoint time/step for external
