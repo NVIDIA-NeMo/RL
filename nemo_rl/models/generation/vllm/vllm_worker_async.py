@@ -1536,7 +1536,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             import traceback
 
             traceback.print_exc()
-            return False
+            # Re-raise so the driver's ray.get surfaces the failure immediately;
+            # returning False here left the train side broadcasting misc params
+            # to consumers that had already died (silent cluster-wide hang).
+            raise
 
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""

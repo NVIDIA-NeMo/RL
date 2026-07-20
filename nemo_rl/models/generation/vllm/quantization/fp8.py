@@ -436,6 +436,13 @@ def load_weights(weights, model_runner):
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue
+        # Already-quantized input (fp8_param training + nccl_reshard misc path):
+        # the FP8 weight bytes pass through as-is and the matching E8M0/scale
+        # tensor arrives as its own "<name>_scale_from_checkpoint"/"_scale_inv"
+        # entry in the same stream — do NOT requantize.
+        if v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            weights_quantized.append((k, v))
+            continue
         # Cast the weight into fp8 and its scale factor
         if global_fp8_config.is_mx:
             from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (

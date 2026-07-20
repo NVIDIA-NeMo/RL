@@ -1895,12 +1895,12 @@ class MegatronPolicyWorkerImpl(
         self._require_remote_sparse_refit().finish(succeeded)
 
     def _is_fp8_export(self) -> bool:
-        """Return True if the train side stores weights as TE blockwise FP8."""
+        """Return True if the train side stores weights as TE FP8 (blockwise or MXFP8)."""
         if self.fp8_cfg is None:
             return False
         return bool(
             self.fp8_cfg.get("fp8_param", False)
-            and self.fp8_cfg.get("fp8_recipe") == "blockwise"
+            and self.fp8_cfg.get("fp8_recipe") in ("blockwise", "mxfp8")
         )
 
     def _build_refit_conversion_tasks(self) -> list:
@@ -1912,8 +1912,18 @@ class MegatronPolicyWorkerImpl(
         scale tensor).
         """
         if self._is_fp8_export():
+            # vLLM's MXFP8 (is_mx) loader expects scales named
+            # "<name>_scale_from_checkpoint" (unswizzled E8M0 receive buffer);
+            # the blockwise loader expects "<name>_scale_inv".
+            scale_suffix = (
+                "_scale_from_checkpoint"
+                if self.fp8_cfg.get("fp8_recipe") == "mxfp8"
+                else "_scale_inv"
+            )
             return self.megatron_bridge._model_bridge.build_export_fp8_tasks(
-                self.megatron_bridge.hf_pretrained, [self.model]
+                self.megatron_bridge.hf_pretrained,
+                [self.model],
+                scale_inv_suffix=scale_suffix,
             )
         return [
             task
@@ -2082,7 +2092,7 @@ class MegatronPolicyWorkerImpl(
             if local_tensor is None:
                 continue  # non-local PP rank
             # FP8 scale siblings take the misc path.
-            if task.global_param_name.endswith("_scale_inv"):
+            if task.global_param_name.endswith(("_scale_inv", "_scale_from_checkpoint")):
                 continue
 
             if isinstance(task.mapping, GatedMLPMapping):
@@ -2348,7 +2358,7 @@ class MegatronPolicyWorkerImpl(
         def _task_is_misc(task) -> bool:
             # FP8 scale siblings carry the suffix on global_param_name and are
             # always misc (packed_broadcast).
-            if task.global_param_name.endswith("_scale_inv"):
+            if task.global_param_name.endswith(("_scale_inv", "_scale_from_checkpoint")):
                 return True
             # Compound mappings (QKV/GatedMLP) export homogeneous sub-params
             # (all nccl-reshard or all misc), so the first HF name is representative.

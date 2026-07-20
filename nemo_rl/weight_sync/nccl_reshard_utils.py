@@ -223,6 +223,11 @@ _STR_TO_DTYPE = {
     "float32": torch.float32,
     "float8_e4m3fn": torch.float8_e4m3fn,
     "float8_e5m2": torch.float8_e5m2,
+    # E8M0 block-scale tensors (MXFP8 *_scale_from_checkpoint) are uint8.
+    "torch.uint8": torch.uint8,
+    "uint8": torch.uint8,
+    "torch.int32": torch.int32,
+    "int32": torch.int32,
 }
 
 
@@ -630,11 +635,18 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
                     "policy.megatron_cfg.fp8_cfg.fp8_param=True "
                     "(BF16→FP8 train-side quantization is not implemented yet)."
                 )
-            elif fp8_recipe != "blockwise":
+            elif fp8_recipe not in ("blockwise", "mxfp8"):
                 violations.append(
                     "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
-                    f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
-                    "don't produce export-ready scale_inv tensors."
+                    f"or 'mxfp8' when fp8_param=True (got {fp8_recipe!r}); other "
+                    "recipes don't produce export-ready scale_inv tensors."
+                )
+            elif fp8_recipe == "mxfp8" and not vllm_cfg.get("is_mx", False):
+                violations.append(
+                    "policy.megatron_cfg.fp8_cfg.fp8_recipe='mxfp8' requires "
+                    "policy.generation.vllm_cfg.is_mx=True so the vLLM side "
+                    "builds MXFP8 (E8M0 block-scale) params to receive the "
+                    "transferred weights."
                 )
         elif fp8_param:
             violations.append(
