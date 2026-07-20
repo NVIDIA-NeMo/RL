@@ -16,7 +16,7 @@ import math
 import random
 import warnings
 from functools import partial, wraps
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -27,8 +27,14 @@ from transformers import (
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
-from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.utils.logger import Logger
+
+if TYPE_CHECKING:
+    # Runtime import would cycle: policy.interfaces pulls in algorithms.loss,
+    # which imports back into algorithms.utils.
+    from nemo_rl.models.generation.interfaces import GenerationInterface
+    from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 
 
 def get_gdpo_reward_component_keys(batch) -> list[str]:
@@ -1032,10 +1038,10 @@ def print_efficiency_summary(
 
 
 def maybe_enable_refit_prequantize(
-    policy: Any,
-    policy_generation: Any,
+    policy: "ColocatablePolicyInterface",
+    policy_generation: "GenerationInterface",
     state_dict_info: Optional[dict[str, Any]],
-    policy_config: dict[str, Any],
+    policy_config: PolicyConfig,
 ) -> None:
     """Complete the trainer-side pre-quantized refit handshake if requested.
 

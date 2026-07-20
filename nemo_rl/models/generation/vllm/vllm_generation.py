@@ -914,7 +914,7 @@ class VllmGeneration(GenerationInterface):
             return False
 
     def prepare_refit_info(
-        self, state_dict_info: dict[str, Any]
+        self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
         """Prepare the info for refit.
 
