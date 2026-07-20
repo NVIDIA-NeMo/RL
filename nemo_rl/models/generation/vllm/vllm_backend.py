@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import logging
 import re
 import socket
-import traceback
 from typing import Any
 
 import torch
@@ -28,8 +28,11 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
+logger = logging.getLogger(__name__)
+
 try:
     import vllm  # noqa: F401
+    from vllm.distributed.parallel_state import get_pp_group
 except ImportError:
     raise ImportError(
         "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -222,9 +225,9 @@ class VllmInternalWorkerExtension:
 
         This path is only used for the Eagle3 online-training flow, where the
         trainer exports draft parameters under a `draft.` prefix before sending
-        them to vLLM.
-        This implementation is specific to the eagle model. For MTP, we can add
-        similar logic to this function to split weights and send it to the drafter.
+        them to vLLM. MTP parameters do not use the `draft.` prefix; they remain
+        in the policy stream and are forwarded separately by
+        ``_maybe_refit_mtp_drafter``.
         The "draft." prefix is added here https://github.com/isomap/RL/blob/d3a5e1396d00f82fb888d9ec6800687a23bb4017/nemo_rl/models/policy/workers/megatron_policy_worker.py#L967-L997
         """
         policy_weights = []
@@ -291,7 +294,7 @@ class VllmInternalWorkerExtension:
 
         draft_model = self._get_drafter_model()
         if draft_model is None:
-            print(
+            logger.warning(
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
             )
             return
@@ -377,7 +380,14 @@ class VllmInternalWorkerExtension:
         """
         draft_model = self._get_drafter_model()
         if draft_model is None:
-            print("[mtp] Drafter unavailable; cannot load MTP weights from disk.")
+            # vLLM places the speculative drafter only on the last pipeline
+            # stage. Its absence is expected on every earlier stage, but means
+            # the engine cannot serve speculative decoding on the owning stage.
+            if get_pp_group().is_last_rank:
+                raise RuntimeError(
+                    "[mtp] vLLM speculative_config is set for MTP but the drafter "
+                    "model is unavailable; cannot load MTP weights from disk."
+                )
             return False
 
         predictor = draft_model.model
@@ -412,9 +422,10 @@ class VllmInternalWorkerExtension:
         # Mark that the MTP drafter is served from a one-time disk load so refit
         # does not re-load or re-process these static weights.
         self._mtp_drafter_from_disk = True
-        print(
-            f"[mtp] Loaded MTP draft weights for layers "
-            f"{sorted(mtp_layer_indices)} from {model_path}"
+        logger.info(
+            "[mtp] Loaded MTP draft weights for layers %s from %s",
+            sorted(mtp_layer_indices),
+            model_path,
         )
         return True
 
@@ -540,9 +551,9 @@ class VllmInternalWorkerExtension:
             torch.cuda.empty_cache()
             return True
         except Exception as e:
-            print(
-                f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
-                f"{traceback.format_exc()}"
+            logger.exception(
+                "Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: %s",
+                e,
             )
             return False
 
@@ -584,8 +595,9 @@ class VllmInternalWorkerExtension:
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
-            print(
-                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
+            logger.exception(
+                "Error in VllmInternalWorkerExtension.update_weights_from_collective: %s",
+                e,
             )
             return False
 

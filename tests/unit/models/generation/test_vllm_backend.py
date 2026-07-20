@@ -19,7 +19,7 @@
 import contextlib
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
@@ -120,14 +120,19 @@ def _make_mtp_refit_extension(
 
 
 @pytest.mark.vllm
-def test_update_weights_from_collective_processes_weights_after_loading(monkeypatch):
+@pytest.mark.parametrize("with_mtp", [False, True])
+def test_update_weights_from_collective_processes_weights_after_loading(
+    monkeypatch, with_mtp
+):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     call_order = []
     process_calls = []
+    draft_model = object() if with_mtp else None
+    draft_model_config = object() if with_mtp else None
 
     def process_weights_after_loading(model, model_config, device):
-        call_order.append("process")
+        call_order.append("process_mtp" if model is draft_model else "process_main")
         process_calls.append((model, model_config, device))
 
     monkeypatch.setattr(
@@ -135,6 +140,14 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
         process_weights_after_loading,
     )
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+    if with_mtp:
+        ext._mtp_drafter_from_disk = False
+        ext.model_runner.drafter = SimpleNamespace(model=draft_model)
+        ext.model_runner.vllm_config = SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp", draft_model_config=draft_model_config
+            )
+        )
 
     @contextlib.contextmanager
     def set_current_vllm_config(config):
@@ -172,17 +185,66 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
 
     assert ext.update_weights_from_collective() is True
 
-    assert process_calls == [(ext.model_runner.model, ext.model_config, ext.device)]
-    assert call_order == [
+    expected_process_calls = [(ext.model_runner.model, ext.model_config, ext.device)]
+    expected_call_order = [
         "broadcast",
         "load",
         "config_enter",
-        "process",
+        "process_main",
         "config_exit",
-        "kv",
-        "gc",
-        "empty_cache",
     ]
+    if with_mtp:
+        expected_process_calls.append((draft_model, draft_model_config, ext.device))
+        expected_call_order.extend(["config_enter", "process_mtp", "config_exit"])
+    expected_call_order.extend(["kv", "gc", "empty_cache"])
+
+    assert process_calls == expected_process_calls
+    assert call_order == expected_call_order
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "method_name",
+    ["update_weights_via_ipc_zmq", "update_weights_from_collective"],
+)
+@pytest.mark.parametrize(
+    "worker_results, expected", [([True, True], True), ([True, False], False)]
+)
+def test_sync_weight_updates_check_every_internal_worker(
+    method_name, worker_results, expected
+):
+    """A failure on a later PP rank must not be hidden by rank zero success."""
+    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = SimpleNamespace(collective_rpc=MagicMock(return_value=worker_results))
+
+    assert getattr(worker, method_name)() is expected
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method_name",
+    ["update_weights_via_ipc_zmq_async", "update_weights_from_collective_async"],
+)
+@pytest.mark.parametrize(
+    "worker_results, expected", [([True, True], True), ([True, False], False)]
+)
+async def test_async_weight_updates_check_every_internal_worker(
+    method_name, worker_results, expected
+):
+    """Async refit also reports failures from every internal PP rank."""
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = SimpleNamespace(collective_rpc=AsyncMock(return_value=worker_results))
+
+    assert await getattr(worker, method_name)() is expected
 
 
 @pytest.mark.vllm
@@ -254,8 +316,11 @@ def test_load_mtp_weights_from_disk_loads_only_mtp_layer(tmp_path, monkeypatch):
 
 
 @pytest.mark.vllm
-def test_load_mtp_weights_from_disk_returns_false_without_drafter(tmp_path):
-    """When vLLM has not built a drafter, the load is skipped (no exception)."""
+@pytest.mark.parametrize("is_last_rank", [False, True])
+def test_load_mtp_weights_from_disk_without_drafter(
+    tmp_path, monkeypatch, is_last_rank
+):
+    """Only the pipeline stage that owns the drafter requires it to exist."""
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtension,
     )
@@ -265,8 +330,16 @@ def test_load_mtp_weights_from_disk_returns_false_without_drafter(tmp_path):
     ext.model_runner = MagicMock()
     ext.model_runner.drafter = None
     ext._load_draft_weights = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_backend.get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=is_last_rank),
+    )
 
-    assert ext.load_mtp_weights_from_disk(str(tmp_path)) is False
+    if is_last_rank:
+        with pytest.raises(RuntimeError, match="drafter model is unavailable"):
+            ext.load_mtp_weights_from_disk(str(tmp_path))
+    else:
+        assert ext.load_mtp_weights_from_disk(str(tmp_path)) is False
     ext._load_draft_weights.assert_not_called()
 
 
@@ -291,6 +364,33 @@ def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
     with pytest.raises(ValueError, match="No MTP layer weights"):
         ext.load_mtp_weights_from_disk(str(model_dir))
     ext._load_draft_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+def test_load_weights_routes_only_policy_weights_to_mtp_drafter(monkeypatch):
+    """The MTP path receives policy weights, while Eagle gets draft-prefixed ones."""
+    from nemo_rl.models.generation.vllm.quantization import fp8
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    main_model = SimpleNamespace(load_weights=MagicMock())
+    ext.model_runner = SimpleNamespace(
+        model=main_model,
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(architectures=[])),
+    )
+    ext._load_draft_weights = MagicMock()
+    ext._maybe_refit_mtp_drafter = MagicMock()
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _: False)
+
+    policy_weights = [("model.weight", "policy-value")]
+    draft_weights = [("weight", "draft-value")]
+    ext._load_weights(policy_weights + [("draft.weight", "draft-value")])
+
+    main_model.load_weights.assert_called_once_with(weights=policy_weights)
+    ext._load_draft_weights.assert_called_once_with(draft_weights)
+    ext._maybe_refit_mtp_drafter.assert_called_once_with(policy_weights)
 
 
 @pytest.mark.vllm
