@@ -91,6 +91,7 @@ def make_processed_microbatch_iterator(
     straggler_timer: StragglerDetector,
     pad_full_seq_to: Optional[int],
     delegate_pack_to_model: bool = False,
+    delegate_mtp_loss_mask_to_model: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -124,6 +125,7 @@ def make_processed_microbatch_iterator(
             pad_full_seq_to=pad_full_seq_to,
             pack_sequences=pack_sequences,
             delegate_pack_to_model=delegate_pack_to_model,
+            delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
             straggler_timer=straggler_timer,
         )
 
@@ -148,6 +150,7 @@ def get_microbatch_iterator(
     straggler_timer: StragglerDetector,
     seq_length_key: Optional[str] = None,
     delegate_pack_to_model: bool = False,
+    delegate_mtp_loss_mask_to_model: bool = False,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -212,6 +215,7 @@ def get_microbatch_iterator(
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
         delegate_pack_to_model=delegate_pack_to_model,
+        delegate_mtp_loss_mask_to_model=delegate_mtp_loss_mask_to_model,
     )
 
     # Compute padded sequence length for pipeline parallelism
@@ -246,6 +250,7 @@ def process_microbatch(
     pad_full_seq_to: Optional[int] = None,
     pack_sequences: bool = False,
     delegate_pack_to_model: bool = False,
+    delegate_mtp_loss_mask_to_model: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
@@ -286,11 +291,10 @@ def process_microbatch(
             seq_lengths = data_dict[seq_length_key]
 
             if delegate_pack_to_model:
-                # The VLM packing path does not pack or propagate mtp_loss_mask,
-                # so MTP training would be silently dropped here. Fail loudly
-                # instead of producing wrong results.
-                assert "mtp_loss_mask" not in data_dict, (
-                    "MTP training is not supported with VLM sequence packing"
+                has_mtp_loss_mask = "mtp_loss_mask" in data_dict
+                assert not has_mtp_loss_mask or delegate_mtp_loss_mask_to_model, (
+                    "MTP training requires a self-packing VLM that advertises "
+                    "model_owns_mtp_loss_mask_packing"
                 )
                 # VLM path: model (e.g. mbridge Qwen3VL) does its own
                 # preprocess_packed_seqs; NeMo-RL must NOT pre-pack + CP-shard,
@@ -320,6 +324,25 @@ def process_microbatch(
                     pad_individual_seqs_to_multiple_of,
                     pad_full_seq_to=pad_full_seq_to,
                 )
+                if has_mtp_loss_mask:
+                    source_mtp_loss_mask = data_dict["mtp_loss_mask"]
+                    assert source_mtp_loss_mask.ndim == 2
+                    assert (
+                        source_mtp_loss_mask.shape[0] == input_ids_cp_sharded.shape[0]
+                    )
+                    mtp_loss_mask = source_mtp_loss_mask.new_zeros(
+                        input_ids_cp_sharded.shape
+                    )
+                    copied_length = min(
+                        source_mtp_loss_mask.shape[1],
+                        input_ids_cp_sharded.shape[1],
+                    )
+                    mtp_loss_mask[:, :copied_length] = source_mtp_loss_mask[
+                        :, :copied_length
+                    ]
+                    mtp_loss_mask = mtp_loss_mask * attention_mask.to(
+                        dtype=mtp_loss_mask.dtype
+                    )
                 position_ids = None
             else:
                 token_identity = None

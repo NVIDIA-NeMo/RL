@@ -349,3 +349,44 @@ def test_packedtensor_as_tensor_with_mixed_none_and_tensors():
     out = pt.as_tensor()
     expected = torch.cat([t1, t3], dim=0)
     assert torch.equal(out, expected)
+
+
+def test_packedtensor_pads_mixed_dynamic_resolution_images():
+    """Raw image batches pad spatial dimensions before packing on dim 0."""
+    first = torch.ones(1, 3, 2, 4)
+    second = 2 * torch.ones(1, 3, 4, 2)
+
+    packed = PackedTensor(
+        [first, second], dim_to_pack=0, pad_to_max_shape=True
+    ).as_tensor()
+
+    assert packed.shape == (2, 3, 4, 4)
+    torch.testing.assert_close(packed[0, :, :2, :4], first[0])
+    torch.testing.assert_close(packed[0, :, 2:, :], torch.zeros(3, 2, 4))
+    torch.testing.assert_close(packed[1, :, :4, :2], second[0])
+    torch.testing.assert_close(packed[1, :, :, 2:], torch.zeros(3, 4, 2))
+
+
+@pytest.mark.parametrize(
+    ("first_shape", "second_shape", "expected_shape"),
+    [
+        ((1, 2, 3), (2, 4, 3), (3, 4, 3)),
+        ((1, 2, 3, 2, 4), (2, 4, 3, 4, 2), (3, 4, 3, 4, 4)),
+    ],
+)
+def test_packedtensor_pad_to_max_shape_supports_audio_and_video(
+    first_shape, second_shape, expected_shape
+):
+    """Padding is generic across non-packing dimensions and tensor ranks."""
+    first = torch.ones(first_shape)
+    second = 2 * torch.ones(second_shape)
+
+    packed = PackedTensor(
+        [first, second], dim_to_pack=0, pad_to_max_shape=True
+    ).as_tensor()
+
+    assert packed.shape == expected_shape
+    slices = (slice(0, first_shape[0]),) + tuple(
+        slice(0, size) for size in first_shape[1:]
+    )
+    torch.testing.assert_close(packed[slices], first)

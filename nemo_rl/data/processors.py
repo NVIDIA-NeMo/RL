@@ -614,15 +614,39 @@ def vlm_hf_data_processor(
     user_message["token_ids"] = message["input_ids"][0]
     # add all keys and values to the user message, and the list of keys
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
-    # imgs_sizes is not declared in model_input_names by the NemotronOmni
-    # checkpoint's bundled image_processor, so append it explicitly when
-    # present. It packs along dim=0 (per-image).
+    # Current Nemotron Omni processors emit imgs_sizes. Historical MMPR
+    # checkpoints instead emit a batch of fixed-size image tiles and only
+    # declare pixel_values. Treat each tile as one dynamic-resolution image so
+    # the model-owned path can patchify it and preserve the processor's exact
+    # placeholder count.
+    if (
+        _uses_image_placeholder
+        and "pixel_values" in message
+        and "imgs_sizes" not in message
+        and message["pixel_values"].ndim == 4
+    ):
+        pixel_values = message["pixel_values"]
+        num_tiles, _, height, width = pixel_values.shape
+        message["imgs_sizes"] = torch.tensor(
+            [[height, width]] * num_tiles, dtype=torch.long
+        )
+
+    # imgs_sizes is not always declared in model_input_names by bundled image
+    # processors, so append it explicitly when present. RADIO uses temporal
+    # patching even for still images and requires one num_frames=1 entry per
+    # image/tile.
     if "imgs_sizes" in message and "imgs_sizes" not in multimodal_keys:
         multimodal_keys.append("imgs_sizes")
+    if "imgs_sizes" in message and "num_frames" not in message:
+        message["num_frames"] = torch.ones(len(message["imgs_sizes"]), dtype=torch.long)
+    if "num_frames" in message and "num_frames" not in multimodal_keys:
+        multimodal_keys.append("num_frames")
     for key in multimodal_keys:
         if key in message:
             user_message[key] = PackedTensor(
-                message[key], dim_to_pack=get_dim_to_pack_along(processor, key)
+                message[key],
+                dim_to_pack=get_dim_to_pack_along(processor, key),
+                pad_to_max_shape=_uses_image_placeholder and key == "pixel_values",
             )
 
     # specifically for gemma, we need to add token_type_ids to the user message as a sequence-type value

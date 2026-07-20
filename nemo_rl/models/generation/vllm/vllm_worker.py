@@ -51,6 +51,19 @@ from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 logger = logging.getLogger(__name__)
 
 
+def _context_capped_max_new_tokens(
+    *, configured_max_new_tokens: int, input_length: int, max_model_len: int
+) -> int:
+    """Cap generation so the training prompt and response fit the context."""
+    remaining_context = max_model_len - input_length
+    if remaining_context <= 0:
+        raise ValueError(
+            "Cannot generate from an input whose training length exhausts the "
+            f"model context: input_length={input_length}, max_model_len={max_model_len}."
+        )
+    return min(configured_max_new_tokens, remaining_context)
+
+
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
     if enable_prefix_caching is None:
@@ -516,11 +529,21 @@ class BaseVllmGenerationWorker:
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
-            logprobs_mode="processed_logprobs",
+            # Keep the main default, while allowing an RL recipe to request
+            # raw model logprobs. This is required when policy logprobs are
+            # compared with vLLM generation under a logits processor.
+            logprobs_mode=self.cfg["vllm_cfg"].get(
+                "logprobs_mode", "processed_logprobs"
+            ),
             **vllm_kwargs,
         )
 
         self._create_engine(llm_kwargs)
+        # Nemotron Omni checkpoints fold RADIO LayerScale into adjacent weights,
+        # while stock vLLM still allocates ls1/ls2 parameters. Initialize those
+        # parameters before colocated level-1 sleep releases their CUDA storage;
+        # mutating them later from prepare_refit_info corrupts sleep/wake state.
+        self.llm.collective_rpc("_initialize_nemotron_omni_radio_layerscale")
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
         )
@@ -577,6 +600,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            bad_words=self.cfg.get("bad_words") or None,
             ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
@@ -750,10 +774,6 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         input_lengths = data["input_lengths"]
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
-        sampling_params = self._build_sampling_params(
-            greedy=greedy,
-            stop_strings=stop_strings,
-        )
 
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
@@ -761,13 +781,31 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Original input length with padding
         padded_input_length = input_ids.size(1)
 
-        # Convert inputs to vLLM format
-        prompts = format_prompt_for_vllm_generation(data)
-
-        # Generate outputs
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
+        if self.cfg["vllm_cfg"].get("cap_max_tokens_to_context", False):
+            max_model_len = int(self.llm.llm_engine.model_config.max_model_len)
+            sampling_params = [
+                self._build_sampling_params(
+                    greedy=greedy,
+                    stop_strings=stop_strings,
+                    max_new_tokens=_context_capped_max_new_tokens(
+                        configured_max_new_tokens=int(self.cfg["max_new_tokens"]),
+                        input_length=int(input_length),
+                        max_model_len=max_model_len,
+                    ),
+                )
+                for input_length in input_lengths.tolist()
+            ]
+        else:
+            sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=stop_strings,
+            )
+
+        # Convert inputs to vLLM format and generate outputs.
+        prompts = format_prompt_for_vllm_generation(data)
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
         outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 

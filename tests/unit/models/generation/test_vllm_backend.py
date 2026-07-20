@@ -259,3 +259,82 @@ def test_load_mtp_weights_from_disk_raises_when_mtp_weights_missing(
     with pytest.raises(ValueError, match="No MTP layer weights"):
         ext.load_mtp_weights_from_disk(str(model_dir))
     ext._load_draft_weights.assert_not_called()
+
+
+class _TinyRadioVisionModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(initializer_factor=1.0)
+        self.ls1 = torch.nn.Parameter(torch.full((4,), 0.001))
+        self.ls2 = torch.nn.Parameter(torch.full((4,), -0.001))
+        self.projection = torch.nn.Parameter(torch.full((4,), 0.25))
+
+
+def _make_extension_with_radio(architecture):
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtension,
+    )
+
+    ext = VllmInternalWorkerExtension.__new__(VllmInternalWorkerExtension)
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(architectures=[architecture])
+        ),
+        model=SimpleNamespace(vision_model=_TinyRadioVisionModel()),
+    )
+    return ext
+
+
+@pytest.mark.vllm
+def test_initialize_folded_nemotron_radio_layerscale_while_awake():
+    ext = _make_extension_with_radio("NemotronH_Nano_Omni_Reasoning_V3")
+
+    initialized = ext._initialize_nemotron_omni_radio_layerscale()
+
+    vision_model = ext.model_runner.model.vision_model
+    assert initialized == 2
+    assert torch.equal(vision_model.ls1, torch.ones_like(vision_model.ls1))
+    assert torch.equal(vision_model.ls2, torch.ones_like(vision_model.ls2))
+    assert torch.equal(
+        vision_model.projection, torch.full_like(vision_model.projection, 0.25)
+    )
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_does_not_mutate_folded_layerscale():
+    ext = _make_extension_with_radio("NemotronH_Nano_Omni_Reasoning_V3")
+
+    state_dict_info = {"language_model.weight": ((4, 4), torch.bfloat16)}
+    ext.prepare_refit_info(state_dict_info)
+
+    vision_model = ext.model_runner.model.vision_model
+    assert ext.state_dict_info is state_dict_info
+    assert torch.equal(vision_model.ls1, torch.full_like(vision_model.ls1, 0.001))
+    assert torch.equal(vision_model.ls2, torch.full_like(vision_model.ls2, -0.001))
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_rejects_explicit_nemotron_radio_layerscale():
+    ext = _make_extension_with_radio("NemotronH_Super_Omni_Reasoning_V3")
+
+    with pytest.raises(RuntimeError, match="explicit RADIO LayerScale"):
+        ext.prepare_refit_info(
+            {
+                "vision_model.radio_model.model.blocks.0.ls1": (
+                    (4,),
+                    torch.bfloat16,
+                )
+            }
+        )
+
+
+@pytest.mark.vllm
+def test_prepare_refit_info_leaves_non_nemotron_model_unchanged():
+    ext = _make_extension_with_radio("SomeOtherArchitecture")
+
+    ext.prepare_refit_info({})
+    assert ext._initialize_nemotron_omni_radio_layerscale() == 0
+
+    vision_model = ext.model_runner.model.vision_model
+    assert torch.equal(vision_model.ls1, torch.full_like(vision_model.ls1, 0.001))
+    assert torch.equal(vision_model.ls2, torch.full_like(vision_model.ls2, -0.001))
