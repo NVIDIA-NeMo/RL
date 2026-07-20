@@ -48,6 +48,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "prorlv2": "examples/configs/prorlv2.v2.yaml",
     "ppo": "examples/configs/ppo_math_1B_megatron.yaml",
     "mopd": "examples/configs/grpo_math_1B.yaml",
+    "gdpo": "examples/configs/gdpo_math_1B.yaml",
 }
 
 # Configuration keys that are allowed to be added to base configs during testing

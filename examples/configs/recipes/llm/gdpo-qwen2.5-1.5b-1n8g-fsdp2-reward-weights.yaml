@@ -1,0 +1,20 @@
+defaults: ../../gdpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  adv_estimator:
+    reward_weights:
+    - 1.0
+    - 0.5
+    - 0.25
+checkpointing:
+  checkpoint_dir: results/gdpo-qwen2.5-1.5b-1n8g-fsdp2-reward-weights
+policy:
+  train_global_batch_size: 64
+logger:
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: gdpo-qwen2.5-1.5b-1n8g-fsdp2-reward-weights
+cluster:
+  gpus_per_node: 8
