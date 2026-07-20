@@ -35,6 +35,11 @@ from nemo_rl.models.generation.vllm.utils import (
     model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
 )
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+
+
+def _decoded_routes(payload: str) -> list:
+    return decode_routed_experts(payload, dtype=torch.int32).tolist()
 
 
 def _mk_inputs(batch_size: int = 2, seq_len: int = 5):
@@ -449,13 +454,15 @@ def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_i
         device=torch.device("cpu"),
     )
 
-    assert response.choices[0].message.routed_experts == [
+    # Routes travel as a base64 string envelope, one opaque object per choice.
+    assert isinstance(response.choices[0].message.routed_experts, str)
+    assert _decoded_routes(response.choices[0].message.routed_experts) == [
         [[10]],
         [[11]],
         [[30]],
         [[0]],
     ]
-    assert response.choices[1].message.routed_experts == [
+    assert _decoded_routes(response.choices[1].message.routed_experts) == [
         [[10]],
         [[11]],
         [[31]],
@@ -517,7 +524,7 @@ def test_attach_routed_experts_to_chat_response_choices_warns_on_missing_routes(
         2,
         4,
     )
-    assert response.choices[0].message.routed_experts == [
+    assert _decoded_routes(response.choices[0].message.routed_experts) == [
         [[10]],
         [[11]],
         [[R3_MISSING_ROUTE_SENTINEL]],
