@@ -14,8 +14,16 @@
 
 import argparse
 import os
+import sys
 from copy import deepcopy
 from typing import Any, cast
+
+# Allow running this file directly (e.g. `uv run examples/nemo_gym/run_grpo_rollout_benchmark.py`):
+# put the repo root on sys.path so the `from examples...` / `from nemo_rl...` imports below resolve
+# even when Python placed this file's own directory on sys.path[0] instead of the repo root.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 from omegaconf import OmegaConf
 
