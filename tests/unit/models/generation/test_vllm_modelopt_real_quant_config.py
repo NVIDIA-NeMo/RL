@@ -17,7 +17,7 @@ import os
 import sys
 import types
 import weakref
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import pytest
 import torch
@@ -158,6 +158,27 @@ def _install_fake_vllm_reload(monkeypatch):
         module = types.ModuleType(module_name)
         module.__path__ = []
         monkeypatch.setitem(sys.modules, module_name, module)
+
+    config_module = types.ModuleType("vllm.config")
+    config_module.current = None
+
+    @contextmanager
+    def set_current_vllm_config(config):
+        previous = config_module.current
+        config_module.current = config
+        try:
+            yield
+        finally:
+            config_module.current = previous
+
+    def get_current_vllm_config():
+        if config_module.current is None:
+            raise AssertionError("Current vLLM config is not set")
+        return config_module.current
+
+    config_module.set_current_vllm_config = set_current_vllm_config
+    config_module.get_current_vllm_config = get_current_vllm_config
+    monkeypatch.setitem(sys.modules, "vllm.config", config_module)
 
     reload_module = types.ModuleType("vllm.model_executor.model_loader.reload")
     reload_module.__path__ = []
@@ -1426,6 +1447,64 @@ def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
     torch.testing.assert_close(child.input_quantizer_amax, torch.tensor([3.0]))
 
 
+def test_real_quant_reload_keeps_vllm_config_active_during_layerwise_processing(
+    monkeypatch,
+):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    config_mod = sys.modules["vllm.config"]
+    reload_mod = sys.modules["vllm.model_executor.model_loader.reload"]
+
+    model = _mark_as_modelopt_layer(torch.nn.Linear(1, 1))
+    vllm_config = object()
+    model_config = object()
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension.model_runner = types.SimpleNamespace(
+        model=model,
+        vllm_config=vllm_config,
+    )
+    extension.model_config = model_config
+    extension.device = torch.device("cpu")
+    extension._nrl_modelopt_reload_roots = (model,)
+    calls = []
+
+    monkeypatch.setattr(
+        backend.VllmQuantInternalWorkerExtension,
+        "_is_real_quant_model",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        reload_mod,
+        "initialize_layerwise_reload",
+        lambda root: calls.append(("initialize", root)),
+    )
+
+    def finalize(root, config):
+        assert config_mod.get_current_vllm_config() is vllm_config
+        calls.append(("finalize", root, config))
+
+    monkeypatch.setattr(reload_mod, "finalize_layerwise_reload", finalize)
+    monkeypatch.setattr(
+        backend.torch.accelerator,
+        "synchronize",
+        lambda: calls.append("sync"),
+    )
+
+    with extension._weight_update_lifecycle("collective") as finish:
+        # FlashInferExperts performs this lookup when online layer processing
+        # reconstructs its kernel during the yielded weight-load phase.
+        assert config_mod.get_current_vllm_config() is vllm_config
+        calls.append("load")
+        finish()
+
+    assert config_mod.current is None
+    assert calls == [
+        ("initialize", model),
+        "load",
+        ("finalize", model, model_config),
+        "sync",
+    ]
+
+
 def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
     base_backend = _base_vllm_backend()
@@ -1434,7 +1513,10 @@ def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch)
     model = _mark_as_modelopt_layer(torch.nn.Linear(1, 1))
     model_config = object()
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(model=model)
+    extension.model_runner = types.SimpleNamespace(
+        model=model,
+        vllm_config=object(),
+    )
     extension.model_config = model_config
     extension.device = torch.device("cpu")
     extension.state_dict_info = {}
@@ -1483,7 +1565,10 @@ def test_real_quant_collective_reload_raises_on_failure(monkeypatch):
 
     model = _mark_as_modelopt_layer(torch.nn.Linear(1, 1))
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(model=model)
+    extension.model_runner = types.SimpleNamespace(
+        model=model,
+        vllm_config=object(),
+    )
     extension.model_config = object()
     extension.device = torch.device("cpu")
     extension.state_dict_info = {}
@@ -1557,7 +1642,10 @@ def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
     model_config = object()
     socket = FakeSocket()
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(model=model)
+    extension.model_runner = types.SimpleNamespace(
+        model=model,
+        vllm_config=object(),
+    )
     extension.model_config = model_config
     extension.device = torch.device("cpu")
     extension.zmq_socket = socket
@@ -1611,7 +1699,8 @@ def test_real_quant_ipc_finalize_failure_acks_complete(monkeypatch):
     socket.send = socket.sent.append
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     extension.model_runner = types.SimpleNamespace(
-        model=_mark_as_modelopt_layer(torch.nn.Linear(1, 1))
+        model=_mark_as_modelopt_layer(torch.nn.Linear(1, 1)),
+        vllm_config=object(),
     )
     extension.model_config = object()
     extension.device = torch.device("cpu")
@@ -1694,7 +1783,10 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
             self.sent.append(payload)
 
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension.model_runner = types.SimpleNamespace(model=torch.nn.Linear(1, 1))
+    extension.model_runner = types.SimpleNamespace(
+        model=torch.nn.Linear(1, 1),
+        vllm_config=object(),
+    )
     extension.model_config = object()
     extension.device = torch.device("cuda:0")
     extension.zmq_socket = FakeSocket()

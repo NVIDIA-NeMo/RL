@@ -454,6 +454,7 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 yield finalize
             return
 
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.reload import (
             finalize_layerwise_reload,
             initialize_layerwise_reload,
@@ -479,10 +480,14 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 raise
 
         try:
-            with torch.device(self.device):
-                for reload_root in reload_roots:
-                    initialize_layerwise_reload(reload_root)
-            yield finalize
+            # Layerwise loading may reconstruct backend CustomOps as soon as a
+            # layer becomes complete. Keep vLLM's worker config available for
+            # that online processing as well as deferred finalization.
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                with torch.device(self.device):
+                    for reload_root in reload_roots:
+                        initialize_layerwise_reload(reload_root)
+                yield finalize
         except IPCWeightManifestError as error:
             raise RuntimeError(
                 f"ModelOpt real-quant refit rejected: {error}"
