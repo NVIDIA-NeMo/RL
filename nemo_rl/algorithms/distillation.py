@@ -217,6 +217,14 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+    if (
+        generation_config["backend"] == "vllm"
+        and cast(VllmConfig, generation_config).get("refit_transport") is not None
+    ):
+        raise ValueError(
+            "Remote sparse refit is currently supported only by GRPO; distillation "
+            "support is tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
+        )
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):

@@ -1,5 +1,14 @@
 # Audio Post-training with NeMo RL
 
+> **Audio dependencies are not pre-installed in the NeMo-RL container.**
+> Run the following script once before training or evaluation:
+>
+> ```bash
+> bash tools/install_audio_deps.sh
+> ```
+>
+> The script is a no-op if they are already installed. Audio tests run it automatically.
+
 This guide explains how to use NeMo RL to train [Qwen2.5-Omni](https://huggingface.co/Qwen) (3B or 7B) and [Qwen3-Omni-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) with GRPO on audio question-answering data, convert the resulting Megatron checkpoint to Hugging Face format, and evaluate it on the [MMAU benchmark](https://huggingface.co/datasets/TwinkStart/MMAU).
 
 NeMo RL ships three recipes out of the box, but the pieces are independent and can be mixed:
