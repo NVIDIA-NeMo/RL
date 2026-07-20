@@ -561,6 +561,11 @@ if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
 
+# CI=true causes PyTorch to enable strict custom-op aliasing checks
+# (error_on_custom_op_aliasing), which raises RuntimeError in some vLLM custom ops.
+# Unset it so the Ray daemon and all workers it spawns behave like a local non-CI run.
+unset CI
+
 # Turn on pipefail here; it does not carry into this 'bash -c' subshell from the
 # submit host. Without it, 'ray status | grep worker_units | awk ...' exits 0 even
 # when grep matches nothing (awk's status wins), so the '|| echo 0' fallback never
@@ -781,6 +786,12 @@ worker_cmd=$(cat <<EOF
 if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
   env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
 fi
+
+# CI=true causes PyTorch to enable strict custom-op aliasing checks
+# (error_on_custom_op_aliasing), which raises RuntimeError in some vLLM custom ops.
+# Unset it so the Ray daemon and all workers it spawns behave like a local non-CI run.
+unset CI
+
 echo "[INFO] Worker \$SLURM_PROCID on node \$SLURMD_NODENAME"
 
 # Fail fast if LOG_DIR is not actually shared with the submit host -- the worker
