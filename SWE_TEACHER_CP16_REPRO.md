@@ -103,9 +103,6 @@ per the flight-recorder dump; analyzer: `tools/analyze_fr.py`).
   float`) = 0, and the "~2600 nan" first reported was a grep artifact (the run dir was `...-nancap`, a
   NaN-capture debug run → "nancap" matched `nan` in ~2400 log-path lines). Both runs used
   `moe_backend: triton`. So the CP-hang-at-GBS-128 evidence is **1 run, not 2**.
-- **NaN is not a live issue.** `moe_backend: triton` + `NRL_NAN_GUARD=1` handle it: the clean run
-  5456109 (triton, GBS=32) had 0 fatal NaN, 8 non-fatal guard events. The guard converts a rare NaN
-  logprob to a safe value; it does not indicate a collapse.
 - **The CP hang strikes early — first 1–2 optimizer steps, not mid-training.** 5355697 hung on **step 0**
   (the first CP-attention all_to_all). It reaches the training loop (load + refit + rollout complete)
   then deadlocks on an early step → it fails fast (~10 min to the 600 s watchdog), so GBS=128 is a cheap
