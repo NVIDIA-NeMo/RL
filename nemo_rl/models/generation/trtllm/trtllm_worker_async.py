@@ -55,6 +55,7 @@ class TrtllmAsyncGenerationWorkerImpl:
     def configure_worker(
         num_gpus: int | float,
         bundle_indices: Optional[tuple[int, list[int]]] = None,
+        num_gpus_per_node: Optional[int] = None,
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         # TRT-LLM with orchestrator_type="ray" creates its own internal
         # Ray actors that each need a GPU.  The outer actor therefore
@@ -520,6 +521,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             # logprob alignment with training-side Megatron.
             include_stop_str_in_output=True,
             logprobs=True,
+            logprobs_simple_format=True,
         )
 
 
