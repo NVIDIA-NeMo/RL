@@ -79,6 +79,8 @@ class TrtllmAsyncGenerationWorkerImpl:
             # to TRT-LLM as ray_placement_config (instead of TRTLLM_RAY_BUNDLE_INDICES).
             init_kwargs["bundle_indices"] = bundle_indices[1]
 
+        init_kwargs["fraction_of_gpus"] = num_gpus
+
         return resources, env_vars, init_kwargs, {}
 
     def __repr__(self) -> str:
@@ -88,12 +90,14 @@ class TrtllmAsyncGenerationWorkerImpl:
         self,
         config: TrtllmConfig,
         bundle_indices: Optional[list[int]] = None,
+        fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
     ) -> None:
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         self.is_model_owner = bundle_indices is not None
         self._bundle_indices = bundle_indices
+        self._fraction_of_gpus = fraction_of_gpus
         self._seed = seed
         self.llm = None
         self.TrtSamplingParams = None
@@ -117,7 +121,7 @@ class TrtllmAsyncGenerationWorkerImpl:
 
         trtllm_cfg = self.cfg["trtllm_cfg"]
         tp_size = trtllm_cfg["tensor_parallel_size"]
-        self._colocated = bool(self.cfg.get("colocated", {}).get("enabled", False))
+        self._colocated = self.cfg["colocated"]["enabled"]
 
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
@@ -202,7 +206,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                     ExecutorMemoryType.KV_CACHE: "NONE",
                 }
             )
-            llm_kwargs["per_worker_gpu_share"] = 0.5
+            llm_kwargs["per_worker_gpu_share"] = self._fraction_of_gpus
 
         # Escape hatch: spread remaining user-provided TRT-LLM kwargs last so
         # they can override anything above for advanced tuning.

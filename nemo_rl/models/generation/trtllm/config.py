@@ -21,9 +21,9 @@ class TrtllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
     gpu_memory_utilization: NotRequired[float]
     max_model_len: int
-    precision: NotRequired[str]
-    max_batch_size: NotRequired[int]
-    max_num_tokens: NotRequired[int]
+    precision: str
+    max_batch_size: int
+    max_num_tokens: int
     async_engine: NotRequired[bool]
     # MoE expert parallelism. TRT-LLM splits the TP dimension on MoE layers
     # into moe_tp × moe_ep, so the constraint is

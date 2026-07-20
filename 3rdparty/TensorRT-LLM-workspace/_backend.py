@@ -146,7 +146,8 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         "https://github.com/NVIDIA/TensorRT-LLM.git",
     )
     git_ref = env.get(
-        "BUILD_CUSTOM_TRTLLM_REF", "bf2ef86f9a2652132b11773d4041e292c553c142"
+        "BUILD_CUSTOM_TRTLLM_REF",
+        "bf2ef86f9a2652132b11773d4041e292c553c142",  # pragma: allowlist secret
     )
 
     # Our own cache keyed by (git_url, git_ref, version, platform_tag).
