@@ -42,6 +42,7 @@ def _scratch(tag: str, shape: torch.Size, device: torch.device) -> torch.Tensor:
 
 
 def swap_w13_to_w31_row_indices(num_rows: int) -> torch.Tensor:
+    """Row indices that swap the stacked [w1; w3] halves to [w3; w1] order."""
     half = num_rows // 2
     return torch.cat((torch.arange(half, num_rows), torch.arange(half)))
 
