@@ -1633,8 +1633,9 @@ def setup_reference_model_state(
             )
 
         reference_state_dict = {}
-        pinned_reference_swap = config["megatron_cfg"].get(
-            "pinned_reference_swap", False
+        # NotRequired key: absent means disabled, default lives in the exemplar YAML.
+        pinned_reference_swap = bool(
+            config["megatron_cfg"].get("pinned_reference_swap")
         )
 
         if should_load_checkpoint or use_peft:
