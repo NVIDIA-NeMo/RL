@@ -18,6 +18,18 @@ set -eou pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
+# Assert a `sed -i` patch target exists before patching. `sed` exits 0 even when
+# the pattern doesn't match, so if TRT-LLM upstream changes these files our
+# patches would silently no-op and the build would fail later in an obscure way.
+# Fail loudly here instead. Args: <file> <fixed-string-pattern>.
+assert_patch_target() {
+    grep -qF -- "$2" "$1" || {
+        echo "[ERROR] Expected patch target not found in $1 (did TRT-LLM upstream change?):" >&2
+        echo "          $2" >&2
+        exit 1
+    }
+}
+
 # Parse command line arguments
 GIT_URL=${1:-https://github.com/NVIDIA/TensorRT-LLM.git}
 GIT_REF=${2:-bf2ef86f9a2652132b11773d4041e292c553c142}
@@ -80,28 +92,47 @@ git submodule update --init --recursive --depth=1
 #   - remove `setuptools<80` ceiling. Modern setuptools (>=80) is required by
 #     several of our other dependencies (e.g. transformer-engine build deps);
 #     downgrading creates an unresolvable conflict in the venv.
+assert_patch_target requirements.txt 'nvidia-modelopt[torch]~=0.37.0'
 sed -i 's|nvidia-modelopt\[torch\]~=0\.37\.0|nvidia-modelopt[torch]>=0.44.0a0|' requirements.txt
+assert_patch_target requirements.txt 'setuptools<80'
 sed -i 's|^setuptools<80$|setuptools|' requirements.txt
 
 # cutlass_kernels/CMakeLists.txt invokes `setup_library.py develop --user`,
 # which (a) requires a setup.py shim and (b) the `--user` flag is invalid
 # inside a venv. Rewrite the COMMAND to copy setup_library.py to setup.py
 # (so `develop` finds a buildable target) and drop `--user`.
+assert_patch_target cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt \
+    'COMMAND ${Python3_EXECUTABLE} setup_library.py develop --user'
 sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND bash -c "cp -f setup_library.py setup.py \&\& \${Python3_EXECUTABLE} setup_library.py develop"|' \
     cpp/tensorrt_llm/kernels/cutlass_kernels/CMakeLists.txt
 
+# SM arch list. Sourced from BUILD_CUSTOM_TRTLLM_ARCH so it stays in sync with
+# _backend.py, which folds the same value into the wheel cache key (a change to
+# the arch list must invalidate the cached wheel). The default below MUST match
+# _backend.py's _DEFAULT_ARCH.
+#   90-real;100-real: build Hopper (sm_90) and Blackwell (sm_100) kernels,
+#                     i.e. H100/GB200/B200 only (B200 is also sm_100) — other
+#                     SKUs (e.g. A100 sm_80, L40 sm_89, consumer Blackwell
+#                     RTX 50-series sm_120) need this list extended.
+ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-90-real;100-real}"
+
 # Build the wheel.
-#   -a 90-real;100-real: build Hopper (sm_90) and Blackwell (sm_100) kernels.
 #   --nvrtc_dynamic_linking: required so the wheel links against the venv's
 #                            libnvrtc-builtins lazily instead of statically.
-echo "Building TensorRT-LLM wheel (this takes ~30-60 minutes)..."
+echo "Building TensorRT-LLM wheel (arch=${ARCH}, ~30-60 minutes)..."
+# Bracket the build with ccache stats so CI logs surface the cache hit rate.
+# Builds run cold unless vars.TRTLLM_BUILD_CACHE is set, so this makes a
+# missing/misconfigured cache obvious instead of a silent full rebuild.
+# `|| true` keeps it non-fatal when ccache isn't on PATH.
+ccache --zero-stats >/dev/null 2>&1 || true
 python3 scripts/build_wheel.py \
-    -a "90-real;100-real" \
+    -a "$ARCH" \
     -G Ninja \
     --clean \
     --use_ccache \
     --nvrtc_dynamic_linking \
     -D "ENABLE_UCX=OFF"
+ccache --show-stats || true
 
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."
 cp "$BUILD_DIR"/build/tensorrt_llm-*.whl "$WHEEL_OUTPUT_DIR/"

@@ -46,6 +46,8 @@ policy:
     defer_fp32_logits: true
     moe_per_layer_logging: true
     checkpoint:
+      # async_save disabled: colocated TRT-LLM wake OOMs on this model when
+      # megatron async checkpoint save runs concurrently
       async_save: false
     optimizer:
       lr: 1.0e-06

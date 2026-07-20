@@ -5,8 +5,8 @@ source $SCRIPT_DIR/common.env
 # ===== BEGIN CONFIG =====
 NUM_NODES=8
 GPUS_PER_NODE=4
-STEPS_PER_RUN=10
-MAX_STEPS=20
+STEPS_PER_RUN=30
+MAX_STEPS=100
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -36,8 +36,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'mean(data["train/gen_kl_error"]) < 0.02' \
-        'data["train/reward"]["20"] > -0.5'
-
+        'data["train/reward"]["100"] > -0.5' \
+        'data["validation/accuracy"]["100"] > 0.1'
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi

@@ -454,6 +454,32 @@ class TrtllmGeneration(GenerationInterface):
         """
         return True
 
+    def clear_logger_metrics(self) -> None:
+        """No-op: TRT-LLM rollout telemetry is not yet wired up.
+
+        vLLM overrides this (``vllm_generation.py``) to reset AsyncLLM
+        iteration stats (rollout throughput, KV-cache utilization, in-flight
+        batch counters). TRT-LLM has no equivalent plumbing yet, so this stays
+        a no-op rather than inheriting silently — making the gap explicit.
+
+        TODO: fetch AsyncLLM iteration stats from the TRT-LLM workers and
+        clear them here, mirroring ``clear_vllm_logger_metrics``.
+        """
+        return None
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Return empty metrics: TRT-LLM rollout telemetry is not yet wired up.
+
+        See :meth:`clear_logger_metrics`. Returning ``{}`` explicitly documents
+        that rollout observability metrics (present for vLLM) are absent for
+        TRT-LLM runs, rather than letting them silently disappear via the
+        inherited no-op default.
+
+        TODO: surface AsyncLLM iteration stats here, mirroring
+        ``get_vllm_logger_metrics``.
+        """
+        return {}
+
     def shutdown(self) -> bool:
         try:
             return self.worker_group.shutdown(cleanup_method="shutdown")

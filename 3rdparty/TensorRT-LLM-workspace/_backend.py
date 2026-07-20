@@ -77,16 +77,43 @@ def _wheel_platform_tag() -> str:
 _METADATA_WHEEL_TAG = "py3-none-any"
 
 
-def _wheel_cache_dir(base: str, git_url: str, git_ref: str) -> Path:
-    """Return a per-(url, ref, version, platform) cache subdirectory under *base*.
+# Default SM arch list passed to build_wheel.py's -a flag. MUST stay in sync
+# with tools/build-custom-trtllm.sh, which reads BUILD_CUSTOM_TRTLLM_ARCH and
+# falls back to this same default. Folded into the wheel cache key below so
+# editing the arch list forces a rebuild instead of reusing a stale wheel.
+_DEFAULT_ARCH = "90-real;100-real"
+
+
+def _build_input_tag(arch: str) -> str:
+    """Build-affecting inputs (beyond url/ref/version/platform) for the cache key.
+
+    The compiled wheel depends on the SM arch list and the torch/CUDA toolchain
+    it links against, so a change to any of these — without a git_ref bump —
+    would otherwise silently reuse a stale cached wheel. torch is imported
+    lazily so prepare_metadata_for_build_wheel (called under ``uv lock`` without
+    torch) never triggers it.
+    """
+    try:
+        import torch  # noqa: PLC0415
+
+        toolchain = f"torch{torch.__version__},cuda{torch.version.cuda}"
+    except Exception:
+        toolchain = "torch?"
+    return f"arch={arch}|{toolchain}"
+
+
+def _wheel_cache_dir(base: str, git_url: str, git_ref: str, build_inputs: str) -> Path:
+    """Return a per-(url, ref, version, platform, build-inputs) cache subdir.
 
     Using a content-addressed subdir means different commits never collide,
     and a stale wheel from a previous ref is never accidentally reused.
     The cache key uses the real platform tag (not py3-none-any) so aarch64 and
-    x86_64 wheels built in separate Docker runs never overwrite each other.
+    x86_64 wheels built in separate Docker runs never overwrite each other, and
+    ``build_inputs`` (arch list + toolchain) so editing a build-affecting input
+    without bumping git_ref still forces a rebuild.
     """
     key = hashlib.sha256(
-        f"{git_url}|{git_ref}|{VERSION}|{_wheel_platform_tag()}".encode()
+        f"{git_url}|{git_ref}|{VERSION}|{_wheel_platform_tag()}|{build_inputs}".encode()
     ).hexdigest()[:16]
     return Path(base) / key
 
@@ -149,15 +176,29 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         "BUILD_CUSTOM_TRTLLM_REF",
         "bf2ef86f9a2652132b11773d4041e292c553c142",  # pragma: allowlist secret
     )
+    # NOTE: when bumping the ref above, re-sync the Requires-Dist list in
+    # 3rdparty/TensorRT-LLM-workspace/pyproject.toml ([project].dependencies).
+    # uv resolves this package's runtime deps from that hand-curated static list
+    # (surfaced by prepare_metadata_for_build_wheel), NOT from the built wheel's
+    # METADATA — so a ref bump can silently drop or miss real deps. Regenerate:
+    #   git -C <trtllm-checkout> checkout <new-ref> && cat requirements.txt
+    # then reconcile [project].dependencies against it (dropping build-only pins).
 
-    # Our own cache keyed by (git_url, git_ref, version, platform_tag).
+    # SM arch list — single source of truth for both the cache key (below) and
+    # the build script (which reads BUILD_CUSTOM_TRTLLM_ARCH). Exporting it into
+    # env guarantees the script compiles exactly what the cache key was keyed on.
+    arch = env.get("BUILD_CUSTOM_TRTLLM_ARCH", _DEFAULT_ARCH)
+    env["BUILD_CUSTOM_TRTLLM_ARCH"] = arch
+
+    # Our own cache keyed by (git_url, git_ref, version, platform_tag,
+    # build_inputs=arch+toolchain).
     # uv's built-in build cache misses across venvs for no-build-isolation
     # packages because its cache key incorporates the build-environment hash.
     # We bypass that by always building into TRTLLM_WHEEL_CACHE_DIR (a stable
     # path that persists across all venv sync calls in the same Docker build),
     # then copying the result into wheel_directory for uv to consume.
     cache_base = env.get("TRTLLM_WHEEL_CACHE_DIR", "/opt/trtllm_wheels")
-    cache_dir = _wheel_cache_dir(cache_base, git_url, git_ref)
+    cache_dir = _wheel_cache_dir(cache_base, git_url, git_ref, _build_input_tag(arch))
 
     cached = sorted(glob.glob(str(cache_dir / "tensorrt_llm-*.whl")))
     if cached:
