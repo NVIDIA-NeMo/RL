@@ -23,8 +23,6 @@ policy:
       skip_tokenizer_init: false
       tensor_parallel_size: 2
       gpu_memory_utilization: 0.55
-      env_vars:
-        CI: ""
     vllm_kwargs:
       mm_processor_cache_gb: 0
       limit_mm_per_prompt:
