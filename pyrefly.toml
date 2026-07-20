@@ -195,6 +195,7 @@ project-includes = [
   "nemo_rl/utils/packed_tensor.py",
   "nemo_rl/utils/prefetch_venvs.py",
   "nemo_rl/utils/r3_trace.py",
+  "nemo_rl/utils/routed_experts_codec.py",
   "nemo_rl/utils/timer.py",
   "nemo_rl/utils/venvs.py",
   "nemo_rl/utils/weight_transfer_http.py",
