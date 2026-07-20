@@ -16,6 +16,7 @@ import importlib
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -166,7 +167,15 @@ def test_quant_ignore_name_candidates_include_model_prefix_and_base_names():
     ]
 
 
-def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
+@pytest.mark.parametrize(
+    "quant_cfg",
+    [
+        "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml",
+        "examples/modelopt/quant_configs/kv_cache_fp8.yaml",
+        "examples/modelopt/quant_configs/kv_cache_nvfp4.yaml",
+    ],
+)
+def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch, quant_cfg):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
@@ -175,7 +184,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
 
     llm_kwargs = {}
     worker_mod._configure_quant_engine_kwargs(
-        {"quant_cfg": "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml"},
+        {"quant_cfg": quant_cfg},
         llm_kwargs,
     )
 
@@ -185,9 +194,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(monkeypatch):
     assert llm_kwargs["worker_extension_cls"] == (
         "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
     )
-    assert os.environ["VLLM_QUANT_CFG"] == (
-        "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml"
-    )
+    assert os.environ["VLLM_QUANT_CFG"] == quant_cfg
     assert "quantization" not in llm_kwargs
 
 
@@ -511,13 +518,18 @@ def test_real_quant_load_weights_forwards_ignored_shape_mismatch(monkeypatch):
     assert forwarded == [("lm_head.weight", mismatched)]
 
 
-def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
+def test_fake_quant_load_weights_exposes_activation_quantizer_buffers(monkeypatch):
     backend = _import_vllm_quant_backend(monkeypatch)
 
     child = torch.nn.Module()
     child.weight = torch.nn.Parameter(torch.ones(1))
-    child.register_buffer("input_quantizer_amax", torch.tensor([1.0]))
+    child.input_quantizer = torch.nn.Module()
+    child.input_quantizer.register_buffer("_amax", torch.tensor([1.0]))
     child.register_buffer("weight_quantizer_amax", torch.tensor([2.0]))
+    child.self_attn = torch.nn.Module()
+    child.self_attn.attn = torch.nn.Module()
+    child.self_attn.attn.k_bmm_quantizer = torch.nn.Module()
+    child.self_attn.attn.k_bmm_quantizer.register_buffer("_amax", torch.tensor([-1.0]))
     model = torch.nn.Module()
     model.child = child
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
@@ -525,11 +537,18 @@ def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
     seen_names = []
 
     def fake_base_load_weights(self, weights):
+        assert [name for name, _ in weights] == [
+            "child.self_attn.attn.k_bmm_quantizer._amax"
+        ]
         params = dict(child.named_parameters())
         seen_names.extend(params)
-        params["input_quantizer_amax"].weight_loader(
-            params["input_quantizer_amax"],
+        params["input_quantizer._amax"].weight_loader(
+            params["input_quantizer._amax"],
             torch.tensor([3.0]),
+        )
+        params["self_attn.attn.k_bmm_quantizer._amax"].weight_loader(
+            params["self_attn.attn.k_bmm_quantizer._amax"],
+            torch.tensor([4.0]),
         )
         return "loaded"
 
@@ -544,13 +563,24 @@ def test_fake_quant_load_weights_exposes_input_quantizer_buffers(monkeypatch):
         fake_base_load_weights,
     )
 
-    assert extension._load_weights([("unused", torch.ones(1))]) == "loaded"
+    assert (
+        extension._load_weights(
+            [("child.self_attn.k_bmm_quantizer._amax", torch.tensor([4.0]))]
+        )
+        == "loaded"
+    )
 
     assert "weight" in seen_names
-    assert "input_quantizer_amax" in seen_names
+    assert "input_quantizer._amax" in seen_names
+    assert "self_attn.attn.k_bmm_quantizer._amax" in seen_names
     assert "weight_quantizer_amax" not in seen_names
-    assert not hasattr(child.input_quantizer_amax, "weight_loader")
-    torch.testing.assert_close(child.input_quantizer_amax, torch.tensor([3.0]))
+    assert not hasattr(child.input_quantizer._amax, "weight_loader")
+    assert not hasattr(child.self_attn.attn.k_bmm_quantizer._amax, "weight_loader")
+    torch.testing.assert_close(child.input_quantizer._amax, torch.tensor([3.0]))
+    torch.testing.assert_close(
+        child.self_attn.attn.k_bmm_quantizer._amax,
+        torch.tensor([4.0]),
+    )
 
 
 def test_real_quant_collective_reload_runs_modelopt_hooks(monkeypatch):
@@ -851,6 +881,7 @@ def test_get_quantizer_stats_counts_enabled_positive_amax(monkeypatch):
         "enabled": 3,
         "with_amax": 2,
         "positive_amax": 1,
+        "kv_amax": {},
     }
 
 
@@ -870,6 +901,31 @@ def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
     }
 
     assert captured["config_file"] == "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+
+
+@pytest.mark.parametrize(
+    ("recipe", "num_bits"),
+    [("kv_cache_fp8.yaml", (4, 3)), ("kv_cache_nvfp4.yaml", (2, 1))],
+)
+def test_resolve_kv_cache_quant_recipe(recipe, num_bits):
+    repo_root = Path(__file__).resolve().parents[4]
+
+    config = resolve_quant_cfg(
+        str((repo_root / "examples/modelopt/quant_configs" / recipe).resolve())
+    )
+
+    kv_config = config["quant_cfg"][1]
+    assert config["algorithm"] == "max"
+    assert config["quant_cfg"][0] == {"quantizer_name": "*", "enable": False}
+    assert kv_config["quantizer_name"] == "*[kv]_bmm_quantizer"
+    assert kv_config["enable"] is True
+    assert kv_config["cfg"]["num_bits"] == num_bits
+    if recipe == "kv_cache_nvfp4.yaml":
+        assert kv_config["cfg"]["block_sizes"] == {
+            -1: 16,
+            "type": "dynamic",
+            "scale_bits": (4, 3),
+        }
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
