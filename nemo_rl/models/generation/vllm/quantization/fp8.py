@@ -1324,13 +1324,13 @@ def apply_monolithic_mxfp8_moe(
     )
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
-    from vllm.model_executor.layers.quantization.modelopt import MxFp8MoeBackend
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         mxfp8_e4m3_quantize,
     )
     from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
 
-    assert self.mxfp8_backend == MxFp8MoeBackend.FLASHINFER_TRTLLM
+    assert self.mxfp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
 
     if layer.enable_eplb:
         raise NotImplementedError(
