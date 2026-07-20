@@ -86,9 +86,7 @@ class TrtllmGeneration(GenerationInterface):
             names=["data_parallel", "tensor_parallel"],
         )
 
-        self.colocated_enabled = bool(
-            self.cfg.get("colocated", {}).get("enabled", False)
-        )
+        self.colocated_enabled = bool(self.cfg["colocated"]["enabled"])
         # The synchronous TRT-LLM engine path is no longer supported: only the
         # async worker wires up colocated sleep/wakeup, IPC-ZMQ refit, and
         # per-sample streaming. Fail loudly at setup rather than silently
