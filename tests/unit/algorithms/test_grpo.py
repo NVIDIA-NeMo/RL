@@ -50,6 +50,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
+from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -1807,6 +1808,59 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     grpo_mod.setup(master_config, tokenizer, dataset, None)
 
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
+
+
+def test_async_collector_dataloader_payload_materializes_dataset(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    records = (
+        {
+            "message_log": [{"role": "user", "content": "a"}],
+            "length": 1,
+            "loss_multiplier": 1.0,
+            "extra_env_info": {},
+            "task_name": "test",
+            "idx": 0,
+        },
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.data["shuffle"] = True
+    master_config.data["num_workers"] = 0
+    master_config.grpo["use_dynamic_sampling"] = False
+    dataloader = StatefulDataLoader(records, batch_size=4, shuffle=False)
+
+    raw_data, dataloader_config, dataloader_state = (
+        grpo_mod._get_async_collector_dataloader_payload(dataloader, master_config)
+    )
+
+    assert raw_data == list(records)
+    assert dataloader_config == {
+        "batch_size": 4,
+        "shuffle": True,
+        "drop_last": True,
+        "num_workers": 0,
+    }
+    assert isinstance(dataloader_state, dict)
+
+
+def test_async_collector_dataloader_payload_rejects_wrapped_dataloader(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    wrapped_dataloader = MagicMock(spec=MultipleDataloaderWrapper)
+    master_config = mock_grpo_components["master_config"]
+
+    with pytest.raises(
+        NotImplementedError,
+        match="MultipleDataloaderWrapper reconstruction",
+    ):
+        grpo_mod._get_async_collector_dataloader_payload(
+            wrapped_dataloader, master_config
+        )
 
 
 def test_grpo_train_collects_generation_logger_and_seq_metrics(

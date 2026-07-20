@@ -18,7 +18,7 @@ import concurrent.futures
 import threading as _threading
 import time
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
 import ray
 import torch
@@ -27,6 +27,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
+from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -37,6 +38,13 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+class AsyncCollectorDataloaderConfig(TypedDict):
+    batch_size: int
+    shuffle: bool
+    drop_last: bool
+    num_workers: int
 
 
 @ray.remote  # pragma: no cover
@@ -239,10 +247,38 @@ class AsyncTrajectoryCollector:
         except Exception:
             return False
 
-    def start_collection(self, dataloader: StatefulDataLoader) -> None:
+    def _build_dataloader(
+        self,
+        raw_data: list[DatumSpec],
+        dataloader_config: AsyncCollectorDataloaderConfig,
+        dataloader_state: Optional[dict[str, Any]] = None,
+    ) -> StatefulDataLoader:
+        """Build the collector-local dataloader from Ray-serializable inputs."""
+        dataloader = StatefulDataLoader(
+            raw_data,
+            batch_size=dataloader_config["batch_size"],
+            shuffle=dataloader_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=dataloader_config["drop_last"],
+            num_workers=dataloader_config["num_workers"],
+        )
+        if dataloader_state is not None:
+            dataloader.load_state_dict(dataloader_state)
+        return dataloader
+
+    def start_collection(
+        self,
+        raw_data: list[DatumSpec],
+        dataloader_config: AsyncCollectorDataloaderConfig,
+        dataloader_state: Optional[dict[str, Any]] = None,
+    ) -> None:
         """Start collecting trajectories from dataloader."""
         self.running = True
-        self.dataloader = dataloader
+        self.dataloader = self._build_dataloader(
+            raw_data,
+            dataloader_config,
+            dataloader_state,
+        )
 
         print("Started continuous trajectory collection")
 

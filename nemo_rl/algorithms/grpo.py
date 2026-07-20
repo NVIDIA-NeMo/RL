@@ -298,6 +298,52 @@ class MasterConfig(BaseModel, extra="allow"):
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
 
+def _materialize_dataset_for_ray(dataset: Any) -> list[Any]:
+    """Materialize dataset rows before sending them to a Ray actor."""
+    return list(dataset)
+
+
+def _get_async_collector_dataloader_config(
+    dataloader: StatefulDataLoader,
+    master_config: MasterConfig,
+) -> dict[str, Any]:
+    """Mirror GRPO train dataloader kwargs for actor-side reconstruction."""
+    grpo_config = master_config.grpo
+    data_config = master_config.data
+
+    batch_size = int(grpo_config["num_prompts_per_step"])
+    if grpo_config["use_dynamic_sampling"]:
+        batch_size = int(batch_size * grpo_config["batch_multiplier"])
+    dataloader_batch_size = getattr(dataloader, "batch_size", None)
+    if dataloader_batch_size is not None:
+        batch_size = int(dataloader_batch_size)
+
+    return {
+        "batch_size": batch_size,
+        "shuffle": data_config["shuffle"],
+        "drop_last": True,
+        "num_workers": data_config["num_workers"],
+    }
+
+
+def _get_async_collector_dataloader_payload(
+    dataloader: StatefulDataLoader,
+    master_config: MasterConfig,
+) -> tuple[list[Any], dict[str, Any], dict[str, Any]]:
+    """Return Ray-serializable dataset rows, dataloader config, and state."""
+    if not isinstance(dataloader, StatefulDataLoader):
+        raise NotImplementedError(
+            "Async GRPO Ray-safe dataloader handoff currently supports plain "
+            "StatefulDataLoader only. MultipleDataloaderWrapper reconstruction "
+            "inside the collector actor is not implemented."
+        )
+    return (
+        _materialize_dataset_for_ray(dataloader.dataset),
+        _get_async_collector_dataloader_config(dataloader, master_config),
+        dataloader.state_dict(),
+    )
+
+
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
@@ -3675,6 +3721,13 @@ def async_grpo_train(
             "has not been merged yet."
         )
 
+    if master_config.data["use_multiple_dataloader"]:
+        raise NotImplementedError(
+            "Async GRPO Ray-safe dataloader handoff currently supports a single "
+            "training dataloader. Multiple dataloaders require actor-side "
+            "MultipleDataloaderWrapper reconstruction."
+        )
+
     if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config.grpo["async_grpo"].get("in_flight_weight_updates", False):
             print(
@@ -3830,8 +3883,14 @@ def async_grpo_train(
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
     )
 
+    raw_data, dataloader_config, dataloader_state = (
+        _get_async_collector_dataloader_payload(dataloader, master_config)
+    )
+
     # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
+    collection_task = trajectory_collector.start_collection.remote(
+        raw_data, dataloader_config, dataloader_state
+    )
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
