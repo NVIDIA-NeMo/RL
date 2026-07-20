@@ -475,7 +475,8 @@ def load_weights(weights, model_runner):
         else:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
-    # Finally load the weights into vllm
+    # Finally load the weights into vllm. Deferred: importing vllm_backend at
+    # module top would cycle through the nemo_rl generation package init.
     from nemo_rl.models.generation.vllm.vllm_backend import load_weights_maybe_cached
 
     load_weights_maybe_cached(model, weights_quantized)
@@ -1302,7 +1303,13 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         layer.w2_weight.copy_(w2_weight_shuffled)
 
 
-def apply_monolithic_mxfp8_moe(self, layer, x, router_logits, input_ids=None):
+def apply_monolithic_mxfp8_moe(
+    self,
+    layer,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Forward for the FlashInfer TRTLLM MXFP8 MoE with hidden-dim padding.
 
     Mirrors vLLM 0.20.0 ModelOptMxFp8FusedMoE.apply_monolithic, with three

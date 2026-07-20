@@ -137,12 +137,14 @@ class _RefitLoaderCache:
         self.snapshot.clear()
 
 
-def _cached_params_still_valid(model, cache: _RefitLoaderCache) -> bool:
+def _cached_params_still_valid(model: Any, cache: _RefitLoaderCache) -> bool:
     current = dict(model.named_parameters())
     return all(current.get(name) is param for name, param in cache.snapshot.items())
 
 
-def _record_loader_calls(model, cache: _RefitLoaderCache, weights: list) -> set[str]:
+def _record_loader_calls(
+    model: Any, cache: _RefitLoaderCache, weights: list[tuple[str, torch.Tensor]]
+) -> set[str]:
     """Run model.load_weights once while recording every weight_loader call.
 
     Incoming weights are matched to loader calls by tensor object identity,
@@ -191,7 +193,9 @@ def _record_loader_calls(model, cache: _RefitLoaderCache, weights: list) -> set[
     return loaded if loaded is not None else set()
 
 
-def load_weights_maybe_cached(model, weights: list) -> set[str]:
+def load_weights_maybe_cached(
+    model: Any, weights: list[tuple[str, torch.Tensor]]
+) -> set[str]:
     """model.load_weights with optional loader replay caching.
 
     Opt-in via NRL_REFIT_CACHED_LOADERS=1 since model load_weights
