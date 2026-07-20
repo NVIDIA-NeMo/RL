@@ -1,0 +1,30 @@
+# Routed-expert NVFP4 W4A4 recipe for QARL.
+#
+# Routed-expert weights and layer-input activations use block-16 E2M1 NVFP4.
+# Every non-routed-expert path remains in its native dtype.
+
+metadata:
+  recipe_type: ptq
+  description: Routed-expert NVFP4 W4A4.
+
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*.experts.*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*.experts.*input_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1

@@ -196,7 +196,7 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link-type: doc
 
 Run quantization-aware GRPO and distillation using NVIDIA ModelOpt.
-Includes NVFP4 W4A16 real rollout.
+Includes NVFP4 W4A4 and W4A16 real rollout.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
@@ -330,6 +330,7 @@ design-docs/training-backends.md
 design-docs/sequence-packing-and-dynamic-batching.md
 design-docs/env-vars.md
 design-docs/nemo-gym-integration.md
+design-docs/modelopt-real-quant-architecture.md
 ```
 
 ```{toctree}

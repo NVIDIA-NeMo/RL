@@ -248,6 +248,38 @@ async def test_async_weight_updates_check_every_internal_worker(
 
 
 @pytest.mark.vllm
+def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        def recv_pyobj(self):
+            return IPCProtocol.COMPLETE
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
+    ext.zmq_socket = FakeSocket()
+    ext.maybe_init_zmq = lambda: None
+
+    @contextlib.contextmanager
+    def lifecycle(_transport):
+        yield lambda: pytest.fail("an incomplete transfer must not be finalized")
+
+    ext._weight_update_lifecycle = lifecycle
+
+    assert ext.update_weights_via_ipc_zmq() is False
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
+
+
+@pytest.mark.vllm
 def test_read_mtp_layer_weights_from_checkpoint_filters_and_reads(tmp_path):
     """Only the requested MTP layer tensors are read, across the shards holding them."""
     from nemo_rl.models.generation.vllm.vllm_backend import (
