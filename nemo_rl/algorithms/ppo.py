@@ -228,6 +228,14 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for PPO"
     )
+    if (
+        generation_config["backend"] == "vllm"
+        and cast(VllmConfig, generation_config).get("refit_transport") is not None
+    ):
+        raise ValueError(
+            "Remote sparse refit is currently supported only by GRPO; PPO support "
+            "is tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
+        )
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         policy_megatron_config = cast(MegatronConfig, policy_config["megatron_cfg"])

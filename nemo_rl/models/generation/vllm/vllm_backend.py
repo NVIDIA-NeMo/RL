@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import re
+import socket
 import traceback
 from typing import Any
 
@@ -95,6 +96,7 @@ class VllmInternalWorkerExtension:
     # True once the MTP drafter has been served by a one-time disk load (see
     # load_mtp_weights_from_disk); refit then leaves those static weights alone.
     _mtp_drafter_from_disk: bool = False
+    _sparse_delta_applier: Any = None
 
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
@@ -141,6 +143,10 @@ class VllmInternalWorkerExtension:
 
         return get_device_uuid(self.device.index)
 
+    def report_node_hostname(self) -> str:
+        """Return the host shared by worker processes on this node."""
+        return socket.gethostname()
+
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""
         return f"ipc:///tmp/{self.report_device_id()}.sock"
@@ -169,6 +175,13 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+
+    def prepare_sparse_delta_refit_info(
+        self, state_dict_info: dict[str, tuple[tuple[int, ...], torch.dtype]]
+    ) -> list[str]:
+        """Reserve scratch space and report weights that require overwrite."""
+        applier = self._get_sparse_delta_applier()
+        return sorted(applier.discover_native_skips(state_dict_info))
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -432,6 +445,19 @@ class VllmInternalWorkerExtension:
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
         self._maybe_refit_mtp_drafter(policy_weights)
 
+    def _get_sparse_delta_applier(self) -> Any:
+        if self._sparse_delta_applier is None:
+            # Avoid importing sparse-refit code for existing refit transports.
+            from nemo_rl.models.generation.vllm.vllm_sparse_delta import (
+                VllmSparseDeltaApplier,
+            )
+
+            self._sparse_delta_applier = VllmSparseDeltaApplier(
+                self.model_runner,
+                self.device,
+            )
+        return self._sparse_delta_applier
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -566,6 +592,18 @@ class VllmInternalWorkerExtension:
         gc.collect()
         torch.cuda.empty_cache()
         return True
+
+    def update_weights_from_decoded_sparse_payload(
+        self, *payloads: bytes | str
+    ) -> dict[str, Any]:
+        applier = self._get_sparse_delta_applier()
+        return applier.update_weights_from_decoded_sparse_payload(*payloads)
+
+    def synchronize_device(self) -> None:
+        self._get_sparse_delta_applier().synchronize_device()
+
+    def finish_sparse_delta_refit(self) -> dict[str, Any]:
+        return self._get_sparse_delta_applier().finish_sparse_delta_refit()
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
