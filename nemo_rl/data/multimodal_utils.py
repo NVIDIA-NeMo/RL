@@ -114,24 +114,47 @@ class PackedTensor:
         if len(non_none_tensors) == 0:
             return None
 
-        # Dynamic-resolution image processors can produce one raw-pixel batch
-        # per prompt with a different spatial extent, for example
-        # ``[1, 3, 448, 544]`` and ``[1, 3, 544, 448]``. These batches still
-        # pack along the image-count dimension, but they must first share a
-        # common canvas. The accompanying image-size tensor retains the true
-        # per-image dimensions so the model can crop away this padding before
-        # patchification.
-        if (
-            self.pad_to_max_shape
-            and self.dim_to_pack == 0
-            and all(t.ndim == 4 for t in non_none_tensors)
-            and len({t.shape[1] for t in non_none_tensors}) == 1
-        ):
-            max_height = max(t.shape[2] for t in non_none_tensors)
-            max_width = max(t.shape[3] for t in non_none_tensors)
+        # Some multimodal processors produce a different shape per prompt,
+        # such as dynamic-resolution images, variable-frame videos, or audio
+        # feature sequences. Concatenation already permits the packing
+        # dimension to vary; when explicitly requested, pad every other
+        # dimension to the largest size in the batch.
+        if self.pad_to_max_shape:
+            ranks = {tensor.ndim for tensor in non_none_tensors}
+            if len(ranks) != 1:
+                raise ValueError(
+                    "pad_to_max_shape requires tensors with the same rank, "
+                    f"but received ranks {sorted(ranks)}"
+                )
+
+            rank = ranks.pop()
+            pack_dim = (
+                self.dim_to_pack if self.dim_to_pack >= 0 else rank + self.dim_to_pack
+            )
+            if not 0 <= pack_dim < rank:
+                raise IndexError(
+                    f"dim_to_pack={self.dim_to_pack} is invalid for tensors with rank {rank}"
+                )
+            max_shape = [
+                max(tensor.shape[dim] for tensor in non_none_tensors)
+                for dim in range(rank)
+            ]
+
+            def pad_to_batch_shape(tensor: torch.Tensor) -> torch.Tensor:
+                padding = []
+                for dim in reversed(range(rank)):
+                    padding.extend(
+                        (
+                            0,
+                            0
+                            if dim == pack_dim
+                            else max_shape[dim] - tensor.shape[dim],
+                        )
+                    )
+                return F.pad(tensor, padding)
+
             non_none_tensors = [
-                F.pad(t, (0, max_width - t.shape[3], 0, max_height - t.shape[2]))
-                for t in non_none_tensors
+                pad_to_batch_shape(tensor) for tensor in non_none_tensors
             ]
 
         return torch.cat(non_none_tensors, dim=self.dim_to_pack).to(device)
