@@ -85,7 +85,7 @@ def mxfp8_e4m3_quantize_for_refit(
             )
             if x_scales.ndim == 1 and x.ndim == 2:
                 x_scales = x_scales.view(x.size(0), -1)
-    if x_q is None:
+    if x_q is None or x_scales is None:
         x_q, x_scales = _mxfp8_e4m3_quantize_torch(x)
     x_scales = torch.squeeze(x_scales, dim=-1)
     # Match the receiver path's zero-scale clamp: an E8M0 byte of 0 (2^-127)
