@@ -49,6 +49,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     enable_prefix_caching: bool
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
+    # Move training gradients and optimizer state to CPU around a non-colocated
+    # refit when extra GPU headroom is needed for transfer staging.
+    offload_policy_before_refit: NotRequired[bool]
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]

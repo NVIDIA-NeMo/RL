@@ -14,6 +14,7 @@
 
 import gc
 from copy import deepcopy
+from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
@@ -137,6 +138,7 @@ basic_megatron_test_config: PolicyConfig = {
             "materialize_only_last_token_logits": True,
             "num_speculative_tokens": 0,
             "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
+            "offload_policy_before_refit": False,
             "parsers": [],
             "expose_http_server": False,
         },
@@ -461,3 +463,32 @@ def test_megatron_generation_non_colocated_refit(
             print(f"Error during generation_cluster shutdown: {e}")
         gc.collect()
         torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize(
+    ("offload_policy_before_refit", "expected_offload"),
+    [(None, True), (False, False), (True, True)],
+)
+def test_non_colocated_refit_respects_policy_offload_config(
+    offload_policy_before_refit,
+    expected_offload,
+):
+    policy = MagicMock()
+    generation = MagicMock(spec=MegatronGeneration)
+    generation.weight_synchronizer = None
+    mcore_generation_config = {"refit_backend": "gloo"}
+    if offload_policy_before_refit is not None:
+        mcore_generation_config["offload_policy_before_refit"] = (
+            offload_policy_before_refit
+        )
+    generation.cfg = {"mcore_generation_config": mcore_generation_config}
+    policy.swap_weights_via_reshard.return_value = ["train"]
+    generation.update_weights_from_collective.return_value = [True]
+
+    with patch("nemo_rl.algorithms.grpo.ray.get", side_effect=lambda value: value):
+        refit_policy_generation(policy, generation, colocated_inference=False)
+
+    if expected_offload:
+        policy.offload_before_refit.assert_called_once_with()
+    else:
+        policy.offload_before_refit.assert_not_called()

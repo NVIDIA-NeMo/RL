@@ -2098,26 +2098,41 @@ def refit_policy_generation(
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
 
-    # Megatron generation backend needs explicit suspend/resume around refits.
-    if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.suspend_for_refit()
+    def timed_phase(name: str):
+        return timer.time(name) if timer is not None else nullcontext()
 
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
-        policy.offload_before_refit()
+    is_megatron_generation = isinstance(policy_generation, MegatronGeneration)
+
+    # Megatron generation backend needs explicit suspend/resume around refits.
+    if is_megatron_generation:
+        with timed_phase("prepare_for_generation/suspend_for_refit"):
+            policy_generation.suspend_for_refit()
+
+    should_offload_policy = colocated_inference or (
+        is_megatron_generation
+        and policy_generation.cfg["mcore_generation_config"].get(
+            "offload_policy_before_refit", True
+        )
+    )
+    if should_offload_policy:
+        with timed_phase("prepare_for_generation/offload_policy"):
+            policy.offload_before_refit()
     # Colocated inference needs to prepare for generation.
     # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
-        policy_generation.prepare_for_generation(tags=["weights"])
+    if colocated_inference or is_megatron_generation:
+        with timed_phase("prepare_for_generation/prepare_weights"):
+            policy_generation.prepare_for_generation(tags=["weights"])
 
     if (
         not colocated_inference
-        and isinstance(policy_generation, MegatronGeneration)
+        and is_megatron_generation
         and policy_generation.cfg["mcore_generation_config"]["refit_backend"]
         == "nvshmem"
     ):
-        futures_train = policy.preinit_nvshmem()
-        futures_inference = policy_generation.preinit_nvshmem_collective()
-        ray.get(futures_train + futures_inference)
+        with timed_phase("prepare_for_generation/preinit_nvshmem"):
+            futures_train = policy.preinit_nvshmem()
+            futures_inference = policy_generation.preinit_nvshmem_collective()
+            ray.get(futures_train + futures_inference)
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -2166,7 +2181,7 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            if isinstance(policy_generation, MegatronGeneration):
+            if is_megatron_generation:
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
             else:
                 futures_train = policy.broadcast_weights_for_collective(
@@ -2192,11 +2207,13 @@ def refit_policy_generation(
         policy.offload_after_refit()
     # Colocated inference needs to prepare for generation.
     # Megatron non-colocated inference needs to enter inference mode after refit.
-    if colocated_inference or isinstance(policy_generation, MegatronGeneration):
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
+    if colocated_inference or is_megatron_generation:
+        with timed_phase("prepare_for_generation/prepare_kv_cache"):
+            policy_generation.prepare_for_generation(tags=["kv_cache"])
 
-    if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.resume_after_refit()
+    if is_megatron_generation:
+        with timed_phase("prepare_for_generation/resume_after_refit"):
+            policy_generation.resume_after_refit()
 
     return {}
 
