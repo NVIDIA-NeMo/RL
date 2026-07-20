@@ -498,8 +498,12 @@ VAL_PERIOD=1000
 KEEP_TOP_K=2
 
 # ============================ SWE agent ============================
-AGENT_MAX_TURNS=200
+AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-200}"
 AGENT_TIMEOUT=1800
+if ! [[ "${AGENT_MAX_TURNS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: AGENT_MAX_TURNS must be a positive integer." >&2
+  exit 1
+fi
 
 # ============================== Logging ==============================
 WANDB_PROJ="swe-benchmark"
@@ -620,6 +624,7 @@ echo "  invariants    : samples/replica=${PER_REPLICA_SAMPLES}, batch/train-GPU=
 echo "Parallelism: TP=${TP}, EP=${EP}, CP=${CP}, PP=${PP}, vLLM_TP=${VLLM_TP}, pad=${MAKE_SEQ_DIVISIBLE_BY}"
 echo "Model: ${MODEL_PATH}"
 echo "Tokenizer: ${TOKENIZER_PATH:-recipe default}"
+echo "Agent max turns: ${AGENT_MAX_TURNS}"
 echo "Container: ${CONTAINER}"
 echo "Cache namespace: ${CACHE_NAMESPACE}"
 echo "Streaming tool call: ${STREAMING_TOOL_CALL_ENABLED}"
