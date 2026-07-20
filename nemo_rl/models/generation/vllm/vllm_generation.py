@@ -829,30 +829,75 @@ class VllmGeneration(GenerationInterface):
             )
 
             try:
-                # Dispatch training side first (async, non-blocking) so gen-side
-                # rendezvous can complete immediately.
+                # Dispatch training side first (async, non-blocking).
                 futures_train = policy.init_collective(
                     ip, port, target_ws, train_world_size=effective_train_ws
                 )
-                # Call through the router (synchronous): dispatches gen workers,
-                # waits for rendezvous to complete, handles eviction on failure.
-                self.init_collective(
-                    ip, port, target_ws, train_world_size=effective_train_ws
+                # Call router directly to get the full structured result dict,
+                # preserving failure-type information (rendezvous_master_failure,
+                # evicted_shard_ids, etc.) that would be lost if we went through
+                # self.init_collective() which converts the dict to a plain RuntimeError.
+                result = self._router.call_async(
+                    self._router.run_init_collective(
+                        ip, port, target_ws, train_world_size=effective_train_ws
+                    )
                 )
-                # Gen side is done; collect training side.
-                ray.get(futures_train, timeout=COLLECTIVE_SYNC_RENDEZVOUS_TIMEOUT_S)
-                self._last_synced_world_size = target_ws
-                self._last_synced_comm_epoch = comm_epoch
-                if attempt > 1:
+
+                if not result.get("success"):
+                    # Abort train side — it is waiting in NCCL rendezvous for gen
+                    # workers that either failed or were evicted.
+                    if hasattr(policy, "abort_collective"):
+                        try:
+                            ray.get(policy.abort_collective(), timeout=30)
+                        except Exception as abort_e:  # noqa: BLE001
+                            print(
+                                f"  ! abort_collective raised "
+                                f"{type(abort_e).__name__}: {abort_e}",
+                                flush=True,
+                            )
+                    # Rendezvous-master failure: every gen worker raised
+                    # DistStoreError/DistNetworkError because the train-side
+                    # TCPStore master timed out. The gen workers were healthy;
+                    # don't respawn the RefitWorker, just retry.
+                    rendezvous_master = result.get("rendezvous_master_failure", False)
+                    respawn = not rendezvous_master
                     print(
-                        f"  ✓ ensure_collective_synced recovered on attempt {attempt}",
+                        f"  ⚠ ensure_collective_synced attempt {attempt} failed: "
+                        f"{result.get('error')} (rendezvous_master={rendezvous_master} "
+                        f"respawn={respawn})",
                         flush=True,
                     )
-                return
-            except Exception as e:  # noqa: BLE001
+                    if uses_refit_worker and respawn and hasattr(policy, "abort_collective"):
+                        pass  # already aborted above
+                    elif uses_refit_worker and not respawn and hasattr(policy, "reset_collective"):
+                        try:
+                            policy.reset_collective()
+                        except Exception as reset_e:  # noqa: BLE001
+                            print(
+                                f"  ! policy.reset_collective raised "
+                                f"{type(reset_e).__name__}: {reset_e}",
+                                flush=True,
+                            )
+                    self._last_synced_world_size = None
+                    if attempt >= COLLECTIVE_SYNC_MAX_ATTEMPTS:
+                        raise RuntimeError(
+                            f"ensure_collective_synced failed: {result.get('error')}"
+                        )
+                else:
+                    # Gen side done; train side completed rendezvous simultaneously.
+                    ray.get(futures_train, timeout=COLLECTIVE_SYNC_RENDEZVOUS_TIMEOUT_S)
+                    self._last_synced_world_size = target_ws
+                    self._last_synced_comm_epoch = comm_epoch
+                    if attempt > 1:
+                        print(
+                            f"  ✓ ensure_collective_synced recovered on attempt {attempt}",
+                            flush=True,
+                        )
+                    return
+            except Exception as e:  # noqa: BLE001 - catastrophic/unexpected error
                 respawn = _should_respawn_refit_worker(e)
                 print(
-                    f"  ⚠ ensure_collective_synced attempt {attempt} failed: "
+                    f"  ⚠ ensure_collective_synced attempt {attempt} unexpected error: "
                     f"{type(e).__name__}: {e} (respawn={respawn})",
                     flush=True,
                 )
@@ -1014,7 +1059,7 @@ class VllmGeneration(GenerationInterface):
 
         from ray.exceptions import RayActorError
 
-        for attempt in range(2):
+        while self.worker_group.dp_size > 0:
             try:
                 # Shard the data across the tied worker groups
                 dp_size = self.sharding_annotations.get_axis_size("data_parallel")
@@ -1051,7 +1096,7 @@ class VllmGeneration(GenerationInterface):
                 return combined
 
             except RayActorError:
-                if attempt == 1 or self._router is None:
+                if self._router is None:
                     raise
                 print(
                     "[vllm_generation] RayActorError in generate; "
@@ -1059,6 +1104,8 @@ class VllmGeneration(GenerationInterface):
                     flush=True,
                 )
                 self._cordon_dead_workers()
+
+        raise RuntimeError("generate: no alive DP shards remaining")
 
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
