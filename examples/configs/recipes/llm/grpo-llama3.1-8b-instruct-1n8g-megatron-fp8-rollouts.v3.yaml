@@ -34,6 +34,19 @@ policy:
       precision: fp8
       max_model_len: 4096
       use_deep_gemm: true
+      # vLLM >= 0.25 keeps more device memory outside the CuMemAllocator
+      # sleep pool than 0.20; at the inherited 0.6 the pool intermittently
+      # fails to re-map at wake-up mid-run ("CUDA Error: out of memory at
+      # csrc/cumem_allocator.cpp").
+      gpu_memory_utilization: 0.55
+    vllm_kwargs:
+      compilation_config:
+        # vLLM 0.25 defaults to FULL_AND_PIECEWISE cudagraphs, whose capture
+        # memory lives outside the sleep pool and is the main new wake-up
+        # footprint; PIECEWISE restores the 0.20-era graph footprint.
+        # (Lowering gpu_memory_utilization further did not help: 0.5 still
+        # hit the same wake-up OOM.)
+        cudagraph_mode: PIECEWISE
 data:
   max_input_seq_length: 4096
 logger:
