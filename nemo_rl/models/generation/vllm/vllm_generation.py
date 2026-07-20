@@ -849,8 +849,21 @@ class VllmGeneration(GenerationInterface):
                 )
 
                 if not result.get("success"):
-                    # Abort train side — it is waiting in NCCL rendezvous for gen
-                    # workers that either failed or were evicted.
+                    # Rendezvous-master failure: every gen worker raised
+                    # DistStoreError/DistNetworkError because the train-side
+                    # TCPStore master timed out. Gen workers were healthy;
+                    # preserve the RefitWorker and just retry.
+                    rendezvous_master = result.get("rendezvous_master_failure", False)
+                    respawn = not rendezvous_master
+                    print(
+                        f"  ⚠ ensure_collective_synced attempt {attempt} failed: "
+                        f"{result.get('error')} (rendezvous_master={rendezvous_master} "
+                        f"respawn={respawn})",
+                        flush=True,
+                    )
+                    # Always abort train side — it is blocked in the NCCL rendezvous.
+                    # For RefitWorker: also kill+respawn (poisoned context) or soft-reset
+                    # (clean timeout), matching the exception path below.
                     if hasattr(policy, "abort_collective"):
                         try:
                             ray.get(policy.abort_collective(), timeout=30)
@@ -860,21 +873,7 @@ class VllmGeneration(GenerationInterface):
                                 f"{type(abort_e).__name__}: {abort_e}",
                                 flush=True,
                             )
-                    # Rendezvous-master failure: every gen worker raised
-                    # DistStoreError/DistNetworkError because the train-side
-                    # TCPStore master timed out. The gen workers were healthy;
-                    # don't respawn the RefitWorker, just retry.
-                    rendezvous_master = result.get("rendezvous_master_failure", False)
-                    respawn = not rendezvous_master
-                    print(
-                        f"  ⚠ ensure_collective_synced attempt {attempt} failed: "
-                        f"{result.get('error')} (rendezvous_master={rendezvous_master} "
-                        f"respawn={respawn})",
-                        flush=True,
-                    )
-                    if uses_refit_worker and respawn and hasattr(policy, "abort_collective"):
-                        pass  # already aborted above
-                    elif uses_refit_worker and not respawn and hasattr(policy, "reset_collective"):
+                    if uses_refit_worker and not respawn and hasattr(policy, "reset_collective"):
                         try:
                             policy.reset_collective()
                         except Exception as reset_e:  # noqa: BLE001

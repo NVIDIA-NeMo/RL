@@ -1158,6 +1158,8 @@ class RayWorkerGroup:
         return_from_workers = []
         # For each worker, determine what data it should receive
         for worker_idx, worker in enumerate(self._workers):
+            if worker_idx in self._dead_indices:
+                continue
             # Get the worker's coordinates in the sharding space
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 

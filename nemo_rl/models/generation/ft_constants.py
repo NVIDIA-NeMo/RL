@@ -31,10 +31,6 @@ NCCL_HEARTBEAT_TIMEOUT_S: float = float(
     os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "60")
 )
 
-# ensure_collective_synced: exponential backoff base and cap.
-# Kept for legacy/DTensor back-compat; superseded by the quiesce-wait below on the RefitWorker path.
-COLLECTIVE_SYNC_BACKOFF_BASE_S: float = 5.0
-COLLECTIVE_SYNC_BACKOFF_CAP_S: float = NCCL_HEARTBEAT_TIMEOUT_S + 30.0
 # Each retry fires at a settled gen world (quiesce-wait), so fewer attempts are needed. Env-overridable.
 COLLECTIVE_SYNC_MAX_ATTEMPTS: int = int(
     os.environ.get("NRL_COLLECTIVE_SYNC_MAX_ATTEMPTS", "5")
