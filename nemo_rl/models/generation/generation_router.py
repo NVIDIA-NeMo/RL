@@ -1340,6 +1340,20 @@ class GenerationRouter:
         # joining does NOT block refit — the next refit pushes fresh weights to joining shards.
         return True, "ok"
 
+    def get_shards_list(self) -> list[dict]:
+        """Return a snapshot of the shard table as a list of dicts (thread-safe read)."""
+        return [
+            {
+                "shard_id": s.shard_id,
+                "status": s.status,
+                "url": s.url,
+                "consecutive_failures": s.consecutive_failures,
+                "consecutive_successes": s.consecutive_successes,
+                "last_health_ok_age_s": None,
+            }
+            for s in self._shards.values()
+        ]
+
     def shard_count_ready(self) -> int:
         return sum(1 for s in self._shards.values() if s.status == "ready")
 

@@ -1288,6 +1288,13 @@ def setup(
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
 
+    # Fault injection for fault-tolerance testing. Launches background threads
+    # that kill/cordon shards at scheduled times according to the recipe config.
+    # No-op when fault_inject.enabled is absent or false.
+    if policy_generation is not None and hasattr(policy_generation, "_router"):
+        from nemo_rl.models.generation.fault_inject import maybe_launch_fault_injector
+        maybe_launch_fault_injector(generation_config, policy_generation)
+
     # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
     # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
     # cache (shared key when student == teacher) — both workers write to the
