@@ -235,6 +235,11 @@ class GRPOConfig(TypedDict):
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool
+    # Reuse the vLLM engine's returned processed logprobs as prev_logprobs for
+    # importance sampling instead of recomputing them with a trainer forward.
+    # The engine IS the behavior policy, so this is exact for the sampled
+    # tokens and removes one full-batch forward per step.
+    use_generation_logprobs_as_prev: NotRequired[bool]
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
     dynamic_sampling_max_gen_batches: NotRequired[int]
@@ -2875,7 +2880,15 @@ def grpo_train(
                         logprob_data, flat_messages, master_config.policy
                     )
 
-                    if not skip_prev_logprobs:
+                    if master_config.grpo.get("use_generation_logprobs_as_prev"):
+                        # The importance-sampling behavior policy is the vLLM
+                        # engine itself, so its returned processed logprobs are
+                        # the exact prev_logprobs; reusing them skips one
+                        # full-batch trainer forward per step.
+                        train_data["prev_logprobs"] = train_data[
+                            "generation_logprobs"
+                        ].clone()
+                    elif not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             logprob_data, timer=timer
                         )["logprobs"]
