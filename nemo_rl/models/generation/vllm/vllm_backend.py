@@ -405,28 +405,6 @@ class VllmInternalWorkerExtension:
         kv_cache_dtype = getattr(cache_config, "cache_dtype", None)
         return kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
 
-    def _maybe_process_fp8_kv_cache(self) -> None:
-        """Process weights after loading for FP8 KV cache (static scales)."""
-        if not self._uses_fp8_kv_cache():
-            return
-
-        # FP8 KV cache: process KV scales after weight loading
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.model_loader.utils import (
-            process_weights_after_loading,
-        )
-
-        # Get target device for processing
-        target_device = next(self.model_runner.model.parameters()).device
-
-        # Call process_weights_after_loading to handle KV scales
-        with set_current_vllm_config(self.model_runner.vllm_config):
-            process_weights_after_loading(
-                self.model_runner.model,
-                self.model_runner.model_config,
-                target_device,
-            )
-
     @staticmethod
     def _split_policy_and_draft_weights(
         weights: list[tuple[str, torch.Tensor]],
