@@ -64,6 +64,12 @@ def pytest_addoption(parser):
         help="Run ONLY sglang tests",
     )
     parser.addoption(
+        "--trtllm-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY TensorRT-LLM tests",
+    )
+    parser.addoption(
         "--nemo-gym-only",
         action="store_true",
         default=False,
@@ -78,6 +84,7 @@ def pytest_collection_modifyitems(config, items):
     run_automodel_only = config.getoption("--automodel-only")
     run_vllm_only = config.getoption("--vllm-only")
     run_sglang_only = config.getoption("--sglang-only")
+    run_trtllm_only = config.getoption("--trtllm-only")
     run_nemo_gym_only = config.getoption("--nemo-gym-only")
 
     # Check for mutually exclusive options
@@ -86,11 +93,13 @@ def pytest_collection_modifyitems(config, items):
         run_automodel_only,
         run_vllm_only,
         run_sglang_only,
+        run_trtllm_only,
         run_nemo_gym_only,
     ]
     if sum(exclusive_options) > 1:
         raise ValueError(
-            "--mcore-only, --automodel-only, --vllm-only, --sglang-only, and --nemo-gym-only are mutually exclusive"
+            "--mcore-only, --automodel-only, --vllm-only, --sglang-only, "
+            "--trtllm-only, and --nemo-gym-only are mutually exclusive"
         )
 
     marker_expr = config.getoption("-m", default="")
@@ -176,6 +185,23 @@ def pytest_collection_modifyitems(config, items):
         # Exclude sglang tests by default
         new_items = [
             item for item in new_items if not item.get_closest_marker("sglang")
+        ]
+
+    # Filter by TensorRT-LLM marker
+    if run_trtllm_only:
+        try:
+            import tensorrt_llm  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run TensorRT-LLM tests: tensorrt_llm is not available.\n"
+                "Please run tests with: uv run --extra trtllm --group test pytest ..."
+            )
+        new_items = [
+            item for item in new_items if item.get_closest_marker("trtllm")
+        ]
+    else:
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("trtllm")
         ]
 
     # Filter by nemo_gym marker
