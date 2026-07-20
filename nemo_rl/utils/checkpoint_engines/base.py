@@ -103,6 +103,11 @@ def create_checkpoint_engine(
 ) -> CheckpointEngine:
     if backend == "nixl":
         backend = "nemo_rl.utils.checkpoint_engines.nixl:NIXLCheckpointEngine"
+    if ":" not in backend:
+        raise ValueError(
+            f"Unknown checkpoint-engine backend {backend!r}: expected 'nixl' or a "
+            "'module:ClassName' path to a CheckpointEngine implementation."
+        )
     module_name, class_name = backend.split(":", 1)
     engine_cls = getattr(importlib.import_module(module_name), class_name)
     return engine_cls(bucket_size=bucket_size_bytes, **engine_kwargs)

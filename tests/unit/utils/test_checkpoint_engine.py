@@ -422,6 +422,11 @@ def test_checkpoint_engine_helpers():
         torch.testing.assert_close(merged[0][1], tensor)
 
 
+def test_create_checkpoint_engine_rejects_unknown_short_name():
+    with pytest.raises(ValueError, match="Unknown checkpoint-engine backend 'nixll'"):
+        create_checkpoint_engine("nixll", bucket_size_bytes=16, engine_kwargs={})
+
+
 def test_sharded_plugin_requires_target_weight_layout_accessor():
     engine = _PluginCheckpointEngine(bucket_size=16, marker="sharded")
     engine.shard_expert_weights = True
@@ -571,11 +576,8 @@ def test_maybe_preinit_nixl_checkpoint_engine_defaults_backend(monkeypatch):
         maybe_preinit_nixl_checkpoint_engine(
             {
                 "generation": {
-                    "checkpoint_engine": {
-                        "enabled": True,
-                        "backend": "nixl",
-                        "engine_kwargs": {"nixl": {}},
-                    }
+                    "refit_transport": "nixl",
+                    "refit_cfg": {"nixl": {}},
                 }
             }
         )

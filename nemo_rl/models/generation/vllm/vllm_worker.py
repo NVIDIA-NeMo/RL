@@ -40,14 +40,16 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    VllmConfig,
+)
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
-    generated_token_logprob,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
@@ -56,7 +58,7 @@ from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.weight_sync.checkpoint_engine_config import (
-    enabled_checkpoint_engine_config,
+    checkpoint_engine_refit_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -259,8 +261,11 @@ class BaseVllmGenerationWorker:
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
         self._sparse_refit_receiver: Any = None
-        if self.is_model_owner and self.cfg.get("refit_transport") is not None:
-            # Avoid receiver dependencies and threads for existing refit transports.
+        if (
+            self.is_model_owner
+            and self.cfg.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
+        ):
+            # Keep sparse receiver dependencies and threads off other refit paths.
             from nemo_rl.models.generation.vllm.vllm_sparse_refit import (
                 VllmSparseRefitReceiver,
             )
@@ -342,7 +347,7 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
-        checkpoint_engine_config = enabled_checkpoint_engine_config(self.cfg)
+        checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
         if checkpoint_engine_config is not None:
             from nemo_rl.models.generation.vllm.checkpoint_engine import (
                 configure_nixl_worker,
@@ -846,14 +851,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
             if hasattr(generation, "logprobs") and generation.logprobs:
                 try:
-                    for idx, (token_id, logprob_dict) in enumerate(
-                        zip(generated_tokens, generation.logprobs)
-                    ):
-                        if not logprob_dict:
-                            continue
-                        logprob = generated_token_logprob(logprob_dict, token_id)
-                        if logprob is not None:
-                            full_logprobs[sequence_length + idx] = logprob
+                    for idx, logprob_dict in enumerate(generation.logprobs):
+                        if logprob_dict:
+                            position = sequence_length + idx
+                            full_logprobs[position] = next(iter(logprob_dict.items()))[
+                                1
+                            ].logprob
                 except Exception:
                     import traceback
 

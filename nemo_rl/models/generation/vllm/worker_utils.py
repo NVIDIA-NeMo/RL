@@ -12,15 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
-
-
-def generated_token_logprob(
-    logprob_dict: dict[int, Any], token_id: int
-) -> float | None:
-    logprob = logprob_dict.get(token_id)
-    return None if logprob is None else float(logprob.logprob)
-
 
 def resolve_distributed_executor_backend(
     tensor_parallel_size: int,

@@ -57,6 +57,8 @@ def _ordered_generation_metadata(generation_results: list[Any]) -> list[Any]:
 
 @dataclass
 class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
+    """Coordinate checkpoint-engine setup and policy-to-rollout transfers."""
+
     _policy: Any
     _generation: Any
     _checkpoint_engine_config: CheckpointEngineConfig
@@ -77,9 +79,7 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
 
     def _release_after_refit(self) -> bool:
         cfg = self._checkpoint_engine_config
-        return bool(
-            cfg["engine_kwargs"][cfg["backend"]].get("release_after_refit", False)
-        )
+        return bool(cfg["engine_kwargs"][cfg["backend"]]["release_after_refit"])
 
     def _run_policy(
         self, checkpoint_method: str, **method_kwargs: Any
@@ -111,9 +111,9 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
         if self._bucket_size_bytes is not None:
             return self._bucket_size_bytes
 
-        memory_ratio_raw = self._checkpoint_engine_config.get(
-            "update_weights_bucket_memory_ratio", 0.05
-        )
+        memory_ratio_raw = self._checkpoint_engine_config[
+            "update_weights_bucket_memory_ratio"
+        ]
         try:
             memory_ratio = float(memory_ratio_raw)
         except (TypeError, ValueError) as exc:
@@ -255,20 +255,3 @@ class CheckpointEngineWeightSynchronizer(WeightSynchronizer):
             + self._run_generation("finalize_checkpoint_engine")
         )
         self._checkpoint_engine_ready = False
-
-
-def sync_weights_with_checkpoint_engine(
-    policy: Any,
-    generation: Any,
-    *,
-    timer: Optional[Timer] = None,
-    kv_scales: Optional[dict[str, float]] = None,
-) -> None:
-    """Run one checkpoint-engine refit and release its peer connections."""
-    synchronizer = CheckpointEngineWeightSynchronizer(
-        policy, generation, generation.cfg["checkpoint_engine"]
-    )
-    try:
-        synchronizer.sync_weights(timer=timer, kv_scales=kv_scales)
-    finally:
-        synchronizer.shutdown()

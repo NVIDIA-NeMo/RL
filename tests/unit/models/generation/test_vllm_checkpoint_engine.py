@@ -72,6 +72,47 @@ def test_checkpoint_engine_worker_lifecycle(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypatch):
+    from nemo_rl.models.generation.vllm.checkpoint_engine import (
+        VllmCheckpointEngineMixin,
+    )
+
+    batches = [
+        [("a", torch.ones(2, 2))],
+        [("b", torch.ones(3)), ("c", torch.ones(4))],
+    ]
+
+    class FakeEngine:
+        shard_expert_weights = False
+
+        async def receive_weight_batches(self):
+            for batch in batches:
+                yield batch
+
+    worker = VllmCheckpointEngineMixin()
+    worker.checkpoint_engine = FakeEngine()
+    events = []
+    worker._load_weights = lambda batch: events.append(
+        ("load", [name for name, _weight in batch])
+    )
+    worker._maybe_process_fp8_kv_cache = lambda: events.append(("fp8",))
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: SimpleNamespace(synchronize=lambda: events.append(("sync",))),
+    )
+
+    assert asyncio.run(worker._update_weights_from_checkpoint_engine_async()) is True
+    assert events == [
+        ("load", ["a"]),
+        ("sync",),
+        ("load", ["b", "c"]),
+        ("sync",),
+        ("fp8",),
+    ]
+
+
+@pytest.mark.vllm
 def test_checkpoint_engine_worker_reports_total_memory(monkeypatch):
     from nemo_rl.models.generation.vllm.checkpoint_engine import (
         VllmCheckpointEngineMixin,

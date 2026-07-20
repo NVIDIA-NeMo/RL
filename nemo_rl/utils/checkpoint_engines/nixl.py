@@ -119,6 +119,8 @@ def _sync_device(device: torch.device) -> None:
 
 
 class NixlAgent:
+    """Wrap a NIXL agent and its peer-control messaging."""
+
     def __init__(
         self,
         backend_name: str = NIXL_DEFAULT_BACKEND_NAME,
@@ -193,6 +195,8 @@ class NixlAgent:
 
 
 class NIXLCheckpointEngine(CheckpointEngine):
+    """Transfer checkpoint weight buckets through a NIXL backend."""
+
     def __init__(
         self,
         bucket_size: int,

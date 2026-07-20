@@ -332,8 +332,17 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
-    refit_transport: null  # Set to "vllm_s3_sparse" or "vllm_zmq_sparse" for remote sparse-delta refit.
-    refit_cfg: null  # Optional tuning and storage settings for remote sparse-delta refit.
+    # null = topology default (IPC colocated, NCCL non-colocated).
+    # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
+    refit_transport: null
+    refit_cfg:
+      nixl:
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        backend_name: UCX
+        backend_init_params: null
+        release_after_refit: false
+        shard_expert_weights: false
     mcore_generation_config:
       async_engine: false
       max_model_len: ${policy.max_total_sequence_length}

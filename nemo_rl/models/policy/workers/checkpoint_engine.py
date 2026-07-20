@@ -22,6 +22,9 @@ from nemo_rl.models.generation.vllm.refit_layout import (
     VllmWeightLayout,
     select_hf_weight_for_vllm_target,
 )
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    checkpoint_engine_refit_config,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.utils.checkpoint_engines.base import CheckpointEngine
@@ -29,12 +32,11 @@ if TYPE_CHECKING:
 
 def maybe_preinit_nixl_checkpoint_engine(config: dict[str, Any]) -> Any:
     """Preinitialize NIXL when checkpoint-engine refit is configured."""
-    checkpoint_config = config.get("generation", {}).get("checkpoint_engine")
-    if not (
-        checkpoint_config
-        and checkpoint_config["enabled"]
-        and checkpoint_config["backend"] == "nixl"
-    ):
+    generation_config = config.get("generation")
+    if generation_config is None:
+        return None
+    checkpoint_config = checkpoint_engine_refit_config(generation_config)
+    if checkpoint_config is None or checkpoint_config["backend"] != "nixl":
         return None
 
     from nemo_rl.utils.checkpoint_engines.nixl import (

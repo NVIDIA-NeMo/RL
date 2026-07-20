@@ -8,21 +8,17 @@ policy:
       resources:
         gpus_per_node: 8
         num_nodes: 1
-    checkpoint_engine:
-      enabled: true
-      # "nixl" or a "module:ClassName" path to a CheckpointEngine implementation
-      backend: nixl
-      # fraction of total GPU memory used by each weight-transfer bucket
-      update_weights_bucket_memory_ratio: 0.05
-      # per-backend constructor kwargs, keyed by the configured backend string
-      engine_kwargs:
-        nixl:
-          device: cuda
-          # Free registered transfer buffers between refits. Keep false for throughput.
-          release_after_refit: false
-          shard_expert_weights: false
-          backend_name: UCX
-          backend_init_params: null
+    refit_transport: nixl
+    refit_cfg:
+      nixl:
+        # fraction of total GPU memory used by each weight-transfer bucket
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        # Free registered transfer buffers between refits. Keep false for throughput.
+        release_after_refit: false
+        shard_expert_weights: false
+        backend_name: UCX
+        backend_init_params: null
 
 cluster:
   num_nodes: 2

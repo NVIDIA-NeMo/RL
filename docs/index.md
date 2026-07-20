@@ -163,6 +163,13 @@ Extend a model's context window with YaRN RoPE scaling on the Megatron backend f
 Off-policy distillation across mismatched tokenizers — build a (student, teacher) projection matrix and run x-token KD via CUDA-IPC teacher logits.
 :::
 
+:::{grid-item-card} {octicon}`arrow-both` Weight Refit
+:link: guides/refit
+:link-type: doc
+
+Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
+:::
+
 :::{grid-item-card} {octicon}`sync` Checkpoint-Engine Refit
 :link: guides/checkpoint-engine-refit
 :link-type: doc
@@ -295,6 +302,7 @@ guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
+guides/refit.md
 guides/checkpoint-engine-refit.md
 guides/router-replay.md
 guides/muon-optimizer.md

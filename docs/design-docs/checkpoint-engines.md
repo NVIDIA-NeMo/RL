@@ -27,7 +27,7 @@ only for the runtime weight update between policy and generation workers.
 
 The refit lifecycle is coordinated by `CheckpointEngineWeightSynchronizer`:
 
-1. Read `policy.generation.checkpoint_engine`.
+1. Read `policy.generation.refit_transport` and its matching `refit_cfg` scope.
 2. Resolve the configured bucket size from the smallest fixed GPU capacity
    reported by policy and vLLM workers before transfer buffers are allocated.
 3. Instantiate the backend on policy workers and vLLM internal workers.
@@ -48,7 +48,8 @@ generation metadata. Backends receive `train_world_size` and
 
 ## Configuration Contract
 
-Checkpoint-engine config lives under `policy.generation`:
+Checkpoint-engine refit uses the same selector as other non-colocated vLLM
+transports:
 
 ```yaml
 policy:
@@ -56,43 +57,39 @@ policy:
     backend: vllm
     colocated:
       enabled: false
-    checkpoint_engine:
-      enabled: true
-      backend: nixl
-      update_weights_bucket_memory_ratio: 0.05
-      engine_kwargs:
-        nixl:
-          device: cuda
-          release_after_refit: false
-          backend_name: UCX
-          # Optional, cluster-specific eight-rail tuning.
-          backend_init_params:
-            engine_config: MAX_RMA_RAILS=8
-            device_list: "mlx5_0,mlx5_1,mlx5_2,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
+    refit_transport: nixl
+    refit_cfg:
+      nixl:
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        release_after_refit: false
+        backend_name: UCX
+        # Optional, cluster-specific eight-rail tuning.
+        backend_init_params:
+          engine_config: MAX_RMA_RAILS=8
+          device_list: "mlx5_0,mlx5_1,mlx5_2,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
 ```
 
-`backend` can be:
+`refit_transport` can select:
 
 - `nixl`, which maps to
   `nemo_rl.utils.checkpoint_engines.nixl:NIXLCheckpointEngine`
 - a class path in `module:ClassName` format
 
-`engine_kwargs` must be keyed by the exact backend value. For a plugin:
+For a plugin, key its settings by the exact class path:
 
 ```yaml
 policy:
   generation:
-    checkpoint_engine:
-      enabled: true
-      backend: "my_pkg.refit:MyCheckpointEngine"
-      update_weights_bucket_memory_ratio: 0.05
-      engine_kwargs:
-        "my_pkg.refit:MyCheckpointEngine":
-          transport: custom
+    refit_transport: "my_pkg.refit:MyCheckpointEngine"
+    refit_cfg:
+      "my_pkg.refit:MyCheckpointEngine":
+        update_weights_bucket_memory_ratio: 0.05
+        transport: custom
 ```
 
 `update_weights_bucket_memory_ratio` is the fraction of fixed total GPU memory
-used by each transfer bucket and defaults to `0.05` when omitted. The
+used by each transfer bucket. Its Pydantic default is `0.05`. The
 synchronizer queries every policy and rollout worker, uses the smallest reported
 GPU capacity, and computes
 `minimum_total_memory_bytes * update_weights_bucket_memory_ratio`, rounded down
@@ -233,7 +230,7 @@ success.
 
 ## NIXL Backend
 
-The built-in NIXL backend is selected with `backend: nixl`. It currently uses:
+The built-in NIXL backend is selected with `refit_transport: nixl`. It currently uses:
 
 - NIXL agents for memory registration and transfer
 - ZMQ control messages for bucket metadata and completion notifications
@@ -276,6 +273,12 @@ every participating node and keep `MAX_RMA_RAILS` no larger than the number of
 usable selected rails. Values in `backend_init_params` are converted to strings
 before creating the NIXL backend.
 
+Prefer `backend_init_params.device_list` over `UCX_NET_DEVICES` for per-run
+selection because it is recorded with the run configuration. Both constrain
+UCX discovery rather than overriding one another, so conflicting values can
+exclude the intended devices. Reserve `UCX_NET_DEVICES` for a cluster-wide
+override and normally configure only one of the two.
+
 The validated cluster omits `mlx5_3` because it maps to the Ethernet-link-layer
 interface `enp90s0np0` on the `10.65.x.x/31` network, while the eight selected
 HCAs use the InfiniBand link layer and map to `ibp*` interfaces on the
@@ -299,12 +302,12 @@ and correctness-control results are recorded in the
 
 NIXL/UCX backend creation can be expensive if it first happens in the critical
 path. The current code preinitializes NIXL agents in two places when the config
-selects `backend: nixl`:
+selects `refit_transport: nixl`:
 
 - policy worker construction
 - vLLM internal worker construction, via vLLM's `worker_cls` hook
 
-NeMo RL passes the checkpoint-engine settings through
+NeMo RL passes the normalized `refit_cfg.nixl` settings through
 `VllmConfig.additional_config`. `NixlVllmWorker` creates and retains the
 preinit agent before calling vLLM's worker constructor. The preinit path uses
 the configured `backend_name` and `backend_init_params`; logs usually show
@@ -351,15 +354,18 @@ To add a backend:
 4. Implement policy and rollout peer setup using the combined metadata list.
 5. Stream policy weights from the input generator without replaying it.
 6. Yield vLLM-loadable `(name, tensor)` batches from `receive_weight_batches()`.
-7. Add backend-specific config under `engine_kwargs.<backend>`.
-8. Use a `module:ClassName` backend string in config, or add a short-name
+7. Add backend-specific config under `refit_cfg.<backend>`.
+8. Use a `module:ClassName` `refit_transport` value, or add a short-name
    mapping in `create_checkpoint_engine()` if the backend should be built in.
 9. Run a non-colocated GRPO job and verify the `[vLLM refit]` timing line.
 
 Current limitations:
 
 - Checkpoint-engine refit targets non-colocated policy-to-vLLM refit.
-- SGLang checkpoint-engine refit is not implemented.
+- SGLang and Megatron generation do not implement checkpoint-engine refit;
+  [issue #3288](https://github.com/NVIDIA-NeMo/RL/issues/3288) tracks
+  generation-side support. Megatron and DTensor policy backends are supported
+  when the generation backend is vLLM.
 - The built-in NIXL backend uses paired policy-to-rollout transfer only.
 - Sharded vLLM EP refit supports static expert ownership and canonical
   unquantized Triton expert storage. Dynamic EPLB, redundant experts, and

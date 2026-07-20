@@ -1854,7 +1854,9 @@ class MegatronPolicyWorkerImpl(
 
             refit_config = self.cfg["generation"]["refit_cfg"]
             assert refit_config is not None
-            self._remote_sparse_refit = MegatronRemoteSparseRefit(self, refit_config)
+            self._remote_sparse_refit = MegatronRemoteSparseRefit(
+                self, refit_config.sparse
+            )
         return self._remote_sparse_refit
 
     def finish_remote_sparse_delta_sync(self, *, succeeded: bool) -> None:

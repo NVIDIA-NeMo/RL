@@ -763,12 +763,8 @@ def test_configure_quant_engine_kwargs_preserves_checkpoint_extension(monkeypatc
     monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
     cfg = {
         "quant_cfg": "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml",
-        "checkpoint_engine": {
-            "enabled": True,
-            "backend": "nixl",
-            "update_weights_bucket_memory_ratio": 0.05,
-            "engine_kwargs": {"nixl": {}},
-        },
+        "refit_transport": "nixl",
+        "refit_cfg": {"nixl": {}},
     }
     llm_kwargs = {}
 

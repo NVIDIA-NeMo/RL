@@ -14,28 +14,12 @@
 
 """Tests for vLLM worker helper functions."""
 
-import types
-
 import pytest
 
 from nemo_rl.models.generation.vllm.worker_utils import (
-    generated_token_logprob,
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
-
-
-def test_generated_token_logprob_uses_generated_token_id():
-    first_logprob = types.SimpleNamespace(logprob=-0.1)
-    generated_logprob = types.SimpleNamespace(logprob=-2.5)
-
-    logprob_dict = {
-        11: first_logprob,
-        22: generated_logprob,
-    }
-
-    assert generated_token_logprob(logprob_dict, 22) == -2.5
-    assert generated_token_logprob(logprob_dict, 33) is None
 
 
 @pytest.mark.parametrize(

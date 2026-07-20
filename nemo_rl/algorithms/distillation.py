@@ -69,6 +69,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -81,6 +85,10 @@ from nemo_rl.utils.logger import (
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    checkpoint_engine_refit_config,
+)
+from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -217,14 +225,18 @@ def setup(
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
-    if (
-        generation_config["backend"] == "vllm"
-        and cast(VllmConfig, generation_config).get("refit_transport") is not None
-    ):
-        raise ValueError(
-            "Remote sparse refit is currently supported only by GRPO; distillation "
-            "support is tracked in https://github.com/NVIDIA-NeMo/RL/issues/3275."
-        )
+    checkpoint_engine_config = None
+    if generation_config["backend"] == "vllm":
+        vllm_config = cast(VllmConfig, generation_config)
+        normalize_vllm_refit_config(vllm_config)
+        refit_transport = vllm_config.get("refit_transport")
+        if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
+            raise ValueError(
+                "Remote sparse refit is currently supported only by GRPO; "
+                "distillation support is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+            )
+        checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
     # Disallow SP + packing for dtensor path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
@@ -594,12 +606,23 @@ def setup(
         init_reference_model=False,
     )
 
-    if student_generation is not None:
+    if checkpoint_engine_config is not None:
+        assert isinstance(student_generation, VllmGeneration)
+        student_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=student_policy,
+            generation=student_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+        student_generation.weight_synchronizer.init_communicator()
+    elif student_generation is not None:
         state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and checkpoint_engine_config is None:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()

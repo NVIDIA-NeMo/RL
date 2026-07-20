@@ -27,7 +27,6 @@ from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
     CheckpointEngineWeightSynchronizer,
     _ordered_generation_metadata,
     _sort_ranked_metadata,
-    sync_weights_with_checkpoint_engine,
 )
 from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
@@ -70,7 +69,6 @@ def _checkpoint_engine_cfg(
     device="cpu",
 ):
     return {
-        "enabled": True,
         "backend": backend,
         "update_weights_bucket_memory_ratio": bucket_memory_ratio,
         "engine_kwargs": {
@@ -79,6 +77,19 @@ def _checkpoint_engine_cfg(
                 "release_after_refit": release_after_refit,
             }
         },
+    }
+
+
+def _nixl_refit_cfg(*, release_after_refit=False):
+    return {
+        "refit_transport": "nixl",
+        "refit_cfg": {
+            "nixl": {
+                "device": "cpu",
+                "release_after_refit": release_after_refit,
+            }
+        },
+        "vllm_cfg": {"async_engine": False},
     }
 
 
@@ -135,26 +146,13 @@ def _checkpoint_sync(
     checkpoint_engine_config = checkpoint_engine_config or _checkpoint_engine_cfg(
         release_after_refit=release_after_refit
     )
-    gen = _mock_generation(
-        cfg={
-            "vllm_cfg": {"async_engine": async_engine},
-            "checkpoint_engine": checkpoint_engine_config,
-        }
-    )
+    gen = _mock_generation(cfg={"vllm_cfg": {"async_engine": async_engine}})
     gen.dp_size = 2
     gen.worker_group = _CheckpointWorkerGroup()
-    return CheckpointEngineWeightSynchronizer(policy, gen, gen.cfg["checkpoint_engine"])
+    return CheckpointEngineWeightSynchronizer(policy, gen, checkpoint_engine_config)
 
 
 class TestCheckpointEngineWeightSynchronizer:
-    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
-    def test_bucket_size_defaults_to_five_percent_of_total_memory(self, mock_ray):
-        config = _checkpoint_engine_cfg()
-        del config["update_weights_bucket_memory_ratio"]
-        sync = _checkpoint_sync(mock_ray, checkpoint_engine_config=config)
-
-        assert sync._resolve_bucket_size_bytes() == 4096 * 1024**2
-
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_bucket_uses_minimum_total_memory_and_is_cached(self, mock_ray, capsys):
         config = _checkpoint_engine_cfg(bucket_memory_ratio=0.125)
@@ -281,31 +279,6 @@ class TestCheckpointEngineWeightSynchronizer:
             == 2
         )
 
-    @patch(
-        "nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer."
-        "CheckpointEngineWeightSynchronizer"
-    )
-    def test_sync_helper_always_shuts_down(self, synchronizer_cls):
-        policy = object()
-        generation = _mock_generation(
-            cfg={"checkpoint_engine": _checkpoint_engine_cfg()}
-        )
-        synchronizer = synchronizer_cls.return_value
-        synchronizer.sync_weights.side_effect = RuntimeError("transfer failed")
-
-        with pytest.raises(RuntimeError, match="transfer failed"):
-            sync_weights_with_checkpoint_engine(
-                policy, generation, kv_scales={"kv": 1.0}
-            )
-
-        synchronizer_cls.assert_called_once_with(
-            policy, generation, generation.cfg["checkpoint_engine"]
-        )
-        synchronizer.sync_weights.assert_called_once_with(
-            timer=None, kv_scales={"kv": 1.0}
-        )
-        synchronizer.shutdown.assert_called_once_with()
-
     @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
     def test_sync_weights_does_not_run_colocated_phase_transitions(self, mock_ray):
         sync = _checkpoint_sync(mock_ray)
@@ -357,7 +330,7 @@ class TestCheckpointEngineFactory:
     )
     def test_checkpoint_engine_factory_routing(self, backend, colocated, expected):
         policy = _mock_policy(cfg={})
-        gen = _mock_generation(cfg={"checkpoint_engine": _checkpoint_engine_cfg()})
+        gen = _mock_generation(cfg=_nixl_refit_cfg())
         if isinstance(expected, type) and issubclass(expected, Exception):
             with pytest.raises(expected):
                 create_weight_synchronizer(
@@ -379,7 +352,7 @@ class TestCheckpointEngineFactory:
 
     @pytest.mark.parametrize("cfg", [{"megatron_cfg": {"enabled": False}}, {}])
     def test_checkpoint_engine_accepts_non_megatron_policy(self, cfg):
-        gen = _mock_generation(cfg={"checkpoint_engine": _checkpoint_engine_cfg()})
+        gen = _mock_generation(cfg=_nixl_refit_cfg())
         assert isinstance(
             create_weight_synchronizer(
                 policy=_mock_policy(cfg=cfg),

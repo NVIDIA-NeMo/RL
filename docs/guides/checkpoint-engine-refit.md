@@ -8,7 +8,7 @@ Use it only for non-colocated vLLM generation:
 
 - `policy.generation.backend=vllm`
 - `policy.generation.colocated.enabled=false`
-- `policy.generation.checkpoint_engine.enabled=true`
+- `policy.generation.refit_transport=nixl`
 
 Colocated generation still uses IPC/HTTP refit. Non-colocated generation without
 checkpoint-engine refit still uses the NCCL collective update path.
@@ -16,9 +16,14 @@ checkpoint-engine refit still uses the NCCL collective update path.
 `examples/configs/grpo_math_8B_megatron_nixl.yaml` is a complete two-node
 example built as an overlay on the standard 8B Megatron recipe.
 
+For a minimal run, start from `examples/configs/grpo_math_1B.yaml`, set
+`policy.generation.colocated.enabled=false`, and set
+`policy.generation.refit_transport=nixl`. The base config exposes the NIXL
+defaults under `refit_cfg.nixl` so individual settings can be overridden.
+
 ## Enable NIXL
 
-Add `checkpoint_engine` under `policy.generation`:
+Select NIXL and configure its scoped refit settings:
 
 ```yaml
 policy:
@@ -29,18 +34,16 @@ policy:
       resources:
         num_nodes: 1
         gpus_per_node: 8
-    checkpoint_engine:
-      enabled: true
-      backend: nixl
-      update_weights_bucket_memory_ratio: 0.05
-      engine_kwargs:
-        nixl:
-          device: cuda
-          release_after_refit: false
-          backend_name: UCX
-          backend_init_params:
-            engine_config: MAX_RMA_RAILS=8
-            device_list: "mlx5_0,mlx5_1,mlx5_2,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
+    refit_transport: nixl
+    refit_cfg:
+      nixl:
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        release_after_refit: false
+        backend_name: UCX
+        backend_init_params:
+          engine_config: MAX_RMA_RAILS=8
+          device_list: "mlx5_0,mlx5_1,mlx5_2,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8"
 ```
 
 Key settings:
@@ -70,11 +73,13 @@ NIXL must be importable in every participating environment:
 - policy worker environment
 - vLLM worker environment, including async vLLM workers
 
-Keep checkpoint-engine feature selection in YAML or Hydra overrides. Use
-environment variables for UCX/NIXL transport selection:
+Keep refit selection and NIC/rail selection in YAML or Hydra overrides so they
+are captured in the logged run configuration. Prefer
+`refit_cfg.nixl.backend_init_params.device_list` for a validated topology.
+Cluster-wide `UCX_*` environment variables remain useful for UCX behavior that
+NIXL does not expose through `backend_init_params`:
 
 ```sh
-export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1
 export UCX_TLS=rc,cuda_copy,cuda_ipc,self,sm
 export UCX_IB_ROCE_REACHABILITY_MODE=all
 export UCX_MEMTYPE_CACHE=n
@@ -82,6 +87,11 @@ export UCX_MAX_RNDV_RAILS=8
 export UCX_WARN_UNUSED_ENV_VARS=n
 export NIXL_LOG_LEVEL=INFO
 ```
+
+Do not normally set both `device_list` and `UCX_NET_DEVICES`: they are two
+filters on UCX device discovery, and a disagreement can remove the intended
+rails. Use `UCX_NET_DEVICES` only as a cluster-wide override when the run config
+cannot carry `device_list`.
 
 When vLLM starts nested Ray workers, copy the transport variables into those
 workers:
@@ -112,13 +122,13 @@ policy:
       gpu_memory_utilization: 0.82
     vllm_kwargs:
       moe_backend: triton
-    checkpoint_engine:
-      update_weights_bucket_memory_ratio: 0.05
-      engine_kwargs:
-        nixl:
-          device: cuda
-          release_after_refit: false
-          shard_expert_weights: true
+    refit_transport: nixl
+    refit_cfg:
+      nixl:
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        release_after_refit: false
+        shard_expert_weights: true
 ```
 
 With `shard_expert_weights`, each vLLM worker reports its live destination layout
@@ -235,11 +245,11 @@ Enable UCX peer error handling when failed peers should surface promptly:
 ```yaml
 policy:
   generation:
-    checkpoint_engine:
-      engine_kwargs:
-        nixl:
-          backend_init_params:
-            ucx_error_handling_mode: peer
+    refit_transport: nixl
+    refit_cfg:
+      nixl:
+        backend_init_params:
+          ucx_error_handling_mode: peer
 ```
 
 Changing the rollout actor set is orchestration outside NIXL: stop routing to

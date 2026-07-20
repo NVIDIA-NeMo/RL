@@ -101,7 +101,10 @@ from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.generation.vllm.config import normalize_vllm_refit_config
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -120,8 +123,9 @@ from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
 from nemo_rl.weight_sync.checkpoint_engine_config import (
-    enabled_checkpoint_engine_config,
+    checkpoint_engine_refit_config,
 )
+from nemo_rl.weight_sync.factory import create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -916,6 +920,7 @@ def setup(
     remote_transport = None
     remote_synchronizer_cls = None
     remote_baseline_init_refs: list[Any] = []
+    checkpoint_engine_config = None
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
@@ -1109,7 +1114,8 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
-        if generation_config.get("refit_transport") is not None:
+        refit_transport = generation_config.get("refit_transport")
+        if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
             # Keep optional remote transport dependencies off the default path.
             from nemo_rl.weight_sync.vllm_remote_sparse_weight_synchronizer import (
                 VllmRemoteSparseWeightSynchronizer,
@@ -1123,6 +1129,9 @@ def setup(
             )
             assert remote_transport is not None
             remote_synchronizer_cls = VllmRemoteSparseWeightSynchronizer
+        elif refit_transport is not None:
+            checkpoint_engine_config = checkpoint_engine_refit_config(generation_config)
+            assert checkpoint_engine_config is not None
 
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config.use_importance_sampling_correction, (
@@ -1260,12 +1269,13 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    checkpoint_engine_config = enabled_checkpoint_engine_config(generation_config)
-    if checkpoint_engine_config is not None and backend != "vllm":
+    if generation_config.get("refit_transport") is not None and backend != "vllm":
         raise NotImplementedError(
-            "checkpoint-engine refit is only supported for the vLLM generation "
-            f"backend, but policy.generation.backend={backend!r}. Disable "
-            "policy.generation.checkpoint_engine.enabled."
+            "Non-default refit transports are only supported for the vLLM "
+            f"generation backend, but policy.generation.backend={backend!r}. "
+            "Set policy.generation.refit_transport=null. Support for other "
+            "generation backends is tracked in "
+            "https://github.com/NVIDIA-NeMo/RL/issues/3288."
         )
 
     # if it is not colocated inference, initialize collective communication for update weights
@@ -1311,12 +1321,6 @@ def setup(
             )  # type: ignore
             ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
-    elif not colocated_inference and checkpoint_engine_config is not None:
-        print(
-            f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
-            flush=True,
-        )
-
     if remote_transport is not None:
         t0 = time.perf_counter()
         assert isinstance(policy_generation, VllmGeneration)
@@ -1330,12 +1334,31 @@ def setup(
             api_key_env_var=generation_config["vllm_cfg"].get(
                 "http_refit_api_key_env_var"
             ),
-            request_timeout_s=refit_config.request_timeout_s,
+            request_timeout_s=refit_config.sparse.request_timeout_s,
             baseline_init_refs=remote_baseline_init_refs,
         )
         policy_generation.weight_synchronizer.init_communicator()
         worker_init_timing_metrics[f"vllm_{remote_transport}_sparse_init_time_s"] = (
             time.perf_counter() - t0
+        )
+    elif checkpoint_engine_config is not None:
+        t0 = time.perf_counter()
+        assert isinstance(policy_generation, VllmGeneration)
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+        worker_init_timing_metrics["vllm_checkpoint_engine_init_time_s"] = (
+            time.perf_counter() - t0
+        )
+        print(
+            f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
+            flush=True,
         )
     else:
         state_dict_info = policy.prepare_refit_info()
@@ -2117,18 +2140,6 @@ def refit_policy_generation(
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if synchronizer is not None:
         return synchronizer.sync_weights(timer=timer, kv_scales=kv_scales) or {}
-
-    if isinstance(policy_generation, VllmGeneration) and (
-        enabled_checkpoint_engine_config(policy_generation.cfg) is not None
-    ):
-        from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
-            sync_weights_with_checkpoint_engine,
-        )
-
-        sync_weights_with_checkpoint_engine(
-            policy, policy_generation, timer=timer, kv_scales=kv_scales
-        )
-        return {}
 
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):

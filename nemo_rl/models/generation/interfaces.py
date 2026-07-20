@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Literal, NotRequired, Optional, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -177,21 +177,13 @@ class ColocationConfig(TypedDict):
     resources: OptionalResourcesConfig
 
 
-class CheckpointEngineConfigDisabled(TypedDict):
-    enabled: Literal[False]
-
-
 class CheckpointEngineConfig(TypedDict):
-    """Configuration for checkpoint-engine weight refit.
+    """Normalized internal configuration for checkpoint-engine refit."""
 
-    See examples/configs/grpo_math_8B_megatron_nixl.yaml.
-    """
-
-    enabled: Literal[True]
     # "nixl" or a "module:ClassName" path to a CheckpointEngine implementation
     backend: str
-    # fraction of total GPU memory used by each transfer bucket; defaults to 0.05
-    update_weights_bucket_memory_ratio: NotRequired[float]
+    # fraction of total GPU memory used by each transfer bucket
+    update_weights_bucket_memory_ratio: float
     # per-backend constructor kwargs, keyed by the configured backend string
     engine_kwargs: dict[str, dict[str, Any]]
 
@@ -211,9 +203,6 @@ class GenerationConfig(TypedDict):
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
     use_async_rollouts: NotRequired[bool]
-    checkpoint_engine: NotRequired[
-        CheckpointEngineConfig | CheckpointEngineConfigDisabled
-    ]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.

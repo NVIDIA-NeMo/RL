@@ -27,7 +27,7 @@ from nemo_rl.models.generation.constants import (
     VLLM_BACKEND,
 )
 from nemo_rl.weight_sync.checkpoint_engine_config import (
-    enabled_checkpoint_engine_config,
+    checkpoint_engine_refit_config,
 )
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -66,18 +66,20 @@ def create_weight_synchronizer(
             f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
         )
 
-    checkpoint_engine_config = enabled_checkpoint_engine_config(generation.cfg)
+    checkpoint_engine_config = checkpoint_engine_refit_config(generation.cfg)
     if checkpoint_engine_config is not None:
         if colocated:
             raise ValueError(
                 "checkpoint-engine refit is only supported for non-colocated "
                 "generation. Set policy.generation.colocated.enabled=false or "
-                "disable policy.generation.checkpoint_engine.enabled."
+                "set policy.generation.refit_transport=null."
             )
         if generation_backend != VLLM_BACKEND:
             raise NotImplementedError(
                 "checkpoint-engine non-colocated refit is only supported for "
-                f"the vLLM generation backend, got {generation_backend!r}."
+                f"the vLLM generation backend, got {generation_backend!r}. "
+                "Support for other generation backends is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3288."
             )
 
         from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (

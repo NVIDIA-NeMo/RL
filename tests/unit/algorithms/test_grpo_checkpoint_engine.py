@@ -15,43 +15,45 @@
 """Tests for GRPO checkpoint-engine refit routing."""
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 from nemo_rl.utils.config import load_config
 
 
 def test_nixl_example_is_an_enabled_non_colocated_overlay():
+    from nemo_rl.algorithms.grpo import MasterConfig
+    from nemo_rl.models.generation.vllm.config import (
+        VllmConfig,
+        normalize_vllm_refit_config,
+    )
+
     repo_root = Path(__file__).parents[3]
-    config = load_config(repo_root / "examples/configs/grpo_math_8B_megatron_nixl.yaml")
+    raw_config = load_config(
+        repo_root / "examples/configs/grpo_math_8B_megatron_nixl.yaml"
+    )
+    config = MasterConfig(**raw_config)
 
-    generation = config.policy.generation
-    assert generation.checkpoint_engine.enabled
-    assert generation.checkpoint_engine.backend == "nixl"
-    assert not generation.colocated.enabled
-    assert config.cluster.num_nodes == 2
+    generation = config.policy["generation"]
+    normalize_vllm_refit_config(cast(VllmConfig, generation))
+    assert generation["refit_transport"] == "nixl"
+    assert generation["refit_cfg"].nixl.update_weights_bucket_memory_ratio == 0.05
+    assert not generation["colocated"]["enabled"]
+    assert config.cluster["num_nodes"] == 2
 
 
-def test_refit_policy_generation_checkpoint_engine_uses_weight_sync(monkeypatch):
+def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
     from nemo_rl.algorithms import grpo as grpo_mod
     from nemo_rl.models.generation.vllm import VllmGeneration
-    from nemo_rl.weight_sync import checkpoint_engine_weight_synchronizer
 
     policy = object()
-    sync_weights = MagicMock()
     kv_scales = {"layer_0": 1.0}
 
     generation = MagicMock(spec=VllmGeneration)
-    generation.cfg = {
-        "backend": "vllm",
-        "checkpoint_engine": {"enabled": True, "backend": "nixl"},
-    }
-    monkeypatch.setattr(
-        checkpoint_engine_weight_synchronizer,
-        "sync_weights_with_checkpoint_engine",
-        sync_weights,
-    )
+    generation.weight_synchronizer = MagicMock()
+    generation.weight_synchronizer.sync_weights.return_value = {"transfer_s": 1.0}
 
-    grpo_mod.refit_policy_generation(
+    result = grpo_mod.refit_policy_generation(
         policy=policy,
         policy_generation=generation,
         colocated_inference=False,
@@ -60,12 +62,10 @@ def test_refit_policy_generation_checkpoint_engine_uses_weight_sync(monkeypatch)
         kv_scales=kv_scales,
     )
 
-    sync_weights.assert_called_once_with(
-        policy,
-        generation,
-        timer=None,
-        kv_scales=kv_scales,
+    generation.weight_synchronizer.sync_weights.assert_called_once_with(
+        timer=None, kv_scales=kv_scales
     )
+    assert result == {"transfer_s": 1.0}
 
 
 def test_refit_policy_generation_sglang_uses_standard_refit(monkeypatch):

@@ -18,10 +18,14 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.refit_loader import (
     VllmShardedExpertRefitMixin,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    checkpoint_engine_refit_config,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.utils.checkpoint_engines.base import CheckpointEngine
@@ -31,14 +35,10 @@ NIXL_VLLM_WORKER = "nemo_rl.models.generation.vllm.vllm_backend.NixlVllmWorker"
 _NIXL_CONFIG_KEY = "nemo_rl_checkpoint_engine"
 
 
-def configure_nixl_worker(config: dict[str, Any], vllm_kwargs: dict[str, Any]) -> None:
+def configure_nixl_worker(config: VllmConfig, vllm_kwargs: dict[str, Any]) -> None:
     """Configure vLLM's worker hook for early NIXL initialization."""
-    checkpoint_config = config.get("checkpoint_engine")
-    if not (
-        checkpoint_config
-        and checkpoint_config["enabled"]
-        and checkpoint_config["backend"] == "nixl"
-    ):
+    checkpoint_config = checkpoint_engine_refit_config(config)
+    if checkpoint_config is None or checkpoint_config["backend"] != "nixl":
         return
 
     worker_cls = vllm_kwargs.setdefault("worker_cls", NIXL_VLLM_WORKER)
@@ -136,9 +136,7 @@ class VllmCheckpointEngineMixin(VllmShardedExpertRefitMixin):
         if checkpoint_engine is not None:
             checkpoint_engine.finalize()
 
-    async def _update_weights_from_checkpoint_engine_async(
-        self,
-    ) -> bool:  # pragma: no cover
+    async def _update_weights_from_checkpoint_engine_async(self) -> bool:
         loaded_tensors = 0
         loaded_bytes = 0
         loaded_batches = 0
