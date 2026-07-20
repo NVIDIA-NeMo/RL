@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
 
-from nemo_rl.utils.config import load_config
+from omegaconf import OmegaConf
+
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 
 def test_nixl_example_is_an_enabled_non_colocated_overlay():
@@ -29,10 +31,13 @@ def test_nixl_example_is_an_enabled_non_colocated_overlay():
     )
 
     repo_root = Path(__file__).parents[3]
+    register_omegaconf_resolvers()
     raw_config = load_config(
         repo_root / "examples/configs/grpo_math_8B_megatron_nixl.yaml"
     )
-    config = MasterConfig(**raw_config)
+    resolved_config = OmegaConf.to_container(raw_config, resolve=True)
+    assert isinstance(resolved_config, dict)
+    config = MasterConfig(**resolved_config)
 
     generation = config.policy["generation"]
     normalize_vllm_refit_config(cast(VllmConfig, generation))
