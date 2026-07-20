@@ -48,7 +48,11 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
-from nemo_rl.algorithms.utils import print_performance_metrics, set_seed
+from nemo_rl.algorithms.utils import (
+    maybe_enable_refit_prequantize,
+    print_performance_metrics,
+    set_seed,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -66,7 +70,6 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.algorithms.utils import maybe_enable_refit_prequantize
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration

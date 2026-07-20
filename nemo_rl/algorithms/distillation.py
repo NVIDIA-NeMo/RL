@@ -37,7 +37,7 @@ from nemo_rl.algorithms.loss import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
-from nemo_rl.algorithms.utils import set_seed
+from nemo_rl.algorithms.utils import maybe_enable_refit_prequantize, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -65,7 +65,6 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.algorithms.utils import maybe_enable_refit_prequantize
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )

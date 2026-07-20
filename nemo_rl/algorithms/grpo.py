@@ -55,6 +55,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
+    maybe_enable_refit_prequantize,
     print_efficiency_summary,
     print_performance_metrics,
     set_seed,
@@ -93,7 +94,6 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.algorithms.utils import maybe_enable_refit_prequantize
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     resolve_routed_experts_dtype_name_for_model,

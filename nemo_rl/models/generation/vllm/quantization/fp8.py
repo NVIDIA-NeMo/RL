@@ -1317,10 +1317,10 @@ def apply_monolithic_mxfp8_moe(self, layer, x, router_logits, input_ids=None):
     )
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    from vllm.model_executor.layers.quantization.modelopt import MxFp8MoeBackend
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         mxfp8_e4m3_quantize,
     )
-    from vllm.model_executor.layers.quantization.modelopt import MxFp8MoeBackend
     from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
 
     assert self.mxfp8_backend == MxFp8MoeBackend.FLASHINFER_TRTLLM
