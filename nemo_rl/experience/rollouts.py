@@ -2054,10 +2054,17 @@ async def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    if "vllm_cfg" in policy_generation.cfg:
+    # Dispatch on the backend, not key-presence: an SGLang config can inherit a
+    # vLLM exemplar's ``vllm_cfg`` via deep-merge, so a bare ``"vllm_cfg" in cfg``
+    # check would shadow the SGLang branch. ``context_length`` is nullable, so fall
+    # back to the policy sequence cap when it is unset.
+    if policy_generation.cfg.get("backend") == "sglang":
+        engine_max_model_len = (
+            policy_generation.cfg["sglang_cfg"].get("context_length")
+            or policy_generation.cfg["max_total_sequence_length"]
+        )
+    elif "vllm_cfg" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
-    elif "sglang_cfg" in policy_generation.cfg:
-        engine_max_model_len = policy_generation.cfg["sglang_cfg"]["context_length"]
     elif "mcore_generation_config" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
             "max_model_len"
@@ -2276,13 +2283,14 @@ def _postprocess_single_nemo_gym_group(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        if "vllm_cfg" in policy_generation.cfg:
+        if policy_generation.cfg.get("backend") == "sglang":
+            max_total_tokens_per_sample = (
+                policy_generation.cfg["sglang_cfg"].get("context_length")
+                or policy_generation.cfg["max_total_sequence_length"]
+            )
+        elif "vllm_cfg" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
                 "max_model_len"
-            ]
-        elif "sglang_cfg" in policy_generation.cfg:
-            max_total_tokens_per_sample = policy_generation.cfg["sglang_cfg"][
-                "context_length"
             ]
         elif "trtllm_cfg" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg["trtllm_cfg"][
