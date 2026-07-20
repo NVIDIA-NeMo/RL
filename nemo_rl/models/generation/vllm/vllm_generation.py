@@ -654,28 +654,33 @@ class VllmGeneration(GenerationInterface):
             else "init_collective"
         )
 
-        # Build rank_prefix_list from dp_leader_worker_indices for correctness
-        # after mark_workers_dead (stride formula diverges when dp_size shrinks).
-        rank_prefix_list = list(self.worker_group.dp_leader_worker_indices)
+        # Build rank_prefix_list as sequential gen-side NCCL ranks (0, mp, 2*mp, …).
+        # dp_leader_worker_indices holds physical worker-group indices, which after
+        # mark_workers_dead are no longer sequential (e.g. [1] when shard 0 died).
+        # Using raw indices as rank_prefix would produce rank = train_ws + 1 > world_size
+        # and crash the NCCL rendezvous. We use position-in-cohort instead.
+        per_shard_ws = max(1, self.tp_size * self.pp_size)
+        leaders = list(self.worker_group.dp_leader_worker_indices)
         if include_worker_indices is not None:
             include_set = set(include_worker_indices)
-            rank_prefix_list = [r for r in rank_prefix_list if r in include_set]
+            leaders = [l for l in leaders if l in include_set]
 
-        if not rank_prefix_list:
-            if self.dp_size == 0:
-                raise RuntimeError(
-                    "Data parallel size is zero, cannot initialize collective."
-                )
-            # Fallback: stride-based (original behaviour for non-fault paths)
-            total_workers = len(self.worker_group.workers)
-            workers_per_group = total_workers // self.dp_size
-            rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        if not leaders:
+            raise RuntimeError("Data parallel size is zero, cannot initialize collective.")
 
-        # Send world_size and rank for init collective to all workers
+        # Sequential: shard i gets rank_prefix = i * per_shard_ws regardless of
+        # which physical worker indices survived.
+        rank_prefix_list = [i * per_shard_ws for i in range(len(leaders))]
+        restrict_indices = set(leaders)
+
+        # Send world_size and rank for init collective to cohort workers only.
+        # restrict_to_indices excludes backfill shards that are alive but not
+        # yet joinable, preventing a data-length assertion mismatch.
         futures = self.worker_group.run_all_workers_multiple_data(
             method_name,
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            restrict_to_indices=restrict_indices,
             common_kwargs={
                 "ip": ip,
                 "port": port,
@@ -981,6 +986,14 @@ class VllmGeneration(GenerationInterface):
             actors.append(actor)
             names.append(name)
             bis.append(bi_resolved)
+
+        # Warm NCCL on the new actor while vLLM is still loading the model.
+        # This hides the 15-20s lazy-init cost behind model-load time so the
+        # first init_collective including this shard doesn't spike step time.
+        try:
+            ray.get(actors[0].warmup_nccl_library.remote(), timeout=60)
+        except Exception as e:  # noqa: BLE001
+            print(f"[add_dp_worker] warmup_nccl_library failed (non-fatal): {e}", flush=True)
 
         cached_info = getattr(self, "_cached_state_dict_info", None)
         if cached_info is not None:
@@ -1356,6 +1369,14 @@ class VllmGeneration(GenerationInterface):
             if self.cfg["vllm_cfg"]["async_engine"]
             else "prepare_refit_info"
         )
+
+        # Pre-warm NCCL on the initial cohort so the first refit doesn't pay
+        # the 15-20s lazy-init cost during init_collective.
+        warmup_futures = self.worker_group.run_all_workers_single_data(
+            "warmup_nccl_library",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(warmup_futures)
 
         # Use run_all_workers_single_data to send data to all workers
         futures = self.worker_group.run_all_workers_single_data(

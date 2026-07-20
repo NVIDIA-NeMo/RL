@@ -895,6 +895,7 @@ class RayWorkerGroup:
         *args,
         run_rank_0_only_axes: list[str] | None = None,
         common_kwargs: Optional[dict[str, Any]] = None,
+        restrict_to_indices: Optional[set[int]] = None,
         **kwargs,
     ) -> list[ray.ObjectRef]:
         """Run a method on all workers in parallel with different data.
@@ -905,6 +906,12 @@ class RayWorkerGroup:
                    e.g. [[arg1_for_worker_1, arg1_for_worker_2], [arg2_for_worker_1, arg2_for_worker_2]]
             run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
             common_kwargs: Keyword arguments to pass to all workers
+            restrict_to_indices: When provided, dispatch ONLY to workers whose index is in
+                this set (in addition to dead-index and rank-0-only filters). Used by
+                ``_raw_init_collective`` to dispatch only to the frozen joinable cohort,
+                excluding backfill shards that are alive but not yet joinable — without
+                this, the data list length mismatches the dispatch count and triggers an
+                assertion. ``rank_prefix`` / data lists must be sized to the restricted set.
             **kwargs: Keyword arguments to pass to workers/groups
                       e.g. {"key1": [value_for_worker_1, value_for_worker_2], "key2": [value_for_worker_1, value_for_worker_2]}
 
@@ -960,6 +967,8 @@ class RayWorkerGroup:
         data_idx = 0
         for worker_idx, worker in enumerate(self.workers):
             if worker_idx in self._dead_indices:
+                continue
+            if restrict_to_indices is not None and worker_idx not in restrict_to_indices:
                 continue
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 

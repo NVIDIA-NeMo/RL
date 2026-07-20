@@ -112,6 +112,13 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     group.broadcast(packed_tensors[buffer_idx], src=src)
                 break
 
+    # Drain any in-flight broadcasts on all streams. Without this, a peer
+    # dying during the last buffer's broadcast leaves its NCCL error enqueued
+    # on the stream; the error escapes silently and the caller returns True
+    # (success) for a partially-failed broadcast causing weight corruption.
+    for s in streams:
+        _sync_stream(s)
+
 
 def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
     """Consume a packed tensor and unpack it into a list of tensors.

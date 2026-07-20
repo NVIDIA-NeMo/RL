@@ -191,6 +191,54 @@ class VllmInternalWorkerExtension:
                 pass
         self.model_update_group = None  # type: ignore[assignment]
 
+    def warmup_nccl_library(self) -> None:
+        """Pre-warm NCCL's per-process lazy init before the first real collective.
+
+        On TP=PP=EP=1 gen workers there is no intra-shard NCCL group, so the
+        cross-cluster model_update_group is the first NCCL collective the process
+        ever sees. NCCL's lazy init (dlopen, IB probe, cuMemMap workspace) adds
+        15-20s to the first init_collective. This method pre-pays that cost with a
+        throwaway rank-1 communicator so subsequent init_collective calls hit warm
+        state. For TP>1 workers vLLM's own TP group has already triggered lazy
+        init, so this is a cheap no-op guarded by _nccl_library_warmed.
+        """
+        if getattr(self, "_nccl_library_warmed", False):
+            return
+
+        import time as _time
+        from nccl.core.communicator import Communicator
+        from nccl.core.utils import get_unique_id
+
+        _t = _time.monotonic()
+        try:
+            unique_id = get_unique_id()
+            with torch.cuda.device(self.device):
+                comm = Communicator.init(nranks=1, rank=0, unique_id=unique_id)
+                data = torch.ones(1, device=self.device)
+                comm.broadcast(
+                    sendbuf=data,
+                    recvbuf=data,
+                    root=0,
+                    stream=int(torch.cuda.current_stream().cuda_stream),
+                )
+                torch.cuda.current_stream().synchronize()
+                for method in ("abort", "destroy", "finalize"):
+                    fn = getattr(comm, method, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                            break
+                        except Exception:  # noqa: BLE001
+                            continue
+            self._nccl_library_warmed = True  # pyrefly: ignore[implicitly-defined-attribute]
+            print(
+                f"[warmup_nccl_library] device={self.device} "
+                f"total={_time.monotonic() - _t:.2f}s",
+                flush=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[warmup_nccl_library] failed (non-fatal): {e}", flush=True)
+
     def get_node_id(self) -> str:
         """Return the Ray node ID this worker is running on."""
         import ray
