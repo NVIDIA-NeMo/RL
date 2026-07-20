@@ -329,6 +329,47 @@ def test_nemo_gym_postprocess_agent_timeout_preserves_prompt_only_result():
     assert result["full_result"] is nemo_gym_result
 
 
+def test_nemo_gym_postprocess_agent_timeout_accepts_tokenizers_encoding():
+    """Fast-tokenizer chat templates may return a tokenizers.Encoding."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+
+    backend_tokenizer = Tokenizer(
+        WordLevel({"<unk>": 0, "fix": 10, "it": 20}, unk_token="<unk>")
+    )
+    backend_tokenizer.pre_tokenizer = Whitespace()
+    encoding = backend_tokenizer.encode("fix it", add_special_tokens=False)
+
+    class _Tokenizer:
+        def apply_chat_template(
+            self, input_messages, tokenize=True, add_generation_prompt=False
+        ):
+            assert input_messages == [{"role": "user", "content": "fix it"}]
+            assert tokenize is True
+            assert add_generation_prompt is True
+            return encoding
+
+    nemo_gym_result = {
+        "agent_timed_out": True,
+        "reward": 0.0,
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": "fix it"}]},
+        "instance_config": {"mask_sample": True},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assert result["message_log"][0]["token_ids"].tolist() == [10, 20]
+
+
 def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
     """If apply_chat_template itself fails while building the error message, the
     postprocess should still raise the original 'no generation data' ValueError with

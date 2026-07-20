@@ -18,6 +18,7 @@ from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
+from tokenizers import Encoding
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.virtual_cluster import (
@@ -521,6 +522,8 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     "but tokenizing its preserved input prompt failed: "
                     f"{type(e).__name__}: {e}"
                 ) from e
+            if isinstance(prompt_token_ids, Encoding):
+                prompt_token_ids = prompt_token_ids.ids
             nemo_rl_message_log.append(
                 {
                     "role": "user",
