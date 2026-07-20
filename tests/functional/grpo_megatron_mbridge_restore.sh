@@ -144,6 +144,10 @@ run_restore_phase \
 echo "[INFO] Phase 3: convert bridge → MLM and restore"
 MLM_CKPT="$EXP_DIR/mlm_ckpt/iter_0000000"
 trap "rm -rf $EXP_DIR/mlm_ckpt" EXIT
+# Current torch_dist checkpoints store common state through MCore, so the
+# converter needs the checked-out Megatron-LM package on its import path.
+MEGATRON_LM_SRC="$PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+PYTHONPATH="$MEGATRON_LM_SRC:${PYTHONPATH:-}" \
 uv run --no-sync python "$SCRIPT_DIR/_bridge_to_mlm_helper.py" \
     --bridge-iter-dir "$BRIDGE_CKPT" \
     --mlm-iter-dir "$MLM_CKPT"

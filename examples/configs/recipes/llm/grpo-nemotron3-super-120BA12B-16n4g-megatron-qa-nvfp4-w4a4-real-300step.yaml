@@ -1,0 +1,45 @@
+defaults: grpo-nemotron3-super-120BA12B-16n4g-megatron-qa-bf16-300step.yaml
+
+checkpointing:
+  checkpoint_dir: results/super120b-w4a4-real-300step
+
+policy:
+  disable_modelopt_layer_spec: true
+  quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
+  quant_calib_data: cnn_dailymail
+  quant_calib_size: 16
+  quant_batch_size: 1
+  quant_sequence_length: 1024
+  generation:
+    quant_cfg: examples/modelopt/quant_configs/nvfp4_experts.yaml
+    real_quant: true
+    real_quant_ignore:
+      - lm_head
+      - '*output_layer*'
+      - '*mtp*'
+      - '*router*'
+      - '*mixer.gate*'
+      - '*self_attention*'
+      - '*self_attn*'
+      - '*.q_proj*'
+      - '*.k_proj*'
+      - '*.v_proj*'
+      - '*.o_proj*'
+      - '*.qkv_proj*'
+      - '*.linear_qkv*'
+      - '*.linear_proj*'
+      - '*.mixer.in_proj*'
+      - '*.mixer.out_proj*'
+      - '*fc1_latent_proj*'
+      - '*fc2_latent_proj*'
+      - '*.shared_expert.*'
+      - '*.shared_experts.*'
+    vllm_kwargs:
+      moe_backend: auto
+
+logger:
+  log_dir: logs/super120b-w4a4-real-300step
+  wandb:
+    name: super120b-w4a4-real-300step
+  tensorboard:
+    log_dir: tb_logs/super120b-w4a4-real-300step

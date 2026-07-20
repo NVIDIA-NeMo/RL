@@ -707,7 +707,7 @@ class TestApplyMoeConfig:
             _apply_moe_config(model_cfg, config)
 
         assert model_cfg.moe_flex_dispatcher_backend == "hybridep"
-        assert model_cfg.moe_hybridep_num_sms == 32
+        assert model_cfg.moe_flex_dispatcher_num_sms == 32
         # min(ep_size=8, 64) == 8
         assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "8"
         # int(ep_size=8 > 4) == 1
@@ -718,6 +718,25 @@ class TestApplyMoeConfig:
             for m in warn_messages
         )
         assert any("USE_MNNVL not configured" in m for m in warn_messages)
+
+    def test_hybridep_num_sms_supports_old_mcore(self, monkeypatch):
+        """The existing recipe key still targets legacy MCore releases."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "1")
+        model_cfg = SimpleNamespace()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=32,
+        )
+
+        with patch("nemo_rl.models.megatron.setup.TransformerConfig", new=object):
+            _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_flex_dispatcher_num_sms")
+        assert model_cfg.moe_hybridep_num_sms == 32
 
     def test_hybridep_env_vars_from_explicit_config(self, monkeypatch):
         """Explicit hybridep_* config keys override defaults without warnings."""
@@ -1991,11 +2010,12 @@ class TestSetupModelConfig:
             "megatron_cfg": {},
         }
 
-        mock_cfg = MagicMock()
-        mock_cfg.model = self._make_model_cfg_mock()
+        mock_model_cfg = self._make_model_cfg_mock()
 
-        with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
-            mock_cc.from_yaml.return_value = mock_cfg
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
             with pytest.warns(
                 UserWarning, match="hf_config_overrides is set but will be ignored"
             ):
@@ -2006,6 +2026,8 @@ class TestSetupModelConfig:
                     hf_model_name="test-model",
                     pretrained_path=str(tmp_path),
                 )
+
+        mock_load_model_config.assert_called_once_with(str(tmp_path))
 
     def test_megatron_bridge_without_hf_config_overrides_no_warning(
         self, tmp_path, request
@@ -2027,11 +2049,12 @@ class TestSetupModelConfig:
             "megatron_cfg": {},
         }
 
-        mock_cfg = MagicMock()
-        mock_cfg.model = self._make_model_cfg_mock()
+        mock_model_cfg = self._make_model_cfg_mock()
 
-        with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
-            mock_cc.from_yaml.return_value = mock_cfg
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
             with _warnings.catch_warnings():
                 _warnings.simplefilter("error", UserWarning)
                 # Should not raise
@@ -2042,6 +2065,40 @@ class TestSetupModelConfig:
                     hf_model_name="test-model",
                     pretrained_path=str(tmp_path),
                 )
+
+        mock_load_model_config.assert_called_once_with(str(tmp_path))
+
+    def test_hf_conversion_loads_model_config_from_iteration_dir(
+        self, tmp_path, request
+    ):
+        """Converted HF caches enter through Bridge's compatibility loader."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        iteration_dir = tmp_path / "iter_0000000"
+        iteration_dir.mkdir()
+        (iteration_dir / "run_config.yaml").touch()
+        mock_model_cfg = self._make_model_cfg_mock()
+
+        config = {
+            "pretrained_checkpoint": None,
+            "megatron_cfg": {},
+        }
+
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path=str(tmp_path),
+            )
+
+        mock_load_model_config.assert_called_once_with(str(iteration_dir))
 
 
 @pytest.mark.mcore

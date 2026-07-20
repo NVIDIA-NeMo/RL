@@ -15,7 +15,9 @@ import gc
 import re
 import socket
 import traceback
-from typing import Any
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from typing import Any, Literal
 
 import torch
 import zmq
@@ -37,6 +39,66 @@ except ImportError:
         "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
         "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
+
+
+WeightUpdateTransport = Literal["ipc", "collective"]
+WeightUpdateFinalizer = Callable[[], None]
+
+
+def _format_refit_key_error(label: str, keys: set[str]) -> str:
+    """Format a bounded refit-key diagnostic."""
+    ordered = sorted(keys)
+    suffix = " ..." if len(ordered) > 8 else ""
+    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
+
+
+class IPCWeightManifestError(RuntimeError):
+    """An IPC transfer did not match the prepared state-dict manifest."""
+
+
+class _IPCWeightManifest:
+    """Validate an IPC stream against its prepared state-dict manifest."""
+
+    def __init__(self, expected_keys: Iterable[str]) -> None:
+        self.expected_keys = set(expected_keys)
+        self.loaded_keys: set[str] = set()
+        self.errors: list[str] = []
+
+    def validate_batch(self, keys: Sequence[str]) -> set[str] | None:
+        batch_keys: set[str] = set()
+        duplicate_keys: set[str] = set()
+        for key in keys:
+            if key in batch_keys:
+                duplicate_keys.add(key)
+            batch_keys.add(key)
+        duplicate_keys.update(self.loaded_keys & batch_keys)
+        unexpected_keys = batch_keys - self.expected_keys
+        if duplicate_keys:
+            self.errors.append(
+                _format_refit_key_error("duplicate keys", duplicate_keys)
+            )
+        if unexpected_keys:
+            self.errors.append(
+                _format_refit_key_error("unexpected keys", unexpected_keys)
+            )
+        return None if self.errors else batch_keys
+
+    def record_loaded(self, keys: set[str]) -> None:
+        self.loaded_keys.update(keys)
+
+    def record_load_failure(self, error: Exception) -> None:
+        message = f"{type(error).__name__}: {error}"
+        if len(message) > 512:
+            message = message[:512] + " ..."
+        self.errors.append(f"weight load failed: {message}")
+
+    def require_complete(self) -> None:
+        details = list(self.errors)
+        missing_keys = self.expected_keys - self.loaded_keys
+        if missing_keys:
+            details.append(_format_refit_key_error("missing keys", missing_keys))
+        if details:
+            raise IPCWeightManifestError("; ".join(details))
 
 
 def fix_gemma3_vision_weight_name(key: str) -> str:
@@ -180,18 +242,16 @@ class VllmInternalWorkerExtension:
         applier = self._get_sparse_delta_applier()
         return sorted(applier.discover_native_skips(state_dict_info))
 
+    def _uses_fp8_kv_cache(self) -> bool:
+        """Return whether this worker owns an FP8 KV cache."""
+        vllm_config = getattr(self.model_runner, "vllm_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+        kv_cache_dtype = getattr(cache_config, "cache_dtype", None)
+        return kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
-        use_fp8_kv_cache = False
-        if hasattr(self.model_runner.vllm_config, "cache_config"):
-            kv_cache_dtype = getattr(
-                self.model_runner.vllm_config.cache_config, "cache_dtype", None
-            )
-            use_fp8_kv_cache = (
-                kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
-            )
-
-        if not use_fp8_kv_cache:
+        if not self._uses_fp8_kv_cache():
             return
 
         # FP8 KV cache: process KV scales after weight loading
@@ -380,6 +440,36 @@ class VllmInternalWorkerExtension:
             )
         return self._sparse_delta_applier
 
+    @contextmanager
+    def _weight_update_lifecycle(
+        self, transport: WeightUpdateTransport
+    ) -> Iterator[WeightUpdateFinalizer]:
+        """Provide setup/finalization around a transport-owned weight update."""
+        del transport
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
+
+        def finalize() -> None:
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                process_weights_after_loading(
+                    self.model_runner.model, self.model_config, self.device
+                )
+
+        yield finalize
+        # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
+        # this optional second pass, just as it was before lifecycle hooks.
+        self._maybe_process_fp8_kv_cache()
+
+    def _weight_update_errors_are_fatal(self) -> bool:
+        """Whether transport errors should propagate instead of returning False."""
+        return False
+
+    def _synchronize_before_ipc_data_ack(self) -> None:
+        """Fence work consuming one IPC data batch before its acknowledgment."""
+        torch.cuda.current_stream().synchronize()
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -388,79 +478,90 @@ class VllmInternalWorkerExtension:
             bool: True if weights were successfully updated.
         """
         buffer = None
+        weight = None
         weights = None
 
         try:
             self.maybe_init_zmq()
-            while True:
-                # Blocking receive with timeout (this is the main operation)
-                payload = self.zmq_socket.recv_pyobj()
+            manifest = _IPCWeightManifest(self.state_dict_info)
+            with self._weight_update_lifecycle("ipc") as finalize:
+                while True:
+                    # Blocking receive with timeout (this is the main operation)
+                    payload = self.zmq_socket.recv_pyobj()
 
-                if payload == IPCProtocol.COMPLETE:
-                    # means the update is done
-                    from vllm.config import set_current_vllm_config
-                    from vllm.model_executor.model_loader.utils import (
-                        process_weights_after_loading,
-                    )
+                    if payload == IPCProtocol.COMPLETE:
+                        # A REP socket must reply even when validation or finalization
+                        # fails, otherwise the sender remains blocked until timeout.
+                        try:
+                            manifest.require_complete()
+                            finalize()
+                        finally:
+                            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                        break
 
-                    with set_current_vllm_config(self.model_runner.vllm_config):
-                        process_weights_after_loading(
-                            self.model_runner.model, self.model_config, self.device
+                    batch_keys = None
+                    batch_error = None
+                    try:
+                        ipc_handle, list_keys, used_bytes = payload
+                        batch_keys = manifest.validate_batch(list_keys)
+                        if batch_keys is None:
+                            continue
+
+                        buffer = rebuild_cuda_tensor_from_ipc(
+                            ipc_handle, self.device.index
                         )
-                    self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-                    break
+                        weights = []
+                        offset = 0
+                        for key in list_keys:
+                            shape, dtype = self.state_dict_info[key]  # pyrefly
+                            if isinstance(shape, list):
+                                shape = torch.Size(shape)
 
-                ipc_handle, list_keys, used_bytes = payload
-                buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
+                            size_in_bytes = dtype.itemsize * shape.numel()
+                            weight = (
+                                buffer[offset : offset + size_in_bytes]
+                                .view(dtype=dtype)
+                                .view(shape)
+                            )
+                            weights.append((key, weight))
+                            offset += calculate_aligned_size(size_in_bytes)
 
-                weight = None
-                weights = []
-                offset = 0
-                for key in list_keys:
-                    shape, dtype = self.state_dict_info[key]  # pyrefly
-                    if isinstance(shape, list):
-                        shape = torch.Size(shape)
+                        assert offset == used_bytes, (
+                            "Offset is not equal to used bytes, usually indicate "
+                            "inaccurate info like keys or cached dtype in "
+                            "state_dict_info"
+                        )
+                        self._load_weights(weights)
+                    except Exception as error:
+                        batch_error = error
+                    finally:
+                        # Synchronize before releasing or ACKing an IPC allocation,
+                        # including when a loader failed after scheduling CUDA work.
+                        if buffer is not None:
+                            try:
+                                self._synchronize_before_ipc_data_ack()
+                            except Exception as error:
+                                if batch_error is None:
+                                    batch_error = error
 
-                    # Get the weight from the buffer
-                    size_in_bytes = dtype.itemsize * shape.numel()
-                    weight = (
-                        buffer[offset : offset + size_in_bytes]
-                        .view(dtype=dtype)
-                        .view(shape)
-                    )
-                    weights.append((key, weight))
+                        if batch_error is not None:
+                            manifest.record_load_failure(batch_error)
+                        elif batch_keys is not None:
+                            manifest.record_loaded(batch_keys)
 
-                    # Move offset to the next weight
-                    aligned_size = calculate_aligned_size(size_in_bytes)
-                    offset += aligned_size
-
-                assert offset == used_bytes, (
-                    "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
-                )
-
-                # Load weights into the model
-                self._load_weights(weights)
-
-                torch.cuda.current_stream().synchronize()
-
-                # CRITICAL: Delete views before ACK to prevent corruption.
-                # 'weights' contains views into IPC shared memory. Even though load_weights()
-                # copied the data, Python may not garbage collect these view objects immediately.
-                # If sender reuses the buffer before GC runs, old views would read corrupted data.
-                # Explicit del ensures immediate cleanup before sending ACK.
-                del weight, weights, buffer
-                weight = None
-                weights = None
-                buffer = None
-                self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-
-            # Process weights after loading for FP8 KV cache
-            self._maybe_process_fp8_kv_cache()
+                        # Drop every view before ACK permits sender-side reuse.
+                        del weight, weights, buffer
+                        weight = None
+                        weights = None
+                        buffer = None
+                        self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
             gc.collect()
             torch.cuda.empty_cache()
             return True
         except Exception as e:
+            if self._weight_update_errors_are_fatal():
+                raise
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
                 f"{traceback.format_exc()}"
@@ -477,29 +578,19 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
-        load_model_weight_func = self._load_weights
-
         try:
-            packed_broadcast_consumer(
-                iterator=iter(self.state_dict_info.items()),
-                group=self.model_update_group,
-                src=0,
-                post_unpack_func=load_model_weight_func,
-            )
-
-            # Process weights after loading
-            from vllm.config import set_current_vllm_config
-            from vllm.model_executor.model_loader.utils import (
-                process_weights_after_loading,
-            )
-
-            with set_current_vllm_config(self.model_runner.vllm_config):
-                process_weights_after_loading(
-                    self.model_runner.model, self.model_config, self.device
+            with self._weight_update_lifecycle("collective") as finalize:
+                packed_broadcast_consumer(
+                    iterator=iter(self.state_dict_info.items()),
+                    group=self.model_update_group,
+                    src=0,
+                    post_unpack_func=self._load_weights,
                 )
-            self._maybe_process_fp8_kv_cache()
+                finalize()
 
         except Exception as e:
+            if self._weight_update_errors_are_fatal():
+                raise
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
             )

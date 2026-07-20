@@ -484,10 +484,12 @@ class MegatronPolicyWorkerImpl(
             return False
         return len(getattr(self.model, "remove_forward_pre_hook_handles", {})) > 0
 
-    def _disable_forward_pre_hook_until_next_train_step(self) -> None:
+    def _disable_forward_pre_hook_until_next_train_step(
+        self, *, param_sync: bool = False
+    ) -> None:
         assert isinstance(self.model, DistributedDataParallel)
         if self._forward_pre_hook_enabled():
-            self.disable_forward_pre_hook(param_sync=False)
+            self.disable_forward_pre_hook(param_sync=param_sync)
         model_config = get_model_config(self.model)
         self._first_train_step_param_sync_func = model_config.param_sync_func
         model_config.param_sync_func = None
@@ -2005,9 +2007,6 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
-    def _use_real_quant_refit(self) -> bool:
-        return False
-
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -2230,14 +2229,7 @@ class MegatronPolicyWorkerImpl(
         else:
             # Ordinary offload case
             if move_params:
-                new_state_dict = {}
-                for name, item in model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device=device, non_blocking=True, copy=True
-                        )
-                    new_state_dict[name] = item
-                model.load_state_dict(new_state_dict)
+                model.to(device=device, non_blocking=True)
         return model
 
     def move_optimizer(self, device: str):

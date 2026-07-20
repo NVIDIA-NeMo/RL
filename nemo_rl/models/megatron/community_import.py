@@ -154,8 +154,14 @@ def import_model_from_hf_name(
         ]
     if transformer_layer_spec is not None:
         model_provider.transformer_layer_spec = transformer_layer_spec
-    if mamba_stack_spec is not None and hasattr(model_provider, "mamba_stack_spec"):
-        model_provider.mamba_stack_spec = mamba_stack_spec
+    if mamba_stack_spec is not None:
+        # HybridModelProvider superseded the deprecated Mamba-only field.  A
+        # MambaModelProvider normalizes mamba_stack_spec only in __post_init__,
+        # so assignments made here must target the canonical field directly.
+        if hasattr(model_provider, "hybrid_stack_spec"):
+            model_provider.hybrid_stack_spec = mamba_stack_spec
+        elif hasattr(model_provider, "mamba_stack_spec"):
+            model_provider.mamba_stack_spec = mamba_stack_spec
     model_provider.finalize()
 
     from megatron.core import parallel_state

@@ -142,6 +142,7 @@ project-includes = [
   "nemo_rl/modelopt/__init__.py",
   "nemo_rl/modelopt/models/__init__.py",
   "nemo_rl/modelopt/models/generation/__init__.py",
+  "nemo_rl/modelopt/models/generation/vllm_modelopt.py",
   "nemo_rl/modelopt/models/generation/vllm_quant_worker.py",
   "nemo_rl/modelopt/models/policy/__init__.py",
   "nemo_rl/modelopt/models/policy/workers/__init__.py",
