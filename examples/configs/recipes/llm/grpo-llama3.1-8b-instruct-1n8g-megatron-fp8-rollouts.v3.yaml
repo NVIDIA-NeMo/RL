@@ -34,6 +34,15 @@ policy:
       precision: fp8
       max_model_len: 4096
       use_deep_gemm: true
+    vllm_kwargs:
+      # At the same gpu_memory_utilization, vLLM 0.25's profiling sizes the
+      # KV cache several GiB larger than 0.20 did, growing the CuMemAllocator
+      # sleep pool past what can be re-mapped at wake-up next to the
+      # colocated Megatron policy ("CUDA Error: out of memory at
+      # csrc/cumem_allocator.cpp"; lowering gpu_memory_utilization to 0.5
+      # still OOM'ed). Pin the KV cache to a 0.20-equivalent size instead
+      # (takes precedence over gpu_memory_utilization).
+      kv_cache_memory_bytes: 21474836480  # 20 GiB
 data:
   max_input_seq_length: 4096
 logger:
