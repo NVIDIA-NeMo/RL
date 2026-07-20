@@ -45,6 +45,8 @@ policy:
     bias_activation_fusion: false
     defer_fp32_logits: true
     moe_per_layer_logging: true
+    checkpoint:
+      async_save: false
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06
