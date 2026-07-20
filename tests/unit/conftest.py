@@ -196,9 +196,7 @@ def pytest_collection_modifyitems(config, items):
                 "Cannot run TensorRT-LLM tests: tensorrt_llm is not available.\n"
                 "Please run tests with: uv run --extra trtllm --group test pytest ..."
             )
-        new_items = [
-            item for item in new_items if item.get_closest_marker("trtllm")
-        ]
+        new_items = [item for item in new_items if item.get_closest_marker("trtllm")]
     else:
         new_items = [
             item for item in new_items if not item.get_closest_marker("trtllm")

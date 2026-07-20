@@ -53,9 +53,7 @@ def _config():
 
 
 def _worker():
-    worker = TrtllmAsyncGenerationWorkerImpl.__new__(
-        TrtllmAsyncGenerationWorkerImpl
-    )
+    worker = TrtllmAsyncGenerationWorkerImpl.__new__(TrtllmAsyncGenerationWorkerImpl)
     worker.cfg = _config()
     worker.model_name = worker.cfg["model_name"]
     worker.is_model_owner = True

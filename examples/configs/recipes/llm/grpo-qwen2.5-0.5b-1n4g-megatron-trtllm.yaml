@@ -1,14 +1,11 @@
 defaults: ../../grpo_math_1B_trtllm.yaml
-
 grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 4
   max_val_samples: 64
   val_batch_size: 64
-
 checkpointing:
   checkpoint_dir: results/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm
-
 policy:
   model_name: Qwen/Qwen2.5-0.5B
   tokenizer:
@@ -26,18 +23,10 @@ policy:
     enabled: true
   generation:
     max_new_tokens: 512
-    colocated:
-      enabled: true
-    trtllm_cfg:
-      async_engine: true
-      tensor_parallel_size: 1
-
 logger:
   log_dir: logs/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm
   wandb:
     project: nemo-rl
     name: grpo-qwen2.5-0.5b-1n4g-megatron-trtllm
-
 cluster:
   gpus_per_node: 4
-  num_nodes: 1
