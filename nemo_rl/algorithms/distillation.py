@@ -524,7 +524,7 @@ def setup(
                 )
                 thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
                 truncate_noncontiguous_episodes = nemo_gym_dict.pop(
-                    "truncate_noncontiguous_episodes", False
+                    "truncate_noncontiguous_episodes", None
                 )
                 # Pass prebuilt cache + venv dirs through the global config so the
                 # gym reuses image-baked venvs instead of rebuilding them.

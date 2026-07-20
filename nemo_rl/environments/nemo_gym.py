@@ -667,7 +667,7 @@ def spinup_nemo_gym_actor(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     truncate_noncontiguous_episodes = nemo_gym_dict.pop(
-        "truncate_noncontiguous_episodes", False
+        "truncate_noncontiguous_episodes", None
     )
 
     # Pass prebuilt cache + venv dirs through the global config so the gym reuses
