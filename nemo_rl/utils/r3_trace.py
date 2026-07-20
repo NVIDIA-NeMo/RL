@@ -448,6 +448,65 @@ def trace_tq_fetch_payload(
         _write_record(record)
 
 
+def trace_tq_prefetch_payload(
+    *,
+    keys: Sequence[str],
+    data: Any,
+) -> None:
+    """Trace a prefetched train microbatch without starting a new RL step.
+
+    The full-shard fetch path calls :func:`trace_tq_fetch_payload` once per
+    step. All-field prefetch delivers one packed microbatch at a time, so its
+    step identity comes from the surrounding ``r3_trace_stage("train")`` context
+    and only the microbatch counter advances. The function is a no-op when the
+    optional routed-experts field is absent.
+    """
+    ctx = _current_context()
+    if (
+        ctx is None
+        or ctx["stage"] != "train"
+        or "routed_experts" not in data
+        or "input_lengths" not in data
+    ):
+        return
+
+    counter = ctx["microbatch_counts"]
+    counter["tq_prefetch"] += 1
+    microbatch_idx = int(counter["tq_prefetch"])
+    routed_experts = data["routed_experts"]
+    input_lengths = data["input_lengths"]
+    input_ids = data.get("input_ids")
+    sample_count = min(len(keys), int(routed_experts.shape[0]))
+    preview_samples = _trace_samples()
+
+    for sample_idx in range(sample_count):
+        valid_length = _length_at(input_lengths, sample_idx)
+        preview_limit = 16 if sample_idx < preview_samples else 0
+        record = {
+            "event": "tq_fetch_sample",
+            "stage": "train",
+            "trace_step": ctx["trace_step"],
+            "microbatch_idx": microbatch_idx,
+            "sample_idx": sample_idx,
+            "key": keys[sample_idx],
+            "valid_length": valid_length,
+            "routed_experts": _valid_sample_record(
+                routed_experts,
+                sample_idx=sample_idx,
+                valid_length=valid_length,
+                preview_limit=preview_limit,
+            ),
+        }
+        if input_ids is not None:
+            record["input_ids"] = _valid_sample_record(
+                input_ids,
+                sample_idx=sample_idx,
+                valid_length=valid_length,
+                preview_limit=preview_limit,
+            )
+        _write_record(record)
+
+
 @contextmanager
 def r3_trace_stage(stage: str) -> Iterator[None]:
     active, step = _should_trace_step(f"stage:{stage}")

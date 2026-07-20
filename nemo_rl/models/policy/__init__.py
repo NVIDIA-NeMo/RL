@@ -511,6 +511,19 @@ class RouterReplayConfig(TypedDict):
     enabled: Literal[True]
 
 
+class TrainMicrobatchPrefetchConfig(TypedDict):
+    """Sync-TQ train fetch granularity and failure deadlines."""
+
+    enabled: bool
+    # 0 fetches on demand; 1 overlaps preparation of the next microbatch.
+    depth: NotRequired[Literal[0, 1]]
+    # Required when enabled: maximum foreground wait for one microbatch.
+    item_ready_timeout_s: NotRequired[float]
+    # Includes receiver lead and depth-zero compute gaps. When absent,
+    # PyTorch's Gloo backend default is used.
+    collective_timeout_s: NotRequired[float]
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -532,6 +545,7 @@ class PolicyConfig(TypedDict):
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
+    train_microbatch_prefetch: NotRequired[TrainMicrobatchPrefetchConfig]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]

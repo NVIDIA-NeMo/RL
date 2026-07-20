@@ -48,6 +48,8 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -84,6 +86,12 @@ from nemo_rl.models.megatron.train import (
     aggregate_training_statistics,
     megatron_forward_backward,
 )
+from nemo_rl.models.megatron.train_microbatch_prefetch import (
+    TQ_SAMPLE_IDS_FIELD,
+    TrainMicrobatchPrefetcher,
+    TrainMicrobatchPrefetchGroup,
+    initialize_train_microbatch_prefetch_group,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -106,13 +114,14 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 def _should_use_router_replay(
     *,
     enabled: bool,
-    data: BatchedDataDict[Any],
+    data: Optional[BatchedDataDict[Any]],
     stage: str,
     require: bool,
+    deferred_routes: bool = False,
 ) -> bool:
     if not enabled or not require:
         return False
-    if "routed_experts" in data:
+    if (data is not None and "routed_experts" in data) or deferred_routes:
         return True
     raise RuntimeError(
         "policy.router_replay.enabled=true requires routed_experts for "
@@ -121,6 +130,18 @@ def _should_use_router_replay(
         "stopped carrying routed_experts. Reference-logprob intentionally skips "
         "routed_experts; prev-logprob and train must not."
     )
+
+
+def _attach_mtp_loss_mask(
+    raw_iterator: Iterator[BatchedDataDict[Any]],
+) -> Iterator[BatchedDataDict[Any]]:
+    """Create the MTP mask after a complete raw microbatch is prefetched."""
+    for microbatch in raw_iterator:
+        if "token_mask" in microbatch and "sample_mask" in microbatch:
+            microbatch["mtp_loss_mask"] = microbatch["token_mask"] * microbatch[
+                "sample_mask"
+            ].unsqueeze(-1)
+        yield microbatch
 
 
 def _model_self_packs_for_cp(model: Any) -> bool:
@@ -225,6 +246,64 @@ class MegatronPolicyWorkerImpl(
         self._replica_group_cache = groups[my_dp_rank]
         return self._replica_group_cache
 
+    @wrap_with_nvtx_name("policy_worker/train_presharded")
+    def train_presharded(
+        self,
+        meta: KVBatchMeta,
+        loss_fn: Any,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Train from a metadata plan with optional all-field microbatch fetch."""
+        if not self._train_microbatch_prefetch_enabled:
+            return super().train_presharded(
+                meta,
+                loss_fn=loss_fn,
+                eval_mode=eval_mode,
+                gbs=gbs,
+                mbs=mbs,
+            )
+        if self._train_microbatch_prefetch_group is None:
+            raise RuntimeError(
+                "train microbatch prefetch group was not initialized during "
+                "Megatron worker construction"
+            )
+        skeleton = BatchedDataDict({TQ_SAMPLE_IDS_FIELD: list(meta.sample_ids)})
+        skeleton = self._attach_or_repack_pack_metadata(skeleton, meta)
+
+        prefetcher = TrainMicrobatchPrefetcher(
+            client=self._require_dp_client(),
+            meta=meta,
+            group=self._train_microbatch_prefetch_group,
+            pad_value_dict=self._pad_value_dict(),
+            depth=self._train_microbatch_prefetch_depth,
+            item_ready_timeout_s=(self._train_microbatch_prefetch_item_ready_timeout_s),
+        )
+        try:
+            result = self.train(
+                skeleton,
+                loss_fn=loss_fn,
+                eval_mode=eval_mode,
+                gbs=gbs,
+                mbs=mbs,
+                microbatch_prefetcher=prefetcher,
+            )
+            prefetcher.assert_complete()
+        except Exception as train_error:
+            try:
+                prefetcher.close()
+            except Exception as close_error:
+                train_error.add_note(
+                    "microbatch-prefetch cleanup also failed: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+            raise
+        else:
+            prefetcher.close()
+            result["train_microbatch_prefetch_metrics"] = prefetcher.metrics()
+            return result
+
     @staticmethod
     def configure_worker(
         num_gpus: int | float,
@@ -294,6 +373,39 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        prefetch_cfg = config.get("train_microbatch_prefetch") or {}
+        self._train_microbatch_prefetch_enabled = bool(prefetch_cfg.get("enabled"))
+        self._train_microbatch_prefetch_depth = 0
+        self._train_microbatch_prefetch_item_ready_timeout_s = 0.0
+        self._train_microbatch_prefetch_collective_timeout_s: float | None = None
+        self._train_microbatch_prefetch_group: Optional[
+            TrainMicrobatchPrefetchGroup
+        ] = None
+        if self._train_microbatch_prefetch_enabled:
+            if "item_ready_timeout_s" not in prefetch_cfg:
+                raise ValueError(
+                    "policy.train_microbatch_prefetch.item_ready_timeout_s is "
+                    "required when prefetch is enabled"
+                )
+            self._train_microbatch_prefetch_depth = int(prefetch_cfg.get("depth", 1))
+            self._train_microbatch_prefetch_item_ready_timeout_s = float(
+                prefetch_cfg["item_ready_timeout_s"]
+            )
+            collective_timeout_s = prefetch_cfg.get("collective_timeout_s")
+            if collective_timeout_s is not None:
+                self._train_microbatch_prefetch_collective_timeout_s = float(
+                    collective_timeout_s
+                )
+            if self._train_microbatch_prefetch_depth not in (0, 1):
+                raise ValueError(
+                    "policy.train_microbatch_prefetch.depth must be 0 or 1"
+                )
+            sequence_packing_cfg = config.get("sequence_packing")
+            if sequence_packing_cfg is None or not sequence_packing_cfg["enabled"]:
+                raise ValueError(
+                    "policy.train_microbatch_prefetch.enabled=true currently "
+                    "requires policy.sequence_packing.enabled=true"
+                )
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -437,6 +549,17 @@ class MegatronPolicyWorkerImpl(
             self.model,
             self.optimizer,
         )
+        if self._train_microbatch_prefetch_enabled:
+            # Actor construction is already world-collective through Megatron
+            # setup. Create every prefetch group here so a later per-rank TQ
+            # connection failure cannot strand healthy ranks in new_group().
+            self._train_microbatch_prefetch_group = (
+                initialize_train_microbatch_prefetch_group(
+                    collective_timeout_s=(
+                        self._train_microbatch_prefetch_collective_timeout_s
+                    )
+                )
+            )
         self._first_train_step_forward_pre_hook_disabled = False
         self._first_train_step_param_sync_func = None
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
@@ -550,18 +673,28 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         check_dim_skip_keys: Optional[Iterable[str]] = None,
+        microbatch_prefetcher: Optional[TrainMicrobatchPrefetcher] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
         ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
         workers (cross-tokenizer ride-along tensors whose dim 1 is not the
         student sequence axis). Megatron doesn't run cross-tokenizer, so it
-        must be None.
+        must be None. ``microbatch_prefetcher`` is used only by the synchronous
+        TQ train entrypoint to stream complete packed microbatches.
         """
         assert check_dim_skip_keys is None, (
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        if (
+            getattr(self, "_train_microbatch_prefetch_enabled", False)
+            and microbatch_prefetcher is None
+        ):
+            raise RuntimeError(
+                "policy.train_microbatch_prefetch is supported only by the "
+                "synchronous TQ train_presharded path"
+            )
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -587,6 +720,15 @@ class MegatronPolicyWorkerImpl(
             group=parallel_state.get_data_parallel_group(),
         )
         num_global_batches = int(total_dataset_size.item()) // gbs
+        if (
+            microbatch_prefetcher is not None
+            and len(microbatch_prefetcher.plan.global_batches) != num_global_batches
+        ):
+            raise RuntimeError(
+                "train microbatch plan/global-batch mismatch: plan has "
+                f"{len(microbatch_prefetcher.plan.global_batches)}, training "
+                f"expects {num_global_batches}"
+            )
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
@@ -614,16 +756,45 @@ class MegatronPolicyWorkerImpl(
             losses = []
             total_num_microbatches = 0
             for gb_idx in range(num_global_batches):
-                gb_result = process_global_batch(
-                    data,
-                    loss_fn=loss_fn,
-                    dp_group=parallel_state.get_data_parallel_group(),
-                    batch_idx=gb_idx,
-                    batch_size=local_gbs,
-                )
-                batch = gb_result["batch"]
-                global_valid_seqs = gb_result["global_valid_seqs"]
-                global_valid_toks = gb_result["global_valid_toks"]
+                if microbatch_prefetcher is None:
+                    gb_result = process_global_batch(
+                        data,
+                        loss_fn=loss_fn,
+                        dp_group=parallel_state.get_data_parallel_group(),
+                        batch_idx=gb_idx,
+                        batch_size=local_gbs,
+                    )
+                    batch = gb_result["batch"]
+                    global_valid_seqs = gb_result["global_valid_seqs"]
+                    global_valid_toks = gb_result["global_valid_toks"]
+                    prefetched_raw_iterator = None
+                    prefetched_microbatch_lengths = None
+                    prefetched_forward_pad_seqlen = None
+                else:
+                    batch = data.get_batch(
+                        batch_idx=gb_idx,
+                        batch_size=local_gbs,
+                    )
+                    global_batch_plan = microbatch_prefetcher.plan.global_batches[
+                        gb_idx
+                    ]
+                    global_valid_seqs = torch.tensor(
+                        global_batch_plan.global_valid_seqs,
+                        dtype=torch.float32,
+                        device="cuda",
+                    )
+                    global_valid_toks = torch.tensor(
+                        global_batch_plan.global_valid_toks,
+                        dtype=torch.float32,
+                        device="cuda",
+                    )
+                    prefetched_raw_iterator = microbatch_prefetcher.iter_global_batch(
+                        gb_idx
+                    )
+                    prefetched_microbatch_lengths = global_batch_plan.microbatch_lengths
+                    prefetched_forward_pad_seqlen = (
+                        microbatch_prefetcher.plan.pad_to_seqlen
+                    )
 
                 # Pre-compute the MTP loss mask, only when MTP is enabled, so
                 # process_microbatch can pack it.
@@ -635,6 +806,10 @@ class MegatronPolicyWorkerImpl(
                         "sample_mask"
                     ].unsqueeze(-1)
                     batch["mtp_loss_mask"] = mtp_loss_mask
+                elif mtp_enabled and prefetched_raw_iterator is not None:
+                    prefetched_raw_iterator = _attach_mtp_loss_mask(
+                        prefetched_raw_iterator
+                    )
 
                 (
                     data_iterator,
@@ -648,6 +823,9 @@ class MegatronPolicyWorkerImpl(
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
                     delegate_pack_to_model=self.delegate_pack_to_model,
+                    prefetched_raw_iterator=prefetched_raw_iterator,
+                    prefetched_microbatch_lengths=prefetched_microbatch_lengths,
+                    prefetched_forward_pad_seqlen=prefetched_forward_pad_seqlen,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -694,6 +872,11 @@ class MegatronPolicyWorkerImpl(
                         data=batch,
                         stage="train",
                         require=True,
+                        deferred_routes=(
+                            microbatch_prefetcher is not None
+                            and ROUTED_EXPERTS_FIELD
+                            in microbatch_prefetcher.plan.fields
+                        ),
                     )
                     with maybe_r3_trace_stage("train", enabled=use_router_replay):
                         losses_reduced = megatron_forward_backward(
@@ -1024,6 +1207,11 @@ class MegatronPolicyWorkerImpl(
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
     ) -> None:
+        if getattr(self, "_train_microbatch_prefetch_enabled", False):
+            raise RuntimeError(
+                "policy.train_microbatch_prefetch is not supported by the "
+                "split/async TQ training path"
+            )
         existing = getattr(self, "_train_step_state", None)
         if existing is not None:
             raise RuntimeError(

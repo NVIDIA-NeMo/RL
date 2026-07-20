@@ -33,7 +33,7 @@ from unittest.mock import MagicMock, patch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
-from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.tq_policy import TQPolicy, _aggregate_train_results
 
 
 class _SplitStubWorker(TQWorkerMixin):
@@ -125,6 +125,25 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
 
 
 class TestTQPolicySplitFanout:
+    def test_train_aggregation_preserves_one_prefetch_source_per_dp(self):
+        def _result(rank: int, wait_s: float) -> dict:
+            return {
+                "rank": rank,
+                "global_loss": 1.0,
+                "grad_norm": 0.5,
+                "all_mb_metrics": {"loss": [0.1]},
+                "train_microbatch_prefetch_metrics": {
+                    "consumer_wait_s": wait_s,
+                },
+            }
+
+        out = _aggregate_train_results([_result(0, 0.1), _result(16, 0.2)])
+
+        assert out["train_microbatch_prefetch_source_metrics"] == [
+            {"rank": 0, "consumer_wait_s": 0.1},
+            {"rank": 16, "consumer_wait_s": 0.2},
+        ]
+
     def test_begin_consumes_single_data_futures_with_ray_get(self):
         """run_all_workers_single_data returns plain ObjectRefs, not a
         MultiWorkerFuture — the fan-out must ray.get them (PR #2683
