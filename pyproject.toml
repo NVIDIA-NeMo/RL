@@ -206,9 +206,7 @@ mcore = [
 # backend (_backend.py). The path source lets uv lock resolve the dep graph
 # without compiling (prepare_metadata_for_build_wheel returns static metadata).
 # The actual ~60-min wheel build is triggered by `uv sync --extra trtllm`.
-trtllm = [
-  "tensorrt-llm==1.3.0rc21",
-]
+trtllm = ["tensorrt-llm==1.3.0rc21"]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext==0.6.0",
@@ -552,7 +550,10 @@ requires-dist = ["tensorrt-cu13==10.16.1.11"]
 [[tool.uv.dependency-metadata]]
 name = "tensorrt-cu13"
 version = "10.16.1.11"
-requires-dist = ["tensorrt-cu13-libs==10.16.1.11", "tensorrt-cu13-bindings==10.16.1.11"]
+requires-dist = [
+  "tensorrt-cu13-libs==10.16.1.11",
+  "tensorrt-cu13-bindings==10.16.1.11",
+]
 
 # wheel_stub — downloads the actual C++ library binary at install time.
 [[tool.uv.dependency-metadata]]
