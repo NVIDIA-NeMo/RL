@@ -2052,9 +2052,9 @@ def run_async_nemo_gym_rollout(
             if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
                 rollout_metrics[metric_name] = penalty_counts[key] / len(results)
 
-    # Expose per-component rewards (reward1, reward2, ...) for multi-reward NeMo Gym
-    # environments so GDPO can compute per-component advantages; single-reward envs are
-    # unaffected. Mirrors the native rollout path's reward-component handling above.
+    # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
+    # Gym environments so GDPO can compute per-component advantages; single-reward envs
+    # are unaffected. Mirrors the native rollout path's reward-component handling above.
     from nemo_rl.environments.nemo_gym import (
         extract_reward_components,
         validate_reward_components_match_scalar,
@@ -2062,18 +2062,19 @@ def run_async_nemo_gym_rollout(
 
     component_dicts = [extract_reward_components(r["full_result"]) for r in results]
     if any(c is not None for c in component_dicts):
-        # Canonical (alphabetical) component ordering, not just deduplication: the
-        # reward{n} index -> component-name mapping must be stable across every sample
-        # and every run. GDPO's per-component baseline (calculate_baseline_and_std_per_prompt)
-        # assumes reward1 denotes the same signal for all responses to a prompt, and
-        # grpo.adv_estimator.reward_weights is documented as "ordered to match reward1,
-        # reward2, ...". A first-seen order (e.g. dict.fromkeys) would be batch-dependent
-        # and could shift that mapping between runs; sorting keeps it deterministic.
-        ordered_names = sorted(
+        # Emit each component under a `reward/<name>` key, matching the native
+        # multi-reward path and what get_gdpo_reward_component_keys() consumes (it selects
+        # keys starting with "reward/" and sorts them by name). The name carries the
+        # component identity, so ordering is handled downstream by that sort — no
+        # positional index needed. Take the union of names across the batch and default a
+        # component absent on a given sample to 0.0, so every sample carries the same key
+        # set (the per-prompt baseline requires each reward/<name> present for all
+        # responses to a prompt).
+        component_names = sorted(
             {name for c in component_dicts if c is not None for name in c}
         )
-        for component_idx, name in enumerate(ordered_names, start=1):
-            final_batch[f"reward{component_idx}"] = torch.tensor(
+        for name in component_names:
+            final_batch[f"reward/{name}"] = torch.tensor(
                 [
                     c[name] if c is not None and name in c else 0.0
                     for c in component_dicts

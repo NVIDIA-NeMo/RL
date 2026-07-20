@@ -2867,8 +2867,8 @@ def test_gdpo_advantage_estimator_reward_weights():
     prompt_ids = torch.tensor([[0], [0], [0]])
     mask = torch.ones(3, 2)
     repeated_batch = {
-        "reward1": torch.tensor([1.0, 0.0, 1.0]),
-        "reward2": torch.tensor([1.0, 1.0, 0.0]),
+        "reward/correctness": torch.tensor([1.0, 0.0, 1.0]),
+        "reward/format": torch.tensor([1.0, 1.0, 0.0]),
     }
 
     def run(weights):

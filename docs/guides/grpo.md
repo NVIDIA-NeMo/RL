@@ -637,8 +637,9 @@ Note that this method only has an effect when training involves more than one re
 
 The aggregation weights \\( w_n \\) in \\( A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)} \\)
 are configurable via `reward_weights`, an optional list with one entry per reward
-component, ordered to match `reward1, reward2, ...`. When omitted, all weights default
-to `1.0` (equal weighting). For example, to down-weight the second and third rewards:
+component, ordered alphabetically by component name (matching the sorted `reward/<name>`
+keys). When omitted, all weights default to `1.0` (equal weighting). For example, to
+down-weight the second and third rewards:
 ```
 grpo:
   adv_estimator:

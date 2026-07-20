@@ -122,7 +122,8 @@ class GDPOAdvantageEstimator:
                 f"This batch has {len(reward_component_keys)} component(s): {reward_component_keys}. "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
-        # Resolve per-reward weights (ordered to match reward1, reward2, ...).
+        # Resolve per-reward weights (ordered to match the reward/<name> components,
+        # sorted alphabetically by name — same order as reward_component_keys).
         weights = self.reward_weights
         if weights is None:
             weights = [1.0] * len(reward_component_keys)
@@ -130,7 +131,8 @@ class GDPOAdvantageEstimator:
             raise ValueError(
                 f"reward_weights has {len(weights)} entries but this batch has "
                 f"{len(reward_component_keys)} reward components ({reward_component_keys}). "
-                "Provide exactly one weight per component, ordered to match reward1, reward2, ..."
+                "Provide exactly one weight per component, ordered alphabetically by "
+                "component name (matching the sorted reward/<name> keys)."
             )
         valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
         leave_one_out = self.use_leave_one_out_baseline
