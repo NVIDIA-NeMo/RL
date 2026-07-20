@@ -46,6 +46,7 @@ from megatron.bridge.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
 )
+from megatron.bridge.training.model_load_save import load_model_config
 from megatron.bridge.training.optim import setup_optimizer
 from megatron.bridge.training.setup import (
     _create_peft_pre_wrap_hook,
@@ -54,7 +55,6 @@ from megatron.bridge.training.setup import (
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
-from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -519,9 +519,9 @@ def setup_model_config(
         _patch_hf_config_double_instantiation()
 
         try:
-            cfg_from_pretrained = ConfigContainer.from_yaml(
-                pretrained_run_config, mode=InstantiationMode.STRICT
-            )
+            # Enter through Bridge's checkpoint loader so its compatibility
+            # migrations run before the serialized model config is instantiated.
+            model_cfg, _ = load_model_config(os.path.dirname(pretrained_run_config))
         except Exception as e:
             # Add helpful context as a note to the exception
             e.add_note(
@@ -535,9 +535,6 @@ def setup_model_config(
                 f"{'=' * 80}"
             )
             raise
-
-        model_cfg = cfg_from_pretrained.model
-        cfg_from_pretrained.logger = LoggerConfig()
 
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
@@ -704,7 +701,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
             "moe_flex_dispatcher_backend"
         ]
     if "moe_hybridep_num_sms" in config["megatron_cfg"]:
-        model_cfg.moe_hybridep_num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+        num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+        if hasattr(TransformerConfig, "moe_flex_dispatcher_num_sms"):
+            model_cfg.moe_flex_dispatcher_num_sms = num_sms
+        else:
+            model_cfg.moe_hybridep_num_sms = num_sms
 
     # HybridEP environment variables
     # These are required by DeepEP's hybrid-ep branch for NVLink domain configuration.

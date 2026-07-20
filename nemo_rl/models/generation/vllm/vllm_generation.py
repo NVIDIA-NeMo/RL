@@ -43,6 +43,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ class VllmGeneration(GenerationInterface):
         # Store config
         self.cfg = config
         self._defer_model_load = defer_model_load
+        self.weight_synchronizer: WeightSynchronizer | None = None
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -903,6 +905,8 @@ class VllmGeneration(GenerationInterface):
     def shutdown(self) -> bool:
         """Shut down all vLLM workers and clean up resources."""
         try:
+            if self.weight_synchronizer is not None:
+                self.weight_synchronizer.shutdown()
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
         except Exception as e:

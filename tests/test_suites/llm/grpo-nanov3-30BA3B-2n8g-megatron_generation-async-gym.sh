@@ -8,7 +8,11 @@ GPUS_PER_NODE=8
 STEPS_PER_RUN=8
 MAX_STEPS=8
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=90
+# ~25 min startup (30B-MoE load + CUDA-graph warmup + nemo_gym servers) plus
+# ~63 min for 8 async steps left no headroom at 90 min, so the driver finished
+# but Slurm SIGKILLed teardown/metric-dump at the wall-clock limit (CI mislabels
+# the exit-137 as OOM). 120 min leaves margin for teardown + metrics.
+NUM_MINUTES=120
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

@@ -20,6 +20,12 @@ import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_FALLBACK_DTYPE,
+    get_num_routed_experts,
+    resolve_routed_experts_dtype,
+)
+from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
@@ -223,11 +229,14 @@ def test_normalize_routed_experts_full_sequence_alignment():
     )
 
     assert routed_experts.shape == (8, 3, 2)
-    assert routed_experts.dtype == torch.int32
+    assert routed_experts.dtype == ROUTED_EXPERTS_FALLBACK_DTYPE
     assert torch.equal(
-        routed_experts[:5], completion_output.routed_experts.to(torch.int32)
+        routed_experts[:5],
+        completion_output.routed_experts.to(ROUTED_EXPERTS_FALLBACK_DTYPE),
     )
-    expected_default_route = torch.tensor([0, 1], dtype=torch.int32).view(1, 1, 2)
+    expected_default_route = torch.tensor(
+        [0, 1], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    ).view(1, 1, 2)
     assert torch.equal(routed_experts[5:], expected_default_route.expand(3, 3, 2))
 
 
@@ -237,8 +246,12 @@ def test_normalize_routed_experts_concatenates_prompt_and_decode():
 
     request_output = Output()
     completion_output = Output()
-    request_output.prompt_routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
-    completion_output.routed_experts = 2 * torch.ones(3, 1, 2, dtype=torch.int32)
+    request_output.prompt_routed_experts = torch.ones(
+        2, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
+    completion_output.routed_experts = 2 * torch.ones(
+        3, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
 
     routed_experts = pad_and_align_routed_expert_indices(
         request_output,
@@ -248,7 +261,9 @@ def test_normalize_routed_experts_concatenates_prompt_and_decode():
         device=torch.device("cpu"),
     )
 
-    expected_default_route = torch.tensor([0, 1], dtype=torch.int32).view(1, 1, 2)
+    expected_default_route = torch.tensor(
+        [0, 1], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    ).view(1, 1, 2)
     assert torch.equal(routed_experts[:2], request_output.prompt_routed_experts)
     assert torch.equal(routed_experts[2:4], completion_output.routed_experts[:2])
     assert torch.equal(routed_experts[4:], expected_default_route.expand(1, 1, 2))
@@ -265,7 +280,7 @@ def test_normalize_routed_experts_uses_valid_dummy_route_for_missing_last_token(
             [[4, 5, 6], [7, 8, 9]],
             [[1, 2, 3], [10, 11, 12]],
         ],
-        dtype=torch.int32,
+        dtype=ROUTED_EXPERTS_FALLBACK_DTYPE,
     )
 
     routed_experts = pad_and_align_routed_expert_indices(
@@ -276,7 +291,9 @@ def test_normalize_routed_experts_uses_valid_dummy_route_for_missing_last_token(
         device=torch.device("cpu"),
     )
 
-    expected_default_route = torch.tensor([0, 1, 2], dtype=torch.int32).view(1, 1, 3)
+    expected_default_route = torch.tensor(
+        [0, 1, 2], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    ).view(1, 1, 3)
     assert torch.equal(routed_experts[:2], completion_output.routed_experts)
     assert torch.equal(routed_experts[2:], expected_default_route.expand(3, 2, 3))
 
@@ -293,7 +310,7 @@ def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_r
             [[1, 2, 3], [10, 11, 12]],
             [[0, 0, 0], [0, 0, 0]],
         ],
-        dtype=torch.int32,
+        dtype=ROUTED_EXPERTS_FALLBACK_DTYPE,
     )
 
     routed_experts = pad_and_align_routed_expert_indices(
@@ -304,7 +321,9 @@ def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_r
         device=torch.device("cpu"),
     )
 
-    expected_default_route = torch.tensor([0, 1, 2], dtype=torch.int32).view(1, 1, 3)
+    expected_default_route = torch.tensor(
+        [0, 1, 2], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    ).view(1, 1, 3)
     assert torch.equal(routed_experts[:2], completion_output.routed_experts[:2])
     assert torch.equal(routed_experts[2:], expected_default_route.expand(1, 2, 3))
 
@@ -316,7 +335,9 @@ def test_normalize_routed_experts_strict_mode_marks_missing_routes_for_fallback(
     request_output = Output()
     request_output.num_cached_tokens = 4
     completion_output = Output()
-    completion_output.routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
+    completion_output.routed_experts = torch.ones(
+        2, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
 
     routed_experts, stats = pad_and_align_routed_expert_indices(
         request_output,
@@ -337,9 +358,13 @@ def test_normalize_routed_experts_strict_mode_marks_missing_routes_for_fallback(
     assert torch.equal(routed_experts[:2], completion_output.routed_experts)
     assert torch.equal(
         routed_experts[2:5],
-        torch.full((3, 1, 2), R3_MISSING_ROUTE_SENTINEL, dtype=torch.int32),
+        torch.full(
+            (3, 1, 2), R3_MISSING_ROUTE_SENTINEL, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
     )
-    expected_default_route = torch.tensor([0, 1], dtype=torch.int32).view(1, 1, 2)
+    expected_default_route = torch.tensor(
+        [0, 1], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    ).view(1, 1, 2)
     assert torch.equal(routed_experts[5:], expected_default_route)
 
 
@@ -350,7 +375,9 @@ def test_normalize_routed_experts_can_reject_missing_routes_when_fallback_disabl
     request_output = Output()
     request_output.num_cached_tokens = 4
     completion_output = Output()
-    completion_output.routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
+    completion_output.routed_experts = torch.ones(
+        2, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
 
     with pytest.raises(ValueError, match="incomplete routed_experts"):
         pad_and_align_routed_expert_indices(
@@ -371,7 +398,9 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
     request_output = Output()
     request_output.num_cached_tokens = 0
     completion_output = Output()
-    completion_output.routed_experts = torch.ones(4, 1, 2, dtype=torch.int32)
+    completion_output.routed_experts = torch.ones(
+        4, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
 
     with pytest.raises(ValueError, match="too many routed_experts routes"):
         pad_and_align_routed_expert_indices(
@@ -387,17 +416,23 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
 def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index():
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102, 103],
-        prompt_routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+        prompt_routed_experts=torch.tensor(
+            [[[10]], [[11]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
         outputs=[
             SimpleNamespace(
                 index=1,
                 token_ids=[201, 202],
-                routed_experts=torch.tensor([[[31]], [[32]]], dtype=torch.int32),
+                routed_experts=torch.tensor(
+                    [[[31]], [[32]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
             ),
             SimpleNamespace(
                 index=0,
                 token_ids=[200],
-                routed_experts=torch.tensor([[[30]]], dtype=torch.int32),
+                routed_experts=torch.tensor(
+                    [[[30]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
             ),
         ],
     )
@@ -453,7 +488,9 @@ def test_attach_routed_experts_to_chat_response_choices_warns_on_missing_routes(
             SimpleNamespace(
                 index=0,
                 token_ids=[200, 201],
-                routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+                routed_experts=torch.tensor(
+                    [[[10]], [[11]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
             )
         ],
     )
@@ -496,7 +533,9 @@ def test_attach_routed_experts_to_chat_response_choices_raises_for_unmatched_cho
             SimpleNamespace(
                 index=1,
                 token_ids=[200],
-                routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+                routed_experts=torch.tensor(
+                    [[[10]], [[11]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
             )
         ],
     )
@@ -602,3 +641,71 @@ def test_compute_spec_decode_metrics():
     assert math.isclose(metrics["vllm/spec_acceptance_length"], 3.4, rel_tol=1e-6)
     # acceptance_rate = accepted / draft_tokens = 240 / 300 = 0.8
     assert math.isclose(metrics["vllm/spec_acceptance_rate"], 0.8, rel_tol=1e-6)
+
+
+def test_resolve_routed_experts_dtype_boundaries():
+    assert resolve_routed_experts_dtype(None) == ROUTED_EXPERTS_FALLBACK_DTYPE
+    assert resolve_routed_experts_dtype(8) == torch.int8
+    assert resolve_routed_experts_dtype(128) == torch.int8
+    assert resolve_routed_experts_dtype(129) == torch.int16
+    assert resolve_routed_experts_dtype(256) == torch.int16
+    assert resolve_routed_experts_dtype(32768) == torch.int16
+    assert resolve_routed_experts_dtype(32769) == torch.int32
+
+
+def test_get_num_routed_experts_across_config_conventions():
+    qwen_moe = SimpleNamespace(num_experts=128)
+    deepseek = SimpleNamespace(n_routed_experts=256)
+    mixtral = SimpleNamespace(num_local_experts=8)
+    dense = SimpleNamespace()
+    vlm = SimpleNamespace(text_config=SimpleNamespace(num_experts=128))
+
+    assert get_num_routed_experts(qwen_moe) == 128
+    assert get_num_routed_experts(deepseek) == 256
+    assert get_num_routed_experts(mixtral) == 8
+    assert get_num_routed_experts(dense) is None
+    assert get_num_routed_experts(vlm) == 128
+
+
+def test_pad_and_align_uses_resolved_dtype():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.arange(5 * 3 * 2).reshape(5, 3, 2) % 128
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=6,
+        padded_length=8,
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int8,
+    )
+
+    assert routed_experts.dtype == torch.int8
+    assert torch.equal(
+        routed_experts[:5], completion_output.routed_experts.to(torch.int8)
+    )
+
+
+def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
+    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
+
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.full((2, 1, 2), 200)
+
+    with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
+        pad_and_align_routed_expert_indices(
+            request_output,
+            completion_output,
+            valid_length=3,
+            padded_length=3,
+            device=torch.device("cpu"),
+            routed_experts_dtype=torch.int8,
+        )

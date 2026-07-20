@@ -46,6 +46,21 @@ from pydantic import BaseModel
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
+def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
+    """Load common state from either legacy or current MCore checkpoints."""
+    # Keep the optional MCore dependency out of DTensor and Automodel imports.
+    try:
+        from megatron.core.dist_checkpointing import load_common_state_dict
+    except ImportError as error:
+        raise RuntimeError(
+            "Megatron-Core is required to inspect optimizer state in the distributed "
+            f"checkpoint at {iteration_dir}. Install NeMo-RL with the `mcore` extra."
+        ) from error
+
+    # MCore accepts Path today but deprecates it in favor of str.
+    return load_common_state_dict(str(iteration_dir))
+
+
 class PretrainedCheckpointConfig(TypedDict):
     """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
 
@@ -198,11 +213,16 @@ class CheckpointManager:
             if optimizer_path.exists():
                 return weights_path, optimizer_path
 
-            # Megatron path
-            common_pt_path = weights_path / "iter_0000000" / "common.pt"
-            if common_pt_path.exists():
-                common_pt_obj = torch.load(common_pt_path, map_location="cpu")
-                if "optimizer" in common_pt_obj:
+            # Megatron path. MCore's public loader supports both legacy checkpoints,
+            # which store common state in common.pt, and current torch_dist
+            # checkpoints, which embed it as a common_state ShardedObject.
+            iteration_dir = weights_path / "iter_0000000"
+            is_megatron_checkpoint = (iteration_dir / "common.pt").exists() or (
+                iteration_dir / "metadata.json"
+            ).exists()
+            if is_megatron_checkpoint:
+                common_state_dict = _load_megatron_common_state_dict(iteration_dir)
+                if "optimizer" in common_state_dict:
                     # In Megatron, optimizer_path is only a flag to indicate that the optimizer
                     # state is embedded in the weights_path. We will actually load the optimizer
                     # state from the weights_path.

@@ -7,6 +7,9 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
+# Audio deps (torchaudio/torchcodec) are not in the shipped container; install at test time.
+bash "$PROJECT_ROOT/tools/install_audio_deps.sh"
+
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs

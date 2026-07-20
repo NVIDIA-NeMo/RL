@@ -255,7 +255,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_3390_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_3420_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -287,8 +287,8 @@ def test_nightly_compute_stays_below_3390_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 3390, (
-        f"Total GPU hours exceeded 3390: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 3420, (
+        f"Total GPU hours exceeded 3420: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 

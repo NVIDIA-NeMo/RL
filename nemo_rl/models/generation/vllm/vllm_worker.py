@@ -30,8 +30,11 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
     GenerationOutputSpec,
+    get_num_routed_experts,
+    resolve_routed_experts_dtype,
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -83,7 +86,9 @@ class BaseVllmGenerationWorker:
 
     @staticmethod
     def configure_worker(
-        num_gpus: int | float, bundle_indices: Optional[tuple[int, list[int]]] = None
+        num_gpus: int | float,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+        num_gpus_per_node: Optional[int] = None,
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         """Provides complete worker configuration for vLLM tensor and pipeline parallelism.
 
@@ -93,6 +98,9 @@ class BaseVllmGenerationWorker:
         Args:
             num_gpus: Original GPU allocation for this worker based on the placement group
             bundle_indices: Tuple of (node_idx, local_bundle_indices) for parallelism (if applicable)
+            num_gpus_per_node: Number of GPUs per node in the cluster. Used to map a
+                bundle id to a node-local engine slot when deriving VLLM_PORT. When
+                None, the original per-engine index is used unchanged.
 
         Returns:
             tuple with complete worker configuration:
@@ -136,16 +144,40 @@ class BaseVllmGenerationWorker:
                 + f"_{seed}"
             )
 
-            # Give each vLLM engine a deterministic starting port for TP/DP
-            # rendezvous.  vLLM's _get_open_port() reads VLLM_PORT and
-            # auto-increments on collision, so the per-engine spacing
-            # provides headroom.  See the port layout in virtual_cluster.py.
-            if len(local_bundle_indices) == 1:
-                engine_index_on_node = local_bundle_indices[0]
-            else:
-                engine_index_on_node = local_bundle_indices[0] // len(
-                    local_bundle_indices
+            # Give each vLLM engine a deterministic starting VLLM_PORT for the
+            # TP/DP rendezvous. vLLM's _get_open_port() reads VLLM_PORT and
+            # increments it on collision, so spacing engines by
+            # DEFAULT_VLLM_PORTS_PER_ENGINE leaves headroom. See the port layout
+            # in virtual_cluster.py.
+            #
+            # The port offset must be a node-local slot. The first entry of
+            # local_bundle_indices is a bundle id within the placement group.
+            # When a single engine spans more than one node (model parallel size
+            # larger than the per-node GPU count), that id can exceed the per-node
+            # GPU count, so dividing it by mp_size gives an offset that grows with
+            # the number of engines and can push VLLM_PORT into the OS ephemeral
+            # range, causing address-in-use errors. When num_gpus_per_node is
+            # known, reduce the id modulo the per-node GPU count to get a
+            # node-local slot. When it is not provided, use the original index,
+            # which is correct for engines that fit within one node.
+            mp_size = len(local_bundle_indices)
+            if num_gpus_per_node is None:
+                engine_index_on_node = (
+                    local_bundle_indices[0]
+                    if mp_size == 1
+                    else local_bundle_indices[0] // mp_size
                 )
+            elif mp_size > num_gpus_per_node:
+                # The engine spans several nodes. Each engine's rank-0 process is
+                # on a different node, so every such engine can use node-local
+                # slot 0 without colliding.
+                engine_index_on_node = 0
+            elif mp_size == 1:
+                engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
+            else:
+                engine_index_on_node = (
+                    local_bundle_indices[0] % num_gpus_per_node
+                ) // mp_size
             env_vars["VLLM_PORT"] = str(
                 DEFAULT_VLLM_PORT_RANGE_LOW
                 + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
@@ -215,6 +247,14 @@ class BaseVllmGenerationWorker:
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
+        self._sparse_refit_receiver: Any = None
+        if self.is_model_owner and self.cfg.get("refit_transport") is not None:
+            # Avoid receiver dependencies and threads for existing refit transports.
+            from nemo_rl.models.generation.vllm.vllm_sparse_refit import (
+                VllmSparseRefitReceiver,
+            )
+
+            self._sparse_refit_receiver = VllmSparseRefitReceiver(self)
 
         if not self.is_model_owner:
             return
@@ -233,6 +273,8 @@ class BaseVllmGenerationWorker:
         """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
         self.model_name = self.cfg["model_name"]
+        # Refined from the model's expert count in _load_model.
+        self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -381,6 +423,9 @@ class BaseVllmGenerationWorker:
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
         hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        self.routed_experts_dtype = resolve_routed_experts_dtype(
+            get_num_routed_experts(hf_config)
+        )
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
                 assert load_format == "dummy", (
@@ -613,6 +658,27 @@ class BaseVllmGenerationWorker:
                     metrics[metric.name] = metric.value
         return metrics
 
+    def report_refit_server_base_url(self) -> str | None:
+        receiver = self._sparse_refit_receiver
+        return receiver.report_refit_server_base_url() if receiver is not None else None
+
+    def start_zmq_sparse_refit_relay(self) -> str:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        return receiver.start_zmq_sparse_refit_relay()
+
+    def configure_zmq_sparse_refit_relay(self, relay_addresses: list[str]) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        receiver.configure_zmq_sparse_refit_relay(relay_addresses)
+
+    def stop_zmq_sparse_refit_relay(self) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is not None:
+            receiver.stop_zmq_sparse_refit_relay()
+
 
 class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
@@ -628,6 +694,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
             )
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.start_sync_server()
 
     def init_collective(
         self,
@@ -768,6 +836,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 device=input_ids.device,
                 require_complete_routed_experts=return_routed_experts,
                 return_stats=True,
+                routed_experts_dtype=self.routed_experts_dtype,
             )
             if return_routed_experts and full_routed_experts is None:
                 raise RuntimeError(
@@ -1052,6 +1121,9 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self._sparse_refit_receiver is not None:
+                self._sparse_refit_receiver.shutdown()
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())
