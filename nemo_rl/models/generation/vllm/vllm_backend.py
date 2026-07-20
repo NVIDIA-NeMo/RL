@@ -14,7 +14,7 @@
 import gc
 import re
 import traceback
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import zmq
@@ -259,11 +259,13 @@ class VllmInternalWorkerExtension:
             trimmed.append((key, tensor))
         return trimmed
 
-    def _get_drafter_model(self) -> Optional[torch.nn.Module]:
+    def _get_drafter_model(self) -> Any:
         """Return the vLLM drafter's underlying model, or None if absent.
 
         The drafter holds the speculative-decoding draft model (Eagle3 or MTP),
-        which vLLM keeps as a module separate from the main model.
+        which vLLM keeps as a module separate from the main model. Typed ``Any``
+        because these are dynamic vLLM model classes whose ``load_weights`` /
+        ``mtp_start_layer_idx`` members are not visible through ``nn.Module``.
         """
         draft_owner = getattr(self.model_runner, "drafter", None)
         return getattr(draft_owner, "model", None) if draft_owner else None
