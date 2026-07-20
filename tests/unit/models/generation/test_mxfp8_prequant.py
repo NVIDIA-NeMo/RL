@@ -45,12 +45,24 @@ def test_torch_reference_shapes_and_roundtrip(shape):
     assert tuple(scales.shape) == expected_scale_shape
 
     x_dq = _dequantize(x_fp8, scales)
-    rel_err = (x_dq - x.to(torch.float32)).abs() / x.to(torch.float32).abs().clamp(
-        min=1e-3
+    x32 = x.to(torch.float32)
+    abs_err = (x_dq - x32).abs()
+    block_amax = (
+        x32.abs()
+        .reshape(*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE, MXFP8_BLOCK_SIZE)
+        .amax(dim=-1, keepdim=True)
+        .expand(*shape[:-1], shape[-1] // MXFP8_BLOCK_SIZE, MXFP8_BLOCK_SIZE)
+        .reshape(shape)
     )
-    # e4m3 has 3 mantissa bits; block-pow2 scaling keeps values in normal range.
+    # e4m3 has 3 mantissa bits: elements within the block's representable range
+    # must round-trip to ~12.5% relative error; elements far below the block
+    # amax may legitimately quantize to zero, so bound them by absolute error
+    # instead of a ratio (keeps the test deterministic across torch versions).
+    representable = x32.abs() >= block_amax / 64
+    rel_err = (abs_err / x32.abs().clamp(min=1e-6))[representable]
     assert rel_err.median() < 0.05
     assert rel_err.max() < 0.25
+    assert (abs_err[~representable] <= block_amax[~representable] / 32).all()
 
 
 def test_last_dim_not_divisible_raises():
