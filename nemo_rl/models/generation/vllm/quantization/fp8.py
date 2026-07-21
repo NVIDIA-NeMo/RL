@@ -169,6 +169,19 @@ def apply_fp8_patches(self, fp8_config):
                     apply_monolithic_mxfp8_moe,
                 )
             )
+            # vLLM 0.25 only: keep the MXFP8 linear weight in [N, K] load layout
+            # and transpose at apply, so refit loads stay shape-compatible.
+            try:
+                import vllm.model_executor.kernels.linear.mxfp8.flashinfer  # noqa: F401
+
+                fp8_state.vllm_patches.append(
+                    patch(
+                        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferCutedslMxfp8LinearKernel.apply_weights",
+                        apply_weights_cutedsl_mxfp8_linear,
+                    )
+                )
+            except ImportError:
+                pass  # vLLM 0.20: CuteDSL linear kernel does not exist
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
@@ -739,24 +752,15 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
         layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
 
-    # Weight layout: vLLM 0.25's FlashInferCutedsl MXFP8 linear kernel stores the
-    # weight column-major [K, N] (weight.contiguous().t()) and its apply() reads
-    # it directly; the older FlashInferCutlass kernel keeps [N, K] and transposes
-    # at apply time. Mirror the selected kernel so refit-loaded weights match what
-    # apply expects. The [N, K] checkpoint weight stays the permanent load target
-    # (weight_loader + later refits keep working); the column-major view is exposed
-    # to the kernel via a zero-copy transpose that aliases the same storage, so it
-    # tracks every refit load with no reprocessing.
-    _kernel_name = type(getattr(self, "kernel", None)).__name__
-    if "FlashInferCutedsl" in _kernel_name:
-        if not hasattr(layer, "weight_row_major"):
-            layer.weight_row_major = layer.weight
-            layer.weight = torch.nn.Parameter(
-                layer.weight_row_major.data.transpose(0, 1), requires_grad=False
-            )
-        else:
-            # Re-point the column-major view at the freshly refit-loaded weight.
-            layer.weight.data = layer.weight_row_major.data.transpose(0, 1)
+    # Weight layout: vLLM 0.25's FlashInferCutedsl MXFP8 linear kernel wants the
+    # weight column-major [K, N] and its apply() reads layer.weight directly,
+    # whereas the older FlashInferCutlass kernel keeps [N, K] and transposes at
+    # apply. We keep the weight in its checkpoint [N, K] layout here so the
+    # weight_loader and every later refit load into it unchanged, and instead
+    # make the CuteDSL kernel transpose at apply time (Cutlass-style) via the
+    # apply_weights_cutedsl_mxfp8_linear patch installed alongside this function.
+    # (Transposing layer.weight here would break refit: the next load streams an
+    # [N, K] checkpoint shard into what would then be a [K, N] parameter.)
 
 
 def create_weights_mxfp8_moe(
@@ -1487,6 +1491,42 @@ def apply_monolithic_mxfp8_moe(
     if output.shape[-1] != unpadded_hidden_size:
         output = output[..., :unpadded_hidden_size].contiguous()
     return output
+
+
+def apply_weights_cutedsl_mxfp8_linear(self, layer, x, bias=None):
+    """Refit-safe apply for vLLM 0.25's FlashInferCutedsl MXFP8 linear kernel.
+
+    Mirrors the upstream kernel apply, except it reads the weight as
+    ``layer.weight.t()`` instead of ``layer.weight``. Our refit keeps the weight
+    in checkpoint [N, K] layout (so every refit load works); the kernel wants
+    column-major [K, N], which ``.t()`` yields as a zero-copy view. Same GEMM.
+    """
+    import flashinfer as vllm_flashinfer
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        mxfp8_e4m3_quantize,
+    )
+
+    weight = layer.weight.t()  # [N, K] load target -> column-major [K, N] view
+    weight_scale = layer.weight_scale
+    out_dtype = x.dtype
+    K, N = weight.shape
+
+    input_shape = x.shape
+    input_2d = x.view(-1, K)
+    assert K % MXFP8_BLOCK_SIZE == 0
+    input_mxfp8, input_scale = mxfp8_e4m3_quantize(input_2d, is_sf_swizzled_layout=True)
+    output = vllm_flashinfer.mm_mxfp8(
+        input_mxfp8,
+        weight,
+        input_scale,
+        weight_scale,
+        out_dtype=out_dtype,
+        backend="cute-dsl",
+    )
+    if bias is not None:
+        output = output + bias
+    return output.view((*input_shape[:-1], N))
 
 
 def process_weights_after_loading_kv(self, layer) -> None:
