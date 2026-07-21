@@ -574,6 +574,9 @@ def setup(
             "invalid_tool_call_patterns", None
         )
         thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+        # Multimodal fields: same reasoning — top-level NemoGymConfig fields,
+        # not part of Gym's global config.
+        tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
         # Pass prebuilt cache + venv dirs through the global config so the gym reuses
         # image-baked venvs instead of rebuilding them.
         uv_cache_dir = get_nemo_gym_uv_cache_dir()
@@ -589,6 +592,7 @@ def setup(
             thinking_tags=thinking_tags,
             require_routed_experts=router_replay_enabled(policy_config),
             initial_global_config_dict=nemo_gym_dict,
+            tokenizer_config=tokenizer_config,
         )
         nemo_gym_opts = {}
         if nemo_gym_num_nodes:

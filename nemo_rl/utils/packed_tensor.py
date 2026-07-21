@@ -77,14 +77,16 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                     # Apply backend specific post processing and then convert to linearized uint8 tensor.
                     # contiguous() is required because the upstream iterator may
                     # yield non-contiguous tensors that view(...) cannot handle.
-                    tensor = (
-                        post_iter_func(next(iterator))
-                        .contiguous()
-                        .view(torch.uint8)
-                        .view(-1)
-                    )
+                    # 0-D tensors (e.g. BN `num_batches_tracked` counters on
+                    # Nemotron-Omni's sound encoder) must be reshape(1)-ed
+                    # before `.view(torch.uint8)` — Long→Byte view is illegal
+                    # on scalars.
+                    tensor = post_iter_func(next(iterator)).contiguous()
+                    if tensor.dim() == 0:
+                        tensor = tensor.reshape(1)
+                    tensor = tensor.view(torch.uint8).view(-1)
                     packing_tensor_list[buffer_idx].append(tensor)
-                    packing_tensor_sizes[buffer_idx] += tensor.view(torch.uint8).numel()
+                    packing_tensor_sizes[buffer_idx] += tensor.numel()
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Pack the tensors and call broadcast collective
@@ -133,11 +135,15 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
         packed_tensor_sizes = list(map(lambda x: x[4], meta_data_list))
         unpacked_tensor = packed_tensor.split_with_sizes(packed_tensor_sizes)
 
-        # unpacked_list = List[(name, torch.Tensor.view(dtype).view(*shape))]
+        # unpacked_list = List[(name, torch.Tensor.view(dtype).reshape(shape))]
+        # reshape(tuple) accepts an empty tuple for 0-D targets, whereas
+        # view(*shape) would call view() with no args and raise. Producer
+        # side reshapes 0-D tensors to (1,) before packing, and this consumer
+        # must reshape back to the original 0-D shape stored in meta_data.
         unpacked_list = [
             (
                 meta_data_list[i][0],
-                tensor.view(meta_data_list[i][2]).view(*meta_data_list[i][1]),
+                tensor.view(meta_data_list[i][2]).reshape(tuple(meta_data_list[i][1])),
             )
             for i, tensor in enumerate(unpacked_tensor)
         ]

@@ -14,11 +14,18 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, NotRequired, TypedDict
+from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
+
+from nemo_rl.data.multimodal_utils import (
+    encode_images_in_examples,
+    extract_multimodal_model_inputs,
+    process_multimodal_chat,
+    resolve_to_image,
+)
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
@@ -80,6 +87,10 @@ class NemoGymConfig(TypedDict):
     require_routed_experts: NotRequired[
         bool
     ]  # Require Gym output items to carry R3 routed_experts
+    # Multimodal fields (populated by `setup_nemo_gym_config` when VLM is enabled).
+    tokenizer_config: NotRequired[
+        Optional[Dict[str, Any]]
+    ]  # For processor reconstruction inside the actor
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
@@ -142,12 +153,177 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     return is_invalid_tool_call, has_malformed_thinking
 
 
+########################################
+# Multimodal helpers
+########################################
+
+
+def _strip_repeat_runs(ids: torch.Tensor, min_run: int = 4) -> torch.Tensor:
+    """Collapse runs of ``min_run`` or more consecutive identical token ids.
+
+    Each qualifying run is reduced to a single occurrence; short runs are
+    preserved unchanged. Used to normalize input_ids sequences before
+    comparing a vLLM-inlined multimodal trajectory against an HF-processor
+    trajectory that keeps image-token expansion as sidecar metadata
+    (``num_patches`` / ``num_tokens``) rather than inline placeholders.
+
+    Args:
+        ids: 1D tensor of token ids.
+        min_run: minimum consecutive-identical-token count to trigger a
+            collapse. Defaults to 4 — large enough to skip Nano-Omni's
+            per-image placeholder runs (hundreds of tokens) while preserving
+            legitimate short repeats in text.
+
+    Returns:
+        A new 1D tensor with the same dtype/device as ``ids``.
+    """
+    n = len(ids)
+    if n == 0:
+        return ids
+    ids_list = ids.tolist()
+    out: list[int] = []
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and ids_list[j] == ids_list[i]:
+            j += 1
+        run_len = j - i
+        if run_len >= min_run:
+            out.append(ids_list[i])
+        else:
+            out.extend(ids_list[i:j])
+        i = j
+    return torch.tensor(out, dtype=ids.dtype, device=ids.device)
+
+
+def _process_full_multimodal_trajectory(
+    nemo_gym_row: dict,
+    nemo_gym_result: dict,
+    message_log: list[dict],
+    processor: Any,
+) -> None:
+    """Process all turns once and attach model inputs without replacing vLLM IDs."""
+    from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+    from nemo_gym.responses_converter import ResponsesConverter
+
+    response = nemo_gym_result["response"]
+    # Prefer `response.agent_input` — the effective initial input that vLLM
+    # actually saw on the first /v1/responses call, i.e. after gymv_agent's
+    # system-prompt prepend and string→message coercion. Falling back to the
+    # raw row would drop the injected system message and produce a token-count
+    # mismatch against vLLM (see gymv_agent._maybe_prepend_system_prompt).
+    create_params = dict(nemo_gym_row["responses_create_params"])
+    agent_input = response.get("agent_input")
+    if agent_input is not None:
+        initial_input = list(agent_input)
+    else:
+        initial_input = create_params.get("input", [])
+        if isinstance(initial_input, str):
+            initial_input = [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": initial_input}],
+                }
+            ]
+    create_params["input"] = [
+        *initial_input,
+        *(response.get("seed_obs") or []),
+        *response["output"],
+    ]
+    chat_params = ResponsesConverter(
+        return_token_id_information=False
+    ).responses_to_chat_completion_create_params(
+        NeMoGymResponseCreateParamsNonStreaming.model_validate(create_params)
+    )
+    processor_messages = [
+        message.model_dump(exclude_none=True)
+        if hasattr(message, "model_dump")
+        else dict(message)
+        for message in chat_params.messages
+    ]
+
+    images = []
+    for message in processor_messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        converted_parts = []
+        for part in content:
+            if part.get("type") != "image_url":
+                converted_parts.append(part)
+                continue
+            image_url = part.get("image_url", "")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url", "")
+            image = resolve_to_image(image_url)
+            images.append(image)
+            converted_parts.append({"type": "image", "image": image})
+        message["content"] = converted_parts
+
+    if not images:
+        return
+
+    _, processed = process_multimodal_chat(
+        processor,
+        processor_messages,
+        add_generation_prompt=False,
+    )
+
+    vllm_token_ids = torch.cat([message["token_ids"] for message in message_log])
+    processor_token_ids = processed["input_ids"][0]
+    # Multimodal processors (e.g. Nano-Omni's
+    # NemotronH_Nano_Omni_Reasoning_V3Processor) don't inline the image-token
+    # expansion into `input_ids` — they emit it as `num_patches`/`num_tokens`
+    # sidecars for the model runtime. vLLM, in contrast, inlines a long run of
+    # the image-placeholder token id at rollout time. So the two sequences
+    # will always disagree over each image slot even when the trajectory is
+    # identical. Collapse long runs of the same token id on both sides before
+    # comparing — this normalizes the vLLM-inlined expansion (typically
+    # hundreds of consecutive identical ids per image) while preserving text
+    # tokenization (where consecutive-identical runs are rare and short).
+    vllm_stripped = _strip_repeat_runs(vllm_token_ids.cpu())
+    proc_stripped = _strip_repeat_runs(processor_token_ids.cpu())
+    if not torch.equal(vllm_stripped, proc_stripped):
+        common_length = min(len(vllm_stripped), len(proc_stripped))
+        mismatches = (
+            vllm_stripped[:common_length] != proc_stripped[:common_length]
+        ).nonzero(as_tuple=True)[0]
+        first_mismatch = int(mismatches[0]) if len(mismatches) else common_length
+        lo = max(0, first_mismatch - 8)
+        hi = min(common_length, first_mismatch + 8)
+        raise ValueError(
+            "vLLM and VLM processor token sequences differ for the full "
+            "NeMo-Gym trajectory (after collapsing image-token runs): "
+            f"vllm_length={len(vllm_token_ids)} "
+            f"(stripped {len(vllm_stripped)}), "
+            f"processor_length={len(processor_token_ids)} "
+            f"(stripped {len(proc_stripped)}), first_mismatch={first_mismatch}.\n"
+            f"  window [{lo}:{hi}]\n"
+            f"  vllm : {vllm_stripped[lo:hi].tolist()}\n"
+            f"  proc : {proc_stripped[lo:hi].tolist()}"
+        )
+
+    first_user_message = next(
+        message for message in message_log if message["role"] == "user"
+    )
+    first_user_message.update(extract_multimodal_model_inputs(processor, processed))
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
+        # Reconstruct the processor inside the actor (rather than serializing it
+        # per rollout call) for full-trajectory multimodal postprocessing.
+        self._processor: Optional[Any] = None
+        tokenizer_config = cfg.get("tokenizer_config")
+        if tokenizer_config:
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            self._processor = get_tokenizer(tokenizer_config, get_processor=True)
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -260,6 +436,11 @@ Depending on your data shape, you may want to change these values."""
     ) -> list[dict]:
         timer = Timer()
 
+        # For multimodal runs, replace local filesystem image paths in the
+        # examples with base64 data URLs before shipping to vLLM. No-op when
+        # examples carry no `input_image` items (text-only case).
+        encode_images_in_examples(nemo_gym_examples)
+
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
@@ -276,7 +457,7 @@ Depending on your data shape, you may want to change these values."""
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
+                        nemo_gym_row, nemo_gym_result, tokenizer
                     )
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
@@ -317,7 +498,10 @@ Depending on your data shape, you may want to change these values."""
         return nemo_rl_results, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
-        self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
+        self,
+        nemo_gym_row: dict,
+        nemo_gym_result: dict,
+        tokenizer: PreTrainedTokenizerBase,
     ) -> dict:
         assert isinstance(nemo_gym_result, dict), (
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
@@ -423,6 +607,12 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 (output_item_dict, prompt_token_ids, generation_token_ids)
             )
 
+        processor = getattr(self, "_processor", None)
+        if processor is not None and nemo_rl_message_log:
+            _process_full_multimodal_trajectory(
+                nemo_gym_row, nemo_gym_result, nemo_rl_message_log, processor
+            )
+
         if batch_decode_items:
             prompt_strs = tokenizer.batch_decode(
                 [item[1] for item in batch_decode_items]
@@ -484,3 +674,10 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
     generation_config["stop_token_ids"] = None
+
+    # For VLM runs, plumb the tokenizer config into the gym env config so the
+    # NemoGym actor can reconstruct the processor inside itself (needed for
+    # multi-turn multimodal postprocessing).
+    if config.policy.get("is_vlm", False):
+        env_cfg = config.env.setdefault("nemo_gym", {})
+        env_cfg.setdefault("tokenizer_config", dict(config.policy["tokenizer"]))

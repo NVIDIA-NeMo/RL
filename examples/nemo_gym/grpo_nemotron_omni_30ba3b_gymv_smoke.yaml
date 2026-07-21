@@ -1,0 +1,173 @@
+# Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16 smoke test on gym-v.
+#
+# Sibling of grpo_qwen25vl_gymv_smoke.yaml. Nemotron-Omni is the known-good
+# multimodal + NeMo-Gym baseline in-house (see the games-bandit recipe chain);
+# this file adapts it to the current mm-integration branch so the Qwen path
+# and the Nemotron-Omni path can be exercised through the same code path.
+#
+# Both the model AND the env are multimodal here — expect real visual RL
+# signal (unlike the earlier text-only Nemotron placeholder).
+#
+# Shape (2 nodes × 8 GPUs, non-colocated):
+#   - Node 1: vLLM generation, TP=8
+#   - Node 2: Megatron policy training, TP=8, EP=8, PP=1, CP=1
+#
+# Data: size=4 FrozenLake ablation manifest (multi-turn train, single-turn
+# eval), sourced from nemo-rl-games-bandit's frozenlake_size4.yaml chain.
+#
+# Run with:
+#   uv run --locked --extra mcore --extra vllm \
+#     examples/nemo_gym/run_multimodal_grpo_nemo_gym.py \
+#     --config examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_smoke.yaml
+
+defaults: grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 1                # smoke: minimal loop
+  num_generations_per_prompt: 4          # gbs = 1 * 4 = 4
+  num_val_generations_per_prompt: 1
+  max_rollout_turns: 4
+  max_num_epochs: 1
+  max_num_steps: 20                       # smoke: 5 optimizer steps
+  val_period: 5
+  val_at_start: false                     # exercise eval before training
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: null
+  async_grpo:
+    enabled: false                       # sync for the smoke run
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo-nemotron-omni-30ba3b-gymv-smoke"
+
+policy:
+  model_name: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16"
+  is_vlm: true                           # required by run_multimodal_grpo_nemo_gym.py
+  tokenizer:
+    name: ${policy.model_name}
+    # Nano-Omni-Reasoning uses a native <think> block; keep it open and
+    # preserve prior reasoning across turns (append-only trajectory rep).
+    # Mirrors the games-bandit grpo_game_rlvr_trajectory_collection.yaml recipe.
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # 8k gives room for a 4-turn multi-image rollout with Omni's per-image cost.
+  max_total_sequence_length: 8192
+
+  megatron_cfg:
+    # Full 8-GPU policy node: TP=8, EP=8, PP=1, CP=1. Overrides
+    # grpo_nanov3.yaml's TP=2/PP=2/CP=4 layout (tuned for a 32-node run).
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false             # sp only pays off with tp + cp
+    # Nemotron-Omni VLM freeze contract: language model trains, vision +
+    # audio towers stay frozen. Matches games-bandit vlm_grpo_games.yaml
+    # (the known-good stabilizer choice — unfrozen vision drifted).
+    freeze_vision_encoder: true
+    freeze_vision_projector: true
+    freeze_audio_encoder: true
+    freeze_audio_projector: true
+    # RADIO CPE eval mode: keeps vision-tower positional embeddings in eval
+    # mode during rollout/train (required for the frozen vision path to
+    # produce stable features).
+    radio_force_cpe_eval_mode: true
+
+  # base recipe ties this to dtensor_cfg.tensor_parallel_size; we're on
+  # megatron, so pin to the megatron TP directly.
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+
+  generation:
+    max_new_tokens: 2048                 # per-turn cap; 4 turns fit in 8k context
+    # Nano-Omni-Reasoning bad_words: only the vision-side text tokens (safe,
+    # in-vocab). The audio-delimiter tokens (<so_embedding>, <so_start>,
+    # <so_end>) sit past the LM's text-logit width and cause vLLM
+    # out-of-bounds writes in bad_words masking — see the games-bandit
+    # vlm_grpo_games.yaml history comment for the full incident.
+    bad_words: ["<image>", "<img>", "</img>"]
+    vllm_cfg:
+      # Full 8-GPU vLLM node.
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.7
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true                # skip CUDA-graph capture for the smoke run
+      # Nano-Omni + prefix caching crashes vLLM's mm cache (mm_hash miss).
+      # Belt-and-suspenders: also disabled via mm_processor_cache_gb=0 below.
+      enable_prefix_caching: false
+      # VLMs need the tokenizer initialized (run_multimodal_grpo_nemo_gym.py asserts).
+      skip_tokenizer_init: false
+      # Nano-Omni chat template expects string content, not the OpenAI
+      # {type: text, text: ...} list. Keeps the NeMo-Gym prompt-token prefix
+      # invariant across multi-turn rollouts.
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+        chat_template_content_format: string
+    vllm_kwargs:
+      # Bounds per-prompt image count (multi-turn appends one board / turn).
+      limit_mm_per_prompt: {"image": 8}
+      # Disable vLLM's mm processor cache — the mm-cache desync crash on
+      # Nano-Omni is the load-bearing fix. Must sit in vllm_kwargs, not
+      # vllm_cfg (see vlm_grpo_3B.yaml note).
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 16384
+      # Nano-Omni's mamba backbone needs SSM cache in fp32 (accuracy).
+      mamba_ssm_cache_dtype: "float32"
+    colocated:
+      enabled: false                     # non-colocated: dedicated vLLM node
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+data:
+  train:
+    # Sourced from nemo-rl-games-bandit's frozenlake_size4.yaml — the
+    # size=4 (num_holes=3) FrozenLake ablation train manifest.
+    data_path: /lustre/fsw/portfolios/coreai/users/rohitkumarj/game-rlvr-vlm-data/frozenlake_ablations/size_4/train_manifest.jsonl
+  validation:
+    # Paired eval manifest for the size=4 FrozenLake ablation. Note: rows are
+    # `Games/FrozenLake-singleturn-v0` with horizon_cap=1 (single-turn eval),
+    # while train rows are the multi-turn `Games/FrozenLake-v0`.
+    data_path: /lustre/fsw/portfolios/coreai/users/rohitkumarj/game-rlvr-vlm-data/frozenlake_ablations/size_4/eval_manifest.jsonl
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    is_trajectory_collection: false
+    # Replace the base recipe's math/code/etc bundle with gym-v only. Any
+    # env-block overrides inherited from grpo_nanov3.yaml (math_with_judge,
+    # code_gen, workplace_assistant, ...) are ignored by Gym when their
+    # config_paths aren't loaded.
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - environments/gym_v/config.yaml
+    # Agent-side horizon; keep in sync with grpo.max_rollout_turns.
+    # Outer group name matches the manifest's agent_ref.name = "gym_v_agent"
+    # (see 3rdparty/Gym-workspace/Gym/environments/gym_v/config.yaml).
+    gym_v_agent:
+      responses_api_agents:
+        gymv_agent:
+          max_steps: 4
+          done_if_no_boxed_answer: true
+
+logger:
+  log_dir: "logs/grpo-nemotron-omni-30ba3b-gymv-smoke"
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: "grpo-nemotron-omni-gymv"
+    name: "grpo-nemotron-omni-30ba3b-gymv-smoke"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
