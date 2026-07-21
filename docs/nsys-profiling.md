@@ -61,6 +61,7 @@ payload raises at startup so misconfiguration surfaces immediately.
 The supported worker types are:
 - **DTensorPolicyWorker**: Pattern matched against `"dtensor_policy_worker"`
 - **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
+- **TrtllmAsyncGenerationWorker**: Pattern matched against `"trtllm_async_generation_worker"`
 
 ## Example Usage
 
@@ -91,6 +92,14 @@ LD_LIBRARY_PATH="/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64:
 NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="megatron_policy_worker,vllm_generation_worker" uv run examples/run_grpo.py --config examples/configs/grpo_math_1B_megatron.yaml grpo.max_num_steps=5
 ```
 
+### Profile TRT-LLM Generation Workers
+
+```bash
+NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="trtllm_async_generation_worker" uv run examples/run_grpo.py --config examples/configs/grpo_math_1B_trtllm.yaml grpo.max_num_steps=5
+```
+
+The outer `TrtllmAsyncGenerationWorker` actor is CPU-only, so nsys wraps TRT-LLM's **internal** RayExecutor GPU workers instead. This is done by injecting `ray_worker_nsight_options` (with `capture-range=cudaProfilerApi`, deferred capture) into the `AsyncLLM` constructor. When `start_gpu_profiling()` is called, it broadcasts `collective_rpc("start_gpu_profiling")` to the internal GPU workers, each of which calls `torch.cuda.profiler.start()` to trigger the capture. Traces are one `.nsys-rep` per internal GPU worker (replicas × TP).
+
 ## Profile Output
 
 When profiling is enabled, it generates the following logs and files:
@@ -104,9 +113,10 @@ When profiling is enabled, it generates the following logs and files:
    ```
    dtensor_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
    ```
-If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, nsight is NOT applied to the outer `VllmGenerationWorker` to avoid interfering with Ray's compiled DAG. Instead, `ray_workers_use_nsight` is enabled and vLLM's default nsight config is monkey-patched to use `capture-range=cudaProfilerApi` (deferred capture). This means the internal TP workers run under nsys with near-zero overhead until `start_gpu_profiling()` triggers `cudaProfilerStart()` on each worker via `collective_rpc`. The `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` files are the nsight profiles from the internal TP workers. (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
+For TRT-LLM, the meaningful generation profiles are the per-internal-GPU-worker files (`trtllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep`), one per GPU (replicas × TP). If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, nsight is NOT applied to the outer `VllmGenerationWorker` to avoid interfering with Ray's compiled DAG. Instead, `ray_workers_use_nsight` is enabled and vLLM's default nsight config is monkey-patched to use `capture-range=cudaProfilerApi` (deferred capture). This means the internal TP workers run under nsys with near-zero overhead until `start_gpu_profiling()` triggers `cudaProfilerStart()` on each worker via `collective_rpc`. The `vllm_tp_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` files are the nsight profiles from the internal TP workers. (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).
 
 3. **File Location**: Profile files are saved in `/tmp/ray/session*/logs/nsight/` directory on each worker node. Ensure you check both `ls /tmp/ray/session_[0-9]*/logs/nsight` and `ls /tmp/ray/session_latest/logs/nsight` for the profiles, since the "latest" pointer may be stale.
 
