@@ -495,7 +495,7 @@ class AsyncNemoGymRolloutImpl:
         # Run generation.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results, env_timing_metrics = await nemo_gym_env.run_rollouts.remote(
-                inputs, self._tokenizer, timer_prefix
+                inputs, timer_prefix
             )
             # Convert results to completions.
             completions = [self._result_to_completion(r) for r in results]

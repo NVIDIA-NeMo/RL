@@ -1217,6 +1217,8 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         "uv_cache_dir": expected_uv_cache_dir,
         "uv_venv_dir": expected_uv_venv_dir,
     }
+    # tokenizer handed to the actor at construction (perf: no per-call reship)
+    assert nemo_gym_cls.options.return_value.remote.call_args.args[1] is tokenizer
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
     nemo_gym_actor._spinup.remote.assert_called_once_with()
     mock_ray.get.assert_called_once_with("spinup-ref")

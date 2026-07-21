@@ -75,7 +75,7 @@ def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
 
 
 @pytest.fixture(scope="function")
-def nemo_gym(nemo_gym_vllm_generation):
+def nemo_gym(nemo_gym_vllm_generation, nemo_gym_tokenizer):  # noqa: F811
     """Create a NeMo-Gym actor for testing."""
 
     yaml_str = r"""example_multi_step_resources_server:
@@ -116,7 +116,7 @@ rollout_max_attempts_to_avoid_lp_nan: 1
                 "nemo_rl.environments.nemo_gym.NemoGym"
             ),
         }
-    ).remote(config)
+    ).remote(config, nemo_gym_tokenizer)
 
     # Blocking wait for NeMo-Gym to spin up
     ray.get(env._spinup.remote())
@@ -292,7 +292,6 @@ def test_nemo_gym_sanity(
     nemo_gym,
     nemo_gym_sanity_test_data,
     nemo_gym_vllm_generation,
-    nemo_gym_tokenizer,  # noqa: F811
 ):
     """Test basic functionality of MathEnvironment step with simple messages."""
 
@@ -310,9 +309,7 @@ def test_nemo_gym_sanity(
         example["_rowidx"] = idx
 
     actual_result, _ = ray.get(
-        nemo_gym.run_rollouts.remote(
-            nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
-        )
+        nemo_gym.run_rollouts.remote(nemo_gym_sanity_test_data["input"], "")
     )
     expected_result = nemo_gym_sanity_test_data["expected_output"]
 

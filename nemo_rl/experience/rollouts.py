@@ -1823,9 +1823,7 @@ def run_async_nemo_gym_rollout(
     with timer.time(f"{timer_prefix}/run_rollouts"):
         nemo_gym_environment = task_to_env["nemo_gym"]
         results, rollout_loop_timing_metrics = ray.get(
-            nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
-            )
+            nemo_gym_environment.run_rollouts.remote(nemo_gym_rows, timer_prefix)
         )
 
         # Tensorize all token ids
