@@ -120,4 +120,6 @@ def replace_prefix_tokens(
         f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
     )
 
-    return model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+    return (
+        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
+    )

@@ -24,18 +24,19 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
 
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
 logger = logging.getLogger(__name__)
 
 _TOOL_BOT = "<tool_call>\n"
-_TOOL_CALL_RE = re.compile(
-    r"<tool_call>\n(.*?)\n</tool_call>", re.DOTALL
-)
+_TOOL_CALL_RE = re.compile(r"<tool_call>\n(.*?)\n</tool_call>", re.DOTALL)
 
 
 def create_app(
@@ -59,6 +60,7 @@ def create_app(
     # so model output starts inside the reasoning block without a leading <think> tag.
     # parse() is stateless — safe for concurrent requests.
     from tensorrt_llm.llmapi.reasoning_parser import DeepSeekR1Parser
+
     _reasoning_parser = DeepSeekR1Parser(reasoning_at_start=True)
 
     # Stop tokens TRT-LLM appends to gen_token_ids but NOT reproduced by apply_chat_template.
@@ -87,7 +89,10 @@ def create_app(
         logprobs_requested = body.get("logprobs", False)
 
         prompt_token_ids = _build_prompt_token_ids(
-            messages, tokenizer, tools=tools, default_template_kwargs=_default_template_kwargs
+            messages,
+            tokenizer,
+            tools=tools,
+            default_template_kwargs=_default_template_kwargs,
         )
 
         # Prefix splice: empty required_prefix_ids (no prior assistant turn) → returns template unchanged.
@@ -102,19 +107,24 @@ def create_app(
             template_token_ids=prompt_token_ids,
         )
 
-        max_tokens_requested = body.get("max_tokens") or body.get("max_completion_tokens") or max_seq_len
+        max_tokens_requested = (
+            body.get("max_tokens") or body.get("max_completion_tokens") or max_seq_len
+        )
         remaining_ctx = max(0, max_seq_len - len(adj_prompt))
 
         # Return HTTP 400 on context exhaustion.
         if remaining_ctx == 0:
             return JSONResponse(
                 status_code=400,
-                content={"error": f"context length exceeded: prompt ({len(adj_prompt)} tokens) exhausted context window ({max_seq_len})"},
+                content={
+                    "error": f"context length exceeded: prompt ({len(adj_prompt)} tokens) exhausted context window ({max_seq_len})"
+                },
             )
 
         max_tokens = min(int(max_tokens_requested), remaining_ctx)
 
         from tensorrt_llm import SamplingParams as TrtSamplingParams
+        from tensorrt_llm.executor.utils import RequestError
 
         sampling = TrtSamplingParams(
             temperature=float(temperature),
@@ -129,9 +139,9 @@ def create_app(
                 [{"prompt_token_ids": adj_prompt}],
                 sampling_params=sampling,
             )
-        except Exception as e:
+        except RequestError as e:
             err = str(e)
-            if "prompt length" in err or "max_num_tokens" in err or "max_seq_len" in err:
+            if "max_seq_len" in err or "max_num_tokens" in err:
                 return JSONResponse(
                     status_code=400,
                     content={"error": f"context length exceeded: {err}"},
@@ -144,13 +154,14 @@ def create_app(
 
         gen_logprobs: list[float] = []
         if gen.logprobs:
-            for lp in gen.logprobs:
+            # TRT-LLM returns floats in simple format and token-indexed dicts otherwise.
+            for token_id, lp in zip(gen_token_ids, gen.logprobs, strict=True):
                 if isinstance(lp, (int, float)):
                     gen_logprobs.append(float(lp))
                 elif isinstance(lp, dict):
-                    gen_logprobs.append(float(next(iter(lp.values())).logprob))
+                    gen_logprobs.append(float(lp[token_id].logprob))
                 else:
-                    gen_logprobs.append(float(lp))
+                    raise TypeError(f"Unsupported TRT-LLM logprob type: {type(lp)}")
 
         # Strip trailing stop tokens TRT-LLM appends — apply_chat_template doesn't reproduce
         # <|endoftext|>, so they'd break seen_token_ids contiguity. Trim logprobs in lockstep.
@@ -239,6 +250,7 @@ def create_app(
 #  Tool-call parsing — mirrors Qwen3ToolParser.detect_and_parse() exactly
 # ---------------------------------------------------------------------------
 
+
 def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Extract <tool_call> blocks; arg serialisation is byte-identical to Qwen3ToolParser."""
     results: list[dict[str, Any]] = []
@@ -253,14 +265,16 @@ def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
             obj.get("parameters") or obj.get("arguments", {}),
             ensure_ascii=False,
         )
-        results.append({
-            "id": f"call_{uuid.uuid4().hex[:8]}",
-            "type": "function",
-            "function": {
-                "name": func_name,
-                "arguments": arguments,
-            },
-        })
+        results.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": func_name,
+                    "arguments": arguments,
+                },
+            }
+        )
     return results
 
 
@@ -275,6 +289,7 @@ def _strip_tool_call_tags(text: str) -> str:
 # ---------------------------------------------------------------------------
 #  Prompt construction
 # ---------------------------------------------------------------------------
+
 
 def _to_int_ids(enc: Any) -> list[int]:
     """Coerce apply_chat_template output to flat list[int] (handles transformers v5 BatchEncoding)."""
@@ -329,17 +344,23 @@ def _compute_splice_inputs(
     required_prefix_ids: list[int] = []
     for _m in reversed(messages):
         if _m.get("role") == "assistant" and "prompt_token_ids" in _m:
-            required_prefix_ids = (
-                list(_m["prompt_token_ids"]) + list(_m.get("generation_token_ids") or [])
+            required_prefix_ids = list(_m["prompt_token_ids"]) + list(
+                _m.get("generation_token_ids") or []
             )
             break
 
     _clean = [_strip_token_fields(m) for m in messages]
     _last_asst_idx = next(
-        (i for i in reversed(range(len(_clean))) if _clean[i].get("role") == "assistant"),
+        (
+            i
+            for i in reversed(range(len(_clean)))
+            if _clean[i].get("role") == "assistant"
+        ),
         None,
     )
-    _msgs_to_last_asst = _clean[:_last_asst_idx + 1] if _last_asst_idx is not None else _clean
+    _msgs_to_last_asst = (
+        _clean[: _last_asst_idx + 1] if _last_asst_idx is not None else _clean
+    )
     _prefix_tkw: dict[str, Any] = {
         **default_template_kwargs,
         "tokenize": True,
@@ -357,6 +378,7 @@ def _compute_splice_inputs(
 #  Server lifecycle
 # ---------------------------------------------------------------------------
 
+
 def start_server(
     llm: Any,
     tokenizer: Any,
@@ -368,6 +390,7 @@ def start_server(
 ) -> "tuple[threading.Thread, str, Any]":
     """Start the HTTP server in a daemon thread and return (thread, base_url, server)."""
     import uvicorn
+
     from nemo_rl.distributed.virtual_cluster import (
         _get_free_port_local,
         _get_node_ip_local,

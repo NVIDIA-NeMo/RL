@@ -377,7 +377,8 @@ def batched_message_log_to_flat_message(
         try:
             _validate_tensor_consistency(tensors)
         except RuntimeError as e:
-            raise RuntimeError(f"[key={key!r}] {e}") from e
+            e.add_note(f"[key={key!r}]")
+            raise
 
         # Create zero tensors for None values
         filled_values: list[Tensor] = [
