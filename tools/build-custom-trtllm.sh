@@ -123,11 +123,17 @@ sed -i 's|COMMAND \${Python3_EXECUTABLE} setup_library.py develop --user|COMMAND
 #                     SKUs (e.g. A100 sm_80, L40 sm_89, consumer Blackwell
 #                     RTX 50-series sm_120) need this list extended.
 ARCH="${BUILD_CUSTOM_TRTLLM_ARCH:-90-real;100-real}"
+JOBS="${TRTLLM_BUILD_JOBS:-24}"
+NPROC=$(nproc 2>/dev/null || echo "$JOBS")
+if (( JOBS > NPROC )); then
+    JOBS=$NPROC
+fi
 
 # Build the wheel.
+#   --job_count: parallel compile jobs (see JOBS above).
 #   --nvrtc_dynamic_linking: required so the wheel links against the venv's
 #                            libnvrtc-builtins lazily instead of statically.
-echo "Building TensorRT-LLM wheel (arch=${ARCH}, ~30-60 minutes)..."
+echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
 # Bracket the build with ccache stats so CI logs surface the cache hit rate.
 # Builds run cold unless vars.TRTLLM_BUILD_CACHE is set, so this makes a
 # missing/misconfigured cache obvious instead of a silent full rebuild.
@@ -139,6 +145,7 @@ python3 scripts/build_wheel.py \
     --clean \
     --use_ccache \
     --nvrtc_dynamic_linking \
+    --job_count "$JOBS" \
     -D "ENABLE_UCX=OFF"
 ccache --show-stats || true
 
