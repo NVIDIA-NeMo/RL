@@ -157,7 +157,21 @@ def _patch_tq_actor_runtime_env() -> None:
     if _TQ_RUNTIME_ENV_PATCHED:
         return
 
-    runtime_env = {"pip": [_resolve_tq_pin()]}
+    # Escape hatch for images that already bake transfer_queue into the base
+    # env on every node (the exact end-state the TODO above describes): the
+    # pip injection is then pure overhead, and on multi-node cold starts the
+    # per-node pip install can exceed Ray's runtime_env setup timeout and
+    # kill the job (observed: 8-node run, RuntimeEnvSetupError after 600s).
+    if os.environ.get("NRL_TQ_SKIP_ACTOR_RUNTIME_ENV") == "1":
+        _TQ_RUNTIME_ENV_PATCHED = True
+        return
+
+    runtime_env = {
+        "pip": [_resolve_tq_pin()],
+        # Multi-node cold-start pip installs (one per node, concurrently,
+        # through the cluster's PyPI egress) can exceed Ray's 600s default.
+        "config": {"setup_timeout_seconds": 1800},
+    }
 
     def _install(cls) -> bool:
         if not hasattr(cls, "options"):

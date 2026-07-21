@@ -49,6 +49,16 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # over_sampling=False.
     force_in_order: bool = False
 
+    # ── AReaL decoupled-PPO ────────────────────────────────────────────────
+    # ── refit / interruptible generation (idea borrowed from the legacy
+    #    trajectory_collector prepare/resume_after_refit; implemented natively) ──
+    # AReaL-style: after the weight swap, call
+    # invalidate_kv_cache(reset_running_requests=True) so vLLM preempts
+    # in-flight requests and reprefills them under the new weights;
+    # False keeps stale KV (Magistral-style, cheaper).
+    refit_invalidate_kv_cache: bool = True
+    evict_stale_samples: bool = True
+
 
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig

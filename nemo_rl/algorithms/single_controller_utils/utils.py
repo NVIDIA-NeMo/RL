@@ -23,6 +23,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.metric_utils import calculate_single_metric
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -90,20 +91,170 @@ def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
     return metrics
 
 
+def _metric_values(value: Any) -> list[Any]:
+    """Normalize a metric payload so results can be concatenated by key."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _collect_reducible_metrics(
+    train_result: dict[str, Any],
+) -> dict[str, list[Any]]:
+    """Collect one finish result's metrics that share GRPO reductions."""
+    mb: dict[str, list[Any]] = {}
+    if "moe_metrics" in train_result:
+        mb.update(
+            {
+                f"moe/{k}": _metric_values(v)
+                for k, v in train_result["moe_metrics"].items()
+            }
+        )
+    if "mtp_metrics" in train_result:
+        mb.update(
+            {
+                f"mtp/{k}": _metric_values(v)
+                for k, v in train_result["mtp_metrics"].items()
+            }
+        )
+    mb.update(
+        {
+            k: _metric_values(v)
+            for k, v in train_result.get("all_mb_metrics", {}).items()
+        }
+    )
+    return mb
+
+
+def _reduce_mb_metrics(mb: dict[str, list[Any]]) -> dict[str, float]:
+    """Apply the legacy GRPO per-microbatch reduction rules."""
+    metrics: dict[str, float] = {}
+    for k, v in mb.items():
+        if k in _MB_METRIC_MIN:
+            valid = [x for x in v if not np.isinf(x)]
+            metrics[k] = float(np.min(valid)) if valid else -1.0
+        elif k in _MB_METRIC_MAX:
+            valid = [x for x in v if not np.isinf(x)]
+            metrics[k] = float(np.max(valid)) if valid else -1.0
+        elif k in _MB_METRIC_MEAN:
+            metrics[k] = float(np.mean(v))
+        else:
+            metrics[k] = float(np.sum(v))
+    return metrics
+
+
+def aggregate_step_metrics_multi_minibatch(
+    train_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Reduce an AReaL RL step's optimizer results into logging scalars.
+
+    Per-microbatch metric lists are concatenated before applying the existing
+    GRPO reductions; summed keys are then rescaled by 1/M because each finish
+    result's lists are already normalized within that minibatch (a result's
+    list sums to its minibatch mean). Metrics that describe one optimizer
+    result retain their natural cross-result semantics: loss and grad norm are
+    averaged, FLOPs and valid counts are summed, and the final optimizer
+    result supplies LR/WD.
+
+    Args:
+        train_results: Ordered ``finish_train_step`` outputs, one per AReaL
+            training minibatch.
+
+    Returns:
+        Flat dict of RL-step scalars ready for logging.
+
+    Raises:
+        ValueError: If no optimizer results are provided.
+    """
+    if not train_results:
+        raise ValueError(
+            "aggregate_step_metrics_multi_minibatch requires at least one train "
+            "result"
+        )
+    if len(train_results) == 1:
+        return aggregate_step_metrics(train_results[0])
+
+    per_result = [aggregate_step_metrics(result) for result in train_results]
+    merged_mb: dict[str, list[Any]] = {}
+    for result in train_results:
+        for key, values in _collect_reducible_metrics(result).items():
+            merged_mb.setdefault(key, []).extend(values)
+    metrics: dict[str, Any] = _reduce_mb_metrics(merged_mb)
+
+    # Each finish result's non-min/max lists are normalized within that
+    # minibatch (the worker rescales by its own 1/N, so a result's list sums
+    # to the minibatch MEAN — mirroring the sync path where the worker
+    # pre-divides by num_global_batches). Summing the concatenation therefore
+    # yields M× the per-step value; rescale summed keys back to the mean over
+    # minibatches. Min/max/mean rules need no correction, and the step-level
+    # keys below (valid counts, lr/wd) are overwritten explicitly anyway.
+    for key in merged_mb:
+        if (
+            key not in _MB_METRIC_MIN
+            and key not in _MB_METRIC_MAX
+            and key not in _MB_METRIC_MEAN
+        ):
+            metrics[key] /= len(train_results)
+
+    # These fields describe a whole optimizer result, not an individual inner
+    # microbatch. Reduce them across optimizer-step boundaries explicitly.
+    for key in ("loss", "grad_norm"):
+        values = [result[key] for result in per_result if key in result]
+        if values:
+            metrics[key] = float(np.mean(values))
+
+    # A finish result repeats its global count for each inner microbatch. The
+    # single-result reducer removes that duplication; the RL step then needs the
+    # sum across its separate optimizer steps for correct throughput metrics.
+    for key in ("total_flops", "global_valid_seqs", "global_valid_toks"):
+        values = [result[key] for result in per_result if key in result]
+        if values:
+            metrics[key] = float(np.sum(values))
+
+    num_ranks = [result["num_ranks"] for result in per_result if "num_ranks" in result]
+    if num_ranks:
+        metrics["num_ranks"] = num_ranks[-1]
+
+    # LR/WD are repeated within a finish result and change between optimizer
+    # steps. Log the values used by the final optimizer step.
+    for key in ("lr", "wd"):
+        if key in per_result[-1]:
+            metrics[key] = per_result[-1][key]
+        else:
+            metrics.pop(key, None)
+    return metrics
+
+
 def reduce_advantage_pump_metrics(
     rewards: list[torch.Tensor],
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
-) -> dict[str, float]:
+    gen_tokens_per_sample: list[float] | None = None,
+    staleness: list[int] | None = None,
+) -> dict[str, Any]:
     """Reduce per-step accumulators from _advantage_pump into step scalars.
 
     Args:
         rewards: One tensor per advantage_pump call; each row a sample reward.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
+        gen_tokens_per_sample: Per-row generated-token counts (token_mask sums),
+            when the controller collects them. Emitted under the SAME metric
+            names as the legacy NeMo-Gym rollout path
+            (``gen_tokens_per_sample/*``, ``total_tokens_per_sample/*``,
+            ``mean_gen_tokens_per_sample``) so wandb charts line up across the
+            legacy and SC paths.
+        staleness: Per-sample weight-version lag (trainer version at
+            consumption minus the sample's generation version) for every
+            sample trained on this step.
 
     Returns:
-        Dict with reward, advantages/{mean,max,min}, total_num_tokens.
+        Dict with reward, advantages/{mean,max,min}, total_num_tokens, and —
+        when ``gen_tokens_per_sample`` is provided — the legacy-named length
+        metrics above, and — when ``staleness`` is provided —
+        staleness/{mean,max,min}.
     """
     out: dict[str, float] = {}
     if rewards:
@@ -120,6 +271,28 @@ def reduce_advantage_pump_metrics(
             out["advantages/min"] = 0.0
     if sequence_lengths:
         out["total_num_tokens"] = float(sum(sequence_lengths))
+    if gen_tokens_per_sample:
+        out.update(
+            calculate_single_metric(
+                gen_tokens_per_sample,
+                len(gen_tokens_per_sample),
+                "gen_tokens_per_sample",
+            )
+        )
+        # Alias kept for parity with the legacy path's downstream logging.
+        out["mean_gen_tokens_per_sample"] = out["gen_tokens_per_sample/mean"]
+        if sequence_lengths:
+            out.update(
+                calculate_single_metric(
+                    sequence_lengths,
+                    len(sequence_lengths),
+                    "total_tokens_per_sample",
+                )
+            )
+    if staleness:
+        out["staleness/mean"] = float(np.mean(staleness))
+        out["staleness/max"] = float(max(staleness))
+        out["staleness/min"] = float(min(staleness))
     return out
 
 
