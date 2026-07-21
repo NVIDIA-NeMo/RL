@@ -124,16 +124,43 @@ def _install_optional_modelopt_config_api(monkeypatch):
     )
 
 
+def _install_fake_vllm_worker(monkeypatch):
+    """Install the minimal vLLM worker hierarchy needed by the backend import."""
+    module_names = ["vllm", "vllm.v1", "vllm.v1.worker"]
+    modules = {}
+    for module_name in module_names:
+        module = types.ModuleType(module_name)
+        module.__path__ = []
+        modules[module_name] = module
+        monkeypatch.setitem(sys.modules, module_name, module)
+
+    gpu_worker_module = types.ModuleType("vllm.v1.worker.gpu_worker")
+
+    class FakeVllmWorker:
+        pass
+
+    gpu_worker_module.Worker = FakeVllmWorker
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", gpu_worker_module)
+    modules["vllm"].v1 = modules["vllm.v1"]
+    modules["vllm.v1"].worker = modules["vllm.v1.worker"]
+    modules["vllm.v1.worker"].gpu_worker = gpu_worker_module
+
+
+def _clear_vllm_backend_modules(monkeypatch):
+    for module_name in (
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend",
+        "nemo_rl.models.generation.vllm.vllm_backend",
+    ):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+
 def _import_vllm_quant_backend(monkeypatch):
     """Import the NeMo-RL backend without requiring the vLLM C extension."""
     monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
-    vllm_module = types.ModuleType("vllm")
-    vllm_module.__path__ = []
-    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    _install_fake_vllm_worker(monkeypatch)
     _install_fake_vllm_reload(monkeypatch)
     _install_fake_modelopt_tensor_quantizer(monkeypatch)
-    sys.modules.pop("nemo_rl.modelopt.models.generation.vllm_quant_backend", None)
-    sys.modules.pop("nemo_rl.models.generation.vllm.vllm_backend", None)
+    _clear_vllm_backend_modules(monkeypatch)
     try:
         return importlib.import_module(
             "nemo_rl.modelopt.models.generation.vllm_quant_backend"
@@ -728,6 +755,36 @@ def test_quant_worker_forwards_snapshot_pythonpath_to_inner_vllm_workers():
     assert "PYTHONPATH" in worker_mod._EXTRA_ENV_VARS
 
 
+def test_configure_quant_engine_kwargs_preserves_checkpoint_extension(monkeypatch):
+    worker_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
+    )
+    monkeypatch.delenv("VLLM_QUANT_CFG", raising=False)
+    monkeypatch.delenv("VLLM_MODELOPT_REAL_QUANT", raising=False)
+    cfg = {
+        "quant_cfg": "examples/modelopt/quant_configs/nvfp4_w4a8_fp8.yaml",
+        "refit_transport": "nixl",
+        "refit_cfg": {"nixl": {}},
+    }
+    llm_kwargs = {}
+
+    worker_mod._configure_quant_engine_kwargs(cfg, llm_kwargs)
+
+    assert llm_kwargs["worker_extension_cls"] == (
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend."
+        "VllmQuantInternalWorkerExtensionWithCheckpointEngine"
+    )
+
+
+def test_fake_quant_worker_inherits_nixl_worker():
+    patch_mod = pytest.importorskip(
+        "nemo_rl.modelopt.models.generation.vllm_quant_patch"
+    )
+    from nemo_rl.models.generation.vllm.vllm_backend import NixlVllmWorker
+
+    assert issubclass(patch_mod.FakeQuantWorker, NixlVllmWorker)
+
+
 def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
@@ -975,14 +1032,14 @@ def test_vllm_modelopt_backend_registers_real_quant_configs_on_import(monkeypatc
     calls = []
 
     monkeypatch.setenv("VLLM_MODELOPT_REAL_QUANT", "1")
-    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    _install_fake_vllm_worker(monkeypatch)
     _install_fake_modelopt_tensor_quantizer(monkeypatch)
     monkeypatch.setattr(
         vllm_modelopt,
         "register_nemo_modelopt_nvfp4",
         lambda: calls.append("registered"),
     )
-    sys.modules.pop("nemo_rl.modelopt.models.generation.vllm_quant_backend", None)
+    _clear_vllm_backend_modules(monkeypatch)
 
     importlib.import_module("nemo_rl.modelopt.models.generation.vllm_quant_backend")
 

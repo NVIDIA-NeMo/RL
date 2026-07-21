@@ -29,7 +29,9 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    extract_reward_components,
     setup_nemo_gym_config,
+    validate_reward_components_match_scalar,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
 
@@ -41,6 +43,57 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_extract_reward_components():
+    """The GDPO multi-reward bridge helper: None for single-reward, normalized dict otherwise."""
+    # Single-reward result (no reward_components) -> None, so callers use scalar reward.
+    assert extract_reward_components({"reward": 1.0}) is None
+    assert extract_reward_components({"reward": 1.0, "reward_components": {}}) is None
+
+    # Multi-reward result -> name->float dict (values coerced to float, keys to str).
+    components = extract_reward_components(
+        {
+            "reward": 2.0,
+            "reward_components": {"correctness": 1, "format": 0.5},
+        }
+    )
+    assert components == {"correctness": 1.0, "format": 0.5}
+    assert all(isinstance(v, float) for v in components.values())
+
+
+def test_validate_reward_components_match_scalar():
+    """Multi-reward verifiers must set reward == sum(reward_components); mismatch raises."""
+    # Contract satisfied: reward equals the component sum -> no error.
+    validate_reward_components_match_scalar(
+        [{"reward": 1.5, "reward_components": {"correctness": 1.0, "format": 0.5}}]
+    )
+    # Float tolerance: tiny rounding differences are accepted.
+    validate_reward_components_match_scalar(
+        [
+            {
+                "reward": 1.5000001,
+                "reward_components": {"correctness": 1.0, "format": 0.5},
+            }
+        ]
+    )
+    # Single-reward results (no reward_components) are skipped entirely.
+    validate_reward_components_match_scalar([{"reward": 2.0}])
+
+    # Mismatch (scalar reward != component sum) -> ValueError naming the offending index.
+    with pytest.raises(ValueError, match="result 1"):
+        validate_reward_components_match_scalar(
+            [
+                {
+                    "reward": 1.5,
+                    "reward_components": {"correctness": 1.0, "format": 0.5},
+                },
+                {
+                    "reward": 2.0,
+                    "reward_components": {"correctness": 1.0, "format": 0.5},
+                },
+            ]
+        )
 
 
 @pytest.mark.nemo_gym

@@ -23,11 +23,12 @@ policy:
   generation:
     refit_transport: vllm_zmq_sparse
     refit_cfg:
-      delta_compression:
-        encoding: xor
-      verify_samples_per_payload: 0
-      baseline:
-        in_memory: false
+      sparse:
+        delta_compression:
+          encoding: xor
+        verify_samples_per_payload: 0
+        baseline:
+          in_memory: false
     colocated:
       enabled: false
       resources:

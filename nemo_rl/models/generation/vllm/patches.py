@@ -283,7 +283,9 @@ def _patch_vllm_hermes_tool_parser_thread_safety(logger) -> None:
 
 
 def _apply_vllm_patches(
-    py_executable: str, *, extra_env_vars: list[str] | None = None
+    py_executable: str,
+    *,
+    extra_env_vars: list[str] | None = None,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
     from vllm.logger import init_logger

@@ -1,0 +1,24 @@
+# GRPO with non-colocated NIXL/UCX checkpoint-engine refit
+defaults: "grpo_math_8B_megatron.yaml"
+
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+    refit_transport: nixl
+    refit_cfg:
+      nixl:
+        # fraction of total GPU memory used by each weight-transfer bucket
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        # Free registered transfer buffers between refits. Keep false for throughput.
+        release_after_refit: false
+        shard_expert_weights: false
+        backend_name: UCX
+        backend_init_params: null
+
+cluster:
+  num_nodes: 2
