@@ -328,6 +328,7 @@ def setup(
     Logger,
     CheckpointManager,
     GRPOSaveState,
+    Optional[str],
     MasterConfig,
     dict[str, Any],
     dict[str, str],
@@ -335,10 +336,10 @@ def setup(
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        A 13-tuple, in order:
+        A 14-tuple, in order:
             policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
             when not enabled), cluster, dataloader, val_dataloader, loss_fn,
-            logger, checkpointer, grpo_save_state, master_config,
+            logger, checkpointer, grpo_save_state, last_checkpoint_path, master_config,
             teacher_worker_groups, alias_to_group_alias.
     """
     # Start timing the entire setup process
@@ -378,7 +379,7 @@ def setup(
     #      Checkpointing
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    last_checkpoint_path = checkpointer.resolve_training_start_checkpoint()
     grpo_save_state: Optional[GRPOSaveState] = cast(
         Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
     )
@@ -1432,6 +1433,7 @@ def setup(
         logger,
         checkpointer,
         grpo_save_state,
+        last_checkpoint_path,
         master_config,
         teacher_worker_groups,
         alias_to_group_alias,
@@ -3673,6 +3675,7 @@ def async_grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    last_checkpoint_path: Optional[str] = None,
     max_trajectory_age_steps: int = 1,
     teacher_worker_groups: Optional[dict[str, Any]] = None,
     alias_to_group_alias: Optional[dict[str, str]] = None,
@@ -3692,6 +3695,7 @@ def async_grpo_train(
         checkpointer: Checkpoint manager
         grpo_save_state: Training state
         master_config: Master configuration
+        last_checkpoint_path: Startup checkpoint path resolved by setup, if any
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
     # Ensure we are running with a compatible async generation backend.
@@ -3813,7 +3817,6 @@ def async_grpo_train(
         max_size=optimal_buffer_size
     )
 
-    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):

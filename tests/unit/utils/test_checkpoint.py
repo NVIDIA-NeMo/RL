@@ -36,6 +36,7 @@ def checkpoint_dir(tmp_path):
 def checkpoint_config(checkpoint_dir):
     return {
         "enabled": True,
+        "resume_if_exists": True,
         "checkpoint_dir": checkpoint_dir,
         "metric_name": "loss",
         "higher_is_better": False,
@@ -332,6 +333,7 @@ def test_checkpoint_without_keep_top_k(tmp_path):
     # Test checkpoint manager without keep_top_k
     config = {
         "enabled": True,
+        "resume_if_exists": True,
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
@@ -564,6 +566,7 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
     # Use keep_top_k=None to keep all checkpoints for this test
     config = {
         "enabled": True,
+        "resume_if_exists": True,
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
@@ -609,6 +612,7 @@ def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
     # Use keep_top_k=None to keep all checkpoints for this test
     config = {
         "enabled": True,
+        "resume_if_exists": True,
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "loss",
         "higher_is_better": False,
@@ -652,6 +656,7 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
     """Test get_best_checkpoint_path with higher_is_better=True."""
     config = {
         "enabled": True,
+        "resume_if_exists": True,
         "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
         "metric_name": "accuracy",
         "higher_is_better": True,
@@ -683,6 +688,7 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
 def async_checkpoint_config(checkpoint_dir):
     return {
         "enabled": True,
+        "resume_if_exists": True,
         "checkpoint_dir": checkpoint_dir,
         "metric_name": None,
         "higher_is_better": False,
@@ -808,6 +814,7 @@ class TestShutdown:
         """shutdown() blocks until both rename and deletion complete."""
         config = {
             "enabled": True,
+            "resume_if_exists": True,
             "checkpoint_dir": checkpoint_dir,
             "metric_name": None,
             "higher_is_better": False,
@@ -900,6 +907,7 @@ class TestDeletionSerialization:
         """Old checkpoints are deleted without blocking the main thread."""
         config = {
             "enabled": True,
+            "resume_if_exists": True,
             "checkpoint_dir": checkpoint_dir,
             "metric_name": None,
             "higher_is_better": False,
@@ -926,6 +934,7 @@ class TestDeletionSerialization:
         """Deletion runs asynchronously, so the next begin_finalization returns quickly."""
         config = {
             "enabled": True,
+            "resume_if_exists": True,
             "checkpoint_dir": checkpoint_dir,
             "metric_name": None,
             "higher_is_better": False,
@@ -1125,6 +1134,7 @@ class TestFTKeepLatestK:
     ):
         config = {
             "enabled": True,
+            "resume_if_exists": True,
             "checkpoint_dir": checkpoint_dir,
             "metric_name": metric_name,
             "higher_is_better": higher_is_better,
@@ -1325,3 +1335,133 @@ class TestFTKeepLatestK:
 
         # top-2 by metric -> {1, 2}; ft latest-2 -> {5, 6}; union -> {1, 2, 5, 6}.
         assert self._remaining_steps(checkpoint_dir) == [1, 2, 5, 6]
+
+
+def test_resolve_training_start_checkpoint_resumes_existing_checkpoint(
+    checkpoint_manager, checkpoint_dir
+):
+    steps = [1, 2, 3]
+
+    for step in steps:
+        training_info = {"loss": 0.5}
+        tmp_dir = checkpoint_manager.init_tmp_checkpoint(step, training_info)
+        checkpoint_manager.finalize_checkpoint(tmp_dir)
+
+    checkpoint_path = checkpoint_manager.resolve_training_start_checkpoint()
+
+    assert Path(checkpoint_path).name == f"step_{max(steps)}"
+    assert sorted(path.name for path in checkpoint_dir.glob("step_*")) == [
+        "step_1",
+        "step_2",
+        "step_3",
+    ]
+
+
+def test_resolve_training_start_checkpoint_archives_existing_checkpoints(
+    checkpoint_config, checkpoint_dir
+):
+    manager = CheckpointManager(
+        {
+            **checkpoint_config,
+            "resume_if_exists": False,
+            "keep_top_k": None,
+        }
+    )
+
+    for step in [1, 2, 4]:
+        training_info = {"loss": 0.5}
+        tmp_dir = manager.init_tmp_checkpoint(step, training_info)
+        manager.finalize_checkpoint(tmp_dir)
+
+    checkpoint_path = manager.resolve_training_start_checkpoint()
+
+    assert checkpoint_path is None
+    assert list(checkpoint_dir.glob("step_*")) == []
+    assert sorted(path.name for path in (checkpoint_dir / "run_0").glob("step_*")) == [
+        "step_1",
+        "step_2",
+        "step_4",
+    ]
+    assert manager.get_latest_checkpoint_path() is None
+    assert manager.get_best_checkpoint_path() is None
+
+
+def test_resolve_training_start_checkpoint_uses_next_archive_directory(
+    checkpoint_config, checkpoint_dir
+):
+    manager = CheckpointManager(
+        {
+            **checkpoint_config,
+            "resume_if_exists": False,
+            "keep_top_k": None,
+        }
+    )
+
+    for step in [1, 2]:
+        training_info = {"loss": 0.5}
+        tmp_dir = manager.init_tmp_checkpoint(step, training_info)
+        manager.finalize_checkpoint(tmp_dir)
+
+    assert manager.resolve_training_start_checkpoint() is None
+
+    for step in [3, 4]:
+        training_info = {"loss": 0.4}
+        tmp_dir = manager.init_tmp_checkpoint(step, training_info)
+        manager.finalize_checkpoint(tmp_dir)
+
+    assert manager.resolve_training_start_checkpoint() is None
+    assert sorted(path.name for path in (checkpoint_dir / "run_0").glob("step_*")) == [
+        "step_1",
+        "step_2",
+    ]
+    assert sorted(path.name for path in (checkpoint_dir / "run_1").glob("step_*")) == [
+        "step_3",
+        "step_4",
+    ]
+
+
+def test_resolve_training_start_checkpoint_uses_max_archive_directory(
+    checkpoint_config, checkpoint_dir
+):
+    manager = CheckpointManager(
+        {
+            **checkpoint_config,
+            "resume_if_exists": False,
+            "keep_top_k": None,
+        }
+    )
+    (checkpoint_dir / "run_2").mkdir(parents=True)
+    (checkpoint_dir / "run_10").mkdir()
+
+    tmp_dir = manager.init_tmp_checkpoint(1, {"loss": 0.5})
+    manager.finalize_checkpoint(tmp_dir)
+
+    assert manager.resolve_training_start_checkpoint() is None
+    assert (checkpoint_dir / "run_11" / "step_1").is_dir()
+
+
+def test_resolve_training_start_checkpoint_returns_none_when_disabled(checkpoint_dir):
+    manager = CheckpointManager(
+        {
+            "enabled": False,
+            "resume_if_exists": False,
+            "checkpoint_dir": checkpoint_dir,
+            "metric_name": "loss",
+            "higher_is_better": False,
+            "save_period": 1,
+            "keep_top_k": None,
+            "save_optimizer": True,
+        }
+    )
+
+    for step in [1, 2]:
+        step_dir = checkpoint_dir / f"step_{step}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        with open(step_dir / "training_info.json", "w") as f:
+            json.dump({"loss": 0.5}, f)
+
+    assert manager.resolve_training_start_checkpoint() is None
+    assert sorted(path.name for path in checkpoint_dir.glob("step_*")) == [
+        "step_1",
+        "step_2",
+    ]

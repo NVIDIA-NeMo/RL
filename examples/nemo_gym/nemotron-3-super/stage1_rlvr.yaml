@@ -1,5 +1,6 @@
 checkpointing:
   enabled: true
+  resume_if_exists: true
   checkpoint_dir: "results/super_v3_prod_stage1"
   metric_name: "val:total_reward/mean"
   higher_is_better: true

@@ -210,6 +210,7 @@ def _make_master_config(
             "cluster": {"num_nodes": 1, "gpus_per_node": 1},
             "checkpointing": {
                 "enabled": save_enabled,
+                "resume_if_exists": True,
                 "checkpoint_must_save_by": None,
                 "save_period": 100,
                 "metric_name": None,
@@ -296,7 +297,7 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
         patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
-        mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
+        mock_cp_cls.return_value.resolve_training_start_checkpoint.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
         mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
@@ -415,7 +416,7 @@ def test_setup_val_dataloader_gating(
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
         patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
-        mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
+        mock_cp_cls.return_value.resolve_training_start_checkpoint.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
         mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
@@ -767,7 +768,7 @@ def test_setup_builds_one_policy_per_teacher():
         patch.object(xt_mod, "assert_teacher_student_batch_grid"),
         patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
-        mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
+        mock_cp_cls.return_value.resolve_training_start_checkpoint.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
         mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
