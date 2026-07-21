@@ -106,3 +106,21 @@ Fix = when the selected kernel is CuteDSL, produce the weight as
 load target so weight_loader + refit #2 keep working; the CuteDSL apply reads the
 [K,N] view -> same aliasing pattern as BF16-TRTLLM's w13_weight_for_apply).
 Guard with a bit-exact verify vs the kernel's own process_weights output.
+
+## Grind progress (gcp-nrt, 2026-07-21)
+
+Cascade being resolved one break per run cycle:
+1. FusedMoeWeightScaleSupported import — fixed (99b1a96)
+2. mxfp8_backend / Fp8MoeBackend assert — fixed (99b1a96)
+3. CuteDSL linear kernel guard — fixed (0fa4259)
+4. **CuteDSL linear weight-layout stride — FIXED (ba0b1b1f): expose layer.weight as a
+   zero-copy transpose view of the [N,K] load target. Validated: the `mB.strides[1]`
+   error is GONE.**
+5. `layer.enable_eplb` on RoutedExperts (0.25 FusedMoE split) — fixed (3679830):
+   read via layer.moe_config.moe_parallel_config.enable_eplb.
+6. (in flight, job 460903)
+
+All remaining breaks are the same class (FusedMoE -> MoERunner+RoutedExperts attribute
+migration); each resolves with a getattr/attribute-path fix. The hard part (weight
+layout, #4) is solved. gcp-nrt caveat: worker venv build needs a retry when
+nvidia-resiliency-ext source build times out on the network (transient).
