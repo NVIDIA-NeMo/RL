@@ -274,6 +274,26 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
 
 
 @requires_weight_folding
+def test_iter_real_quant_refit_params_can_keep_export_on_gpu():
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant_export_cpu_offload"] = False
+
+    list(worker._iter_real_quant_refit_params())
+
+    _, kwargs = worker.megatron_bridge.calls[0]
+    assert kwargs["cpu"] is False
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_rejects_non_boolean_export_placement():
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant_export_cpu_offload"] = "false"
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        list(worker._iter_real_quant_refit_params())
+
+
+@requires_weight_folding
 def test_iter_real_quant_refit_params_exports_w4a4_mode():
     worker = _make_real_quant_worker()
     quant_cfg = "NVFP4_EXPERTS_ONLY_CFG"

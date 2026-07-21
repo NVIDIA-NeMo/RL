@@ -492,6 +492,54 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     assert configured["vllm_cfg"]["load_format"] == "dummy"
 
 
+def test_configure_generation_config_defaults_real_quant_export_to_cpu():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["real_quant_export_cpu_offload"] is True
+
+
+def test_configure_generation_config_keeps_colocated_real_quant_export_on_gpu():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["real_quant_export_cpu_offload"] is False
+
+
+def test_configure_generation_config_rejects_non_boolean_real_quant_export():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = "false"
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+
+def test_configure_generation_config_keeps_non_colocated_export_on_gpu():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = True
+    vllm_config["colocated"]["enabled"] = False
+
+    with pytest.warns(UserWarning, match="Non-colocated NCCL refit"):
+        configured = configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
+
+    assert configured["real_quant_export_cpu_offload"] is False
+
+
 @pytest.mark.parametrize("method", ["deepseek_mtp", "mtp"])
 def test_configure_generation_config_keeps_dummy_startup_weights_for_mtp(method):
     """MTP keeps dummy startup weights even without draft refit.
