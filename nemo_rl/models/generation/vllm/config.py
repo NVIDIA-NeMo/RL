@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, PositiveInt
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
 VllmRefitTransportName = Literal["s3", "zmq"]
+VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl"]
+VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
+VLLM_BUILTIN_REFIT_TRANSPORTS = VLLM_SPARSE_REFIT_TRANSPORTS | {"nixl"}
 
 
 class VllmSpecificArgs(TypedDict):
@@ -100,7 +103,7 @@ class VllmRefitTuningConfig(BaseModel, extra="allow"):
     partition_workers: PositiveInt = 8
 
 
-class VllmRefitConfig(BaseModel, extra="allow"):
+class VllmSparseRefitConfig(BaseModel, extra="allow"):
     delta_compression: VllmDeltaCompressionConfig = Field(
         default_factory=VllmDeltaCompressionConfig
     )
@@ -111,11 +114,32 @@ class VllmRefitConfig(BaseModel, extra="allow"):
     request_timeout_s: PositiveFloat = 600.0
 
 
+class VllmNixlRefitConfig(BaseModel, extra="forbid"):
+    update_weights_bucket_memory_ratio: Annotated[float, Field(gt=0, lt=1)] = 0.05
+    device: str = "cuda"
+    backend_name: str = "UCX"
+    backend_init_params: dict[str, Any] | None = None
+    release_after_refit: bool = False
+    shard_expert_weights: bool = False
+
+
+class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
+    update_weights_bucket_memory_ratio: Annotated[float, Field(gt=0, lt=1)] = 0.05
+    release_after_refit: bool = False
+
+
+class VllmRefitConfig(BaseModel, extra="allow"):
+    sparse: VllmSparseRefitConfig = Field(default_factory=VllmSparseRefitConfig)
+    nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
+
+
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
-    # Null uses NCCL; remote sparse refit supports S3 or ZeroMQ value planes.
-    refit_transport: NotRequired[Literal["vllm_s3_sparse", "vllm_zmq_sparse"] | None]
+    # Null uses the topology default (IPC colocated, NCCL non-colocated).
+    # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
+    # A custom checkpoint engine may use a ``module:ClassName`` selector.
+    refit_transport: NotRequired[VllmRefitSelector | str | None]
     refit_cfg: NotRequired[VllmRefitConfig | None]
 
     # quantization config
@@ -128,9 +152,30 @@ class VllmConfig(GenerationConfig):
 
 
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
-    """Resolve sparse-refit defaults into the generation config."""
-    if config.get("refit_transport") is None:
+    """Validate the selected refit transport and resolve its scoped defaults."""
+    if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
+        raise ValueError(
+            "policy.generation.checkpoint_engine was replaced by "
+            "policy.generation.refit_transport='nixl' and "
+            "policy.generation.refit_cfg.nixl."
+        )
+    transport = config.get("refit_transport")
+    if transport is None:
         return None
+    if transport not in VLLM_BUILTIN_REFIT_TRANSPORTS and ":" not in transport:
+        raise ValueError(
+            f"Unknown vLLM refit transport {transport!r}: expected null, "
+            "'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
+            "'module:ClassName' checkpoint-engine path."
+        )
     refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
+    if ":" in transport:
+        plugin_config = (refit_config.model_extra or {}).get(transport)
+        if plugin_config is None:
+            raise ValueError(
+                f"Custom checkpoint-engine transport {transport!r} requires "
+                f"policy.generation.refit_cfg[{transport!r}]."
+            )
+        VllmCheckpointEnginePluginConfig.model_validate(plugin_config)
     config["refit_cfg"] = refit_config
     return refit_config

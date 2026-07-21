@@ -177,6 +177,17 @@ class ColocationConfig(TypedDict):
     resources: OptionalResourcesConfig
 
 
+class CheckpointEngineConfig(TypedDict):
+    """Normalized internal configuration for checkpoint-engine refit."""
+
+    # "nixl" or a "module:ClassName" path to a CheckpointEngine implementation
+    backend: str
+    # fraction of total GPU memory used by each transfer bucket
+    update_weights_bucket_memory_ratio: float
+    # per-backend constructor kwargs, keyed by the configured backend string
+    engine_kwargs: dict[str, dict[str, Any]]
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
