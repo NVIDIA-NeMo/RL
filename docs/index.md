@@ -264,6 +264,7 @@ guides/sft-openmathinstruct2.md
 guides/nemotron-3-nano.md
 guides/nemotron-3-nano-omni.md
 guides/nemotron-3-super.md
+guides/glm-5-2.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
