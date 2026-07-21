@@ -56,3 +56,33 @@ dense) — small surface, but must be correct.
    for the exact weight transform; apply it in `process_weights_after_loading_mxfp8_linear`.
 3. Run the naive-vs-patch A/B (oci-hsg `nemo-rl-cg-test/exp_vllm0251_ab.sh`,
    GB200 4n4g) to confirm the refit optimizations still reproduce on 0.25.1.
+
+## Detailed fix recipe for break #4 (CuteDSL linear weight layout)
+
+Root cause: `process_weights_after_loading_mxfp8_linear` re-lays-out only the
+scale (`swizzle_mxfp8_scale`); the weight stays checkpoint [N,K]. The old
+Cutlass kernel accepted that; CuteDSL wants dim-1-contiguous (the stride error).
+
+Fix = the same "idempotent re-layout + bit-exact verify" pattern #3294 already
+uses for MoE and #3296 uses for BF16-TRTLLM:
+
+1. **Find the transform (needs vLLM 0.25 source):** read
+   `FlashInferCutedslMxfp8LinearKernel.process_weights_after_loading` in vLLM
+   0.25 (under `.../quantization/kernels/...`). That is the ground-truth layout
+   the kernel wants on a normal load. Likely a transpose ([N,K]->[K,N] to make
+   dim-1 contiguous), possibly + a block pack. Mirror it exactly.
+2. **Apply idempotently in refit:** keep the checkpoint-layout weight as the
+   permanent load target (every refit's weight_loader works unchanged);
+   recompute the CuteDSL layout from it into an apply-target each refit
+   (separate tensor or aliased view), exactly like `w13_weight_for_apply` in
+   the BF16-TRTLLM path.
+3. **Bit-exact verify:** add an `NRL_MXFP8_*_VERIFY`-style assert that our
+   refit-produced weight equals vLLM's own `process_weights` output on a fresh
+   load, byte-for-byte.
+4. **Scope:** confirm which layers hit the mxfp8-linear path (attention is
+   BF16-ignored, experts go MoE path -> likely just router / a few dense).
+
+Moderate effort, no new architecture (reuses #3294's own pattern). The only new
+work is reading the exact CuteDSL transform. Cleanest at #3280 merge: the merged
+base pins 0.25 and includes #3280's `convert_to_fp8_moe_kernel_format`, giving a
+tested reference for the layout instead of reverse-engineering the stride.
