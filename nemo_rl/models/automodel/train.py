@@ -146,9 +146,21 @@ def model_forward(
             model_args["input_ids"] = model_args["input_ids"].squeeze(0)
             if model_args["position_ids"] is not None:
                 model_args["position_ids"] = model_args["position_ids"].squeeze(0)
-            model_args["cu_seqlens"] = fa_kwargs.cu_seqlens_q.to(
+            cu_seqlens = fa_kwargs.cu_seqlens_q.to(
                 dtype=torch.int32, device=model_args["input_ids"].device
             )
+            # pack_sequences pads the packed row to train_mb_tokens, but
+            # cu_seqlens only covers real tokens. THD kernels that build
+            # per-token varlen params (e.g. the TileLang DSA indexer) require
+            # cu_seqlens[-1] == packed_len, so cover the trailing padding with
+            # a dummy segment; downstream slicing uses the original
+            # flash_attn_kwargs and never reads these positions.
+            packed_len = model_args["input_ids"].shape[0]
+            if int(cu_seqlens[-1]) < packed_len:
+                cu_seqlens = torch.cat(
+                    [cu_seqlens, cu_seqlens.new_tensor([packed_len])]
+                )
+            model_args["cu_seqlens"] = cu_seqlens
             model_args["qkv_format"] = "thd"
         else:
             model_args["flash_attn_kwargs"] = fa_kwargs
@@ -781,8 +793,13 @@ class LogprobsPostProcessor:
         if processed_inputs.thd_batch is not None:
             thd = processed_inputs.thd_batch
             cu_actual = thd.cu_seqlens_per_row[0]
+            # Always slice logits by the padded layout: it equals the actual
+            # layout without CP padding, and GLM DSA CP hands gathered logits
+            # in the CP-padded global layout with cp_size treated as 1 here.
             cu_padded = (
-                thd.cu_seqlens_padded_per_row[0] if self.cp_size > 1 else cu_actual
+                thd.cu_seqlens_padded_per_row[0]
+                if thd.cu_seqlens_padded_per_row
+                else cu_actual
             )
             cp_group = self.cp_mesh.get_group() if self.cp_size > 1 else None
             cp_size_val = self.cp_size

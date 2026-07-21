@@ -152,6 +152,7 @@ class PPLossAdapter:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        glm_dsa_cp_group: Any = None,
     ):
         self._loss_fn = loss_fn
         self._cfg = cfg
@@ -162,6 +163,9 @@ class PPLossAdapter:
         self._dp_size = dp_size
         self._enable_seq_packing = enable_seq_packing
         self._sampling_params = sampling_params
+        # GLM DSA CP shards the sequence contiguously; logits are all-gathered
+        # back to the global layout here and the loss then runs as if cp=1.
+        self._glm_dsa_cp_group = glm_dsa_cp_group
 
         self._microbatches: list[dict[str, Any]] = []
         self._cu_seqlens_list: list[Optional[torch.Tensor]] = []
@@ -224,6 +228,16 @@ class PPLossAdapter:
         # THD format: [total_tokens, vocab] → [1, total_tokens, vocab]
         if logits.ndim == 2:
             logits = logits.unsqueeze(0)
+        if self._glm_dsa_cp_group is not None:
+            from nemo_automodel.components.models.glm_moe_dsa.cp import (
+                glm_dsa_cp_all_gather,
+            )
+
+            # Contiguous CP shard → differentiable gather restores the global
+            # packed layout; backward slices the gradient back per rank.
+            logits = glm_dsa_cp_all_gather(
+                logits, dim=1, cp_group=self._glm_dsa_cp_group
+            )
         mb_data = self._microbatches[self._call_idx]
         cu_seqlens = (
             self._cu_seqlens_list[self._call_idx] if self._cu_seqlens_list else None
@@ -396,44 +410,23 @@ def reset_pp_stage_shapes_for_thd(model: Any, tokens_per_chunk: int) -> None:
 
     THD format produces [1, T, dim] outputs instead of [batch, seq, dim].
     Must be called before each schedule.step() when sequence lengths change.
+
+    Delegates to automodel's ``reset_pp_stage_shapes``, which honors per-model
+    ``get_pipeline_stage_metas`` hooks (e.g. GLM DSA declares an extra
+    inter-stage top-k carry tensor) and falls back to generic single-tensor
+    [1, T, ...] metas for models without the hook.
     """
     from nemo_automodel.components.distributed.pipelining.functional import (
-        _get_hidden_and_vocab_size,
+        reset_pp_stage_shapes,
     )
 
-    schedule = model.info.schedule
-    stages = model.info.stages
-    model_config = model.parts[0].config
-    hidden_size, vocab_size = _get_hidden_and_vocab_size(model_config)
-
-    schedule._stages_forward_initialized = False
-    if hasattr(schedule, "_stages_backward_initialized"):
-        schedule._stages_backward_initialized = False
-
-    for stage in stages:
-        try:
-            model_dtype = next(stage.submod.parameters()).dtype
-        except StopIteration:
-            model_dtype = torch.bfloat16
-
-        if stage.is_first:
-            stage.inputs_meta = (
-                torch.empty(1, tokens_per_chunk, device="meta", dtype=torch.long),
-            )
-        else:
-            stage.inputs_meta = (
-                torch.empty(
-                    1, tokens_per_chunk, hidden_size, device="meta", dtype=model_dtype
-                ),
-            )
-
-        has_lm_head = (
-            hasattr(stage.submod, "lm_head") and stage.submod.lm_head is not None
-        )
-        out_dim = vocab_size if has_lm_head else hidden_size
-        stage._outputs_meta = (
-            torch.empty(1, tokens_per_chunk, out_dim, device="meta", dtype=model_dtype),
-        )
+    reset_pp_stage_shapes(
+        schedule=model.info.schedule,
+        stages=model.info.stages,
+        model_config=model.parts[0].config,
+        microbatch_size=1,
+        seq_len=tokens_per_chunk,
+    )
 
 
 def _reset_pp_schedule_state(
@@ -488,6 +481,7 @@ def prepare_pp_seqpack_batch(
     cp_mesh: Any = None,
     device_mesh: Any = None,
     token_mask: Optional[torch.Tensor] = None,
+    model: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any], "THDBatch"]:
     """Pack sequences into THD format for a PP training step.
 
@@ -560,8 +554,25 @@ def prepare_pp_seqpack_batch(
         cp_mesh=cp_mesh,
         device_mesh=device_mesh,
         token_mask=token_mask,
+        model=model,
     )
     pp_batch = thd_batch.to_model_kwargs(device=input_ids.device)
+    if cp_size == 1:
+        # max_seqlen is a CP-path hint; drop it here since a 0-dim scalar
+        # cannot be split by the PP schedule's kwargs chunking.
+        pp_batch.pop("max_seqlen", None)
+    # The PP schedule splits args/kwargs along dim 0, but num_chunks=1 packing
+    # emits chunk-dim-less tensors (input_ids [T], cu_seqlens [S+1]) — restore
+    # the chunk dimension on every tensor kwarg (0-dim scalars become [1]) so
+    # splitting and the stage input metas line up. Non-tensor kwargs
+    # (qkv_format, the GLM DSA CP process group) are replicated per
+    # microbatch by the schedule as-is.
+    if pp_batch["input_ids"].ndim == 1:
+        for key, value in pp_batch.items():
+            if torch.is_tensor(value):
+                pp_batch[key] = (
+                    value.reshape(1) if value.ndim == 0 else value.unsqueeze(0)
+                )
     return pp_batch, accum_data, thd_batch
 
 
@@ -604,6 +615,14 @@ def pp_forward_with_post_processing(
     has_first_stage: bool,
     has_last_stage: bool,
     capturer: PPLogitsCapturer,
+    enable_seq_packing: bool = False,
+    n_microbatches: int = 1,
+    is_hf_model: bool = False,
+    tokenizer_eos_id: int = 0,
+    logprob_mb_tokens: int = 0,
+    cp_size: int = 1,
+    cp_mesh: Any = None,
+    device_mesh: Any = None,
 ) -> dict[str, torch.Tensor]:
     """Run PP schedule.eval() on one chunk and apply post-processing.
 
@@ -643,22 +662,72 @@ def pp_forward_with_post_processing(
 
     # 1. Pad batch and reset schedule state
     capturer.reset()
-    input_ids, actual_seqs = pad_batch_for_pp(input_ids, pp_batch_size)
-    labels = input_ids.clone()
-
-    _reset_pp_schedule_state(model, input_ids.shape[-1])
+    enable_thd = enable_seq_packing and not is_hf_model
+    thd_batch = None
+    batch_kwargs: dict[str, Any] = {}
+    data_seq_len = input_ids.shape[1]
+    glm_dsa_cp = False
+    if enable_thd:
+        # Mirror the PP training path: pack the chunk into THD rows so custom
+        # models (e.g. GLM DSA with TileLang kernels) get cu_seqlens/qkv_format.
+        actual_seqs = input_ids.shape[0]
+        pack_model = model.parts[0]
+        glm_dsa_cp = cp_size > 1 and hasattr(
+            pack_model, "prepare_model_inputs_for_cp"
+        )
+        pp_batch, _, thd_batch = prepare_pp_seqpack_batch(
+            input_ids=input_ids,
+            input_lengths=chunk_data["input_lengths"],
+            accum_data={},
+            pp_batch_size=pp_batch_size,
+            n_microbatches=n_microbatches,
+            tokenizer_eos_id=tokenizer_eos_id,
+            train_mb_tokens=logprob_mb_tokens,
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            device_mesh=device_mesh,
+            model=pack_model,
+        )
+        input_ids = pp_batch.pop("input_ids")
+        labels = pp_batch.pop("labels")
+        batch_kwargs = {
+            k: v
+            for k, v in pp_batch.items()
+            if v is not None and not (isinstance(v, dict) and len(v) == 0)
+        }
+        _reset_pp_schedule_state(
+            model,
+            input_ids.shape[-1],
+            seqpack=True,
+            is_hf_model=is_hf_model,
+            force=True,
+        )
+    else:
+        input_ids, actual_seqs = pad_batch_for_pp(input_ids, pp_batch_size)
+        labels = input_ids.clone()
+        _reset_pp_schedule_state(model, input_ids.shape[-1])
 
     # 2. Run schedule.eval()
     targets = labels if has_last_stage else None
     losses = [] if has_last_stage else None
     args = (input_ids,) if has_first_stage else ()
-    schedule.eval(*args, target=targets, losses=losses)
+    schedule.eval(*args, target=targets, losses=losses, **batch_kwargs)
 
     # 3. Dispatch based on post-processor type
     if isinstance(post_processor, LogprobsPostProcessor):
         # Broadcast full logits, then post-process on all ranks
         if has_last_stage:
             all_logits = torch.cat(capturer.captured_logits, dim=0)
+            if glm_dsa_cp:
+                from nemo_automodel.components.models.glm_moe_dsa.cp import (
+                    glm_dsa_cp_all_gather,
+                )
+
+                # Contiguous CP shard → gather restores the global packed
+                # layout before the PP broadcast; unpacking then runs as cp=1.
+                all_logits = glm_dsa_cp_all_gather(
+                    all_logits, dim=1, cp_group=cp_mesh.get_group()
+                )
             tensors = {"logits": all_logits}
         else:
             tensors = {"logits": None}
@@ -668,21 +737,63 @@ def pp_forward_with_post_processing(
         )
         logits = broadcasted["logits"]
 
-        processed_inputs = ProcessedInputs(
-            input_ids=input_ids,
-            seq_len=input_ids.shape[1],
-        )
-        token_logprobs = post_processor(
-            logits=logits,
-            data_dict=chunk_data,
-            processed_inputs=processed_inputs,
-            original_batch_size=actual_seqs,
-            original_seq_len=seq_dim_size,
-            sequence_dim=1,
-        )
+        if thd_batch is not None:
+            # THD path: captured logits are per packed row [n_rows, packed_len, V].
+            # Unpack each row via the post-processor's thd_batch branch, using
+            # the sequences packed into that row (contiguous blocks of pp_mbs).
+            from nemo_rl.models.automodel.data import THDBatch
 
-        # Trim dummy-padded rows and pad to global seq dim
-        token_logprobs = token_logprobs[:actual_seqs]
+            if logits.ndim == 2:
+                logits = logits.unsqueeze(0)
+            pp_mbs = pp_batch_size // n_microbatches
+            row_logprobs_list = []
+            for row_idx in range(n_microbatches):
+                row_start = row_idx * pp_mbs
+                row_real = max(0, min(pp_mbs, actual_seqs - row_start))
+                row_thd = THDBatch(
+                    input_ids=thd_batch.input_ids,
+                    position_ids=thd_batch.position_ids,
+                    labels=thd_batch.labels,
+                    cu_seqlens=thd_batch.cu_seqlens_per_row[row_idx],
+                    cu_seqlens_per_row=[thd_batch.cu_seqlens_per_row[row_idx]],
+                    cu_seqlens_padded_per_row=[
+                        thd_batch.cu_seqlens_padded_per_row[row_idx]
+                    ],
+                    n_packed_rows=1,
+                )
+                row_data = chunk_data.slice(row_start, row_start + row_real)
+                processed_inputs = ProcessedInputs(
+                    input_ids=input_ids,
+                    seq_len=logits.shape[1],
+                    thd_batch=row_thd,
+                )
+                row_logprobs = post_processor(
+                    logits=logits[row_idx : row_idx + 1],
+                    data_dict=row_data,
+                    processed_inputs=processed_inputs,
+                    original_batch_size=row_real,
+                    original_seq_len=data_seq_len,
+                    sequence_dim=1,
+                )
+                row_logprobs_list.append(row_logprobs)
+            token_logprobs = torch.cat(row_logprobs_list, dim=0)
+        else:
+            processed_inputs = ProcessedInputs(
+                input_ids=input_ids,
+                seq_len=input_ids.shape[1],
+            )
+            token_logprobs = post_processor(
+                logits=logits,
+                data_dict=chunk_data,
+                processed_inputs=processed_inputs,
+                original_batch_size=actual_seqs,
+                original_seq_len=seq_dim_size,
+                sequence_dim=1,
+            )
+            # Trim dummy-padded rows
+            token_logprobs = token_logprobs[:actual_seqs]
+
+        # Pad to global seq dim
         padding_needed = seq_dim_size - token_logprobs.shape[1]
         if padding_needed > 0:
             token_logprobs = torch.nn.functional.pad(
@@ -691,6 +802,10 @@ def pp_forward_with_post_processing(
         return {"logprobs": token_logprobs}
 
     elif isinstance(post_processor, TopkLogitsPostProcessor):
+        if thd_batch is not None:
+            raise NotImplementedError(
+                "PP top-k logits path does not support sequence packing yet."
+            )
         # Post-process on last stage first (reduces vocab dim), then broadcast
         k = post_processor.k
         if has_last_stage:
@@ -737,6 +852,14 @@ def pp_forward_loop(
     pp_mesh: Any,
     has_first_stage: bool,
     has_last_stage: bool,
+    enable_seq_packing: bool = False,
+    n_microbatches: int = 1,
+    is_hf_model: bool = False,
+    tokenizer_eos_id: int = 0,
+    logprob_mb_tokens: int = 0,
+    cp_size: int = 1,
+    cp_mesh: Any = None,
+    device_mesh: Any = None,
 ) -> dict[str, torch.Tensor]:
     """Run PP eval over all data in pp_batch_size chunks with post-processing.
 
@@ -793,6 +916,14 @@ def pp_forward_loop(
             has_first_stage=has_first_stage,
             has_last_stage=has_last_stage,
             capturer=capturer,
+            enable_seq_packing=enable_seq_packing,
+            n_microbatches=n_microbatches,
+            is_hf_model=is_hf_model,
+            tokenizer_eos_id=tokenizer_eos_id,
+            logprob_mb_tokens=logprob_mb_tokens,
+            cp_size=cp_size,
+            cp_mesh=cp_mesh,
+            device_mesh=device_mesh,
         )
 
         for key, tensor in chunk_result.items():
@@ -911,6 +1042,7 @@ def pp_train_forward_backward_loop(
                 cp_mesh=cp_mesh,
                 device_mesh=device_mesh,
                 token_mask=token_mask,
+                model=model_parts[0],
             )
         else:
             pp_batch = {
@@ -918,6 +1050,11 @@ def pp_train_forward_backward_loop(
                 "labels": input_ids.clone(),
             }
 
+        glm_dsa_cp = (
+            cp_size > 1
+            and enable_seq_packing
+            and hasattr(model_parts[0], "prepare_model_inputs_for_cp")
+        )
         if has_last_stage:
             cu_seqlens_per_row = (
                 thd_batch.cu_seqlens_per_row if enable_seq_packing else None
@@ -927,7 +1064,10 @@ def pp_train_forward_backward_loop(
                 if enable_seq_packing and cp_size > 1
                 else None
             )
-            cp_group = cp_mesh.get_group() if cp_size > 1 else None
+            # GLM DSA CP: the loss adapter all-gathers logits back to the
+            # global layout, so the seqpack loss runs with cp semantics off
+            # (the TE dual-chunk arithmetic does not apply to contiguous CP).
+            cp_group = cp_mesh.get_group() if cp_size > 1 and not glm_dsa_cp else None
             loss_adapter.set_microbatches(
                 accum_data,
                 n_microbatches,

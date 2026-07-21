@@ -678,6 +678,7 @@ class DTensorPolicyWorkerV2Impl(
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
+            glm_dsa_cp_group=self._glm_dsa_cp_group(),
         )
 
         pp_batch_size = self.model.pp_batch_size
@@ -917,6 +918,19 @@ class DTensorPolicyWorkerV2Impl(
         self.timer.stop("get_logprobs")
         return return_data
 
+    def _glm_dsa_cp_group(self) -> Optional[Any]:
+        """CP group when the model owns its CP sharding (GLM DSA), else None.
+
+        Model-owned CP shards the sequence contiguously; the loss/logprob
+        consumers all-gather logits back to the global layout and then run
+        with cp semantics off.
+        """
+        if self.cp_size > 1 and hasattr(
+            self.model_handle.parts[0], "prepare_model_inputs_for_cp"
+        ):
+            return self.cp_mesh.get_group()
+        return None
+
     def _get_logprobs_pp(
         self,
         data: BatchedDataDict[Any],
@@ -927,15 +941,24 @@ class DTensorPolicyWorkerV2Impl(
         for mp in self.model_handle.parts:
             mp.eval()
 
+        # GLM DSA CP: logits arrive gathered to the global layout, so the
+        # post-processor must unpack them with cp semantics off.
+        glm_dsa_cp = self._glm_dsa_cp_group() is not None
         post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
             device_mesh=self.device_mesh,
-            cp_mesh=self.cp_mesh,
+            cp_mesh=None if glm_dsa_cp else self.cp_mesh,
             tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
+            cp_size=1 if glm_dsa_cp else self.cp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
         )
+
+        # Custom models with THD packing need the cu_seqlens squeeze hook,
+        # same as the PP training path.
+        thd_hooks: list = []
+        if self.enable_seq_packing and not self.is_hf_model:
+            thd_hooks = install_thd_squeeze_hook(self.model_handle.parts)
 
         with torch.no_grad():
             result = pp_forward_loop(
@@ -947,7 +970,21 @@ class DTensorPolicyWorkerV2Impl(
                 pp_mesh=self.pp_mesh,
                 has_first_stage=self.has_first_stage,
                 has_last_stage=self.has_last_stage,
+                enable_seq_packing=self.enable_seq_packing,
+                n_microbatches=self.model.info.schedule._n_microbatches,
+                is_hf_model=self.is_hf_model,
+                tokenizer_eos_id=self.tokenizer.eos_token_id,
+                logprob_mb_tokens=self.cfg["sequence_packing"]["logprob_mb_tokens"]
+                if self.enable_seq_packing
+                else 0,
+                cp_size=self.cp_size,
+                cp_mesh=self.cp_mesh,
+                device_mesh=self.device_mesh,
             )
+
+        # Remove THD squeeze hooks
+        for h in thd_hooks:
+            h.remove()
 
         return_data = BatchedDataDict[LogprobOutputSpec]()
         return_data["logprobs"] = result["logprobs"].cpu()

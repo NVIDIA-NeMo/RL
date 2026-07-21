@@ -435,6 +435,9 @@ class THDBatch:
     cp_size: int = 1
     cp_rank: int = 0
     max_seqlen: Optional[torch.Tensor] = None
+    # Model-specific attn kwargs from a model-owned CP sharder (e.g. GLM DSA's
+    # _glm_dsa_cp_group / glm_dsa_cp_query_indices). Empty for the TE path.
+    extra_attn_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def to_model_kwargs(self, device: torch.device) -> dict[str, Any]:
         """Build kwargs dict to pass to schedule.step() or model forward.
@@ -455,6 +458,8 @@ class THDBatch:
         # via apply_cp(). Don't pass them as kwargs — it can confuse TE backends.
         if self.max_seqlen is not None:
             result["max_seqlen"] = self.max_seqlen.to(device)
+        for key, value in self.extra_attn_kwargs.items():
+            result[key] = value.to(device) if torch.is_tensor(value) else value
         return result
 
 
@@ -501,11 +506,17 @@ def pack_for_thd(
     cp_mesh: Any = None,
     device_mesh: Any = None,
     token_mask: Optional[torch.Tensor] = None,
+    model: Any = None,
 ) -> THDBatch:
     """Pack sequences into THD-format batch, optionally with CP sharding.
 
     For CP > 1, individual sequences are padded to multiples of ``2*cp_size``
     before packing, and ``make_cp_batch_and_ctx`` shards tokens across CP ranks.
+    Models that own their CP attention (GLM DSA TileLang) expose a
+    ``prepare_model_inputs_for_cp`` hook; when ``model`` provides it, its
+    batch sharder is attached so ``make_cp_batch_and_ctx`` uses it instead of
+    the TE dual-chunk path, and the model-specific attn kwargs it emits are
+    carried in ``THDBatch.extra_attn_kwargs``.
     For PP, ``num_chunks`` controls how many microbatch rows are produced.
 
     Args:
@@ -651,19 +662,41 @@ def pack_for_thd(
         "seq_lens_padded": seq_lens_padded,
     }
 
+    extra_attn_kwargs: dict[str, Any] = {}
     if cp_size > 1:
         # Use automodel's make_cp_batch_and_ctx for combined THD + CP sharding.
-        from nemo_automodel.components.distributed.cp_utils import (
-            make_cp_batch_and_ctx,
-        )
+        import nemo_automodel.components.distributed.cp_utils as cp_utils
 
-        _, thd_batch = make_cp_batch_and_ctx(
+        # Models that own their CP attention attach their batch sharder via
+        # the prepare_model_inputs_for_cp hook; make_cp_batch_and_ctx prefers
+        # the attached "_cp_make_batch_fn" over the TE dual-chunk path.
+        prepare_cp = getattr(model, "prepare_model_inputs_for_cp", None)
+        if prepare_cp is not None:
+            thd_input.update(
+                prepare_cp(input_ids=thd_input["input_ids"], num_chunks=num_chunks)
+            )
+
+        _, thd_batch = cp_utils.make_cp_batch_and_ctx(
             device_mesh,
             thd_input,
             use_te=True,
             padding_token_id=padding_value,
             num_chunks=num_chunks,
         )
+
+        if prepare_cp is not None:
+            # Only model-owned CP emits these; never leak them into TE models'
+            # kwargs (they would reject unexpected keys).
+            extra_attn_kwargs = {
+                key: thd_batch[key]
+                for key in (
+                    "_glm_dsa_cp_group",
+                    "glm_dsa_cp_query_indices",
+                    "padding_mask",
+                    "cu_seqlens_padded",
+                )
+                if key in thd_batch
+            }
     else:
         thd_batch = split_batch_into_thd_chunks(
             thd_input,
@@ -682,6 +715,7 @@ def pack_for_thd(
         cp_size=thd_batch.get("cp_size", 1),
         cp_rank=thd_batch.get("cp_rank", 0),
         max_seqlen=thd_batch.get("max_seqlen"),
+        extra_attn_kwargs=extra_attn_kwargs,
     )
 
 
