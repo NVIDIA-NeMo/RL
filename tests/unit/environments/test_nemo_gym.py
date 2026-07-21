@@ -29,6 +29,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
     validate_reward_components_match_scalar,
@@ -60,6 +61,40 @@ def test_extract_reward_components():
     )
     assert components == {"correctness": 1.0, "format": 0.5}
     assert all(isinstance(v, float) for v in components.values())
+
+
+def test_build_reward_component_columns():
+    """The bridge emission helper: reward/<name> keys, 0.0-fill, deterministic order.
+
+    Guards the producer->consumer contract end to end — the keys built here must be
+    exactly what get_gdpo_reward_component_keys() selects (this is what would have caught
+    the earlier reward1/reward2 vs reward/<name> mismatch).
+    """
+    from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
+
+    # Keys are reward/<name>; one entry per sample; values preserved.
+    cols = build_reward_component_columns(
+        [
+            {"correctness": 1.0, "format": 0.0},
+            {"correctness": 0.0, "format": 1.0},
+        ]
+    )
+    assert set(cols) == {"reward/correctness", "reward/format"}
+    assert torch.equal(cols["reward/correctness"], torch.tensor([1.0, 0.0]))
+    assert torch.equal(cols["reward/format"], torch.tensor([0.0, 1.0]))
+
+    # Union across the batch, deterministic (sorted) order, 0.0-fill for missing
+    # components (and None samples).
+    cols = build_reward_component_columns([{"b": 2.0}, {"a": 1.0, "b": 3.0}, None])
+    assert list(cols.keys()) == ["reward/a", "reward/b"]
+    assert torch.equal(cols["reward/a"], torch.tensor([0.0, 1.0, 0.0]))
+    assert torch.equal(cols["reward/b"], torch.tensor([2.0, 3.0, 0.0]))
+
+    # The emitted keys are exactly what GDPO's consumer selects.
+    assert get_gdpo_reward_component_keys(cols) == ["reward/a", "reward/b"]
+
+    # No components anywhere -> no columns (single-reward path is untouched).
+    assert build_reward_component_columns([None, None]) == {}
 
 
 def test_validate_reward_components_match_scalar():

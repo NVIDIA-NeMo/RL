@@ -525,6 +525,32 @@ def extract_reward_components(nemo_gym_result: dict) -> Dict[str, float] | None:
     return {str(name): float(score) for name, score in components.items()}
 
 
+def build_reward_component_columns(
+    component_dicts: List[Dict[str, float] | None],
+) -> Dict[str, torch.Tensor]:
+    """Build ``reward/<name>`` batch columns from per-sample reward-component dicts.
+
+    Takes the union of component names across the batch in sorted (deterministic) order
+    and, for each, emits a ``reward/<name>`` tensor with one entry per sample. A
+    component absent on a given sample is filled with ``0.0`` so every column covers all
+    samples (the per-prompt baseline requires each component present for all responses).
+
+    Keys are prefixed ``reward/`` so they are exactly what
+    ``nemo_rl.algorithms.utils.get_gdpo_reward_component_keys`` selects (it matches
+    ``startswith("reward/")`` and sorts by name); the name carries the component identity,
+    so no positional index is needed. Returns an empty dict when no sample has components.
+    """
+    component_names = sorted(
+        {name for c in component_dicts if c is not None for name in c}
+    )
+    return {
+        f"reward/{name}": torch.tensor(
+            [c[name] if c is not None and name in c else 0.0 for c in component_dicts]
+        )
+        for name in component_names
+    }
+
+
 def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> None:
     """Assert each multi-reward result sets ``reward == sum(reward_components)``.
 
