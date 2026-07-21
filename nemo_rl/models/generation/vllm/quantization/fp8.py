@@ -700,7 +700,12 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     else:
         kernel = getattr(self, "kernel", None)
         kernel_name = type(kernel).__name__ if kernel is not None else None
-        if "FlashInferCutlass" not in str(kernel_name):
+        # vLLM 0.25 replaced FlashInferCutlass* with FlashInferCutedsl* MXFP8
+        # linear kernels; both consume the same swizzle_mxfp8_scale layout we
+        # produce below (it is vLLM's own util), so accept either.
+        if not any(
+            k in str(kernel_name) for k in ("FlashInferCutlass", "FlashInferCutedsl")
+        ):
             raise AssertionError(
                 f"Unsupported MXFP8 linear kernel for refit: {kernel_name}"
             )
