@@ -25,22 +25,21 @@ Envelope format (version 1):
     "nrlre1:<dtype>:<S>x<L>x<K>:<base64 of C-contiguous array bytes>"
 
 This module must stay importable inside the NeMo Gym actor, so it may only
-depend on numpy and torch.
+depend on torch.
 """
 
 import base64
 from typing import Any, Union
 
-import numpy as np
 import torch
 
 _MAGIC = "nrlre1"
-_NP_DTYPES = {"int8": np.int8, "int16": np.int16, "int32": np.int32}
-_TORCH_DTYPE_NAMES = {
-    torch.int8: "int8",
-    torch.int16: "int16",
-    torch.int32: "int32",
+_WIRE_TORCH_DTYPES = {
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
 }
+_TORCH_DTYPE_NAMES = {v: k for k, v in _WIRE_TORCH_DTYPES.items()}
 
 
 def encode_routed_experts(routed_experts: torch.Tensor) -> str:
@@ -58,7 +57,7 @@ def encode_routed_experts(routed_experts: torch.Tensor) -> str:
     if dtype_name is None:
         raise ValueError(
             f"Unsupported routed_experts dtype {routed_experts.dtype}; "
-            f"expected one of {sorted(_NP_DTYPES)}."
+            f"expected one of {sorted(_WIRE_TORCH_DTYPES)}."
         )
     arr = routed_experts.detach().cpu().contiguous().numpy()
     tokens, num_layers, topk = arr.shape
@@ -83,19 +82,25 @@ def decode_routed_experts(payload: Union[str, Any], dtype: torch.dtype) -> torch
             f"'{_MAGIC}:<dtype>:<SxLxK>:<base64>' envelope."
         )
     _, dtype_name, shape_str, data = parts
-    if dtype_name not in _NP_DTYPES:
+    wire_dtype = _WIRE_TORCH_DTYPES.get(dtype_name)
+    if wire_dtype is None:
         raise ValueError(f"Unsupported routed_experts dtype '{dtype_name}'.")
     shape = tuple(int(dim) for dim in shape_str.split("x"))
     if len(shape) != 3:
         raise ValueError(
             f"routed_experts envelope shape '{shape_str}' is not 3-dimensional."
         )
-    arr = np.frombuffer(base64.b64decode(data), dtype=_NP_DTYPES[dtype_name])
+    # Decode into a writable bytearray so torch.frombuffer can share its
+    # memory directly (frombuffer writability follows the underlying buffer;
+    # the bytearray construction is the single unavoidable copy).
+    raw = bytearray(base64.b64decode(data, validate=True))
     expected = shape[0] * shape[1] * shape[2]
-    if arr.size != expected:
+    if len(raw) != expected * wire_dtype.itemsize:
         raise ValueError(
-            f"routed_experts envelope has {arr.size} elements, expected "
-            f"{expected} for shape {shape}."
+            f"routed_experts envelope has {len(raw) // wire_dtype.itemsize} "
+            f"elements, expected {expected} for shape {shape}."
         )
-    # frombuffer views are read-only; copy() yields a writable array.
-    return torch.from_numpy(arr.reshape(shape).copy()).to(dtype)
+    if expected == 0:
+        return torch.empty(shape, dtype=dtype)
+    tensor = torch.frombuffer(raw, dtype=wire_dtype).reshape(shape)
+    return tensor if tensor.dtype == dtype else tensor.to(dtype)
