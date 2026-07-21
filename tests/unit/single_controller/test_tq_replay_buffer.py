@@ -121,6 +121,12 @@ class FakeDataPlaneClient:
         return len(self._rows)
 
 
+class _PutThenFailDataPlaneClient(FakeDataPlaneClient):
+    def put_samples(self, *args: Any, **kwargs: Any) -> KVBatchMeta:
+        super().put_samples(*args, **kwargs)
+        raise RuntimeError("injected DataPlane put failure")
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -175,6 +181,31 @@ class TestTQReplayBufferReserveCommit:
         assert dp.depth() == 0
         assert dp.put_calls == []
 
+    def test_cancel_reservation_drops_only_unready_slot(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        committed = _add_group(buf, weight=2)
+        pending_id = buf.reserve(weight_version=3)
+
+        assert buf.cancel_reservation(pending_id)
+        assert not buf.cancel_reservation(pending_id)
+        assert not buf.cancel_reservation("missing")
+        assert not buf.cancel_reservation(buf._group_ids[0])
+
+        assert buf.size() == 1
+        assert buf.ready_list == [True]
+        assert buf.meta_list[0].sample_ids == committed.sample_ids
+
+    def test_reserve_rejects_duplicate_group_id(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        buf.reserve(weight_version=3, group_id="stable-group")
+
+        with pytest.raises(ValueError, match="already reserved"):
+            buf.reserve(weight_version=3, group_id="stable-group")
+
+        assert buf.size() == 1
+
     def test_commit_writes_tq_then_fills_meta(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -218,6 +249,46 @@ class TestTQReplayBufferReserveCommit:
                     end_weight_version=3,
                 )
             )
+
+        assert dp.put_calls == []
+        assert dp.depth() == 0
+
+    def test_failed_commit_clears_rows_and_reservation(self):
+        dp = _PutThenFailDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(RuntimeError, match="injected DataPlane put failure"):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert buf.size() == 0
+        assert dp.depth() == 0
+        assert len(dp.clear_calls) == 1
+
+    def test_commit_rejects_reservation_weight_mismatch_before_writing(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(ValueError, match="reserved at weight version 3, not 4"):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=4,
+                    end_weight_version=4,
+                )
+            )
+
+        assert buf.size() == 1
+        assert dp.put_calls == []
 
     def test_reserve_then_commit_preserves_dispatch_order(self):
         """Reserve in dispatch order, commit out of order; insertion order holds."""

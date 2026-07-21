@@ -25,6 +25,7 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
+    RolloutCheckpointingConfig,
     SingleControllerBundle,
     setup_single_controller,
 )
@@ -106,6 +107,7 @@ def _make_master_config(
         loss_fn=ClippedPGLossConfig(),
         env=env if env is not None else {},
         async_rl=AsyncRLConfig(max_inflight_prompts=max_inflight_prompts),
+        rollout_checkpointing=RolloutCheckpointingConfig(),
     )
 
 
@@ -222,6 +224,63 @@ class TestSetup:
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    def test_rollout_checkpointing_requires_root_dir(self):
+        with pytest.raises(ValueError, match="root_dir is required"):
+            RolloutCheckpointingConfig(enabled=True)
+
+    def test_rollout_checkpointing_rejects_non_gym_path(self, tmp_path):
+        config = RolloutCheckpointingConfig(enabled=True, root_dir=tmp_path)
+
+        with pytest.raises(NotImplementedError, match="only NeMo-Gym"):
+            sc_setup_mod._validate_rollout_checkpointing_setup(
+                config,
+                use_nemo_gym=False,
+            )
+
+    def test_builds_single_rollout_checkpoint_runtime(self, tmp_path):
+        config = RolloutCheckpointingConfig(
+            enabled=True,
+            root_dir=tmp_path,
+            writer_concurrency=3,
+        )
+        assert config.model_dump()["root_dir"] == str(tmp_path)
+        tokenizer = MagicMock(
+            name_or_path="tokenizer-name",
+            chat_template="{{ messages }}",
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+            unk_token_id=3,
+        )
+        tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
+        generation_config = {
+            "backend": "vllm",
+            "max_new_tokens": 128,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": None,
+            "stop_token_ids": [2],
+            "stop_strings": None,
+            "vllm_cfg": {"max_model_len": 256},
+        }
+        writer = MagicMock(name="rollout_checkpoint_writer")
+
+        with patch.object(sc_setup_mod, "RolloutCheckpointWriter") as writer_cls:
+            writer_cls.options.return_value.remote.return_value = writer
+            runtime = sc_setup_mod._build_rollout_checkpoint_runtime(
+                config,
+                tokenizer=tokenizer,
+                generation_config=generation_config,
+            )
+
+        assert runtime is not None
+        assert runtime.writer is writer
+        assert len(runtime.run_id) == 32
+        assert len(runtime.sampling_fingerprint) == 64
+        assert len(runtime.tokenizer_fingerprint) == 64
+        writer_cls.options.assert_called_once_with(max_concurrency=3)
+        writer_cls.options.return_value.remote.assert_called_once_with(str(tmp_path))
+
     def test_returns_bundle(self, patched_factories):
         mc = _make_master_config(colocated=True)
         tokenizer = MagicMock(pad_token_id=0)
@@ -256,6 +315,8 @@ class TestSetup:
         assert bundle.tq_buffer._dp_client is bundle.dp_client
         assert bundle.partition_id == "rollout_data"
         assert bundle.tq_buffer._partition_id == "rollout_data"
+        assert bundle.rollout_checkpoint is None
+        assert bundle.rollout_manager._checkpoint_io_policy is None
 
     def test_enabled_validation_builds_native_resources(self, patched_factories):
         mc = _make_master_config(val_at_start=True)

@@ -351,6 +351,24 @@ async_rl:
   # False: enforces per-weight-version dispatch quota.
   over_sampling: true
 
+# Durable completed-sibling checkpoints for NeMo-Gym rollouts. The current
+# implementation supports NeMo-Gym only and requires a shared filesystem path.
+rollout_checkpointing:
+  enabled: false
+  mode: "completed_generations"
+  root_dir: null
+  writer_concurrency: 8
+  max_pending_writes: 64
+  # Fail a single writer attempt instead of waiting forever.
+  write_timeout_s: 30.0
+  # Retries reuse the same idempotency key and backfill a completed sibling.
+  max_write_retries: 2
+  write_retry_backoff_s: 1.0
+  # Recovery reads use an independent timeout and retry budget.
+  load_timeout_s: 30.0
+  max_load_retries: 2
+  load_retry_backoff_s: 1.0
+
 cluster:
   gpus_per_node: 2
   num_nodes: 1

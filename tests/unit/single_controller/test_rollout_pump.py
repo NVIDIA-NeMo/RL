@@ -29,6 +29,7 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
+    RolloutCheckpointingConfig,
     SingleControllerBundle,
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
@@ -216,6 +217,7 @@ def test_rollout_pump_writes_expected_tq_data(
             max_inflight_prompts=max_rollout_prompts,
             max_buffered_rollouts=max_rollout_prompts,
         ),
+        rollout_checkpointing=RolloutCheckpointingConfig(),
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
@@ -254,6 +256,7 @@ def test_rollout_pump_writes_expected_tq_data(
         partition_id=_PARTITION_ID,
         save_state=_default_grpo_save_state(),
         last_checkpoint_path=None,
+        rollout_checkpoint=None,
     )
     ctrl = SingleControllerActor.remote(master_config=mc, bundle=bundle)
 

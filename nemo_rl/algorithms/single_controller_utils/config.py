@@ -15,9 +15,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer, model_validator
 
 from nemo_rl.algorithms.grpo import GRPOConfig, GRPOLoggerConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
@@ -50,6 +51,35 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     force_in_order: bool = False
 
 
+class RolloutCheckpointingConfig(BaseModel, extra="allow"):
+    """Completed-sibling durability for SingleController NeMo-Gym rollouts."""
+
+    enabled: bool = False
+    mode: Literal["completed_generations"] = "completed_generations"
+    root_dir: Optional[Path] = None
+    writer_concurrency: int = Field(default=8, ge=1)
+    max_pending_writes: int = Field(default=64, ge=1)
+    write_timeout_s: float = Field(default=30.0, gt=0)
+    max_write_retries: int = Field(default=2, ge=0)
+    write_retry_backoff_s: float = Field(default=1.0, ge=0)
+    load_timeout_s: float = Field(default=30.0, gt=0)
+    max_load_retries: int = Field(default=2, ge=0)
+    load_retry_backoff_s: float = Field(default=1.0, ge=0)
+
+    @model_validator(mode="after")
+    def _require_root_when_enabled(self) -> "RolloutCheckpointingConfig":
+        if self.enabled and self.root_dir is None:
+            raise ValueError(
+                "rollout_checkpointing.root_dir is required when checkpointing "
+                "is enabled"
+            )
+        return self
+
+    @field_serializer("root_dir")
+    def _serialize_root_dir(self, value: Optional[Path]) -> Optional[str]:
+        return str(value) if value is not None else None
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -61,6 +91,9 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
     data_plane: DataPlaneConfig
     async_rl: AsyncRLConfig = Field(default_factory=AsyncRLConfig)
+    rollout_checkpointing: RolloutCheckpointingConfig = Field(
+        default_factory=RolloutCheckpointingConfig
+    )
 
 
 # ── Internal SingleController configs ────────────────────────────────────

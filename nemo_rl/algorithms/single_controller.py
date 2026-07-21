@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import uuid
 import warnings
 from typing import Any, Optional, Union, cast
 
@@ -62,6 +63,10 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.rollout_checkpoint import (
+    RolloutWorkItem,
+    compute_rollout_fingerprint,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -117,6 +122,13 @@ class SingleControllerActor:
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
+        self._rollout_checkpoint = bundle.rollout_checkpoint
+        checkpointing_enabled = master_config.rollout_checkpointing.enabled
+        if checkpointing_enabled != (self._rollout_checkpoint is not None):
+            raise ValueError(
+                "SingleController rollout checkpoint configuration and runtime "
+                "bundle do not agree"
+            )
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -218,6 +230,11 @@ class SingleControllerActor:
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
 
+        # Metadata-only work ledger. Failed entries remain available for the
+        # later fence/replace/redispatch recovery slice.
+        self._checkpoint_inflight_work: dict[str, RolloutWorkItem] = {}
+        self._next_rollout_dispatch_sequence: int = 0
+
         # over_sampling=False batch gate: farthest trainer_version covered by
         # already-dispatched batches. Restored as current_step - 1 to preserve
         # the fresh-start invariant _max_rollout_version == _trainer_version - 1
@@ -295,25 +312,29 @@ class SingleControllerActor:
                     "Starting with an empty replay buffer."
                 )
 
-        # Start the rollout and train pumps
+        # Start both pumps and supervise either one failing. Waiting only for
+        # the train pump would hang if rollout generation stopped producing
+        # consumable groups.
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
-
-        # Wait until the train pump is done
-        await train_task
-        self._logger.finish()
-
-        # Cancel the rollout pump and any in-flight dispatches so we exit immediately.
-        rollout_task.cancel()
         try:
-            await rollout_task
-        except asyncio.CancelledError:
-            pass
-        inflight = list(self._dispatched_rollouts)
-        for task in inflight:
-            task.cancel()
-        if inflight:
-            await asyncio.gather(*inflight, return_exceptions=True)
+            done, _ = await asyncio.wait(
+                {rollout_task, train_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if rollout_task in done:
+                # A finite rollout pump may complete normally before the train
+                # pump consumes its final groups. Only an exception is fatal.
+                await rollout_task
+                await train_task
+            else:
+                await train_task
+        finally:
+            for task in (rollout_task, train_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
+            self._logger.finish()
 
         return {
             "train_steps": self._train_steps,
@@ -328,6 +349,7 @@ class SingleControllerActor:
             "train_steps": self._train_steps,
             "inflight_rollouts": self._inflight_rollouts,
             "rollout_permitted": self._rollout_permitted.is_set(),
+            "checkpoint_inflight_groups": len(self._checkpoint_inflight_work),
             "epoch": self._current_epoch,
         }
 
@@ -458,6 +480,43 @@ class SingleControllerActor:
         )
         return metrics
 
+    def _build_rollout_work(
+        self,
+        prompt: DatumSpec,
+        target_step: Optional[int] = None,
+    ) -> Optional[RolloutWorkItem]:
+        """Assign stable checkpoint identity before dispatching one prompt group."""
+        if self._rollout_checkpoint is None:
+            return None
+
+        dispatch_sequence = self._next_rollout_dispatch_sequence
+        self._next_rollout_dispatch_sequence += 1
+        prompt_index = int(prompt["idx"])
+        task_name = prompt.get("task_name")
+        prompt_fingerprint = compute_rollout_fingerprint(
+            {
+                "idx": prompt_index,
+                "task_name": task_name,
+                "message_log": prompt["message_log"],
+                "extra_env_info": prompt["extra_env_info"],
+                "loss_multiplier": prompt["loss_multiplier"],
+            }
+        )
+        return RolloutWorkItem(
+            run_id=self._rollout_checkpoint.run_id,
+            group_id=f"g{dispatch_sequence:016x}-{uuid.uuid4().hex}",
+            prompt_id=f"{task_name or 'prompt'}:{prompt_index}",
+            dispatch_sequence=dispatch_sequence,
+            target_step=target_step,
+            attempt_id=0,
+            policy_version=self._trainer_version,
+            prompt_fingerprint=prompt_fingerprint,
+            sampling_fingerprint=self._rollout_checkpoint.sampling_fingerprint,
+            tokenizer_fingerprint=self._rollout_checkpoint.tokenizer_fingerprint,
+            num_generations=self._master_config.grpo["num_generations_per_prompt"],
+            prompt_ref={"idx": prompt_index, "task_name": task_name},
+        )
+
     # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
@@ -483,18 +542,36 @@ class SingleControllerActor:
         num_generations_per_prompt = self._master_config.grpo[
             "num_generations_per_prompt"
         ]
+        checkpoint_runtime = self._rollout_checkpoint
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
-            prompt: DatumSpec, target_step: Optional[int]
+            prompt: DatumSpec,
+            target_step: Optional[int],
+            checkpoint_work: Optional[RolloutWorkItem],
         ) -> None:
-            self._inflight_rollouts += 1
+            committed = False
             try:
-                await self._rollout_manager.generate_and_push(
-                    prompt,
-                    num_generations_per_prompt=num_generations_per_prompt,
-                    target_step=target_step,
-                )
+                if checkpoint_work is None:
+                    await self._rollout_manager.generate_and_push(
+                        prompt,
+                        num_generations_per_prompt=num_generations_per_prompt,
+                        target_step=target_step,
+                    )
+                else:
+                    if checkpoint_runtime is None:
+                        raise RuntimeError(
+                            "checkpoint work was assigned without a checkpoint runtime"
+                        )
+                    await self._rollout_manager.generate_and_push(
+                        prompt,
+                        num_generations_per_prompt=num_generations_per_prompt,
+                        target_step=target_step,
+                        checkpoint_work=checkpoint_work,
+                        checkpoint_writer=checkpoint_runtime.writer,
+                    )
+                    self._checkpoint_inflight_work.pop(checkpoint_work.group_id, None)
+                committed = True
                 if self._diagnostics:
                     content = ""
                     for i in range(len(prompt["message_log"])):
@@ -503,43 +580,67 @@ class SingleControllerActor:
                             break
                     print(f"  rollout done for prompt='{content[:20]}...'", flush=True)
             finally:
+                if not committed:
+                    # A failed rollout never creates a consumable TQ group, so
+                    # the train pump cannot release this dispatch's capacity.
+                    self._buffer_capacity.release()
                 self._inflight_rollouts -= 1
                 sem.release()
 
         max_epochs = self._master_config.grpo["max_num_epochs"]
-        while max_epochs is None or self._current_epoch < max_epochs:
-            for prompt_batch in self._dataloader:
-                # over_sampling=False: batch-level gate on max_rollout_version.
-                if not over_sampling:
-                    while (
-                        self._max_rollout_version
-                        >= self._trainer_version + max_staleness
-                    ):
-                        await asyncio.sleep(0.005)
-                    self._max_rollout_version += 1
+        async with asyncio.TaskGroup() as rollout_tasks:
+            while max_epochs is None or self._current_epoch < max_epochs:
+                for prompt_batch in self._dataloader:
+                    # over_sampling=False: batch-level gate on max_rollout_version.
+                    if not over_sampling:
+                        while (
+                            self._max_rollout_version
+                            >= self._trainer_version + max_staleness
+                        ):
+                            await asyncio.sleep(0.005)
+                        self._max_rollout_version += 1
 
-                # target_step = batch dispatch index when force_in_order is on.
-                target_step = self._max_rollout_version if force_in_order else None
+                    # target_step = batch dispatch index when force_in_order is on.
+                    target_step = self._max_rollout_version if force_in_order else None
 
-                for prompt_idx in range(prompt_batch.size):
-                    prompt: DatumSpec = {  # type: ignore
-                        k: v[prompt_idx] for k, v in prompt_batch.items()
-                    }
+                    for prompt_idx in range(prompt_batch.size):
+                        prompt: DatumSpec = {  # type: ignore
+                            k: v[prompt_idx] for k, v in prompt_batch.items()
+                        }
+                        capacity_acquired = False
+                        inflight_acquired = False
+                        try:
+                            await self._buffer_capacity.acquire()
+                            capacity_acquired = True
+                            await sem.acquire()
+                            inflight_acquired = True
+                            await self._rollout_permitted.wait()
 
-                    # check if buffer is full
-                    await self._buffer_capacity.acquire()
-                    # check if inflight rollouts is full
-                    await sem.acquire()
-                    # wait for rollout to be permitted
-                    await self._rollout_permitted.wait()
+                            checkpoint_work = self._build_rollout_work(
+                                prompt, target_step
+                            )
+                            if checkpoint_work is not None:
+                                self._checkpoint_inflight_work[
+                                    checkpoint_work.group_id
+                                ] = checkpoint_work
 
-                    # dispatch rollout
-                    task = asyncio.create_task(
-                        _dispatch_one_prompt(prompt, target_step)
-                    )
-                    self._dispatched_rollouts.add(task)
-                    task.add_done_callback(self._dispatched_rollouts.discard)
-            self._current_epoch += 1
+                            self._inflight_rollouts += 1
+                            task = rollout_tasks.create_task(
+                                _dispatch_one_prompt(
+                                    prompt, target_step, checkpoint_work
+                                )
+                            )
+                            self._dispatched_rollouts.add(task)
+                            task.add_done_callback(self._dispatched_rollouts.discard)
+                            # The child now owns both permits.
+                            capacity_acquired = False
+                            inflight_acquired = False
+                        finally:
+                            if inflight_acquired:
+                                sem.release()
+                            if capacity_acquired:
+                                self._buffer_capacity.release()
+                self._current_epoch += 1
 
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
@@ -736,9 +837,7 @@ class SingleControllerActor:
                     elif "val_reward" in save_state:
                         del save_state["val_reward"]
 
-                    full_metric_name = self._master_config.checkpointing[
-                        "metric_name"
-                    ]
+                    full_metric_name = self._master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"
@@ -765,9 +864,7 @@ class SingleControllerActor:
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
+                            save_state[full_metric_name] = metrics_source[metric_name]
 
                     with self._timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {self._train_steps}...")
@@ -873,35 +970,41 @@ class SingleControllerActor:
                 raise result
 
     async def _sync_weights(self, *, reopen_rollouts: bool = True) -> None:
-        """Drain in-flight rollouts then synchronize weights.
+        """Synchronize weights, draining checkpointed rollouts first.
 
         SC owns the drain gate (when to sync); WeightSynchronizer owns how.
 
         Flow:
           1. _rollout_permitted.clear()  — no new dispatches
-          2. drain _inflight_rollouts → 0  (5ms poll)
+          2. when checkpointing is enabled, drain _inflight_rollouts → 0
           3. weight_synchronizer.sync_weights(trainer_version)
           4. _rollout_permitted.set()   — resume
-          
-        pass ``reopen_rollouts=False`` to keep the admission gate closed 
+
+        Pass ``reopen_rollouts=False`` to keep the admission gate closed
         through validation.
         """
         self._rollout_permitted.clear()
 
-        # TODO: currently sync_weights is not implemented, comment out for now
-        # # Drain: wait for all in-flight rollouts to complete before NCCL
-        # # Critical: if GenWorker has queued calls when NCCL init is dispatched,
-        # # the init sits behind them — trainer blocks in rendezvous → deadlock
-        # drain_start = time.monotonic()
-        # while self._inflight_rollouts > 0:
-        #     await asyncio.sleep(0.005)
+        if self._rollout_checkpoint is not None:
+            # Checkpoint work pins one policy version. Do not update the
+            # generation backend until every dispatched group has either
+            # reached TQ or failed into the controller recovery ledger.
+            drain_start = time.monotonic()
+            while self._inflight_rollouts > 0:
+                await asyncio.sleep(0.005)
 
-        # drain_elapsed = time.monotonic() - drain_start
-        # print(
-        #     f"  _sync_weights: drained in {drain_elapsed:.3f}s, "
-        #     f"syncing weights v{self._trainer_version}",
-        #     flush=True,
-        # )
+            if self._checkpoint_inflight_work:
+                raise RuntimeError(
+                    "cannot synchronize generation weights while failed rollout "
+                    "checkpoint work awaits recovery"
+                )
+
+            drain_elapsed = time.monotonic() - drain_start
+            print(
+                f"  _sync_weights: drained in {drain_elapsed:.3f}s, "
+                f"syncing weights v{self._trainer_version}",
+                flush=True,
+            )
 
         t0 = time.monotonic()
         await asyncio.to_thread(self._weight_synchronizer.sync_weights)

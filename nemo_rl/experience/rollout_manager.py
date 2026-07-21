@@ -1259,20 +1259,27 @@ class RolloutManager:
             group_id=group_id,
         )
 
-        record = await self.run_rollout(
-            input_sample,
-            num_generations_per_prompt=num_generations_per_prompt,
-            checkpoint_work=checkpoint_work,
-            checkpoint_writer=checkpoint_writer,
-        )
-        end_version = self._weight_version
+        try:
+            record = await self.run_rollout(
+                input_sample,
+                num_generations_per_prompt=num_generations_per_prompt,
+                checkpoint_work=checkpoint_work,
+                checkpoint_writer=checkpoint_writer,
+            )
+            end_version = self._weight_version
 
-        await self._tq_buffer.commit(
-            group_id,
-            record,
-            start_weight_version=start_version,
-            end_weight_version=end_version,
-        )
+            await self._tq_buffer.commit(
+                group_id,
+                record,
+                start_weight_version=start_version,
+                end_weight_version=end_version,
+            )
+        except BaseException:
+            # run_rollout (including checkpoint I/O) failed before this group
+            # became consumable. Do not leave an unready slot that can never be
+            # selected or evicted.
+            self._tq_buffer.cancel_reservation(group_id)
+            raise
 
 
 def _copy_completion_to_cpu(completion: Completion) -> Completion:

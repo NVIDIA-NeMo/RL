@@ -88,7 +88,6 @@ class RolloutWorkItem:
     group_id: str
     prompt_id: str
     dispatch_sequence: int
-    target_step: int | None
     attempt_id: int
     policy_version: int
     prompt_fingerprint: str
@@ -96,6 +95,7 @@ class RolloutWorkItem:
     tokenizer_fingerprint: str
     num_generations: int
     prompt_ref: Any
+    target_step: int | None = None
 
     def __post_init__(self) -> None:
         _validate_path_component(self.run_id, "run_id")
@@ -721,6 +721,11 @@ def _decode_file(file_bytes: bytes, path: Path) -> tuple[bytes, str]:
             f"payload checksum mismatch for rollout checkpoint {path}"
         )
     return payload_bytes, header["record_checksum"]
+
+
+def compute_rollout_fingerprint(value: Any) -> str:
+    """Return a deterministic SHA-256 fingerprint for checkpoint identity data."""
+    return _semantic_checksum(value)
 
 
 def _semantic_checksum(value: Any) -> str:

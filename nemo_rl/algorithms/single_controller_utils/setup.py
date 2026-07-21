@@ -22,6 +22,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 from __future__ import annotations
 
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,7 +41,10 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    MasterConfig,
+    RolloutCheckpointingConfig,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
@@ -48,13 +52,28 @@ from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
-from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_checkpoint import compute_rollout_fingerprint
+from nemo_rl.experience.rollout_checkpoint_writer import RolloutCheckpointWriter
+from nemo_rl.experience.rollout_manager import (
+    RolloutCheckpointIOPolicy,
+    RolloutManager,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
+
+
+@dataclass(frozen=True)
+class RolloutCheckpointRuntime:
+    """Driver-built handles and run-wide identity used by SingleController."""
+
+    writer: Any
+    run_id: str
+    sampling_fingerprint: str
+    tokenizer_fingerprint: str
 
 
 @dataclass
@@ -82,6 +101,7 @@ class SingleControllerBundle:
     partition_id: str
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
+    rollout_checkpoint: Optional[RolloutCheckpointRuntime]
 
 
 def _build_clusters(
@@ -253,6 +273,82 @@ def _maybe_inject_megatron_train_iters(
     )
 
 
+def _validate_rollout_checkpointing_setup(
+    config: RolloutCheckpointingConfig,
+    *,
+    use_nemo_gym: bool,
+) -> None:
+    """Reject unsupported checkpointing configurations before worker setup."""
+    if not config.enabled:
+        return
+    if config.mode != "completed_generations":
+        raise ValueError(
+            "SingleController rollout checkpointing only supports "
+            "mode='completed_generations'"
+        )
+    if config.root_dir is None:
+        raise ValueError(
+            "rollout_checkpointing.root_dir is required when checkpointing is enabled"
+        )
+    if config.writer_concurrency < 1:
+        raise ValueError("rollout_checkpointing.writer_concurrency must be >= 1")
+    if config.max_pending_writes < 1:
+        raise ValueError("rollout_checkpointing.max_pending_writes must be >= 1")
+    if not use_nemo_gym:
+        raise NotImplementedError(
+            "SingleController rollout checkpointing currently supports only NeMo-Gym"
+        )
+
+
+def _build_rollout_checkpoint_runtime(
+    config: RolloutCheckpointingConfig,
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    generation_config: Any,
+) -> Optional[RolloutCheckpointRuntime]:
+    """Create the single writer actor and immutable run-wide fingerprints."""
+    if not config.enabled:
+        return None
+    assert config.root_dir is not None
+
+    writer = RolloutCheckpointWriter.options(
+        max_concurrency=config.writer_concurrency
+    ).remote(str(config.root_dir))
+    sampling_fingerprint = compute_rollout_fingerprint(
+        {
+            "backend": generation_config["backend"],
+            "model_name": generation_config.get("model_name"),
+            "max_seq_len": _generation_max_seq_len(generation_config),
+            "max_new_tokens": generation_config["max_new_tokens"],
+            "temperature": generation_config["temperature"],
+            "top_p": generation_config["top_p"],
+            "top_k": generation_config.get("top_k"),
+            "stop_token_ids": generation_config.get("stop_token_ids"),
+            "stop_strings": generation_config.get("stop_strings"),
+        }
+    )
+    tokenizer_fingerprint = compute_rollout_fingerprint(
+        {
+            "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+            "name_or_path": str(getattr(tokenizer, "name_or_path", "")),
+            "chat_template": getattr(tokenizer, "chat_template", None),
+            "vocab": tokenizer.get_vocab(),
+            "special_token_ids": {
+                "bos_token_id": tokenizer.bos_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+                "pad_token_id": tokenizer.pad_token_id,
+                "unk_token_id": tokenizer.unk_token_id,
+            },
+        }
+    )
+    return RolloutCheckpointRuntime(
+        writer=writer,
+        run_id=uuid.uuid4().hex,
+        sampling_fingerprint=sampling_fingerprint,
+        tokenizer_fingerprint=tokenizer_fingerprint,
+    )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -329,6 +425,11 @@ def setup_single_controller(
     # Setup Dataset & Environments
     # ==========================
     use_nemo_gym = _should_use_nemo_gym(master_config)
+    rollout_checkpoint_config = master_config.rollout_checkpointing
+    _validate_rollout_checkpointing_setup(
+        rollout_checkpoint_config,
+        use_nemo_gym=use_nemo_gym,
+    )
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
@@ -506,6 +607,22 @@ def setup_single_controller(
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
     )
+    rollout_checkpoint = _build_rollout_checkpoint_runtime(
+        rollout_checkpoint_config,
+        tokenizer=tokenizer,
+        generation_config=generation_config,
+    )
+    checkpoint_io_policy = None
+    if rollout_checkpoint_config.enabled:
+        checkpoint_io_policy = RolloutCheckpointIOPolicy(
+            max_pending_writes=rollout_checkpoint_config.max_pending_writes,
+            write_timeout_s=rollout_checkpoint_config.write_timeout_s,
+            max_retries=rollout_checkpoint_config.max_write_retries,
+            retry_backoff_s=rollout_checkpoint_config.write_retry_backoff_s,
+            load_timeout_s=rollout_checkpoint_config.load_timeout_s,
+            max_load_retries=rollout_checkpoint_config.max_load_retries,
+            load_retry_backoff_s=rollout_checkpoint_config.load_retry_backoff_s,
+        )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         env_handles=env_handles,
@@ -516,6 +633,7 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         tq_buffer=tq_buffer,
+        checkpoint_io_policy=checkpoint_io_policy,
     )
 
     return SingleControllerBundle(
@@ -536,4 +654,5 @@ def setup_single_controller(
         partition_id=partition_id,
         save_state=save_state,
         last_checkpoint_path=last_checkpoint_path,
+        rollout_checkpoint=rollout_checkpoint,
     )

@@ -47,11 +47,14 @@ from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
+    RolloutCheckpointRuntime,
+    RolloutCheckpointingConfig,
     SingleControllerBundle,
     setup_single_controller,
 )
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
@@ -170,9 +173,19 @@ class _FakeWeightSynchronizer:
 class _FakeRolloutManager:
     def __init__(self) -> None:
         self.weight_versions: list[int] = []
+        self.generate_calls: list[dict[str, Any]] = []
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    async def generate_and_push(self, prompt: Any, **kwargs: Any) -> None:
+        self.generate_calls.append({"prompt": prompt, **kwargs})
+
+
+class _FailingRolloutManager(_FakeRolloutManager):
+    async def generate_and_push(self, prompt: Any, **kwargs: Any) -> None:
+        await super().generate_and_push(prompt, **kwargs)
+        raise RuntimeError("injected rollout failure")
 
 
 class _FakeTQBuffer:
@@ -302,6 +315,7 @@ def _actor_master_config(
             max_buffered_rollouts=4,
             over_sampling=over_sampling,
         ),
+        rollout_checkpointing=RolloutCheckpointingConfig(),
     )
 
 
@@ -312,6 +326,8 @@ def _make_bundle(
     dataloader: Optional[_FakeDataloader] = None,
     tq_buffer: Optional[_FakeTQBuffer] = None,
     last_checkpoint_path: Optional[str] = None,
+    rollout_manager: Optional[_FakeRolloutManager] = None,
+    rollout_checkpoint: Optional[RolloutCheckpointRuntime] = None,
 ) -> SingleControllerBundle:
     return SingleControllerBundle(
         gen_handle=object(),
@@ -326,13 +342,16 @@ def _make_bundle(
         weight_synchronizer=_FakeWeightSynchronizer(),
         advantage_estimator=None,
         loss_fn=object(),
-        rollout_manager=_FakeRolloutManager(),
+        rollout_manager=(
+            rollout_manager if rollout_manager is not None else _FakeRolloutManager()
+        ),
         tq_buffer=tq_buffer if tq_buffer is not None else _FakeTQBuffer(),
         partition_id=_PARTITION_ID,
         save_state=(
             save_state if save_state is not None else _default_grpo_save_state()
         ),
         last_checkpoint_path=last_checkpoint_path,
+        rollout_checkpoint=rollout_checkpoint,
     )
 
 
@@ -346,6 +365,178 @@ def _run_train_pump(mc: MasterConfig, bundle: SingleControllerBundle):
         return actor
 
     return asyncio.run(_main())
+
+
+class TestRolloutCheckpointWiring:
+    def test_rollout_pump_assigns_work_before_checkpointed_dispatch(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            num_prompts_per_step=1,
+            max_num_epochs=1,
+        )
+        mc.rollout_checkpointing = RolloutCheckpointingConfig(
+            enabled=True,
+            root_dir=tmp_path / "rollout-checkpoints",
+        )
+        prompt = {
+            "message_log": [
+                {
+                    "role": "user",
+                    "content": "question",
+                    "token_ids": torch.tensor([1, 2]),
+                }
+            ],
+            "length": 2,
+            "extra_env_info": {"responses_create_params": {"input": []}},
+            "loss_multiplier": 1.0,
+            "idx": 7,
+            "task_name": "gym-task",
+        }
+        batch = BatchedDataDict({key: [value] for key, value in prompt.items()})
+        rollout_manager = _FakeRolloutManager()
+        writer = object()
+        runtime = RolloutCheckpointRuntime(
+            writer=writer,
+            run_id="run-1",
+            sampling_fingerprint="sampling-fingerprint",
+            tokenizer_fingerprint="tokenizer-fingerprint",
+        )
+        actor = _ACTOR_CLS(
+            mc,
+            _make_bundle(
+                dataloader=_FakeDataloader([batch]),
+                rollout_manager=rollout_manager,
+                rollout_checkpoint=runtime,
+            ),
+        )
+
+        async def _drive() -> None:
+            await actor._rollout_pump()
+            while actor._inflight_rollouts > 0:
+                await asyncio.sleep(0)
+
+        asyncio.run(_drive())
+
+        assert len(rollout_manager.generate_calls) == 1
+        call = rollout_manager.generate_calls[0]
+        work = call["checkpoint_work"]
+        assert call["checkpoint_writer"] is writer
+        assert call["target_step"] is None
+        assert work.run_id == "run-1"
+        assert work.prompt_id == "gym-task:7"
+        assert work.dispatch_sequence == 0
+        assert work.attempt_id == 0
+        assert work.policy_version == 0
+        assert work.num_generations == 2
+        assert work.prompt_ref == {"idx": 7, "task_name": "gym-task"}
+        assert work.sampling_fingerprint == "sampling-fingerprint"
+        assert work.tokenizer_fingerprint == "tokenizer-fingerprint"
+        assert actor._checkpoint_inflight_work == {}
+
+    def test_rollout_failure_propagates_and_releases_capacity(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            num_prompts_per_step=1,
+            max_num_epochs=1,
+        )
+        mc.rollout_checkpointing = RolloutCheckpointingConfig(
+            enabled=True,
+            root_dir=tmp_path / "rollout-checkpoints",
+        )
+        prompt = {
+            "message_log": [{"role": "user", "content": "question"}],
+            "extra_env_info": {},
+            "loss_multiplier": 1.0,
+            "idx": 7,
+            "task_name": "gym-task",
+        }
+        batch = BatchedDataDict({key: [value] for key, value in prompt.items()})
+        runtime = RolloutCheckpointRuntime(
+            writer=object(),
+            run_id="run-1",
+            sampling_fingerprint="sampling-fingerprint",
+            tokenizer_fingerprint="tokenizer-fingerprint",
+        )
+        actor = _ACTOR_CLS(
+            mc,
+            _make_bundle(
+                dataloader=_FakeDataloader([batch]),
+                rollout_manager=_FailingRolloutManager(),
+                rollout_checkpoint=runtime,
+            ),
+        )
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            asyncio.run(actor._rollout_pump())
+
+        assert any(
+            isinstance(error, RuntimeError) and str(error) == "injected rollout failure"
+            for error in exc_info.value.exceptions
+        )
+        assert actor._inflight_rollouts == 0
+        assert actor._buffer_capacity._value == mc.async_rl.max_buffered_rollouts
+        assert len(actor._checkpoint_inflight_work) == 1
+
+    def test_weight_sync_waits_for_dispatched_rollouts(self, tmp_path):
+        mc = _actor_master_config(tmp_path)
+        mc.rollout_checkpointing = RolloutCheckpointingConfig(
+            enabled=True,
+            root_dir=tmp_path / "rollout-checkpoints",
+        )
+        runtime = RolloutCheckpointRuntime(
+            writer=object(),
+            run_id="run-1",
+            sampling_fingerprint="sampling-fingerprint",
+            tokenizer_fingerprint="tokenizer-fingerprint",
+        )
+        bundle = _make_bundle(rollout_checkpoint=runtime)
+        actor = _ACTOR_CLS(mc, bundle)
+        actor._inflight_rollouts = 1
+
+        async def _drive() -> None:
+            sync_task = asyncio.create_task(actor._sync_weights())
+            await asyncio.sleep(0.01)
+            assert bundle.weight_synchronizer.sync_count == 0
+            actor._inflight_rollouts = 0
+            await sync_task
+
+        asyncio.run(_drive())
+
+        assert bundle.weight_synchronizer.sync_count == 1
+        assert bundle.rollout_manager.weight_versions == [0]
+
+    def test_weight_sync_does_not_drain_when_checkpointing_is_disabled(self, tmp_path):
+        bundle = _make_bundle()
+        actor = _ACTOR_CLS(_actor_master_config(tmp_path), bundle)
+        actor._inflight_rollouts = 1
+
+        asyncio.run(actor._sync_weights())
+
+        assert bundle.weight_synchronizer.sync_count == 1
+
+    def test_run_propagates_rollout_pump_failure_and_cancels_training(self, tmp_path):
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path),
+            _make_bundle(),
+        )
+        train_cancelled: list[bool] = []
+
+        async def _fail_rollouts() -> None:
+            raise RuntimeError("rollout pump failed")
+
+        async def _block_training() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                train_cancelled.append(True)
+
+        actor._rollout_pump = _fail_rollouts
+        actor._train_pump = _block_training
+
+        with pytest.raises(RuntimeError, match="rollout pump failed"):
+            asyncio.run(actor.run())
+
+        assert train_cancelled == [True]
 
 
 def _step_dir_names(ckpt_dir: Path) -> set[str]:
@@ -370,7 +561,9 @@ class TestCounterRestore:
         save_state["consumed_samples"] = 42
         save_state["total_valid_tokens"] = 1234
 
-        actor = _ACTOR_CLS(_actor_master_config(tmp_path), _make_bundle(save_state=save_state))
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path), _make_bundle(save_state=save_state)
+        )
 
         assert actor._train_steps == 7
         assert actor._trainer_version == 7
@@ -399,7 +592,9 @@ class TestCounterRestore:
             "total_steps": 5,
         }
 
-        actor = _ACTOR_CLS(_actor_master_config(tmp_path), _make_bundle(save_state=save_state))
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path), _make_bundle(save_state=save_state)
+        )
 
         assert actor._train_steps == 5
         assert actor._max_rollout_version == 4
@@ -674,9 +869,7 @@ class TestGetResumePaths:
     def test_resume_paths_from_fixture_layout(self, tmp_path):
         step_dir = _write_checkpoint(tmp_path, 3, _STEP_3_SAVE_STATE)
 
-        weights_path, optimizer_path = CheckpointManager.get_resume_paths(
-            str(step_dir)
-        )
+        weights_path, optimizer_path = CheckpointManager.get_resume_paths(str(step_dir))
 
         assert weights_path == step_dir / "policy" / "weights"
         assert optimizer_path == step_dir / "policy" / "optimizer"

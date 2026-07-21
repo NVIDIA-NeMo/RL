@@ -37,6 +37,7 @@ from nemo_rl.experience.rollout_checkpoint import (
     RolloutWorkItem,
     StaleAttemptError,
     StorageUnavailableError,
+    compute_rollout_fingerprint,
 )
 
 
@@ -46,7 +47,6 @@ def _work(*, attempt_id: int = 0, policy_version: int = 7) -> RolloutWorkItem:
         group_id="group-1",
         prompt_id="prompt-1",
         dispatch_sequence=3,
-        target_step=9,
         attempt_id=attempt_id,
         policy_version=policy_version,
         prompt_fingerprint="prompt-sha",
@@ -55,6 +55,10 @@ def _work(*, attempt_id: int = 0, policy_version: int = 7) -> RolloutWorkItem:
         num_generations=4,
         prompt_ref={"dataset_index": 11},
     )
+
+
+def test_rollout_work_target_step_defaults_to_none() -> None:
+    assert _work().target_step is None
 
 
 def _record(
@@ -129,6 +133,16 @@ def test_same_record_retry_returns_prior_ack(tmp_path) -> None:
     assert second.already_existed
     assert second.record_checksum == first.record_checksum
     assert second.path == first.path
+
+
+def test_rollout_fingerprint_is_stable_across_dictionary_order() -> None:
+    first = {"prompt": [1, 2], "sampling": {"top_p": 1.0, "temperature": 0.7}}
+    second = {"sampling": {"temperature": 0.7, "top_p": 1.0}, "prompt": [1, 2]}
+
+    assert compute_rollout_fingerprint(first) == compute_rollout_fingerprint(second)
+    assert compute_rollout_fingerprint(first) != compute_rollout_fingerprint(
+        {**first, "prompt": [1, 3]}
+    )
 
 
 def test_same_record_concurrent_retry_is_idempotent(tmp_path) -> None:

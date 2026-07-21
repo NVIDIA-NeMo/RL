@@ -90,6 +90,7 @@ class _FakeBuffer:
         self.commit_calls: list[tuple[str, object, int, int]] = []
         # reserve(weight_version=X) -> group_id; commit fills the slot.
         self._slots: list[str] = []
+        self.cancel_calls: list[str] = []
 
     def reserve(
         self,
@@ -116,6 +117,14 @@ class _FakeBuffer:
             (group_id, record, start_weight_version, end_weight_version)
         )
         return record
+
+    def cancel_reservation(self, group_id: str) -> bool:
+        self.cancel_calls.append(group_id)
+        try:
+            self._slots.remove(group_id)
+        except ValueError:
+            return False
+        return True
 
 
 class _FakeImpl:
@@ -287,6 +296,26 @@ class TestGenerateAndPushFlow:
         mgr._tq_buffer = None
         with pytest.raises(AssertionError, match="tq_buffer"):
             _run(mgr.generate_and_push({"prompt": "p"}, num_generations_per_prompt=2))
+
+    def test_failed_rollout_cancels_reservation(self):
+        buf = _FakeBuffer()
+
+        async def _fail(_sample):
+            raise RuntimeError("rollout failed")
+
+        mgr = _make_manager(buf, _FakeImpl(on_run=_fail))
+
+        with pytest.raises(RuntimeError, match="rollout failed"):
+            _run(
+                mgr.generate_and_push(
+                    {"prompt": "p"},
+                    num_generations_per_prompt=2,
+                )
+            )
+
+        assert len(buf.cancel_calls) == 1
+        assert buf._slots == []
+        assert buf.commit_calls == []
 
 
 class _ReadyRef:

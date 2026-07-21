@@ -18,9 +18,11 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
     MasterConfig,
+    RolloutCheckpointingConfig,
     WeightSyncConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
+    RolloutCheckpointRuntime,
     SingleControllerBundle,
     setup_single_controller,
 )
@@ -29,6 +31,8 @@ __all__ = [
     "AdvantageConfig",
     "AsyncRLConfig",
     "MasterConfig",
+    "RolloutCheckpointingConfig",
+    "RolloutCheckpointRuntime",
     "SingleControllerBundle",
     "WeightSyncConfig",
     "setup_single_controller",

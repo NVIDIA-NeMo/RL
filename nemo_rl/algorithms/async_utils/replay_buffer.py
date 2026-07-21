@@ -679,6 +679,8 @@ class TQReplayBuffer:
         """
         if group_id is None:
             group_id = str(uuid.uuid4())
+        elif group_id in self._group_ids:
+            raise ValueError(f"rollout group {group_id!r} is already reserved")
         self.meta_list.append(None)
         self.start_weight_list.append(weight_version)
         self.end_weight_list.append(-1)
@@ -686,6 +688,27 @@ class TQReplayBuffer:
         self.ready_list.append(False)
         self._group_ids.append(group_id)
         return group_id
+
+    def cancel_reservation(self, group_id: str) -> bool:
+        """Drop an uncommitted reservation after its rollout fails.
+
+        Returns ``True`` when an unready slot was removed. Missing and already
+        committed groups are left untouched so failure cleanup is idempotent.
+        """
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError:
+            return False
+        if self.ready_list[idx]:
+            return False
+
+        del self.meta_list[idx]
+        del self.start_weight_list[idx]
+        del self.end_weight_list[idx]
+        del self.target_step_list[idx]
+        del self.ready_list[idx]
+        del self._group_ids[idx]
+        return True
 
     async def commit(
         self,
@@ -709,34 +732,87 @@ class TQReplayBuffer:
         Raises:
             ValueError: group_id has no live slot (removed or never reserved).
         """
-        train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
-        sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=start_weight_version, group_id=group_id
-        )
-        await self._call_dp(
-            "put_samples",
-            sample_ids=sample_ids,
-            partition_id=self._partition_id,
-            fields=fields,
-            tags=tags,
-        )
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError as exc:
+            raise ValueError(f"no reservation for rollout group {group_id!r}") from exc
+        if self.ready_list[idx]:
+            raise ValueError(f"rollout group {group_id!r} is already committed")
+        reserved_version = self.start_weight_list[idx]
+        if start_weight_version != reserved_version:
+            raise ValueError(
+                f"rollout group {group_id!r} was reserved at weight version "
+                f"{reserved_version}, not {start_weight_version}"
+            )
 
-        # mirrors kv_first_write
-        lengths = train_batch["input_lengths"]
-        meta = KVBatchMeta(
-            partition_id=self._partition_id,
-            task_name="train",
-            sample_ids=list(sample_ids),
-            fields=list(fields.keys()),
-            sequence_lengths=[int(s) for s in lengths.tolist()],
-            tags=[dict(t) for t in tags],
+        try:
+            train_batch = record_to_train_batch(
+                record, pad_value_dict=self._pad_value_dict
+            )
+            sample_ids, fields, tags = pack_payload(
+                train_batch, weight_version=start_weight_version, group_id=group_id
+            )
+        except BaseException:
+            self.cancel_reservation(group_id)
+            raise
+        put_task = asyncio.create_task(
+            self._call_dp(
+                "put_samples",
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+                fields=fields,
+                tags=tags,
+            )
         )
+        try:
+            # If the caller is cancelled, let the DataPlane RPC reach a known
+            # outcome before clearing. Otherwise a delayed put can recreate
+            # rows after cleanup has already run.
+            await asyncio.shield(put_task)
 
-        idx = self._group_ids.index(group_id)
-        self.meta_list[idx] = meta
-        self.end_weight_list[idx] = end_weight_version
-        self.ready_list[idx] = True
-        return meta
+            # mirrors kv_first_write
+            lengths = train_batch["input_lengths"]
+            meta = KVBatchMeta(
+                partition_id=self._partition_id,
+                task_name="train",
+                sample_ids=list(sample_ids),
+                fields=list(fields.keys()),
+                sequence_lengths=[int(s) for s in lengths.tolist()],
+                tags=[dict(t) for t in tags],
+            )
+
+            # Other concurrent groups may have been removed while the DataPlane
+            # write was in flight, so resolve this group's current index again.
+            idx = self._group_ids.index(group_id)
+            self.meta_list[idx] = meta
+            self.end_weight_list[idx] = end_weight_version
+            self.ready_list[idx] = True
+            return meta
+        except BaseException as commit_error:
+            if not put_task.done():
+                try:
+                    await put_task
+                except BaseException:
+                    pass
+
+            cleanup_error: BaseException | None = None
+            try:
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=list(sample_ids),
+                    partition_id=self._partition_id,
+                )
+            except BaseException as exc:
+                cleanup_error = exc
+            finally:
+                self.cancel_reservation(group_id)
+
+            if cleanup_error is not None:
+                raise BaseExceptionGroup(
+                    f"failed to commit and clean up rollout group {group_id!r}",
+                    [commit_error, cleanup_error],
+                )
+            raise
 
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
         """Drop entries at the given indices and optionally clear them from DataPlane.
