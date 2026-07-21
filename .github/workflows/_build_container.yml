@@ -112,6 +112,7 @@ jobs:
           set -euo pipefail
           REF="$REGISTRY/$IMAGE_NAME:${{ steps.trtllm_ccache_tag.outputs.tag }}"
           if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "Using TRT-LLM ccache seed $REF"
             echo "build-context=trtllm-ccache-seed=docker-image://$REF" >> "$GITHUB_OUTPUT"
           else
             echo "No TRT-LLM ccache image found at $REF; starting with an empty cache"
@@ -208,7 +209,10 @@ jobs:
           target: ${{ inputs.target }}
 
       - name: Update TRT-LLM ccache image
-        if: github.ref == 'refs/heads/main' && inputs.trtllm-ccache-tag != ''
+        # Cache mounts survive a failed RUN in the current Buildx builder. Run
+        # this step after both successful and failed image builds so completed
+        # compiler outputs are preserved for the next retry.
+        if: ${{ always() && !cancelled() && inputs.trtllm-ccache-tag != '' && steps.trtllm_ccache_tag.outcome == 'success' }}
         uses: docker/build-push-action@v5
         with:
           file: ${{ inputs.dockerfile }}
@@ -220,7 +224,7 @@ jobs:
             ${{ steps.trtllm_ccache_seed.outputs.build-context }}
           build-args: |
             ${{ inputs.build-args }}
-            CCACHE_EXPORT_KEY=${{ github.run_id }}
+            CCACHE_EXPORT_KEY=${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
             ${{ steps.recent_pr_cache_refs.outputs.cache-from }}

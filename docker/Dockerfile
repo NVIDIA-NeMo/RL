@@ -139,6 +139,7 @@ ARG BASE_IMAGE
 ARG UV_VERSION
 ARG TARGETARCH
 ARG TRTLLM_CCACHE_MAXSIZE=200G
+ARG TRTLLM_BUILD_JOBS=24
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
@@ -354,6 +355,8 @@ echo "Exporting TRT-LLM ccache for build ${CCACHE_EXPORT_KEY:-local}"
 # RUN command, leaving this builder-local mount empty. Merge the registry seed
 # again here so an existing remote cache can never be replaced by an empty one.
 rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
+echo "TRT-LLM ccache state before export:"
+ccache --show-stats
 mkdir -p /tmp/trtllm-ccache-export
 cp -a /root/.cache/ccache/. /tmp/trtllm-ccache-export/
 EOF

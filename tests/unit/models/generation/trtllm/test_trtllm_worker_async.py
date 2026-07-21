@@ -76,7 +76,10 @@ def test_configure_worker_reserves_gpus_for_internal_trtllm_actors(monkeypatch):
     assert env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] == "1"
     assert env_vars["NCCL_CUMEM_ENABLE"] == "1"
     assert env_vars["PATH"].endswith(":/usr/bin")
-    assert init_kwargs == {"bundle_indices": [2, 3]}
+    assert init_kwargs == {
+        "bundle_indices": [2, 3],
+        "fraction_of_gpus": 2,
+    }
     assert actor_options == {}
 
 
@@ -173,6 +176,7 @@ def test_build_sampling_params_supports_async_greedy_and_sampling_modes():
         stop_token_ids=[9],
         include_stop_str_in_output=True,
         logprobs=True,
+        logprobs_simple_format=True,
     )
 
     worker.TrtSamplingParams.reset_mock()
@@ -186,6 +190,7 @@ def test_build_sampling_params_supports_async_greedy_and_sampling_modes():
         stop_token_ids=[9],
         include_stop_str_in_output=True,
         logprobs=True,
+        logprobs_simple_format=True,
     )
 
 
