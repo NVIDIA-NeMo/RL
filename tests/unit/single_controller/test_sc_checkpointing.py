@@ -92,13 +92,13 @@ class _FakeTrainer:
     def prepare_for_training(self) -> None:
         pass
 
-    def begin_train_step(self, step_id: str, loss_fn: Any = None) -> None:
+    def begin_train_step(self, loss_fn: Any) -> None:
         pass
 
-    def train_microbatch_from_meta(self, step_id: str, meta: KVBatchMeta) -> None:
+    def train_microbatches_from_meta(self, meta: KVBatchMeta) -> None:
         pass
 
-    def finish_train_step(self, step_id: str) -> dict[str, Any]:
+    def finish_train_step(self) -> dict[str, Any]:
         return dict(self._step_metrics)
 
     def save_checkpoint(
