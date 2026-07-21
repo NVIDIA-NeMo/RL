@@ -134,11 +134,15 @@ fi
 #   --nvrtc_dynamic_linking: required so the wheel links against the venv's
 #                            libnvrtc-builtins lazily instead of statically.
 echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
-# Bracket the build with ccache stats so CI logs surface the cache hit rate.
-# Builds run cold unless vars.TRTLLM_BUILD_CACHE is set, so this makes a
-# missing/misconfigured cache obvious instead of a silent full rebuild.
-# `|| true` keeps it non-fatal when ccache isn't on PATH.
-ccache --zero-stats >/dev/null 2>&1 || true
+
+# Record whether cached compiler outputs exist, then reset only the counters so
+# the final report describes this build. `--zero-stats` keeps cached objects.
+echo "ccache state before build:"
+ccache --show-stats
+CCACHE_FILES_BEFORE=$(ccache --print-stats | awk '$1 == "files_in_cache" {print $2}')
+CCACHE_FILES_BEFORE=${CCACHE_FILES_BEFORE:-0}
+ccache --zero-stats
+
 python3 scripts/build_wheel.py \
     -a "$ARCH" \
     -G Ninja \
@@ -147,7 +151,19 @@ python3 scripts/build_wheel.py \
     --nvrtc_dynamic_linking \
     --job_count "$JOBS" \
     -D "ENABLE_UCX=OFF"
-ccache --show-stats || true
+
+echo "ccache statistics for this build:"
+ccache --show-stats
+CCACHE_HITS=$(ccache --print-stats | awk \
+    '$1 == "direct_cache_hit" || $1 == "preprocessed_cache_hit" {hits += $2} END {print hits + 0}')
+if ((CCACHE_FILES_BEFORE > 0 && CCACHE_HITS == 0)); then
+    echo "[ERROR] ccache contained ${CCACHE_FILES_BEFORE} files before the build, but this build had zero cache hits."
+    exit 1
+elif ((CCACHE_FILES_BEFORE > 0)); then
+    echo "ccache validation passed: ${CCACHE_HITS} hits from an existing cache."
+else
+    echo "No existing ccache entries were found; allowing this cold build."
+fi
 
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."
 cp "$BUILD_DIR"/build/tensorrt_llm-*.whl "$WHEEL_OUTPUT_DIR/"
