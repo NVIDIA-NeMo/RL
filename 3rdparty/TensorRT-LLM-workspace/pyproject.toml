@@ -9,10 +9,6 @@
 # Declared as no-build-isolation-package in the root pyproject.toml so the
 # build runs in the main venv context and has access to torch / CUDA headers.
 #
-# To control which fork/ref is built, set these env vars before `uv sync`:
-#   BUILD_CUSTOM_TRTLLM_URL  (default: https://github.com/NVIDIA/TensorRT-LLM.git)
-#   BUILD_CUSTOM_TRTLLM_REF  (default: bf2ef86f9a2652132b11773d4041e292c553c142)
-#
 # Sourced from requirements.txt on github.com/shuyixiong/TensorRT-LLM@nemorl.
 # Intentional omissions from requirements.txt:
 #   - datasets==3.1.0        → conflicts with nemorl base datasets>=4.0.0
@@ -112,3 +108,14 @@ dependencies = [
 requires = []
 build-backend = "_backend"
 backend-path = ["."]
+
+[tool.trtllm]
+# Single source of truth for which TensorRT-LLM fork/commit the custom wheel
+# builds. _backend.py reads these, folds them into the wheel cache key, and
+# passes them to tools/build-custom-trtllm.sh as its required argv (the script
+# itself takes no defaults). The CI ccache tag suffix is derived from `ref` in
+# .github/workflows/_build_container.yml, so bumping `ref` here invalidates both
+# the wheel cache and the ccache image in one edit. When bumping, also re-sync
+# [project].dependencies against the new requirements.txt.
+url = "https://github.com/NVIDIA/TensorRT-LLM.git"
+ref = "bf2ef86f9a2652132b11773d4041e292c553c142"   # pragma: allowlist secret

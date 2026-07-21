@@ -38,7 +38,7 @@ on:
       trtllm-ccache-tag:
         required: false
         default: ""
-        description: Registry tag used to restore and update the TRT-LLM ccache image. Empty disables it.
+        description: Arch-scoped prefix for the TRT-LLM ccache image tag (e.g. trtllm-ccache-arm64); the short TRT-LLM ref from [tool.trtllm] is appended automatically. Empty disables the ccache.
         type: string
       dockerfile:
         required: true
@@ -88,13 +88,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Resolve TRT-LLM ccache tag
+        id: trtllm_ccache_tag
+        if: inputs.trtllm-ccache-tag != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Single source of truth for the built ref is [tool.trtllm].ref in the
+          # workspace pyproject.toml.
+          PYPROJECT=3rdparty/TensorRT-LLM-workspace/pyproject.toml
+          REF=$(sed -nE '/^\[tool\.trtllm\]/,/^\[/{s/^[[:space:]]*ref[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p;}' "$PYPROJECT" | head -1)
+          if [ -z "$REF" ]; then
+            echo "Could not read [tool.trtllm].ref from $PYPROJECT" >&2
+            exit 1
+          fi
+          echo "tag=${{ inputs.trtllm-ccache-tag }}-${REF:0:8}" >> "$GITHUB_OUTPUT"
+
       - name: Resolve TRT-LLM ccache seed
         id: trtllm_ccache_seed
         if: inputs.trtllm-ccache-tag != ''
         shell: bash
         run: |
           set -euo pipefail
-          REF="$REGISTRY/$IMAGE_NAME:${{ inputs.trtllm-ccache-tag }}"
+          REF="$REGISTRY/$IMAGE_NAME:${{ steps.trtllm_ccache_tag.outputs.tag }}"
           if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
             echo "build-context=trtllm-ccache-seed=docker-image://$REF" >> "$GITHUB_OUTPUT"
           else
@@ -209,5 +225,5 @@ jobs:
             ${{ steps.build_meta.outputs.cache-from }}
             ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
           no-cache: false
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.trtllm-ccache-tag }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trtllm_ccache_tag.outputs.tag }}
           target: trtllm-ccache

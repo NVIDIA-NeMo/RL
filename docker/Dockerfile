@@ -130,11 +130,6 @@ ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
 ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
-# TensorRT-LLM does not publish a cp313 release wheel on PyPI — the official
-# releases target cp312 and below. Until an official cp313 wheel is available,
-# we must build from source.
-ARG BUILD_CUSTOM_TRTLLM_URL
-ARG BUILD_CUSTOM_TRTLLM_REF
 
 # Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
@@ -230,9 +225,7 @@ if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
 fi
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py
-    # invokes tools/build-custom-trtllm.sh during this sync (≈60 min).
-    # Build coordinates are passed via env vars:
-    #   BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF
+    # invokes tools/build-custom-trtllm.sh during this sync.
     uv sync --link-mode symlink --locked --extra trtllm --no-install-project
 fi
 

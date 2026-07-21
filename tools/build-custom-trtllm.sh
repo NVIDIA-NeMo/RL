@@ -30,9 +30,17 @@ assert_patch_target() {
     }
 }
 
-# Parse command line arguments
-GIT_URL=${1:-https://github.com/NVIDIA/TensorRT-LLM.git}
-GIT_REF=${2:-bf2ef86f9a2652132b11773d4041e292c553c142}
+# Required positional arguments: the fork URL and commit ref to build.
+# This is purely a build script — it does not resolve defaults. The caller owns
+# the source of truth (the PEP 517 backend _backend.py reads them from the
+# [tool.trtllm] table of the workspace pyproject.toml and passes them here).
+if [[ $# -lt 2 || -z "${1:-}" || -z "${2:-}" ]]; then
+    echo "[ERROR] Usage: $0 <GIT_URL> <GIT_REF>" >&2
+    echo "        Both the TensorRT-LLM fork URL and commit ref are required." >&2
+    exit 1
+fi
+GIT_URL=$1
+GIT_REF=$2
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty")/TensorRT-LLM
 if [[ -e "$BUILD_DIR" ]]; then

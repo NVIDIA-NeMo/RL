@@ -58,6 +58,16 @@ NAME: str = _META["project"]["name"].replace("-", "_")  # tensorrt_llm
 DIST_NAME: str = _META["project"]["name"]  # tensorrt-llm
 REQUIRES: list[str] = _META["project"].get("dependencies", [])
 
+# Fork URL + commit ref to build. The [tool.trtllm] table in this same
+# pyproject.toml is the sole source of truth. This backend reads it here, folds
+# it into the wheel cache key, and passes it to tools/build-custom-trtllm.sh as
+# argv (the script takes no defaults); the CI ccache tag suffix is derived from
+# the same `ref`. There is no env-var override — to build a different fork/ref,
+# edit [tool.trtllm].
+_TRTLLM: dict[str, str] = _META["tool"]["trtllm"]
+TRTLLM_URL: str = _TRTLLM["url"]
+TRTLLM_REF: str = _TRTLLM["ref"]
+
 
 def _wheel_platform_tag() -> str:
     """Return the real wheel tag for the current interpreter, e.g. cp313-cp313-linux_aarch64.
@@ -168,16 +178,10 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         raise FileNotFoundError(f"Build script not found: {script}")
 
     env = os.environ.copy()
-    git_url = env.get(
-        "BUILD_CUSTOM_TRTLLM_URL",
-        "https://github.com/NVIDIA/TensorRT-LLM.git",
-    )
-    git_ref = env.get(
-        "BUILD_CUSTOM_TRTLLM_REF",
-        "bf2ef86f9a2652132b11773d4041e292c553c142",  # pragma: allowlist secret
-    )
-    # NOTE: when bumping the ref above, re-sync the Requires-Dist list in
-    # 3rdparty/TensorRT-LLM-workspace/pyproject.toml ([project].dependencies).
+    git_url = TRTLLM_URL
+    git_ref = TRTLLM_REF
+    # NOTE: when bumping the ref (in the [tool.trtllm] table of this pyproject.toml),
+    # re-sync the Requires-Dist list in [project].dependencies of the same file.
     # uv resolves this package's runtime deps from that hand-curated static list
     # (surfaced by prepare_metadata_for_build_wheel), NOT from the built wheel's
     # METADATA — so a ref bump can silently drop or miss real deps. Regenerate:
