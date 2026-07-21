@@ -1,0 +1,146 @@
+defaults: ../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  max_num_epochs: 10
+  max_num_steps: 10000
+  normalize_rewards: true
+  use_leave_one_out_baseline: false
+  val_period: 10
+  val_at_start: false
+  overlong_filtering: false
+  max_val_samples: 960
+  val_batch_size: 960
+  batch_multiplier: 1
+  use_dynamic_sampling: false
+  reward_scaling:
+    enabled: false
+    target_min: -1.0
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 256
+    max_response_length: 1024
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_type: tis
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+  token_level_loss: true
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-glm52-2k-pp8-ep64
+  keep_top_k: 2
+  save_period: 3
+  checkpoint_must_save_by: "00:03:45:00"
+  save_optimizer: true
+policy:
+  model_name: zai-org/GLM-5.2
+  hf_config_overrides:
+    num_mtp_modules: 0
+
+  train_micro_batch_size: 1
+  train_global_batch_size: 512
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 128
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: "torch.bfloat16"
+      exp_avg_sq_dtype: "torch.bfloat16"
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    pipeline_parallel_size: 8
+    expert_parallel_size: 64
+    activation_checkpointing: true
+    moe_parallelizer:
+      wrap_outer_model: false
+      reshard_after_forward: false
+
+    automodel_kwargs:
+      pipeline_config:
+        _target_: nemo_automodel.components.distributed.pipelining.config.PipelineConfig
+        pp_schedule: Interleaved1F1B
+        pp_microbatch_size: 1
+        patch_inner_model: false
+        patch_causal_lm_model: false
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: te
+        rms_norm: torch_fp32
+        fake_balanced_gate: false
+        rope_fusion: false
+        gate_precision: float32
+        enable_hf_state_dict_adapter: true
+        experts: gmm
+        dispatcher: hybridep
+        enable_fsdp_optimizations: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  generation:
+    max_new_tokens: 1024
+    vllm_kwargs:
+      compilation_config:
+        pass_config:
+          fuse_allreduce_rms: false
+    vllm_cfg:
+      tensor_parallel_size: 32
+      expert_parallel_size: 128
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      max_model_len: 2048
+    colocated:
+      enabled: true
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: "dapo_math_verify"
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: false
+  wandb:
+    project: nemorl-glm52
+    name: grpo-glm52-2k-pp8-ep64
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64
