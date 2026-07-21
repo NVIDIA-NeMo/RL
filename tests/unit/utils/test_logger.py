@@ -366,6 +366,38 @@ class TestWandbLogger:
         mock_run.log.assert_called_once_with(metrics, commit=False)
 
     @patch("nemo_rl.utils.logger.wandb")
+    def test_log_metrics_commits_finished_custom_step(self, mock_wandb):
+        """The final log for a batch commits all custom-step metrics together."""
+        logger = WandbLogger({})
+        metrics = {"eval_step": 2, "score": 0.5}
+
+        logger.log_metrics(
+            metrics,
+            step=2,
+            step_metric="eval_step",
+            step_finished=True,
+        )
+
+        mock_wandb.init.return_value.log.assert_called_once_with(metrics, commit=True)
+
+    @patch("nemo_rl.utils.logger.wandb")
+    def test_log_plot_with_custom_step(self, mock_wandb):
+        logger = WandbLogger({})
+        figure = MagicMock()
+
+        logger.log_plot(
+            figure,
+            step=3,
+            name="generation_metrics/tokens",
+            step_metric="eval_step",
+        )
+
+        mock_wandb.init.return_value.log.assert_called_once_with(
+            {"eval_step": 3, "generation_metrics/tokens": figure},
+            commit=False,
+        )
+
+    @patch("nemo_rl.utils.logger.wandb")
     def test_log_metrics_with_prefix_and_step_metric(self, mock_wandb):
         """Test logging metrics with both prefix and step metric."""
         cfg = {}
@@ -1298,6 +1330,53 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         assert mock_parent_logger.logged_step_metrics[0] == custom_step_metric
 
     @patch("nemo_rl.utils.logger.ray")
+    def test_flush_aggregates_system_metrics_at_batch_step(
+        self, mock_ray, mock_parent_logger
+    ):
+        """Eval flushes all system samples once using its batch-defined step."""
+        mock_ray.is_initialized.return_value = True
+        monitor = RayGpuMonitorLogger(
+            collection_interval=10.0,
+            flush_interval=60.0,
+            metric_prefix="ray",
+            step_metric="ray/ray_step",
+            parent_logger=mock_parent_logger,
+        )
+        monitor.use_batch_steps("eval_step")
+        monitor.metrics_buffer = [
+            {
+                "step": 10,
+                "metrics": {"node.0.gpu.0.util": 50.0, "node.0.mem_gb": 100.0},
+            },
+            {
+                "step": 20,
+                "metrics": {
+                    "node.0.gpu.0.util": 90.0,
+                    "node.0.mem_gb": 120.0,
+                    "node.0.invalid": float("inf"),
+                },
+            },
+        ]
+
+        monitor.flush(step=4)
+
+        assert len(mock_parent_logger.logged_metrics) == 1
+        assert mock_parent_logger.logged_metrics[0] == {
+            "samples": 2,
+            "node.0.gpu.0.util/mean": 70.0,
+            "node.0.gpu.0.util/max": 90.0,
+            "node.0.gpu.0.util/last": 90.0,
+            "node.0.mem_gb/mean": 110.0,
+            "node.0.mem_gb/max": 120.0,
+            "node.0.mem_gb/last": 120.0,
+            "eval_step": 4,
+        }
+        assert mock_parent_logger.logged_steps == [4]
+        assert mock_parent_logger.logged_prefixes == ["ray"]
+        assert mock_parent_logger.logged_step_metrics == ["eval_step"]
+        assert monitor.metrics_buffer == []
+
+    @patch("nemo_rl.utils.logger.ray")
     @patch("nemo_rl.utils.logger.time")
     def test_collection_loop(self, mock_time, mock_ray):
         """Test _collection_loop method (one iteration)."""
@@ -1400,6 +1479,47 @@ ray_node_gram_used{{GpuIndex="0",GpuDeviceName="NVIDIA Test GPU"}} {80.0 * 1024}
         mock_wandb_instance = mock_wandb_logger.return_value
         mock_wandb_instance.define_metric.assert_called_once_with(
             "ray/*", step_metric="ray/ray_step"
+        )
+
+    @patch("nemo_rl.utils.logger.WandbLogger")
+    @patch("nemo_rl.utils.logger.TensorboardLogger")
+    @patch("nemo_rl.utils.logger.RayGpuMonitorLogger")
+    def test_use_batch_steps_with_gpu_monitoring(
+        self, mock_gpu_monitor, mock_tb_logger, mock_wandb_logger, temp_dir
+    ):
+        """Eval switches Ray and W&B to the caller's batch step."""
+        cfg = {
+            "wandb_enabled": True,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": True,
+            "gpu_monitoring": {
+                "collection_interval": 10.0,
+                "flush_interval": 60.0,
+            },
+            "wandb": {"project": "test-project"},
+            "log_dir": temp_dir,
+        }
+
+        logger = Logger(cfg)
+        logger.use_batch_steps("eval_step", ("eval/*", "generation_metrics/*", "ray/*"))
+
+        gpu_monitor = mock_gpu_monitor.return_value
+        gpu_monitor.use_batch_steps.assert_called_once_with("eval_step")
+        gpu_monitor.start.assert_called_once_with()
+        wandb_logger = mock_wandb_logger.return_value
+        wandb_logger.define_metric.assert_has_calls(
+            [
+                call("eval_step"),
+                call("eval/*", step_metric="eval_step"),
+                call("generation_metrics/*", step_metric="eval_step"),
+                call("ray/*", step_metric="eval_step"),
+            ],
+            any_order=True,
+        )
+        assert call("ray/*", step_metric="ray/ray_step") in (
+            wandb_logger.define_metric.call_args_list
         )
 
     @patch("nemo_rl.utils.logger.WandbLogger")

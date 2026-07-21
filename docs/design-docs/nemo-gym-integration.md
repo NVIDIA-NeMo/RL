@@ -4,13 +4,13 @@ This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvid
 
 ## Overview
 
-NeMo Gym provides HTTP-based training environments for LLMs. **NeMo Gym is CPU-only**—it runs no inference engines and holds no GPU memory. NeMo RL exposes its vLLM generation engine as an OpenAI-compatible HTTP server, which NeMo Gym calls during rollouts, enabling:
+NeMo Gym provides HTTP-based training and evaluation environments for LLMs. **NeMo Gym is CPU-only**—it runs no inference engines and holds no GPU memory. NeMo RL exposes its vLLM generation engine as an OpenAI-compatible HTTP server, which NeMo Gym calls during rollouts, enabling:
 
 - **Decoupled architecture**: Environments don't need direct access to model internals
 - **Multi-step/multi-turn support**: Agents can orchestrate complex interactions with tools
 - **Refit compatibility**: NeMo RL's weight synchronization works transparently
 
-The same NeMo Gym rollout path is used by GRPO and on-policy distillation when `env.should_use_nemo_gym` is enabled. Distillation uses the generated NeMo Gym conversations as the student on-policy samples before computing teacher logits and the distillation loss.
+The same NeMo Gym rollout path is used by GRPO, on-policy distillation, and standalone evaluation when `env.should_use_nemo_gym` is enabled. Distillation uses the generated NeMo Gym conversations as the student on-policy samples before computing teacher logits and the distillation loss.
 
 For on-policy distillation, NeMo Gym controls the rollout turn count from its environment and agent configuration. The standard distillation `distillation.max_rollout_turns` setting is not used by the NeMo Gym rollout path.
 
@@ -36,6 +36,59 @@ env:
 ```
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
+
+### Rollout Benchmark Through the Eval Flow
+
+Use the dedicated converter entrypoint to run an existing GRPO NeMo Gym recipe
+as a rollout-only benchmark:
+
+```bash
+uv run examples/nemo_gym/run_grpo_rollout_benchmark.py \
+  --config examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+```
+
+The entrypoint validates the source as a GRPO config, converts it to the
+standard eval schema, and then calls the same eval implementation as
+`examples/run_eval.py`. The GRPO recipe remains the only source of rollout
+sampling configuration:
+
+- `grpo.num_generations_per_prompt` controls trajectories per prompt.
+- `grpo.num_prompts_per_step` controls prompts in each 1-based `eval_step`.
+- `policy.generation` supplies `max_new_tokens`, `temperature`, `top_p`,
+  `top_k`, stop settings, and the vLLM configuration.
+
+The converter also flattens `data.default` plus `data.validation`, copies the
+NeMo Gym, logger, cluster, tokenizer, and full policy configuration, and removes
+legacy trajectory-collection control fields before Gym starts. Do not add an
+`eval` block or a second generation block to the GRPO recipe. Results and
+telemetry use the normal eval outputs: `nemo_gym_eval_results.jsonl`,
+`generation_metrics.jsonl`, W&B `eval_step`, rollout metrics, generation
+metrics, and Ray system metrics.
+
+### Standalone Evaluation
+
+`examples/run_eval.py` supports NeMo Gym datasets and agents through the same
+`env.should_use_nemo_gym` switch. A complete configuration is available at
+`examples/nemo_gym/eval_workplace_assistant_nemotron_nano_v2_9b.yaml`:
+
+```bash
+uv run examples/run_eval.py \
+  --config examples/nemo_gym/eval_workplace_assistant_nemotron_nano_v2_9b.yaml
+```
+
+The example uses Gym's checked-in workplace-assistant split. Gym eval supports
+`mean_reward` and `pass@k`; use `eval.num_tests_per_prompt` for multiple
+trajectories per prompt. It uses the HTTP-serving vLLM or Megatron rollout
+engine selected by `generation.backend`.
+
+Each completed batch is a 1-based W&B `eval_step`. Eval, rollout, generation,
+and (when `logger.monitor_gpus=true`) Ray system metrics share that axis. Raw
+results and generation time series are written to
+`nemo_gym_eval_results.jsonl` and `generation_metrics.jsonl`.
+
+Standard eval can construct vLLM, SGLang, or Megatron from
+`generation.backend`. NeMo Gym eval supports the same HTTP rollout engines as
+the GRPO Gym flow: vLLM and Megatron.
 
 ### Version Requirements
 

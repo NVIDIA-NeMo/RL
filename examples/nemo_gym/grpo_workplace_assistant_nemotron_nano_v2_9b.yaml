@@ -125,6 +125,7 @@ policy:
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
     defer_fp32_logits: false
+    moe_per_layer_logging: false
     moe_permute_fusion: true
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
@@ -299,6 +300,7 @@ env:
     port_range_high: 5999
     rollout_max_attempts_to_avoid_lp_nan: 1
     is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
+    trajectory_collection_batch_size: null  # Optional positive integer; null collects the validation set in one batch
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/workplace_assistant/configs/workplace_assistant.yaml

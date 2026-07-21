@@ -16,9 +16,30 @@ from unittest.mock import MagicMock
 
 import torch
 
-from nemo_rl.data.collate_fn import preference_collate_fn
+from nemo_rl.data.collate_fn import eval_collate_fn, preference_collate_fn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_eval_collate_fn_retains_loss_multiplier():
+    data_batch = [
+        DatumSpec(
+            message_log=[],
+            extra_env_info={"instance_id": "one"},
+            loss_multiplier=0.25,
+            idx=0,
+        ),
+        DatumSpec(
+            message_log=[],
+            extra_env_info={"instance_id": "two"},
+            loss_multiplier=1.0,
+            idx=1,
+        ),
+    ]
+
+    batch = eval_collate_fn(data_batch)
+
+    assert torch.equal(batch["loss_multiplier"], torch.tensor([0.25, 1.0]))
 
 
 def test_preference_collate_fn():
