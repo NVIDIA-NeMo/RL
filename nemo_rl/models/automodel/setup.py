@@ -22,30 +22,10 @@ from typing import Any, Optional, Union
 
 import torch
 from hydra.utils import get_class
-from nemo_automodel import NeMoAutoModelForSequenceClassification
-
-try:
-    from nemo_automodel import NeMoAutoModelForTokenClassification
-except ImportError:
-    # Local backport until the pinned Automodel submodule exports
-    # NeMoAutoModelForTokenClassification. The tripwire test in
-    # tests/unit/models/automodel/test_automodel_setup.py should fail once this
-    # shim is no longer needed.
-    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2948.
-    from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass
-    from transformers import AutoModelForTokenClassification
-
-    class NeMoAutoModelForTokenClassification(
-        _BaseNeMoAutoModelClass, AutoModelForTokenClassification
-    ):
-        """Backport shim - see surrounding comment."""
-
-        pass
-else:
-    raise RuntimeError(
-        "Automodel now exports NeMoAutoModelForTokenClassification; remove the "
-        "local backport shim in nemo_rl.models.automodel.setup."
-    )
+from nemo_automodel import (
+    NeMoAutoModelForSequenceClassification,
+    NeMoAutoModelForTokenClassification,
+)
 
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -593,49 +573,6 @@ def setup_distributed(
     )
 
 
-# AUTOMODEL-WORKAROUND(restore-dtype): TEMPORARY. Remove when the automodel pin includes
-# NVIDIA-NeMo/Automodel PR #2419 (rewrites _restore_loaded_model_dtype to honor an explicit
-# torch_dtype via promote_types). Currently pinned at automodel 6de0c361 (pre-#2419).
-def _disable_automodel_checkpoint_dtype_restore() -> None:
-    """No-op Automodel's ``_restore_loaded_model_dtype`` on the HF/force_hf load path.
-
-    NeMo-RL loads policy models with ``torch_dtype=float32`` to keep fp32 master weights
-    for the optimizer. Automodel's ``_restore_loaded_model_dtype`` (added after automodel
-    ``92635e74``) re-casts each loaded parameter back to the bf16 checkpoint dtype, silently
-    downgrading the master weights so AdamW updates underflow and the model fails to learn
-    (e.g. grpo-nano-v2-12b reward stuck ~0.18). Disable it so the requested fp32 load is
-    honored. Tracked by NVIDIA-NeMo/Automodel#2419; remove once the automodel pin includes it.
-    See ``test_automodel_dtype_restore_workaround_still_needed`` for the removal tripwire.
-    """
-    from nemo_automodel._transformers import model_init as _model_init
-
-    # Removal tripwire: if Automodel drops/renames this symbol (the likely shape of the
-    # upstream fix), the workaround is obsolete -> warn loudly and self-deactivate.
-    restore = getattr(_model_init, "_restore_loaded_model_dtype", None)
-    if restore is None:
-        import warnings
-
-        warnings.warn(
-            "Automodel no longer defines _restore_loaded_model_dtype; NeMo-RL's fp32 "
-            "master-weight workaround is obsolete - remove "
-            "_disable_automodel_checkpoint_dtype_restore() in setup.py.",
-            stacklevel=2,
-        )
-        return
-    if getattr(restore, "_nrl_disabled", False):
-        return
-
-    def _noop(*args, **kwargs) -> None:  # pragma: no cover
-        return None
-
-    _noop._nrl_disabled = True
-    # Stash the genuine function so the removal tripwire test
-    # (test_automodel_dtype_restore_workaround_still_needed) can exercise Automodel's
-    # real behavior even after this no-op has globally replaced the symbol process-wide.
-    _noop._nrl_original = restore
-    _model_init._restore_loaded_model_dtype = _noop
-
-
 def build_pipeline_config(
     automodel_kwargs: dict,
     config: "PolicyConfig",
@@ -872,10 +809,6 @@ def setup_model_and_optimizer(
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
 
-    # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
-    # checkpoint dtype, which would break optimizer master-weight precision (see helper).
-    _disable_automodel_checkpoint_dtype_restore()
-
     # Bundle distributed topology + policies into a single DistributedSetup. automodel
     # 2d946b0's from_pretrained rejects the old separate distributed kwargs
     # (device_mesh/moe_mesh/distributed_config/moe_config/activation_checkpointing/
@@ -906,11 +839,7 @@ def setup_model_and_optimizer(
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
         model_name,
-        device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
-        distributed_config=fsdp2_config,
-        moe_config=moe_config if ep_size > 1 else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+        distributed_setup=distributed_setup,
         peft_config=peft_config,
         attn_implementation=attn_impl,
         torch_dtype=str(model_config.torch_dtype),
