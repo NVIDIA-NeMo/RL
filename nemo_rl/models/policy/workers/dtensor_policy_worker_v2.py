@@ -474,7 +474,7 @@ class DTensorPolicyWorkerV2Impl(
             self.model_handle.train()
 
         if self.pp_enabled:
-            return self._train_pp(
+            metrics = self._train_pp(
                 data=data,
                 loss_fn=loss_fn,
                 eval_mode=eval_mode,
@@ -485,6 +485,8 @@ class DTensorPolicyWorkerV2Impl(
                 optimizers_list=self.optimizers,
                 schedulers_list=self.schedulers,
             )
+            self.timer.stop("train")
+            return metrics
 
         # --- Non-PP path (existing) ---
 
@@ -829,7 +831,11 @@ class DTensorPolicyWorkerV2Impl(
             max_seq = torch.tensor([seq_dim_size], device="cuda")
             torch.distributed.all_reduce(max_seq, op=torch.distributed.ReduceOp.MAX)
             seq_dim_size = int(max_seq.item())
-            return self._get_logprobs_pp(data, logprob_batch_size, seq_dim_size)
+            return_data = self._get_logprobs_pp(
+                data, logprob_batch_size, seq_dim_size
+            )
+            self.timer.stop("get_logprobs")
+            return return_data
 
         all_log_probs = []
         self.model.eval()
