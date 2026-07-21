@@ -270,3 +270,25 @@ def test_load_response_dataset_warns_on_swallowed_key(monkeypatch, stub_module):
     }
     with pytest.warns(UserWarning, match="subset='socratic'"):
         load_response_dataset(config)
+
+
+def test_warn_on_unsupported_data_path_and_input_key():
+    """Constructor-consumed keys beyond the HF-loading four are checked too
+    (e.g. `data_path` on a loader that hardcodes its source)."""
+    with pytest.warns(UserWarning) as record:
+        warn_on_unsupported_dataset_config_keys(
+            _SplitOnlyDataset, {"data_path": "/tmp/my.jsonl", "input_key": "question"}
+        )
+    messages = [str(w.message) for w in record]
+    assert any("data_path='/tmp/my.jsonl'" in m for m in messages)
+    assert any("input_key='question'" in m for m in messages)
+
+
+def test_load_preference_dataset_warns_on_swallowed_key(stub_module):
+    """The preference dispatcher applies the same guard as the response one."""
+    config = {
+        "dataset_name": f"{stub_module}.StubPreferenceDataset",
+        "split": "test",
+    }
+    with pytest.warns(UserWarning, match="split='test'"):
+        load_preference_dataset(config)

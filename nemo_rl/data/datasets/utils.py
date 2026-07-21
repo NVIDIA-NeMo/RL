@@ -185,10 +185,24 @@ def resolve_external_dataset_class(dataset_name: str) -> type:
     return dataset_class
 
 
-# Behavioral keys from ResponseDatasetConfig that change *which data* a run
-# sees. If one of these is set but the resolved dataset class does not accept
-# it, the user silently gets different data than they configured.
-_BEHAVIORAL_DATASET_CONFIG_KEYS = ("seed", "split", "split_validation_size", "subset")
+# Constructor-consumed keys from ResponseDatasetConfig / PreferenceDatasetConfig
+# that change *which data* a run sees. If one of these is set but the resolved
+# dataset class does not accept it, the user silently gets different data than
+# they configured. Keys consumed by the dispatchers themselves (dataset_name,
+# env_name, processor, prompt_file, system_prompt_file) are deliberately absent.
+_BEHAVIORAL_DATASET_CONFIG_KEYS = (
+    "chosen_key",
+    "data_path",
+    "download_dir",
+    "input_key",
+    "output_key",
+    "prompt_key",
+    "rejected_key",
+    "seed",
+    "split",
+    "split_validation_size",
+    "subset",
+)
 
 
 def warn_on_unsupported_dataset_config_keys(
