@@ -120,6 +120,37 @@ def convert_grpo_to_eval_config(
 
     policy_config = deepcopy(grpo_config.policy)
     policy_config["generation"] = cast(GenerationConfig, generation_config)
+
+    # The benchmark is generation-only, so the eval "cluster" IS the generation
+    # cluster. Size it to the generation's own (non-colocated) resources rather than
+    # the full training cluster: otherwise EVERY allocated node becomes a generation
+    # replica (dp_size == cluster.num_nodes), so a node the launcher reserved for
+    # training silently becomes an extra replica and dilutes per-replica concurrency
+    # to GBS / cluster.num_nodes (e.g. R=2 requested but 3 nodes allocated → 3
+    # replicas at GBS/3). Fall back to the training cluster when generation is
+    # colocated or declares no explicit resources.
+    eval_cluster = cast(dict[str, Any], deepcopy(grpo_config.cluster))
+    gen_colocated = cast(dict[str, Any], generation_config.get("colocated") or {})
+    if not gen_colocated.get("enabled", False):
+        gen_resources = cast(dict[str, Any], gen_colocated.get("resources") or {})
+        gen_num_nodes = gen_resources.get("num_nodes")
+        if gen_num_nodes:
+            if gen_num_nodes != eval_cluster.get("num_nodes"):
+                print(
+                    f"Rollout benchmark: sizing the generation cluster to "
+                    f"{gen_num_nodes} node(s) from policy.generation.colocated.resources "
+                    f"(training cluster has {eval_cluster.get('num_nodes')}); "
+                    f"per-replica concurrency = GBS / {gen_num_nodes}."
+                )
+            eval_cluster["num_nodes"] = gen_num_nodes
+            gen_gpus_per_node = gen_resources.get("gpus_per_node")
+            if gen_gpus_per_node:
+                eval_cluster["gpus_per_node"] = gen_gpus_per_node
+            # Keep the cluster valid: segment_size must divide num_nodes.
+            segment_size = eval_cluster.get("segment_size")
+            if segment_size and gen_num_nodes % segment_size != 0:
+                eval_cluster["segment_size"] = 1
+
     converted_config: dict[str, Any] = {
         "eval": {
             "metric": ROLLOUT_BENCHMARK_METRIC,
@@ -136,7 +167,7 @@ def convert_grpo_to_eval_config(
             "nemo_gym": converted_nemo_gym_config,
         },
         "logger": deepcopy(grpo_config.logger),
-        "cluster": deepcopy(grpo_config.cluster),
+        "cluster": eval_cluster,
         "policy": policy_config,
     }
     return EvalMasterConfig.model_validate(converted_config)
