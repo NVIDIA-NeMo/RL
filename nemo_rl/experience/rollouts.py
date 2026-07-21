@@ -1091,6 +1091,152 @@ def _calculate_single_metric(
     }
 
 
+def _calculate_refine_metrics(
+    results: list[dict[str, Any]], max_total_tokens_per_sample: int
+) -> dict[str, Any]:
+    """Calculate chain- and round-level metrics for fixed-slot refine rollouts.
+
+    Round pass rate is the fraction of all chains newly solved in that round.
+    Padded slots therefore remain in the denominator but never count as a pass.
+    Operational metrics (length, truncation, and tool use) only include real slots.
+    """
+    if not results or not all(
+        isinstance(r.get("full_result", {}).get("refine_round_idx"), int)
+        for r in results
+    ):
+        return {}
+
+    chain_results: dict[int, dict[str, Any]] = {}
+    for i, result in enumerate(results):
+        source_rowidx = int(result.get("source_rowidx", i))
+        chain_results.setdefault(source_rowidx, result["full_result"])
+
+    chain_count = len(chain_results)
+    chain_pass_count = sum(
+        bool(result.get("chain_resolved", result.get("reward", 0.0)))
+        for result in chain_results.values()
+    )
+    metrics: dict[str, Any] = {
+        "refine/pass_rate": chain_pass_count / chain_count,
+        "refine/pass_count": chain_pass_count,
+        "refine/chain_count": chain_count,
+    }
+
+    round_indices = sorted({int(r["full_result"]["refine_round_idx"]) for r in results})
+    for round_idx in round_indices:
+        round_results = [
+            r for r in results if int(r["full_result"]["refine_round_idx"]) == round_idx
+        ]
+        active_results = [
+            r for r in round_results if not bool(r["full_result"].get("is_padded"))
+        ]
+        prefix = f"refine/round_{round_idx}"
+        pass_count = sum(bool(r["full_result"].get("resolved")) for r in active_results)
+        active_count = len(active_results)
+        metrics.update(
+            {
+                f"{prefix}/pass_rate": pass_count / chain_count,
+                f"{prefix}/pass_count": pass_count,
+                f"{prefix}/chain_count": chain_count,
+                f"{prefix}/active_rate": active_count / chain_count,
+                f"{prefix}/active_count": active_count,
+                f"{prefix}/truncated_count": 0,
+                f"{prefix}/tool_call_success_count": 0,
+                f"{prefix}/tool_call_attempt_count": 0,
+                f"{prefix}/tool_call_turn_count": 0,
+                f"{prefix}/gen_token_count": 0,
+                f"{prefix}/token_count": 0,
+                f"{prefix}/truncation_rate": math.nan,
+                f"{prefix}/tool_call_success_rate": math.nan,
+            }
+        )
+
+        if not active_results:
+            continue
+
+        assistant_tokens = [
+            sum(
+                len(message["token_ids"])
+                for message in result["message_log"]
+                if message["role"] == "assistant"
+            )
+            for result in active_results
+        ]
+        total_tokens = [
+            sum(len(message["token_ids"]) for message in result["message_log"])
+            for result in active_results
+        ]
+        tool_call_turns = [
+            sum(
+                bool(message.get("is_tool_call"))
+                or bool(message.get("is_invalid_tool_call"))
+                for message in result["message_log"]
+                if message["role"] == "assistant"
+            )
+            for result in active_results
+        ]
+        successful_tool_calls = sum(
+            sum(
+                bool(message.get("is_tool_call"))
+                for message in result["message_log"]
+                if message["role"] == "assistant"
+            )
+            for result in active_results
+        )
+        invalid_tool_calls = sum(
+            sum(
+                bool(message.get("is_invalid_tool_call"))
+                for message in result["message_log"]
+                if message["role"] == "assistant"
+            )
+            for result in active_results
+        )
+        tool_call_attempts = successful_tool_calls + invalid_tool_calls
+        truncated_count = sum(
+            total == max_total_tokens_per_sample for total in total_tokens
+        )
+
+        metrics.update(
+            _calculate_single_metric(
+                tool_call_turns,
+                active_count,
+                f"{prefix}/tool_call_turns_per_sample",
+            )
+        )
+        metrics.update(
+            _calculate_single_metric(
+                assistant_tokens,
+                active_count,
+                f"{prefix}/gen_tokens_per_sample",
+            )
+        )
+        metrics.update(
+            _calculate_single_metric(
+                total_tokens,
+                active_count,
+                f"{prefix}/total_tokens_per_sample",
+            )
+        )
+        metrics.update(
+            {
+                f"{prefix}/truncation_rate": truncated_count / active_count,
+                f"{prefix}/truncated_count": truncated_count,
+                f"{prefix}/tool_call_success_rate": (
+                    successful_tool_calls / tool_call_attempts
+                    if tool_call_attempts
+                    else math.nan
+                ),
+                f"{prefix}/tool_call_success_count": successful_tool_calls,
+                f"{prefix}/tool_call_attempt_count": tool_call_attempts,
+                f"{prefix}/tool_call_turn_count": sum(tool_call_turns),
+                f"{prefix}/gen_token_count": sum(assistant_tokens),
+                f"{prefix}/token_count": sum(total_tokens),
+            }
+        )
+
+    return metrics
+
+
 def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -1232,6 +1378,9 @@ def run_async_nemo_gym_rollout(
             # )
             # / batch_size,
         }
+        rollout_metrics.update(
+            _calculate_refine_metrics(results, max_total_tokens_per_sample)
+        )
 
     # Per-agent misc metrics.
     # Results may have expanded beyond the input row count (e.g. one result per turn
@@ -1335,6 +1484,13 @@ def run_async_nemo_gym_rollout(
             "group_hash must be a non-empty string on every result when any result sets it"
         )
         final_batch["group_hash"] = group_hashes
+
+    chain_hashes = [r.get("chain_hash") for r in results]
+    if any(h is not None for h in chain_hashes):
+        assert all(isinstance(h, str) and h for h in chain_hashes), (
+            "chain_hash must be a non-empty string on every result when any result sets it"
+        )
+        final_batch["chain_hash"] = chain_hashes
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,

@@ -30,6 +30,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_configured_message_level_advantage_penalties,
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
+    _get_prompt_ids_for_advantage,
     _resolve_message_level_advantage_penalties,
     aggregate_rollout_metrics,
     async_grpo_train,
@@ -76,6 +77,16 @@ def _logged_train_metrics_with_key(logger, key: str):
         if call.kwargs.get("prefix") == "train" and key in metrics:
             return metrics
     raise AssertionError(f"No train metrics payload contained {key}")
+
+
+def test_get_prompt_ids_for_advantage_prefers_group_hash():
+    repeated_batch = BatchedDataDict(
+        {"group_hash": ["same-problem", "same-problem", "other-problem"]}
+    )
+
+    group_ids = _get_prompt_ids_for_advantage(repeated_batch, MagicMock())
+
+    assert torch.equal(group_ids, torch.tensor([0, 0, 1]))
 
 
 def test_apply_message_level_advantage_penalties_targets_flagged_message_spans():
@@ -2414,6 +2425,37 @@ def test_grpo_advantage_estimator_zero_std():
     assert torch.allclose(result[2:], expected_prompt_1, rtol=1e-4)
 
 
+def test_grpo_advantage_estimator_deduplicates_refine_rounds_by_chain():
+    estimator = GRPOAdvantageEstimator(
+        {"use_leave_one_out_baseline": True, "normalize_rewards": False},
+        ClippedPGLossConfig(),
+    )
+    prompt_ids = torch.tensor([0, 0, 0, 0, 0, 0])
+    rewards = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+    repeated_batch = {
+        "chain_hash": [
+            "chain-a",
+            "chain-a",
+            "chain-b",
+            "chain-b",
+            "chain-c",
+            "chain-c",
+        ]
+    }
+
+    advantages = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=torch.ones(6, 2),
+        repeated_batch=repeated_batch,
+    )
+
+    # RLOO is calculated across the three unique chains: positive chains see
+    # baseline (1 + 0) / 2, while the negative chain sees (1 + 1) / 2.
+    expected = torch.tensor([0.5, 0.5, 0.5, 0.5, -1.0, -1.0])
+    assert torch.equal(advantages[:, 0], expected)
+
+
 def test_grpo_advantage_estimator_tensor_shapes():
     """Test GRPOAdvantageEstimator with different tensor shapes.
 
@@ -3305,6 +3347,38 @@ class TestAggregateRolloutMetrics:
         result = aggregate_rollout_metrics(metrics)
         assert result["mean_gen_tokens_per_sample"] == pytest.approx(200.0)
         assert result["reward/mean"] == pytest.approx(0.7)
+
+    def test_refine_metrics_use_summed_denominators(self):
+        metrics = {
+            "refine/pass_rate": [0.5, 1.0],
+            "refine/pass_count": [1, 3],
+            "refine/chain_count": [2, 3],
+            "refine/round_1/pass_rate": [0.5, 1 / 3],
+            "refine/round_1/pass_count": [1, 1],
+            "refine/round_1/chain_count": [2, 3],
+            "refine/round_1/active_rate": [0.5, 2 / 3],
+            "refine/round_1/active_count": [1, 2],
+            "refine/round_1/truncation_rate": [1.0, 0.0],
+            "refine/round_1/truncated_count": [1, 0],
+            "refine/round_1/tool_call_success_rate": [1.0, 0.5],
+            "refine/round_1/tool_call_success_count": [1, 2],
+            "refine/round_1/tool_call_attempt_count": [1, 4],
+            "refine/round_1/tool_call_turn_count": [1, 4],
+            "refine/round_1/gen_token_count": [10, 50],
+            "refine/round_1/token_count": [20, 70],
+            "refine/round_1/tool_call_turns_per_sample/mean": [1.0, 2.0],
+            "refine/round_1/gen_tokens_per_sample/mean": [10.0, 25.0],
+            "refine/round_1/total_tokens_per_sample/mean": [20.0, 35.0],
+        }
+
+        result = aggregate_rollout_metrics(metrics)
+
+        assert result["refine/pass_rate"] == pytest.approx(4 / 5)
+        assert result["refine/round_1/pass_rate"] == pytest.approx(2 / 5)
+        assert result["refine/round_1/active_rate"] == pytest.approx(3 / 5)
+        assert result["refine/round_1/truncation_rate"] == pytest.approx(1 / 3)
+        assert result["refine/round_1/tool_call_success_rate"] == pytest.approx(3 / 5)
+        assert result["refine/round_1/gen_tokens_per_sample/mean"] == 20.0
 
     def test_non_numeric_passed_through(self):
         metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}

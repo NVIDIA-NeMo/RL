@@ -56,12 +56,24 @@ class GRPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        baseline, std = calculate_baseline_and_std_per_prompt(
-            prompt_ids,
-            rewards,
-            torch.ones_like(rewards),
-            leave_one_out_baseline=self.use_leave_one_out_baseline,
+        repeated_batch = kwargs.get("repeated_batch")
+        chain_hashes = (
+            repeated_batch.get("chain_hash") if repeated_batch is not None else None
         )
+        if chain_hashes is None:
+            baseline, std = calculate_baseline_and_std_per_prompt(
+                prompt_ids,
+                rewards,
+                torch.ones_like(rewards),
+                leave_one_out_baseline=self.use_leave_one_out_baseline,
+            )
+        else:
+            baseline, std = _calculate_chain_aware_baseline_and_std(
+                prompt_ids,
+                rewards,
+                chain_hashes,
+                leave_one_out_baseline=self.use_leave_one_out_baseline,
+            )
         advantages = (rewards - baseline).unsqueeze(-1)
 
         if self.normalize_rewards:
@@ -72,7 +84,92 @@ class GRPOAdvantageEstimator:
                 std.unsqueeze(-1)[non_zero_std_mask] + epsilon
             )
 
+        if chain_hashes is not None:
+            # A rollout chain is expanded into a fixed number of round slots. Without
+            # this normalization, chains that use more real rounds contribute the same
+            # sequence advantage multiple times (while early-success padding is masked),
+            # biasing the policy toward multi-round outcomes. Keep sample_mask binary
+            # for validity/error filtering and normalize the policy signal here instead.
+            round_weights = _calculate_chain_round_weights(
+                chain_hashes,
+                mask,
+                dtype=advantages.dtype,
+                device=advantages.device,
+            )
+            advantages = advantages * round_weights.unsqueeze(-1)
+
         return advantages.expand(mask.shape)
+
+
+def _calculate_chain_aware_baseline_and_std(
+    prompt_ids: torch.Tensor,
+    rewards: torch.Tensor,
+    chain_hashes: list[str],
+    *,
+    leave_one_out_baseline: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute one GRPO statistic per rollout chain, then expand to round slots."""
+    if len(chain_hashes) != len(rewards):
+        raise ValueError(
+            f"chain_hash length {len(chain_hashes)} does not match rewards {len(rewards)}"
+        )
+
+    representative_rows: list[int] = []
+    chain_to_representative: dict[str, int] = {}
+    inverse: list[int] = []
+    for row, chain_hash in enumerate(chain_hashes):
+        if chain_hash not in chain_to_representative:
+            chain_to_representative[chain_hash] = len(representative_rows)
+            representative_rows.append(row)
+        representative = representative_rows[chain_to_representative[chain_hash]]
+        if not torch.equal(prompt_ids[row], prompt_ids[representative]):
+            raise ValueError(f"chain_hash {chain_hash!r} spans multiple prompt groups")
+        if not torch.equal(rewards[row], rewards[representative]):
+            raise ValueError(f"chain_hash {chain_hash!r} has inconsistent rewards")
+        inverse.append(chain_to_representative[chain_hash])
+
+    representative_index = torch.tensor(
+        representative_rows, dtype=torch.long, device=rewards.device
+    )
+    representative_prompts = prompt_ids[representative_index]
+    representative_rewards = rewards[representative_index]
+    chain_baseline, chain_std = calculate_baseline_and_std_per_prompt(
+        representative_prompts,
+        representative_rewards,
+        torch.ones_like(representative_rewards),
+        leave_one_out_baseline=leave_one_out_baseline,
+    )
+    inverse_index = torch.tensor(inverse, dtype=torch.long, device=rewards.device)
+    return chain_baseline[inverse_index], chain_std[inverse_index]
+
+
+def _calculate_chain_round_weights(
+    chain_hashes: list[str],
+    mask: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Give each active round an equal share of its rollout chain's loss."""
+    if len(chain_hashes) != mask.shape[0]:
+        raise ValueError(
+            f"chain_hash length {len(chain_hashes)} does not match mask batch "
+            f"size {mask.shape[0]}"
+        )
+
+    active_rows = mask.reshape(mask.shape[0], -1).any(dim=1).tolist()
+    active_rounds_per_chain: dict[str, int] = {}
+    for chain_hash, is_active in zip(chain_hashes, active_rows, strict=True):
+        if is_active:
+            active_rounds_per_chain[chain_hash] = (
+                active_rounds_per_chain.get(chain_hash, 0) + 1
+            )
+
+    weights = [
+        1.0 / active_rounds_per_chain[chain_hash] if is_active else 0.0
+        for chain_hash, is_active in zip(chain_hashes, active_rows, strict=True)
+    ]
+    return torch.tensor(weights, dtype=dtype, device=device)
 
 
 class GDPOAdvantageEstimator:

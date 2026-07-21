@@ -186,11 +186,13 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         "response": {
             "output": [
                 {
+                    "type": "function_call",
                     "prompt_token_ids": [1, 2],
                     "generation_token_ids": [3],
                     "generation_log_probs": [-0.1],
                 },
                 {
+                    "type": "message",
                     "prompt_token_ids": [1, 2, 3, 4, 5],
                     "generation_token_ids": [6, 7],
                     "generation_log_probs": [-0.2, -0.3],
@@ -215,12 +217,66 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     ]
     assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
     assert result["message_log"][1]["token_ids"].tolist() == [3]
+    assert result["message_log"][1]["is_tool_call"] is True
     assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
     assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert result["message_log"][3]["is_tool_call"] is False
     assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
     assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
     assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
+def test_nemo_gym_postprocess_replaces_padding_with_minimal_dummy_tokens():
+    class _Tokenizer:
+        pad_token_id = 17
+        eos_token_id = 18
+
+        def batch_decode(self, _batch):
+            raise AssertionError("padding must bypass normal response decoding")
+
+    nemo_gym_result = {
+        "is_padded": True,
+        "loss_multiplier": 0.0,
+        "group_hash": "same-chain",
+        "chain_hash": "same-chain:rollout-3",
+        "reward": 1.0,
+        "response": {
+            "output": [{"generation_token_ids": list(range(10_000))}],
+        },
+        "responses_create_params": {"input": "large input" * 10_000},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+    )
+
+    assert result["message_log"] == [
+        {
+            "role": "user",
+            "content": "",
+            "token_ids": torch.tensor([17]),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "token_ids": torch.tensor([17]),
+            "generation_logprobs": torch.tensor([0.0]),
+            "is_tool_call": False,
+            "is_invalid_tool_call": False,
+            "has_malformed_thinking": False,
+        },
+    ]
+    assert result["input_message_log"] == result["message_log"][:1]
+    assert result["loss_multiplier"] == 0.0
+    assert result["group_hash"] == "same-chain"
+    assert result["chain_hash"] == "same-chain:rollout-3"
+    assert result["full_result"] is nemo_gym_result
 
 
 @pytest.mark.nemo_gym

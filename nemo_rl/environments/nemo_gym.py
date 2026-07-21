@@ -298,6 +298,46 @@ Depending on your data shape, you may want to change these values."""
             f"Hit a non-successful response when querying NeMo Gym for rollouts: {nemo_gym_result}"
         )
 
+        # Fixed-size multi-round agents use masked padding slots when a chain
+        # terminates early. Gym deliberately sends no token-heavy response data
+        # for these slots; retain the batch/group/reward metadata while giving
+        # the model path the smallest safe sequence shape. sample_mask=0 keeps
+        # the dummy assistant token out of the objective.
+        if nemo_gym_result.get("is_padded", False):
+            loss_multiplier = float(nemo_gym_result.get("loss_multiplier", 1.0))
+            assert loss_multiplier == 0.0, (
+                "NeMo-Gym results marked is_padded must set loss_multiplier=0"
+            )
+            padding_token_id = tokenizer.pad_token_id
+            if padding_token_id is None:
+                padding_token_id = tokenizer.eos_token_id
+            assert isinstance(padding_token_id, int), (
+                "A pad_token_id or eos_token_id is required for NeMo-Gym padding"
+            )
+
+            user_message = {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([padding_token_id], dtype=torch.long),
+            }
+            assistant_message = {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([padding_token_id], dtype=torch.long),
+                "generation_logprobs": torch.tensor([0.0], dtype=torch.float32),
+                "is_tool_call": False,
+                "is_invalid_tool_call": False,
+                "has_malformed_thinking": False,
+            }
+            return {
+                "message_log": [user_message, assistant_message],
+                "input_message_log": [user_message],
+                "full_result": nemo_gym_result,
+                "group_hash": nemo_gym_result.get("group_hash"),
+                "chain_hash": nemo_gym_result.get("chain_hash"),
+                "loss_multiplier": loss_multiplier,
+            }
+
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
         batch_decode_items = []
@@ -349,6 +389,11 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     "content": "",
                     "token_ids": torch.tensor(generation_token_ids),
                     "generation_logprobs": torch.tensor(generation_log_probs),
+                    # A structured function_call has been parsed and executed by
+                    # NeMo-Gym. Keep this bit on the trainable message so rollout
+                    # metrics can distinguish valid calls from textual/malformed
+                    # attempts without re-parsing decoded model output.
+                    "is_tool_call": output_item_dict.get("type") == "function_call",
                     "is_invalid_tool_call": is_invalid_tool_call,
                     "has_malformed_thinking": has_malformed_thinking,
                 }
@@ -397,6 +442,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             # Forward optional per-element fields used by multi-turn/group-hash flows.
             # Defaults preserve the original single-result behavior for agents that don't set them.
             "group_hash": nemo_gym_result.get("group_hash"),
+            "chain_hash": nemo_gym_result.get("chain_hash"),
             "loss_multiplier": float(nemo_gym_result.get("loss_multiplier", 1.0)),
         }
 

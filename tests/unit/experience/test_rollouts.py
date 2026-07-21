@@ -41,6 +41,7 @@ from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
+    _calculate_refine_metrics,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -101,6 +102,97 @@ class TestCalculateSingleMetric:
         result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+def _refine_result(
+    source_rowidx,
+    round_idx,
+    *,
+    resolved,
+    chain_resolved,
+    is_padded=False,
+    assistant_messages=None,
+):
+    assistant_messages = assistant_messages or []
+    return {
+        "source_rowidx": source_rowidx,
+        "full_result": {
+            "reward": float(chain_resolved),
+            "resolved": resolved,
+            "chain_resolved": chain_resolved,
+            "refine_round_idx": round_idx,
+            "is_padded": is_padded,
+        },
+        "message_log": [
+            {"role": "user", "token_ids": torch.tensor([1, 2])},
+            *assistant_messages,
+        ],
+    }
+
+
+def _assistant_message(token_count, **flags):
+    return {
+        "role": "assistant",
+        "token_ids": torch.arange(token_count),
+        **flags,
+    }
+
+
+def test_calculate_refine_metrics_excludes_padding_and_attributes_round_passes():
+    results = [
+        _refine_result(
+            0,
+            0,
+            resolved=True,
+            chain_resolved=True,
+            assistant_messages=[_assistant_message(3, is_tool_call=True)],
+        ),
+        _refine_result(
+            0,
+            1,
+            resolved=True,
+            chain_resolved=True,
+            is_padded=True,
+            assistant_messages=[_assistant_message(3, is_tool_call=True)],
+        ),
+        _refine_result(
+            1,
+            0,
+            resolved=False,
+            chain_resolved=True,
+            assistant_messages=[_assistant_message(4, is_invalid_tool_call=True)],
+        ),
+        _refine_result(
+            1,
+            1,
+            resolved=True,
+            chain_resolved=True,
+            assistant_messages=[_assistant_message(5, is_tool_call=True)],
+        ),
+    ]
+
+    metrics = _calculate_refine_metrics(results, max_total_tokens_per_sample=7)
+
+    assert metrics["refine/pass_rate"] == 1.0
+    assert metrics["refine/round_0/pass_rate"] == 0.5
+    assert metrics["refine/round_1/pass_rate"] == 0.5
+    assert metrics["refine/round_1/active_rate"] == 0.5
+    assert metrics["refine/round_0/tool_call_success_rate"] == 0.5
+    assert metrics["refine/round_1/tool_call_success_rate"] == 1.0
+    assert metrics["refine/round_0/tool_call_turns_per_sample/mean"] == 1.0
+    assert metrics["refine/round_0/gen_tokens_per_sample/mean"] == 3.5
+    assert metrics["refine/round_1/gen_tokens_per_sample/mean"] == 5.0
+    assert metrics["refine/round_0/truncation_rate"] == 0.0
+    assert metrics["refine/round_1/truncation_rate"] == 1.0
+
+
+def test_calculate_refine_metrics_ignores_non_refine_results():
+    assert (
+        _calculate_refine_metrics(
+            [{"full_result": {"reward": 1.0}, "message_log": []}], 100
+        )
+        == {}
+    )
 
 
 @pytest.fixture(scope="function")

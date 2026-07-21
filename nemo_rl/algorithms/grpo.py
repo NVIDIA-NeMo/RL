@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import os
 import time
 import warnings
@@ -140,6 +141,23 @@ def _group_hashes_to_ids(group_hashes: list[str]) -> torch.Tensor:
             hash_to_id[h] = len(hash_to_id)
         ids.append(hash_to_id[h])
     return torch.tensor(ids, dtype=torch.long)
+
+
+def _get_prompt_ids_for_advantage(
+    repeated_batch: BatchedDataDict[DatumSpec], tokenizer: TokenizerType
+) -> torch.Tensor:
+    """Return explicit environment groups or fall back to initial prompt tokens."""
+    if "group_hash" in repeated_batch:
+        return _group_hashes_to_ids(repeated_batch["group_hash"])
+
+    initial_prompt_message_logs = extract_initial_prompt_messages(
+        repeated_batch["message_log"], repeated_batch["length"]
+    )
+    prompt_batched_flat, _ = batched_message_log_to_flat_message(
+        initial_prompt_message_logs,
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+    return prompt_batched_flat["token_ids"]
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -416,7 +434,8 @@ def setup(
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
         _pps_gpp = (
-            grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
+            grpo_config["num_prompts_per_step"]
+            * grpo_config["num_generations_per_prompt"]
         )
         _gbs = policy_config["train_global_batch_size"]
         # Multi-sample agents (e.g. the refine agent) expand each generation into
@@ -2745,7 +2764,8 @@ def aggregate_rollout_metrics(
     Different metric types are aggregated according to their semantics:
     - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
     - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
-    - "total_turns": summed
+    - "total_turns" and metrics ending with "/count": summed
+    - Refine rates and means: recomputed from their summed counts
     - Non-numeric values: passed through as-is
     - All other numeric metrics: averaged
 
@@ -2763,10 +2783,49 @@ def aggregate_rollout_metrics(
             aggregated[k] = min(v)
         elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
             aggregated[k] = max(v)
-        elif k == "total_turns":
+        elif k == "total_turns" or k.endswith("/count"):
             aggregated[k] = sum(v)
         else:
             aggregated[k] = sum(v) / len(v)
+    # Refine rates need to be weighted by their actual denominators because later
+    # rounds can have fewer active samples after early success.
+    if "refine/pass_count" in aggregated:
+        aggregated["refine/pass_rate"] = (
+            aggregated["refine/pass_count"] / aggregated["refine/chain_count"]
+        )
+    round_prefixes = {
+        key.removesuffix("/active_count")
+        for key in aggregated
+        if key.startswith("refine/round_") and key.endswith("/active_count")
+    }
+    for prefix in round_prefixes:
+        chain_count = aggregated[f"{prefix}/chain_count"]
+        active_count = aggregated[f"{prefix}/active_count"]
+        tool_call_attempt_count = aggregated[f"{prefix}/tool_call_attempt_count"]
+        aggregated[f"{prefix}/pass_rate"] = (
+            aggregated[f"{prefix}/pass_count"] / chain_count
+        )
+        aggregated[f"{prefix}/active_rate"] = active_count / chain_count
+        aggregated[f"{prefix}/truncation_rate"] = (
+            aggregated[f"{prefix}/truncated_count"] / active_count
+            if active_count
+            else math.nan
+        )
+        aggregated[f"{prefix}/tool_call_success_rate"] = (
+            aggregated[f"{prefix}/tool_call_success_count"] / tool_call_attempt_count
+            if tool_call_attempt_count
+            else math.nan
+        )
+        for metric_name, count_name in (
+            ("tool_call_turns_per_sample", "tool_call_turn_count"),
+            ("gen_tokens_per_sample", "gen_token_count"),
+            ("total_tokens_per_sample", "token_count"),
+        ):
+            aggregated[f"{prefix}/{metric_name}/mean"] = (
+                aggregated[f"{prefix}/{count_name}"] / active_count
+                if active_count
+                else math.nan
+            )
     return aggregated
 
 
@@ -3145,20 +3204,13 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
+                    # Refine rounds have different prompts but must share the
+                    # original problem's GRPO baseline. Prefer the environment's
+                    # stable group key; preserve prompt-token grouping for agents
+                    # that do not provide one.
+                    prompt_ids_for_adv = _get_prompt_ids_for_advantage(
+                        repeated_batch, tokenizer
                     )
-
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
 
