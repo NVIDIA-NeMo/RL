@@ -1319,7 +1319,6 @@ def setup(
             )
             ray.get(futures_train + futures_inference)
         elif nccl_reshard_refit_enabled:
-            from nemo_rl.weight_sync.factory import create_weight_synchronizer
             from nemo_rl.weight_sync.nccl_reshard_utils import (
                 check_nccl_reshard_refit_support,
             )
