@@ -261,7 +261,7 @@ def materialize(
     The lazy ``BatchedDataDict`` import keeps
     ``import nemo_rl.data_plane`` cheap for unit tests that don't
     actually call this function (``BatchedDataDict`` transitively
-    pulls multimodal deps like decord / torchvision).
+    pulls multimodal deps like torchvision / torchaudio).
 
     Args:
         td: Wire TensorDict to materialize.

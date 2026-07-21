@@ -385,6 +385,12 @@ class MegatronGenerationMixin:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
+            # DP inference schedules requests independently, so a forward pre-hook
+            # cannot safely launch a parameter all-gather from only the rank that
+            # received work. Gather once across every worker, then keep the hooks
+            # disabled until the next training step completes.
+            if self._forward_pre_hook_enabled():
+                self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
         lang_module = unwrap_model(self.model)
         lang_module.eval()

@@ -18,6 +18,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmConfig
+from nemo_rl.models.generation.vllm.config import VLLM_SPARSE_REFIT_TRANSPORTS
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -45,7 +46,11 @@ def configure_generation_config(
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
         # set load_format
-        config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        config["vllm_cfg"]["load_format"] = (
+            "auto"
+            if is_eval or config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
+            else "dummy"
+        )
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
         if speculative_config and not is_eval and not has_refit_draft_weights:
             # Speculative decoding needs real draft weights at startup, since the

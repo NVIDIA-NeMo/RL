@@ -12,12 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+# Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
+# signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
+# int8 for <=128 experts (e.g. Qwen3-MoE), int16 for <=32768 (e.g. DeepSeek-V3),
+# int32 beyond. This shrinks message logs, transports, replay buffers, and
+# checkpoints 2-4x vs int32. The Megatron replay install converts to int64 at the
+# gather site, so training math is unaffected. When the expert count cannot be
+# determined, fall back to int16.
+ROUTED_EXPERTS_FALLBACK_DTYPE = torch.int16
+
+_ROUTED_EXPERTS_DTYPE_NAMES = {
+    torch.int8: "int8",
+    torch.int16: "int16",
+    torch.int32: "int32",
+}
+
+
+def get_num_routed_experts(hf_config: Any) -> Optional[int]:
+    """Best-effort read of the routed-expert count from a HF model config.
+
+    Checks the attribute names used by the common MoE architectures (Qwen-MoE,
+    DeepSeek, Mixtral), including nested ``text_config`` for VLMs. Returns None
+    for dense models or unrecognized configs.
+    """
+    for owner in (hf_config, getattr(hf_config, "text_config", None)):
+        if owner is None:
+            continue
+        for attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+            value = getattr(owner, attr, None)
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
+def resolve_routed_experts_dtype(num_experts: Optional[int]) -> torch.dtype:
+    """Return the narrowest signed dtype that fits expert ids and the -1 sentinel."""
+    if num_experts is None:
+        return ROUTED_EXPERTS_FALLBACK_DTYPE
+    if num_experts - 1 <= torch.iinfo(torch.int8).max:
+        return torch.int8
+    if num_experts - 1 <= torch.iinfo(torch.int16).max:
+        return torch.int16
+    return torch.int32
+
+
+def resolve_routed_experts_dtype_name_for_model(model_name: str) -> str:
+    """Resolve the routed-experts carry dtype name ("int8"/"int16"/"int32") for a model.
+
+    Used where only the model name is available (e.g. building the NeMo-Gym env
+    config on the driver). Falls back to the default dtype name if the config
+    cannot be loaded.
+    """
+    # Deferred import: transformers config loading is only needed for this sizing.
+    from transformers import AutoConfig
+
+    try:
+        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except (OSError, ValueError):
+        return _ROUTED_EXPERTS_DTYPE_NAMES[ROUTED_EXPERTS_FALLBACK_DTYPE]
+    return _ROUTED_EXPERTS_DTYPE_NAMES[
+        resolve_routed_experts_dtype(get_num_routed_experts(hf_config))
+    ]
 
 
 def verify_right_padding(
@@ -113,6 +175,17 @@ class OptionalResourcesConfig(TypedDict):
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
+
+
+class CheckpointEngineConfig(TypedDict):
+    """Normalized internal configuration for checkpoint-engine refit."""
+
+    # "nixl" or a "module:ClassName" path to a CheckpointEngine implementation
+    backend: str
+    # fraction of total GPU memory used by each transfer bucket
+    update_weights_bucket_memory_ratio: float
+    # per-backend constructor kwargs, keyed by the configured backend string
+    engine_kwargs: dict[str, dict[str, Any]]
 
 
 class GenerationConfig(TypedDict):

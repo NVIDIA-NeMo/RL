@@ -447,6 +447,29 @@ def test_configure_generation_config_uses_real_startup_weights_without_draft_ref
     assert configured["vllm_cfg"]["load_format"] == "auto"
 
 
+@pytest.mark.parametrize("transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
+def test_configure_generation_config_uses_real_delta_baseline(transport: str):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = transport
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_configure_generation_config_keeps_dummy_startup_weights_for_nixl():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["refit_transport"] = "nixl"
+
+    configured = configure_generation_config(
+        vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
 def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refit():
     """Speculative training can keep dummy startup weights when draft refit is available."""
     vllm_config = deepcopy(basic_vllm_test_config)
