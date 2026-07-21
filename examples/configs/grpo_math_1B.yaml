@@ -16,8 +16,11 @@ grpo:
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
-  # Reuse the vLLM engine's returned processed logprobs as prev_logprobs for
-  # importance sampling instead of recomputing them with a trainer forward.
+  # Reuse the vLLM engine's returned processed logprobs as prev_logprobs instead
+  # of recomputing them with a trainer forward (saves one forward per step).
+  # On-policy only: mutually exclusive with loss_fn.use_importance_sampling_correction,
+  # loss_fn.truncated_importance_sampling_type, and loss_fn.force_on_policy_ratio
+  # (setup() asserts this). It also makes the mismatch diagnostics degenerate.
   use_generation_logprobs_as_prev: false
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10

@@ -2421,6 +2421,9 @@ def test_grpo_train_reuses_generation_logprobs_as_prev(mock_grpo_components):
     """
     master_config = mock_grpo_components["master_config"]
     master_config.grpo["use_generation_logprobs_as_prev"] = True
+    # Reuse is only valid in the on-policy, IS-correction-off regime (see the
+    # _validate_generation_logprobs_as_prev guard).
+    master_config.loss_fn.use_importance_sampling_correction = False
     master_config.grpo["seq_logprob_error_threshold"] = None
     master_config.grpo["max_num_steps"] = 1
     master_config.grpo["max_num_epochs"] = 1
@@ -2476,6 +2479,48 @@ def test_grpo_train_reuses_generation_logprobs_as_prev(mock_grpo_components):
     trained_data = policy.train.call_args[0][0]
     assert torch.equal(
         trained_data["prev_logprobs"], trained_data["generation_logprobs"]
+    )
+
+
+def test_validate_generation_logprobs_as_prev_rejects_importance_sampling():
+    """PR #3295 guard: prev==generation collapses the IS weight, so the flag is
+    incompatible with use_importance_sampling_correction (and thus TIS)."""
+    with pytest.raises(AssertionError, match="use_importance_sampling_correction"):
+        _validate_generation_logprobs_as_prev(
+            {"use_generation_logprobs_as_prev": True},
+            ClippedPGLossConfig(use_importance_sampling_correction=True),
+        )
+
+
+def test_validate_generation_logprobs_as_prev_rejects_force_on_policy_ratio():
+    """PR #3295 guard: force_on_policy_ratio overrides prev in the loss, so the
+    reused generation logprobs would be silently ignored."""
+    with pytest.raises(AssertionError, match="force_on_policy_ratio"):
+        _validate_generation_logprobs_as_prev(
+            {"use_generation_logprobs_as_prev": True},
+            ClippedPGLossConfig(
+                use_importance_sampling_correction=False,
+                force_on_policy_ratio=True,
+            ),
+        )
+
+
+def test_validate_generation_logprobs_as_prev_allows_on_policy_no_is():
+    """The one valid regime: on-policy with IS correction and force_on_policy off."""
+    _validate_generation_logprobs_as_prev(
+        {"use_generation_logprobs_as_prev": True},
+        ClippedPGLossConfig(
+            use_importance_sampling_correction=False,
+            force_on_policy_ratio=False,
+        ),
+    )
+
+
+def test_validate_generation_logprobs_as_prev_noop_when_flag_unset():
+    """Guard must not fire when the flag is absent, even with IS correction on."""
+    _validate_generation_logprobs_as_prev(
+        {},
+        ClippedPGLossConfig(use_importance_sampling_correction=True),
     )
 
 

@@ -246,10 +246,15 @@ class GRPOConfig(TypedDict):
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool
-    # Reuse the vLLM engine's returned processed logprobs as prev_logprobs for
-    # importance sampling instead of recomputing them with a trainer forward.
-    # The engine IS the behavior policy, so this is exact for the sampled
-    # tokens and removes one full-batch forward per step.
+    # Reuse the vLLM engine's returned processed logprobs as prev_logprobs
+    # instead of recomputing them with a trainer forward, saving one full-batch
+    # forward per step. The engine is the behavior policy, so prev == generation.
+    # ONLY valid in the on-policy regime with the off-policy importance-sampling
+    # correction disabled: it is mutually exclusive with
+    # loss_fn.use_importance_sampling_correction, loss_fn.truncated_importance_sampling_type,
+    # and loss_fn.force_on_policy_ratio (see _validate_generation_logprobs_as_prev).
+    # When enabled, the mismatch diagnostics (token_mult_prob_error, gen_kl_error,
+    # policy_kl, js_divergence) become degenerate since prev == generation.
     use_generation_logprobs_as_prev: NotRequired[bool]
     # When using dynamic sampling, the maximum number of batches to generate
     # before throwing an error
@@ -317,6 +322,45 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+
+
+def _validate_generation_logprobs_as_prev(
+    grpo_config: GRPOConfig, loss_config: ClippedPGLossConfig
+) -> None:
+    """Guard grpo.use_generation_logprobs_as_prev against incompatible loss settings.
+
+    Reusing the engine's generation logprobs as prev_logprobs is only equivalent
+    to the trainer-recomputed prev in the on-policy, no-importance-sampling
+    regime. The full clipped objective factors as
+
+        loss = exp(prev - generation) * clamp(exp(curr - prev))
+
+    so setting prev == generation collapses the off-policy IS weight to 1 and
+    folds the engine/trainer mismatch into the PPO clip. That silently disables
+    loss_fn.use_importance_sampling_correction and any truncated importance
+    sampling (whose filters key off exp(prev - generation)), and conflicts with
+    force_on_policy_ratio (which overrides prev with curr.detach() in the loss).
+    Fail loudly instead of changing the objective behind the user's back.
+    """
+    if not grpo_config.get("use_generation_logprobs_as_prev"):
+        return
+
+    assert not loss_config.use_importance_sampling_correction, (
+        "grpo.use_generation_logprobs_as_prev=True is incompatible with "
+        "loss_fn.use_importance_sampling_correction=True: reusing the engine's "
+        "generation logprobs as prev_logprobs collapses the off-policy IS weight "
+        "exp(prev - generation) to 1, silently disabling the correction (and any "
+        "loss_fn.truncated_importance_sampling_type, whose filters key off the "
+        "same term). Use it only in the on-policy regime with importance "
+        "sampling correction disabled."
+    )
+    assert not loss_config.force_on_policy_ratio, (
+        "grpo.use_generation_logprobs_as_prev=True is mutually exclusive with "
+        "loss_fn.force_on_policy_ratio=True: force_on_policy_ratio overrides "
+        "prev_logprobs with curr_logprobs.detach() inside the loss, so the reused "
+        "generation logprobs would be silently ignored. Pick one on-policy strategy."
+    )
+    print("  ✓ use_generation_logprobs_as_prev enabled (on-policy, IS correction off)")
 
 
 def setup(
@@ -546,6 +590,9 @@ def setup(
         )
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
+
+    # Validate use_generation_logprobs_as_prev (PR #3295)
+    _validate_generation_logprobs_as_prev(grpo_config, loss_config)
 
     # Validate skip_reference_policy_logprobs_calculation
     if grpo_config.get("skip_reference_policy_logprobs_calculation"):
