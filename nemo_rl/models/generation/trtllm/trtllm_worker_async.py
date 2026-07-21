@@ -271,7 +271,8 @@ class TrtllmAsyncGenerationWorkerImpl:
         from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
 
         tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name, trust_remote_code=True,
+            self.model_name,
+            trust_remote_code=True,
         )
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,

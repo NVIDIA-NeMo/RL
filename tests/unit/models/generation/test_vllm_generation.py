@@ -40,7 +40,9 @@ from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
     _resolve_enable_prefix_caching,
 )
-from nemo_rl.models.generation.vllm.vllm_worker_async import VllmAsyncGenerationWorkerImpl
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorkerImpl,
+)
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
