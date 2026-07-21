@@ -34,6 +34,7 @@ from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_checkpoint import (
     ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
     CompletedSiblingRecord,
+    IncompatibleCheckpointError,
     PersistAck,
     RolloutWorkItem,
     StorageUnavailableError,
@@ -86,6 +87,38 @@ class RolloutCheckpointWritePolicy:
             or self.retry_backoff_s < 0
         ):
             raise ValueError("retry_backoff_s must be a finite number >= 0")
+
+
+@dataclass(frozen=True)
+class RolloutCheckpointIOPolicy(RolloutCheckpointWritePolicy):
+    """Bounded retry policy for checkpoint-writer reads and writes."""
+
+    load_timeout_s: float
+    max_load_retries: int
+    load_retry_backoff_s: float
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (
+            not isinstance(self.load_timeout_s, (int, float))
+            or isinstance(self.load_timeout_s, bool)
+            or not math.isfinite(self.load_timeout_s)
+            or self.load_timeout_s <= 0
+        ):
+            raise ValueError("load_timeout_s must be a finite number > 0")
+        if (
+            not isinstance(self.max_load_retries, int)
+            or isinstance(self.max_load_retries, bool)
+            or self.max_load_retries < 0
+        ):
+            raise ValueError("max_load_retries must be an integer >= 0")
+        if (
+            not isinstance(self.load_retry_backoff_s, (int, float))
+            or isinstance(self.load_retry_backoff_s, bool)
+            or not math.isfinite(self.load_retry_backoff_s)
+            or self.load_retry_backoff_s < 0
+        ):
+            raise ValueError("load_retry_backoff_s must be a finite number >= 0")
 
 
 class AsyncRolloutImpl:
@@ -481,6 +514,7 @@ class AsyncNemoGymRolloutImpl:
         env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         on_sibling_complete: Optional[SiblingCompleteCallback] = None,
+        restored_completions: Optional[dict[int, Completion]] = None,
     ) -> PromptGroupRecord:
         """Run the requested number of rollouts for one prompt.
 
@@ -507,6 +541,7 @@ class AsyncNemoGymRolloutImpl:
             timer_prefix,
             env_handles=env_handles,
             on_sibling_complete=on_sibling_complete,
+            restored_completions=restored_completions,
         )
 
         timer.stop(f"{timer_prefix}/total")
@@ -576,9 +611,21 @@ class AsyncNemoGymRolloutImpl:
         *,
         env_handles: dict[str, EnvironmentInterface],
         on_sibling_complete: Optional[SiblingCompleteCallback] = None,
+        restored_completions: Optional[dict[int, Completion]] = None,
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
         nemo_gym_env = env_handles["nemo_gym"]
+        restored_completions = dict(restored_completions or {})
+        invalid_restored_indices = set(restored_completions) - set(range(len(inputs)))
+        if invalid_restored_indices:
+            raise ValueError(
+                "restored NeMo-Gym generation indices are outside the rollout group: "
+                f"{sorted(invalid_restored_indices)}"
+            )
+        if restored_completions and on_sibling_complete is None:
+            raise ValueError(
+                "restored NeMo-Gym completions require a sibling completion callback"
+            )
 
         with timer.time(f"{timer_prefix}/run_rollouts"):
             if on_sibling_complete is None:
@@ -586,20 +633,53 @@ class AsyncNemoGymRolloutImpl:
                     inputs, self._tokenizer, timer_prefix
                 )
                 completions = [self._result_to_completion(result) for result in results]
+                prompt_message_log = results[0]["input_message_log"]
             else:
-                (
-                    results,
-                    completions,
-                    env_timing_metrics,
-                ) = await self._stream_and_persist_rollouts(
-                    inputs,
-                    timer_prefix,
-                    env_handles=env_handles,
-                    on_sibling_complete=on_sibling_complete,
-                )
+                missing_inputs = [
+                    row for row in inputs if row["_rowidx"] not in restored_completions
+                ]
+                generated_results: dict[int, dict] = {}
+                generated_completions: dict[int, Completion] = {}
+                env_timing_metrics: dict[str, Any] = {}
+                if missing_inputs:
+                    (
+                        generated_results,
+                        generated_completions,
+                        env_timing_metrics,
+                    ) = await self._stream_and_persist_rollouts(
+                        missing_inputs,
+                        timer_prefix,
+                        env_handles=env_handles,
+                        on_sibling_complete=on_sibling_complete,
+                    )
+
+                completions_by_index = {
+                    **restored_completions,
+                    **generated_completions,
+                }
+                missing_indices = set(range(len(inputs))) - set(completions_by_index)
+                if missing_indices:
+                    raise RuntimeError(
+                        "NeMo-Gym rollout recovery ended without completions for "
+                        f"generation indices {sorted(missing_indices)}"
+                    )
+                completions = [
+                    completions_by_index[generation_index]
+                    for generation_index in range(len(inputs))
+                ]
+                if generated_results:
+                    prompt_message_log = next(iter(generated_results.values()))[
+                        "input_message_log"
+                    ]
+                else:
+                    first_completion = completions[0]
+                    if not first_completion.message_log:
+                        raise ValueError(
+                            "restored NeMo-Gym completion has an empty message log"
+                        )
+                    prompt_message_log = copy.deepcopy(first_completion.message_log[:1])
 
             # All N rollouts share the same input prompt; tensorize one copy.
-            prompt_message_log = results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
 
         # Compute rollout metrics.
@@ -619,11 +699,14 @@ class AsyncNemoGymRolloutImpl:
         *,
         env_handles: dict[str, EnvironmentInterface],
         on_sibling_complete: SiblingCompleteCallback,
-    ) -> tuple[list[dict], list[Completion], dict[str, Any]]:
+    ) -> tuple[dict[int, dict], dict[int, Completion], dict[str, Any]]:
         """Stream Gym rows, submit sibling writes, and restore input order."""
         nemo_gym_env = env_handles["nemo_gym"]
-        results: list[dict | None] = [None for _ in inputs]
-        completions_by_index: list[Completion | None] = [None for _ in inputs]
+        expected_row_indices = {row["_rowidx"] for row in inputs}
+        if len(expected_row_indices) != len(inputs):
+            raise ValueError("NeMo-Gym rollout inputs contain duplicate row indices")
+        results: dict[int, dict] = {}
+        completions_by_index: dict[int, Completion] = {}
         received_row_indices: set[int] = set()
         env_timing_metrics: dict[str, Any] = {}
         persist_tasks: list[asyncio.Task[None]] = []
@@ -634,10 +717,10 @@ class AsyncNemoGymRolloutImpl:
                 num_returns="streaming"
             ).remote(inputs, self._tokenizer, timer_prefix):
                 rowidx, result, timing_metrics = await result_ref
-                if not isinstance(rowidx, int) or not 0 <= rowidx < len(inputs):
+                if not isinstance(rowidx, int) or rowidx not in expected_row_indices:
                     raise ValueError(
-                        f"NeMo-Gym returned invalid row index {rowidx!r} for "
-                        f"{len(inputs)} inputs"
+                        f"NeMo-Gym returned unexpected row index {rowidx!r}; "
+                        f"expected one of {sorted(expected_row_indices)}"
                     )
                 if rowidx in received_row_indices:
                     raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
@@ -667,18 +750,14 @@ class AsyncNemoGymRolloutImpl:
             if persist_errors:
                 raise persist_errors[0]
 
-        if any(result is None for result in results):
-            raise RuntimeError("NeMo-Gym rollout stream ended before all rows arrived")
+        missing_row_indices = expected_row_indices - received_row_indices
+        if missing_row_indices:
+            raise RuntimeError(
+                "NeMo-Gym rollout stream ended before rows "
+                f"{sorted(missing_row_indices)} arrived"
+            )
 
-        return (
-            [result for result in results if result is not None],
-            [
-                completion
-                for completion in completions_by_index
-                if completion is not None
-            ],
-            env_timing_metrics,
-        )
+        return results, completions_by_index, env_timing_metrics
 
     def _result_to_completion(self, result: dict) -> Completion:
         """Convert one run_rollouts result dict into a Completion."""
@@ -794,7 +873,7 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         tq_buffer: Optional[TQReplayBuffer] = None,
-        checkpoint_write_policy: Optional[RolloutCheckpointWritePolicy] = None,
+        checkpoint_io_policy: Optional[RolloutCheckpointIOPolicy] = None,
     ) -> None:
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
@@ -821,8 +900,8 @@ class RolloutManager:
         self._val_env_handles = val_env_handles
         self._tq_buffer = tq_buffer
         self._weight_version: int = 0
-        self._checkpoint_write_policy = checkpoint_write_policy
-        self._checkpoint_write_semaphore: Optional[asyncio.Semaphore] = None
+        self._checkpoint_io_policy = checkpoint_io_policy
+        self._checkpoint_io_semaphore: Optional[asyncio.Semaphore] = None
 
     def set_weight_version(self, version: int) -> None:
         """Set the weight_version used for rollout tags.
@@ -861,9 +940,9 @@ class RolloutManager:
                 num_generations_per_prompt=num_generations_per_prompt,
             )
         work = checkpoint_work
-        if self._checkpoint_write_policy is None:
+        if self._checkpoint_io_policy is None:
             raise ValueError(
-                "checkpoint_write_policy is required when checkpointing is enabled"
+                "checkpoint_io_policy is required when checkpointing is enabled"
             )
         if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
             raise NotImplementedError(
@@ -884,12 +963,128 @@ class RolloutManager:
                 completion,
             )
 
+        restored_completions = await self._load_completed_siblings(
+            work,
+            checkpoint_writer,
+        )
         return await self._impl.run_rollout(
             input_sample,
             env_handles=env_handles,
             num_generations_per_prompt=num_generations_per_prompt,
             on_sibling_complete=_persist,
+            restored_completions=restored_completions,
         )
+
+    async def _load_completed_siblings(
+        self,
+        work: RolloutWorkItem,
+        checkpoint_writer: Any,
+    ) -> dict[int, Completion]:
+        """Load validated sibling checkpoints before dispatching Gym work."""
+        policy = self._require_checkpoint_io_policy()
+        async with self._get_checkpoint_io_semaphore(policy):
+            loaded = await self._load_records_with_retry(
+                checkpoint_writer,
+                work,
+                policy,
+            )
+            if not isinstance(loaded, dict):
+                raise TypeError("checkpoint load_completed must return a dictionary")
+
+            completions: dict[int, Completion] = {}
+            for generation_index, record in loaded.items():
+                if not isinstance(record, CompletedSiblingRecord):
+                    raise TypeError(
+                        "checkpoint load_completed values must be "
+                        "CompletedSiblingRecord instances"
+                    )
+                if generation_index != record.generation_index:
+                    raise ValueError(
+                        "checkpoint dictionary key does not match record generation "
+                        f"index: {generation_index!r} != {record.generation_index}"
+                    )
+                self._validate_loaded_record(record, work)
+                completions[generation_index] = _copy_completion_to_cpu(
+                    record.completion
+                )
+            return completions
+
+    async def _load_records_with_retry(
+        self,
+        checkpoint_writer: Any,
+        work: RolloutWorkItem,
+        policy: RolloutCheckpointIOPolicy,
+    ) -> Any:
+        """Retry transient checkpoint reads with a bounded acknowledgement wait."""
+        total_attempts = policy.max_load_retries + 1
+        last_error: TimeoutError | StorageUnavailableError | None = None
+        for attempt_index in range(total_attempts):
+            try:
+                return await asyncio.wait_for(
+                    self._invoke_checkpoint_writer_method(
+                        checkpoint_writer.load_completed,
+                        work,
+                    ),
+                    timeout=policy.load_timeout_s,
+                )
+            except (TimeoutError, StorageUnavailableError) as error:
+                last_error = error
+                if attempt_index + 1 < total_attempts:
+                    if policy.load_retry_backoff_s > 0:
+                        await asyncio.sleep(policy.load_retry_backoff_s)
+                    continue
+                break
+
+        assert last_error is not None
+        raise StorageUnavailableError(
+            "checkpoint writer did not return completed siblings for "
+            f"{work.run_id!r}/{work.group_id!r} after {total_attempts} attempts"
+        ) from last_error
+
+    def _validate_loaded_record(
+        self,
+        record: CompletedSiblingRecord,
+        work: RolloutWorkItem,
+    ) -> None:
+        """Reject a writer response that is incompatible with dispatched work."""
+        expected = {
+            "run_id": work.run_id,
+            "group_id": work.group_id,
+            "prompt_id": work.prompt_id,
+            "policy_version": work.policy_version,
+            "prompt_fingerprint": work.prompt_fingerprint,
+            "sampling_fingerprint": work.sampling_fingerprint,
+            "tokenizer_fingerprint": work.tokenizer_fingerprint,
+        }
+        actual = {
+            "run_id": record.run_id,
+            "group_id": record.group_id,
+            "prompt_id": record.prompt_id,
+            "policy_version": record.policy_version,
+            "prompt_fingerprint": record.prompt_fingerprint,
+            "sampling_fingerprint": record.sampling_fingerprint,
+            "tokenizer_fingerprint": record.tokenizer_fingerprint,
+        }
+        mismatches = {
+            field: (actual[field], expected_value)
+            for field, expected_value in expected.items()
+            if actual[field] != expected_value
+        }
+        if mismatches:
+            raise IncompatibleCheckpointError(
+                "checkpoint writer returned a record incompatible with rollout work: "
+                f"{mismatches}"
+            )
+        if record.attempt_id > work.attempt_id:
+            raise IncompatibleCheckpointError(
+                f"checkpoint attempt {record.attempt_id} is newer than dispatched "
+                f"attempt {work.attempt_id} for {work.run_id}/{work.group_id}"
+            )
+        if record.generation_index >= work.num_generations:
+            raise IncompatibleCheckpointError(
+                f"loaded generation_index {record.generation_index} is outside "
+                f"checkpoint group size {work.num_generations}"
+            )
 
     async def _persist_completed_sibling(
         self,
@@ -904,14 +1099,8 @@ class RolloutManager:
                 f"generation_index {generation_index} is outside checkpoint group "
                 f"size {work.num_generations}"
             )
-        policy = self._checkpoint_write_policy
-        if policy is None:
-            raise RuntimeError("checkpoint write policy is not configured")
-        if self._checkpoint_write_semaphore is None:
-            self._checkpoint_write_semaphore = asyncio.Semaphore(
-                policy.max_pending_writes
-            )
-        async with self._checkpoint_write_semaphore:
+        policy = self._require_checkpoint_io_policy()
+        async with self._get_checkpoint_io_semaphore(policy):
             durable_completion = _copy_completion_to_cpu(completion)
             record = CompletedSiblingRecord(
                 schema_version=ROLLOUT_CHECKPOINT_SCHEMA_VERSION,
@@ -946,7 +1135,10 @@ class RolloutManager:
         for attempt_index in range(total_attempts):
             try:
                 ack = await asyncio.wait_for(
-                    self._invoke_persist_completed(checkpoint_writer, record),
+                    self._invoke_checkpoint_writer_method(
+                        checkpoint_writer.persist_completed,
+                        record,
+                    ),
                     timeout=policy.write_timeout_s,
                 )
             except (TimeoutError, StorageUnavailableError) as error:
@@ -975,20 +1167,34 @@ class RolloutManager:
             f"{record.logical_key!r} after {total_attempts} attempts"
         ) from last_error
 
-    async def _invoke_persist_completed(
+    def _require_checkpoint_io_policy(self) -> RolloutCheckpointIOPolicy:
+        """Return the configured policy or fail before checkpoint I/O."""
+        if self._checkpoint_io_policy is None:
+            raise RuntimeError("checkpoint I/O policy is not configured")
+        return self._checkpoint_io_policy
+
+    def _get_checkpoint_io_semaphore(
         self,
-        checkpoint_writer: Any,
-        record: CompletedSiblingRecord,
+        policy: RolloutCheckpointIOPolicy,
+    ) -> asyncio.Semaphore:
+        """Return the manager-wide bound for concurrent checkpoint I/O."""
+        if self._checkpoint_io_semaphore is None:
+            self._checkpoint_io_semaphore = asyncio.Semaphore(policy.max_pending_writes)
+        return self._checkpoint_io_semaphore
+
+    async def _invoke_checkpoint_writer_method(
+        self,
+        method: Any,
+        *args: Any,
     ) -> Any:
-        """Invoke either a Ray writer handle or an in-process writer."""
-        method = checkpoint_writer.persist_completed
+        """Invoke a method on either a Ray handle or an in-process writer."""
         remote = getattr(method, "remote", None)
         if remote is not None:
-            result = remote(record)
+            result = remote(*args)
         elif inspect.iscoroutinefunction(method):
-            result = method(record)
+            result = method(*args)
         else:
-            result = await asyncio.to_thread(method, record)
+            result = await asyncio.to_thread(method, *args)
         if inspect.isawaitable(result):
             return await result
         return result
