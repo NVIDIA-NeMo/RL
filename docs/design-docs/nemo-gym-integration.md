@@ -33,7 +33,19 @@ env:
     config_paths:
       - resources_servers/math/configs/math.yaml
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
+
+logger:
+  wandb:
+    # Optional debugging aid. Keep disabled for normal training because complete
+    # result payloads can produce many large W&B Table artifacts.
+    log_nemo_gym_full_result_tables: false
 ```
+
+When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
+the per-agent `full_result` Tables. This prevents those payloads from entering
+the async replay buffer and avoids uploading them to W&B. Numeric per-agent
+rollout metrics are unaffected. Set the flag to `true` only when the complete
+Gym result payloads are needed for a short debugging run.
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
@@ -107,11 +119,12 @@ flowchart LR
 ```
 
 The flow is:
-1. The GRPO or distillation loop calls `run_rollouts.remote(batch)` on the NemoGym Actor
+1. The GRPO or distillation rollout layer starts a streaming `run_rollouts` call on the NemoGym Actor
 2. Actor sends `POST /run` to the Agent Server
 3. Agent Server orchestrates the rollout via RolloutCollectionHelper
-4. Results return to the Actor
-5. Actor returns results to the training loop
+4. Completed examples return to the Actor
+5. Actor post-processes and streams each completed example back with its original row index
+6. The rollout layer emits a prompt group after all generations for that prompt are complete; synchronous callers drain the stream and retain full-batch behavior
 
 ## vLLM HTTP Server
 
@@ -172,7 +185,7 @@ sequenceDiagram
     
     Loop->>Policy: Refit (trigger weight sync)
     Policy->>vLLM: Sync weights to vLLM
-    Loop->>Bridge: run_rollouts.remote(batch)
+    Loop->>Bridge: streaming run_rollouts(batch)
     Bridge->>Agent: POST /run
     Agent->>Model: POST /v1/responses
     Model->>vLLM: POST /v1/chat/completions
@@ -180,8 +193,9 @@ sequenceDiagram
     Model-->>Agent: Responses API format
     Agent->>Resource: Execute tool / compute reward
     Resource-->>Agent: Tool result / reward
-    Agent-->>Bridge: Results + rewards
-    Bridge-->>Loop: Token IDs, logprobs, rewards
+    Agent-->>Bridge: Completed example + reward
+    Bridge-->>Loop: Stream row index, token IDs, logprobs, reward
+    Note over Loop,Bridge: Async GRPO emits each complete prompt group;<br/>sync paths drain all rows before continuing
     Loop->>Policy: Compute loss and train
 ```
 
@@ -195,7 +209,7 @@ sequenceDiagram
 | Step | Location | Description |
 |------|----------|-------------|
 | **Refit** | NeMo RL | Synchronizes policy weights to vLLM workers. For async RL, refit timing may differ—see {doc}`generation` for details. |
-| **run_rollouts.remote()** | NeMo RL | Ray remote call from the training loop to the NemoGym actor |
+| **Streaming `run_rollouts()`** | NeMo RL | Ray generator call from the rollout layer to the NemoGym actor; rows can arrive out of input order |
 | **POST /run** | NeMo RL → NeMo Gym | HTTP request from NemoGym actor to Agent Server subprocess |
 | **Rollout orchestration** | NeMo Gym | Agent calls Model Server and Resources Server via HTTP |
 | **POST /v1/chat/completions** | NeMo Gym → NeMo RL | Model Server proxies to NeMo RL's vLLM HTTP endpoint |
@@ -203,15 +217,27 @@ sequenceDiagram
 
 ### Async Result Processing
 
-The NemoGym actor uses an **as-completed** pattern to overlap waiting with post-processing:
+The NemoGym actor and NeMo RL rollout layer use an **as-completed** pattern to overlap waiting, post-processing, and downstream collection:
 
-1. **Results return out of order**: Single steps of the rollouts (the "assistant" + "tool" turns) complete at different times depending on conversation length and tool calls. Rather than waiting for all results, the actor processes each result as soon as it completes. Note: this is pipelining within NeMo Gym, not asynchronous processing of global batch steps by NeMo RL.
+1. **Completed examples return out of order**: Full rollout examples complete at different times depending on conversation length and tool calls. The actor processes and streams each example as soon as it completes, tagged with its original row index.
 
 2. **Immediate post-processing**: As each rollout completes, the actor immediately extracts token IDs and logprobs. This overlaps CPU work with network I/O from slower rollouts still in flight.
 
-3. **Reordering at the end**: Each example carries an index. After all results are collected, results are reordered to match the original batch order before returning to the training loop.
+3. **Prompt-group buffering**: Async GRPO groups the streamed rows by prompt and emits a group as soon as all of that prompt's generations have arrived. A slow prompt therefore does not prevent already-complete prompt groups from entering the replay buffer. Synchronous GRPO, PPO, and distillation use the same stream but drain the complete batch before continuing.
+
+4. **Stable ordering where required**: Each example carries a row index. Prompt groups preserve their input slices, and full-batch synchronous callers restore input order before returning.
 
 This pattern maximizes throughput by keeping the CPU busy while waiting for network responses.
+
+### Async GRPO Collector Invariants
+
+The async GRPO collector uses the same prompt-group contract for Gym and native environments:
+
+- One batch worker owns each reserved target weight until all expected prompt groups are buffered or the batch fails.
+- Gym prompts receive a monotonic `_ng_task_index`. The counter is checkpointed, restored, and cross-checked against buffered trajectories so task identities are not reused after restart.
+- A partial Gym stream can be retried without duplicating groups that were already accepted by the replay buffer.
+- Native rollouts still execute as one batch. Their per-sample metrics are aggregated separately for each prompt group before buffering, so batch-level metrics are not duplicated across groups.
+- Gym rows are validated for range, uniqueness, completeness, and single-agent grouping. Results are restored to input order within a prompt group before post-processing.
 
 ## Data Format Translation
 

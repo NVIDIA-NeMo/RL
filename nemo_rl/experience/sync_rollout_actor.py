@@ -52,10 +52,11 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 # Carry keys producible by the rollout actor only when the caller opts in.
@@ -231,11 +232,15 @@ class SyncRolloutActor:
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
         if _should_use_nemo_gym(cfg):
-            r = run_async_nemo_gym_rollout(
+            r = run_nemo_gym_rollout_sync(
                 **common,
                 max_seq_len=None,
                 max_rollout_turns=None,
                 generation_config=cfg.policy["generation"],
+                log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                    wandb_enabled=cfg.logger["wandb_enabled"],
+                    wandb_config=cfg.logger["wandb"],
+                ),
                 effort_config=EffortLevelsConfig.model_validate(
                     cfg.env["nemo_gym"].get("effort_levels")
                 )

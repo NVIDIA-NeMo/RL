@@ -48,6 +48,7 @@ project-includes = [
   "nemo_rl/algorithms/async_utils/__init__.py",
   "nemo_rl/algorithms/async_utils/interfaces.py",
   "nemo_rl/algorithms/async_utils/replay_buffer.py",
+  "nemo_rl/algorithms/async_utils/trajectory_collector.py",
   "nemo_rl/algorithms/logits_sampling_utils.py",
   "nemo_rl/algorithms/loss/__init__.py",
   "nemo_rl/algorithms/loss/interfaces.py",

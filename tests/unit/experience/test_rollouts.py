@@ -24,6 +24,7 @@ import ray
 import torch
 from transformers import AutoTokenizer
 
+import nemo_rl.experience.rollouts as rollouts_mod
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -39,13 +40,15 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
-from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl, RolloutManager
 from nemo_rl.experience.rollouts import (
     _tokenize_env_observation,
     generate_responses_async,
     run_async_multi_turn_rollout,
+    run_async_multi_turn_rollout_groups,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -888,17 +891,568 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
 
     # stop_strings is truthy so the function hits the next assert and exits
     # right after emitting the warning — keeps this test free of any rollout work.
+    async def _consume_rollout():
+        async for _ in run_async_nemo_gym_rollout(
+            policy_generation=_FakePolicyGeneration(),
+            input_batch={"extra_env_info": []},
+            tokenizer=None,
+            task_to_env={},
+            generation_config={"stop_strings": "x", "max_new_tokens": 50},
+            num_generations=1,
+            log_full_result_tables=False,
+            max_seq_len=200,
+            max_rollout_turns=None,
+        ):
+            pass
+
     with pytest.warns(UserWarning, match="greater than the"):
         with pytest.raises(AssertionError, match="Stop strings"):
-            run_async_nemo_gym_rollout(
-                policy_generation=_FakePolicyGeneration(),
-                input_batch={"extra_env_info": []},
-                tokenizer=None,
-                task_to_env={},
-                generation_config={"stop_strings": "x", "max_new_tokens": 50},
-                max_seq_len=200,
-                max_rollout_turns=None,
+            asyncio.run(_consume_rollout())
+
+
+def test_native_rollout_groups_match_whole_batch(monkeypatch):
+    """One native batch can be split without changing data or metric semantics."""
+
+    async def fake_sample_rollout(sample_idx, initial_sample_state, **kwargs):
+        del kwargs
+        final_state = {
+            "message_log": initial_sample_state["message_log"]
+            + [{"role": "assistant", "content": f"answer-{sample_idx}"}],
+            "extra_env_info": initial_sample_state["extra_env_info"],
+            "task_name": initial_sample_state["task_name"],
+            "total_reward": torch.tensor(float(sample_idx - 1)),
+            "idx": initial_sample_state["idx"],
+            "reward/correctness": torch.tensor(float(sample_idx)),
+            "reward/style": torch.tensor(float(sample_idx * 2)),
+        }
+        sample_metrics = {
+            "turn_count": sample_idx + 1,
+            "total_tokens": sample_idx + 10,
+            "assistant_tokens": sample_idx + 2,
+            "env_tokens": 8,
+            "terminated": sample_idx % 2 == 0,
+            "truncated": sample_idx == 3,
+            "max_turns_reached": sample_idx == 3,
+            "total_reward": float(sample_idx - 1),
+            "turn_gen_tokens": [sample_idx + 2],
+            "turn_input_tokens": [sample_idx + 10],
+            "turn_total_tokens": [sample_idx + 12],
+            "max_gen_tokens_per_turn": sample_idx + 2,
+            "per_worker_token_counts": {f"worker-{sample_idx % 2}": sample_idx + 1},
+        }
+        return final_state, sample_metrics
+
+    monkeypatch.setattr(
+        rollouts_mod, "run_sample_multi_turn_rollout", fake_sample_rollout
+    )
+    input_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [{"role": "user", "content": f"prompt-{i}"}] for i in range(4)
+            ],
+            "extra_env_info": [{"sample": i} for i in range(4)],
+            "task_name": ["test"] * 4,
+            "idx": [100, 101, 102, 103],
+            "loss_multiplier": torch.arange(4),
+        }
+    )
+    rollout_kwargs = {
+        "policy_generation": None,
+        "input_batch": input_batch,
+        "tokenizer": None,
+        "task_to_env": {},
+        "max_seq_len": 128,
+        "max_rollout_turns": 2,
+    }
+
+    whole_batch, whole_metrics = run_async_multi_turn_rollout(**rollout_kwargs)
+
+    async def collect_groups():
+        return [
+            group
+            async for group in run_async_multi_turn_rollout_groups(
+                **rollout_kwargs, num_generations=2
             )
+        ]
+
+    groups = asyncio.run(collect_groups())
+
+    assert [group.group_index for group in groups] == [0, 1]
+    assert [group.final_batch.size for group in groups] == [2, 2]
+    assert [group.task_index for group in groups] == [None, None]
+    for key in (
+        "total_reward",
+        "reward/correctness",
+        "reward/style",
+        "loss_multiplier",
+    ):
+        assert torch.equal(
+            torch.cat([group.final_batch[key] for group in groups]), whole_batch[key]
+        )
+    assert [idx for group in groups for idx in group.final_batch["idx"]] == whole_batch[
+        "idx"
+    ]
+
+    group_metrics = [group.rollout_metrics for group in groups]
+    assert (
+        sum(metrics["total_turns"] for metrics in group_metrics)
+        == whole_metrics["total_turns"]
+    )
+    for key in (
+        "avg_turns_per_sample",
+        "natural_termination_rate",
+        "truncation_rate",
+        "max_turns_reached_rate",
+        "mean_total_tokens_per_sample",
+        "mean_gen_tokens_per_sample",
+        "mean_env_tokens_per_sample",
+        "mean_total_reward",
+    ):
+        assert (
+            sum(metrics[key] for metrics in group_metrics) / len(groups)
+            == (whole_metrics[key])
+        )
+    for key in (
+        "histogram/gen_tokens_length",
+        "histogram/input_tokens_length",
+        "histogram/total_tokens_length",
+    ):
+        assert [value for metrics in group_metrics for value in metrics[key]] == (
+            whole_metrics[key]
+        )
+    combined_worker_counts = {}
+    for metrics in group_metrics:
+        for worker, count in metrics["per_worker_token_counts"].items():
+            combined_worker_counts[worker] = (
+                combined_worker_counts.get(worker, 0) + count
+            )
+    assert combined_worker_counts == whole_metrics["per_worker_token_counts"]
+    assert (
+        min(metrics["min_total_reward"] for metrics in group_metrics)
+        == (whole_metrics["min_total_reward"])
+    )
+    assert (
+        max(metrics["max_total_reward"] for metrics in group_metrics)
+        == (whole_metrics["max_total_reward"])
+    )
+    assert (
+        max(metrics["max_turns_per_sample"] for metrics in group_metrics)
+        == (whole_metrics["max_turns_per_sample"])
+    )
+    assert (
+        max(metrics["max_gen_tokens_per_sample"] for metrics in group_metrics)
+        == (whole_metrics["max_gen_tokens_per_sample"])
+    )
+
+
+def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
+    """Prompt groups are yielded in completion order using async iteration."""
+
+    clock = {"now": 0.0}
+
+    class _FakeTimerContext:
+        def __init__(self, timer, label):
+            self.timer = timer
+            self.label = label
+
+        def __enter__(self):
+            self.timer.start(self.label)
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.timer.stop(self.label)
+
+    class _FakeTimer:
+        def __init__(self):
+            self.start_times = {}
+            self.elapsed = {}
+
+        def start(self, label):
+            self.start_times[label] = clock["now"]
+
+        def stop(self, label):
+            elapsed = clock["now"] - self.start_times.pop(label)
+            self.elapsed.setdefault(label, []).append(elapsed)
+            return elapsed
+
+        def time(self, label):
+            return _FakeTimerContext(self, label)
+
+        def get_timing_metrics(self, reduction_op="mean"):
+            assert reduction_op == "sum"
+            return {label: sum(values) for label, values in self.elapsed.items()}
+
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _AsyncOnlyStream:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                value = next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+            clock["now"] += 1.0
+            return value
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, tokenizer, timer_prefix):
+            del rows, tokenizer, timer_prefix
+            # Both groups complete out of order internally and group 1 completes first.
+            completion_order = [3, 1, 2, 0]
+            values = []
+            for position, rowidx in enumerate(completion_order):
+                result = {
+                    "rowidx": rowidx,
+                    "input_message_log": [{"token_ids": [rowidx]}],
+                    "message_log": [
+                        {
+                            "role": "assistant",
+                            "token_ids": [rowidx],
+                            "generation_logprobs": [0.0],
+                        }
+                    ],
+                }
+                timing = {"timing/remote": 1.0} if position == 3 else None
+                values.append(_ReadyRef((rowidx, result, timing)))
+            return _AsyncOnlyStream(values)
+
+    class _PolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 128}}
+
+    rows = []
+    for task_index in (10, 10, 11, 11):
+        rows.append(
+            {
+                "agent_ref": {"name": "agent"},
+                "responses_create_params": {},
+                "_ng_task_index": task_index,
+            }
+        )
+    input_batch = BatchedDataDict(
+        {
+            "extra_env_info": rows,
+            "message_log": [[{"role": "user", "content": "prompt"}]] * 4,
+            "loss_multiplier": torch.ones(4),
+        }
+    )
+    captured_groups = []
+
+    def _postprocess_group(**kwargs):
+        assert kwargs["log_full_result_tables"] is False
+        task_index = int(kwargs["nemo_gym_rows"][0]["_ng_task_index"])
+        captured_groups.append(
+            (task_index, [result["rowidx"] for result in kwargs["results"]])
+        )
+        return rollouts_mod.NemoGymRolloutResult(
+            input_ids=torch.empty(0),
+            final_batch=kwargs["input_batch"],
+            rollout_metrics={},
+            task_index=task_index,
+        )
+
+    monkeypatch.setattr(
+        rollouts_mod, "_postprocess_single_nemo_gym_group", _postprocess_group
+    )
+    monkeypatch.setattr(rollouts_mod, "Timer", _FakeTimer)
+
+    async def _collect():
+        results = []
+        async for result in run_async_nemo_gym_rollout(
+            policy_generation=_PolicyGeneration(),
+            input_batch=input_batch,
+            tokenizer=None,
+            task_to_env={
+                "nemo_gym": type(
+                    "_Environment",
+                    (),
+                    {"run_rollouts": _RunRolloutsRemote()},
+                )()
+            },
+            generation_config={
+                "stop_strings": [],
+                "stop_token_ids": [],
+                "top_k": None,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_new_tokens": 32,
+            },
+            num_generations=2,
+            log_full_result_tables=False,
+        ):
+            results.append(result)
+            if len(results) == 1:
+                # Simulate work done by the consumer before requesting another group.
+                clock["now"] += 100.0
+        return results
+
+    rollout_results = asyncio.run(_collect())
+
+    assert [result.task_index for result in rollout_results] == [11, 10]
+    assert captured_groups == [(11, [2, 3]), (10, [0, 1])]
+    assert rollout_results[-1].rollout_metrics["timing/remote"] == 1.0
+    assert rollout_results[-1].rollout_metrics["timing/rollout/run_rollouts"] == 4.0
+    assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
+
+
+def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
+    rows = [
+        {"agent_ref": {"name": "agent"}},
+        {"agent_ref": {"name": "agent"}},
+    ]
+    accumulator = rollouts_mod._NemoGymStreamAccumulator(
+        rows=rows,
+        num_generations=2,
+        allow_mixed_agents=False,
+    )
+
+    assert accumulator.add(0, {"row": 0}) is None
+    with pytest.raises(ValueError, match="duplicate row index 0"):
+        accumulator.add(0, {"row": 0})
+    with pytest.raises(RuntimeError, match=r"missing row indices \[1\]"):
+        accumulator.finish()
+
+    with pytest.raises(ValueError, match="outside the expected range"):
+        rollouts_mod._NemoGymStreamAccumulator(
+            rows=rows,
+            num_generations=2,
+            allow_mixed_agents=False,
+        ).add(2, {"row": 2})
+
+
+def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
+    accumulator = rollouts_mod._NemoGymStreamAccumulator(
+        rows=[
+            {"agent_ref": {"name": "agent-a"}},
+            {"agent_ref": {"name": "agent-b"}},
+        ],
+        num_generations=2,
+        allow_mixed_agents=False,
+    )
+
+    assert accumulator.add(0, {"row": 0}) is None
+    with pytest.raises(ValueError, match="one NeMo-Gym agent"):
+        accumulator.add(1, {"row": 1})
+
+
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+def test_postprocess_nemo_gym_group_returns_task_index(log_full_result_tables):
+    rows = [
+        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+        {"agent_ref": {"name": "agent"}, "_ng_task_index": 42},
+    ]
+    results = []
+    for reward in (1.0, 2.0):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {"reward": reward},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=log_full_result_tables,
+    )
+
+    assert rollout_result.task_index == 42
+    assert rollout_result.final_batch["total_reward"].tolist() == [1.0, 2.0]
+    assert (
+        "agent/full_result" in rollout_result.rollout_metrics
+    ) is log_full_result_tables
+
+
+def test_run_nemo_gym_rollout_sync_drains_entire_batch(monkeypatch):
+    input_batch = BatchedDataDict({"loss_multiplier": torch.ones(3)})
+    expected = rollouts_mod.NemoGymRolloutResult(
+        input_ids=torch.empty(0),
+        final_batch=input_batch,
+        rollout_metrics={"metric": 1.0},
+        task_index=None,
+    )
+
+    async def fake_stream(**kwargs):
+        assert kwargs["num_generations"] == input_batch.size
+        assert kwargs["returns_entire_batch"] is True
+        assert kwargs["log_full_result_tables"] is False
+        yield expected
+
+    monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_stream)
+
+    actual = run_nemo_gym_rollout_sync(
+        policy_generation=None,
+        input_batch=input_batch,
+        tokenizer=None,
+        task_to_env={},
+        generation_config={},
+        log_full_result_tables=False,
+    )
+
+    assert actual is expected
+
+
+def test_rollout_manager_consumes_stream_and_restores_input_order():
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _Stream:
+        def __init__(self):
+            self.values = iter(
+                [
+                    _ReadyRef((1, {"value": "second"}, None)),
+                    _ReadyRef((0, {"value": "first"}, {"remote_time": 2.0})),
+                ]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, inputs, tokenizer, timer_prefix):
+            del inputs, tokenizer, timer_prefix
+            return _Stream()
+
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._task_to_env = {
+        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    }
+    manager._tokenizer = None
+    manager._result_to_completion = lambda result: result["value"]
+    manager._compute_rollout_metrics = lambda completions, agent: {
+        "completion_count": len(completions),
+        "agent": agent,
+    }
+
+    completions, metrics = asyncio.run(
+        manager._run_rollouts(
+            inputs=[
+                {"agent_ref": {"name": "agent"}},
+                {"agent_ref": {"name": "agent"}},
+            ],
+            timer=rollouts_mod.Timer(),
+            timer_prefix="timing/test",
+        )
+    )
+
+    assert completions == ["first", "second"]
+    assert metrics == {
+        "completion_count": 2,
+        "agent": "agent",
+        "remote_time": 2.0,
+    }
+
+
+def test_rollout_manager_rejects_duplicate_stream_rows():
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _DuplicateStream:
+        def __init__(self):
+            self.values = iter(
+                [
+                    _ReadyRef((0, {"value": "first"}, None)),
+                    _ReadyRef((0, {"value": "duplicate"}, None)),
+                ]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, inputs, tokenizer, timer_prefix):
+            del inputs, tokenizer, timer_prefix
+            return _DuplicateStream()
+
+    manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._task_to_env = {
+        "nemo_gym": type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    }
+    manager._tokenizer = None
+
+    with pytest.raises(ValueError, match="duplicate row index 0"):
+        asyncio.run(
+            manager._run_rollouts(
+                inputs=[
+                    {"agent_ref": {"name": "agent"}},
+                    {"agent_ref": {"name": "agent"}},
+                ],
+                timer=rollouts_mod.Timer(),
+                timer_prefix="timing/test",
+            )
+        )
 
 
 @pytest.mark.nemo_gym
@@ -933,13 +1487,14 @@ def test_run_async_nemo_gym_rollout(
     rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
     assert "max_output_tokens" not in rows[1]["responses_create_params"]
 
-    actual_result = run_async_nemo_gym_rollout(
+    actual_result = run_nemo_gym_rollout_sync(
         policy_generation=nemo_gym_vllm_generation,
         input_batch=input_batch,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
+        log_full_result_tables=True,
         max_rollout_turns=None,
     )
     for row in rows:
@@ -1546,12 +2101,13 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         }
     )
 
-    original_result = run_async_nemo_gym_rollout(
+    original_result = run_nemo_gym_rollout_sync(
         policy_generation=nemo_gym_vllm_generation,
         input_batch=repeated_batch,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         generation_config=nemo_gym_vllm_generation.cfg,
+        log_full_result_tables=False,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         max_rollout_turns=None,
     )

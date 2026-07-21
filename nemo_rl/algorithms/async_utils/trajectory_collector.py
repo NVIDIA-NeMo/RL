@@ -14,11 +14,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import threading as _threading
 import time
 from collections import defaultdict
-from typing import Any, Optional
+from collections.abc import AsyncGenerator
+from typing import Any, Optional, cast
 
 import ray
 import torch
@@ -30,13 +32,22 @@ from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_mu
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.experience.rollouts import (
-    run_async_multi_turn_rollout,
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEXT_NEMO_GYM_TASK_INDEX_KEY,
 )
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.experience.rollouts import (
+    RolloutGroupResult,
+    run_async_multi_turn_rollout_groups,
+)
+from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
+_MAX_NEMO_GYM_STREAM_RETRIES = 3
+_NEMO_GYM_RETRY_DELAY_BASE_SECONDS = 1.0
+_REPLAY_BUFFER_MAX_BACKOFF_SECONDS = 0.5
 
 
 @ray.remote  # pragma: no cover
@@ -54,6 +65,7 @@ class AsyncTrajectoryCollector:
         teacher_worker_groups: Optional[dict[str, Any]] = None,
         alias_to_group_alias: Optional[dict[str, str]] = None,
         on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
+        next_nemo_gym_task_index: int = 0,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -91,9 +103,11 @@ class AsyncTrajectoryCollector:
 
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
+        self.dataloader: StatefulDataLoader | None = None
+        self.collection_thread: _threading.Thread | None = None
 
         # Track when generation limits cause collection to pause
-        self._last_limit_warning_version = None
+        self._last_limit_warning_version: int | None = None
 
         # Event to signal when generation limits are cleared (more efficient than polling)
         self._generation_limit_cleared = _threading.Event()
@@ -103,24 +117,11 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
-        # This value limits the parallelism of the generation requests.
-        max_inflight = (
-            int(self.master_config.grpo["num_prompts_per_step"])
-            * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
-        ) or 1
-        self._inflight_sema = _threading.Semaphore(max_inflight)
-
         # Simple lock to prevent race conditions when checking/spawning workers
         self._generation_check_lock: _threading.Lock = _threading.Lock()
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
-        # Track spawned, buffered, and completed prompt-group workers per target.
-        self._spawned_per_target: dict[int, int] = {}
-        self._buffered_per_target: dict[int, int] = {}
-        self._completed_per_target: dict[int, int] = {}
-        self._spawning_targets: set[int] = set()
-        self._counter_lock: _threading.Lock = _threading.Lock()
+        self._next_nemo_gym_task_index = next_nemo_gym_task_index
 
         # Timer for efficiency metrics
         self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
@@ -270,8 +271,13 @@ class AsyncTrajectoryCollector:
     def _collection_loop(self):
         """Run the collection loop in background thread."""
         dataloader_exhausted = False
+        if self.dataloader is None:
+            raise RuntimeError(
+                "start_collection must set a dataloader before collection"
+            )
+        dataloader = self.dataloader
         try:
-            for batch in self.dataloader:
+            for batch in dataloader:
                 if not self.running:
                     break
 
@@ -339,9 +345,27 @@ class AsyncTrajectoryCollector:
             else:
                 print("🛑 Trajectory collection stopped")
 
+    def _stamp_nemo_gym_task_indices(self, batch: BatchedDataDict[DatumSpec]) -> None:
+        """Assign one stable, monotonic task index to every prompt in a batch."""
+        stamped_rows = []
+        first_task_index = self._next_nemo_gym_task_index
+        for offset, row in enumerate(batch["extra_env_info"]):
+            if not isinstance(row, dict):
+                raise TypeError(
+                    "Expected NeMo-Gym extra_env_info row to be a dict, "
+                    f"got {type(row).__name__}"
+                )
+            stamped_row = dict(row)
+            stamped_row[NEMO_GYM_TASK_INDEX_KEY] = first_task_index + offset
+            stamped_rows.append(stamped_row)
+
+        batch["extra_env_info"] = stamped_rows
+        self._next_nemo_gym_task_index += len(stamped_rows)
+
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
         target_weight: Optional[int] = None
+        worker_started = False
         try:
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config.grpo["num_generations_per_prompt"]
@@ -361,123 +385,87 @@ class AsyncTrajectoryCollector:
                     f"🔄 No targets need generation for weight {generation_weight_version}"
                 )
                 return
+            reserved_target = target_weight
 
             print(
-                f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
+                f"🎯 Generating for target weight {reserved_target} from generation_weight_version {generation_weight_version}"
             )
 
             trajectories_needed = ray.get(
                 self.replay_buffer.get_trajectories_needed.remote(
-                    target_weight, num_prompts_per_step, max_age_steps
+                    reserved_target, num_prompts_per_step, max_age_steps
                 )
             )
             num_prompts_to_generate = min(num_prompts_in_batch, trajectories_needed)
             if num_prompts_to_generate == 0:
                 print(
-                    f"🔄 Target {target_weight} already has enough trajectories, skipping"
+                    f"🔄 Target {reserved_target} already has enough trajectories, skipping"
                 )
-                with self._generation_check_lock:
-                    self._generating_targets.discard(target_weight)
+                self._release_target(reserved_target)
                 return
 
             if num_prompts_to_generate < num_prompts_in_batch:
                 print(
-                    f"🎯 Gap-filling for target weight {target_weight}: "
+                    f"🎯 Gap-filling for target weight {reserved_target}: "
                     f"generating {num_prompts_to_generate}/{num_prompts_in_batch} "
                     f"prompts (need {trajectories_needed} more trajectories)"
                 )
 
-            # Generate only the prompt groups needed for this target. While the
-            # spawn loop is open, workers may finish before later workers start,
-            # so reservation release is deferred until spawning closes.
-            started = 0
-            with self._counter_lock:
-                self._spawning_targets.add(target_weight)
+            # Generate all prompt groups needed for this target in one batched worker.
+            from nemo_rl.algorithms.grpo import _should_use_nemo_gym
+
+            use_nemo_gym = _should_use_nemo_gym(self.master_config)
+
+            if not self._refit_pause_cleared.is_set() and self.running:
+                with self._threads_lock:
+                    active_threads = len(self._inflight_threads)
+                print(
+                    "⏸️ Waiting for refit to complete before starting new "
+                    f"generation ({active_threads} threads still active)"
+                )
+                with self._efficiency_timer.time("idle/refit_event_wait"):
+                    self._refit_pause_cleared.wait()
+                generation_weight_version = self.current_weight_version
+
+            rollout_batch = batch.slice(0, num_prompts_to_generate)
+            if use_nemo_gym:
+                self._stamp_nemo_gym_task_indices(rollout_batch)
+            repeated_batch = rollout_batch.repeat_interleave(num_generations)
+
+            def _run_rollout_batch() -> None:
+                asyncio.run(
+                    self._run_rollout_batch_worker(
+                        repeated_batch=repeated_batch,
+                        generation_weight_version=generation_weight_version,
+                        target_weight_version=reserved_target,
+                        num_generations=num_generations,
+                        use_nemo_gym=use_nemo_gym,
+                    )
+                )
+
+            worker = _threading.Thread(target=_run_rollout_batch, daemon=True)
             try:
-                for prompt_idx in range(num_prompts_to_generate):
-                    # Wait for refit to complete if in progress
-                    if not self._refit_pause_cleared.is_set() and self.running:
-                        with self._threads_lock:
-                            active_threads = len(self._inflight_threads)
-                        print(
-                            f"⏸️ Waiting for refit to complete before starting new generation ({active_threads} threads still active)"
-                        )
-                        print(
-                            "   Note: With vLLM V1 async engine, active threads can complete during weight update"
-                        )
-                        with self._efficiency_timer.time("idle/refit_event_wait"):
-                            self._refit_pause_cleared.wait()
+                with self._threads_lock:
+                    self._inflight_threads.add(worker)
+                worker.start()
+                worker_started = True
+            except Exception:
+                with self._threads_lock:
+                    self._inflight_threads.discard(worker)
+                raise
 
-                        # After refit finishes if weight version has updated, reflect that in the new trajectories
-                        generation_weight_version = self.current_weight_version
-
-                    single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
-                    repeated_batch = single_prompt_batch.repeat_interleave(
-                        num_generations
-                    )
-
-                    worker = _threading.Thread(
-                        target=self._run_prompt_group_worker,
-                        args=(
-                            repeated_batch,
-                            generation_weight_version,
-                            target_weight,
-                            prompt_idx,
-                        ),
-                        daemon=True,
-                    )
-                    self._inflight_sema.acquire()
-                    registered = False
-                    try:
-                        with self._threads_lock:
-                            self._inflight_threads.add(worker)
-                        with self._counter_lock:
-                            self._spawned_per_target[target_weight] = (
-                                self._spawned_per_target.get(target_weight, 0) + 1
-                            )
-                            spawned_count = self._spawned_per_target[target_weight]
-                        registered = True
-                        worker.start()
-                    except Exception:
-                        # The worker never ran, so it won't release its slot or
-                        # run its finally block; undo the bookkeeping here.
-                        with self._threads_lock:
-                            self._inflight_threads.discard(worker)
-                        if registered:
-                            with self._counter_lock:
-                                updated_count = (
-                                    self._spawned_per_target.get(target_weight, 0) - 1
-                                )
-                                if updated_count > 0:
-                                    self._spawned_per_target[target_weight] = (
-                                        updated_count
-                                    )
-                                else:
-                                    self._spawned_per_target.pop(target_weight, None)
-                        self._inflight_sema.release()
-                        raise
-                    started += 1
-                    print(
-                        f"📊 Started worker {started}/{num_prompts_to_generate} for "
-                        f"target_weight={target_weight} ({spawned_count} total)"
-                    )
-            finally:
-                if started < num_prompts_to_generate:
-                    print(
-                        f"⚠️ Only {started}/{num_prompts_to_generate} workers "
-                        f"started for target_weight={target_weight}"
-                    )
-                with self._counter_lock:
-                    self._spawning_targets.discard(target_weight)
-                self._maybe_release_target(target_weight)
+            backend = "NeMo-Gym" if use_nemo_gym else "native"
+            print(
+                f"📊 Started one {backend} batch worker for "
+                f"{num_prompts_to_generate} prompt groups at "
+                f"target_weight={reserved_target}"
+            )
 
             self._cleanup_finished_threads()
 
         except Exception as e:
-            if target_weight is not None:
-                with self._counter_lock:
-                    self._spawning_targets.discard(target_weight)
-                self._maybe_release_target(target_weight)
+            if target_weight is not None and not worker_started:
+                self._release_target(target_weight)
             print(f"❌ Error processing batch: {e}")
             import traceback
 
@@ -598,7 +586,7 @@ class AsyncTrajectoryCollector:
 
     def get_dataloader_state(self) -> dict:
         """Get the current dataloader state for checkpointing."""
-        if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
+        if self.dataloader is not None:
             return self.dataloader.state_dict()
         return {}
 
@@ -607,7 +595,14 @@ class AsyncTrajectoryCollector:
 
         Called by the driver process each step to merge collector-side metrics.
         """
-        return self._efficiency_timer.get_timing_metrics(reduction_op="sum")
+        return cast(
+            dict[str, float],
+            self._efficiency_timer.get_timing_metrics(reduction_op="sum"),
+        )
+
+    def get_rollouts_state(self) -> dict[str, int]:
+        """Get collector-side rollout state for checkpointing."""
+        return {NEXT_NEMO_GYM_TASK_INDEX_KEY: self._next_nemo_gym_task_index}
 
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
@@ -615,37 +610,13 @@ class AsyncTrajectoryCollector:
             for t in finished:
                 self._inflight_threads.remove(t)
 
-    def _maybe_release_target(self, target_weight_version: int) -> None:
-        """Release a target's reservation once all its workers have completed.
-
-        A worker counts as "completed" whether or not it managed to buffer a
-        trajectory. The reservation is released exactly when the number of
-        completed workers reaches the number spawned for the target and no more
-        workers are being spawned for the same target. Safe to call repeatedly:
-        the reservation is discarded at most once and the per-target counters
-        are dropped on release (so a later re-reservation starts from a clean
-        slate and the dicts don't grow unbounded).
-        """
-        with self._counter_lock:
-            if target_weight_version in self._spawning_targets:
-                return
-            completed = self._completed_per_target.get(target_weight_version, 0)
-            spawned = self._spawned_per_target.get(target_weight_version, 0)
-            if completed < spawned:
-                return
-            buffered = self._buffered_per_target.get(target_weight_version, 0)
-            self._spawned_per_target.pop(target_weight_version, None)
-            self._buffered_per_target.pop(target_weight_version, None)
-            self._completed_per_target.pop(target_weight_version, None)
-            self._spawning_targets.discard(target_weight_version)
-
+    def _release_target(self, target_weight_version: int) -> None:
+        """Release the reservation owned by a completed batch worker."""
         with self._generation_check_lock:
             if target_weight_version in self._generating_targets:
                 self._generating_targets.discard(target_weight_version)
                 print(
-                    "🧹 Released reservation for target weight "
-                    f"{target_weight_version} ({spawned} workers completed, "
-                    f"{buffered} buffered)"
+                    f"🧹 Released reservation for target weight {target_weight_version}"
                 )
 
     def _compute_teacher_logprobs(
@@ -759,172 +730,328 @@ class AsyncTrajectoryCollector:
 
         return result, total_time
 
-    def _run_prompt_group_worker(
+    async def _iter_rollout_groups(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
-        generation_weight_version: int,
-        target_weight_version: int,
-        prompt_idx: int,
-    ) -> None:
-        worker_start = time.perf_counter()
-        try:
-            # Import here to avoid circular dependency
-            from nemo_rl.algorithms.grpo import _should_use_nemo_gym
+        num_generations: int,
+        use_nemo_gym: bool,
+        task_index_to_group_index: dict[int, int],
+    ) -> AsyncGenerator[RolloutGroupResult, None]:
+        """Yield prompt groups from either backend through one result type."""
+        if use_nemo_gym:
+            # Import here to keep the NeMo-Gym dependency local to its backend.
             from nemo_rl.experience.rollouts import (
                 get_nemo_gym_thinking_tags,
                 run_async_nemo_gym_rollout,
             )
 
-            # Run rollout for this prompt group
-            # Async engine supports concurrent generation; avoid locking
-            # Check if we should use nemo_gym (similar to synchronous GRPO)
-            if _should_use_nemo_gym(self.master_config):
-                generation_config = self.master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-                    policy_generation=self.policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=self.tokenizer,
-                    task_to_env=self.task_to_env,
-                    max_seq_len=self.master_config.policy["max_total_sequence_length"],
-                    generation_config=generation_config,
-                    max_rollout_turns=None,
-                    greedy=False,
-                    reward_penalty_config=self.master_config.reward_penalties,
-                    thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
-                )
-                final_batch = nemo_gym_rollout_result.final_batch
-                rollout_metrics = nemo_gym_rollout_result.rollout_metrics
-            else:
-                final_batch, rollout_metrics = run_async_multi_turn_rollout(
-                    policy_generation=self.policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=self.tokenizer,
-                    task_to_env=self.task_to_env,
-                    max_seq_len=self.master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=self.master_config.grpo["max_rollout_turns"],
-                    greedy=False,
-                )
-
-            # Move to CPU and push to buffer (avoid blocking on GC/push)
-            final_batch_cpu = final_batch.to("cpu")
-            del final_batch
-
-            # Compute teacher logprobs at collection time (overlapped with async rollouts)
-            if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
-                agent_refs = final_batch_cpu["agent_ref"]
-                if isinstance(agent_refs, list):
-                    from nemo_rl.data.llm_message_utils import (
-                        batched_message_log_to_flat_message,
-                    )
-
-                    flat_for_teacher, teacher_input_lengths = (
-                        batched_message_log_to_flat_message(
-                            final_batch_cpu["message_log"],
-                            pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
-                            make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
-                        )
-                    )
-                    teacher_logprobs, teacher_logprob_time = (
-                        self._compute_teacher_logprobs(
-                            flat_for_teacher["token_ids"],
-                            agent_refs,
-                            input_lengths=teacher_input_lengths,
-                        )
-                    )
-                    # Store inside batch dict so from_batches handles
-                    # variable-length padding across prompt groups
-                    final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs
-                    rollout_metrics = dict(rollout_metrics)
-                    rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
-
-            # Record per-trajectory wall-clock duration for buffer starvation diagnostics
-            trajectory_duration_s = time.perf_counter() - worker_start
-            rollout_metrics = dict(rollout_metrics)
-            rollout_metrics["trajectory_duration_s"] = trajectory_duration_s
-
-            trajectory_group = {
-                "batch": final_batch_cpu,
-                "rollout_metrics": rollout_metrics,
-                "timestamp": time.time(),
+            # NeMo-Gym owns stop criteria. Configuration fills the policy EOS token
+            # automatically, so clear the derived values before validation.
+            generation_config: GenerationConfig = {
+                **self.master_config.policy["generation"],
+                "stop_token_ids": None,
+                "stop_strings": None,
             }
+            async for rollout_result in run_async_nemo_gym_rollout(
+                policy_generation=self.policy_generation,
+                input_batch=repeated_batch,
+                tokenizer=self.tokenizer,
+                task_to_env=self.task_to_env,
+                max_seq_len=self.master_config.policy["max_total_sequence_length"],
+                generation_config=generation_config,
+                num_generations=num_generations,
+                log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                    wandb_enabled=self.master_config.logger["wandb_enabled"],
+                    wandb_config=self.master_config.logger["wandb"],
+                ),
+                max_rollout_turns=None,
+                greedy=False,
+                reward_penalty_config=self.master_config.reward_penalties,
+                thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
+            ):
+                task_index = rollout_result.task_index
+                if task_index is None:
+                    raise ValueError("NeMo-Gym prompt group is missing _ng_task_index")
+                task_index = int(task_index)
+                if task_index not in task_index_to_group_index:
+                    raise ValueError(f"Unexpected _ng_task_index {task_index}")
+                yield RolloutGroupResult(
+                    group_index=task_index_to_group_index[task_index],
+                    final_batch=rollout_result.final_batch,
+                    rollout_metrics=rollout_result.rollout_metrics,
+                    task_index=task_index,
+                )
+            return
 
-            # Use exponential backoff when buffer is full
-            try:
-                backoff_delay = 0.01
-                backoff_start = None
-                while self.running:
-                    status = ray.get(
-                        self.replay_buffer.add.remote(
-                            trajectory_group,
-                            generation_weight_version,
-                            target_weight_version,
-                        )
-                    )
-                    if status == "success":
-                        with self._counter_lock:
-                            self._buffered_per_target[target_weight_version] = (
-                                self._buffered_per_target.get(target_weight_version, 0)
-                                + 1
-                            )
-                            buffered_count = self._buffered_per_target[
-                                target_weight_version
-                            ]
-                            spawned_count = self._spawned_per_target.get(
-                                target_weight_version, 0
-                            )
-                        if backoff_start is not None:
-                            self._efficiency_timer.record(
-                                "idle/buffer_full_backoff",
-                                time.perf_counter() - backoff_start,
-                            )
-                        print(
-                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
-                            f"target_weight {target_weight_version}) "
-                            f"[{buffered_count}/{spawned_count} buffered]"
-                        )
-                        break
-                    elif status == "full":
-                        if backoff_start is None:
-                            backoff_start = time.perf_counter()
-                        # Exponential backoff up to 0.5 second
-                        time.sleep(min(backoff_delay, 0.5))
-                        backoff_delay *= 1.5
-                    else:
-                        # Unexpected status, wait briefly
-                        time.sleep(0.01)
-            except Exception as e:
-                print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
-                if backoff_start is not None:
-                    self._efficiency_timer.record(
-                        "idle/buffer_full_backoff",
-                        time.perf_counter() - backoff_start,
-                    )
-                import traceback
+        async for rollout_result in run_async_multi_turn_rollout_groups(
+            policy_generation=self.policy_generation,
+            input_batch=repeated_batch,
+            tokenizer=self.tokenizer,
+            task_to_env=self.task_to_env,
+            max_seq_len=self.master_config.policy["max_total_sequence_length"],
+            num_generations=num_generations,
+            max_rollout_turns=self.master_config.grpo["max_rollout_turns"],
+            greedy=False,
+        ):
+            yield rollout_result
 
-                traceback.print_exc()
-        except Exception as e:
-            print(f"❌ Error in prompt group worker: {e}")
+    async def _run_rollout_batch_worker(
+        self,
+        repeated_batch: BatchedDataDict[DatumSpec],
+        generation_weight_version: int,
+        target_weight_version: int,
+        num_generations: int,
+        use_nemo_gym: bool,
+    ) -> None:
+        """Own one target reservation while collecting its rollout batch."""
+        worker_start = time.perf_counter()
+        try:
+            await self._collect_rollout_batch(
+                repeated_batch=repeated_batch,
+                generation_weight_version=generation_weight_version,
+                target_weight_version=target_weight_version,
+                num_generations=num_generations,
+                use_nemo_gym=use_nemo_gym,
+            )
+        except Exception as error:
             self._efficiency_timer.record(
                 "wasted/failed_trajectory", time.perf_counter() - worker_start
+            )
+            backend = "NeMo-Gym" if use_nemo_gym else "native"
+            print(
+                f"❌ Error in {backend} batch worker "
+                f"(target_weight={target_weight_version}): {error}"
             )
             import traceback
 
             traceback.print_exc()
         finally:
-            with self._counter_lock:
-                self._completed_per_target[target_weight_version] = (
-                    self._completed_per_target.get(target_weight_version, 0) + 1
-                )
-            self._maybe_release_target(target_weight_version)
-
-            # Detach thread record when finished
+            self._release_target(target_weight_version)
             with self._threads_lock:
-                current = _threading.current_thread()
-                if current in self._inflight_threads:
-                    self._inflight_threads.remove(current)
-            try:
-                self._inflight_sema.release()
-            except Exception:
-                import traceback
+                self._inflight_threads.discard(_threading.current_thread())
 
-                traceback.print_exc()
+    @staticmethod
+    def _build_task_index_map(
+        repeated_batch: BatchedDataDict[DatumSpec],
+        num_generations: int,
+    ) -> dict[int, int]:
+        """Map each Gym task index to its repeated prompt-group position."""
+        task_index_to_group_index: dict[int, int] = {}
+        prompt_group_count = repeated_batch.size // num_generations
+        for group_index in range(prompt_group_count):
+            start = group_index * num_generations
+            rows = repeated_batch["extra_env_info"][start : start + num_generations]
+            raw_task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in rows]
+            if any(task_index is None for task_index in raw_task_indices):
+                raise ValueError(
+                    "Every NeMo-Gym row must include _ng_task_index, got "
+                    f"{raw_task_indices} for group {group_index}"
+                )
+
+            task_indices = {int(task_index) for task_index in raw_task_indices}
+            if len(task_indices) != 1:
+                raise ValueError(
+                    "Expected one _ng_task_index per repeated prompt group, got "
+                    f"{sorted(task_indices)} for group {group_index}"
+                )
+            task_index = task_indices.pop()
+            if task_index in task_index_to_group_index:
+                raise ValueError(f"Duplicate _ng_task_index {task_index}")
+            task_index_to_group_index[task_index] = group_index
+
+        return task_index_to_group_index
+
+    async def _enqueue_rollout_group(
+        self,
+        rollout_result: RolloutGroupResult,
+        generation_weight_version: int,
+        target_weight_version: int,
+        expected_prompt_groups: int,
+        buffered_group_indices: set[int],
+        collection_started_at: float,
+    ) -> None:
+        """Push one prompt group to the replay buffer with bounded backoff."""
+        final_batch_cpu = rollout_result.final_batch.to("cpu")
+        rollout_metrics = rollout_result.rollout_metrics
+
+        # Teacher inference is blocking. Keep it off this worker's event loop so
+        # other completed prompt groups can continue moving toward the buffer.
+        if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
+            agent_refs = final_batch_cpu["agent_ref"]
+            if isinstance(agent_refs, list):
+                from nemo_rl.data.llm_message_utils import (
+                    batched_message_log_to_flat_message,
+                )
+
+                flat_for_teacher, teacher_input_lengths = (
+                    batched_message_log_to_flat_message(
+                        final_batch_cpu["message_log"],
+                        pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
+                        make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
+                    )
+                )
+                teacher_logprobs, teacher_logprob_time = await asyncio.to_thread(
+                    self._compute_teacher_logprobs,
+                    flat_for_teacher["token_ids"],
+                    agent_refs,
+                    input_lengths=teacher_input_lengths,
+                )
+                # Keep the tensor inside the batch so replay-buffer collation can
+                # pad variable-length prompt groups correctly.
+                final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs
+                rollout_metrics = dict(rollout_metrics)
+                rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
+
+        rollout_metrics = dict(rollout_metrics)
+        rollout_metrics["trajectory_duration_s"] = (
+            time.perf_counter() - collection_started_at
+        )
+        trajectory_group = {
+            "batch": final_batch_cpu,
+            "rollout_metrics": rollout_metrics,
+            "timestamp": time.time(),
+        }
+        if rollout_result.task_index is not None:
+            trajectory_group[NEMO_GYM_TASK_INDEX_KEY] = rollout_result.task_index
+
+        backoff_delay = 0.01
+        backoff_started_at: float | None = None
+        try:
+            while self.running:
+                status = await self.replay_buffer.add.remote(
+                    trajectory_group,
+                    generation_weight_version,
+                    target_weight_version,
+                )
+                if status == "success":
+                    buffered_group_indices.add(rollout_result.group_index)
+                    group_description = f"group_index={rollout_result.group_index}"
+                    if rollout_result.task_index is not None:
+                        group_description = (
+                            f"_ng_task_index={rollout_result.task_index}"
+                        )
+                    print(
+                        "📦 Buffered prompt group "
+                        f"({group_description}, target_weight={target_weight_version}) "
+                        f"[{len(buffered_group_indices)}/{expected_prompt_groups} buffered]"
+                    )
+                    return
+                if status != "full":
+                    raise RuntimeError(
+                        f"Replay buffer returned unexpected add status {status!r}"
+                    )
+
+                if backoff_started_at is None:
+                    backoff_started_at = time.perf_counter()
+                await asyncio.sleep(
+                    min(backoff_delay, _REPLAY_BUFFER_MAX_BACKOFF_SECONDS)
+                )
+                backoff_delay *= 1.5
+
+            raise RuntimeError("Trajectory collection stopped before enqueue completed")
+        finally:
+            if backoff_started_at is not None:
+                self._efficiency_timer.record(
+                    "idle/buffer_full_backoff",
+                    time.perf_counter() - backoff_started_at,
+                )
+
+    async def _collect_rollout_batch(
+        self,
+        repeated_batch: BatchedDataDict[DatumSpec],
+        generation_weight_version: int,
+        target_weight_version: int,
+        num_generations: int,
+        use_nemo_gym: bool,
+    ) -> None:
+        """Run one backend batch and enqueue every completed prompt group."""
+        collection_started_at = time.perf_counter()
+        if num_generations <= 0 or repeated_batch.size % num_generations != 0:
+            raise ValueError(
+                "Rollout batch size must be divisible by a positive num_generations"
+            )
+        expected_prompt_groups = repeated_batch.size // num_generations
+        expected_group_indices = set(range(expected_prompt_groups))
+        task_index_to_group_index = (
+            self._build_task_index_map(repeated_batch, num_generations)
+            if use_nemo_gym
+            else {}
+        )
+        buffered_group_indices: set[int] = set()
+        last_error: Exception | None = None
+        max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
+        for attempt in range(1, max_attempts + 1):
+            push_tasks: list[asyncio.Task[None]] = []
+            scheduled_group_indices: set[int] = set()
+            stream_error: Exception | None = None
+            try:
+                async for rollout_result in self._iter_rollout_groups(
+                    repeated_batch=repeated_batch,
+                    num_generations=num_generations,
+                    use_nemo_gym=use_nemo_gym,
+                    task_index_to_group_index=task_index_to_group_index,
+                ):
+                    group_index = rollout_result.group_index
+                    if group_index not in expected_group_indices:
+                        raise ValueError(f"Unexpected prompt group index {group_index}")
+                    if rollout_result.final_batch.size != num_generations:
+                        raise ValueError(
+                            f"Prompt group {group_index} contains "
+                            f"{rollout_result.final_batch.size} rollouts; expected "
+                            f"{num_generations}"
+                        )
+                    if group_index in buffered_group_indices:
+                        continue
+                    if group_index in scheduled_group_indices:
+                        raise ValueError(
+                            f"Rollout stream yielded prompt group {group_index} twice"
+                        )
+                    scheduled_group_indices.add(group_index)
+                    push_tasks.append(
+                        asyncio.create_task(
+                            self._enqueue_rollout_group(
+                                rollout_result=rollout_result,
+                                generation_weight_version=generation_weight_version,
+                                target_weight_version=target_weight_version,
+                                expected_prompt_groups=expected_prompt_groups,
+                                buffered_group_indices=buffered_group_indices,
+                                collection_started_at=collection_started_at,
+                            )
+                        )
+                    )
+            except Exception as error:
+                stream_error = error
+
+            push_results = await asyncio.gather(*push_tasks, return_exceptions=True)
+            push_errors = [
+                result for result in push_results if isinstance(result, Exception)
+            ]
+            pending_group_indices = expected_group_indices - buffered_group_indices
+            if not pending_group_indices:
+                return
+
+            last_error = stream_error or (push_errors[0] if push_errors else None)
+            if last_error is None:
+                last_error = RuntimeError(
+                    "Rollout stream ended before yielding prompt groups "
+                    f"{sorted(pending_group_indices)}"
+                )
+            if attempt == max_attempts or not self.running:
+                break
+
+            retry_delay = _NEMO_GYM_RETRY_DELAY_BASE_SECONDS * (2 ** (attempt - 1))
+            print(
+                "❌ NeMo-Gym batch did not complete prompt groups "
+                f"{sorted(pending_group_indices)}; retrying in "
+                f"{retry_delay:.1f}s "
+                f"(attempt {attempt + 1}/{max_attempts})"
+            )
+            await asyncio.sleep(retry_delay)
+
+        batch_error = RuntimeError(
+            "Rollout batch failed to buffer prompt groups "
+            f"{sorted(expected_group_indices - buffered_group_indices)}"
+        )
+        if last_error is not None:
+            raise batch_error from last_error
+        raise batch_error
