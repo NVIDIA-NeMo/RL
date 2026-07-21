@@ -540,10 +540,16 @@ def setup_nemo_gym_generation_config(generation_config: dict[str, Any]) -> None:
     """Configure a generation backend for NeMo Gym HTTP rollouts."""
     backend = generation_config.get("backend")
     if backend == "dynamo":
-        # Dynamo always serves rollouts over its own OpenAI-compatible HTTP
-        # frontend (deployment="ray" owns the fleet), so there is no
-        # async_engine / expose_http_server toggle to flip here — the endpoint
-        # already exists. Just drop the unsupported stop settings and return.
+        # Dynamo serves rollouts over its own OpenAI HTTP frontend, but NeMo Gym
+        # needs per-token data (prompt/generation token_ids) on assistant
+        # messages to reconstruct the rollout — the raw frontend returns none, so
+        # every output item is skipped and the postprocess crashes on an empty
+        # message log. Setting expose_http_server makes DynamoGeneration front
+        # the engine with the DynamoTokenWrapperServer, which surfaces the
+        # workers' nvext.engine_data token_ids (they run with --enable-rl) in an
+        # OpenAI-compatible response. This runs before setup() builds
+        # DynamoGeneration, which reads the flag.
+        generation_config["vllm_cfg"]["expose_http_server"] = True
         generation_config["stop_strings"] = None
         generation_config["stop_token_ids"] = None
         return
