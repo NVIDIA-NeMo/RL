@@ -275,6 +275,13 @@ class VllmGeneration(GenerationInterface):
 
         self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
 
+        # Phase events for fault injection timing. Set while the corresponding
+        # operation is in progress; cleared when it completes. FaultInjector
+        # blocks on these to fire at a specific training phase.
+        import threading as _threading
+        self._generating = _threading.Event()
+        self._refitting = _threading.Event()
+
         # Fault-tolerant router (non-colocated only): manages shard table,
         # health poller, and NCCL lifecycle.  Colocated inference uses IPC-ZMQ
         # and does not need fault tolerance at this layer.
@@ -1071,6 +1078,17 @@ class VllmGeneration(GenerationInterface):
 
         from ray.exceptions import RayActorError
 
+        self._generating.set()
+        try:
+            return self._generate_impl(data, greedy)
+        finally:
+            self._generating.clear()
+
+    def _generate_impl(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        from ray.exceptions import RayActorError
+
         while self.worker_group.dp_size > 0:
             try:
                 # Shard the data across the tied worker groups
@@ -1434,16 +1452,20 @@ class VllmGeneration(GenerationInterface):
         failure detection and promotion of joining shards).  Returns [] when the
         router handled the call — the work is already done before this returns.
         """
-        if self._router is not None:
-            result = self._router.call_async(
-                self._router.run_update_weights_from_collective()
-            )
-            if not result.get("success"):
-                raise RuntimeError(
-                    f"update_weights_from_collective failed: {result.get('error', 'unknown')}"
+        self._refitting.set()
+        try:
+            if self._router is not None:
+                result = self._router.call_async(
+                    self._router.run_update_weights_from_collective()
                 )
-            return []
-        return self._raw_update_weights_from_collective()
+                if not result.get("success"):
+                    raise RuntimeError(
+                        f"update_weights_from_collective failed: {result.get('error', 'unknown')}"
+                    )
+                return []
+            return self._raw_update_weights_from_collective()
+        finally:
+            self._refitting.clear()
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

@@ -60,6 +60,7 @@ import time
 from typing import Any, Literal, Optional
 
 FaultMode = Literal["cordon", "actor-kill", "ray-kill"]
+TriggerOn = Literal["time", "during_generation", "during_refit"]
 
 
 class FaultInjector:
@@ -75,6 +76,7 @@ class FaultInjector:
         mode: FaultMode,
         target_shard: str,
         trigger_after_s: float = 60.0,
+        trigger_on: TriggerOn = "time",
         recover_after_s: Optional[float] = None,
         recover: bool = False,
         repeat_every_s: Optional[float] = None,
@@ -91,6 +93,7 @@ class FaultInjector:
         self.mode = mode
         self.target_shard = target_shard
         self.trigger_after_s = trigger_after_s
+        self.trigger_on = trigger_on
         self.recover_after_s = recover_after_s
         self.recover = recover
         self.repeat_every_s = repeat_every_s
@@ -142,12 +145,13 @@ class FaultInjector:
                 )
 
             print(
-                f"[fault-inject] cycle={cycle_n}: sleeping {delay_before_kill}s before "
-                f"firing mode={self.mode} target={self.target_shard} "
+                f"[fault-inject] cycle={cycle_n}: waiting to fire "
+                f"(trigger_on={self.trigger_on}, delay={delay_before_kill}s) "
+                f"mode={self.mode} target={self.target_shard} "
                 f"recover={self.recover} burst_size={this_cycle_burst}",
                 flush=True,
             )
-            time.sleep(delay_before_kill)
+            self._wait_for_trigger(delay_before_kill)
 
             fault_ts = time.time()
             print(
@@ -259,6 +263,56 @@ class FaultInjector:
             )
             time.sleep(float(self.repeat_every_s))
             delay_before_kill = 0.0
+
+    # ------------------------------------------------------------------
+    # Trigger logic
+    # ------------------------------------------------------------------
+
+    def _wait_for_trigger(self, delay_s: float, phase_timeout_s: float = 1800.0) -> None:
+        """Wait according to trigger_on, then sleep delay_s before firing.
+
+        - ``"time"``: plain sleep(delay_s), same as K8s behaviour.
+        - ``"during_generation"``: block until VllmGeneration._generating is
+          set (generate() is in progress), then sleep delay_s within that window.
+        - ``"during_refit"``: block until VllmGeneration._refitting is set
+          (update_weights_from_collective() is in progress), then sleep delay_s.
+        """
+        if self.trigger_on == "time":
+            time.sleep(delay_s)
+            return
+
+        event_name = (
+            "_generating" if self.trigger_on == "during_generation" else "_refitting"
+        )
+        event = getattr(self._gen, event_name, None)
+        if event is None:
+            print(
+                f"[fault-inject] {event_name} event not found on generation object; "
+                f"falling back to time-based trigger",
+                flush=True,
+            )
+            time.sleep(delay_s)
+            return
+
+        print(
+            f"[fault-inject] waiting for phase '{self.trigger_on}' to start "
+            f"(timeout={phase_timeout_s:.0f}s) ...",
+            flush=True,
+        )
+        fired = event.wait(timeout=phase_timeout_s)
+        if not fired:
+            print(
+                f"[fault-inject] timed out waiting for phase '{self.trigger_on}'; "
+                f"proceeding anyway",
+                flush=True,
+            )
+        else:
+            print(
+                f"[fault-inject] phase '{self.trigger_on}' started; "
+                f"sleeping {delay_s}s then firing",
+                flush=True,
+            )
+        time.sleep(delay_s)
 
     # ------------------------------------------------------------------
     # Steady-state gates
@@ -510,11 +564,13 @@ def maybe_launch_fault_injector(
             entry.get("recover_batch_delay_s", fi_cfg.get("recover_batch_delay_s", 600.0))
         )
 
+        trigger_on = entry.get("trigger_on", fi_cfg.get("trigger_on", "time"))
         injector = FaultInjector(
             vllm_gen=vllm_gen,
             mode=mode,
             target_shard=target,
             trigger_after_s=trigger,
+            trigger_on=trigger_on,
             recover_after_s=entry.get("recover_after_s", fi_cfg.get("recover_after_s")),
             recover=recover,
             repeat_every_s=repeat_every_s,
