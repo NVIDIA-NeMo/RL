@@ -48,7 +48,11 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
-from nemo_rl.algorithms.utils import print_performance_metrics, set_seed
+from nemo_rl.algorithms.utils import (
+    maybe_enable_refit_prequantize,
+    print_performance_metrics,
+    set_seed,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -654,7 +658,9 @@ def setup(
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+        maybe_enable_refit_prequantize(
+            policy, policy_generation, state_dict_info, master_config.policy
+        )
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
