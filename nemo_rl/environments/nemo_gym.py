@@ -539,13 +539,21 @@ def create_nemo_gym_actor(
 def setup_nemo_gym_generation_config(generation_config: dict[str, Any]) -> None:
     """Configure a generation backend for NeMo Gym HTTP rollouts."""
     backend = generation_config.get("backend")
+    if backend == "dynamo":
+        # Dynamo always serves rollouts over its own OpenAI-compatible HTTP
+        # frontend (deployment="ray" owns the fleet), so there is no
+        # async_engine / expose_http_server toggle to flip here — the endpoint
+        # already exists. Just drop the unsupported stop settings and return.
+        generation_config["stop_strings"] = None
+        generation_config["stop_token_ids"] = None
+        return
     if backend == "vllm":
         backend_config = generation_config["vllm_cfg"]
     elif backend == "megatron":
         backend_config = generation_config["mcore_generation_config"]
     else:
         raise ValueError(
-            "NeMo Gym HTTP rollouts require backend=vllm or backend=megatron"
+            "NeMo Gym HTTP rollouts require backend=vllm, backend=megatron, or backend=dynamo"
         )
 
     # Gym calls the rollout engine through its OpenAI-compatible HTTP server.
