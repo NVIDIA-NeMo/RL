@@ -14,9 +14,9 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_asft.py \
+uv run examples/run_sft.py \
     --config $CONFIG_PATH \
-    asft.max_num_steps=$MAX_STEPS \
+    sft.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \

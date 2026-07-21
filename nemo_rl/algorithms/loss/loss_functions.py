@@ -1042,18 +1042,22 @@ class DPOLossFn(PreferenceLossFn):
         }
 
 
-class ASFTLossConfig(TypedDict):
+class ASFTLossConfig(BaseModel, extra="allow"):
     """Configuration for Anchored Supervised Fine-Tuning loss.
 
     Based on "Anchored Supervised Fine-Tuning" (arXiv:2509.23753).
     Combines DFT (Dynamic Fine-Tuning) token-probability weighting with
-    KL divergence anchoring against a reference model.
+    KL divergence anchoring against a reference model. This is the ``sft.asft``
+    block: when present (non-null) it turns plain-CE SFT into Anchored SFT.
     """
 
-    kl_weight: float
-    kl_type: str
-    kl_input_clamp_value: float | None
-    kl_output_clamp_value: float | None
+    # KL anchor strength. 0.03 is the paper/bf16 default; internal sweeps found
+    # 0.005-0.01 the sweet spot for Qwen3-8B. kl_weight >= 0.05 over-regularizes.
+    kl_weight: float = 0.03
+    # Schulman KL estimator on the correct-token logprobs: "k1", "k2", or "k3".
+    kl_type: str = "k3"
+    kl_input_clamp_value: Optional[float] = 20.0
+    kl_output_clamp_value: Optional[float] = 10.0
 
 
 class ASFTLossDataDict(TypedDict):
@@ -1098,10 +1102,10 @@ class ASFTLossFn(LossFunction):
     input_type = LossInputType.LOGPROB
 
     def __init__(self, cfg: ASFTLossConfig, use_fused_linear_logprobs: bool = False):
-        self.kl_weight = cfg["kl_weight"]
-        self.kl_type = cfg.get("kl_type", "k3")
-        self.kl_input_clamp_value = cfg.get("kl_input_clamp_value", 20.0)
-        self.kl_output_clamp_value = cfg.get("kl_output_clamp_value", 10.0)
+        self.kl_weight = cfg.kl_weight
+        self.kl_type = cfg.kl_type
+        self.kl_input_clamp_value = cfg.kl_input_clamp_value
+        self.kl_output_clamp_value = cfg.kl_output_clamp_value
         # When the Megatron fused-linear-logprobs forward is active, the loss
         # receives precomputed next-token logprobs instead of full logits; the
         # loss-input wrapper branches on this flag (see prepare_loss_input).

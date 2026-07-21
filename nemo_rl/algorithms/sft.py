@@ -22,7 +22,11 @@ from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
+from nemo_rl.algorithms.loss.loss_functions import (
+    ASFTLossConfig,
+    ASFTLossFn,
+    NLLLossFn,
+)
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -75,6 +79,29 @@ class SFTConfig(BaseModel, extra="allow"):
     val_at_end: bool = False
     seed: int = 42
     only_unmask_final: bool = False
+    # Anchored SFT (ASFT, arXiv:2509.23753): when set, replace the plain NLL/CE
+    # loss with the DFT-reweight + KL-anchor loss and enable a frozen reference
+    # model (like DPO). None (default) => standard cross-entropy SFT.
+    asft: Optional[ASFTLossConfig] = None
+
+
+def _add_reference_policy_logprobs(
+    policy: PolicyInterface,
+    data: BatchedDataDict,
+    micro_batch_size: int,
+) -> None:
+    """Compute frozen-reference logprobs and attach them to ``data`` in place.
+
+    Used by Anchored SFT; mirrors DPO's reference-logprob precompute. The
+    returned logprobs put the logprob of input token ``i`` at position ``i``;
+    rolling left by one aligns position ``i`` with the next-token logprob the
+    ASFT loss consumes.
+    """
+    reference_logprobs = policy.get_reference_policy_logprobs(
+        data,
+        micro_batch_size=micro_batch_size,
+    )["reference_logprobs"]
+    data["reference_policy_logprobs"] = torch.roll(reference_logprobs, -1, dims=-1)
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -99,7 +126,7 @@ def setup(
     RayVirtualCluster,
     StatefulDataLoader,
     Optional[StatefulDataLoader],
-    NLLLossFn,
+    ASFTLossFn | NLLLossFn,
     Logger,
     CheckpointManager,
     SFTSaveState,
@@ -213,6 +240,10 @@ def setup(
 
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
+    # Anchored SFT (sft.asft set) trains with the DFT+KL-anchor loss and needs a
+    # frozen reference model; plain SFT uses the NLL loss and no reference.
+    use_asft = sft_config.asft is not None
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
@@ -221,15 +252,21 @@ def setup(
         weights_path=weights_path,
         optimizer_path=optimizer_path,
         init_optimizer=True,
-        init_reference_model=False,
+        init_reference_model=use_asft,
     )
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLossFn(
-        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
+    use_fused_linear_logprobs = (
+        policy_config["megatron_cfg"]["enabled"]
         and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
     )
+    if use_asft:
+        loss_fn = ASFTLossFn(
+            sft_config.asft, use_fused_linear_logprobs=use_fused_linear_logprobs
+        )
+    else:
+        loss_fn = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -316,6 +353,12 @@ def validate(
                 dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
                 val_data = maybe_pad_last_batch(val_data, dp_size, val_mbs)
 
+            # Anchored SFT needs the frozen-reference logprobs for the KL anchor.
+            if master_config.sft.asft is not None:
+                _add_reference_policy_logprobs(
+                    policy, val_data, micro_batch_size=val_mbs
+                )
+
             ## just run model fwd
             val_results = policy.train(
                 val_data,
@@ -396,6 +439,7 @@ def sft_train(
     total_valid_tokens = sft_save_state.total_valid_tokens
 
     sft_config = master_config.sft
+    use_asft = sft_config.asft is not None
     # Validation configuration
     val_period = sft_config.val_period
     val_at_start = sft_config.val_at_start
@@ -464,6 +508,19 @@ def sft_train(
                     train_data.update(
                         cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )
+
+                # Anchored SFT: compute frozen-reference logprobs before the
+                # training step (like DPO) so the loss can anchor to them.
+                if use_asft:
+                    print("▶ Computing reference policy logprobs...")
+                    with timer.time("reference_logprobs"):
+                        _add_reference_policy_logprobs(
+                            policy,
+                            train_data,
+                            micro_batch_size=master_config.policy[
+                                "train_micro_batch_size"
+                            ],
+                        )
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
@@ -597,6 +654,14 @@ def sft_train(
 
             print("\n📊 Training Results:")
             print(f"  • Loss: {float(metrics['loss']):.4f}")
+            # Anchored SFT diagnostics (present only when sft.asft is set).
+            for key, label in (
+                ("nll_loss", "NLL loss"),
+                ("kl_penalty", "KL penalty"),
+                ("mean_dft_weight", "Mean DFT weight"),
+            ):
+                if key in metrics:
+                    print(f"  • {label}: {float(metrics[key]):.4f}")
             if "total_flops" in train_results:
                 total_tflops = (
                     train_results["total_flops"]
