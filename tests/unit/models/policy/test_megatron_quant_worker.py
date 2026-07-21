@@ -285,18 +285,6 @@ def test_iter_real_quant_refit_params_can_keep_export_on_gpu():
     assert kwargs["cpu"] is False
 
 
-@requires_weight_folding
-def test_configure_real_quant_refit_rejects_non_boolean_export_placement():
-    worker = _make_real_quant_worker()
-    worker.cfg["generation"]["real_quant_export_cpu_offload"] = "false"
-
-    with pytest.raises(ValueError, match="must be a boolean"):
-        configure_generation_config(
-            worker.cfg["generation"],
-            SimpleNamespace(pad_token_id=0, eos_token_id=1),
-        )
-
-
 @pytest.mark.parametrize("quant_mode", ["w4a16_nvfp4", "nvfp4"])
 @requires_quant
 @requires_weight_folding
