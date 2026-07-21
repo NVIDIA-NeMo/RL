@@ -327,8 +327,8 @@ def test_modelopt_real_quant_cpu_and_gpu_exports_are_byte_identical(
         assert cpu_tensor.shape == gpu_tensor.shape
         assert cpu_tensor.dtype == gpu_tensor.dtype
         assert torch.equal(
-            cpu_tensor.contiguous().view(torch.uint8),
-            gpu_tensor.detach().contiguous().view(torch.uint8).cpu(),
+            cpu_tensor.contiguous().reshape(-1).view(torch.uint8),
+            gpu_tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu(),
         )
 
 
