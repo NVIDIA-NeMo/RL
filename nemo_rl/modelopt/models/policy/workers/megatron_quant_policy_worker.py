@@ -487,11 +487,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         if ignore is None:
             ignore = DEFAULT_NVFP4_IGNORE
         mode = self._get_real_quant_mode()
-        export_cpu_offload = generation_cfg.get("real_quant_export_cpu_offload", True)
-        if not isinstance(export_cpu_offload, bool):
-            raise ValueError(
-                "generation.real_quant_export_cpu_offload must be a boolean"
-            )
+        export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
         yield from self.megatron_bridge.export_hf_weights_modelopt(
             [self.model],
             quant_mode="nvfp4" if mode == "w4a4" else "w4a16_nvfp4",
