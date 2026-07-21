@@ -95,6 +95,7 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     ],
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
     "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
+    "nemo_rl.environments.image_reward_environment._RewardWorker": None,
     # ModelOpt quantization-aware workers
     "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker": [
         "modelopt",
