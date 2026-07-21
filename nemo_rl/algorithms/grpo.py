@@ -62,6 +62,7 @@ from nemo_rl.algorithms.utils import (
     log_generation_metrics,
     print_efficiency_summary,
     print_performance_metrics,
+    resolve_generation_metrics_logger,
     set_seed,
 )
 from nemo_rl.data import DataConfig
@@ -3672,17 +3673,14 @@ def grpo_train(
                     name="train/token_mult_prob_error_plot_sample",
                 )
             del train_data
-            if (
+            _gen_metrics_interval = resolve_generation_metrics_logger(
                 master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("enable_vllm_metrics_logger", False)
-            ):
+            )
+            if _gen_metrics_interval is not None:
                 log_generation_metrics(
                     generation_logger_metrics,
                     total_steps + 1,
-                    master_config.policy["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    _gen_metrics_interval,
                     logger,
                 )
 
@@ -4888,6 +4886,7 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
+                generation_metrics_logged_early = False
                 if NEED_REFIT:
                     timer.start("idle/refit_bubble")
 
@@ -4902,6 +4901,51 @@ def async_grpo_train(
                         generation_logger_metrics = (
                             policy_generation.get_logger_metrics()
                         )
+                        # Log generation telemetry to wandb BEFORE the weight-sync
+                        # refit. refit_policy_generation broadcasts the full policy
+                        # and can OOM on under-provisioned training nodes; emitting
+                        # the metrics we just collected here ensures the per-worker
+                        # inflight-batch-size figure reaches wandb even if the
+                        # subsequent refit fails. The post-step logging below is
+                        # skipped once this fires to avoid a duplicate log.
+                        _early_gen_metrics_interval = (
+                            resolve_generation_metrics_logger(
+                                master_config.policy["generation"]
+                            )
+                        )
+                        if (
+                            _early_gen_metrics_interval is not None
+                            and generation_logger_metrics
+                        ):
+                            # Console summary (wandb-independent proof that the
+                            # per-worker inflight-batch-size telemetry was collected).
+                            _ifb = generation_logger_metrics.get(
+                                "inflight_batch_sizes", {}
+                            )
+                            print(
+                                "  • Generation Logger Metrics (pre-refit) — "
+                                f"Inflight Batch Sizes per worker (step {step + 1}):"
+                            )
+                            for _dp_idx in sorted(_ifb.keys()):
+                                _series = _ifb[_dp_idx]
+                                if _series:
+                                    print(
+                                        f"    - Generation Worker {_dp_idx:3d}: "
+                                        f"n={len(_series)} peak={max(_series)} "
+                                        f"mean={sum(_series) / len(_series):.2f} "
+                                        f"last={_series[-1]}"
+                                    )
+                                else:
+                                    print(
+                                        f"    - Generation Worker {_dp_idx:3d}: (empty)"
+                                    )
+                            log_generation_metrics(
+                                generation_logger_metrics,
+                                step + 1,
+                                _early_gen_metrics_interval,
+                                logger,
+                            )
+                            generation_metrics_logged_early = True
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
@@ -5236,17 +5280,17 @@ def async_grpo_train(
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
 
-            if (
+            _gen_metrics_interval = resolve_generation_metrics_logger(
                 master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("enable_vllm_metrics_logger", False)
+            )
+            if (
+                _gen_metrics_interval is not None
+                and not generation_metrics_logged_early
             ):
                 log_generation_metrics(
                     generation_logger_metrics,
                     step + 1,
-                    master_config.policy["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    _gen_metrics_interval,
                     logger,
                 )
 

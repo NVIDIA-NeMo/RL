@@ -70,6 +70,7 @@ from nemo_rl.algorithms.utils import (
     get_gdpo_reward_component_keys,
     log_generation_metrics,
     print_performance_metrics,
+    resolve_generation_metrics_logger,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
@@ -1279,17 +1280,14 @@ def grpo_train_sync(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
-            if (
+            _gen_metrics_interval = resolve_generation_metrics_logger(
                 master_config.policy["generation"]
-                .get("vllm_cfg", {})
-                .get("enable_vllm_metrics_logger", False)
-            ):
+            )
+            if _gen_metrics_interval is not None:
                 log_generation_metrics(
                     generation_logger_metrics,
                     total_steps + 1,
-                    master_config.policy["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    _gen_metrics_interval,
                     logger,
                 )
 

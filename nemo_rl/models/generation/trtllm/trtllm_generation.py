@@ -132,7 +132,9 @@ class TrtllmGeneration(GenerationInterface):
         # broadcast; colocated shares the policy's NCCL group so don't touch it.
         env_vars: dict[str, str] = {}
         if not self.colocated_enabled:
-            env_vars["NCCL_CUMEM_ENABLE"] = "1"
+            env_vars["NCCL_CUMEM_ENABLE"] = os.environ.get(
+                "NRL_GEN_NCCL_CUMEM_ENABLE", "1"
+            )
 
         if self.model_parallel_size > 1:
             node_bundle_indices = self._get_tied_worker_bundle_indices(cluster)
@@ -434,6 +436,61 @@ class TrtllmGeneration(GenerationInterface):
         except Exception as e:
             print(f"Error in finish_generation: {e}")
             return False
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Collect in-flight batching telemetry from the DP-leader workers.
+
+        Returns the same shape the consumer (algorithms/utils.py) asserts on:
+        ``{metric_name: {dp_idx: list[...]}}`` with ``inflight_batch_sizes`` and
+        ``num_pending_samples`` keys. Mirrors vLLM's get_vllm_logger_metrics.
+        """
+        if not self.async_engine:
+            return {}
+        if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger", False):
+            return {}
+        if not self.worker_group or not self.worker_group.workers:
+            return {}
+
+        futures: list[ray.ObjectRef] = []
+        dp_indices: list[int] = []
+        for dp_idx in range(self.worker_group.dp_size):
+            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+            futures.append(
+                self.worker_group.run_single_worker_single_data(
+                    "get_trtllm_logger_metrics",
+                    worker_idx=worker_idx,
+                )
+            )
+            dp_indices.append(dp_idx)
+
+        results = ray.get(futures)
+        logger_metrics: dict[str, dict[int, list[Any]]] = {
+            "inflight_batch_sizes": {},
+            "num_pending_samples": {},
+        }
+        for dp_idx, stats in zip(dp_indices, results):
+            if not stats:
+                continue
+            inflight = stats.get("inflight_batch_sizes")
+            if inflight:
+                logger_metrics["inflight_batch_sizes"][dp_idx] = inflight
+            pending = stats.get("num_pending_samples")
+            if pending:
+                logger_metrics["num_pending_samples"][dp_idx] = pending
+        return logger_metrics
+
+    def clear_logger_metrics(self) -> None:
+        if not self.async_engine:
+            return
+        if not self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger", False):
+            return
+        if not self.worker_group or not self.worker_group.workers:
+            return
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_trtllm_logger_metrics",
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        ray.get(futures)
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         futures = self.worker_group.run_all_workers_single_data(
