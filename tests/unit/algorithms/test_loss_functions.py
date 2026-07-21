@@ -17,6 +17,8 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss import (
+    ASFTLossConfig,
+    ASFTLossFn,
     ClippedPGLossConfig,
     ClippedPGLossFn,
     DistillationLossFn,
@@ -125,6 +127,63 @@ def test_nll_loss():
     ## NLLLossFn averages the loss over unmasked tokens
     torch.testing.assert_close(loss.cpu(), torch.tensor(999.0))
     assert metrics_dict["num_unmasked_tokens"] == 2
+
+
+def test_asft_loss():
+    """Anchored SFT loss = DFT-reweighted NLL + kl_weight * KL(policy||ref),
+    masked to response tokens. Hand-verified against an independent computation
+    of the documented formula, plus the kl_weight=0 reduction to DFT-only."""
+    B, S = 2, 5
+    # next-token logprobs from the policy, shape [B, S-1].
+    next_token_logprobs = torch.tensor(
+        [[-0.1, -0.2, -0.3, -0.4], [-0.5, -0.6, -0.7, -0.8]]
+    )
+    # reference logprobs live on [B, S] (rolled convention); the loss uses [:, :-1].
+    ref_full = torch.tensor(
+        [[-0.2, -0.1, -0.5, -0.3, 0.0], [-0.4, -0.9, -0.2, -0.6, 0.0]]
+    )
+    # token_mask [B, S]; [:, 1:] selects the response tokens the loss trains on.
+    token_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0, 1.0], [0.0, 1.0, 1.0, 1.0, 0.0]])
+    sample_mask = torch.tensor([1.0, 1.0])
+    data = {
+        "input_ids": torch.zeros(B, S, dtype=torch.long),
+        "token_mask": token_mask,
+        "sample_mask": sample_mask,
+        "reference_policy_logprobs": ref_full,
+    }
+    mask = token_mask[:, 1:] * sample_mask.unsqueeze(-1)
+    global_valid_toks = mask.sum()
+
+    kl_weight = 0.03
+    loss, metrics = ASFTLossFn(ASFTLossConfig(kl_weight=kl_weight, kl_type="k3"))(
+        next_token_logprobs, data, None, global_valid_toks
+    )
+
+    # Independent recomputation of the documented formula.
+    dft = torch.exp(next_token_logprobs).detach()
+    kl = calculate_kl(
+        logprobs=next_token_logprobs,
+        logprobs_reference=ref_full[:, :-1],
+        kl_type="k3",
+        input_clamp_value=20.0,
+        output_clamp_value=10.0,
+    )
+    per_token = dft * (-next_token_logprobs) + kl_weight * kl
+    expected = masked_mean(per_token, mask, global_normalization_factor=global_valid_toks)
+    torch.testing.assert_close(loss, expected)
+
+    # DFT weight is a probability in (0, 1]; the k3 KL penalty is non-negative.
+    assert 0.0 < metrics["mean_dft_weight"] <= 1.0
+    assert metrics["kl_penalty"] >= 0.0
+
+    # kl_weight=0 reduces exactly to the DFT-reweighted NLL (no anchor).
+    loss0, _ = ASFTLossFn(ASFTLossConfig(kl_weight=0.0))(
+        next_token_logprobs, data, None, global_valid_toks
+    )
+    expected0 = masked_mean(
+        dft * (-next_token_logprobs), mask, global_normalization_factor=global_valid_toks
+    )
+    torch.testing.assert_close(loss0, expected0)
 
 
 def test_dpo_loss():

@@ -37,8 +37,8 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     # Smoke checks: run completed and the ASFT loss (DFT-weighted NLL + KL) is
     # finite/reasonable and the KL anchor is active (non-negative, not exploding).
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 1.0' \
-        'data["train/loss"]["10"] < 1.0' \
+        'data["train/loss"]["1"] < 0.5' \
+        'data["train/loss"]["10"] < 0.5' \
         'data["train/kl_penalty"]["10"] >= 0.0'
 
     # Clean up checkpoint directory after successful run to save space.
