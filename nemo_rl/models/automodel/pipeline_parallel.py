@@ -774,11 +774,12 @@ def pp_forward_loop(
 
     all_results: dict[str, list[torch.Tensor]] = {}
     for chunk_idx in range(num_chunks):
-        start = chunk_idx * pp_batch_size
-        # clamp to >=0: with uneven cross-rank data a chunk past this rank's
-        # samples yields an empty slice (downstream padding handles it).
-        actual_chunk_size = max(0, min(pp_batch_size, total_samples - start))
-        chunk_data = data.slice(start, start + actual_chunk_size)
+        chunk_start = chunk_idx * pp_batch_size
+        # Clamp both bounds: ranks with fewer samples still run the globally
+        # synchronized chunk count, and chunks past the local batch are empty.
+        start = min(chunk_start, total_samples)
+        end = min(chunk_start + pp_batch_size, total_samples)
+        chunk_data = data.slice(start, end)
         input_ids = chunk_data.get("input_ids").cuda()
 
         chunk_result = pp_forward_with_post_processing(
