@@ -511,6 +511,7 @@ class VllmInternalWorkerExtension:
         else:
             self.model_runner.model.load_weights(weights=policy_weights)
 
+        # Eagle3 draft weights are exported with the `draft.` prefix.
         self._load_draft_weights(draft_weights)
         # MTP drafters co-trained with the policy receive their weights from the
         # policy stream (no `draft.` prefix), so feed it the policy weights too.
