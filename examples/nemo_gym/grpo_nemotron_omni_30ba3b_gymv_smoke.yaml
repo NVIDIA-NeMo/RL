@@ -28,8 +28,8 @@ grpo:
   num_val_generations_per_prompt: 1
   max_rollout_turns: 4
   max_num_epochs: 1
-  max_num_steps: 20                       # smoke: 5 optimizer steps
-  val_period: 5
+  max_num_steps: 20                       # 
+  val_period: 500
   val_at_start: false                     # exercise eval before training
   val_at_end: false
   max_val_samples: null
@@ -55,36 +55,50 @@ policy:
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  # 8k gives room for a 4-turn multi-image rollout with Omni's per-image cost.
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 4096
 
   megatron_cfg:
     # Full 8-GPU policy node: TP=8, EP=8, PP=1, CP=1. Overrides
     # grpo_nanov3.yaml's TP=2/PP=2/CP=4 layout (tuned for a 32-node run).
-    tensor_model_parallel_size: 8
+    tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
     pipeline_model_parallel_size: 1
-    context_parallel_size: 1
-    sequence_parallel: false             # sp only pays off with tp + cp
-    # Nemotron-Omni VLM freeze contract: language model trains, vision +
-    # audio towers stay frozen. Matches games-bandit vlm_grpo_games.yaml
-    # (the known-good stabilizer choice — unfrozen vision drifted).
-    freeze_vision_encoder: true
-    freeze_vision_projector: true
-    freeze_audio_encoder: true
-    freeze_audio_projector: true
+    context_parallel_size: 2
+    sequence_parallel: true             # sp only pays off with tp + cp
+    activation_checkpointing: true
     # RADIO CPE eval mode: keeps vision-tower positional embeddings in eval
     # mode during rollout/train (required for the frozen vision path to
     # produce stable features).
     radio_force_cpe_eval_mode: true
+    # Empty the CUDA cache before the vLLM refit broadcast so the packed
+    # staging tensor (see nemo_rl/utils/packed_tensor.py) doesn't OOM against
+    # Adam m/v that materialize at the end of iter 1.
+    clear_memory_caches_before_refit: true
+    # Nemotron-Omni carries a sound_encoder / sound_projection tower that
+    # never sees an audio input in gym-v. Those params live in the DDP bucket
+    # with requires_grad=True but never receive a backward hook, so MCore's
+    # async grad-reduce path trips the golden-count assertion at
+    # param_and_grad_buffer.py:272 on iter 2's zero_grad_buffer(). Disable
+    # the overlap paths until the sound tower is actually frozen via a
+    # nemo-rl pre_wrap_hook (mirror of freeze_moe_router). This is a real
+    # perf cost — remove once the freeze path is wired.
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+
+    # Flat LR throughout: skip warmup (base recipe warmed 3e-7 → 3e-6 over 10
+    # iters). Combined with lr_decay_style="constant" and min_lr == lr from
+    # grpo_nanov3.yaml, this pins the LR at 3e-6 from step 0 onward.
+    scheduler:
+      lr_warmup_iters: 0
 
   # base recipe ties this to dtensor_cfg.tensor_parallel_size; we're on
   # megatron, so pin to the megatron TP directly.
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  make_sequence_length_divisible_by: 32
 
   generation:
-    max_new_tokens: 2048                 # per-turn cap; 4 turns fit in 8k context
+    max_new_tokens: 4096                 # per-turn cap; 4 turns fit in 8k context
     # Nano-Omni-Reasoning bad_words: only the vision-side text tokens (safe,
     # in-vocab). The audio-delimiter tokens (<so_embedding>, <so_start>,
     # <so_end>) sit past the LM's text-logit width and cause vLLM
@@ -96,7 +110,7 @@ policy:
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.7
+      gpu_memory_utilization: 0.8
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: true                # skip CUDA-graph capture for the smoke run
       # Nano-Omni + prefix caching crashes vLLM's mm cache (mm_hash miss).
@@ -110,8 +124,8 @@ policy:
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
-        reasoning_parser: deepseek_r1
-        chat_template_content_format: string
+        reasoning_parser: nemotron_v3
+        # chat_template_content_format: string
     vllm_kwargs:
       # Bounds per-prompt image count (multi-turn appends one board / turn).
       limit_mm_per_prompt: {"image": 8}
@@ -126,7 +140,7 @@ policy:
       enabled: false                     # non-colocated: dedicated vLLM node
       resources:
         gpus_per_node: 8
-        num_nodes: 1
+        num_nodes: 2
 
 data:
   train:
@@ -156,7 +170,7 @@ env:
     gym_v_agent:
       responses_api_agents:
         gymv_agent:
-          max_steps: 4
+          max_steps: 1
           done_if_no_boxed_answer: true
 
 logger:
@@ -170,4 +184,4 @@ logger:
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 2
+  num_nodes: 4

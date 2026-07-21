@@ -4,24 +4,45 @@
 # with the repo checked out at the working directory (typically /opt/nemo-rl).
 #
 # Usage:
-#   examples/nemo_gym/run_gymv_smoke.sh qwen                # Qwen2.5-VL-3B (1n, 4vllm+4mcore)
-#   examples/nemo_gym/run_gymv_smoke.sh nemotron            # Nemotron-Omni-30B (2n, 1vllm+1mcore)
-#   examples/nemo_gym/run_gymv_smoke.sh <recipe.yaml>       # any recipe under examples/nemo_gym/
+#   examples/nemo_gym/run_gymv_smoke.sh qwen                          # Qwen2.5-VL-3B (1n, 4vllm+4mcore)
+#   examples/nemo_gym/run_gymv_smoke.sh nemotron                      # Nemotron-Omni-30B sync (2n, 1vllm+1mcore)
+#   examples/nemo_gym/run_gymv_smoke.sh nemotron async                # Nemotron-Omni-30B async, max_trajectory_age_steps=1
+#   examples/nemo_gym/run_gymv_smoke.sh nemotron async wandb          # ... also sets logger.wandb_enabled=true
+#   examples/nemo_gym/run_gymv_smoke.sh <recipe.yaml>                 # any recipe under examples/nemo_gym/
 #
-# Extra CLI args after the recipe pick are forwarded to the training script,
-# so you can layer Hydra overrides on top, e.g.:
+# Extra CLI args after the recipe/mode/wandb tokens are forwarded to the
+# training script, so you can layer Hydra overrides on top, e.g.:
 #   examples/nemo_gym/run_gymv_smoke.sh qwen grpo.max_num_steps=1
 
 set -euo pipefail
 
 RECIPE_KEY="${1:-qwen}"; shift || true
 
+# Optional mode token ("sync" or "async"). Only consumed if it matches; anything
+# else stays in $@ so Hydra overrides after the recipe key still work.
+MODE=""
+if [[ "${1:-}" == "async" || "${1:-}" == "sync" ]]; then
+    MODE="${1}"; shift
+fi
+
+# Optional "wandb" token — same consume-if-matches pattern. Appends the
+# Hydra override that flips wandb logging on for this run.
+EXTRA_HYDRA_ARGS=()
+if [[ "${1:-}" == "wandb" ]]; then
+    EXTRA_HYDRA_ARGS+=("logger.wandb_enabled=true")
+    shift
+fi
+
 case "${RECIPE_KEY}" in
     qwen)
         RECIPE="examples/nemo_gym/grpo_qwen25vl_gymv_smoke.yaml"
         ;;
     nemotron|omni)
-        RECIPE="examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_smoke.yaml"
+        if [[ "${MODE}" == "async" ]]; then
+            RECIPE="examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_smoke_async_1off.yaml"
+        else
+            RECIPE="examples/nemo_gym/grpo_nemotron_omni_30ba3b_gymv_smoke.yaml"
+        fi
         ;;
     *)
         RECIPE="${RECIPE_KEY}"
@@ -64,10 +85,12 @@ echo "==> recipe: ${RECIPE}"
 echo "==> entry:  ${ENTRY}"
 echo "==> HF_HOME=${HF_HOME}"
 echo "==> RAY_TMPDIR=${RAY_TMPDIR}"
-
-	#--locked --no-sync \
+if [[ "${#EXTRA_HYDRA_ARGS[@]}" -gt 0 ]]; then
+    echo "==> extra:  ${EXTRA_HYDRA_ARGS[*]}"
+fi
 
 exec uv run \
     "${ENTRY}" \
     --config "${RECIPE}" \
+    ${EXTRA_HYDRA_ARGS[@]+"${EXTRA_HYDRA_ARGS[@]}"} \
     "$@"

@@ -130,10 +130,6 @@ policy:
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
-    # Freeze the vision tower + projector for the smoke run. Matches the
-    # nemo-rl-games-bandit vlm_grpo_games.yaml default stabilizer choice.
-    freeze_vision_encoder: true
-    freeze_vision_projector: true
 
     optimizer:
       optimizer: "adam"

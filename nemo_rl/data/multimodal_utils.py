@@ -67,34 +67,6 @@ MEDIA_TAG_PATTERN = re.compile(
 
 logger = logging.getLogger(__name__)
 
-
-class MultimodalProcessorAdapter(Protocol):
-    """Adapter for processor-specific multimodal chat preprocessing."""
-
-    def process(
-        self,
-        processor: Any,
-        messages: list[dict[str, Any]],
-        *,
-        add_generation_prompt: bool,
-    ) -> tuple[str, dict[str, Any]]:
-        """Render and tokenize a complete multimodal conversation."""
-
-
-_MULTIMODAL_PROCESSOR_ADAPTERS: dict[str, MultimodalProcessorAdapter] = {}
-
-
-def register_multimodal_processor_adapter(
-    processor_class_name: str, adapter: MultimodalProcessorAdapter
-) -> None:
-    """Register preprocessing behavior for a nonstandard processor class."""
-    if not processor_class_name:
-        raise ValueError("processor_class_name must be non-empty")
-    if not callable(getattr(adapter, "process", None)):
-        raise TypeError("adapter must implement a callable process method")
-    _MULTIMODAL_PROCESSOR_ADAPTERS[processor_class_name] = adapter
-
-
 def _images_from_messages(messages: list[dict[str, Any]]) -> list[Image.Image]:
     images = []
     for message in messages:
@@ -132,63 +104,6 @@ class _HuggingFaceMultimodalProcessorAdapter:
         return formatted_text, dict(processed)
 
 
-class _PlaceholderMultimodalProcessorAdapter:
-    """Adapter for processors that expand image placeholder text in ``__call__``."""
-
-    def process(
-        self,
-        processor: Any,
-        messages: list[dict[str, Any]],
-        *,
-        add_generation_prompt: bool,
-    ) -> tuple[str, dict[str, Any]]:
-        images = _images_from_messages(messages)
-        image_token = getattr(processor, "image_token", "<image>")
-        placeholder_messages = []
-        for message in messages:
-            converted_message = dict(message)
-            content = message.get("content")
-            if isinstance(content, list):
-                text_parts = []
-                for part in content:
-                    if part.get("type") == "image":
-                        text_parts.append(image_token)
-                    elif part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                    else:
-                        raise ValueError(
-                            "Placeholder-style image processors only support text "
-                            f"and image content, got {part.get('type')!r}."
-                        )
-                # Empty separator matches vLLM's
-                # `chat_template_content_format="string"` handler, which
-                # concatenates multimodal parts (image_token + text) with no
-                # inter-part separator. Using "\n" here inserted an extra
-                # newline token per <image>/text boundary and made the
-                # reconstructed trajectory diverge from what vLLM tokenized
-                # during rollout (see examples/nemo_gym/debug_nano_omni_template.py).
-                converted_message["content"] = "".join(text_parts)
-            placeholder_messages.append(converted_message)
-
-        template_messages = placeholder_messages
-        if hasattr(processor, "conversation_preprocessor"):
-            template_messages = [
-                processor.conversation_preprocessor(message)
-                for message in placeholder_messages
-            ]
-        formatted_text = processor.apply_chat_template(
-            template_messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        processed = processor(
-            text=formatted_text,
-            images=images,
-            return_tensors="pt",
-        )
-        return formatted_text, dict(processed)
-
-
 def process_multimodal_chat(
     processor: Any,
     messages: list[dict[str, Any]],
@@ -201,9 +116,7 @@ def process_multimodal_chat(
     adapter. All other processors are expected to support Hugging Face's
     multimodal ``apply_chat_template`` interface.
     """
-    adapter = _MULTIMODAL_PROCESSOR_ADAPTERS.get(
-        type(processor).__name__, _HuggingFaceMultimodalProcessorAdapter()
-    )
+    adapter = _HuggingFaceMultimodalProcessorAdapter()
     formatted_text, processed = adapter.process(
         processor,
         messages,
@@ -233,15 +146,6 @@ def process_multimodal_chat(
             "Hugging Face multimodal chat-template interface."
         )
     return formatted_text, processed
-
-
-for _processor_class_name in (
-    "NemotronNanoVLV2Processor",
-    "NemotronH_Nano_Omni_Reasoning_V3Processor",
-):
-    register_multimodal_processor_adapter(
-        _processor_class_name, _PlaceholderMultimodalProcessorAdapter()
-    )
 
 
 class PackedTensor:

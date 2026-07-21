@@ -172,6 +172,7 @@ mcore = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "megatron-core",
   "megatron-bridge",
+  "megatron-energon[av-decode]~=7.0",
   # Must match Megatron-Bridge main's transformers requirement (still includes GLM 5.1 support).
   "transformers>=5.8.1,<5.9.0",
   "nvidia-modelopt[torch]; sys_platform != 'darwin'",

@@ -30,6 +30,7 @@ from nemo_rl.data.interfaces import (
     VLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import get_formatted_message_log
+from nemo_rl.data.multimodal_utils import get_multimodal_keys_from_processor
 
 TokenizerType = PreTrainedTokenizerBase
 
