@@ -64,15 +64,18 @@ _PARTITION_ID = "rollout_data"
 _ArealClass = SingleControllerArealActor.__ray_actor_class__
 
 
-def _make_batch(n: int) -> KVBatchMeta:
+def _make_batch(n: int, *, weight_versions: list[int] | None = None) -> KVBatchMeta:
     """Real full-batch KVBatchMeta with ``n`` rows. ``tags`` carry a
     ``weight_version`` so the loop's lag log path is exercised."""
+    if weight_versions is None:
+        weight_versions = [0] * n
+    assert len(weight_versions) == n
     return KVBatchMeta(
         partition_id=_PARTITION_ID,
         task_name="train",
         sample_ids=[f"s{i}" for i in range(n)],
         sequence_lengths=[i + 1 for i in range(n)],
-        tags=[{"row": i, "weight_version": 0} for i in range(n)],
+        tags=[{"row": i, "weight_version": weight_versions[i]} for i in range(n)],
     )
 
 
@@ -199,6 +202,7 @@ class _ArealHelper:
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
+            "staleness": [],
         }
         self._trainer_version = 0
         self._train_steps = 0
@@ -654,6 +658,34 @@ def test_publish_aggregates_metrics_from_every_minibatch():
     assert train_metrics["custom_sum"] == pytest.approx((1.0 + 2.0) / 2)
     assert train_metrics["lr"] == pytest.approx(2.0e-4)
     assert train_metrics["wd"] == pytest.approx(0.02)
+
+
+def test_publish_logs_rollout_start_weight_staleness():
+    """Staleness uses each consumed row's rollout-start weight version."""
+    events: list = []
+    batch = _make_batch(
+        8,
+        weight_versions=[0, 0, 1, 1, 2, 2, 3, 3],
+    )
+    helper = _ArealHelper(
+        minibatch_size=4,
+        max_num_steps=1,
+        batches=[batch],
+        trainer=_RecordingTrainer(events),
+        events=events,
+    )
+    helper._trainer_version = 3
+    logger = _RecordingLogger()
+    helper._logger = logger
+
+    _run(helper)
+
+    train_metrics = next(
+        metrics for metrics, kwargs in logger.calls if kwargs["prefix"] == "train"
+    )
+    assert train_metrics["staleness/mean"] == pytest.approx(1.5)
+    assert train_metrics["staleness/max"] == pytest.approx(3.0)
+    assert train_metrics["staleness/min"] == pytest.approx(0.0)
 
 
 def test_clear_samples_uses_full_batch_sample_ids():

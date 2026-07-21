@@ -255,6 +255,7 @@ class SingleControllerArealActor:
             "masked_advantages": [],
             "sequence_lengths": [],
             "gen_tokens_per_sample": [],
+            "staleness": [],
         }
 
         print(
@@ -520,6 +521,17 @@ class SingleControllerArealActor:
                         f"minibatches",
                         flush=True,
                     )
+
+                # Per-sample staleness = version gap at consumption. The
+                # weight_version tag is pinned to the rollout's start version,
+                # so refits during generation do not change this value.
+                sample_versions = [
+                    t["weight_version"]
+                    for t in train_meta.tags  # type: ignore
+                ]
+                self._step_log_dict["staleness"].extend(
+                    self._trainer_version - v for v in sample_versions
+                )
 
                 # ══════════ PHASE 2 — per-MINIBATCH optimizer steps (single pass) ══
                 with self._timer.time("training_prep"):

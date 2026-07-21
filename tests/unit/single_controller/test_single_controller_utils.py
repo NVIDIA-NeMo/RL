@@ -22,6 +22,7 @@ import torch
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     aggregate_step_metrics_multi_minibatch,
+    reduce_advantage_pump_metrics,
 )
 
 
@@ -132,3 +133,26 @@ def test_aggregate_step_metrics_combines_all_optimizer_results():
 def test_aggregate_step_metrics_rejects_empty_result_list():
     with pytest.raises(ValueError, match="at least one train result"):
         aggregate_step_metrics_multi_minibatch([])
+
+
+def test_reduce_advantage_pump_metrics_staleness_stats():
+    out = reduce_advantage_pump_metrics(
+        rewards=[torch.tensor([1.0, 0.0])],
+        masked_advantages=[torch.tensor([0.5, -0.5])],
+        sequence_lengths=[3, 4],
+        staleness=[0, 1, 3],
+    )
+
+    assert out["staleness/mean"] == pytest.approx(4.0 / 3.0)
+    assert out["staleness/max"] == pytest.approx(3.0)
+    assert out["staleness/min"] == pytest.approx(0.0)
+
+
+def test_reduce_advantage_pump_metrics_omits_staleness_when_absent():
+    out = reduce_advantage_pump_metrics(
+        rewards=[torch.tensor([1.0])],
+        masked_advantages=[torch.tensor([0.5])],
+        sequence_lengths=[2],
+    )
+
+    assert not any(key.startswith("staleness/") for key in out)

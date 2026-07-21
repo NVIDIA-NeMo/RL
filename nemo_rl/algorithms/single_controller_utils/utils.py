@@ -232,6 +232,7 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
     gen_tokens_per_sample: list[float] | None = None,
+    staleness: list[int] | None = None,
 ) -> dict[str, Any]:
     """Reduce per-step accumulators from _advantage_pump into step scalars.
 
@@ -245,11 +246,15 @@ def reduce_advantage_pump_metrics(
             (``gen_tokens_per_sample/*``, ``total_tokens_per_sample/*``,
             ``mean_gen_tokens_per_sample``) so wandb charts line up across the
             legacy and SC paths.
+        staleness: Per-sample weight-version lag (trainer version at
+            consumption minus the sample's generation version) for every
+            sample trained on this step.
 
     Returns:
         Dict with reward, advantages/{mean,max,min}, total_num_tokens, and —
         when ``gen_tokens_per_sample`` is provided — the legacy-named length
-        metrics above.
+        metrics above, and — when ``staleness`` is provided —
+        staleness/{mean,max,min}.
     """
     out: dict[str, float] = {}
     if rewards:
@@ -284,6 +289,10 @@ def reduce_advantage_pump_metrics(
                     "total_tokens_per_sample",
                 )
             )
+    if staleness:
+        out["staleness/mean"] = float(np.mean(staleness))
+        out["staleness/max"] = float(max(staleness))
+        out["staleness/min"] = float(min(staleness))
     return out
 
 

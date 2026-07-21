@@ -257,6 +257,7 @@ class SingleControllerActor:
             "rewards": [],
             "masked_advantages": [],
             "sequence_lengths": [],
+            "staleness": [],
         }
 
         print(
@@ -667,11 +668,18 @@ class SingleControllerActor:
                             int(s) for s in train_meta.sequence_lengths
                         )
 
-                    # Refresh min_sample_version
-                    curr_min_sample_version = min(
+                    # Per-sample staleness = version gap at consumption;
+                    # _trainer_version stays fixed until the step closes below.
+                    sample_versions = [
                         t["weight_version"]
                         for t in train_meta.tags  # type: ignore
+                    ]
+                    self._step_log_dict["staleness"].extend(
+                        self._trainer_version - v for v in sample_versions
                     )
+
+                    # Refresh min_sample_version
+                    curr_min_sample_version = min(sample_versions)
                     if min_sample_version is not None:
                         min_sample_version = min(
                             min_sample_version, curr_min_sample_version
