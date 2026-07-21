@@ -18,11 +18,9 @@
 import asyncio
 import copy
 import json
-import math
 import statistics
 import warnings
 from collections import defaultdict
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -30,7 +28,7 @@ import ray
 import torch
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
-from wandb import Histogram, Table
+from wandb import Table
 
 from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
@@ -48,6 +46,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -83,6 +82,21 @@ def _add_r3_fallback_metrics(
     gen_metrics["r3/routed_experts_actual_token_routes"] = actual_routes
     gen_metrics["r3/routed_experts_fallback_token_route_fraction"] = (
         float(missing_routes / expected_routes) if expected_routes > 0 else 0.0
+    )
+
+
+def _extract_mask_sample_flags(results: list[dict[str, Any]]) -> torch.Tensor:
+    """Return True for samples the environment asks GRPO to mask from loss."""
+    return torch.tensor(
+        [
+            bool(
+                (result["full_result"].get("instance_config") or {}).get(
+                    "mask_sample", False
+                )
+            )
+            for result in results
+        ],
+        dtype=torch.bool,
     )
 
 
@@ -1204,6 +1218,9 @@ async def run_sample_multi_turn_rollout(
         for name, acc in reward_acc_dict.items():
             final_sample_state[name] = torch.tensor(acc)
 
+    # max_gen_tokens_per_turn: Diagnostic for long single generations
+    max_gen_tokens_per_turn = max(turn_gen_tokens) if turn_gen_tokens else 0
+
     # Sample metrics
     sample_metrics = {
         "turn_count": turn_count,
@@ -1217,6 +1234,7 @@ async def run_sample_multi_turn_rollout(
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
+        "max_gen_tokens_per_turn": max_gen_tokens_per_turn,
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
@@ -1359,13 +1377,19 @@ def run_async_multi_turn_rollout(
             if key not in final_batch:
                 final_batch[key] = input_batch[key]
 
+        turn_counts = [m["turn_count"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
+
         # Aggregate metrics across all samples
         rollout_metrics = {
             # Overall metrics
-            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
-            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
+            "total_turns": sum(turn_counts),
+            "avg_turns_per_sample": sum(turn_counts) / batch_size,
+            "max_turns_per_sample": max(turn_counts),
+            "turns_per_sample/p95": pct(turn_counts, 95),
+            "turns_per_sample/p99": pct(turn_counts, 99),
             "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
             / batch_size,
             "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
@@ -1390,6 +1414,11 @@ def run_async_multi_turn_rollout(
                 m["env_tokens"] for m in all_sample_metrics
             )
             / batch_size,
+            # max_gen_tokens_per_turn: Diagnostic for long single generations
+            "max_gen_tokens_per_turn/max": max(max_gen_tokens_per_turn_values),
+            "max_gen_tokens_per_turn/mean": sum(max_gen_tokens_per_turn_values)
+            / batch_size,
+            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn_values, 95),
             # Reward metrics
             "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
             / batch_size,
@@ -1434,19 +1463,6 @@ class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
-
-
-def _calculate_single_metric(
-    values: Sequence[float | int], batch_size: int, key_name: str
-) -> dict:
-    return {
-        f"{key_name}/mean": sum(values) / batch_size,
-        f"{key_name}/max": max(values),
-        f"{key_name}/min": min(values),
-        f"{key_name}/median": statistics.median(values),
-        f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
-        f"{key_name}/histogram": Histogram(values),
-    }
 
 
 def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
@@ -1975,30 +1991,52 @@ def run_async_nemo_gym_rollout(
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
                 "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
                 == max_total_tokens_per_sample,
+                # max_gen_tokens_per_turn: Diagnostic for long single generations
+                "max_gen_tokens_per_turn": max(
+                    (
+                        len(m["token_ids"])
+                        for m in r["message_log"]
+                        if m["role"] == "assistant"
+                    ),
+                    default=0,
+                ),
             }
             for r in results
         ]
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
+        turn_counts = [m["turn_count"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
+
         rollout_metrics = {
             **rollout_loop_timing_metrics,
-            **_calculate_single_metric(
-                [m["turn_count"] for m in all_sample_metrics],
+            **calculate_single_metric(
+                turn_counts,
                 batch_size,
                 "turns_per_sample",
             ),
-            **_calculate_single_metric(
+            "turns_per_sample/p95": pct(turn_counts, 95),
+            "turns_per_sample/p99": pct(turn_counts, 99),
+            **calculate_single_metric(
                 [m["total_tokens"] for m in all_sample_metrics],
                 batch_size,
                 "total_tokens_per_sample",
             ),
-            **_calculate_single_metric(
+            **calculate_single_metric(
                 [m["assistant_tokens"] for m in all_sample_metrics],
                 batch_size,
                 "gen_tokens_per_sample",
             ),
-            **_calculate_single_metric(
+            **calculate_single_metric(
+                max_gen_tokens_per_turn_values,
+                batch_size,
+                "max_gen_tokens_per_turn",
+            ),
+            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn_values, 95),
+            **calculate_single_metric(
                 [m["total_reward"] for m in all_sample_metrics],
                 batch_size,
                 "total_reward",
@@ -2037,7 +2075,7 @@ def run_async_nemo_gym_rollout(
                 ]
                 if values:
                     per_agent_metrics.update(
-                        _calculate_single_metric(
+                        calculate_single_metric(
                             values, len(agent_results), f"{agent_name}/{key}"
                         )
                     )
@@ -2089,6 +2127,9 @@ def run_async_nemo_gym_rollout(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
+            # Agent/env-driven mask flag — True means this sample should be masked
+            # from the GRPO gradient (kept for advantage computation).
+            "mask_sample": _extract_mask_sample_flags(results),
         }
     )
 
@@ -2125,6 +2166,41 @@ def run_async_nemo_gym_rollout(
         for key, (flag, metric_name) in _PENALTY_METRICS.items():
             if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
                 rollout_metrics[metric_name] = penalty_counts[key] / len(results)
+
+    # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
+    # Gym environments so GDPO can compute per-component advantages; single-reward envs
+    # are unaffected. Mirrors the native rollout path's reward-component handling above.
+    from nemo_rl.environments.nemo_gym import (
+        extract_reward_components,
+        validate_reward_components_match_scalar,
+    )
+
+    component_dicts = [extract_reward_components(r["full_result"]) for r in results]
+    if any(c is not None for c in component_dicts):
+        # Emit each component under a `reward/<name>` key, matching the native
+        # multi-reward path and what get_gdpo_reward_component_keys() consumes (it selects
+        # keys starting with "reward/" and sorts them by name). The name carries the
+        # component identity, so ordering is handled downstream by that sort — no
+        # positional index needed. Take the union of names across the batch and default a
+        # component absent on a given sample to 0.0, so every sample carries the same key
+        # set (the per-prompt baseline requires each reward/<name> present for all
+        # responses to a prompt).
+        component_names = sorted(
+            {name for c in component_dicts if c is not None for name in c}
+        )
+        for name in component_names:
+            final_batch[f"reward/{name}"] = torch.tensor(
+                [
+                    c[name] if c is not None and name in c else 0.0
+                    for c in component_dicts
+                ]
+            )
+        # Leave total_reward as the verifier's scalar `reward` (set above); do not
+        # silently overwrite it. When a verifier emits reward_components, the contract is
+        # reward == sum(components), so overwriting would be a no-op in the correct case
+        # and would only mask a misconfigured verifier when it isn't. Validate that
+        # contract instead and fail fast on a real mismatch.
+        validate_reward_components_match_scalar([r["full_result"] for r in results])
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,

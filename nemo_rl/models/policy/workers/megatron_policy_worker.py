@@ -16,6 +16,7 @@ import gc
 import logging
 import os
 import re
+import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -91,6 +92,11 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.checkpoint_engine import (
+    MegatronCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    maybe_preinit_nixl_checkpoint_engine,
+)
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -145,6 +151,8 @@ class MegatronPolicyWorkerImpl(
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     TQWorkerMixin,
+    MegatronCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
 ):
@@ -152,6 +160,7 @@ class MegatronPolicyWorkerImpl(
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
     _train_step_state: Optional[dict[str, Any]] = None
+    _remote_sparse_refit: Any = None
 
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -227,6 +236,7 @@ class MegatronPolicyWorkerImpl(
     def configure_worker(
         num_gpus: int | float,
         bundle_indices: Optional[tuple[int, list[int]]] = None,
+        num_gpus_per_node: Optional[int] = None,
     ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         """Worker-controlled Ray actor configuration.
 
@@ -235,6 +245,8 @@ class MegatronPolicyWorkerImpl(
         Args:
             num_gpus: Original GPU allocation for this worker based on the placement group
             bundle_indices: Tuple of (node_idx, local_bundle_indices) for this server
+            num_gpus_per_node: Per-node GPU count (unused here; part of the shared
+                configure_worker contract).
 
         Returns:
             tuple with complete worker configuration:
@@ -244,6 +256,7 @@ class MegatronPolicyWorkerImpl(
               - 'runtime_env': Additional runtime_env options (e.g., nsight config)
         """
         del bundle_indices  # one GPU per worker; no per-bundle seeding needed
+        del num_gpus_per_node  # not needed; one GPU per worker
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
         init_kwargs: dict[str, Any] = {}
@@ -288,6 +301,7 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -478,10 +492,12 @@ class MegatronPolicyWorkerImpl(
             return False
         return len(getattr(self.model, "remove_forward_pre_hook_handles", {})) > 0
 
-    def _disable_forward_pre_hook_until_next_train_step(self) -> None:
+    def _disable_forward_pre_hook_until_next_train_step(
+        self, *, param_sync: bool = False
+    ) -> None:
         assert isinstance(self.model, DistributedDataParallel)
         if self._forward_pre_hook_enabled():
-            self.disable_forward_pre_hook(param_sync=False)
+            self.disable_forward_pre_hook(param_sync=param_sync)
         model_config = get_model_config(self.model)
         self._first_train_step_param_sync_func = model_config.param_sync_func
         model_config.param_sync_func = None
@@ -596,6 +612,10 @@ class MegatronPolicyWorkerImpl(
             self.model.train()
             saved_extra_state = None
             reenable_forward_pre_hook_after_eval = False
+
+        torch.distributed.barrier()  # pragma: no cover
+        torch.cuda.synchronize()  # pragma: no cover
+        _train_t0 = time.perf_counter()  # pragma: no cover
 
         with ctx:
             all_mb_metrics = []
@@ -722,8 +742,15 @@ class MegatronPolicyWorkerImpl(
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    # Megatron-LM PR #4116 replaced the optimizer.mtp_grad_norm attribute
+                    # with a per-group dict populated during gradient clipping. Value is
+                    # None when clip_grad == 0 or this rank owns no MTP-tagged params
+                    # (MTP params are tagged only when mtp_detach_heads=True, on the last
+                    # pipeline stage). grad_norms_by_group always exists after step().
+                    mtp_grad_norm = self.optimizer.grad_norms_by_group.get("mtp")
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
+                    mtp_grad_norm = None
 
                 pg_collection = get_pg_collection(self.model)
 
@@ -739,6 +766,11 @@ class MegatronPolicyWorkerImpl(
                 )
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
                     num_zeros_in_grad, mp_group=pg_collection.mp
+                )
+                # Max-reduce across the model-parallel group so every rank (including
+                # non-last-PP-stage ranks, where it is None) has the MTP grad norm.
+                mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
+                    mtp_grad_norm, mp_group=pg_collection.mp
                 )
                 if (
                     not eval_mode
@@ -799,6 +831,10 @@ class MegatronPolicyWorkerImpl(
             # accumulation starts from a clean shared param/grad buffer.
             self._disable_forward_pre_hook_until_next_train_step()
 
+        torch.distributed.barrier()  # pragma: no cover
+        torch.cuda.synchronize()  # pragma: no cover
+        metrics_train_elapsed = time.perf_counter() - _train_t0  # pragma: no cover
+
         if not eval_mode:
             # Step LR scheduler once per train() call, not per global batch.
             # Megatron's OptimizerParamScheduler.step takes an `increment` in
@@ -821,6 +857,7 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
@@ -837,7 +874,33 @@ class MegatronPolicyWorkerImpl(
                 metrics["moe_metrics"] = moe_metrics
         # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
         # pull an unpicklable torch ConfigModuleInstance into the worker actor).
-        self._collect_mtp_metrics(metrics)
+        self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
+
+        # Skip FLOPs estimation when sequence packing is enabled: gbs counts original
+        # samples but each packed sequence spans max_total_sequence_length tokens,
+        # so flops_per_sample * gbs would overcount by the packing factor.
+        if not self.cfg.get("sequence_packing", {}).get("enabled", False):
+            try:  # pragma: no cover
+                from megatron.bridge.training.utils import flop_utils as _mb_flop_utils
+
+                # cfg.model.seq_length is set from max_position_embeddings (model max context)
+                # via CONFIG_MAPPING, not from max_total_sequence_length. Override it with the
+                # actual training sequence length so FLOPs are not inflated.
+                _orig_seq = self.mcore_state.cfg.model.seq_length
+                self.mcore_state.cfg.model.seq_length = self.cfg[
+                    "max_total_sequence_length"
+                ]
+                try:
+                    flops_per_sample = _mb_flop_utils.num_floating_point_operations(
+                        self.mcore_state.cfg, batch_size=1
+                    )
+                finally:
+                    self.mcore_state.cfg.model.seq_length = _orig_seq
+
+                metrics["total_flops"] = flops_per_sample * gbs * num_global_batches
+                metrics["num_ranks"] = torch.distributed.get_world_size()
+            except Exception as e:
+                warnings.warn(f"Failed to compute FLOPs for MFU reporting: {e}")
         self.timer.stop("train")
         return metrics
 
@@ -1690,12 +1753,26 @@ class MegatronPolicyWorkerImpl(
 
         return refit_param_info_hf
 
-    def _collect_mtp_metrics(self, metrics: dict[str, Any]) -> None:
+    def _collect_mtp_metrics(
+        self,
+        metrics: dict[str, Any],
+        total_num_microbatches: int,
+        mtp_grad_norm: Optional[float],
+    ) -> None:
         """Add Multi-Token Prediction metrics to ``metrics`` when MTP is enabled.
 
         get_mtp_metrics is imported lazily (not a module global) so cloudpickle
         does not pull an unpicklable torch ConfigModuleInstance into the worker
         actor's serialization.
+
+        Args:
+            metrics: Metrics dict to populate with MTP metrics (under "mtp_metrics").
+            total_num_microbatches: Microbatches accumulated this step. The MTP loss
+                logging helper sums the per-microbatch loss without dividing, so we pass
+                1/total_num_microbatches to recover the mean (mirroring the MoE path).
+            mtp_grad_norm: The MTP parameter group's gradient norm, already reduced across
+                the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
+                mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
         """
         mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
         if mtp_num_layers is not None and mtp_num_layers > 0:
@@ -1704,8 +1781,13 @@ class MegatronPolicyWorkerImpl(
             # MTP layers live only on the last pipeline stage, so the tracker is
             # populated there alone. Broadcast to all stages so downstream metric
             # aggregation (which reads rank 0's results) sees them when PP > 1.
-            mtp_metrics = get_mtp_metrics()
+            mtp_loss_scale = 1.0 / max(1, total_num_microbatches)
+            mtp_metrics = get_mtp_metrics(loss_scale=mtp_loss_scale)
             mtp_metrics = broadcast_loss_metrics_from_last_stage(mtp_metrics)
+            # mtp_grad_norm is already MP-reduced (same value on every rank); expose it
+            # under the "mtp/" namespace so it logs as train/mtp/grad_norm.
+            if mtp_grad_norm is not None:
+                mtp_metrics["grad_norm"] = float(mtp_grad_norm)
             if mtp_metrics:
                 metrics["mtp_metrics"] = mtp_metrics
 
@@ -1723,6 +1805,62 @@ class MegatronPolicyWorkerImpl(
         elif hasattr(model, "config"):
             return model.config
         return None
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/init_remote_sparse_delta_baseline")
+    def init_remote_sparse_delta_baseline(
+        self,
+        *,
+        shard_rank: int,
+        shard_count: int,
+        transport: str,
+    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        return self._require_remote_sparse_refit().initialize_baseline(
+            shard_rank=shard_rank,
+            shard_count=shard_count,
+            transport=transport,
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_remote_sparse_weights")
+    def stream_remote_sparse_weights(
+        self,
+        transport: str,
+        targets: list[str],
+        *,
+        transfer_id: str,
+        api_key_env_var: Optional[str],
+        timeout_s: float,
+        shard_rank: int,
+        shard_count: int,
+        overwrite_names: list[str],
+    ) -> dict[str, int]:
+        return self._require_remote_sparse_refit().stream(
+            transport,
+            targets,
+            transfer_id=transfer_id,
+            api_key_env_var=api_key_env_var,
+            timeout_s=timeout_s,
+            shard_rank=shard_rank,
+            shard_count=shard_count,
+            overwrite_names=overwrite_names,
+        )
+
+    def _require_remote_sparse_refit(self) -> Any:
+        if self._remote_sparse_refit is None:
+            from nemo_rl.models.policy.workers.megatron_remote_sparse_refit import (
+                MegatronRemoteSparseRefit,
+            )
+
+            refit_config = self.cfg["generation"]["refit_cfg"]
+            assert refit_config is not None
+            self._remote_sparse_refit = MegatronRemoteSparseRefit(
+                self, refit_config.sparse
+            )
+        return self._remote_sparse_refit
+
+    def finish_remote_sparse_delta_sync(self, *, succeeded: bool) -> None:
+        self._require_remote_sparse_refit().finish(succeeded)
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -1795,7 +1933,7 @@ class MegatronPolicyWorkerImpl(
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+            conversion_tasks=self.refit_conversion_tasks,
         )
 
         # Yield the original parameters first.
@@ -1878,9 +2016,6 @@ class MegatronPolicyWorkerImpl(
             src=0,
             post_iter_func=lambda x: x[1],
         )
-
-    def _use_real_quant_refit(self) -> bool:
-        return False
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
@@ -2104,14 +2239,7 @@ class MegatronPolicyWorkerImpl(
         else:
             # Ordinary offload case
             if move_params:
-                new_state_dict = {}
-                for name, item in model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device=device, non_blocking=True, copy=True
-                        )
-                    new_state_dict[name] = item
-                model.load_state_dict(new_state_dict)
+                model.to(device=device, non_blocking=True)
         return model
 
     def move_optimizer(self, device: str):
@@ -2144,6 +2272,13 @@ class MegatronPolicyWorkerImpl(
         **kwargs,
     ):
         """Save a training checkpoint.
+
+        With async_save=True, this method returns after D2H staging. The actual
+        disk write continues in a background persistent worker process. Callers
+        must call finalize_async_save() before renaming the directory or starting
+        another save.
+
+        With async_save=False (default), this blocks until the write is complete.
 
         Args:
             weights_path: The specific directory path where the checkpoint will be saved.
@@ -2217,6 +2352,18 @@ class MegatronPolicyWorkerImpl(
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def finalize_async_save(self):
+        """Block until the in-flight async write completes and run finalize_fns.
+
+        Safe to call when async_save is disabled (no-op).
+        Does NOT terminate the persistent worker — it stays alive for the next save.
+        """
+        maybe_finalize_async_save(
+            self.mcore_state,
+            ckpt_cfg=self.mcore_state.cfg.checkpoint,
+            blocking=True,
+        )
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.

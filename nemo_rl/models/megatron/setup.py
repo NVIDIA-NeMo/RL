@@ -46,6 +46,7 @@ from megatron.bridge.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
 )
+from megatron.bridge.training.model_load_save import load_model_config
 from megatron.bridge.training.optim import setup_optimizer
 from megatron.bridge.training.setup import (
     _create_peft_pre_wrap_hook,
@@ -54,7 +55,6 @@ from megatron.bridge.training.setup import (
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
-from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -128,6 +128,93 @@ try:
     HAVE_FSDP2 = True
 except ImportError:
     HAVE_FSDP2 = False
+
+
+def _force_sync_optimizer_fp32_from_model(optimizer, model):
+    """Force-sync the distributed optimizer's FP32 master copies from the BF16 model params.
+
+    With ``HybridDeviceOptimizer`` (selected by ``optimizer_cpu_offload=True``) three
+    parallel parameter copies exist that all need pretrained values after a
+    fine-tune-style checkpoint load:
+
+      1. ``shard_fp32_from_float16_groups``  -- per-DP-rank FP32 GPU shard used as
+         the Adam master parameter.
+      2. ``hdo.gpu_params_map_cpu_copy``     -- CPU clones the CPU sub-optimizer
+         steps against (this is what makes "cpu offload" actually offload).
+      3. ``hdo.param_to_fp32_param``         -- an additional FP32 working copy
+         that ``HybridDeviceOptimizer`` keeps so it can do its async D2H/H2D
+         dance without aliasing.
+
+    Vanilla ``load_checkpoint`` only refreshes the BF16 model parameters and then
+    calls ``reload_model_params()`` which currently only walks **level 1** for
+    HybridDeviceOptimizer. Levels 2 and 3 keep their default (random) init.
+
+    Failure mode without this helper (the ``optimizer_cpu_offload=True`` +
+    HF -> mcore + ``finetune=True`` path): the first optimizer step does Adam
+    on the stale FP32 master, then writes the result into BF16. BF16 now
+    approximately equals random init plus a tiny Adam delta, and every
+    subsequent forward / refit / rollout uses an essentially untrained model.
+    The training loss looks plausible, but RL reward collapses, KL explodes,
+    and the inference engine produces garbage.
+
+    This helper propagates BF16 -> all three FP32 levels right after the
+    checkpoint load to avoid that reversion.
+    """
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    def _sync_distrib_opt(distrib_opt):
+        try:
+            from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+                HybridDeviceOptimizer,
+            )
+        except ImportError:
+            return False
+        if not isinstance(
+            getattr(distrib_opt, "optimizer", None), HybridDeviceOptimizer
+        ):
+            return False
+
+        hdo = distrib_opt.optimizer
+
+        # Level 1: shard_fp32_from_float16 (GPU FP32 shards) <- BF16 model param view
+        for model_group, shard_main_group in zip(
+            distrib_opt.model_float16_groups,
+            distrib_opt.shard_fp32_from_float16_groups,
+        ):
+            for model_param, shard_main_param in zip(model_group, shard_main_group):
+                if shard_main_param is None:
+                    continue
+                param_range_map = distrib_opt._get_model_param_range_map(model_param)
+                param_range = param_range_map["param"]
+                shard_model_param = model_param.view(-1)[
+                    param_range.start : param_range.end
+                ]
+                shard_main_param.data.copy_(shard_model_param)
+
+        # Level 2: gpu_params_map_cpu_copy (CPU clones the CPU sub-optimizer uses)
+        if hasattr(hdo, "gpu_params_map_cpu_copy"):
+            for gpu_param, cpu_clone in hdo.gpu_params_map_cpu_copy.items():
+                cpu_clone.data.copy_(gpu_param.data)
+
+        # Level 3: param_to_fp32_param (extra FP32 working copy)
+        if hasattr(hdo, "update_fp32_param_by_new_param"):
+            hdo.update_fp32_param_by_new_param()
+        return True
+
+    applied = False
+    if hasattr(optimizer, "chained_optimizers"):
+        for sub_opt in optimizer.chained_optimizers:
+            applied |= _sync_distrib_opt(sub_opt)
+    else:
+        applied = _sync_distrib_opt(optimizer)
+
+    if applied and rank == 0:
+        print(
+            "WORKAROUND: force-synced optimizer FP32 copies from BF16 model "
+            "params (HybridDeviceOptimizer -- synced GPU shards + CPU clones + "
+            "FP32 copies)"
+        )
+
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -519,9 +606,9 @@ def setup_model_config(
         _patch_hf_config_double_instantiation()
 
         try:
-            cfg_from_pretrained = ConfigContainer.from_yaml(
-                pretrained_run_config, mode=InstantiationMode.STRICT
-            )
+            # Enter through Bridge's checkpoint loader so its compatibility
+            # migrations run before the serialized model config is instantiated.
+            model_cfg, _ = load_model_config(os.path.dirname(pretrained_run_config))
         except Exception as e:
             # Add helpful context as a note to the exception
             e.add_note(
@@ -535,9 +622,6 @@ def setup_model_config(
                 f"{'=' * 80}"
             )
             raise
-
-        model_cfg = cfg_from_pretrained.model
-        cfg_from_pretrained.logger = LoggerConfig()
 
     # Apply parallelism settings
     _apply_parallelism_config(model_cfg, config)
@@ -595,6 +679,7 @@ def setup_model_config(
         weights_path,
         optimizer_path,
         load_main_params_from_ckpt,
+        ckpt_cfg=config["megatron_cfg"].get("checkpoint"),
     )
 
     # Validate training configuration
@@ -703,7 +788,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
             "moe_flex_dispatcher_backend"
         ]
     if "moe_hybridep_num_sms" in config["megatron_cfg"]:
-        model_cfg.moe_hybridep_num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+        num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+        if hasattr(TransformerConfig, "moe_flex_dispatcher_num_sms"):
+            model_cfg.moe_flex_dispatcher_num_sms = num_sms
+        else:
+            model_cfg.moe_hybridep_num_sms = num_sms
 
     # HybridEP environment variables
     # These are required by DeepEP's hybrid-ep branch for NVLink domain configuration.
@@ -910,20 +999,59 @@ def _create_checkpoint_config(
     weights_path: Optional[str],
     optimizer_path: Optional[str],
     load_main_params_from_ckpt: bool = False,
+    ckpt_cfg: Optional[dict[str, Any]] = None,
 ) -> CheckpointConfig:
-    """Create checkpoint configurations."""
-    return CheckpointConfig(
+    """Create checkpoint configurations.
+
+    Args:
+        pretrained_path: Path to the pretrained checkpoint.
+        weights_path: Path to save/load training weights.
+        optimizer_path: Path to the optimizer state (None if not resuming optimizer).
+        load_main_params_from_ckpt: Load optimizer main params from the checkpoint.
+        ckpt_cfg: MegatronCheckpointConfig dict from YAML (``megatron_cfg.checkpoint``).
+            Every knob (``async_save``, ``ckpt_assume_constant_structure``, and the
+            parallel-IO fields) is forwarded only when explicitly set in YAML — no
+            call-site default. When a field (or the whole block) is absent, Megatron
+            Bridge's own ``CheckpointConfig`` default applies, so ``async_save``
+            falls back to synchronous save for configs that don't set it.
+    """
+    cfg = ckpt_cfg or {}
+
+    kwargs: dict[str, Any] = dict(
         save_interval=100,
         save=weights_path,
         load=weights_path,
         load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
-        async_save=False,
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
+    # Forward checkpoint knobs only when explicitly set in YAML; otherwise Megatron
+    # Bridge's own CheckpointConfig defaults apply (the exemplar configs own the
+    # values). async_save is presence-checked exactly like the sibling Bridge knobs
+    # — no call-site default — so a config that omits the block keeps Bridge's
+    # default (synchronous save).
+    _optional_ckpt_fields = (
+        "async_save",
+        "ckpt_assume_constant_structure",
+        "ckpt_fully_parallel_save_process_group",
+        "ckpt_fully_parallel_load_process_group",
+        "ckpt_fully_parallel_load_exchange_algo",
+    )
+    for field in _optional_ckpt_fields:
+        if field in cfg:
+            kwargs[field] = cfg[field]
+
+    # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
+    # On a fresh run (no prior checkpoint), weights_path is None, so fall back to
+    # pretrained_path as a placeholder — save_checkpoint() overwrites it with the
+    # real path before each write.
+    if kwargs.get("async_save") and kwargs["save"] is None:
+        kwargs["save"] = pretrained_path
+
+    return CheckpointConfig(**kwargs)
 
 
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
@@ -1173,6 +1301,13 @@ def setup_model_and_optimizer(
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
+    # Must be called before initialize_megatron (before CUDA init) so the
+    # persistent async-checkpoint worker subprocess is spawned in a clean process.
+    # Bridge hardcodes mp_mode='spawn', the only safe option inside Ray actors
+    # (fork with Ray is an anti-pattern). This is a no-op unless async_save is
+    # enabled (see GlobalState.initialize_async_checkpoint_worker).
+    state.initialize_async_checkpoint_worker()
+
     megatron_cfg.dist.external_gpu_device_mapping = True
     initialize_megatron(
         cfg=megatron_cfg,
@@ -1368,6 +1503,24 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
         )
         print("Checkpoint loaded")
+
+        # See _force_sync_optimizer_fp32_from_model: required when
+        # optimizer_cpu_offload=True so the first optimizer step does Adam on the
+        # loaded HF weights instead of stale random init in the FP32 master copies.
+        #
+        # Gate on finetune: this is only safe (and only needed) when the
+        # optimizer state was NOT loaded from the checkpoint, i.e. the FP32
+        # master copies are freshly-built random init. megatron-bridge loads
+        # optimizer state iff `not finetune` (checkpointing.py: "not finetune
+        # and load_optim"), and auto-sets finetune=True on an HF-import /
+        # pretrained load. On a genuine resume (finetune=False) the masters are
+        # restored from the checkpoint at full FP32 precision -- force-copying
+        # the BF16 model params over them would silently round-trip the masters
+        # through BF16 and lose precision, so we must skip the sync there.
+        # state.cfg is megatron_cfg (set above), so this reads the value the
+        # bridge may have just mutated during load_checkpoint.
+        if optimizer is not None and megatron_cfg.checkpoint.finetune:
+            _force_sync_optimizer_fp32_from_model(optimizer, model)
     torch.distributed.barrier()
 
     draft_model = get_attached_draft_model(model)

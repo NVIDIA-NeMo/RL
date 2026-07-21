@@ -33,7 +33,7 @@ def _make_collective_update_extension(backend):
     state_info = object()
     ext.state_dict_info = {"model.weight": state_info}
     ext.model_update_group = object()
-    ext.model_runner = SimpleNamespace(model=object())
+    ext.model_runner = SimpleNamespace(model=object(), vllm_config=object())
     ext.model_config = object()
     ext.device = object()
     return ext, state_info
@@ -104,6 +104,17 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
     )
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
 
+    @contextlib.contextmanager
+    def set_current_vllm_config(config):
+        assert config is ext.model_runner.vllm_config
+        call_order.append("config_enter")
+        try:
+            yield
+        finally:
+            call_order.append("config_exit")
+
+    monkeypatch.setattr("vllm.config.set_current_vllm_config", set_current_vllm_config)
+
     def load_weights(weights):
         call_order.append("load")
         assert weights == [("model.weight", "weight-value")]
@@ -130,7 +141,48 @@ def test_update_weights_from_collective_processes_weights_after_loading(monkeypa
     assert ext.update_weights_from_collective() is True
 
     assert process_calls == [(ext.model_runner.model, ext.model_config, ext.device)]
-    assert call_order == ["broadcast", "load", "process", "kv", "gc", "empty_cache"]
+    assert call_order == [
+        "broadcast",
+        "load",
+        "config_enter",
+        "process",
+        "config_exit",
+        "kv",
+        "gc",
+        "empty_cache",
+    ]
+
+
+@pytest.mark.vllm
+def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        def recv_pyobj(self):
+            return IPCProtocol.COMPLETE
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
+    ext.zmq_socket = FakeSocket()
+    ext.maybe_init_zmq = lambda: None
+
+    @contextlib.contextmanager
+    def lifecycle(_transport):
+        yield lambda: pytest.fail("an incomplete transfer must not be finalized")
+
+    ext._weight_update_lifecycle = lifecycle
+
+    assert ext.update_weights_via_ipc_zmq() is False
+    assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
 
 
 @pytest.mark.vllm

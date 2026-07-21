@@ -27,12 +27,12 @@ sys.path.append("/".join(abspath.split("/")[:-4]))
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.datasets.eval_datasets import (
-    AIMEDataset,
     GPQADataset,
     MathDataset,
     MMLUDataset,
 )
 from nemo_rl.data.datasets.response_datasets import (
+    AIMEDataset,
     DeepScalerDataset,
     OpenMathInstruct2Dataset,
 )
@@ -130,6 +130,7 @@ def test_math_data_processor():
 @pytest.mark.parametrize(
     "dataset_cls",
     [
+        AIMEDataset,
         OpenMathInstruct2Dataset,
         DeepScalerDataset,
     ],
@@ -267,7 +268,6 @@ def system_prompt_file(request):
 @pytest.mark.parametrize(
     "dataset_cls",
     [
-        AIMEDataset,
         GPQADataset,
         MathDataset,
         MMLUDataset,

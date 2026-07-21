@@ -249,6 +249,60 @@ class TestReplayBufferImplCheckpointing:
         assert sample_result["trajectories"][0]["batch"]["data"] == "valid"
         assert buffer.size() == 0
 
+    def test_local_debug_info_reports_starvation_diagnostics(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        assert (
+            buffer.add(
+                {
+                    "batch": {"data": "a"},
+                    "rollout_metrics": {
+                        "trajectory_duration_s": 10.0,
+                        "max_gen_tokens_per_turn/max": 100,
+                        "turns_per_sample/max": 3.0,
+                    },
+                },
+                weight_version=0,
+                target_weight_version=1,
+            )
+            == "success"
+        )
+        assert (
+            buffer.add(
+                {
+                    "batch": {"data": "b"},
+                    "rollout_metrics": {
+                        "trajectory_duration_s": 20.0,
+                        "max_gen_tokens_per_turn": 200,
+                        "turns_per_sample/mean": 4.0,
+                    },
+                },
+                weight_version=0,
+                target_weight_version=1,
+            )
+            == "success"
+        )
+
+        diagnostics = buffer.get_debug_info()["starvation_diagnostics"]
+
+        duration = diagnostics["trajectory_duration_s"]
+        assert duration["mean"] == 15.0
+        assert duration["median"] == 15.0
+        assert duration["max"] == 20.0
+        assert duration["p95"] == 20.0
+
+        gen = diagnostics["max_gen_tokens_per_turn_in_buffer"]
+        assert gen["mean"] == 150.0
+        assert gen["median"] == 150.0
+        assert gen["max"] == 200
+        assert gen["p95"] == 200.0
+
+        turns = diagnostics["turns_per_sample_in_buffer"]
+        assert turns["mean"] == 3.5
+        assert turns["median"] == 3.5
+        assert turns["max"] == 4.0
+        assert turns["p95"] == 4.0
+        assert diagnostics["num_trajectories_sampled"] == 2
+
     def test_local_load_state_dict_validates_checkpoint_shape(self):
         buffer = ReplayBufferImpl(max_size=10)
 
@@ -449,6 +503,42 @@ class TestReplayBuffer:
         assert sample_result is not None
         assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 5
 
+        ray.kill(buffer)
+
+    def test_replay_buffer_starvation_diagnostics_nemo_gym_turn_keys(self):
+        """NeMo Gym uses turns_per_sample/* in rollout_metrics; diagnostics must read them."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        t1 = {
+            "batch": {"data": "a"},
+            "rollout_metrics": {
+                "trajectory_duration_s": 10.0,
+                "max_gen_tokens_per_turn/max": 100,
+                "turns_per_sample/max": 3.0,
+                "turns_per_sample/mean": 2.5,
+            },
+        }
+        t2 = {
+            "batch": {"data": "b"},
+            "rollout_metrics": {
+                "trajectory_duration_s": 20.0,
+                "max_gen_tokens_per_turn/max": 200,
+                "turns_per_sample/max": 5.0,
+                "turns_per_sample/mean": 4.0,
+            },
+        }
+        ray.get(buffer.add.remote(t1, weight_version=0, target_weight_version=1))
+        ray.get(buffer.add.remote(t2, weight_version=0, target_weight_version=1))
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        diag = debug_info["starvation_diagnostics"]["turns_per_sample_in_buffer"]
+        assert diag["max"] == 5.0
+        assert diag["mean"] == 4.0
+        assert diag["median"] == 4.0
+        assert diag["p95"] == 5.0
+        gen = debug_info["starvation_diagnostics"]["max_gen_tokens_per_turn_in_buffer"]
+        assert gen["max"] == 200
+        assert gen["mean"] == 150
+        assert gen["median"] == 150
+        assert gen["p95"] == 200
         ray.kill(buffer)
 
     def test_replay_buffer_age_filtering(self):
@@ -1096,6 +1186,76 @@ class TestAsyncTrajectoryCollector:
             start_step=0,
         )
 
+    def _prime_collection_loop(self, collector):
+        """Unblock every wait-event so _collection_loop() runs to completion."""
+        for attr in (
+            "_manual_pause_cleared",
+            "_refit_pause_cleared",
+            "_generation_limit_cleared",
+        ):
+            ev = threading.Event()
+            ev.set()
+            setattr(collector, attr, ev)
+        collector._should_pause_for_generation_limits = lambda: False
+        collector.running = True
+
+    def test_collection_loop_marks_data_exhausted_on_natural_completion(self):
+        """for...else path: iterator drains cleanly -> data_exhausted, not errored."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+        processed = []
+        collector._process_batch = lambda batch: processed.append(batch)
+        collector.dataloader = [{"b": 0}, {"b": 1}]
+
+        collector._collection_loop()
+
+        assert processed == [{"b": 0}, {"b": 1}]
+        assert collector.data_exhausted is True
+        assert collector.collection_failed is False
+        status = collector.get_status()
+        assert status["data_exhausted"] is True
+        assert status["errored"] is False
+        assert status["running"] is False
+
+    def test_collection_loop_marks_errored_on_crash(self):
+        """A crash sets errored (not data_exhausted) so driver guards fail fast."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+
+        def _boom(batch):
+            raise RuntimeError("collection blew up")
+
+        collector._process_batch = _boom
+        collector.dataloader = [{"b": 0}]
+
+        collector._collection_loop()
+
+        assert collector.collection_failed is True
+        assert collector.data_exhausted is False
+        status = collector.get_status()
+        assert status["errored"] is True
+        assert status["data_exhausted"] is False
+        assert status["running"] is False
+
+    def test_collection_loop_no_exhaustion_on_manual_stop(self):
+        """Breaking out (running=False) must not set data_exhausted/errored."""
+        collector = self.create_local_collector()
+        self._prime_collection_loop(collector)
+
+        def _stop_after_first(batch):
+            collector.running = False
+
+        collector._process_batch = _stop_after_first
+        collector.dataloader = [{"b": 0}, {"b": 1}, {"b": 2}]
+
+        collector._collection_loop()
+
+        assert collector.data_exhausted is False
+        assert collector.collection_failed is False
+        status = collector.get_status()
+        assert status["data_exhausted"] is False
+        assert status["errored"] is False
+
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
         config = {
@@ -1695,3 +1855,23 @@ class TestPromptGrouping:
         )
         assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
         assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))
+
+
+def test_turn_count_fallback_priority():
+    """_rollout_metrics_turn_count_for_diagnostics honors the documented key priority."""
+    f = ReplayBufferImpl._rollout_metrics_turn_count_for_diagnostics
+    assert (
+        f(
+            {
+                "max_turns_per_sample": 7,
+                "avg_turns_per_sample": 1,
+                "turns_per_sample/max": 2,
+                "turns_per_sample/mean": 3,
+            }
+        )
+        == 7.0
+    )
+    assert f({"avg_turns_per_sample": 4, "turns_per_sample/max": 2}) == 4.0
+    assert f({"turns_per_sample/max": 5, "turns_per_sample/mean": 3}) == 5.0
+    assert f({"turns_per_sample/mean": 6}) == 6.0
+    assert f({"reward": 1.0}) is None

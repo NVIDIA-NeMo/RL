@@ -48,6 +48,7 @@ from nemo_rl.data.datasets.response_datasets.oasst import OasstDataset
 from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
     OpenMathInstruct2Dataset,
 )
+from nemo_rl.data.datasets.response_datasets.openr1_math import OpenR1Math220KDataset
 from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
@@ -77,6 +78,7 @@ DATASET_REGISTRY = {
     "intent-bench": IntentBenchDataset,
     "open_assistant": OasstDataset,
     "OpenMathInstruct-2": OpenMathInstruct2Dataset,
+    "OpenR1-Math-220k": OpenR1Math220KDataset,
     "refcoco": RefCOCODataset,
     "squad": SquadDataset,
     "tulu3_sft_mixture": Tulu3SftMixtureDataset,
@@ -153,6 +155,7 @@ __all__ = [
     "OasstDataset",
     "OpenAIFormatDataset",
     "OpenMathInstruct2Dataset",
+    "OpenR1Math220KDataset",
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",

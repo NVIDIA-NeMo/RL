@@ -48,8 +48,10 @@ dependencies = [
   "matplotlib",
   "plotly",
   "sympy>=1.14.0",
-  "pillow>=12.1.1",
+  "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
   "torchvision==0.26.0",
+  # torchaudio and torchcodec are NOT installed in the container image.
+  # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
   # Floor raised to 5.5.0 for Gemma 4 support.
   "transformers>=5.5.0,<5.9.0",
@@ -60,12 +62,15 @@ dependencies = [
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
-  "decord2",
   "soundfile>=0.13.1",
   "nccl4py; sys_platform != 'darwin'",                                                                                       # for non-colocated refit
   "cuda-bindings; sys_platform != 'darwin'",                                                                                 # for non-colocated refit
-  "pybase64",                                                                                                                # for sglang refit
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                                  # for transformer-engine no build isolation
+  # Worker venvs run a base sync before backend extras, so NIXL must be available here.
+  "nixl==1.3.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "pybase64",                                                                                                 # for sglang refit
+  "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
+  "zstandard",                                                                                                # for sparse refit body compression
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                   # for transformer-engine no build isolation
   # tilelang — replacement Triton kernel mamba-ssm requires when
   # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
   # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
@@ -100,7 +105,7 @@ dependencies = [
   # build-container runner is aarch64 (uv reports aarch64-unknown-linux-gnu),
   # so the marker must include aarch64 — otherwise mooncake is silently
   # excluded from the resolution during the Docker build.
-  "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "mooncake-transfer-engine-cuda13==0.3.11.post1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 [project.optional-dependencies]
@@ -257,16 +262,12 @@ megatron-bridge = { path = "3rdparty/Megatron-Bridge-workspace", editable = true
 nemo_gym = { workspace = true }
 tau-bench = { git = "https://github.com/sierra-research/tau-bench", rev = "59a200c6d575d595120f1cb70fea53cef0632f6b" }
 nemo_run = { git = "https://github.com/NVIDIA-NeMo/Run", rev = "414f0077c648fde2c71bb1186e97ccbf96d6844c" }
-# torch/torchaudio/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
+# torch/torchvision/triton all come from the torch index in order to pick up aarch64 wheels
 torch = [
   { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
-  { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
-  { index = "pypi", marker = "sys_platform == 'darwin'" },
-]
-torchaudio = [
   { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
@@ -351,7 +352,6 @@ override-dependencies = [
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
-  "torchaudio==2.11.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
@@ -380,6 +380,13 @@ override-dependencies = [
   # extra composes with mcore/automodel without version-mirroring TQ's
   # requirements.txt. Forward-compatible across TQ minor bumps.
   "numpy>=2.1.0",
+  # av (PyAV) carries CVE-bundled codec libs (libx264, libx265, libopenh264, libmp3lame).
+  # It is only needed by megatron-bridge's optional WAN diffusion path, which installs it
+  # at test time via scripts/install_diffusion_deps.sh. Exclude from the shipped container.
+  "av; sys_platform == 'never'",
+  # decord2 is pulled transitively by sglang → qwen-vl-utils[decord] on aarch64 Linux.
+  # NeMo-RL no longer calls any decord API (replaced by torchvision/torchaudio).
+  "decord2; sys_platform == 'never'",
 ]
 
 # CVE fixes
@@ -395,7 +402,7 @@ constraint-dependencies = [
   "pygments>=2.20.0",         # Address CVE GHSA-5239-wwwm-4pmq
   "cbor2>=5.9.0",             # Address CVE GHSA-3c37-wwvx-h642
   "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
-  "cryptography>=46.0.6",     # Address CVE GHSA-6w46-j5rx-g56g
+  "cryptography>=48.0.1",     # Address CVE GHSA-6w46-j5rx-g56g, GHSA-537c-gmf6-5ccf
   "orjson>=3.11.6",           # Address CVE GHSA-hx9q-6w63-j58v
   "pyjwt>=2.13.0",
   "dulwich>=1.2.5",

@@ -143,7 +143,7 @@ The class must be importable — install it as a package or add its
 parent directory to `PYTHONPATH` before launching training.
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
-[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
+[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [OpenR1-Math-220k](../../nemo_rl/data/datasets/response_datasets/openr1_math.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
 ```python
 # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
@@ -631,7 +631,24 @@ grpo:
     normalize_rewards: true
     use_leave_one_out_baseline: false
 ```
-Note that this method only has an effect when training involve more than one reward function.
+Note that this method only has an effect when training involves more than one reward function.
+
+#### Per-reward weights
+
+The aggregation weights \\( w_n \\) in \\( A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)} \\)
+are configurable via `reward_weights`, an optional list with one entry per reward
+component, ordered alphabetically by component name (matching the sorted `reward/<name>`
+keys). When omitted, all weights default to `1.0` (equal weighting). For example, to
+down-weight the second and third rewards:
+```
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    reward_weights: [1.0, 0.5, 0.25]
+```
+The number of weights must equal the number of reward components, or a `ValueError` is raised.
 
 ## LoRA Configuration
 
