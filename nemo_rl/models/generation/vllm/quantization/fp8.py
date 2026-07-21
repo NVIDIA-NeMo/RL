@@ -1383,7 +1383,16 @@ def apply_monolithic_mxfp8_moe(
     )
     from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
 
-    if layer.enable_eplb:
+    # vLLM 0.25 moved enable_eplb off the layer (now a RoutedExperts) onto
+    # moe_config.moe_parallel_config; 0.20 exposed it directly on the layer.
+    _enable_eplb = getattr(layer, "enable_eplb", None)
+    if _enable_eplb is None:
+        _enable_eplb = getattr(
+            getattr(layer.moe_config, "moe_parallel_config", None),
+            "enable_eplb",
+            False,
+        )
+    if _enable_eplb:
         raise NotImplementedError(
             "EPLB is not supported for FlashInfer TRTLLM MXFP8 MoE backend."
         )
