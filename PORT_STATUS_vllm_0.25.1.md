@@ -86,3 +86,23 @@ Moderate effort, no new architecture (reuses #3294's own pattern). The only new
 work is reading the exact CuteDSL transform. Cleanest at #3280 merge: the merged
 base pins 0.25 and includes #3280's `convert_to_fp8_moe_kernel_format`, giving a
 tested reference for the layout instead of reverse-engineering the stride.
+
+## CONFIRMED transform (read from vLLM v0.25.1 source, 2026-07-21)
+
+`vllm/model_executor/kernels/linear/mxfp8/flashinfer.py`:
+
+- `FlashInferCutlassMxfp8LinearKernel.process_weights_after_loading` (0.20 path):
+  `layer.weight = Parameter(weight.contiguous())`  # [N,K] row-major; apply() does weight.t()
+- `FlashInferCutedslMxfp8LinearKernel.process_weights_after_loading` (0.25 path):
+  `layer.weight = Parameter(weight.contiguous().t())`  # [K,N] column-major; apply() uses it directly
+  (source comment: "Store weight column-major [K, N] as mm_mxfp8 expects for operand B.")
+
+So the ONLY weight-layout delta is the `.t()`: CuteDSL wants the weight pre-transposed
+to column-major [K,N]. Our `process_weights_after_loading_mxfp8_linear` currently
+re-swizzles only the scale and leaves the weight [N,K] -> stride mismatch.
+
+Fix = when the selected kernel is CuteDSL, produce the weight as
+`weight.contiguous().t()` for the apply target, idempotently (keep [N,K] as the
+load target so weight_loader + refit #2 keep working; the CuteDSL apply reads the
+[K,N] view -> same aliasing pattern as BF16-TRTLLM's w13_weight_for_apply).
+Guard with a bit-exact verify vs the kernel's own process_weights output.
