@@ -1398,9 +1398,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         return cast(list[str], list_of_worker_results)
 
-    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+    async def prepare_refit_info_async(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
         """Async version of prepare_refit_info."""
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        results = await self.llm.collective_rpc(
+            "prepare_refit_info", args=(state_dict_info,)
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     async def update_weights_via_ipc_zmq_async(
         self,

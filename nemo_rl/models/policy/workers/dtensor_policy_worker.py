@@ -239,6 +239,9 @@ class DTensorPolicyWorkerImpl(
         configure_dynamo_cache()
 
         self.cfg = config
+        # Staging-buffer cache for refit weight streaming; only populated when
+        # cfg["refit_persistent_ipc_buffers"] is enabled.
+        self._refit_ipc_buffer_cache: dict[str, Any] = {}
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
@@ -1881,6 +1884,11 @@ class DTensorPolicyWorkerImpl(
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
+            buffer_cache=(
+                self._refit_ipc_buffer_cache
+                if self.cfg.get("refit_persistent_ipc_buffers")
+                else None
+            ),
         )
 
     @torch.no_grad()

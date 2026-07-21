@@ -830,12 +830,15 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
             if hasattr(generation, "logprobs") and generation.logprobs:
                 try:
-                    for idx, logprob_dict in enumerate(generation.logprobs):
+                    for idx, (token_id, logprob_dict) in enumerate(
+                        zip(generated_tokens, generation.logprobs)
+                    ):
                         if logprob_dict:
-                            position = sequence_length + idx
-                            full_logprobs[position] = next(iter(logprob_dict.items()))[
-                                1
-                            ].logprob
+                            sampled_logprob = logprob_dict.get(token_id)
+                            if sampled_logprob is not None:
+                                full_logprobs[sequence_length + idx] = (
+                                    sampled_logprob.logprob
+                                )
                 except Exception:
                     import traceback
 
@@ -1005,9 +1008,19 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
         return cast(list[str], list_of_worker_results)
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns the parameter names the engine wants pre-quantized on the
+        trainer (vllm_cfg.refit_prequantize), or None.
+        """
+        results = self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:

@@ -940,6 +940,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Enable trainer-side MXFP8 quantization of the listed params for refit.
+
+        Returns:
+            dict: Refit info updated with quantized dtypes and scale entries.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "enable_refit_prequantize", param_names=param_names
+        )
+        results = ray.get(futures)
+        return results[0]
+
     def finish_inference(self) -> None:
         """Offload policy model to CPU after inference."""
         futures = self.worker_group.run_all_workers_single_data("finish_inference")
