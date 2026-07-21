@@ -67,6 +67,12 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and nemo-automodel.
     AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
 
+    # Use NeMo-RL direct dependencies, nemo-automodel and the diffusion stack
+    # (diffusers + OCR reward deps).
+    AUTOMODEL_DIFFUSION = (
+        f"uv run --locked --extra automodel --extra diffusion --directory {git_root}"
+    )
+
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"
 

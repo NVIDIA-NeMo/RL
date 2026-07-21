@@ -31,11 +31,11 @@ When adding support for a new model, add a corresponding nightly test consisting
 
 ### 1. Recipe YAML under `examples/configs/recipes/`
 
-Place in the appropriate domain subdirectory (`examples/configs/recipes/llm/` or `examples/configs/recipes/vlm/`). Name it following the recipe naming rules below.
+Place in the appropriate domain subdirectory (`examples/configs/recipes/llm/`, `examples/configs/recipes/vlm/`, or `examples/configs/recipes/diffusion/`). Name it following the recipe naming rules below.
 
 ### 2. Driver script under `tests/test_suites/`
 
-Create a shell script in the matching domain (`tests/test_suites/llm/` or `tests/test_suites/vlm/`). Source any common environment (e.g., `common.env`) and invoke the training entrypoint with `uv run ... --config <path-to-yaml>`. Match the driver script filename to the YAML base name with `.sh`.
+Create a shell script in the matching domain (`tests/test_suites/llm/`, `tests/test_suites/vlm/`, or `tests/test_suites/diffusion/`). Source any common environment (e.g., `common.env`) and invoke the training entrypoint with `uv run ... --config <path-to-yaml>`. Match the driver script filename to the YAML base name with `.sh`.
 
 ### 3. Add to nightly list
 
@@ -70,15 +70,23 @@ grpo-qwen2.5-7b-instruct-4n8g-fsdp2tp4sp.v3.yaml
 vlm_<algo>-<model>-<nodes>n<gpus>g-<strategy>[-modifiers][.vN].(yaml|sh)
 ```
 
+### Diffusion Pattern
+
+Image-diffusion recipes follow the LLM pattern (e.g.
+`grpo-qwen-image-ocr-1n8g-dp8-lora`), with the task name appended to the
+model segment as in the VLM recipes.
+
 ### Directory Placement
 
 ```
 examples/configs/recipes/
   llm/<name>.yaml
   vlm/<name>.yaml
+  diffusion/<name>.yaml
 
 tests/test_suites/
   llm/<name>.sh
   vlm/<name>.sh
+  diffusion/<name>.sh
   nightly.txt
 ```

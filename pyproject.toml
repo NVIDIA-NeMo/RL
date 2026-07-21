@@ -213,6 +213,12 @@ nvrx = [
   "nvidia-resiliency-ext==0.6.0",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
+diffusion = [
+  "diffusers>=0.37",
+  # OCR reward (CPU inference; swap in paddlepaddle-gpu for GPU scoring)
+  "paddleocr>=2.9,<3.0",
+  "paddlepaddle>=2.6",
+]
 
 [dependency-groups]
 
