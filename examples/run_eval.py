@@ -57,7 +57,11 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer, data_config, env_configs):
+def setup_data(tokenizer, data_config, env_configs, is_multimodal=False):
+    # is_multimodal only affects non-Gym eval, where the multimodal processor is
+    # already carried by `tokenizer` (built via get_tokenizer(get_processor=...)).
+    # The NeMo Gym branch below returns before it is ever consulted; accept the
+    # kwarg so the run_eval() call site stays consistent.
     print("Setting up data...")
 
     if isinstance(data_config, NemoGymEvalDataConfig):
