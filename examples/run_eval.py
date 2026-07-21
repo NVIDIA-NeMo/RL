@@ -22,7 +22,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    load_eval_dataset,
+    load_response_dataset,
+)
 from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import setup_nemo_gym_generation_config
