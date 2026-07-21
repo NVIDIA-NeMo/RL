@@ -1,0 +1,29 @@
+# Async GRPO SWE2 end-to-end agentic recipe for Qwen3-30B-A3B-Thinking with the TRT-LLM generation backend.
+# For the vLLM variant see examples/nemo_gym/grpo_qwen3_30ba3b_thinking_swe2.yaml.
+
+defaults: ../nemo_gym/grpo_qwen3_30ba3b_thinking_swe2.yaml
+
+policy:
+  generation:
+    backend: trtllm
+    trtllm_cfg:
+      tensor_parallel_size: 2
+      precision: ${policy.precision}
+      max_model_len: ${policy.max_total_sequence_length}
+      max_batch_size: 256
+      max_num_tokens: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.7
+      async_engine: true
+      in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
+      recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+      expose_http_server: true
+      default_chat_template_kwargs:
+        enable_thinking: true
+        truncate_history_thinking: false
+
+logger:
+  wandb:
+    name: qwen3-30b-thinking-swe2-agentic-trtllm
+  mlflow:
+    experiment_name: qwen3-30b-thinking-swe2-agentic-trtllm
+    run_name: qwen3-30b-thinking-swe2-agentic-trtllm
