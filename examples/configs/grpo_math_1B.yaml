@@ -52,6 +52,18 @@ grpo:
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
 
+# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  # Optional model/tokenizer-specific token IDs. Add token IDs that should
+  # be penalized when emitted by the model. Unwanted token IDs must be
+  # specified explicitly; think-tag IDs are inferred when each tag encodes
+  # to one token. Example: {unwanted: [2], think_open: 12, think_close: 13}
+  token_ids: null
+
 loss_fn:
   reference_policy_kl_penalty: 0.01
   # Can be set to k1, k2, k3
@@ -145,6 +157,16 @@ policy:
   
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+    # Compute next-token logprobs directly from hidden states with a chunked
+    # linear cross-entropy fusion, avoiding materialization of the full
+    # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
+    # the maximum trainable sequence length. Not compatible with context
+    # parallelism, sequence packing, or top-k/top-p training-time filtering.
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false
@@ -182,6 +204,7 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
     # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
     mtp_num_layers: 0
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
@@ -307,8 +330,8 @@ policy:
   generation:
     # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
     # See ray.sub for the full port layout.
-    port_range_low: 11001
-    port_range_high: 15000
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -316,6 +339,8 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    refit_transport: null  # Set to "vllm_s3_sparse" or "vllm_zmq_sparse" for remote sparse-delta refit.
+    refit_cfg: null  # Optional tuning and storage settings for remote sparse-delta refit.
     mcore_generation_config:
       async_engine: false
       max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
@@ -353,6 +378,9 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
+      http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
+      http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
+      zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs
@@ -441,8 +469,8 @@ cluster:
   # Port range for the distributed master address (TCPStore / NCCL rendezvous)
   # and per-worker available ports.  Kept below the OS ephemeral range
   # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
-  master_port_range_low: 25000
-  master_port_range_high: 28000
+  master_port_range_low: 1400
+  master_port_range_high: 1999
   segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
 
 # TransferQueue-mediated data plane for sync GRPO.

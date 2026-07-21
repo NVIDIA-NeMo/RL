@@ -89,7 +89,7 @@ Launch them the same way as any other recipe:
 uv run examples/run_sft.py \
     --config examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-128k.yaml
 
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
     --config examples/configs/recipes/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml
 ```
 

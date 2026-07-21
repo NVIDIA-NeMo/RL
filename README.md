@@ -54,7 +54,7 @@
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1u5lmjHOsYpJqXaeYstjw7Qbzvbo67U0v?usp=sharing) to get a head start on your experimentation.  
 * [9/30/2025] [Accelerated RL on GCP with NeMo RL!](https://discuss.google.dev/t/accelerating-reinforcement-learning-on-google-cloud-using-nvidia-nemo-rl/269579/4) 
 * [8/15/2025] [NeMo-RL: Journey of Optimizing Weight Transfer in Large MoE Models by 10x](https://github.com/NVIDIA-NeMo/RL/discussions/1189)
-* [7/31/2025] [NeMo-RL V0.3: Scalable and Performant Post-training with Nemo-RL via Megatron-Core](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
+* [7/31/2025] [NeMo RL V0.3: Scalable and Performant Post-training with NeMo RL via Megatron Core](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
 * [7/25/2025] [Release v0.3.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.3.0)
     * 📝 [v0.3.0 Announcement](https://github.com/NVIDIA-NeMo/RL/discussions/1161)
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/15kpesCV1m_C5UQFStssTEjaN2RsBMeZ0?usp=sharing) to get a head start on your experimentation.
@@ -160,7 +160,41 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Quick Start
 
-Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends. 
+> [!TIP]
+> **Recommended:** Use the pre-built NGC container to skip manual system dependency setup. The container ships with CUDA, cuDNN, vLLM, and SGLang already installed.
+>
+> ```sh
+> docker pull nvcr.io/nvidia/nemo-rl:latest
+> git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
+> cd nemo-rl
+> # export HF_TOKEN=hf_...                        # required for gated models (e.g. Llama)
+> # export HF_HOME=~/.cache/huggingface           # model and tokenizer cache
+> # export HF_DATASETS_CACHE=~/.cache/huggingface/datasets  # dataset cache
+> docker run --rm -it \
+>   -u root \
+>   --runtime=nvidia \
+>   --gpus all \
+>   --shm-size=64g \
+>   --ulimit memlock=-1 \
+>   -v $PWD:/opt/nemo-rl \
+>   -v ${HF_HOME:-$HOME/.cache/huggingface}:/hf_home \
+>   -v ${HF_DATASETS_CACHE:-$HOME/.cache/huggingface/datasets}:/hf_datasets_cache \
+>   -e HF_HOME=/hf_home \
+>   -e HF_DATASETS_CACHE=/hf_datasets_cache \
+>   -e HF_TOKEN \
+>   -e WANDB_API_KEY \
+>   -w /opt/nemo-rl \
+>   nvcr.io/nvidia/nemo-rl:latest \
+>   bash
+> ```
+>
+> Then inside the container: `uv run python examples/run_grpo.py`
+>
+> See the [Installation guide](docs/about/installation.md#docker-quickstart) for details.
+
+### Bare-Metal Quick Start
+
+Use this quick start to get going with either the native PyTorch DTensor or Megatron Core training backends.
 
 > [!NOTE]
 > Both training backends are independent — you can install and use either one on its own.
@@ -211,7 +245,7 @@ Clone **NeMo RL**.
 git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
 
-# If you are already cloned without the recursive option, you can initialize the submodules recursively
+# If you have already cloned without the recursive option, you can initialize the submodules recursively
 git submodule update --init --recursive
 
 # Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
@@ -233,9 +267,9 @@ dpkg -l | grep cudnn.*cuda
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
-sudo apt install cudnn  # Will install cuDNN meta packages which points to the latest versions
-# sudo apt install cudnn9-cuda-12  # Will install cuDNN version 9.x.x compiled for cuda 12.x
-# sudo apt install cudnn9-cuda-12-8  # Will install cuDNN version 9.x.x compiled for cuda 12.8
+sudo apt install cudnn  # Will install cuDNN meta packages that point to the latest versions
+# sudo apt install cudnn9-cuda-13  # Will install cuDNN version 9.x.x compiled for cuda 13.x (CUDA 13 — current primary)
+# sudo apt install cudnn9-cuda-13-2  # Will install cuDNN version 9.x.x compiled for cuda 13.2 specifically
 ```
 
 If you encounter problems when installing vllm's dependency deep_ep on bare-metal (outside of a container), you may need to install libibverbs-dev as well. Here is how you can install it:
@@ -262,7 +296,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > ```sh
 > export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
 > export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
-> # Verify (should match nvidia-cudnn-cu12 version in pyproject.toml, currently 9.19.0):
+> # Verify (should match nvidia-cudnn-cu13 version in pyproject.toml, currently 9.20.0):
 > # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 > ```
 > See [docs/about/installation.md](docs/about/installation.md#configure-cudnn-for-transformer-engine-bare-metal-only) for details.
@@ -277,7 +311,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 
 ## GRPO
 
-We provide a reference GRPO configuration for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
+We provide a reference GRPO configuration for math benchmarks using the [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
 
 You can read about the details of the GRPO implementation [here](docs/guides/grpo.md)
 
@@ -719,7 +753,7 @@ Refer to `examples/configs/evals/eval.yaml` for a full list of parameters that c
 
 ## Set Up Clusters
 
-For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Cluster Start](docs/cluster.md) documentation.
+For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubernetes clusters, please refer to the dedicated [Set Up Clusters](docs/cluster.md) documentation.
 
 ## Tips and Tricks
 - If you forget to initialize the NeMo and Megatron submodules when cloning the NeMo-RL repository, you may run into an error like this:

@@ -17,7 +17,12 @@ from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 import torch
 from pydantic import BaseModel
 
-from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
+from nemo_rl.algorithms.loss.interfaces import (
+    LossFunction,
+    LossInputType,
+    LossType,
+    MetricNormalizer,
+)
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     LocalizedAlignment,
@@ -216,7 +221,14 @@ class ClippedPGLossFn(LossFunction):
 
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: ClippedPGLossConfig):
+    def __init__(
+        self, cfg: ClippedPGLossConfig, use_fused_linear_logprobs: bool = False
+    ):
+        # When True, the model forward is patched to return precomputed next-token
+        # logprobs (via chunked linear CE fusion) instead of full logits. This is
+        # consumed by prepare_loss_input, which short-circuits the logits->logprobs
+        # conversion. See nemo_rl/distributed/model_utils.py for the fused forward.
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
         self.disable_ppo_ratio = cfg.disable_ppo_ratio
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
@@ -306,6 +318,54 @@ class ClippedPGLossFn(LossFunction):
                     "seq-mask-tis uses token-level IS correction with sequence-level masking, "
                     "and is incompatible with sequence_level_importance_ratios=True"
                 )
+
+        # Advertise, per returned metric, the global denominator it was
+        # normalized by (see MetricNormalizer). Built here — next to the flags
+        # that pick the denominators — so split-API trainers can undo the
+        # placeholder global_valid_*=1 normalization without maintaining a
+        # consumer-side table. Keep in sync with __call__'s return dict.
+        grad_normalizer = (
+            MetricNormalizer.TOKENS
+            if self.loss_type == LossType.TOKEN_LEVEL
+            else MetricNormalizer.SEQUENCES
+        )
+        self.metric_normalizations: dict[str, MetricNormalizer] = {
+            # Normalized like the gradient (loss_type-dependent).
+            "loss": grad_normalizer,
+            "kl_penalty": grad_normalizer,
+            # Token-normalized diagnostics, independent of loss_type.
+            "probs_ratio": MetricNormalizer.TOKENS,
+            "probs_ratio_clamped": MetricNormalizer.TOKENS,
+            "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "gen_kl_error": MetricNormalizer.TOKENS,
+            "policy_kl_error": MetricNormalizer.TOKENS,
+            "js_divergence_error": MetricNormalizer.TOKENS,
+            "approx_entropy": MetricNormalizer.TOKENS,
+            # Keyed on sequence_level_importance_ratios, NOT loss_type.
+            "sampling_importance_ratio": (
+                MetricNormalizer.SEQUENCES
+                if self.sequence_level_importance_ratios
+                else MetricNormalizer.TOKENS
+            ),
+            # Raw count — the downstream per-microbatch sum IS the value.
+            "num_valid_samples": MetricNormalizer.NONE,
+            # Normalized by the microbatch's own correct-token count, not a
+            # global factor — already a per-microbatch mean.
+            "positive_nll_loss": MetricNormalizer.NONE,
+            # Extrema — combined downstream with min/max, never scaled.
+            "probs_ratio_min": MetricNormalizer.NONE,
+            "probs_ratio_max": MetricNormalizer.NONE,
+            "probs_ratio_clamped_min": MetricNormalizer.NONE,
+            "probs_ratio_clamped_max": MetricNormalizer.NONE,
+        }
+        if self.truncated_importance_sampling_type is not None:
+            # Keyed on the TIS type, NOT loss_type: seq-mask-tis masks whole
+            # sequences (÷ global_valid_seqs); tis/icepop are token-level.
+            self.metric_normalizations["is_oob_ratio"] = (
+                MetricNormalizer.SEQUENCES
+                if self.truncated_importance_sampling_type == "seq-mask-tis"
+                else MetricNormalizer.TOKENS
+            )
 
     def __call__(
         self,
@@ -730,8 +790,15 @@ class NLLLossFn(LossFunction):
     loss_type = LossType.TOKEN_LEVEL
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, use_linear_ce_fusion: bool = False):
-        self.use_linear_ce_fusion = use_linear_ce_fusion
+    def __init__(self, use_fused_linear_logprobs: bool = False):
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        # See MetricNormalizer — split-API trainers use this to undo the
+        # placeholder global_valid_*=1 normalization per metric.
+        self.metric_normalizations: dict[str, MetricNormalizer] = {
+            "loss": MetricNormalizer.TOKENS,
+            "num_unmasked_tokens": MetricNormalizer.NONE,
+            "num_valid_samples": MetricNormalizer.NONE,
+        }
 
     def __call__(
         self,
@@ -951,14 +1018,14 @@ class DPOLossFn(PreferenceLossFn):
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
+    def __init__(self, cfg: DPOLossConfig, use_fused_linear_logprobs: bool = False):
         self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
         self.preference_loss_weight = cfg.preference_loss_weight
         self.sft_loss_weight = cfg.sft_loss_weight
         self.preference_average_log_probs = cfg.preference_average_log_probs
         self.sft_average_log_probs = cfg.sft_average_log_probs
-        self.use_linear_ce_fusion = use_linear_ce_fusion
-        self.sft_loss = NLLLossFn(use_linear_ce_fusion=use_linear_ce_fusion)
+        self.use_fused_linear_logprobs = use_fused_linear_logprobs
+        self.sft_loss = NLLLossFn(use_fused_linear_logprobs=use_fused_linear_logprobs)
 
     def _dpo_loss(
         self,

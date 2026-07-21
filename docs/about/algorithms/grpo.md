@@ -1,6 +1,6 @@
 # GRPO
 
-We provide a reference GRPO configuration for math benchmarks using the [OpenInstructMath2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
+We provide a reference GRPO configuration for math benchmarks using the [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) dataset.
 
 You can read about the details of the GRPO implementation [here](../../guides/grpo.md).
 
