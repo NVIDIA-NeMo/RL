@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
@@ -275,6 +276,12 @@ Depending on your data shape, you may want to change these values."""
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
+            # Stamp a fresh cohort id per attempt: genrm_compare buffers rollouts
+            # server-side by prompt_id (else a prompt-content hash), so without it
+            # same-text groups and gap-fill re-collections merge into one cohort.
+            group_id = uuid.uuid4().hex
+            for example in nemo_gym_examples:
+                example["prompt_id"] = group_id
             nemo_gym_num_rows = len(nemo_gym_examples)
             nemo_gym_result_iterator = self.rch.run_examples(
                 examples=nemo_gym_examples, head_server_config=self.head_server_config
