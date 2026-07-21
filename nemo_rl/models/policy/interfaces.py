@@ -185,6 +185,18 @@ class ColocatablePolicyInterface(PolicyInterface):
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
 
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Quantize the listed params on the trainer during refit streaming.
+
+        Returns:
+            Refit info updated with the quantized dtypes and scale entries.
+        """
+        raise NotImplementedError(
+            "enable_refit_prequantize is not implemented for this policy worker"
+        )
+
     @abstractmethod
     def stream_weights_via_ipc_zmq(
         self, *args: Any, **kwargs: Any

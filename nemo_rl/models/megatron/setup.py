@@ -1738,6 +1738,10 @@ def setup_reference_model_state(
             )
 
         reference_state_dict = {}
+        # NotRequired key: absent means disabled, default lives in the exemplar YAML.
+        pinned_reference_swap = bool(
+            config["megatron_cfg"].get("pinned_reference_swap")
+        )
 
         if should_load_checkpoint or use_peft:
             reference_model = reference_model[0]
@@ -1745,13 +1749,23 @@ def setup_reference_model_state(
             # Store reference state dict on CPU
             for name, item in reference_model.state_dict().items():
                 if isinstance(item, torch.Tensor):
-                    cpu_item = item.detach().to(
-                        device="cpu", non_blocking=True, copy=True
-                    )
+                    if pinned_reference_swap:
+                        # Pinned so use_reference_model can upload the reference
+                        # weights with non-blocking H2D copies each step.
+                        cpu_item = torch.empty(
+                            item.shape, dtype=item.dtype, device="cpu", pin_memory=True
+                        )
+                        cpu_item.copy_(item.detach(), non_blocking=True)
+                    else:
+                        cpu_item = item.detach().to(
+                            device="cpu", non_blocking=True, copy=True
+                        )
                     del item
                 else:
                     cpu_item = item
                 reference_state_dict[name] = cpu_item
+            if pinned_reference_swap:
+                torch.cuda.synchronize()
             print("Reference model loaded")
         else:
             print("Reference model not loaded")
