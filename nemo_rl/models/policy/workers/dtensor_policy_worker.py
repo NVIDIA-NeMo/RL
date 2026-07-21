@@ -87,6 +87,11 @@ from nemo_rl.models.policy.utils import (
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.checkpoint_engine import (
+    DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    maybe_preinit_nixl_checkpoint_engine,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.native_checkpoint import (
     load_checkpoint,
@@ -95,6 +100,15 @@ from nemo_rl.utils.native_checkpoint import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
+
+
+def dtensor_params_generator(
+    model: nn.Module, target_dtype: torch.dtype
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield contiguous full tensors from a DTensor-backed state dict."""
+    for name, tensor in model.state_dict().items():
+        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        yield name, full_tensor.to(target_dtype, non_blocking=True).contiguous()
 
 
 def _attach_context_parallel_hooks(model: nn.Module) -> None:
@@ -168,7 +182,11 @@ def get_cpu_state_dict(
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class DTensorPolicyWorkerImpl(
-    TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
+    TQWorkerMixin,
+    DTensorCheckpointEngineSendMixin,
+    PolicyCheckpointEngineMixin,
+    AbstractPolicyWorker,
+    ColocatablePolicyInterface,
 ):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -402,6 +420,7 @@ class DTensorPolicyWorkerImpl(
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.device_mesh = device_mesh
+        self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # ------------------------------------------------
         # 3) Move to GPU + Composable FSDP
@@ -1859,29 +1878,19 @@ class DTensorPolicyWorkerImpl(
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(),
+            params_generator=dtensor_params_generator(self.model, self.dtype),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
         )
+
+    def _checkpoint_engine_params(
+        self,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        return dtensor_params_generator(self.model, self.dtype)
 
     @torch.no_grad()
     def broadcast_weights_for_collective(
