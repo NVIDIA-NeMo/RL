@@ -254,8 +254,9 @@ class TestCallJudge:
         # Transient errors exhaust all 5 retries and return None (caller falls
         # back to tau_reward rather than blending with 0.0).  Mock time.sleep
         # to avoid the exponential backoff delay in tests.
-        with mock.patch("litellm.completion", side_effect=Exception("API error")), mock.patch(
-            "nemo_rl.environments.tau_bench_environment.time.sleep"
+        with (
+            mock.patch("litellm.completion", side_effect=Exception("API error")),
+            mock.patch("nemo_rl.environments.tau_bench_environment.time.sleep"),
         ):
             score = worker._call_judge([], domain_rules="", task_instruction="")
         assert score is None

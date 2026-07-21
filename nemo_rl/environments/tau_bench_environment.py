@@ -216,6 +216,7 @@ class TauBenchWorker:
             # concurrent threads in _execute_one do not race on the global monkeypatch.
             # Each Ray actor runs in its own process, so this is safe.
             from unittest.mock import patch as _patch
+
             self._litellm_patcher = _patch("litellm.completion", self._mock_completion)
             self._litellm_patcher.start()
         else:
@@ -513,7 +514,9 @@ class TauBenchWorker:
                 ]
                 judge_score = self._call_judge(convo, rules, instruction)
                 if judge_score is not None:
-                    reward = (1.0 - judge_weight) * tau_reward + judge_weight * judge_score
+                    reward = (
+                        1.0 - judge_weight
+                    ) * tau_reward + judge_weight * judge_score
                 else:
                     # Judge failed after retries; fall back to tau_reward so a
                     # judge outage is never indistinguishable from a score of 0.
