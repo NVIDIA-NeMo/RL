@@ -1,8 +1,6 @@
 defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_thinking_swe1.yaml
 grpo:
   num_prompts_per_step: 16
-  max_val_samples: 32
-  val_batch_size: 32
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym
   enabled: false
@@ -16,6 +14,25 @@ policy:
       enable_prefix_caching: false
     vllm_kwargs:
       enable_chunked_prefill: false
+data:
+  train:
+    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/train-split.jsonl"
+  validation:
+    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/val-split.jsonl"
+env:
+  nemo_gym:
+    # The staged SWE1 data uses this legacy agent name. Register it as an
+    # alias for the current SWE pivot server instead of rewriting the data.
+    single_step_tool_use_with_argument_comparison_swe:
+      responses_api_agents:
+        tool_simulation_agent:
+          entrypoint: app.py
+          resources_server:
+            type: resources_servers
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_resources_server
+          model_server:
+            type: responses_api_models
+            name: policy_model
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym
   wandb:

@@ -74,7 +74,10 @@ def prepare_loss_input(
     elif loss_fn.input_type == LossInputType.LOGPROB:
         # Linear CE fusion patch returns precomputed next-token logprobs (2D tensor).
         # Keep normal path unchanged for standard logits (3D tensor).
-        if hasattr(loss_fn, "use_linear_ce_fusion") and loss_fn.use_linear_ce_fusion:
+        if (
+            hasattr(loss_fn, "use_fused_linear_logprobs")
+            and loss_fn.use_fused_linear_logprobs
+        ):
             logprobs = logits
             logprobs = logprobs.to(torch.float32)
             logprobs = logprobs[:, : data["input_ids"].shape[1] - 1]
@@ -243,7 +246,12 @@ def _pack_input_ids(
         padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
         packed_start = int(cu_seqlens_q_padded[i].item())
         seq = torch.zeros(padded_len, dtype=input_ids.dtype, device=input_ids.device)
-        seq[:actual_len] = input_ids[i, :actual_len]
+        # The packer absorbs bin-level alignment padding into the last
+        # sequence's effective length (see _get_pack_sequence_parameters_for_megatron),
+        # so cu_seqlens can exceed the unpacked row width. Copy only real
+        # tokens; the tail stays zero and is excluded from the loss by token_mask.
+        copy_len = min(actual_len, input_ids.shape[1])
+        seq[:copy_len] = input_ids[i, :copy_len]
         if roll_shift != 0:
             seq = seq.roll(shifts=roll_shift, dims=0)
         sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)

@@ -34,6 +34,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.timer import ThreadSafeTimer
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -76,6 +77,8 @@ class AsyncTrajectoryCollector:
             k: _threading.Lock() for k in self.teacher_worker_groups
         }
         self.running = False
+        self.data_exhausted = False
+        self.collection_failed = False
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -118,6 +121,9 @@ class AsyncTrajectoryCollector:
         self._completed_per_target: dict[int, int] = {}
         self._spawning_targets: set[int] = set()
         self._counter_lock: _threading.Lock = _threading.Lock()
+
+        # Timer for efficiency metrics
+        self._efficiency_timer = ThreadSafeTimer(context={"worker": "collector"})
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -246,8 +252,24 @@ class AsyncTrajectoryCollector:
 
         print("Collection thread started, start_collection returning")
 
+    def is_data_exhausted(self) -> bool:
+        """Check if collection stopped because the dataloader ran out of data."""
+        return self.data_exhausted
+
+    def get_status(self) -> dict:
+        """Return a snapshot of the collector's internal state for driver-side diagnostics."""
+        with self._threads_lock:
+            inflight_workers = len(self._inflight_threads)
+        return {
+            "running": self.running,
+            "data_exhausted": self.data_exhausted,
+            "errored": self.collection_failed,
+            "inflight_workers": inflight_workers,
+        }
+
     def _collection_loop(self):
         """Run the collection loop in background thread."""
+        dataloader_exhausted = False
         try:
             for batch in self.dataloader:
                 if not self.running:
@@ -260,7 +282,8 @@ class AsyncTrajectoryCollector:
                 # Check if refit is in progress and wait
                 if not self._refit_pause_cleared.is_set() and self.running:
                     print("⏸️ Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
+                    with self._efficiency_timer.time("idle/refit_event_wait"):
+                        self._refit_pause_cleared.wait()
                     print("▶️ Refit completed, resuming collection")
 
                 # Check if generation limits require pausing collection
@@ -283,7 +306,8 @@ class AsyncTrajectoryCollector:
                         self._generation_limit_cleared.clear()  # Clear the event to pause
 
                     # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
+                    with self._efficiency_timer.time("idle/generation_limit_pause"):
+                        self._generation_limit_cleared.wait()
 
                     # Double-check we're still running after being woken up
                     if not self.running:
@@ -293,15 +317,27 @@ class AsyncTrajectoryCollector:
                     break
 
                 self._process_batch(batch)
+            else:
+                # for-loop completed without break → dataloader iterator exhausted
+                dataloader_exhausted = True
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
             import traceback
 
             traceback.print_exc()
+            self.collection_failed = True
         finally:
             self.running = False
-            print("🛑 Trajectory collection stopped")
+            if dataloader_exhausted:
+                self.data_exhausted = True
+                print(
+                    "❌ Trajectory collection stopped: dataloader exhausted "
+                    "(max_num_epochs reached). No more data available for generation. "
+                    "Increase max_num_epochs or use a larger dataset."
+                )
+            else:
+                print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
@@ -369,7 +405,8 @@ class AsyncTrajectoryCollector:
                         print(
                             "   Note: With vLLM V1 async engine, active threads can complete during weight update"
                         )
-                        self._refit_pause_cleared.wait()
+                        with self._efficiency_timer.time("idle/refit_event_wait"):
+                            self._refit_pause_cleared.wait()
 
                         # After refit finishes if weight version has updated, reflect that in the new trajectories
                         generation_weight_version = self.current_weight_version
@@ -565,6 +602,13 @@ class AsyncTrajectoryCollector:
             return self.dataloader.state_dict()
         return {}
 
+    def get_efficiency_metrics(self) -> dict[str, float]:
+        """Return accumulated efficiency metrics (sum of durations per category).
+
+        Called by the driver process each step to merge collector-side metrics.
+        """
+        return self._efficiency_timer.get_timing_metrics(reduction_op="sum")
+
     def _cleanup_finished_threads(self) -> None:
         with self._threads_lock:
             finished = {t for t in self._inflight_threads if not t.is_alive()}
@@ -722,10 +766,14 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         prompt_idx: int,
     ) -> None:
+        worker_start = time.perf_counter()
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-            from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
+            from nemo_rl.experience.rollouts import (
+                get_nemo_gym_thinking_tags,
+                run_async_nemo_gym_rollout,
+            )
 
             # Run rollout for this prompt group
             # Async engine supports concurrent generation; avoid locking
@@ -741,6 +789,8 @@ class AsyncTrajectoryCollector:
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    reward_penalty_config=self.master_config.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 )
                 final_batch = nemo_gym_rollout_result.final_batch
                 rollout_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -787,6 +837,11 @@ class AsyncTrajectoryCollector:
                     rollout_metrics = dict(rollout_metrics)
                     rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
 
+            # Record per-trajectory wall-clock duration for buffer starvation diagnostics
+            trajectory_duration_s = time.perf_counter() - worker_start
+            rollout_metrics = dict(rollout_metrics)
+            rollout_metrics["trajectory_duration_s"] = trajectory_duration_s
+
             trajectory_group = {
                 "batch": final_batch_cpu,
                 "rollout_metrics": rollout_metrics,
@@ -796,6 +851,7 @@ class AsyncTrajectoryCollector:
             # Use exponential backoff when buffer is full
             try:
                 backoff_delay = 0.01
+                backoff_start = None
                 while self.running:
                     status = ray.get(
                         self.replay_buffer.add.remote(
@@ -816,6 +872,11 @@ class AsyncTrajectoryCollector:
                             spawned_count = self._spawned_per_target.get(
                                 target_weight_version, 0
                             )
+                        if backoff_start is not None:
+                            self._efficiency_timer.record(
+                                "idle/buffer_full_backoff",
+                                time.perf_counter() - backoff_start,
+                            )
                         print(
                             f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
                             f"target_weight {target_weight_version}) "
@@ -823,6 +884,8 @@ class AsyncTrajectoryCollector:
                         )
                         break
                     elif status == "full":
+                        if backoff_start is None:
+                            backoff_start = time.perf_counter()
                         # Exponential backoff up to 0.5 second
                         time.sleep(min(backoff_delay, 0.5))
                         backoff_delay *= 1.5
@@ -831,11 +894,19 @@ class AsyncTrajectoryCollector:
                         time.sleep(0.01)
             except Exception as e:
                 print(f"❌ Failed to enqueue per-prompt group to buffer: {e}")
+                if backoff_start is not None:
+                    self._efficiency_timer.record(
+                        "idle/buffer_full_backoff",
+                        time.perf_counter() - backoff_start,
+                    )
                 import traceback
 
                 traceback.print_exc()
         except Exception as e:
             print(f"❌ Error in prompt group worker: {e}")
+            self._efficiency_timer.record(
+                "wasted/failed_trajectory", time.perf_counter() - worker_start
+            )
             import traceback
 
             traceback.print_exc()

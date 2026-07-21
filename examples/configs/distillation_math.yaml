@@ -87,6 +87,9 @@ policy: &POLICY_BASE
 
     megatron_cfg: &MEGATRON_BASE
         enabled: false
+        checkpoint:
+          async_save: false
+          ckpt_assume_constant_structure: false
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
@@ -123,6 +126,7 @@ policy: &POLICY_BASE
         moe_enable_deepep: false
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
+        use_gloo_process_groups: false
         gradient_accumulation_fusion: false
         use_fused_weighted_squared_relu: false
         optimizer:
@@ -189,8 +193,8 @@ policy: &POLICY_BASE
     generation:
         # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
         # See ray.sub for the full port layout.
-        port_range_low: 11001
-        port_range_high: 15000
+        port_range_low: 3000
+        port_range_high: 4999
         backend: "vllm"
         max_new_tokens: ${..max_total_sequence_length} # refer to local policy/teacher config
         temperature: 1.0
@@ -279,6 +283,6 @@ logger:
 cluster:
     gpus_per_node: 8
     num_nodes: 1
-    master_port_range_low: 25000
-    master_port_range_high: 28000
+    master_port_range_low: 1400
+    master_port_range_high: 1999
     segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

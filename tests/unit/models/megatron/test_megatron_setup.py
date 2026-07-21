@@ -707,7 +707,7 @@ class TestApplyMoeConfig:
             _apply_moe_config(model_cfg, config)
 
         assert model_cfg.moe_flex_dispatcher_backend == "hybridep"
-        assert model_cfg.moe_hybridep_num_sms == 32
+        assert model_cfg.moe_flex_dispatcher_num_sms == 32
         # min(ep_size=8, 64) == 8
         assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "8"
         # int(ep_size=8 > 4) == 1
@@ -718,6 +718,25 @@ class TestApplyMoeConfig:
             for m in warn_messages
         )
         assert any("USE_MNNVL not configured" in m for m in warn_messages)
+
+    def test_hybridep_num_sms_supports_old_mcore(self, monkeypatch):
+        """The existing recipe key still targets legacy MCore releases."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "8")
+        monkeypatch.setenv("USE_MNNVL", "1")
+        model_cfg = SimpleNamespace()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=32,
+        )
+
+        with patch("nemo_rl.models.megatron.setup.TransformerConfig", new=object):
+            _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_flex_dispatcher_num_sms")
+        assert model_cfg.moe_hybridep_num_sms == 32
 
     def test_hybridep_env_vars_from_explicit_config(self, monkeypatch):
         """Explicit hybridep_* config keys override defaults without warnings."""
@@ -1212,7 +1231,13 @@ class TestCreateCheckpointConfig:
         optimizer_path = str(tmp_path / "optimizer")
 
         checkpoint_config = _create_checkpoint_config(
-            pretrained_path, weights_path, optimizer_path
+            pretrained_path,
+            weights_path,
+            optimizer_path,
+            ckpt_cfg={
+                "async_save": False,
+                "ckpt_assume_constant_structure": False,
+            },
         )
 
         assert checkpoint_config.save == weights_path
@@ -1223,6 +1248,141 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.fully_parallel_save is True
         assert checkpoint_config.fully_parallel_load is True
         assert checkpoint_config.load_rng is False
+
+    def test_missing_ckpt_cfg_defaults_to_sync_save(self, tmp_path):
+        """An absent checkpoint block keeps Megatron Bridge's default (sync save).
+
+        async_save has no call-site default — it is presence-checked and forwarded
+        only when set — so a Megatron config that omits the checkpoint block (e.g.
+        a config that predates the block or builds megatron_cfg programmatically)
+        keeps working via Bridge's own default instead of crashing with a KeyError.
+        """
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        weights_path = str(tmp_path / "weights")
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            weights_path,
+            str(tmp_path / "optimizer"),
+            ckpt_cfg=None,
+        )
+
+        assert checkpoint_config.async_save is False
+        # No fallback substitution for save when sync.
+        assert checkpoint_config.save == weights_path
+
+    def test_partial_ckpt_cfg_missing_async_save_defaults_to_sync_save(self, tmp_path):
+        """A checkpoint block that omits async_save keeps Bridge's default (sync)."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg={"ckpt_assume_constant_structure": True},
+        )
+
+        assert checkpoint_config.async_save is False
+        assert checkpoint_config.ckpt_assume_constant_structure is True
+
+    def test_absent_ckpt_assume_constant_structure_uses_bridge_default(self, tmp_path):
+        """ckpt_assume_constant_structure is omitted unless set in YAML."""
+        from megatron.bridge.training.config import (
+            CheckpointConfig as BridgeCheckpointConfig,
+        )
+
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        pretrained_path = str(tmp_path / "pretrained")
+        weights_path = str(tmp_path / "weights")
+        optimizer_path = str(tmp_path / "optimizer")
+
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path,
+            weights_path,
+            optimizer_path,
+            ckpt_cfg={"async_save": False},
+        )
+        bridge_default = BridgeCheckpointConfig(
+            save_interval=100,
+            save=weights_path,
+            load=weights_path,
+            load_optim=True,
+            pretrained_checkpoint=pretrained_path,
+            async_save=False,
+            fully_parallel_save=True,
+            fully_parallel_load=True,
+            load_rng=False,
+            load_main_params_from_ckpt=False,
+        )
+
+        assert (
+            checkpoint_config.ckpt_assume_constant_structure
+            == bridge_default.ckpt_assume_constant_structure
+        )
+
+    def test_async_save_config_wired_through(self, tmp_path):
+        """async_save / ckpt_assume_constant_structure / parallel-IO fields propagate."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        ckpt_cfg = {
+            "async_save": True,
+            "ckpt_assume_constant_structure": True,
+            "ckpt_fully_parallel_save_process_group": "ep_dp",
+            "ckpt_fully_parallel_load_process_group": "ep_dp",
+            "ckpt_fully_parallel_load_exchange_algo": "broadcast",
+        }
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg=ckpt_cfg,
+        )
+
+        assert checkpoint_config.async_save is True
+        assert checkpoint_config.ckpt_assume_constant_structure is True
+        assert checkpoint_config.ckpt_fully_parallel_save_process_group == "ep_dp"
+        assert checkpoint_config.ckpt_fully_parallel_load_process_group == "ep_dp"
+        assert checkpoint_config.ckpt_fully_parallel_load_exchange_algo == "broadcast"
+
+    def test_cold_start_save_falls_back_to_pretrained(self, tmp_path):
+        """With async_save and no weights_path (cold start), save falls back to pretrained."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        pretrained_path = str(tmp_path / "pretrained")
+
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path,
+            None,  # cold start: no prior checkpoint
+            None,
+            ckpt_cfg={
+                "async_save": True,
+                "ckpt_assume_constant_structure": False,
+            },
+        )
+
+        # Megatron-Bridge requires save != None when async_save is enabled.
+        assert checkpoint_config.save == pretrained_path
+        assert checkpoint_config.load is None
+        assert checkpoint_config.async_save is True
+
+    def test_cold_start_no_fallback_when_sync(self, tmp_path):
+        """Without async_save, a None weights_path leaves save=None (no fallback)."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            None,
+            None,
+            ckpt_cfg={
+                "async_save": False,
+                "ckpt_assume_constant_structure": False,
+            },
+        )
+
+        assert checkpoint_config.save is None
+        assert checkpoint_config.async_save is False
 
 
 @pytest.mark.mcore
@@ -1434,6 +1594,75 @@ class TestValidateDtypeConfig:
             _validate_dtype_config(torch.float32, model_cfg, optimizer_cfg)
 
         assert "optimizer" in str(exc_info.value).lower()
+
+
+@pytest.mark.mcore
+class TestCreateMegatronConfigGlooProcessGroups:
+    """Tests for use_gloo_process_groups plumbing in _create_megatron_config."""
+
+    @staticmethod
+    def _config(**megatron_overrides):
+        megatron_cfg = {
+            "optimizer": {"use_distributed_optimizer": False},
+            "scheduler": {},
+            "distributed_data_parallel_config": {
+                "overlap_param_gather": False,
+                "grad_reduce_in_fp32": False,
+                "overlap_grad_reduce": False,
+                "data_parallel_sharding_strategy": "no_shard",
+            },
+            "train_iters": 10,
+        }
+        megatron_cfg.update(megatron_overrides)
+        return {"megatron_cfg": megatron_cfg, "train_global_batch_size": 8}
+
+    def _dist_config_passed_to_container(self, config):
+        """Return the dist config _create_megatron_config hands to ConfigContainer.
+
+        The container and sibling sub-config builders are patched so only the
+        DistributedInitConfig branch is exercised; DistributedInitConfig itself
+        stays real so the asserted attribute reflects actual behavior.
+        """
+        from nemo_rl.models.megatron.setup import _create_megatron_config
+
+        with (
+            patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_container,
+            patch("nemo_rl.models.megatron.setup.TrainingConfig"),
+            patch("nemo_rl.models.megatron.setup.OptimizerConfig"),
+            patch("nemo_rl.models.megatron.setup.DistributedDataParallelConfig"),
+            patch("nemo_rl.models.megatron.setup.SchedulerConfig"),
+            patch("nemo_rl.models.megatron.setup.TokenizerConfig"),
+            patch("nemo_rl.models.megatron.setup.LoggerConfig"),
+        ):
+            _create_megatron_config(
+                model_cfg=MagicMock(),
+                checkpoint_config=MagicMock(),
+                config=config,
+                hf_model_name="test-model",
+                dtype=torch.bfloat16,
+            )
+
+        return mock_container.call_args.kwargs["dist"]
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_explicit_value_is_forwarded(self, value):
+        """An explicit use_gloo_process_groups is applied to the dist config."""
+        dist_config = self._dist_config_passed_to_container(
+            self._config(use_gloo_process_groups=value)
+        )
+
+        assert dist_config.use_gloo_process_groups is value
+
+    def test_absent_key_defers_to_bridge_default(self):
+        """Omitting the key leaves the Megatron Bridge default untouched."""
+        from megatron.bridge.training.config import DistributedInitConfig
+
+        dist_config = self._dist_config_passed_to_container(self._config())
+
+        assert (
+            dist_config.use_gloo_process_groups
+            == DistributedInitConfig().use_gloo_process_groups
+        )
 
 
 @pytest.mark.mcore
@@ -1781,11 +2010,12 @@ class TestSetupModelConfig:
             "megatron_cfg": {},
         }
 
-        mock_cfg = MagicMock()
-        mock_cfg.model = self._make_model_cfg_mock()
+        mock_model_cfg = self._make_model_cfg_mock()
 
-        with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
-            mock_cc.from_yaml.return_value = mock_cfg
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
             with pytest.warns(
                 UserWarning, match="hf_config_overrides is set but will be ignored"
             ):
@@ -1796,6 +2026,8 @@ class TestSetupModelConfig:
                     hf_model_name="test-model",
                     pretrained_path=str(tmp_path),
                 )
+
+        mock_load_model_config.assert_called_once_with(str(tmp_path))
 
     def test_megatron_bridge_without_hf_config_overrides_no_warning(
         self, tmp_path, request
@@ -1817,11 +2049,12 @@ class TestSetupModelConfig:
             "megatron_cfg": {},
         }
 
-        mock_cfg = MagicMock()
-        mock_cfg.model = self._make_model_cfg_mock()
+        mock_model_cfg = self._make_model_cfg_mock()
 
-        with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
-            mock_cc.from_yaml.return_value = mock_cfg
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
             with _warnings.catch_warnings():
                 _warnings.simplefilter("error", UserWarning)
                 # Should not raise
@@ -1832,6 +2065,40 @@ class TestSetupModelConfig:
                     hf_model_name="test-model",
                     pretrained_path=str(tmp_path),
                 )
+
+        mock_load_model_config.assert_called_once_with(str(tmp_path))
+
+    def test_hf_conversion_loads_model_config_from_iteration_dir(
+        self, tmp_path, request
+    ):
+        """Converted HF caches enter through Bridge's compatibility loader."""
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+
+        iteration_dir = tmp_path / "iter_0000000"
+        iteration_dir.mkdir()
+        (iteration_dir / "run_config.yaml").touch()
+        mock_model_cfg = self._make_model_cfg_mock()
+
+        config = {
+            "pretrained_checkpoint": None,
+            "megatron_cfg": {},
+        }
+
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(mock_model_cfg, None),
+        ) as mock_load_model_config:
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path=str(tmp_path),
+            )
+
+        mock_load_model_config.assert_called_once_with(str(iteration_dir))
 
 
 @pytest.mark.mcore

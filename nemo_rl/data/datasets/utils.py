@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional, Union
 
+import numpy as np
 import torch
 from datasets import (
     Dataset,
@@ -33,6 +34,18 @@ from torch.utils.data import ConcatDataset
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
+
+
+def load_audio_from_file(path: str, sampling_rate: int = 16000) -> np.ndarray:
+    """Decode an audio file (or the audio track of a video) as a 1-D float32 array."""
+    import torchaudio
+
+    waveform, sr = torchaudio.load(path)
+    if sr != sampling_rate:
+        waveform = torchaudio.functional.resample(waveform, sr, sampling_rate)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(0, keepdim=True)
+    return waveform.squeeze(0).numpy().astype(np.float32)
 
 
 def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> None:

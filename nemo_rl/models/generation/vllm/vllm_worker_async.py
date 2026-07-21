@@ -422,11 +422,16 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.generation_tokens = []
 
     async def post_init_async(self):
+        if self.llm is not None:
+            await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:
             await self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
             )
+        if self._sparse_refit_receiver is not None:
+            hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
+            self._sparse_refit_receiver.set_worker_hostnames(hostnames)
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -713,6 +718,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     final_res,
                     device=torch.device("cpu"),
                     logger=LOGGER,
+                    routed_experts_dtype=worker_self.routed_experts_dtype,
                 )
 
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
@@ -906,6 +912,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         app = FastAPI()
 
         app = self._setup_vllm_openai_api_server(app)
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.setup_api_server(app)
 
         ########################################
         # Server spinup
@@ -1210,6 +1218,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
                 require_complete_routed_experts=return_routed_experts,
                 return_stats=True,
+                routed_experts_dtype=self.routed_experts_dtype,
             )
             if return_routed_experts and routed_experts is None:
                 raise RuntimeError(
@@ -1529,6 +1538,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self._sparse_refit_receiver is not None:
+                await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())

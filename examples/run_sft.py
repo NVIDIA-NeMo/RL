@@ -209,17 +209,20 @@ def main(is_vlm: bool = False):
         master_config,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
-    sft_train(
-        policy,
-        train_dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        master_config,
-        logger,
-        checkpointer,
-        sft_save_state,
-    )
+    # The checkpointer owns background async-checkpoint finalization threads;
+    # the context manager guarantees they are flushed (rename + delete) on exit.
+    with checkpointer:
+        sft_train(
+            policy,
+            train_dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            master_config,
+            logger,
+            checkpointer,
+            sft_save_state,
+        )
 
 
 if __name__ == "__main__":

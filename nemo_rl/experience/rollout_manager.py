@@ -25,11 +25,8 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollouts import (
-    _calculate_single_metric,
-    _tensorize_by_key,
-    calculate_rewards,
-)
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.rollouts import _tensorize_by_key, calculate_rewards
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -337,17 +334,29 @@ class AsyncRolloutImpl:
         terminated = [m["terminated"] for m in all_sample_metrics]
         max_turns_reached = [m["max_turns_reached"] for m in all_sample_metrics]
 
+        # max_gen_tokens_per_turn: Diagnostic for long single generations
+        max_gen_tokens_per_turn = [
+            max(m["turn_gen_tokens"]) if m["turn_gen_tokens"] else 0
+            for m in all_sample_metrics
+        ]
+
         # Aggregate metrics across all samples.
         n = len(all_sample_metrics)
         rollout_metrics: dict[str, Any] = {
-            **_calculate_single_metric(total_reward, n, "total_reward"),
+            **calculate_single_metric(total_reward, n, "total_reward"),
             # turn metrics
             "total_turns": sum(turn_count),
-            **_calculate_single_metric(turn_count, n, "turns_per_sample"),
+            **calculate_single_metric(turn_count, n, "turns_per_sample"),
+            "turns_per_sample/p95": pct(turn_count, 95),
+            "turns_per_sample/p99": pct(turn_count, 99),
             # token metrics
-            **_calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
-            **_calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
-            **_calculate_single_metric(env_tokens, n, "env_tokens_per_sample"),
+            **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
+            **calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            **calculate_single_metric(env_tokens, n, "env_tokens_per_sample"),
+            # max_gen_tokens_per_turn: Diagnostic for long single generations
+            "max_gen_tokens_per_turn/max": max(max_gen_tokens_per_turn),
+            "max_gen_tokens_per_turn/mean": sum(max_gen_tokens_per_turn) / n,
+            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
             # truncated metrics
             "truncation_rate": sum(truncated) / n,
             "natural_termination_rate": sum(terminated) / n,
@@ -362,7 +371,7 @@ class AsyncRolloutImpl:
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
         # Per-turn token histograms (flat across all turns, distinct from the
-        # per-sample histograms emitted via _calculate_single_metric above).
+        # per-sample histograms emitted via calculate_single_metric above).
         rollout_metrics["histogram/gen_tokens_length"] = [
             t for m in all_sample_metrics for t in m["turn_gen_tokens"]
         ]
@@ -542,18 +551,36 @@ class AsyncNemoGymRolloutImpl:
             sum(len(m["token_ids"]) for m in c.message_log if m["role"] == "assistant")
             for c in completions
         ]
+        # max_gen_tokens_per_turn: Diagnostic for long single generations
+        max_gen_tokens_per_turn = [
+            max(
+                (
+                    len(m["token_ids"])
+                    for m in c.message_log
+                    if m["role"] == "assistant"
+                ),
+                default=0,
+            )
+            for c in completions
+        ]
         # truncated metrics
         truncated = [c.truncated for c in completions]
 
         # Aggregate metrics across all samples.
         n = len(completions)
         rollout_metrics: dict[str, Any] = {
-            **_calculate_single_metric(total_reward, n, "total_reward"),
+            **calculate_single_metric(total_reward, n, "total_reward"),
             # turn metrics
-            **_calculate_single_metric(turn_count, n, "turns_per_sample"),
+            **calculate_single_metric(turn_count, n, "turns_per_sample"),
+            "turns_per_sample/p95": pct(turn_count, 95),
+            "turns_per_sample/p99": pct(turn_count, 99),
             # token metrics
-            **_calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
-            **_calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            **calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
+            **calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            **calculate_single_metric(
+                max_gen_tokens_per_turn, n, "max_gen_tokens_per_turn"
+            ),
+            "max_gen_tokens_per_turn/p95": pct(max_gen_tokens_per_turn, 95),
             # truncated metrics
             "natural_termination_rate": sum(not t for t in truncated) / n,
             "truncation_rate": sum(truncated) / n,
@@ -569,7 +596,7 @@ class AsyncNemoGymRolloutImpl:
             ]
             if values:
                 rollout_metrics.update(
-                    _calculate_single_metric(values, n, f"{agent_name}/{key}")
+                    calculate_single_metric(values, n, f"{agent_name}/{key}")
                 )
         rollout_metrics[f"{agent_name}/full_result"] = Table(
             data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
