@@ -633,6 +633,23 @@ grpo:
 ```
 Note that this method only has an effect when training involves more than one reward function.
 
+#### Per-reward weights
+
+The aggregation weights \\( w_n \\) in \\( A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)} \\)
+are configurable via `reward_weights`, an optional list with one entry per reward
+component, ordered alphabetically by component name (matching the sorted `reward/<name>`
+keys). When omitted, all weights default to `1.0` (equal weighting). For example, to
+down-weight the second and third rewards:
+```
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    reward_weights: [1.0, 0.5, 0.25]
+```
+The number of weights must equal the number of reward components, or a `ValueError` is raised.
+
 ## LoRA Configuration
 
 GRPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
