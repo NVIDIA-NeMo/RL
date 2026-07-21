@@ -63,6 +63,7 @@
 #               PREFIX_SEEDED_START,
 #               PREFILL_AFTER_ADMISSION,
 #               BACKGROUND_PREFILL_COMPLETION,
+#               STOP_AFTER_FIRST_PREFILL_PAGE,
 #               STABLE_FIRST_SNAPSHOT_PREFILL,
 #               COMPACT_REQUEST_CONTEXT,
 #               INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL,
@@ -128,6 +129,7 @@ FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS="${FINAL_ONLY_PREFILL_COMPLETION_GRA
 PREFIX_SEEDED_START="${PREFIX_SEEDED_START:-0}"
 PREFILL_AFTER_ADMISSION="${PREFILL_AFTER_ADMISSION:-0}"
 BACKGROUND_PREFILL_COMPLETION="${BACKGROUND_PREFILL_COMPLETION:-0}"
+STOP_AFTER_FIRST_PREFILL_PAGE="${STOP_AFTER_FIRST_PREFILL_PAGE:-0}"
 SAME_REQUEST_FINAL_DECODE="${SAME_REQUEST_FINAL_DECODE:-0}"
 STABLE_FIRST_SNAPSHOT_PREFILL="${STABLE_FIRST_SNAPSHOT_PREFILL:-0}"
 COMPACT_REQUEST_CONTEXT="${COMPACT_REQUEST_CONTEXT:-0}"
@@ -197,6 +199,14 @@ if [ "${BACKGROUND_PREFILL_COMPLETION}" != "0" ] && [ "${BACKGROUND_PREFILL_COMP
 fi
 if [ "${BACKGROUND_PREFILL_COMPLETION}" = "1" ] && [ "${PREFILL_AFTER_ADMISSION}" != "1" ]; then
   echo "ERROR: BACKGROUND_PREFILL_COMPLETION requires PREFILL_AFTER_ADMISSION=1." >&2
+  exit 1
+fi
+if [ "${STOP_AFTER_FIRST_PREFILL_PAGE}" != "0" ] && [ "${STOP_AFTER_FIRST_PREFILL_PAGE}" != "1" ]; then
+  echo "ERROR: STOP_AFTER_FIRST_PREFILL_PAGE must be 0 or 1." >&2
+  exit 1
+fi
+if [ "${STOP_AFTER_FIRST_PREFILL_PAGE}" = "1" ] && [ "${BACKGROUND_PREFILL_COMPLETION}" != "1" ]; then
+  echo "ERROR: STOP_AFTER_FIRST_PREFILL_PAGE requires BACKGROUND_PREFILL_COMPLETION=1." >&2
   exit 1
 fi
 if [ "${SAME_REQUEST_FINAL_DECODE}" != "0" ] && [ "${SAME_REQUEST_FINAL_DECODE}" != "1" ]; then
@@ -303,6 +313,12 @@ if [ "${BACKGROUND_PREFILL_COMPLETION}" = "1" ]; then
   STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-background"
 else
   BACKGROUND_PREFILL_COMPLETION_ENABLED=False
+fi
+if [ "${STOP_AFTER_FIRST_PREFILL_PAGE}" = "1" ]; then
+  STOP_AFTER_FIRST_PREFILL_PAGE_ENABLED=True
+  STREAMING_TOOL_CALL_TAG="${STREAMING_TOOL_CALL_TAG}-firstpage"
+else
+  STOP_AFTER_FIRST_PREFILL_PAGE_ENABLED=False
 fi
 if [ "${SAME_REQUEST_FINAL_DECODE}" = "1" ]; then
   SAME_REQUEST_FINAL_DECODE_ENABLED=True
@@ -636,6 +652,7 @@ echo "Final-only incremental tokenizer: ${FINAL_ONLY_INCREMENTAL_TOKENIZER_ENABL
 echo "Final-only prefill: ${FINAL_ONLY_PREFILL_ENABLED}"
 echo "Final-only prefill completion grace: ${FINAL_ONLY_PREFILL_COMPLETION_GRACE_SECONDS}s"
 echo "Background prefill completion: ${BACKGROUND_PREFILL_COMPLETION_ENABLED}"
+echo "Stop after first prefill page: ${STOP_AFTER_FIRST_PREFILL_PAGE_ENABLED}"
 echo "Same-request final decode: ${SAME_REQUEST_FINAL_DECODE_ENABLED}"
 echo "Authoritative-prefix seeded start: ${PREFIX_SEEDED_START_ENABLED}"
 echo "Prefill after admission: ${PREFILL_AFTER_ADMISSION_ENABLED}"
@@ -865,6 +882,7 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   policy.generation.vllm_cfg.streaming_tool_call.prefix_seeded_start=${PREFIX_SEEDED_START_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.prefill_after_admission=${PREFILL_AFTER_ADMISSION_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.background_prefill_completion=${BACKGROUND_PREFILL_COMPLETION_ENABLED} \
+  policy.generation.vllm_cfg.streaming_tool_call.stop_after_first_prefill_page=${STOP_AFTER_FIRST_PREFILL_PAGE_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.same_request_final_decode=${SAME_REQUEST_FINAL_DECODE_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.stable_first_snapshot_prefill=${STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED} \
   policy.generation.vllm_cfg.streaming_tool_call.compact_request_context=${COMPACT_REQUEST_CONTEXT_ENABLED} \
@@ -882,6 +900,7 @@ export COMMAND="PATH=${UV_BIN_DIR}:\${PATH} \
   env.nemo_gym.streaming_tool_call.prefix_seeded_start=${PREFIX_SEEDED_START_ENABLED} \
   env.nemo_gym.streaming_tool_call.prefill_after_admission=${PREFILL_AFTER_ADMISSION_ENABLED} \
   env.nemo_gym.streaming_tool_call.background_prefill_completion=${BACKGROUND_PREFILL_COMPLETION_ENABLED} \
+  env.nemo_gym.streaming_tool_call.stop_after_first_prefill_page=${STOP_AFTER_FIRST_PREFILL_PAGE_ENABLED} \
   env.nemo_gym.streaming_tool_call.same_request_final_decode=${SAME_REQUEST_FINAL_DECODE_ENABLED} \
   env.nemo_gym.streaming_tool_call.stable_first_snapshot_prefill=${STABLE_FIRST_SNAPSHOT_PREFILL_ENABLED} \
   env.nemo_gym.streaming_tool_call.compact_request_context=${COMPACT_REQUEST_CONTEXT_ENABLED} \

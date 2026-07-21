@@ -39,6 +39,7 @@ FINAL_ONLY_PREFILL="${FINAL_ONLY_PREFILL:-0}"
 PREFIX_SEEDED_START="${PREFIX_SEEDED_START:-0}"
 PREFILL_AFTER_ADMISSION="${PREFILL_AFTER_ADMISSION:-0}"
 BACKGROUND_PREFILL_COMPLETION="${BACKGROUND_PREFILL_COMPLETION:-0}"
+STOP_AFTER_FIRST_PREFILL_PAGE="${STOP_AFTER_FIRST_PREFILL_PAGE:-0}"
 STABLE_FIRST_SNAPSHOT_PREFILL="${STABLE_FIRST_SNAPSHOT_PREFILL:-0}"
 COMPACT_REQUEST_CONTEXT="${COMPACT_REQUEST_CONTEXT:-0}"
 INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL="${INCREMENTAL_TOKENIZER_CHECKPOINT_INTERVAL:-8}"
@@ -111,6 +112,7 @@ submit_arm() {
   local prefix_seeded_start="${requested_prefix_seeded_start:-${PREFIX_SEEDED_START}}"
   local prefill_after_admission="${requested_prefill_after_admission:-${PREFILL_AFTER_ADMISSION}}"
   local background_prefill_completion="${BACKGROUND_PREFILL_COMPLETION}"
+  local stop_after_first_prefill_page="${STOP_AFTER_FIRST_PREFILL_PAGE}"
   local compact_request_context="${requested_compact_request_context:-${COMPACT_REQUEST_CONTEXT}}"
   local initial_chunk_chars="${requested_initial_chunk_chars:-${STREAMING_INITIAL_CHUNK_CHARS}}"
   local snapshot_long_poll_timeout_seconds="${requested_snapshot_long_poll_timeout_seconds:-${SNAPSHOT_LONG_POLL_TIMEOUT_SECONDS}}"
@@ -132,6 +134,7 @@ submit_arm() {
     prefix_seeded_start=0
     prefill_after_admission=0
     background_prefill_completion=0
+    stop_after_first_prefill_page=0
     stable_first_snapshot_prefill=0
     same_request_final_decode=0
     compact_request_context=0
@@ -141,6 +144,7 @@ submit_arm() {
     prefix_seeded_start=0
     prefill_after_admission=0
     background_prefill_completion=0
+    stop_after_first_prefill_page=0
     stable_first_snapshot_prefill=0
     same_request_final_decode=0
     compact_request_context=0
@@ -149,12 +153,14 @@ submit_arm() {
     prefix_seeded_start=0
     prefill_after_admission=0
     background_prefill_completion=0
+    stop_after_first_prefill_page=0
     stable_first_snapshot_prefill=0
     same_request_final_decode=0
   elif [ "${final_only_prefill}" != "1" ]; then
     prefix_seeded_start=0
     prefill_after_admission=0
     background_prefill_completion=0
+    stop_after_first_prefill_page=0
     stable_first_snapshot_prefill=0
     same_request_final_decode=0
   elif [ "${prefill_after_admission}" != "1" ] || [ "${prefix_seeded_start}" != "1" ]; then
@@ -195,6 +201,7 @@ submit_arm() {
   PREFIX_SEEDED_START="${prefix_seeded_start}" \
   PREFILL_AFTER_ADMISSION="${prefill_after_admission}" \
   BACKGROUND_PREFILL_COMPLETION="${background_prefill_completion}" \
+  STOP_AFTER_FIRST_PREFILL_PAGE="${stop_after_first_prefill_page}" \
   SAME_REQUEST_FINAL_DECODE="${same_request_final_decode}" \
   STABLE_FIRST_SNAPSHOT_PREFILL="${stable_first_snapshot_prefill}" \
   COMPACT_REQUEST_CONTEXT="${compact_request_context}" \

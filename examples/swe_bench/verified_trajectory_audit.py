@@ -148,6 +148,7 @@ PERF_FIELDS = (
     "streaming_tool_call_prefill_after_admission_requests",
     "streaming_tool_call_prefill_after_admission_tokens",
     "streaming_tool_call_prefill_after_admission_request_seconds",
+    "streaming_tool_call_prefill_first_page_stops",
     "streaming_tool_call_prefill_committed_tokens",
     "streaming_tool_call_prefill_dynamic_tokens",
     "streaming_tool_call_prefill_effective_requests",

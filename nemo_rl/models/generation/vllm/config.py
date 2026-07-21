@@ -70,6 +70,13 @@ class StreamingToolCallConfig(TypedDict):
             background prefill requests. Foreground requests use priority zero,
             and larger values run later. Background completion automatically
             enables vLLM's priority scheduler. The recommended default is 1.
+        stop_after_first_prefill_page: Whether continuation streaming stops
+            requesting shell snapshots after vLLM schedules the first
+            cache-page-aligned background prefill. The authoritative final
+            tokenizer and generation requests remain unchanged. This bounds
+            control-plane overhead while preserving the first reusable APC
+            page. The recommended default is false while this optimization is
+            being validated.
         same_request_final_decode: Whether a settled background prefill session
             appends the authoritative final prompt suffix and performs final
             generation in that same vLLM request. Incompatible, missing, or
@@ -135,6 +142,7 @@ class StreamingToolCallConfig(TypedDict):
     stable_first_snapshot_prefill: NotRequired[bool]
     background_prefill_completion: NotRequired[bool]
     background_prefill_priority: int
+    stop_after_first_prefill_page: bool
     same_request_final_decode: NotRequired[bool]
     compact_request_context: NotRequired[bool]
     incremental_tokenizer_checkpoint_interval: NotRequired[int]
