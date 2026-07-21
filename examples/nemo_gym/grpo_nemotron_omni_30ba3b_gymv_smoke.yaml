@@ -55,7 +55,7 @@ policy:
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 4096
+  max_total_sequence_length: 8192
 
   megatron_cfg:
     # Full 8-GPU policy node: TP=8, EP=8, PP=1, CP=1. Overrides
@@ -98,7 +98,7 @@ policy:
   make_sequence_length_divisible_by: 32
 
   generation:
-    max_new_tokens: 4096                 # per-turn cap; 4 turns fit in 8k context
+    max_new_tokens: ${policy.max_total_sequence_length}                 # per-turn cap; 4 turns fit in 8k context
     # Nano-Omni-Reasoning bad_words: only the vision-side text tokens (safe,
     # in-vocab). The audio-delimiter tokens (<so_embedding>, <so_start>,
     # <so_end>) sit past the LM's text-logit width and cause vLLM
