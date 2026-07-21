@@ -77,6 +77,7 @@ class StreamingToolCallBackgroundStartResult:
     sequence_no: int
     scheduled_chunks: int
     scheduled_tokens: int
+    scheduled_cache_fill_tokens: int
     enqueue_seconds: float
 
 
@@ -90,8 +91,10 @@ class StreamingToolCallCloseResult:
     dummy_tokens: int
     background_scheduled_chunks: int
     background_scheduled_tokens: int
+    background_scheduled_cache_fill_tokens: int
     background_completed_chunks: int
     background_completed_tokens: int
+    background_completed_cache_fill_tokens: int
     background_completed_dummy_tokens: int
     background_effective_chunks: int
     background_dynamic_tokens: int
@@ -160,11 +163,16 @@ class _StreamingToolCallSession:
     engine_observed_prompt_tokens: int | None = None
     background_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     background_start_prompt_token_ids: list[int] | None = None
+    background_start_max_cache_pages: int | None = None
     background_start_result: StreamingToolCallBackgroundStartResult | None = None
+    last_background_prompt_token_ids: list[int] | None = None
+    last_background_result: StreamingToolCallBackgroundStartResult | None = None
     background_scheduled_chunks: int = 0
     background_scheduled_tokens: int = 0
+    background_scheduled_cache_fill_tokens: int = 0
     background_completed_chunks: int = 0
     background_completed_tokens: int = 0
+    background_completed_cache_fill_tokens: int = 0
     background_completed_dummy_tokens: int = 0
     background_effective_chunks: int = 0
     background_dynamic_tokens: int = 0
@@ -174,6 +182,7 @@ class _StreamingToolCallSession:
     background_completion_seconds: float = 0.0
     cache_page_baseline: int | None = None
     cache_page_gate_active: bool = False
+    cache_page_limit_tokens: int | None = None
 
 
 GenerateCallback = Callable[[AsyncIterator[Any], str], AsyncGenerator[Any, None]]
@@ -433,6 +442,7 @@ class StreamingToolCallPrefillManager:
         sequence_no: int = 0,
         initial_candidate_token_ids: list[int] | None = None,
         dynamic_token_baseline: int = 0,
+        max_cache_pages: int | None = None,
     ) -> StreamingToolCallBackgroundStartResult:
         """Start a session and return after its first chunk is safely enqueued.
 
@@ -442,6 +452,26 @@ class StreamingToolCallPrefillManager:
         """
         if dynamic_token_baseline < 0:
             raise ValueError("dynamic_token_baseline must be non-negative")
+        if max_cache_pages is not None:
+            if (
+                isinstance(max_cache_pages, bool)
+                or not isinstance(max_cache_pages, int)
+                or max_cache_pages < 1
+            ):
+                raise ValueError("max_cache_pages must be a positive integer")
+            if not self._require_cache_page_crossing:
+                raise ValueError(
+                    "max_cache_pages requires cache-page crossing enforcement"
+                )
+            if self._cache_page_size_tokens is None:
+                raise ValueError("max_cache_pages requires a known cache page size")
+
+            cache_page_limit_tokens = (
+                dynamic_token_baseline // self._cache_page_size_tokens + max_cache_pages
+            ) * self._cache_page_size_tokens
+            self._validate_prompt_token_count(cache_page_limit_tokens)
+        else:
+            cache_page_limit_tokens = None
         started_at = time.perf_counter()
         session, created = await self._get_or_create_session(
             session_id=session_id,
@@ -451,6 +481,7 @@ class StreamingToolCallPrefillManager:
         if not created:
             if (
                 session.background_start_prompt_token_ids == prompt_token_ids
+                and session.background_start_max_cache_pages == max_cache_pages
                 and session.background_start_result is not None
             ):
                 return session.background_start_result
@@ -459,14 +490,69 @@ class StreamingToolCallPrefillManager:
             )
 
         session.background_start_prompt_token_ids = list(prompt_token_ids)
+        session.background_start_max_cache_pages = max_cache_pages
+        session.cache_page_limit_tokens = cache_page_limit_tokens
         if (
             self._require_cache_page_crossing
             and self._cache_page_size_tokens is not None
         ):
             session.cache_page_baseline = dynamic_token_baseline
             session.cache_page_gate_active = True
+        result = await self._schedule_background_append(
+            session=session,
+            prompt_token_ids=prompt_token_ids,
+            sequence_no=sequence_no,
+            dynamic_token_baseline=dynamic_token_baseline,
+            started_at=started_at,
+        )
+        session.background_start_result = result
+        return result
+
+    async def append_background(
+        self,
+        *,
+        session_id: str,
+        prompt_token_ids: list[int],
+        sequence_no: int,
+        dynamic_token_baseline: int,
+    ) -> StreamingToolCallBackgroundStartResult:
+        """Enqueue a later observation without waiting for engine completion."""
+        if dynamic_token_baseline < 0:
+            raise ValueError("dynamic_token_baseline must be non-negative")
+        session = self._get_session(session_id)
+        if (
+            session.cache_page_baseline is not None
+            and session.cache_page_baseline != dynamic_token_baseline
+        ):
+            raise StreamingToolCallError(
+                "dynamic token baseline changed within a prefill session"
+            )
+        return await self._schedule_background_append(
+            session=session,
+            prompt_token_ids=prompt_token_ids,
+            sequence_no=sequence_no,
+            dynamic_token_baseline=dynamic_token_baseline,
+            started_at=time.perf_counter(),
+        )
+
+    async def _schedule_background_append(
+        self,
+        *,
+        session: _StreamingToolCallSession,
+        prompt_token_ids: list[int],
+        sequence_no: int,
+        dynamic_token_baseline: int,
+        started_at: float,
+    ) -> StreamingToolCallBackgroundStartResult:
+        prior_result = session.last_background_result
+        if (
+            prior_result is not None
+            and prior_result.sequence_no == sequence_no
+            and session.last_background_prompt_token_ids == prompt_token_ids
+        ):
+            return prior_result
         loop = asyncio.get_running_loop()
-        enqueued: asyncio.Future[int] = loop.create_future()
+        enqueued: asyncio.Future[tuple[int, int]] = loop.create_future()
         task = asyncio.create_task(
             self._run_background_append(
                 session=session,
@@ -475,7 +561,7 @@ class StreamingToolCallPrefillManager:
                 dynamic_token_baseline=dynamic_token_baseline,
                 enqueued=enqueued,
             ),
-            name=f"streaming-tool-call-background-{session_id}-{sequence_no}",
+            name=(f"streaming-tool-call-background-{session.session_id}-{sequence_no}"),
         )
         session.background_tasks.add(task)
         task.add_done_callback(
@@ -485,26 +571,46 @@ class StreamingToolCallPrefillManager:
         )
 
         try:
-            scheduled_tokens = await enqueued
+            scheduled_tokens, scheduled_committed_tokens = await enqueued
         except asyncio.CancelledError:
-            await self.abort(session_id=session_id)
+            await self.abort(session_id=session.session_id)
             raise
         except Exception:
-            await self.abort(session_id=session_id)
+            await self.abort(session_id=session.session_id)
             raise
 
         enqueue_seconds = time.perf_counter() - started_at
         scheduled_chunks = int(scheduled_tokens > 0)
+        if scheduled_tokens <= 0:
+            scheduled_cache_fill_tokens = 0
+        elif self._cache_page_size_tokens is None:
+            scheduled_cache_fill_tokens = scheduled_tokens
+        else:
+            reusable_cache_baseline = (
+                dynamic_token_baseline // self._cache_page_size_tokens
+            ) * self._cache_page_size_tokens
+            scheduled_committed_tokens_before = (
+                scheduled_committed_tokens - scheduled_tokens
+            )
+            scheduled_cache_fill_tokens = max(
+                0, scheduled_committed_tokens - reusable_cache_baseline
+            ) - max(0, scheduled_committed_tokens_before - reusable_cache_baseline)
         session.background_scheduled_chunks += scheduled_chunks
         session.background_scheduled_tokens += scheduled_tokens
+        session.background_scheduled_cache_fill_tokens += scheduled_cache_fill_tokens
         session.background_enqueue_seconds += enqueue_seconds
         result = StreamingToolCallBackgroundStartResult(
             sequence_no=sequence_no,
             scheduled_chunks=scheduled_chunks,
             scheduled_tokens=scheduled_tokens,
+            scheduled_cache_fill_tokens=scheduled_cache_fill_tokens,
             enqueue_seconds=enqueue_seconds,
         )
-        session.background_start_result = result
+        # Keep one exact request for idempotence while its engine task may
+        # still be completing. Incremental tokenizer token lists are mutable,
+        # so this must be a defensive copy rather than a borrowed reference.
+        session.last_background_prompt_token_ids = list(prompt_token_ids)
+        session.last_background_result = result
         return result
 
     async def append(
@@ -528,7 +634,7 @@ class StreamingToolCallPrefillManager:
         session_id: str,
         prompt_token_ids: list[int],
         sequence_no: int,
-        enqueued: asyncio.Future[int] | None,
+        enqueued: asyncio.Future[tuple[int, int]] | None,
         cache_page_baseline: int | None = None,
     ) -> StreamingToolCallAppendResult:
         self._assert_owner_loop()
@@ -545,6 +651,13 @@ class StreamingToolCallPrefillManager:
                     session.last_candidate_token_ids == prompt_token_ids
                     and session.last_result is not None
                 ):
+                    if enqueued is not None and not enqueued.done():
+                        enqueued.set_result(
+                            (
+                                session.last_result.chunk_tokens,
+                                session.last_result.committed_tokens,
+                            )
+                        )
                     return session.last_result
                 raise StreamingToolCallError(
                     f"sequence {sequence_no} was already used with different tokens"
@@ -573,8 +686,6 @@ class StreamingToolCallPrefillManager:
                     common_prefix_tokens - self._stability_margin_tokens,
                 )
 
-            self._validate_prompt_token_count(stable_token_count)
-
             # Avoid starting GPU work until the proven stable prefix extends
             # the cacheable prefix by at least one full engine page. If the
             # first background snapshot is too short, the session retains this
@@ -583,6 +694,13 @@ class StreamingToolCallPrefillManager:
             effective_cache_page_baseline = cache_page_baseline
             if effective_cache_page_baseline is None and session.cache_page_gate_active:
                 effective_cache_page_baseline = session.cache_page_baseline
+            if session.cache_page_limit_tokens is not None:
+                stable_token_count = min(
+                    stable_token_count, session.cache_page_limit_tokens
+                )
+
+            self._validate_prompt_token_count(stable_token_count)
+
             if (
                 effective_cache_page_baseline is not None
                 and self._cache_page_size_tokens is not None
@@ -590,7 +708,7 @@ class StreamingToolCallPrefillManager:
                 <= effective_cache_page_baseline // self._cache_page_size_tokens
             ):
                 if enqueued is not None and not enqueued.done():
-                    enqueued.set_result(0)
+                    enqueued.set_result((0, len(session.committed_token_ids)))
                 result = StreamingToolCallAppendResult(
                     sequence_no=sequence_no,
                     committed_tokens=len(session.committed_token_ids),
@@ -609,7 +727,7 @@ class StreamingToolCallPrefillManager:
             ]
             if not chunk_token_ids:
                 if enqueued is not None and not enqueued.done():
-                    enqueued.set_result(0)
+                    enqueued.set_result((0, len(session.committed_token_ids)))
                 result = StreamingToolCallAppendResult(
                     sequence_no=sequence_no,
                     committed_tokens=len(session.committed_token_ids),
@@ -635,7 +753,12 @@ class StreamingToolCallPrefillManager:
             # same streaming engine request without paying a new request cost.
             session.cache_page_gate_active = False
             if enqueued is not None and not enqueued.done():
-                enqueued.set_result(len(chunk_token_ids))
+                enqueued.set_result(
+                    (
+                        len(chunk_token_ids),
+                        len(session.committed_token_ids) + len(chunk_token_ids),
+                    )
+                )
             session.last_activity_monotonic = time.monotonic()
 
             try:
@@ -730,8 +853,14 @@ class StreamingToolCallPrefillManager:
             dummy_tokens=session.dummy_tokens,
             background_scheduled_chunks=session.background_scheduled_chunks,
             background_scheduled_tokens=session.background_scheduled_tokens,
+            background_scheduled_cache_fill_tokens=(
+                session.background_scheduled_cache_fill_tokens
+            ),
             background_completed_chunks=session.background_completed_chunks,
             background_completed_tokens=session.background_completed_tokens,
+            background_completed_cache_fill_tokens=(
+                session.background_completed_cache_fill_tokens
+            ),
             background_completed_dummy_tokens=(
                 session.background_completed_dummy_tokens
             ),
@@ -1011,7 +1140,7 @@ class StreamingToolCallPrefillManager:
         prompt_token_ids: list[int],
         sequence_no: int,
         dynamic_token_baseline: int,
-        enqueued: asyncio.Future[int],
+        enqueued: asyncio.Future[tuple[int, int]],
     ) -> None:
         completion_started_at = time.perf_counter()
         dummy_tokens_before = session.dummy_tokens
@@ -1035,7 +1164,7 @@ class StreamingToolCallPrefillManager:
             if not enqueued.done():
                 enqueued.set_exception(error)
             else:
-                scheduled_tokens = enqueued.result()
+                scheduled_tokens, _ = enqueued.result()
                 session.background_failed_chunks += int(scheduled_tokens > 0)
                 session.background_failed_tokens += scheduled_tokens
             raise
@@ -1046,9 +1175,23 @@ class StreamingToolCallPrefillManager:
         dynamic_tokens_before = max(0, committed_tokens_before - dynamic_token_baseline)
         dynamic_tokens_after = max(0, result.committed_tokens - dynamic_token_baseline)
         dynamic_tokens = dynamic_tokens_after - dynamic_tokens_before
+        if self._cache_page_size_tokens is None:
+            cache_fill_tokens = result.chunk_tokens
+        else:
+            reusable_cache_baseline = (
+                dynamic_token_baseline // self._cache_page_size_tokens
+            ) * self._cache_page_size_tokens
+            cache_fill_tokens_before = max(
+                0, committed_tokens_before - reusable_cache_baseline
+            )
+            cache_fill_tokens_after = max(
+                0, result.committed_tokens - reusable_cache_baseline
+            )
+            cache_fill_tokens = cache_fill_tokens_after - cache_fill_tokens_before
         completed_dummy_tokens = result.dummy_tokens - dummy_tokens_before
         session.background_completed_chunks += 1
         session.background_completed_tokens += result.chunk_tokens
+        session.background_completed_cache_fill_tokens += cache_fill_tokens
         session.background_completed_dummy_tokens += completed_dummy_tokens
         session.background_effective_chunks += int(dynamic_tokens > 0)
         session.background_dynamic_tokens += dynamic_tokens

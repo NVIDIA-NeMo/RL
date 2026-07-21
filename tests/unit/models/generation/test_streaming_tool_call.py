@@ -361,6 +361,7 @@ async def test_background_start_returns_before_engine_completion() -> None:
 
     assert started.scheduled_chunks == 1
     assert started.scheduled_tokens == 3
+    assert started.scheduled_cache_fill_tokens == 3
     assert manager.total_prefill_tokens == 0
     closed = await asyncio.wait_for(
         manager.close(
@@ -399,8 +400,10 @@ async def test_background_completion_is_settled_once_at_close() -> None:
     assert closed.prefix_matched
     assert closed.committed_tokens == 3
     assert closed.background_scheduled_tokens == 3
+    assert closed.background_scheduled_cache_fill_tokens == 3
     assert closed.background_completed_chunks == 1
     assert closed.background_completed_tokens == 3
+    assert closed.background_completed_cache_fill_tokens == 3
     assert closed.background_completed_dummy_tokens == 1
     assert closed.background_effective_chunks == 1
     assert closed.background_dynamic_tokens == 1
@@ -421,31 +424,169 @@ async def test_background_prefill_defers_until_stable_prefix_crosses_cache_page(
         prompt_token_ids=[1, 2, 3, 4, 5, 6, 7],
         initial_candidate_token_ids=[1, 2, 3, 4, 5, 6, 7],
         dynamic_token_baseline=6,
+        max_cache_pages=1,
     )
-    still_deferred = await manager.append(
+    still_deferred = await manager.append_background(
         session_id="session",
-        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8],
+        prompt_token_ids=list(range(1, 21)),
         sequence_no=1,
+        dynamic_token_baseline=6,
     )
-    admitted = await manager.append(
+    admitted = await manager.append_background(
         session_id="session",
-        prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9],
+        prompt_token_ids=list(range(1, 22)),
         sequence_no=2,
+        dynamic_token_baseline=6,
     )
+    await _wait_for_prefill_completion(manager)
     closed = await manager.close(
         session_id="session",
-        final_prompt_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        final_prompt_token_ids=list(range(1, 23)),
     )
 
     assert started.scheduled_chunks == 0
     assert started.scheduled_tokens == 0
-    assert still_deferred.chunk_tokens == 0
-    assert admitted.chunk_tokens == 8
+    assert still_deferred.scheduled_tokens == 0
+    assert admitted.scheduled_tokens == 8
+    assert admitted.scheduled_cache_fill_tokens == 4
     assert engine.received_chunks == [[1, 2, 3, 4, 5, 6, 7, 8]]
     assert closed.prefix_matched
     assert closed.committed_tokens == 8
-    assert closed.background_completed_chunks == 0
+    assert closed.background_completed_chunks == 1
+    assert closed.background_completed_cache_fill_tokens == 4
     assert closed.background_cancelled_chunks == 0
+
+
+@pytest.mark.asyncio
+async def test_background_prefill_caps_far_ahead_snapshot_to_one_cache_page() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(
+        engine,
+        cache_page_size_tokens=4,
+        max_prompt_tokens=8,
+    )
+
+    started = await manager.start_background(
+        session_id="session",
+        prompt_token_ids=list(range(1, 21)),
+        initial_candidate_token_ids=list(range(1, 21)),
+        dynamic_token_baseline=6,
+        max_cache_pages=1,
+    )
+    await _wait_for_prefill_completion(manager)
+    closed = await manager.close(
+        session_id="session",
+        final_prompt_token_ids=list(range(1, 22)),
+    )
+
+    assert started.scheduled_chunks == 1
+    assert started.scheduled_tokens == 8
+    assert started.scheduled_cache_fill_tokens == 4
+    assert engine.received_chunks == [list(range(1, 9))]
+    assert closed.committed_tokens == 8
+    assert closed.background_scheduled_cache_fill_tokens == 4
+    assert closed.background_completed_cache_fill_tokens == 4
+    assert closed.background_dynamic_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_background_prefill_legacy_path_keeps_full_stable_prefix() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine, cache_page_size_tokens=4)
+
+    started = await manager.start_background(
+        session_id="session",
+        prompt_token_ids=list(range(1, 21)),
+        initial_candidate_token_ids=list(range(1, 21)),
+        dynamic_token_baseline=6,
+    )
+    await _wait_for_prefill_completion(manager)
+
+    assert started.scheduled_tokens == 20
+    assert started.scheduled_cache_fill_tokens == 16
+    assert engine.received_chunks == [list(range(1, 21))]
+
+
+@pytest.mark.asyncio
+async def test_background_prefill_caps_after_aligned_cache_baseline() -> None:
+    engine = _FakeEngine()
+    manager = _make_manager(engine, cache_page_size_tokens=4)
+
+    started = await manager.start_background(
+        session_id="session",
+        prompt_token_ids=list(range(1, 21)),
+        initial_candidate_token_ids=list(range(1, 21)),
+        dynamic_token_baseline=8,
+        max_cache_pages=1,
+    )
+    await _wait_for_prefill_completion(manager)
+
+    assert started.scheduled_tokens == 12
+    assert started.scheduled_cache_fill_tokens == 4
+    assert engine.received_chunks == [list(range(1, 13))]
+
+
+@pytest.mark.asyncio
+async def test_background_prefill_retry_is_idempotent_while_engine_runs() -> None:
+    engine = _FakeEngine()
+    engine.block_outputs = True
+    manager = _make_manager(engine, cache_page_size_tokens=4)
+
+    await manager.start_background(
+        session_id="session",
+        prompt_token_ids=list(range(1, 8)),
+        initial_candidate_token_ids=list(range(1, 8)),
+        dynamic_token_baseline=6,
+        max_cache_pages=1,
+    )
+    await manager.append_background(
+        session_id="session",
+        prompt_token_ids=list(range(1, 21)),
+        sequence_no=1,
+        dynamic_token_baseline=6,
+    )
+    admitted = await manager.append_background(
+        session_id="session",
+        prompt_token_ids=list(range(1, 22)),
+        sequence_no=2,
+        dynamic_token_baseline=6,
+    )
+    retried = await asyncio.wait_for(
+        manager.append_background(
+            session_id="session",
+            prompt_token_ids=list(range(1, 22)),
+            sequence_no=2,
+            dynamic_token_baseline=6,
+        ),
+        timeout=0.1,
+    )
+    closed = await manager.close(
+        session_id="session",
+        final_prompt_token_ids=list(range(1, 23)),
+    )
+
+    assert retried == admitted
+    assert closed.background_scheduled_chunks == 1
+    assert closed.background_scheduled_tokens == 8
+    assert closed.background_scheduled_cache_fill_tokens == 4
+
+
+@pytest.mark.asyncio
+async def test_background_prefill_rejects_page_limit_past_context() -> None:
+    manager = _make_manager(
+        _FakeEngine(),
+        cache_page_size_tokens=4,
+        max_prompt_tokens=7,
+    )
+
+    with pytest.raises(StreamingToolCallPromptTooLongError):
+        await manager.start_background(
+            session_id="session",
+            prompt_token_ids=list(range(1, 21)),
+            initial_candidate_token_ids=list(range(1, 21)),
+            dynamic_token_baseline=6,
+            max_cache_pages=1,
+        )
 
 
 @pytest.mark.asyncio

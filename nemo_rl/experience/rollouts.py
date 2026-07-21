@@ -1404,6 +1404,8 @@ PER_AGENT_TOTAL_METRIC_KEYS = frozenset(
         "streaming_tool_call_prefill_after_admission_requests",
         "streaming_tool_call_prefill_after_admission_tokens",
         "streaming_tool_call_prefill_first_page_stops",
+        "streaming_tool_call_prefill_background_scheduled_cache_fill_tokens",
+        "streaming_tool_call_prefill_background_completed_cache_fill_tokens",
         "streaming_tool_call_prefill_race_attempts",
         "streaming_tool_call_prefill_race_prefill_first",
         "streaming_tool_call_prefill_race_command_first",

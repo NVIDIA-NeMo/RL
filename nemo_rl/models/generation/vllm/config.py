@@ -72,11 +72,12 @@ class StreamingToolCallConfig(TypedDict):
             enables vLLM's priority scheduler. The recommended default is 1.
         stop_after_first_prefill_page: Whether continuation streaming stops
             requesting shell snapshots after vLLM schedules the first
-            cache-page-aligned background prefill. The authoritative final
-            tokenizer and generation requests remain unchanged. This bounds
-            control-plane overhead while preserving the first reusable APC
-            page. The recommended default is false while this optimization is
-            being validated.
+            cache-page-aligned background prefill and caps that session at the
+            next APC page boundary. The authoritative final tokenizer and
+            generation requests remain unchanged. This bounds both control-
+            plane overhead and speculative cache-fill work while preserving
+            the first reusable APC page. The recommended default is false
+            while this optimization is being validated.
         same_request_final_decode: Whether a settled background prefill session
             appends the authoritative final prompt suffix and performs final
             generation in that same vLLM request. Incompatible, missing, or

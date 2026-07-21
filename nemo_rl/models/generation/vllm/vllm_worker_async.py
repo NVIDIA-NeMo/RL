@@ -1979,8 +1979,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             prefill_seconds = 0.0
             prefill_background_scheduled_chunks = 0
             prefill_background_scheduled_tokens = 0
+            prefill_background_scheduled_cache_fill_tokens = 0
             prefill_background_completed_chunks = 0
             prefill_background_completed_tokens = 0
+            prefill_background_completed_cache_fill_tokens = 0
             prefill_background_completed_dummy_tokens = 0
             prefill_background_effective_chunks = 0
             prefill_background_dynamic_tokens = 0
@@ -1996,6 +1998,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 background_prefill_completion = bool(
                     streaming_config
                     and streaming_config.get("background_prefill_completion")
+                )
+                background_prefill_request = (
+                    background_prefill_completion and request.prefill_continuation
+                )
+                bounded_background_prefill_request = bool(
+                    background_prefill_request
+                    and streaming_config
+                    and streaming_config["stop_after_first_prefill_page"]
+                )
+                background_enqueue_response = background_prefill_request and (
+                    request.sequence_no == 0 or bounded_background_prefill_request
                 )
                 prefill_start = time.perf_counter()
                 try:
@@ -2022,7 +2035,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                             )
                         if request.sequence_no == 0:
                             if request.prefill_continuation:
-                                if background_prefill_completion:
+                                if background_prefill_request:
                                     prefill_background_start_result = (
                                         await prefill_manager.start_background(
                                             session_id=request.session_id,
@@ -2033,6 +2046,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                                             ),
                                             dynamic_token_baseline=len(
                                                 request.required_prefix_token_ids or []
+                                            ),
+                                            max_cache_pages=(
+                                                1
+                                                if bounded_background_prefill_request
+                                                else None
                                             ),
                                         )
                                     )
@@ -2050,6 +2068,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                                     session_id=request.session_id,
                                     prompt_token_ids=prefill_prompt_token_ids,
                                 )
+                        elif bounded_background_prefill_request:
+                            prefill_background_start_result = (
+                                await prefill_manager.append_background(
+                                    session_id=request.session_id,
+                                    prompt_token_ids=prefill_prompt_token_ids,
+                                    sequence_no=request.sequence_no,
+                                    dynamic_token_baseline=len(
+                                        request.required_prefix_token_ids or []
+                                    ),
+                                )
+                            )
                         else:
                             prefill_append_result = await prefill_manager.append(
                                 session_id=request.session_id,
@@ -2074,6 +2103,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         )
                         prefill_background_completed_tokens = (
                             prefill_close_result.background_completed_tokens
+                        )
+                        prefill_background_completed_cache_fill_tokens = (
+                            prefill_close_result.background_completed_cache_fill_tokens
                         )
                         prefill_background_completed_dummy_tokens = (
                             prefill_close_result.background_completed_dummy_tokens
@@ -2115,13 +2147,16 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         prefill_completed_chunks = prefill_prime_result.completed_chunks
                         prefill_dummy_tokens = prefill_prime_result.dummy_tokens
                         prefill_prefix_matched = prefill_prime_result.prefix_matched
-                    elif request.sequence_no == 0 and background_prefill_completion:
-                        prefill_sessions_started = 1
+                    elif background_enqueue_response:
+                        prefill_sessions_started = int(request.sequence_no == 0)
                         prefill_background_scheduled_chunks = (
                             prefill_background_start_result.scheduled_chunks
                         )
                         prefill_background_scheduled_tokens = (
                             prefill_background_start_result.scheduled_tokens
+                        )
+                        prefill_background_scheduled_cache_fill_tokens = (
+                            prefill_background_start_result.scheduled_cache_fill_tokens
                         )
                         prefill_background_enqueue_seconds = (
                             prefill_background_start_result.enqueue_seconds
@@ -2132,9 +2167,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         prefill_tokens = prefill_append_result.chunk_tokens
                         prefill_completed_chunks = prefill_requests
                         prefill_dummy_tokens = prefill_requests
-                    if not request.final and not (
-                        request.sequence_no == 0 and background_prefill_completion
-                    ):
+                    if not request.final and not background_enqueue_response:
                         if (
                             request.sequence_no == 0
                             and not request.prefill_continuation
@@ -2211,11 +2244,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     "prefill_background_scheduled_tokens": (
                         prefill_background_scheduled_tokens
                     ),
+                    "prefill_background_scheduled_cache_fill_tokens": (
+                        prefill_background_scheduled_cache_fill_tokens
+                    ),
                     "prefill_background_completed_chunks": (
                         prefill_background_completed_chunks
                     ),
                     "prefill_background_completed_tokens": (
                         prefill_background_completed_tokens
+                    ),
+                    "prefill_background_completed_cache_fill_tokens": (
+                        prefill_background_completed_cache_fill_tokens
                     ),
                     "prefill_background_completed_dummy_tokens": (
                         prefill_background_completed_dummy_tokens

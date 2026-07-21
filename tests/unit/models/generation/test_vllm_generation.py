@@ -2147,6 +2147,7 @@ def test_vllm_http_server(cluster, tokenizer):
     assert deferred_start["prefill_effective_requests"] == 0
     assert deferred_start["prefill_background_scheduled_chunks"] == 1
     assert deferred_start["prefill_background_scheduled_tokens"] > 0
+    assert deferred_start["prefill_background_scheduled_cache_fill_tokens"] > 0
     assert deferred_start["stable_first_snapshot_prefill_attempts"] == 1
     assert deferred_start["stable_first_snapshot_prefill_successes"] == 1
     assert deferred_start["stable_first_snapshot_prefill_fallbacks"] == 0
@@ -2160,6 +2161,7 @@ def test_vllm_http_server(cluster, tokenizer):
     assert deferred_final["prefill_dynamic_tokens"] > 0
     assert deferred_final["prefill_effective_requests"] == 1
     assert deferred_final["prefill_background_completed_chunks"] == 1
+    assert deferred_final["prefill_background_completed_cache_fill_tokens"] > 0
     assert deferred_final["prefill_background_scheduled_chunks"] == 0
     assert deferred_final["prefill_background_scheduled_tokens"] == 0
     assert deferred_final["prefill_background_enqueue_seconds"] == 0
