@@ -29,6 +29,7 @@ import json
 import tempfile
 import uuid
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 import torch
@@ -39,11 +40,22 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.experience.rollout_checkpoint import (
+    CompletedSiblingRecord,
+    PersistAck,
+    RolloutWorkItem,
+    StorageUnavailableError,
+)
+from nemo_rl.experience.rollout_manager import (
+    AsyncNemoGymRolloutImpl,
+    RolloutCheckpointWritePolicy,
+    RolloutManager,
+)
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
 )
+from nemo_rl.utils.timer import Timer
 
 # Fixtures shared with the heavyweight rollout tests.
 from tests.unit.environments.test_nemo_gym import (
@@ -272,6 +284,463 @@ class TestGenerateAndPushFlow:
         mgr._tq_buffer = None
         with pytest.raises(AssertionError, match="tq_buffer"):
             _run(mgr.generate_and_push({"prompt": "p"}, num_generations_per_prompt=2))
+
+
+class _ReadyRef:
+    def __init__(self, value):
+        self._value = value
+
+    def __await__(self):
+        async def _resolve():
+            return self._value
+
+        return _resolve().__await__()
+
+
+class _ResultStream:
+    def __init__(self, values):
+        self._values = iter(values)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._values)
+        except StopIteration as error:
+            raise StopAsyncIteration from error
+
+
+class _StreamingRunRollouts:
+    def options(self, *, num_returns):
+        assert num_returns == "streaming"
+        return self
+
+    def remote(self, inputs, tokenizer, timer_prefix):
+        del inputs, tokenizer, timer_prefix
+        return _ResultStream(
+            [
+                _ReadyRef((1, _gym_result(1), None)),
+                _ReadyRef((0, _gym_result(0), {"gym/total": 1.0})),
+            ]
+        )
+
+
+def _gym_result(generation_index: int) -> dict:
+    return {
+        "input_message_log": [
+            {
+                "role": "user",
+                "content": "question",
+                "token_ids": torch.tensor([10]),
+            }
+        ],
+        "message_log": [
+            {
+                "role": "assistant",
+                "content": f"answer-{generation_index}",
+                "token_ids": torch.tensor([generation_index]),
+            }
+        ],
+        "full_result": {"reward": float(generation_index)},
+    }
+
+
+def _checkpoint_work(num_generations: int = 1) -> RolloutWorkItem:
+    return RolloutWorkItem(
+        run_id="run-1",
+        group_id="group-1",
+        prompt_id="prompt-1",
+        dispatch_sequence=0,
+        target_step=None,
+        attempt_id=0,
+        policy_version=0,
+        prompt_fingerprint="prompt-fingerprint",
+        sampling_fingerprint="sampling-fingerprint",
+        tokenizer_fingerprint="tokenizer-fingerprint",
+        num_generations=num_generations,
+        prompt_ref={"idx": 1},
+    )
+
+
+def _checkpoint_write_policy(
+    *,
+    max_pending_writes: int = 1,
+    write_timeout_s: float = 1.0,
+    max_retries: int = 0,
+    retry_backoff_s: float = 0.0,
+) -> RolloutCheckpointWritePolicy:
+    return RolloutCheckpointWritePolicy(
+        max_pending_writes=max_pending_writes,
+        write_timeout_s=write_timeout_s,
+        max_retries=max_retries,
+        retry_backoff_s=retry_backoff_s,
+    )
+
+
+def _persist_ack(
+    record: CompletedSiblingRecord,
+    *,
+    logical_key: tuple[str, str, int] | None = None,
+) -> PersistAck:
+    return PersistAck(
+        logical_key=logical_key or record.logical_key,
+        record_checksum="0" * 64,
+        path=Path("/checkpoint") / f"g{record.generation_index:05d}.pt",
+        already_existed=False,
+    )
+
+
+def test_nemo_gym_stream_persists_in_completion_order_and_waits_for_acks():
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    env_handles = {
+        "nemo_gym": type(
+            "_Environment",
+            (),
+            {"stream_rollouts": _StreamingRunRollouts()},
+        )()
+    }
+    impl._tokenizer = None
+    impl._max_seq_len = 32
+    impl._result_to_completion = lambda result: Completion(
+        message_log=result["message_log"],
+        env_extras=result["full_result"],
+        truncated=False,
+        reward=float(result["full_result"]["reward"]),
+    )
+    impl._compute_rollout_metrics = lambda completions, agent: {
+        "completion_count": len(completions),
+        "agent": agent,
+    }
+    release_acks = asyncio.Event()
+    callback_order: list[int] = []
+
+    async def _persist(generation_index: int, completion: Completion) -> None:
+        callback_order.append(generation_index)
+        assert completion.reward == float(generation_index)
+        await release_acks.wait()
+
+    async def _drive():
+        task = asyncio.create_task(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+                env_handles=env_handles,
+                on_sibling_complete=_persist,
+            )
+        )
+        while len(callback_order) < 2:
+            await asyncio.sleep(0)
+        assert not task.done()
+        release_acks.set()
+        return await task
+
+    completions, _, metrics = _run(_drive())
+
+    assert callback_order == [1, 0]
+    assert [completion.reward for completion in completions] == [0.0, 1.0]
+    assert metrics["gym/total"] == 1.0
+
+
+def test_nemo_gym_stream_awaits_completed_sibling_persistence_before_reraising():
+    class _FailingStream:
+        def __init__(self) -> None:
+            self._first = True
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._first:
+                self._first = False
+                return _ReadyRef((0, _gym_result(0), None))
+            raise RuntimeError("injected NeMo-Gym stream failure")
+
+    class _FailingRunRollouts(_StreamingRunRollouts):
+        def remote(self, inputs, tokenizer, timer_prefix):
+            del inputs, tokenizer, timer_prefix
+            return _FailingStream()
+
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    env_handles = {
+        "nemo_gym": type(
+            "_Environment",
+            (),
+            {"stream_rollouts": _FailingRunRollouts()},
+        )()
+    }
+    impl._tokenizer = None
+    impl._result_to_completion = lambda result: Completion(
+        message_log=result["message_log"],
+        env_extras=result["full_result"],
+        truncated=False,
+        reward=float(result["full_result"]["reward"]),
+    )
+    persisted_indices: list[int] = []
+
+    async def _persist(generation_index: int, _completion: Completion) -> None:
+        await asyncio.sleep(0)
+        persisted_indices.append(generation_index)
+
+    with pytest.raises(RuntimeError, match="injected NeMo-Gym stream failure"):
+        _run(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+                env_handles=env_handles,
+                on_sibling_complete=_persist,
+            )
+        )
+
+    assert persisted_indices == [0]
+
+
+def test_nemo_gym_stream_drains_all_persistence_tasks_before_raising():
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    env_handles = {
+        "nemo_gym": type(
+            "_Environment",
+            (),
+            {"stream_rollouts": _StreamingRunRollouts()},
+        )()
+    }
+    impl._tokenizer = None
+    impl._max_seq_len = 32
+    impl._result_to_completion = lambda result: Completion(
+        message_log=result["message_log"],
+        env_extras=result["full_result"],
+        truncated=False,
+        reward=float(result["full_result"]["reward"]),
+    )
+    impl._compute_rollout_metrics = lambda completions, agent: {}
+    pending_write_started = asyncio.Event()
+    release_pending_write = asyncio.Event()
+
+    async def _persist(generation_index: int, _completion: Completion) -> None:
+        if generation_index == 1:
+            raise StorageUnavailableError("injected persistence failure")
+        pending_write_started.set()
+        await release_pending_write.wait()
+
+    async def _drive() -> None:
+        task = asyncio.create_task(
+            impl._run_rollouts(
+                inputs=[
+                    {"_rowidx": 0, "agent_ref": {"name": "agent"}},
+                    {"_rowidx": 1, "agent_ref": {"name": "agent"}},
+                ],
+                timer=Timer(),
+                timer_prefix="timing/test",
+                env_handles=env_handles,
+                on_sibling_complete=_persist,
+            )
+        )
+        await pending_write_started.wait()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release_pending_write.set()
+        with pytest.raises(
+            StorageUnavailableError, match="injected persistence failure"
+        ):
+            await task
+
+    _run(_drive())
+
+
+def test_rollout_manager_builds_completed_sibling_record_and_gates_group_return():
+    completion = Completion(
+        message_log=[
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([7]),
+            }
+        ],
+        env_extras={"reward": 1.0},
+        truncated=False,
+        reward=1.0,
+    )
+
+    class _GymImpl(AsyncNemoGymRolloutImpl):
+        async def run_rollout(
+            self,
+            input_sample,
+            *,
+            env_handles,
+            num_generations_per_prompt,
+            on_sibling_complete=None,
+        ) -> PromptGroupRecord:
+            assert env_handles == {"nemo_gym": "train"}
+            assert num_generations_per_prompt == 1
+            assert on_sibling_complete is not None
+            await on_sibling_complete(0, completion)
+            return PromptGroupRecord(
+                prompt_idx=input_sample["idx"],
+                prompt=[],
+                extra_env_info={},
+                metadata={"task_name": "nemo_gym"},
+                completions=[completion],
+                rollout_metrics={},
+            )
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.records = []
+
+        async def persist_completed(self, record):
+            self.records.append(record)
+            self.started.set()
+            await self.release.wait()
+            return _persist_ack(record)
+
+    manager = object.__new__(RolloutManager)
+    manager._impl = object.__new__(_GymImpl)
+    manager._env_handles = {"nemo_gym": "train"}
+    manager._val_env_handles = {"nemo_gym": "validation"}
+    manager._checkpoint_write_policy = _checkpoint_write_policy()
+    manager._checkpoint_write_semaphore = None
+    writer = _Writer()
+
+    async def _drive():
+        task = asyncio.create_task(
+            manager.run_rollout(
+                {"idx": 1},
+                num_generations_per_prompt=1,
+                checkpoint_work=_checkpoint_work(),
+                checkpoint_writer=writer,
+            )
+        )
+        await writer.started.wait()
+        assert not task.done()
+        writer.release.set()
+        return await task
+
+    record = _run(_drive())
+
+    assert len(record.completions) == 1
+    assert len(writer.records) == 1
+    persisted = writer.records[0]
+    assert persisted.logical_key == ("run-1", "group-1", 0)
+    assert persisted.policy_version == 0
+    assert persisted.completion.message_log[0]["token_ids"].device.type == "cpu"
+
+
+def test_rollout_manager_retries_transient_checkpoint_storage_failure():
+    completion = Completion(
+        message_log=[
+            {
+                "role": "assistant",
+                "content": "answer",
+                "token_ids": torch.tensor([7]),
+            }
+        ],
+        env_extras={"reward": 1.0},
+        truncated=False,
+        reward=1.0,
+    )
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.records = []
+
+        async def persist_completed(self, record):
+            self.records.append(record)
+            if len(self.records) == 1:
+                raise StorageUnavailableError("injected transient failure")
+            return _persist_ack(record)
+
+    manager = object.__new__(RolloutManager)
+    manager._checkpoint_write_policy = _checkpoint_write_policy(max_retries=1)
+    manager._checkpoint_write_semaphore = None
+    writer = _Writer()
+
+    _run(
+        manager._persist_completed_sibling(
+            _checkpoint_work(),
+            writer,
+            0,
+            completion,
+        )
+    )
+
+    assert len(writer.records) == 2
+    assert writer.records[0] is writer.records[1]
+
+
+def test_rollout_manager_bounds_unacknowledged_checkpoint_wait():
+    completion = Completion(
+        message_log=[],
+        env_extras={},
+        truncated=False,
+        reward=1.0,
+    )
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def persist_completed(self, _record):
+            self.calls += 1
+            await asyncio.Event().wait()
+
+    manager = object.__new__(RolloutManager)
+    manager._checkpoint_write_policy = _checkpoint_write_policy(
+        write_timeout_s=0.01,
+        max_retries=1,
+    )
+    manager._checkpoint_write_semaphore = None
+    writer = _Writer()
+
+    with pytest.raises(
+        StorageUnavailableError, match="did not durably acknowledge.*after 2 attempts"
+    ):
+        _run(
+            manager._persist_completed_sibling(
+                _checkpoint_work(),
+                writer,
+                0,
+                completion,
+            )
+        )
+
+    assert writer.calls == 2
+
+
+def test_rollout_manager_rejects_mismatched_checkpoint_acknowledgement():
+    completion = Completion(
+        message_log=[],
+        env_extras={},
+        truncated=False,
+        reward=1.0,
+    )
+
+    class _Writer:
+        async def persist_completed(self, record):
+            return _persist_ack(record, logical_key=("other-run", "group-1", 0))
+
+    manager = object.__new__(RolloutManager)
+    manager._checkpoint_write_policy = _checkpoint_write_policy()
+    manager._checkpoint_write_semaphore = None
+
+    with pytest.raises(ValueError, match="acknowledgement key does not match"):
+        _run(
+            manager._persist_completed_sibling(
+                _checkpoint_work(),
+                _Writer(),
+                0,
+                completion,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

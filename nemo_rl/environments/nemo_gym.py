@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import subprocess
+from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, Optional, TypedDict
 
@@ -39,6 +40,15 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _has_nan_generation_logprobs(result: dict) -> bool:
+    """Return whether a postprocessed rollout contains NaN policy logprobs."""
+    return any(
+        message.get("generation_logprobs") is not None
+        and torch.isnan(message["generation_logprobs"]).any()
+        for message in result["message_log"]
+    )
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -318,6 +328,55 @@ Depending on your data shape, you may want to change these values."""
         )
 
         return nemo_rl_results, timing_metrics
+
+    async def stream_rollouts(
+        self,
+        nemo_gym_examples: list[dict],
+        tokenizer: PreTrainedTokenizerBase,
+        timer_prefix: str,
+    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+        """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
+        if not nemo_gym_examples:
+            raise ValueError("NeMo-Gym rollout batch must not be empty")
+        if self.rollout_max_attempts_to_avoid_lp_nan != 1:
+            raise NotImplementedError(
+                "streaming NeMo-Gym rollouts require "
+                "rollout_max_attempts_to_avoid_lp_nan=1; whole-batch retries "
+                "cannot safely replay siblings that were already emitted"
+            )
+
+        timer = Timer()
+
+        timer.start("_run_rollouts_total")
+        nemo_gym_result_iterator = self.rch.run_examples(
+            examples=nemo_gym_examples, head_server_config=self.head_server_config
+        )
+
+        num_results = 0
+        for task in nemo_gym_result_iterator:
+            with timer.time(label=f"{timer_prefix}/await_results"):
+                nemo_gym_row, nemo_gym_result = await task
+
+            with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                    nemo_gym_result, tokenizer
+                )
+                if _has_nan_generation_logprobs(nemo_rl_result):
+                    raise RuntimeError("Generation logprobs contain NaN")
+
+            num_results += 1
+            timing_metrics = None
+            if num_results == len(nemo_gym_examples):
+                timer.stop("_run_rollouts_total")
+                timing_metrics = timer.get_timing_metrics("sum")
+                total_time = timing_metrics.pop("_run_rollouts_total")
+                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                    100
+                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                    / total_time
+                )
+
+            yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
