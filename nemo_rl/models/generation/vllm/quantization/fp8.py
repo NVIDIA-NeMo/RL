@@ -750,9 +750,6 @@ def create_weights_mxfp8_moe(
     FusedMoE, but those are read-only properties backed by moe_config. Keep the
     upstream allocation behavior while relying on those existing properties.
     """
-    from vllm.model_executor.layers.fused_moe.layer import (
-        FusedMoeWeightScaleSupported,
-    )
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         MXFP8_BLOCK_SIZE,
         MXFP8_SCALE_DTYPE,
@@ -831,11 +828,11 @@ def create_weights_mxfp8_moe(
 
     set_weight_attrs(
         layer.w13_weight_scale,
-        {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
+        {"quant_method": "block"},
     )
     set_weight_attrs(
         layer.w2_weight_scale,
-        {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
+        {"quant_method": "block"},
     )
 
 
@@ -1156,7 +1153,6 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
     tensors consumed by apply_monolithic_mxfp8_moe. Already-aligned models
     keep the original in-place shuffle behavior.
     """
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSupported
     from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
         swap_w13_to_w31,
     )
@@ -1294,11 +1290,11 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         )
         set_weight_attrs(
             layer.w13_weight_scale_from_checkpoint,
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
+            {"quant_method": "block"},
         )
         set_weight_attrs(
             layer.w2_weight_scale_from_checkpoint,
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
+            {"quant_method": "block"},
         )
 
     if needs_padding:
@@ -1358,13 +1354,11 @@ def apply_monolithic_mxfp8_moe(
     )
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
-    from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         mxfp8_e4m3_quantize,
     )
     from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
 
-    assert self.mxfp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM
 
     if layer.enable_eplb:
         raise NotImplementedError(
