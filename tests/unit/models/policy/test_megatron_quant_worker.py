@@ -14,6 +14,7 @@
 
 import os
 import tempfile
+from collections.abc import Iterator
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -275,7 +276,7 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
 
 
 @requires_weight_folding
-def test_iter_real_quant_refit_params_can_keep_export_on_gpu():
+def test_iter_real_quant_refit_params_can_keep_export_on_gpu() -> None:
     worker = _make_real_quant_worker()
     worker.cfg["generation"]["real_quant_export_cpu_offload"] = False
 
@@ -290,7 +291,8 @@ def test_iter_real_quant_refit_params_can_keep_export_on_gpu():
 @requires_weight_folding
 def test_modelopt_real_quant_cpu_and_gpu_exports_are_byte_identical(
     quant_mode: str,
-):
+) -> None:
+    # Megatron Bridge is an optional dependency needed only by this CUDA test.
     from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
     from megatron.bridge.models.conversion.modelopt_utils import (
         QuantMeta,
@@ -312,7 +314,10 @@ def test_modelopt_real_quant_cpu_and_gpu_exports_are_byte_identical(
         input_amax=torch.tensor(2.0, device="cuda"),
     )
 
-    def export_hook(name: str, tensor: torch.Tensor):
+    def export_hook(
+        name: str,
+        tensor: torch.Tensor,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         yield from export_weight(name, tensor, meta)
 
     weight = HFWeightTuple("model.layers.0.mlp.down_proj.weight", source)

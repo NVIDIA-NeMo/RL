@@ -268,7 +268,9 @@ def test_stream_weights_via_ipc_zmq_aligns_cpu_tensor_groups(monkeypatch):
     assert socket.sent[-1] == IPCProtocol.COMPLETE
 
 
-def test_stream_weights_via_ipc_zmq_preserves_cpu_and_gpu_source_bytes(monkeypatch):
+def test_stream_weights_via_ipc_zmq_preserves_cpu_and_gpu_source_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """CPU and GPU sources must produce identical CUDA IPC staging payloads."""
 
     if not torch.cuda.is_available():
