@@ -1409,8 +1409,29 @@ def apply_monolithic_mxfp8_moe(
         )
     fi_activation_type = activation_map[layer.activation]
 
+    # vLLM 0.25 dropped a couple of attributes off the layer (now RoutedExperts):
+    # routing_method_type is computed from routing config, and ep_rank lives on
+    # moe_config.moe_parallel_config. 0.20 exposed both on the layer directly.
+    _routing_method_type = getattr(layer, "routing_method_type", None)
+    if _routing_method_type is None:
+        from vllm.model_executor.layers.fused_moe.config import (
+            get_routing_method_type,
+        )
+
+        _routing_method_type = get_routing_method_type(
+            scoring_func=layer.scoring_func,
+            top_k=layer.top_k,
+            renormalize=layer.renormalize,
+            num_expert_group=layer.num_expert_group,
+            has_e_score_bias=layer.e_score_correction_bias is not None,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+    _ep_rank = getattr(layer, "ep_rank", None)
+    if _ep_rank is None:
+        _ep_rank = layer.moe_config.moe_parallel_config.ep_rank
+
     # DeepSeekV3 routing requires float32 logits; others expect bfloat16.
-    if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
+    if _routing_method_type == RoutingMethodType.DeepSeekV3:
         assert router_logits.dtype == torch.float32, (
             "DeepSeekV3 routing requires float32 router_logits, "
             f"got {router_logits.dtype}."
@@ -1454,10 +1475,10 @@ def apply_monolithic_mxfp8_moe(
         n_group=n_group,
         topk_group=topk_group,
         intermediate_size=layer.intermediate_size_per_partition,
-        local_expert_offset=layer.ep_rank * layer.local_num_experts,
+        local_expert_offset=_ep_rank * layer.local_num_experts,
         local_num_experts=layer.local_num_experts,
         routed_scaling_factor=layer.routed_scaling_factor,
-        routing_method_type=layer.routing_method_type,
+        routing_method_type=_routing_method_type,
         use_shuffled_weight=True,
         weight_layout=0,
         fp8_quantization_type=Fp8QuantizationType.MxFp8,
