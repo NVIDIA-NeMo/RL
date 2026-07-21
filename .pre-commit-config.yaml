@@ -69,7 +69,7 @@ repos:
   - repo: local
     hooks:
       - id: configs-minimize-check
-        name: minimize-check llm recipes
+        name: minimize-check recipes
         language: system
         pass_filenames: false
         entry: bash
@@ -77,4 +77,4 @@ repos:
           - -lc
           - |
             set -euo pipefail
-            ./tools/config_cli.py minimize-check examples/configs/recipes/{llm,vlm}/*.yaml
+            ./tools/config_cli.py minimize-check examples/configs/recipes/{llm,vlm,diffusion}/*.yaml
