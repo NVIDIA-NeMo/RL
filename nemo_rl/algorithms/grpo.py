@@ -626,7 +626,7 @@ def setup(
                 "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
             },
         }
-        actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+        actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg, tokenizer)
         ray.get(actor._spinup.remote())
         return actor, time.perf_counter() - t0
 

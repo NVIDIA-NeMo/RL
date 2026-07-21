@@ -159,8 +159,12 @@ def _detect_invalid_tool_call_and_malformed_thinking(
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
-    def __init__(self, cfg: NemoGymConfig):
+    def __init__(
+        self, cfg: NemoGymConfig, tokenizer: PreTrainedTokenizerBase | None = None
+    ):
         self.cfg = cfg
+        # Held once so run_rollouts need not re-ship it per prompt group.
+        self.tokenizer = tokenizer
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -268,9 +272,12 @@ Depending on your data shape, you may want to change these values."""
     async def run_rollouts(
         self,
         nemo_gym_examples: list[dict],
-        tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
     ) -> list[dict]:
+        tokenizer = self.tokenizer
+        assert tokenizer is not None, (
+            "NemoGym has no tokenizer; pass one to the constructor before run_rollouts"
+        )
         timer = Timer()
 
         timer.start("_run_rollouts_total")
