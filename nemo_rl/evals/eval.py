@@ -158,9 +158,15 @@ def _validate_nemo_gym_generation_config(
     elif backend == "megatron":
         backend_config = generation_config["mcore_generation_config"]
         config_path = "generation.mcore_generation_config"
+    elif backend == "dynamo":
+        # Dynamo is intrinsically async — every rollout is served over its HTTP
+        # frontend, which always exposes an OpenAI-compatible endpoint. There is
+        # no async_engine / expose_http_server toggle to validate here (unlike
+        # vLLM/Megatron), so accept the config as-is.
+        return
     else:
         raise ValueError(
-            "NeMo Gym evaluation supports the vLLM and Megatron rollout backends"
+            "NeMo Gym evaluation supports the vLLM, Megatron, and Dynamo rollout backends"
         )
     if not backend_config["async_engine"] or not backend_config.get(
         "expose_http_server"
@@ -338,6 +344,25 @@ def setup(
             cluster=cluster,
             config=master_config.policy,
             tokenizer=tokenizer,
+        )
+    elif backend == "dynamo":
+        # Dynamo is non-colocated: the eval cluster IS the dynamo inference
+        # fleet (deployment="ray" owns a fixed worker fleet on it). Mirror the
+        # GRPO training path — DynamoGeneration needs the tokenizer + tokenizer
+        # config (for the OpenAI frontend's chat template) from the policy block
+        # that the GRPO-to-eval conversion preserves.
+        from nemo_rl.models.generation.dynamo import DynamoGeneration
+
+        tokenizer_config = (
+            master_config.policy.get("tokenizer")
+            if master_config.policy is not None
+            else None
+        )
+        policy_generation = DynamoGeneration(
+            cluster=cluster,
+            config=generation_config,
+            tokenizer=tokenizer,
+            tokenizer_config=tokenizer_config,
         )
     else:
         raise ValueError(f"Unsupported evaluation generation backend: {backend}")
