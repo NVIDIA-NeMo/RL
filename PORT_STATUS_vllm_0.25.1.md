@@ -124,3 +124,32 @@ All remaining breaks are the same class (FusedMoE -> MoERunner+RoutedExperts att
 migration); each resolves with a getattr/attribute-path fix. The hard part (weight
 layout, #4) is solved. gcp-nrt caveat: worker venv build needs a retry when
 nvidia-resiliency-ext source build times out on the network (transient).
+
+## RESULT: port works end-to-end on vLLM 0.25.1 (2026-07-21)
+
+All breaks cleared; smoke5 (846ba53) runs multiple steps with refits, SHUFFLE_VERIFY
+passing. Full fix set on top of #3280:
+- 99b1a96: drop FusedMoeWeightScaleSupported import (-> "block" literal) + drop
+  mxfp8_backend/Fp8MoeBackend assert.
+- 0fa4259: accept FlashInferCutedsl* in the linear refit kernel guard.
+- 3679830: read enable_eplb via moe_config.moe_parallel_config.
+- 29bb71f: compute routing_method_type via get_routing_method_type; read ep_rank
+  via moe_config.moe_parallel_config.
+- 846ba53: **refit-safe linear weight layout** — keep layer.weight in checkpoint
+  [N,K] (so every refit load matches), and patch FlashInferCutedslMxfp8LinearKernel.
+  apply_weights to read layer.weight.t() (zero-copy [K,N] column-major, what the
+  kernel wants). NOTE: the earlier ba0b1b1f transpose-in-process was WRONG — it made
+  layer.weight [K,N] and broke refit #2's lm_head load ([N,K] shard into [K,N] param).
+
+The only attributes missing from RoutedExperts were routing_method_type + ep_rank
+(the other ~13 are present). Weight-layout was the one conceptual fix; everything
+else is attribute-path migration from the FusedMoE -> MoERunner+RoutedExperts split.
+
+**Correctness: validated** (bit-exact SHUFFLE_VERIFY passes on 0.25.1).
+
+**Performance: NOT representative yet.** naive-mxfp8 on 0.25.1 shows logprob 144.8 s
+vs 84.6 s on 0.20 — the flashinfer CuteDSL MXFP8 kernel runs an UNTUNED fallback
+tactic (AutoTuner: "shape outside tuning bucket -- perf cliff", esp. the lm_head
+2048x151936 GEMM). This is a flashinfer tuning-state issue, not a port bug. Real
+0.25.1 perf needs a flashinfer autotuner pass covering these shapes / a warm tuning
+cache. Deferred as the last item.
