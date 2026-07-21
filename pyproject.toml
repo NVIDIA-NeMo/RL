@@ -65,8 +65,12 @@ dependencies = [
   "soundfile>=0.13.1",
   "nccl4py; sys_platform != 'darwin'",                                                                                       # for non-colocated refit
   "cuda-bindings; sys_platform != 'darwin'",                                                                                 # for non-colocated refit
-  "pybase64",                                                                                                                # for sglang refit
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                                  # for transformer-engine no build isolation
+  # Worker venvs run a base sync before backend extras, so NIXL must be available here.
+  "nixl==1.3.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "pybase64",                                                                                                 # for sglang refit
+  "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
+  "zstandard",                                                                                                # for sparse refit body compression
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                   # for transformer-engine no build isolation
   # tilelang — replacement Triton kernel mamba-ssm requires when
   # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
   # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
