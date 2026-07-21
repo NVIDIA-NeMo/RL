@@ -26,8 +26,11 @@ Weight updates flow through ``NcclExtension`` inside TRT-LLM's internal
 """
 
 import asyncio
+import copy
 import gc
+import json
 import os
+import threading
 from typing import Any, Optional
 
 import ray
@@ -109,6 +112,17 @@ class TrtllmAsyncGenerationWorkerImpl:
         self._http_base_url: Optional[str] = None
         self._http_server = None
 
+        # In-flight batching telemetry (mirrors the vLLM metrics logger).
+        # Populated by a background asyncio task started in post_init_async
+        # when trtllm_cfg.enable_trtllm_metrics_logger is set.
+        self._trtllm_metrics_enabled = bool(
+            self.cfg["trtllm_cfg"].get("enable_trtllm_metrics_logger", False)
+        )
+        self._trtllm_metrics_lock = threading.Lock()
+        self._stats_task: Optional[asyncio.Task] = None
+        self.inflight_batch_sizes: list[int] = []
+        self.num_pending_samples: list[int] = []
+
         if not self.is_model_owner:
             return
 
@@ -125,6 +139,15 @@ class TrtllmAsyncGenerationWorkerImpl:
         )
 
         self.TrtSamplingParams = TrtSamplingParams
+
+        # Install the sync `fetch_stats_serialized` worker method BEFORE AsyncLLM
+        # spawns its RayGPUWorker engine processes, so they import the patched
+        # BaseWorker. See _ifb_stats_patch for the full rationale (the metric can
+        # only be read from the real engine via collective_rpc, which needs a sync
+        # picklable fetch). Applied here in-process + via a .pth drop so the
+        # separate worker processes also run it.
+        if self._trtllm_metrics_enabled:
+            self._install_ifb_stats_patch()
 
         trtllm_cfg = self.cfg["trtllm_cfg"]
         tp_size = trtllm_cfg["tensor_parallel_size"]
@@ -218,6 +241,13 @@ class TrtllmAsyncGenerationWorkerImpl:
             )
             llm_kwargs["per_worker_gpu_share"] = self._fraction_of_gpus
 
+        # Enable per-iteration performance stats so get_stats_async() yields
+        # inflightBatchingStats (the TRT-LLM analog of vLLM's
+        # vllm:num_requests_running). Set before the extra-kwargs spread so the
+        # user can still override it via trtllm_kwargs.
+        if self._trtllm_metrics_enabled:
+            llm_kwargs["enable_iter_perf_stats"] = True
+
         # Escape hatch: spread remaining user-provided TRT-LLM kwargs last so
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
@@ -256,7 +286,203 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self.cfg["trtllm_cfg"].get("expose_http_server"):
             self.start_http_server()
 
+        if self._trtllm_metrics_enabled:
+            self._stats_task = asyncio.create_task(self._drain_stats_loop())
+            print(
+                "📋[TRT-LLM Metric Logger] stats drain task started",
+                flush=True,
+            )
+
+    # ------------------------------------------------------------------ #
+    #  In-flight batching telemetry
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _get_stat_field(obj: Any, *keys: str) -> Any:
+        """Read a nested field from a stats record that may be a dict or an
+        attribute-style object (TRT-LLM has returned both shapes across
+        versions). Returns None if any level is missing."""
+        cur = obj
+        for k in keys:
+            if cur is None:
+                return None
+            if isinstance(cur, dict):
+                cur = cur.get(k)
+            else:
+                cur = getattr(cur, k, None)
+        return cur
+
+    def _install_ifb_stats_patch(self) -> None:
+        """Expose a SYNC, Ray-picklable ``fetch_stats_serialized`` on TRT-LLM's
+        BaseWorker so the drain can read iteration stats via collective_rpc.
+
+        The metric can only be read from the real engine worker via
+        collective_rpc (the RPC-client get_stats path hits a stats-less engine);
+        collective_rpc returns unpicklable IterationStats objects and the
+        built-in serialized fetches are async (unusable through the sync
+        RayGPUWorker.call_worker_method). We add a plain sync serializing method.
+        Applied both in this actor's process and — because the engine runs in
+        separate RayGPUWorker processes that do not import nemo_rl — by appending
+        a module-level patch to the shared-venv base_worker.py source those
+        processes import. See _ifb_stats_patch for the full rationale.
+        """
+        try:
+            from nemo_rl.models.generation.trtllm import _ifb_stats_patch
+
+            _ifb_stats_patch.apply()
+        except Exception as e:  # pragma: no cover
+            print(
+                f"[TrtllmAsyncWorker] ifb in-process patch skipped: {e!r}",
+                flush=True,
+            )
+
+        marker = "# --- nemo-rl IFB metric patch ---"
+        block = (
+            "\n\n" + marker + "\n"
+            "def _nemorl_fetch_stats_serialized(self):\n"
+            "    return [self._stats_serializer(s) for s in self.fetch_stats()]\n"
+            "try:\n"
+            "    BaseWorker.fetch_stats_serialized = _nemorl_fetch_stats_serialized\n"
+            "except Exception:\n"
+            "    pass\n"
+            "# --- end nemo-rl IFB metric patch ---\n"
+        )
+        try:
+            import fcntl
+
+            import tensorrt_llm.executor.base_worker as _bw
+
+            path = os.path.abspath(_bw.__file__)
+            # a+ appends regardless of seek; flock serializes the co-located
+            # replica actors that share this node's container venv.
+            with open(path, "a+") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    already = marker in f.read()
+                    if not already:
+                        f.write(block)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            print(
+                f"[TrtllmAsyncWorker] IFB stats patch "
+                f"{'present' if already else 'appended'} in {path}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[TrtllmAsyncWorker] ifb base_worker append skipped: {e!r}",
+                flush=True,
+            )
+
+    async def _drain_stats_loop(self) -> None:
+        """Continuously drain per-iteration stats from the engine and record
+        the in-flight batching size (context + generation requests scheduled
+        this iteration)."""
+        assert self.llm is not None
+        interval = float(
+            self.cfg["trtllm_cfg"].get("trtllm_metrics_logger_interval", 5.0)
+        )
+        _err_logged = 0
+        while True:
+            try:
+                # Read iteration stats from the real engine workers via
+                # collective_rpc("fetch_stats_serialized") — a sync serializing
+                # method injected onto TRT-LLM's BaseWorker (see
+                # _install_ifb_stats_patch). On the _torch AsyncLLM Ray backend the
+                # RPC-proxy get_stats()/get_stats_async() reach a stats-less engine
+                # (always empty), and raw collective_rpc("fetch_stats") returns
+                # unpicklable IterationStats objects; fetch_stats_serialized returns
+                # JSON strings (camelCase inflightBatchingStats.numScheduledRequests).
+                try:
+                    rank_results = await self.llm.collective_rpc(
+                        "fetch_stats_serialized"
+                    )
+                except Exception as e:
+                    rank_results = None
+                    if _err_logged < 5:
+                        _err_logged += 1
+                        print(
+                            "⚠️[TRT-LLM Metric Logger] "
+                            f"collective_rpc(fetch_stats_serialized) error: {e!r}",
+                            flush=True,
+                        )
+                # Every TP rank of an engine accumulates the SAME per-iteration
+                # stats, so take a single rank (the first non-empty one) to avoid
+                # double-counting the timeline.
+                records: list[Any] = []
+                for _rank_res in rank_results or []:
+                    if _rank_res:
+                        records = _rank_res
+                        break
+                # Append EXACTLY ONE sample per drain interval to mirror vLLM's
+                # _logger_loop (which samples a single gauge value per interval).
+                # The plot's x-axis assumes one point per interval (x = index *
+                # timeline_interval), so appending every per-iteration engine
+                # record (tens of thousands/step) would both over-densify the
+                # series and massively overstate wall-clock. Take the LAST drained
+                # record as the instantaneous sample; when the engine is idle and
+                # no records are returned, append 0 to both (mirrors vLLM logging
+                # the current 0-gauge) so every interval yields one point.
+                ifb_sample = 0
+                ctx_sample = 0
+                if records:
+                    stats = records[-1]
+                    if isinstance(stats, (str, bytes, bytearray)):
+                        try:
+                            stats = json.loads(stats)
+                        except (ValueError, TypeError):
+                            stats = None
+                    if stats is not None:
+                        ifb = self._get_stat_field(
+                            stats, "inflightBatchingStats", "numScheduledRequests"
+                        )
+                        ctx = self._get_stat_field(
+                            stats, "inflightBatchingStats", "numContextRequests"
+                        )
+                        ifb_sample = int(ifb) if ifb is not None else 0
+                        # numContextRequests is prefill-only; approximates
+                        # queued/pending prefill work. Keep the same two-series
+                        # shape the consumer asserts on.
+                        ctx_sample = int(ctx) if ctx is not None else 0
+                with self._trtllm_metrics_lock:
+                    self.inflight_batch_sizes.append(ifb_sample)
+                    self.num_pending_samples.append(ctx_sample)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if _err_logged < 5:
+                    _err_logged += 1
+                    print(
+                        f"⚠️[TRT-LLM Metric Logger] stats drain error: {e}",
+                        flush=True,
+                    )
+            # Always back off between drain cycles, not just on error. get_stats()
+            # already blocks up to `interval` collecting queued records; this extra
+            # sleep guards against a tight loop if it ever returns immediately
+            # (e.g. before prompts are submitted) so we never busy-spin.
+            await asyncio.sleep(interval)
+
+    def get_trtllm_logger_metrics(self) -> dict[str, Any]:
+        if not self._trtllm_metrics_enabled:
+            return {}
+        with self._trtllm_metrics_lock:
+            return {
+                "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
+                "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+            }
+
+    def clear_trtllm_logger_metrics(self) -> None:
+        if not self._trtllm_metrics_enabled:
+            return
+        with self._trtllm_metrics_lock:
+            self.inflight_batch_sizes = []
+            self.num_pending_samples = []
+
     def shutdown(self) -> bool:
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+            self._stats_task = None
         try:
             self.stop_http_server()
             if self.llm is not None:
