@@ -148,6 +148,9 @@ class VllmConfig(GenerationConfig):
     # NVFP4 kernels and stream packed quantized weights instead of fake-quant
     # modules. This is intended for ModelOpt NVFP4 rollout experiments.
     real_quant: NotRequired[bool]
+    # CPU offload remains the default. Disabling it is supported only for
+    # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
+    real_quant_export_cpu_offload: NotRequired[bool]
     real_quant_ignore: NotRequired[list[str]]
 
 

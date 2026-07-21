@@ -45,6 +45,22 @@ def configure_generation_config(
     # vllm setting
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
+        if config.get("real_quant"):
+            export_cpu_offload = config.get("real_quant_export_cpu_offload", True)
+            if not isinstance(export_cpu_offload, bool):
+                raise ValueError(
+                    "generation.real_quant_export_cpu_offload must be a boolean"
+                )
+            if not export_cpu_offload and (
+                not config["colocated"]["enabled"]
+                or config.get("refit_transport") is not None
+            ):
+                raise ValueError(
+                    "generation.real_quant_export_cpu_offload=false requires "
+                    "colocated CUDA-IPC refit with no explicit refit_transport"
+                )
+            config["real_quant_export_cpu_offload"] = export_cpu_offload
+
         # set load_format
         config["vllm_cfg"]["load_format"] = (
             "auto"
