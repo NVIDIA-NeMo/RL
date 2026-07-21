@@ -4,8 +4,18 @@ grpo:
   num_generations_per_prompt: 4
   max_val_samples: 64
   val_batch_size: 64
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+
 checkpointing:
-  checkpoint_dir: results/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm
+  checkpoint_dir: results/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm-noncolocated-async
+
 policy:
   model_name: Qwen/Qwen2.5-0.5B
   tokenizer:
@@ -23,10 +33,15 @@ policy:
     enabled: true
   generation:
     max_new_tokens: 512
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
 logger:
-  log_dir: logs/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm
+  log_dir: logs/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm-noncolocated-async
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-0.5b-1n4g-megatron-trtllm
+    name: grpo-qwen2.5-0.5b-1n4g-megatron-trtllm-noncolocated-async
 cluster:
   gpus_per_node: 4

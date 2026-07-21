@@ -14,7 +14,7 @@
 # limitations under the License.
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
-source ${SCRIPT_DIR}/common.env
+source "${SCRIPT_DIR}/common.env"
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
