@@ -54,8 +54,10 @@ class BackgroundMeasurement:
     close_seconds: float
     scheduled_chunks: int
     scheduled_tokens: int
+    scheduled_cache_fill_tokens: int
     completed_chunks: int
     completed_tokens: int
+    completed_cache_fill_tokens: int
     effective_chunks: int
     dynamic_tokens: int
     cancelled_chunks: int
@@ -109,6 +111,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--stability-margin-tokens", type=int, default=8)
     parser.add_argument("--background-priority", type=int, default=1)
     parser.add_argument("--cache-page-size-tokens", type=int)
+    parser.add_argument("--max-cache-pages", type=int)
     parser.add_argument("--overlap-seconds", type=_parse_overlaps, default=(0.0,))
     parser.add_argument("--cleanup-delay-seconds", type=float, default=0.05)
     parser.add_argument("--warmup-repeats", type=int, default=1)
@@ -202,6 +205,7 @@ async def _run_background(
     stability_margin_tokens: int,
     background_priority: int,
     cache_page_size_tokens: int | None,
+    max_cache_pages: int | None,
 ) -> BackgroundMeasurement:
     prefix_warm_seconds = await _warm_authoritative_prefix(
         llm,
@@ -232,6 +236,7 @@ async def _run_background(
         prompt_token_ids=first_snapshot,
         initial_candidate_token_ids=first_snapshot[:stable_candidate_end],
         dynamic_token_baseline=trace.immutable_prefix_tokens,
+        max_cache_pages=max_cache_pages,
     )
     if overlap_seconds:
         await asyncio.sleep(overlap_seconds)
@@ -256,8 +261,12 @@ async def _run_background(
         close_seconds=close_seconds,
         scheduled_chunks=start_result.scheduled_chunks,
         scheduled_tokens=start_result.scheduled_tokens,
+        scheduled_cache_fill_tokens=start_result.scheduled_cache_fill_tokens,
         completed_chunks=close_result.background_completed_chunks,
         completed_tokens=close_result.background_completed_tokens,
+        completed_cache_fill_tokens=(
+            close_result.background_completed_cache_fill_tokens
+        ),
         effective_chunks=close_result.background_effective_chunks,
         dynamic_tokens=close_result.background_dynamic_tokens,
         cancelled_chunks=close_result.background_cancelled_chunks,
@@ -283,6 +292,7 @@ async def _run_foreground_contention(
     streaming_input_type: type,
     stability_margin_tokens: int,
     cache_page_size_tokens: int | None,
+    max_cache_pages: int | None,
 ) -> ForegroundContentionMeasurement:
     await _warm_authoritative_prefix(
         llm,
@@ -313,6 +323,7 @@ async def _run_foreground_contention(
         prompt_token_ids=first_snapshot,
         initial_candidate_token_ids=first_snapshot[:stable_candidate_end],
         dynamic_token_baseline=trace.immutable_prefix_tokens,
+        max_cache_pages=max_cache_pages,
     )
     foreground_generation = await _generate_one_token(
         llm,
@@ -397,8 +408,14 @@ def _summarize_pair(
         "scheduled_tokens": _summary(
             [float(item.scheduled_tokens) for item in backgrounds]
         ),
+        "scheduled_cache_fill_tokens": _summary(
+            [float(item.scheduled_cache_fill_tokens) for item in backgrounds]
+        ),
         "completed_tokens": _summary(
             [float(item.completed_tokens) for item in backgrounds]
+        ),
+        "completed_cache_fill_tokens": _summary(
+            [float(item.completed_cache_fill_tokens) for item in backgrounds]
         ),
         "dynamic_tokens": _summary(
             [float(item.dynamic_tokens) for item in backgrounds]
@@ -439,6 +456,11 @@ async def _main(args: argparse.Namespace) -> None:
         raise ValueError("background_priority must be positive")
     if args.cache_page_size_tokens is not None and args.cache_page_size_tokens <= 0:
         raise ValueError("cache_page_size_tokens must be positive when set")
+    if args.max_cache_pages is not None:
+        if args.max_cache_pages <= 0:
+            raise ValueError("max_cache_pages must be positive when set")
+        if args.cache_page_size_tokens is None:
+            raise ValueError("max_cache_pages requires cache_page_size_tokens")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     trace = _build_prompt_trace(tokenizer, args)
     if len(trace.final) >= args.max_model_len:
@@ -511,6 +533,7 @@ async def _main(args: argparse.Namespace) -> None:
                 stability_margin_tokens=args.stability_margin_tokens,
                 background_priority=args.background_priority,
                 cache_page_size_tokens=args.cache_page_size_tokens,
+                max_cache_pages=args.max_cache_pages,
             )
         )
 
@@ -528,6 +551,7 @@ async def _main(args: argparse.Namespace) -> None:
                 streaming_input_type=StreamingInput,
                 stability_margin_tokens=args.stability_margin_tokens,
                 cache_page_size_tokens=args.cache_page_size_tokens,
+                max_cache_pages=args.max_cache_pages,
             )
         )
 
@@ -596,6 +620,7 @@ async def _main(args: argparse.Namespace) -> None:
                         stability_margin_tokens=args.stability_margin_tokens,
                         background_priority=args.background_priority,
                         cache_page_size_tokens=args.cache_page_size_tokens,
+                        max_cache_pages=args.max_cache_pages,
                     )
                 )
 
@@ -680,6 +705,7 @@ async def _main(args: argparse.Namespace) -> None:
                 "scheduling_policy": "priority",
                 "background_priority": args.background_priority,
                 "cache_page_size_tokens": args.cache_page_size_tokens,
+                "max_cache_pages": args.max_cache_pages,
             },
             "trace": {
                 "immutable_prefix_tokens": trace.immutable_prefix_tokens,

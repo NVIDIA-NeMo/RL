@@ -155,6 +155,10 @@ _run_worker() {
   if (( BENCH_CACHE_PAGE_SIZE_TOKENS > 0 )); then
     cache_page_args=(--cache-page-size-tokens "${BENCH_CACHE_PAGE_SIZE_TOKENS}")
   fi
+  max_cache_pages_args=()
+  if (( BENCH_MAX_CACHE_PAGES > 0 )); then
+    max_cache_pages_args=(--max-cache-pages "${BENCH_MAX_CACHE_PAGES}")
+  fi
 
   "${BENCH_RUNTIME_PYTHON}" \
     examples/swe_bench/benchmark_background_prefill_admission.py \
@@ -169,6 +173,7 @@ _run_worker() {
     --stability-margin-tokens 8 \
     --background-priority "${BENCH_BACKGROUND_PRIORITY}" \
     "${cache_page_args[@]}" \
+    "${max_cache_pages_args[@]}" \
     --overlap-seconds "${BENCH_OVERLAP_SECONDS}" \
     --cleanup-delay-seconds 0.05 \
     --warmup-repeats "${BENCH_WARMUP_REPEATS}" \
@@ -200,6 +205,15 @@ else
 fi
 if ! [[ "${BENCH_CACHE_PAGE_SIZE_TOKENS}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: BENCH_CACHE_PAGE_SIZE_TOKENS must be a non-negative integer." >&2
+  exit 1
+fi
+BENCH_MAX_CACHE_PAGES="${BENCH_MAX_CACHE_PAGES:-0}"
+if ! [[ "${BENCH_MAX_CACHE_PAGES}" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: BENCH_MAX_CACHE_PAGES must be a non-negative integer." >&2
+  exit 1
+fi
+if (( BENCH_MAX_CACHE_PAGES > 0 && BENCH_CACHE_PAGE_SIZE_TOKENS == 0 )); then
+  echo "ERROR: BENCH_MAX_CACHE_PAGES requires a positive cache page size." >&2
   exit 1
 fi
 BENCH_CONTENTION_REPEATS="${BENCH_CONTENTION_REPEATS:-10}"
@@ -274,6 +288,7 @@ export BENCH_MODE
 export BENCH_REPEATS BENCH_WARMUP_REPEATS BENCH_CACHE_NAMESPACE
 export BENCH_BACKGROUND_PRIORITY BENCH_CANDIDATE_CHUNK_TOKENS BENCH_OVERLAP_SECONDS
 export BENCH_CACHE_PAGE_SIZE_TOKENS
+export BENCH_MAX_CACHE_PAGES
 export BENCH_CONTENTION_REPEATS BENCH_CONTENTION_FOREGROUND_TOKENS
 export BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP BENCH_SIZE_SWEEP_OVERLAP_SECONDS
 export BENCH_SIZE_SWEEP_REPEATS
@@ -294,6 +309,7 @@ echo "[LAUNCH] runtime_namespace=${BENCH_RUNTIME_NAMESPACE}"
 echo "[LAUNCH] output=${BENCH_OUTPUT_JSON}"
 echo "[LAUNCH] candidate_chunk_token_sweep=${BENCH_CANDIDATE_CHUNK_TOKEN_SWEEP:-disabled}"
 echo "[LAUNCH] cache_page_size_tokens=${BENCH_CACHE_PAGE_SIZE_TOKENS} (0 disables page-aware admission)"
+echo "[LAUNCH] max_cache_pages=${BENCH_MAX_CACHE_PAGES} (0 disables the cap)"
 if [[ "${BENCH_MODE}" == "same_request_final_decode" ]]; then
   echo "[LAUNCH] prefill_logprobs=${BENCH_FINAL_DECODE_PREFILL_LOGPROBS} diagnose_nan_logits=${BENCH_DIAGNOSE_NAN_LOGITS}"
   echo "[LAUNCH] same_request_prefill_chunks=${BENCH_SAME_REQUEST_PREFILL_CHUNKS} concurrent_same_request_sessions=${BENCH_CONCURRENT_SAME_REQUEST_SESSIONS}"
