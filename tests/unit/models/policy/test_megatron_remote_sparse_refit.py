@@ -16,12 +16,12 @@ from types import SimpleNamespace
 
 import torch
 
-from nemo_rl.models.generation.vllm.config import VllmRefitConfig
+from nemo_rl.models.generation.vllm.config import VllmSparseRefitConfig
 from nemo_rl.models.policy.workers.megatron_remote_sparse_refit import (
     MegatronRemoteSparseRefit,
 )
 
-_REFIT_CONFIG = VllmRefitConfig(
+_REFIT_CONFIG = VllmSparseRefitConfig(
     delta_compression={
         "encoding": "overwrite",
         "sparse_bucket_size_bytes": 1024,
@@ -57,7 +57,7 @@ def test_remote_sparse_initializes_canonical_hf_baseline() -> None:
 def test_remote_sparse_preserves_xor_config() -> None:
     remote_refit = MegatronRemoteSparseRefit(
         _worker(),
-        VllmRefitConfig(
+        VllmSparseRefitConfig(
             delta_compression={
                 "encoding": "xor",
                 "sparse_bucket_size_bytes": 1024,

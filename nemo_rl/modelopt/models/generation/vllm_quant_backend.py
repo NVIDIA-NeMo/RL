@@ -27,6 +27,7 @@ from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     matches_quant_ignore_pattern,
 )
+from nemo_rl.models.generation.vllm.checkpoint_engine import VllmCheckpointEngineMixin
 from nemo_rl.models.generation.vllm.vllm_backend import (
     IPCWeightManifestError,
     VllmInternalWorkerExtension,
@@ -654,3 +655,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             "with_amax": with_amax,
             "positive_amax": positive_amax,
         }
+
+
+class VllmQuantInternalWorkerExtensionWithCheckpointEngine(
+    VllmCheckpointEngineMixin, VllmQuantInternalWorkerExtension
+):
+    """ModelOpt worker extension with checkpoint-engine refit support."""
