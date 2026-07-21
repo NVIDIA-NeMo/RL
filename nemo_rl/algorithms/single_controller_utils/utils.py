@@ -23,7 +23,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.experience.rollouts import _calculate_single_metric
+from nemo_rl.experience.metric_utils import calculate_single_metric
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -268,7 +268,7 @@ def reduce_advantage_pump_metrics(
         out["total_num_tokens"] = float(sum(sequence_lengths))
     if gen_tokens_per_sample:
         out.update(
-            _calculate_single_metric(
+            calculate_single_metric(
                 gen_tokens_per_sample,
                 len(gen_tokens_per_sample),
                 "gen_tokens_per_sample",
@@ -278,7 +278,7 @@ def reduce_advantage_pump_metrics(
         out["mean_gen_tokens_per_sample"] = out["gen_tokens_per_sample/mean"]
         if sequence_lengths:
             out.update(
-                _calculate_single_metric(
+                calculate_single_metric(
                     sequence_lengths,
                     len(sequence_lengths),
                     "total_tokens_per_sample",
