@@ -536,10 +536,7 @@ def build_reward_component_columns(
     )
     return {
         f"reward/{name}": torch.tensor(
-            [
-                c[name] if c is not None and name in c else 0.0
-                for c in component_dicts
-            ]
+            [c[name] if c is not None and name in c else 0.0 for c in component_dicts]
         )
         for name in component_names
     }
