@@ -22,6 +22,11 @@ from typing import Any, Literal
 import torch
 import zmq
 
+from nemo_rl.models.generation.vllm.checkpoint_engine import (
+    VllmCheckpointEngineMixin,
+    preinit_nixl_from_vllm_config,
+    resolve_rollout_rank,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -32,6 +37,7 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
 try:
     import vllm  # noqa: F401
+    from vllm.v1.worker.gpu_worker import Worker as VllmWorker
 except ImportError:
     raise ImportError(
         "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -101,6 +107,15 @@ class _IPCWeightManifest:
             raise IPCWeightManifestError("; ".join(details))
 
 
+class NixlVllmWorker(VllmWorker):
+    """vLLM worker that establishes NIXL/UCX before vLLM initialization."""
+
+    def __new__(cls, vllm_config: Any, *args: Any, **kwargs: Any) -> "NixlVllmWorker":
+        worker = super().__new__(cls)
+        worker._nrl_nixl_preinit_agent = preinit_nixl_from_vllm_config(vllm_config)
+        return worker
+
+
 def fix_gemma3_vision_weight_name(key: str) -> str:
     """Re-insert the `vision_model` segment into Gemma3 vision-tower weights.
 
@@ -156,6 +171,27 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 class VllmInternalWorkerExtension:
     _sparse_delta_applier: Any = None
+    _nrl_named_parameters: dict[str, torch.nn.Parameter]
+
+    def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
+        params = getattr(self, "_nrl_named_parameters", None)
+        if params is None:
+            params = dict(self.model_runner.model.named_parameters())
+            self._nrl_named_parameters = params
+        return params
+
+    def _load_full_hf_weights(
+        self, policy_weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        self.model_runner.model.load_weights(weights=policy_weights)
+
+    def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            fp8.load_weights(policy_weights, self.model_runner)
+            return
+        self._load_full_hf_weights(policy_weights)
 
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
@@ -187,9 +223,10 @@ class VllmInternalWorkerExtension:
         """Initialize the collective communication."""
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        local_rank = torch.distributed.get_rank()
         # Place vLLM ranks after all training ranks so all training workers can join
-        rank = train_world_size + rank_prefix + local_rank
+        rank = train_world_size + resolve_rollout_rank(
+            rank_prefix, world_size - train_world_size
+        )
 
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size
@@ -407,11 +444,9 @@ class VllmInternalWorkerExtension:
         """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
 
         Applies Gemma3 vision-tower weight name fix if needed, splits policy/draft
-        weights, applies FP8 conversion if needed, and loads draft weights
-        into the drafter model.
+        weights, dispatches policy weights through the configured refit loader,
+        and loads draft weights into the drafter model.
         """
-        from nemo_rl.models.generation.vllm.quantization import fp8
-
         if (
             "Gemma3ForConditionalGeneration"
             in self.model_runner.vllm_config.model_config.architectures
@@ -420,11 +455,7 @@ class VllmInternalWorkerExtension:
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
-        if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
-        else:
-            self.model_runner.model.load_weights(weights=policy_weights)
-
+        self._load_hf_weights(policy_weights)
         self._load_draft_weights(draft_weights)
 
     def _get_sparse_delta_applier(self) -> Any:
@@ -626,3 +657,9 @@ class VllmInternalWorkerExtension:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+
+class VllmInternalWorkerExtensionWithCheckpointEngine(
+    VllmCheckpointEngineMixin, VllmInternalWorkerExtension
+):
+    """vLLM worker extension with checkpoint-engine refit support."""

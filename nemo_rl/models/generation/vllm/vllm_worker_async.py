@@ -40,6 +40,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.checkpoint_engine import (
+    VllmAsyncCheckpointEngineRpcMixin,
+)
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     format_prompt_for_vllm_generation,
@@ -157,7 +160,9 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     )
 
 
-class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
+class VllmAsyncGenerationWorkerImpl(
+    VllmAsyncCheckpointEngineRpcMixin, BaseVllmGenerationWorker
+):
     def __init__(
         self,
         config,
