@@ -48,7 +48,7 @@ class AsyncRolloutImpl:
     def __init__(
         self,
         tokenizer: TokenizerType,
-        env_handles: dict[str, EnvironmentInterface],
+        task_to_env: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         max_rollout_turns: int,
@@ -56,7 +56,7 @@ class AsyncRolloutImpl:
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
-        self._env_handles = env_handles
+        self._task_to_env = task_to_env
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
@@ -189,7 +189,7 @@ class AsyncRolloutImpl:
             # step. In this case, need to wrap with asyncio.to_thread to make
             # this function yieldable.
             env_output = await asyncio.to_thread(
-                calculate_rewards, sample_batch, self._env_handles
+                calculate_rewards, sample_batch, self._task_to_env
             )
 
             # Update reward and termination statistics
@@ -400,7 +400,7 @@ class AsyncNemoGymRolloutImpl:
     def __init__(
         self,
         tokenizer: TokenizerType,
-        env_handles: dict[str, EnvironmentInterface],
+        task_to_env: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         max_rollout_turns: int,
@@ -408,7 +408,7 @@ class AsyncNemoGymRolloutImpl:
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
-        self._env_handles = env_handles
+        self._task_to_env = task_to_env
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
@@ -492,7 +492,7 @@ class AsyncNemoGymRolloutImpl:
         self, inputs: list[dict], timer: Timer, timer_prefix: str
     ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
         """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
-        nemo_gym_env = self._env_handles["nemo_gym"]
+        nemo_gym_env = self._task_to_env["nemo_gym"]
 
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
@@ -644,7 +644,7 @@ class RolloutManager:
     def __init__(
         self,
         tokenizer: TokenizerType,
-        env_handles: dict[str, EnvironmentInterface],
+        task_to_env: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         max_rollout_turns: int = 1,
@@ -670,7 +670,7 @@ class RolloutManager:
 
         self._impl: AsyncRolloutImpl | AsyncNemoGymRolloutImpl = rollout_cls(
             tokenizer=tokenizer,
-            env_handles=env_handles,
+            task_to_env=task_to_env,
             num_generations_per_prompt=num_generations_per_prompt,
             max_seq_len=max_seq_len,
             max_rollout_turns=max_rollout_turns,
@@ -709,13 +709,17 @@ class RolloutManager:
         group_id = self._tq_buffer.reserve(
             weight_version=start_version, target_step=target_step
         )
-
-        record = await self.run_rollout(input_sample)
-        end_version = self._weight_version
-
-        await self._tq_buffer.commit(
-            group_id,
-            record,
-            start_weight_version=start_version,
-            end_weight_version=end_version,
-        )
+        try:
+            record = await self.run_rollout(input_sample)
+            end_version = self._weight_version
+            await self._tq_buffer.commit(
+                group_id,
+                record,
+                start_weight_version=start_version,
+                end_weight_version=end_version,
+            )
+        except BaseException:
+            # A failed rollout must not leave an unready slot that can block an
+            # in-order sampler. commit() rolls back any DataPlane rows it wrote.
+            await self._tq_buffer.remove_group(group_id)
+            raise

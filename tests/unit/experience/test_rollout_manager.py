@@ -73,6 +73,7 @@ class _FakeBuffer:
     def __init__(self) -> None:
         self.reserve_calls: list[int] = []  # weight_versions passed to reserve
         self.commit_calls: list[tuple[str, object, int, int]] = []
+        self.remove_calls: list[str] = []
         # reserve(weight_version=X) -> group_id; commit fills the slot.
         self._slots: list[str] = []
 
@@ -101,6 +102,12 @@ class _FakeBuffer:
         )
         return record
 
+    async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
+        del remove_in_dp
+        self.remove_calls.append(group_id)
+        self._slots.remove(group_id)
+        return 1
+
 
 class _FakeImpl:
     """Stand-in for AsyncRolloutImpl that returns a sentinel record."""
@@ -127,6 +134,21 @@ def _make_manager(buffer: _FakeBuffer, impl: _FakeImpl) -> RolloutManager:
 
 
 class TestGenerateAndPushFlow:
+    def test_rollout_failure_removes_reserved_group(self):
+        async def _fail_rollout(_sample):
+            raise RuntimeError("injected rollout failure")
+
+        buf = _FakeBuffer()
+        mgr = _make_manager(buf, _FakeImpl(on_run=_fail_rollout))
+
+        with pytest.raises(RuntimeError, match="injected rollout failure"):
+            _run(mgr.generate_and_push({"prompt": "p"}))
+
+        assert len(buf.reserve_calls) == 1
+        assert len(buf.remove_calls) == 1
+        assert buf._slots == []
+        assert buf.commit_calls == []
+
     def test_reserves_then_runs_then_commits(self):
         events: list[str] = []
         buf = _FakeBuffer()
@@ -263,7 +285,7 @@ def test_rollout_manager_raises_without_impl_params():
     """RolloutManager raises AssertionError when required params are missing."""
     common = {
         "tokenizer": None,
-        "env_handles": {},
+        "task_to_env": {},
         "num_generations_per_prompt": 1,
         "max_seq_len": 1,
     }
@@ -352,7 +374,7 @@ def test_async_rollout_manager(
     - rollout_metrics has the expected keys with correct types
     - completions hold independent (not aliased) message_log objects
     """
-    vllm_generation, tokenizer, env_handles, _, _ = multi_step_setup_vllm_async
+    vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
     input_sample = single_multi_step_calculator_input_sample
     num_generations = 2
     max_seq_len = 1024
@@ -361,7 +383,7 @@ def test_async_rollout_manager(
     manager = RolloutManager(
         use_nemo_gym=False,
         tokenizer=tokenizer,
-        env_handles=env_handles,
+        task_to_env=task_to_env,
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
@@ -411,7 +433,7 @@ def test_async_rollout_manager_truncation(
     single_multi_step_calculator_input_sample,
 ):
     """Small max_seq_len forces truncation and truncation_rate=1.0."""
-    vllm_generation, tokenizer, env_handles, _, _ = multi_step_setup_vllm_async
+    vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
     input_sample = single_multi_step_calculator_input_sample
     num_generations = 2
     max_seq_len = 290
@@ -420,7 +442,7 @@ def test_async_rollout_manager_truncation(
     manager = RolloutManager(
         use_nemo_gym=False,
         tokenizer=tokenizer,
-        env_handles=env_handles,
+        task_to_env=task_to_env,
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
@@ -450,7 +472,7 @@ def test_async_rollout_manager_matches_original(
 
     TODO: remove this test together with run_async_multi_turn_rollout when the legacy path is deleted.
     """
-    vllm_generation, tokenizer, env_handles, _, _ = multi_step_setup_vllm_async
+    vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
     input_sample = single_multi_step_calculator_input_sample
     num_generations = 2
     max_seq_len = 1024
@@ -477,7 +499,7 @@ def test_async_rollout_manager_matches_original(
         policy_generation=vllm_generation,
         input_batch=batch,
         tokenizer=tokenizer,
-        task_to_env=env_handles,
+        task_to_env=task_to_env,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
     )
@@ -485,7 +507,7 @@ def test_async_rollout_manager_matches_original(
     manager = RolloutManager(
         use_nemo_gym=False,
         tokenizer=tokenizer,
-        env_handles=env_handles,
+        task_to_env=task_to_env,
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
@@ -619,7 +641,7 @@ def test_async_nemo_gym_rollout_manager(
     manager = RolloutManager(
         use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
-        env_handles={"nemo_gym": nemo_gym},
+        task_to_env={"nemo_gym": nemo_gym},
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,
@@ -730,7 +752,7 @@ def test_async_nemo_gym_rollout_manager_matches_original(
     manager = RolloutManager(
         use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
-        env_handles={"nemo_gym": nemo_gym},
+        task_to_env={"nemo_gym": nemo_gym},
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
         generation_config=nemo_gym_vllm_generation.cfg,

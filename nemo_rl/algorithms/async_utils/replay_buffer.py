@@ -720,30 +720,65 @@ class TQReplayBuffer:
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=start_weight_version, group_id=group_id
         )
-        await self._call_dp(
-            "put_samples",
-            sample_ids=sample_ids,
-            partition_id=self._partition_id,
-            fields=fields,
-            tags=tags,
-        )
+        try:
+            await self._call_dp(
+                "put_samples",
+                sample_ids=sample_ids,
+                partition_id=self._partition_id,
+                fields=fields,
+                tags=tags,
+            )
 
-        # mirrors kv_first_write
-        lengths = train_batch["input_lengths"]
-        meta = KVBatchMeta(
-            partition_id=self._partition_id,
-            task_name="train",
-            sample_ids=list(sample_ids),
-            fields=list(fields.keys()),
-            sequence_lengths=[int(s) for s in lengths.tolist()],
-            tags=[dict(t) for t in tags],
-        )
+            # mirrors kv_first_write
+            lengths = train_batch["input_lengths"]
+            meta = KVBatchMeta(
+                partition_id=self._partition_id,
+                task_name="train",
+                sample_ids=list(sample_ids),
+                fields=list(fields.keys()),
+                sequence_lengths=[int(s) for s in lengths.tolist()],
+                tags=[dict(t) for t in tags],
+            )
 
-        idx = self._group_ids.index(group_id)
-        self.meta_list[idx] = meta
-        self.end_weight_list[idx] = end_weight_version
-        self.ready_list[idx] = True
-        return meta
+            idx = self._group_ids.index(group_id)
+            self.meta_list[idx] = meta
+            self.end_weight_list[idx] = end_weight_version
+            self.ready_list[idx] = True
+            return meta
+        except BaseException as commit_error:
+            # put_samples may have written rows before raising. Roll back by the
+            # deterministic IDs known here; the caller removes the reserved slot.
+            try:
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=list(sample_ids),
+                    partition_id=self._partition_id,
+                )
+            except BaseException as rollback_error:
+                raise BaseExceptionGroup(
+                    f"commit and rollback both failed for group_id={group_id!r}",
+                    [commit_error, rollback_error],
+                )
+            raise
+
+    async def remove_group(self, group_id: str, *, remove_in_dp: bool = False) -> int:
+        """Remove the live slot identified by ``group_id``.
+
+        Args:
+            group_id: Group identifier returned by :meth:`reserve`.
+            remove_in_dp: Whether to clear rows referenced by a committed slot.
+
+        Returns:
+            Number of removed slots (always one on success).
+
+        Raises:
+            ValueError: ``group_id`` has no live slot.
+        """
+        try:
+            idx = self._group_ids.index(group_id)
+        except ValueError as error:
+            raise ValueError(f"unknown group_id={group_id!r}") from error
+        return await self.remove([idx], remove_in_dp=remove_in_dp)
 
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
         """Drop entries at the given indices and optionally clear them from DataPlane.

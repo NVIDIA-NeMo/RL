@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Literal, Optional
 
 import ray
@@ -341,9 +342,9 @@ class SingleControllerActor:
         # at -1 to allow the first batch through the strict_on_policy gate.
         self._max_rollout_version: int = -1
 
-        # Strong refs to dispatched rollout tasks so asyncio doesn't GC them
-        # while they're still running (removed via done_callback on completion).
-        self._dispatched_rollouts: set[asyncio.Task] = set()
+        # Active rollout tasks used by downstream synchronization/drain paths.
+        # TaskGroup remains responsible for task ownership and cancellation.
+        self._dispatched_rollouts: set[asyncio.Task[None]] = set()
 
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released after clear_samples.
@@ -382,14 +383,19 @@ class SingleControllerActor:
         """Main entry point. Runs until max_train_steps is reached."""
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
-
-        await train_task
-
-        rollout_task.cancel()
         try:
-            await rollout_task
-        except asyncio.CancelledError:
-            pass
+            done, _ = await asyncio.wait(
+                {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if rollout_task in done:
+                # Propagate rollout failures immediately. A normally exhausted
+                # rollout pump leaves the train pump to drain committed groups.
+                await rollout_task
+            await train_task
+        finally:
+            rollout_task.cancel()
+            train_task.cancel()
+            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
 
         return {
             "train_steps": self._train_steps,
@@ -450,59 +456,87 @@ class SingleControllerActor:
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(
-            prompt: DatumSpec, target_step: Optional[int]
+            prompt: DatumSpec,
+            target_step: Optional[int],
+            task_started_event: asyncio.Event,
         ) -> None:
+            task_started_event.set()
             self._inflight_rollouts += 1
             try:
                 await self._rollout_manager.generate_and_push(
                     prompt, target_step=target_step
                 )
-                if self._cfg.diagnostics:
-                    content = ""
-                    for i in range(len(prompt["message_log"])):
-                        if prompt["message_log"][i]["role"] == "user":
-                            content = prompt["message_log"][i]["content"]
-                            break
-                    print(f"  rollout done for prompt='{content[:20]}...'", flush=True)
+            except BaseException:
+                # On success ownership transfers to the train pump, which
+                # releases this permit after consuming the committed group.
+                self._buffer_capacity.release()
+                raise
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()
 
+            if self._cfg.diagnostics:
+                content = ""
+                for i in range(len(prompt["message_log"])):
+                    if prompt["message_log"][i]["role"] == "user":
+                        content = prompt["message_log"][i]["content"]
+                        break
+                print(f"  rollout done for prompt='{content[:20]}...'", flush=True)
+
+        def _release_permits_if_task_not_started(
+            _: asyncio.Task[Any],
+            *,
+            task_started_event: asyncio.Event,
+        ) -> None:
+            if not task_started_event.is_set():
+                self._buffer_capacity.release()
+                sem.release()
+
         max_epochs = self._cfg.max_num_epochs
-        while max_epochs is None or self._current_epoch < max_epochs:
-            for prompt_batch in self._dataloader:
-                # over_sampling=False: batch-level gate on max_rollout_version.
-                if not over_sampling:
-                    while (
-                        self._max_rollout_version
-                        >= self._trainer_version + max_staleness
-                    ):
-                        await asyncio.sleep(0.005)
-                    self._max_rollout_version += 1
+        async with asyncio.TaskGroup() as rollout_tasks:
+            while max_epochs is None or self._current_epoch < max_epochs:
+                for prompt_batch in self._dataloader:
+                    # over_sampling=False: batch-level gate on max_rollout_version.
+                    if not over_sampling:
+                        while (
+                            self._max_rollout_version
+                            >= self._trainer_version + max_staleness
+                        ):
+                            await asyncio.sleep(0.005)
+                        self._max_rollout_version += 1
 
-                # target_step = batch dispatch index when force_in_order is on.
-                target_step = self._max_rollout_version if force_in_order else None
+                    # target_step = batch dispatch index when force_in_order is on.
+                    target_step = self._max_rollout_version if force_in_order else None
 
-                for prompt_idx in range(prompt_batch.size):
-                    prompt: DatumSpec = {  # type: ignore
-                        k: v[prompt_idx] for k, v in prompt_batch.items()
-                    }
+                    for prompt_idx in range(prompt_batch.size):
+                        prompt: DatumSpec = {  # type: ignore
+                            k: v[prompt_idx] for k, v in prompt_batch.items()
+                        }
 
-                    # check if buffer is full
-                    await self._buffer_capacity.acquire()
-                    # check if inflight rollouts is full
-                    await sem.acquire()
-                    # wait for rollout to be permitted
-                    await self._rollout_permitted.wait()
+                        # check if buffer is full
+                        await self._buffer_capacity.acquire()
+                        # check if inflight rollouts is full
+                        await sem.acquire()
+                        # wait for rollout to be permitted
+                        await self._rollout_permitted.wait()
 
-                    # dispatch rollout
-                    task = asyncio.create_task(
-                        _dispatch_one_prompt(prompt, target_step)
-                    )
-                    self._dispatched_rollouts.add(task)
-                    task.add_done_callback(self._dispatched_rollouts.discard)
+                        task_started_event = asyncio.Event()
+                        # dispatch rollout
+                        task = rollout_tasks.create_task(
+                            _dispatch_one_prompt(
+                                prompt, target_step, task_started_event
+                            )
+                        )
+                        self._dispatched_rollouts.add(task)
+                        task.add_done_callback(self._dispatched_rollouts.discard)
+                        task.add_done_callback(
+                            partial(
+                                _release_permits_if_task_not_started,
+                                task_started_event=task_started_event,
+                            )
+                        )
 
-            self._current_epoch += 1
+                self._current_epoch += 1
 
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 

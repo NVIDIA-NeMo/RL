@@ -218,9 +218,9 @@ EXCLUDED_UNIT_TESTS=(
     --deselect=tests/unit/experience/test_rollouts.py::test_max_seqlen_respected_sync
     --deselect=tests/unit/experience/test_rollouts.py::test_max_seqlen_respected_async
     --deselect=tests/unit/experience/test_rollouts.py::test_run_sliding_puzzle_vllm
-    --deselect=tests/unit/experience/test_rollouts.py::test_async_rollout_manager
-    --deselect=tests/unit/experience/test_rollouts.py::test_async_rollout_manager_truncation
-    --deselect=tests/unit/experience/test_rollouts.py::test_async_nemo_gym_rollout_manager
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_rollout_manager
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_rollout_manager_truncation
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_nemo_gym_rollout_manager
 
     ###########################################################################
     # ENVIRONMENTS

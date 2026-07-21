@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import ray
 import torch
 from tensordict import TensorDict
@@ -45,7 +48,7 @@ from tests.unit.experience.test_rollouts import (
 )
 
 _PARTITION_ID = "rollout_data"
-# TQReplayBuffer.add tensorizes each PromptGroupRecord and writes
+# TQReplayBuffer.commit tensorizes each PromptGroupRecord and writes
 # ``generations_per_prompt`` training rows directly to TQ.
 _BULK_FIELDS = [
     "input_ids",
@@ -151,18 +154,218 @@ class _SyncDPAdapter:
         return TensorDict(out, batch_size=td.batch_size)
 
 
+@pytest.mark.parametrize(
+    ("force_in_order", "expected_target_steps"),
+    [
+        (False, [None, None]),
+        (True, [0, 1]),
+    ],
+)
+def test_rollout_pump_stamps_target_steps(
+    force_in_order: bool,
+    expected_target_steps: list[int | None],
+) -> None:
+    class _RecordingBuffer:
+        def __init__(self) -> None:
+            self.target_step_list: list[int | None] = []
+
+        def reserve(self, *, target_step: int | None) -> None:
+            self.target_step_list.append(target_step)
+
+    class _RecordingRolloutManager:
+        def __init__(self, buffer: _RecordingBuffer) -> None:
+            self._buffer = buffer
+
+        async def generate_and_push(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> None:
+            del prompt
+            self._buffer.reserve(target_step=target_step)
+
+    buffer = _RecordingBuffer()
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._cfg = SimpleNamespace(
+        max_inflight_prompts=2,
+        over_sampling=False,
+        max_weight_staleness_versions=1,
+        force_in_order=force_in_order,
+        diagnostics=False,
+        max_num_epochs=1,
+    )
+    ctrl._rollout_manager = _RecordingRolloutManager(buffer)
+    prompt_batch = BatchedDataDict(
+        {"message_log": [[{"role": "user", "content": "prompt"}]]}
+    )
+    ctrl._dataloader = [prompt_batch, prompt_batch]
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._rollout_permitted.set()
+    ctrl._buffer_capacity = asyncio.Semaphore(2)
+    ctrl._inflight_rollouts = 0
+    ctrl._dispatched_rollouts = set()
+    ctrl._max_rollout_version = -1
+    ctrl._trainer_version = 0
+    ctrl._current_epoch = 0
+
+    asyncio.run(ctrl._rollout_pump())
+
+    assert buffer.target_step_list == expected_target_steps
+
+
+def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
+    class _FailingRolloutManager:
+        def __init__(self) -> None:
+            self._started = 0
+            self._both_started = asyncio.Event()
+            self.sibling_cancelled = False
+
+        async def generate_and_push(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> None:
+            del target_step
+            self._started += 1
+            if self._started == 2:
+                self._both_started.set()
+            await self._both_started.wait()
+
+            content = prompt["message_log"][0]["content"]
+            if content == "fail":
+                raise RuntimeError("injected rollout failure")
+
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.sibling_cancelled = True
+                raise
+
+    async def _main() -> None:
+        manager = _FailingRolloutManager()
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._cfg = SimpleNamespace(
+            max_inflight_prompts=2,
+            over_sampling=True,
+            max_weight_staleness_versions=1,
+            force_in_order=False,
+            diagnostics=False,
+            max_num_epochs=1,
+        )
+        ctrl._rollout_manager = manager
+        ctrl._dataloader = [
+            BatchedDataDict(
+                {
+                    "message_log": [
+                        [{"role": "user", "content": "fail"}],
+                        [{"role": "user", "content": "sibling"}],
+                    ]
+                }
+            )
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._buffer_capacity = asyncio.Semaphore(2)
+        ctrl._inflight_rollouts = 0
+        ctrl._dispatched_rollouts = set()
+        ctrl._max_rollout_version = -1
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            await asyncio.wait_for(ctrl._rollout_pump(), timeout=1.0)
+
+        assert exc_info.value.subgroup(RuntimeError) is not None
+        assert manager.sibling_cancelled
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._buffer_capacity._value == 2
+        assert ctrl._dispatched_rollouts == set()
+
+    asyncio.run(_main())
+
+
+def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> None:
+    class _NeverCalledRolloutManager:
+        async def generate_and_push(
+            self, prompt: Any, *, target_step: int | None = None
+        ) -> None:
+            del prompt, target_step
+            raise AssertionError("cancelled child unexpectedly started")
+
+    class _CancelBeforeStartTaskGroup:
+        def __init__(self) -> None:
+            self._tasks: list[asyncio.Task[None]] = []
+
+        async def __aenter__(self) -> _CancelBeforeStartTaskGroup:
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            return False
+
+        def create_task(self, coro: Any) -> asyncio.Task[None]:
+            task = asyncio.create_task(coro)
+            task.cancel()
+            self._tasks.append(task)
+            return task
+
+    real_semaphore = asyncio.Semaphore
+    created_semaphores: list[asyncio.Semaphore] = []
+
+    def _recording_semaphore(value: int) -> asyncio.Semaphore:
+        semaphore = real_semaphore(value)
+        created_semaphores.append(semaphore)
+        return semaphore
+
+    monkeypatch.setattr(asyncio, "Semaphore", _recording_semaphore)
+    monkeypatch.setattr(asyncio, "TaskGroup", _CancelBeforeStartTaskGroup)
+
+    async def _main() -> None:
+        controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+        ctrl = object.__new__(controller_cls)
+        ctrl._cfg = SimpleNamespace(
+            max_inflight_prompts=1,
+            over_sampling=True,
+            max_weight_staleness_versions=1,
+            force_in_order=False,
+            diagnostics=False,
+            max_num_epochs=1,
+        )
+        ctrl._rollout_manager = _NeverCalledRolloutManager()
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._buffer_capacity = real_semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._dispatched_rollouts = set()
+        ctrl._max_rollout_version = -1
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+        await asyncio.sleep(0)
+
+        assert ctrl._buffer_capacity._value == 1
+        assert created_semaphores[0]._value == 1
+        assert ctrl._inflight_rollouts == 0
+        assert ctrl._dispatched_rollouts == set()
+
+    asyncio.run(_main())
+
+
+@pytest.mark.vllm
 def test_rollout_pump_writes_expected_tq_data(
     multi_step_setup_vllm_async,  # noqa: F811
     single_multi_step_calculator_input_sample,  # noqa: F811
     tmp_path,
 ):
     """SC._rollout_pump writes max_rollout_prompts * num_generations rows to TQ with the expected fields and tags."""
-    vllm_generation, tokenizer, env_handles, _, _ = multi_step_setup_vllm_async
+    vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
     input_sample = single_multi_step_calculator_input_sample
 
     num_generations = 2
     max_rollout_prompts = 2
-    # TQReplayBuffer.add writes ``num_generations`` training rows per prompt.
+    # TQReplayBuffer.commit writes ``num_generations`` training rows per prompt.
     expected_samples = max_rollout_prompts * num_generations
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
@@ -206,7 +409,7 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
-        env_handles=env_handles,
+        task_to_env=task_to_env,
         num_generations_per_prompt=num_generations,
         max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,

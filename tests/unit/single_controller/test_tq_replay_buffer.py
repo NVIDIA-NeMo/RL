@@ -102,6 +102,20 @@ class FakeDataPlaneClient:
         return len(self._rows)
 
 
+class FailAfterPutDataPlaneClient(FakeDataPlaneClient):
+    """Write all rows, then fail to simulate a partial-success RPC."""
+
+    def put_samples(
+        self,
+        sample_ids: list[str],
+        partition_id: str,
+        fields: Any = None,
+        tags: list[dict[str, Any]] | None = None,
+    ) -> KVBatchMeta:
+        super().put_samples(sample_ids, partition_id, fields, tags)
+        raise RuntimeError("injected put failure")
+
+
 def _run(coro):
     return asyncio.run(coro)
 
@@ -141,6 +155,29 @@ def _add_group(
 
 
 class TestTQReplayBufferReserveCommit:
+    def test_commit_clears_rows_when_put_raises_after_writing(self):
+        dp = FailAfterPutDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+
+        with pytest.raises(RuntimeError, match="injected put failure"):
+            _run(
+                buf.commit(
+                    group_id,
+                    _make_record(),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+        assert dp.depth() == 0
+        assert dp.clear_calls == [dp.put_calls[0]["sample_ids"]]
+        # commit() rolls back DataPlane rows; generate_and_push() owns removal
+        # of the reserved buffer slot.
+        assert buf.size() == 1
+        assert buf.ready_list == [False]
+        assert buf.meta_list == [None]
+
     def test_reserve_appends_placeholder_unready(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
