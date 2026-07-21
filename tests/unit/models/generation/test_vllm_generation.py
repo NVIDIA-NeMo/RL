@@ -526,18 +526,31 @@ def test_configure_generation_config_rejects_non_boolean_real_quant_export():
         )
 
 
-def test_configure_generation_config_keeps_non_colocated_export_on_gpu():
+def test_configure_generation_config_rejects_gpu_export_for_non_colocated_refit():
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["real_quant"] = True
-    vllm_config["real_quant_export_cpu_offload"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
     vllm_config["colocated"]["enabled"] = False
 
-    with pytest.warns(UserWarning, match="Non-colocated NCCL refit"):
-        configured = configure_generation_config(
+    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+        configure_generation_config(
             vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
         )
 
-    assert configured["real_quant_export_cpu_offload"] is False
+
+@pytest.mark.parametrize("refit_transport", ["vllm_zmq_sparse", "nixl"])
+def test_configure_generation_config_rejects_gpu_export_for_explicit_refit_transport(
+    refit_transport: str,
+):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["real_quant"] = True
+    vllm_config["real_quant_export_cpu_offload"] = False
+    vllm_config["refit_transport"] = refit_transport
+
+    with pytest.raises(ValueError, match="colocated CUDA-IPC refit"):
+        configure_generation_config(
+            vllm_config, MagicMock(pad_token_id=0, eos_token_id=1)
+        )
 
 
 @pytest.mark.parametrize("method", ["deepseek_mtp", "mtp"])
