@@ -127,9 +127,7 @@ class TestFlattenDict:
         (True, True, True),
     ],
 )
-def test_should_log_nemo_gym_full_result_tables(
-    wandb_enabled, table_flag, expected
-):
+def test_should_log_nemo_gym_full_result_tables(wandb_enabled, table_flag, expected):
     """Full-result Tables require both an active W&B logger and explicit opt-in."""
     wandb_config = {}
     if table_flag is not None:

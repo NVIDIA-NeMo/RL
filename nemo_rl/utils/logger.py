@@ -97,9 +97,7 @@ def should_log_nemo_gym_full_result_tables(
     *, wandb_enabled: bool, wandb_config: WandbConfig
 ) -> bool:
     """Return whether complete NeMo Gym results should become W&B Tables."""
-    return wandb_enabled and bool(
-        wandb_config.get("log_nemo_gym_full_result_tables")
-    )
+    return wandb_enabled and bool(wandb_config.get("log_nemo_gym_full_result_tables"))
 
 
 class LoggerInterface(ABC):
