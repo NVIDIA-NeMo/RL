@@ -19,12 +19,19 @@ the router's cordon-and-remove path on a live training run.
 Modes:
   * ``cordon``      — cordon the shard in the router (simulate transient
                       health failure). After ``recover_after_s`` the shard
-                      is uncordoned. No NCCL re-init; tests proxy replay only.
+                      is uncordoned. No NCCL re-init; tests the proxy replay
+                      path only.
   * ``actor-kill``  — call router.remove_shard(), which ray.kills the shard's
                       actors and triggers NCCL world-size shrink on next refit.
+                      The router's reconciler automatically spawns a replacement.
   * ``ray-kill``    — directly ray.kill the shard's leader actor and let the
                       health poll detect it naturally. More realistic than
                       actor-kill since it exercises the full detection path.
+                      Replacement is also spawned automatically by the reconciler.
+
+Recovery (scale-up) after actor-kill / ray-kill is handled automatically by
+the GenerationRouter's reconciler loop — no explicit ``recover`` flag needed.
+For cordon mode, ``recover_after_s`` controls when the shard is uncordoned.
 
 Usage — add to the recipe YAML:
 
@@ -33,8 +40,6 @@ Usage — add to the recipe YAML:
       mode: actor-kill
       target_shard: dp-0
       trigger_after_s: 120
-      recover: true
-      recover_after_s: 300
 
 Multiple staggered faults:
 
@@ -78,7 +83,6 @@ class FaultInjector:
         trigger_after_s: float = 60.0,
         trigger_on: TriggerOn = "time",
         recover_after_s: Optional[float] = None,
-        recover: bool = False,
         repeat_every_s: Optional[float] = None,
         rotate_target: bool = True,
         max_cycles: Optional[int] = None,
@@ -86,8 +90,6 @@ class FaultInjector:
         burst_size: int = 1,
         burst_every_n_cycles: int = 0,
         burst_size_random_max: Optional[int] = None,
-        recover_batch_size: Optional[int] = None,
-        recover_batch_delay_s: float = 600.0,
     ):
         self._gen = vllm_gen
         self.mode = mode
@@ -95,7 +97,6 @@ class FaultInjector:
         self.trigger_after_s = trigger_after_s
         self.trigger_on = trigger_on
         self.recover_after_s = recover_after_s
-        self.recover = recover
         self.repeat_every_s = repeat_every_s
         self.rotate_target = rotate_target
         self.max_cycles = max_cycles
@@ -105,10 +106,6 @@ class FaultInjector:
         self.burst_size_random_max = (
             max(1, int(burst_size_random_max)) if burst_size_random_max is not None else None
         )
-        self.recover_batch_size = (
-            max(1, int(recover_batch_size)) if recover_batch_size is not None else None
-        )
-        self.recover_batch_delay_s = float(recover_batch_delay_s)
         self._rng = random.SystemRandom()
         self._first_seen_ready: dict[str, float] = {}
 
@@ -148,7 +145,7 @@ class FaultInjector:
                 f"[fault-inject] cycle={cycle_n}: waiting to fire "
                 f"(trigger_on={self.trigger_on}, delay={delay_before_kill}s) "
                 f"mode={self.mode} target={self.target_shard} "
-                f"recover={self.recover} burst_size={this_cycle_burst}",
+                f"burst_size={this_cycle_burst}",
                 flush=True,
             )
             self._wait_for_trigger(delay_before_kill)
@@ -203,46 +200,6 @@ class FaultInjector:
                     kill_result = {"mode": self.mode, "error": str(e), "target": self.target_shard}
                 killed_in_burst.add(self.target_shard)
                 burst_results.append(kill_result)
-
-            if self.recover and self.mode in ("actor-kill", "ray-kill"):
-                if self.recover_after_s is not None:
-                    print(
-                        f"[fault-inject] cycle={cycle_n} sleeping "
-                        f"{self.recover_after_s}s before add_shard "
-                        f"x{len(killed_in_burst)} (recover from "
-                        f"{self.mode} on {sorted(killed_in_burst)})",
-                        flush=True,
-                    )
-                    time.sleep(float(self.recover_after_s))
-                sorted_killed = sorted(killed_in_burst)
-                print(
-                    f"[RECOVERY-START] unix_ts={time.time():.6f} "
-                    f"recovering {len(sorted_killed)} shards: {sorted_killed}",
-                    flush=True,
-                )
-                batch_sz = self.recover_batch_size or len(sorted_killed)
-                for batch_start in range(0, len(sorted_killed), batch_sz):
-                    batch = sorted_killed[batch_start : batch_start + batch_sz]
-                    if batch_start > 0:
-                        print(
-                            f"[fault-inject] staged recovery: sleeping "
-                            f"{self.recover_batch_delay_s}s before next "
-                            f"batch of {len(batch)} add_shard(s)",
-                            flush=True,
-                        )
-                        time.sleep(self.recover_batch_delay_s)
-                    for sid in batch:
-                        try:
-                            result = self._router.call_async(
-                                self._router.add_shard(reason=f"fault-inject recover of {sid}")
-                            )
-                            print(
-                                f"[fault-inject] add_shard succeeded for "
-                                f"replacement of {sid}: {result}",
-                                flush=True,
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            print(f"[fault-inject] add_shard failed for {sid}: {e}", flush=True)
 
             result = (
                 burst_results[0]
@@ -537,7 +494,6 @@ def maybe_launch_fault_injector(
         target = entry.get("target_shard", "dp-0")
         trigger = float(entry.get("trigger_after_s", 60))
         mode = entry.get("mode", fi_cfg.get("mode", "actor-kill"))
-        recover = bool(entry.get("recover", fi_cfg.get("recover", False)))
         repeat_every_s = entry.get("repeat_every_s", fi_cfg.get("repeat_every_s"))
         rotate_target = bool(entry.get("rotate_target", fi_cfg.get("rotate_target", True)))
         max_cycles = entry.get("max_cycles", fi_cfg.get("max_cycles"))
@@ -554,15 +510,6 @@ def maybe_launch_fault_injector(
         burst_size_random_max = (
             int(burst_size_random_max_raw) if burst_size_random_max_raw is not None else None
         )
-        recover_batch_size_raw = entry.get(
-            "recover_batch_size", fi_cfg.get("recover_batch_size")
-        )
-        recover_batch_size = (
-            int(recover_batch_size_raw) if recover_batch_size_raw is not None else None
-        )
-        recover_batch_delay_s = float(
-            entry.get("recover_batch_delay_s", fi_cfg.get("recover_batch_delay_s", 600.0))
-        )
 
         trigger_on = entry.get("trigger_on", fi_cfg.get("trigger_on", "time"))
         injector = FaultInjector(
@@ -572,7 +519,6 @@ def maybe_launch_fault_injector(
             trigger_after_s=trigger,
             trigger_on=trigger_on,
             recover_after_s=entry.get("recover_after_s", fi_cfg.get("recover_after_s")),
-            recover=recover,
             repeat_every_s=repeat_every_s,
             rotate_target=rotate_target,
             max_cycles=max_cycles,
@@ -580,15 +526,12 @@ def maybe_launch_fault_injector(
             burst_size=burst_size,
             burst_every_n_cycles=burst_every_n_cycles,
             burst_size_random_max=burst_size_random_max,
-            recover_batch_size=recover_batch_size,
-            recover_batch_delay_s=recover_batch_delay_s,
         )
         t = injector.start()
         print(
             f"[fault-inject] launched: mode={mode}, target={target}, "
-            f"trigger_after_s={trigger}, recover={recover}, "
-            f"repeat_every_s={repeat_every_s}, rotate_target={rotate_target}, "
-            f"max_cycles={max_cycles}",
+            f"trigger_after_s={trigger}, repeat_every_s={repeat_every_s}, "
+            f"rotate_target={rotate_target}, max_cycles={max_cycles}",
             flush=True,
         )
         threads.append(t)

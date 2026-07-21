@@ -120,6 +120,7 @@ class GenerationRouter:
         join_success_threshold: int = _DEFAULT_JOIN_SUCCESS_THRESHOLD,
         reset_collective_timeout_s: float = _DEFAULT_RESET_COLLECTIVE_TIMEOUT_S,
         joinable_min_age_s: float = _DEFAULT_JOINABLE_MIN_AGE_S,
+        auto_recover: bool = True,
     ):
         self.health_poll_interval_s = health_poll_interval_s
         self.health_timeout_s = health_timeout_s
@@ -128,6 +129,16 @@ class GenerationRouter:
         # Unproven joining shards must age past this before counting as joinable (cold route warm-up).
         self._joinable_min_age_s = float(joinable_min_age_s)
         self._reset_collective_timeout_s = reset_collective_timeout_s
+        # When True, the health poll reconciler restores lost shards automatically.
+        self.auto_recover = auto_recover
+        # Bootstrap fleet size — reconciler restores toward this target.
+        # Set by register_shards(); not updated on add/remove so it always
+        # reflects the intended fleet size.
+        self._target_shard_count: int = 0
+        # add_shard calls launched by the reconciler that haven't yet registered
+        # a joining shard. Counted against the deficit so consecutive ticks
+        # don't over-provision.
+        self._inflight_adds: int = 0
 
         # Tracks when the joinable shard count last changed; used by the trainer's debounce logic.
         self._joinable_changed_at: float = time.monotonic()
@@ -207,6 +218,8 @@ class GenerationRouter:
         self._total_shards_at_bootstrap = max(
             self._total_shards_at_bootstrap, len(self._shards)
         )
+        # Target fleet size for the reconciler: restore toward this count on failure.
+        self._target_shard_count = len(self._shards)
         if generation is not None:
             self._generation = generation
 
@@ -609,7 +622,44 @@ class GenerationRouter:
                 self._refresh_joinable_stability()
             except Exception as e:  # noqa: BLE001
                 print(f"[router] joinable refresh failed: {e}", flush=True)
+            # Reconcile fleet size: spawn replacements for lost shards.
+            try:
+                await self._reconcile_recovery()
+            except Exception as e:  # noqa: BLE001
+                print(f"[router] reconcile recovery failed: {e}", flush=True)
             await asyncio.sleep(self.health_poll_interval_s)
+
+    async def _reconcile_recovery(self) -> None:
+        """Restore the fleet to _target_shard_count after shard loss.
+
+        Called once per health poll tick. Each unit of deficit launches one
+        background add_shard task. _inflight_adds prevents consecutive ticks
+        from over-provisioning while a long vLLM init is in progress.
+        """
+        if not self.auto_recover or self._generation is None or self._target_shard_count == 0:
+            return
+        alive = self.shard_count_alive_for_collective()
+        deficit = self._target_shard_count - (alive + self._inflight_adds)
+        if deficit <= 0:
+            return
+        print(
+            f"[router] reconcile: deficit={deficit} "
+            f"(target={self._target_shard_count}, alive={alive}, "
+            f"inflight={self._inflight_adds}); launching {deficit} add_shard(s)",
+            flush=True,
+        )
+        for _ in range(deficit):
+            self._inflight_adds += 1
+            asyncio.create_task(self._recover_one())
+
+    async def _recover_one(self) -> None:
+        """Launch one add_shard and decrement _inflight_adds when done."""
+        try:
+            await self.add_shard(reason="auto-recover")
+        except Exception as e:  # noqa: BLE001
+            print(f"[router] auto-recover add_shard failed: {e}", flush=True)
+        finally:
+            self._inflight_adds -= 1
 
     async def _per_worker_results(
         self,

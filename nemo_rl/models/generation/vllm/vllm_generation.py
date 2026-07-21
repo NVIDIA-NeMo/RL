@@ -291,7 +291,8 @@ class VllmGeneration(GenerationInterface):
         if not self.cfg["colocated"]["enabled"]:
             from nemo_rl.models.generation.generation_router import GenerationRouter
 
-            self._router = GenerationRouter(generation=self)
+            auto_recover = bool(self.cfg.get("fault_tolerance", {}).get("auto_recover", True))
+            self._router = GenerationRouter(generation=self, auto_recover=auto_recover)
             # Build shard table from current DP shards.
             shards = [
                 (f"dp-{i}", url or "")
