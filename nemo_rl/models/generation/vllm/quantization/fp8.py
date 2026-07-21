@@ -739,6 +739,25 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
         layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
 
+    # Weight layout: vLLM 0.25's FlashInferCutedsl MXFP8 linear kernel stores the
+    # weight column-major [K, N] (weight.contiguous().t()) and its apply() reads
+    # it directly; the older FlashInferCutlass kernel keeps [N, K] and transposes
+    # at apply time. Mirror the selected kernel so refit-loaded weights match what
+    # apply expects. The [N, K] checkpoint weight stays the permanent load target
+    # (weight_loader + later refits keep working); the column-major view is exposed
+    # to the kernel via a zero-copy transpose that aliases the same storage, so it
+    # tracks every refit load with no reprocessing.
+    _kernel_name = type(getattr(self, "kernel", None)).__name__
+    if "FlashInferCutedsl" in _kernel_name:
+        if not hasattr(layer, "weight_row_major"):
+            layer.weight_row_major = layer.weight
+            layer.weight = torch.nn.Parameter(
+                layer.weight_row_major.data.transpose(0, 1), requires_grad=False
+            )
+        else:
+            # Re-point the column-major view at the freshly refit-loaded weight.
+            layer.weight.data = layer.weight_row_major.data.transpose(0, 1)
+
 
 def create_weights_mxfp8_moe(
     self,
@@ -1363,7 +1382,6 @@ def apply_monolithic_mxfp8_moe(
         mxfp8_e4m3_quantize,
     )
     from vllm.utils.flashinfer import flashinfer_trtllm_fp8_block_scale_moe
-
 
     if layer.enable_eplb:
         raise NotImplementedError(
