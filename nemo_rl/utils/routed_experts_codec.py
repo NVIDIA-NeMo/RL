@@ -60,9 +60,11 @@ def encode_routed_experts(routed_experts: torch.Tensor) -> str:
             f"Unsupported routed_experts dtype {routed_experts.dtype}; "
             f"expected one of {sorted(_NP_DTYPES)}."
         )
-    arr = routed_experts.detach().cpu().numpy()
+    arr = routed_experts.detach().cpu().contiguous().numpy()
     tokens, num_layers, topk = arr.shape
-    data = base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode("ascii")
+    # memoryview feeds the buffer to b64encode zero-copy; tobytes() would
+    # materialize a full-size intermediate copy of the payload.
+    data = base64.b64encode(memoryview(arr)).decode("ascii")
     return f"{_MAGIC}:{dtype_name}:{tokens}x{num_layers}x{topk}:{data}"
 
 
