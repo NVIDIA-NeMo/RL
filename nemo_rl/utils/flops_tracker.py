@@ -24,7 +24,14 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
-from nemo_rl.utils.flops_formulas import FLOPSConfig, deepseekv3, llama, qwen2, qwen3
+from nemo_rl.utils.flops_formulas import (
+    FLOPSConfig,
+    deepseekv3,
+    llama,
+    nemotronh,
+    qwen2,
+    qwen3,
+)
 
 
 def get_default_hf_config(model_name: str) -> PretrainedConfig:
@@ -99,6 +106,36 @@ def convert_config_to_flops_config(
             mtp_num_layers=0,
             causal_self_attn=True,
         ), deepseekv3
+    elif config.__class__.model_type == "nemotron_h":
+        # NemotronH is a hybrid Mamba/attention/MLP(-or-MoE) model. The layer
+        # composition is described by ``hybrid_override_pattern`` (e.g.
+        # "M" = Mamba, "*" = attention, "-" = dense MLP, "E" = MoE FFN).
+        # ``mamba_num_heads`` and ``n_groups`` are optional in some configs.
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            attention_heads=config.num_attention_heads,
+            query_groups=getattr(
+                config, "num_key_value_heads", config.num_attention_heads
+            ),
+            vocab_size=config.vocab_size,
+            is_hybrid_model=True,
+            hybrid_override_pattern=config.hybrid_override_pattern,
+            mamba_state_dim=config.ssm_state_size,
+            mamba_head_dim=config.mamba_head_dim,
+            mamba_num_groups=config.n_groups,
+            mamba_num_heads=getattr(config, "mamba_num_heads", None),
+            # MoE ("E") layers: each token uses ``num_experts_per_tok`` routed
+            # experts plus ``n_shared_experts`` always-on shared experts, each of
+            # width ``moe_intermediate_size``. NemotronH uses a non-gated ReLU^2
+            # activation, so gated_linear_unit is False.
+            moe_router_topk=config.num_experts_per_tok,
+            moe_ffn_hidden_size=config.moe_intermediate_size,
+            moe_shared_expert_num=getattr(config, "n_shared_experts", 0),
+            gated_linear_unit=False,
+        ), nemotronh
     else:
         raise ValueError(f"Unsupported config type: {type(config)}")
 

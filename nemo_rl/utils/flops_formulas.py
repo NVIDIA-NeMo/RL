@@ -58,6 +58,8 @@ class FLOPSConfig:
     mamba_head_dim: Optional[int] = None
     mamba_num_groups: Optional[int] = None
     mamba_num_heads: Optional[int] = None
+    gated_linear_unit: Optional[bool] = None
+    moe_shared_expert_num: Optional[int] = None
 
 
 def gpt3(config: FLOPSConfig):
@@ -492,6 +494,30 @@ def _mlp_layer_flops(config: FLOPSConfig):
     )
 
 
+def _moe_layer_flops(config: FLOPSConfig):
+    """Model FLOPs for an MoE FFN layer (routed + shared experts).
+
+    Each token is routed to ``moe_router_topk`` experts (plus any always-on
+    shared experts), so the effective FFN width is
+    ``moe_ffn_hidden_size * (moe_router_topk + moe_shared_expert_num)``.
+    ``gated_linear_unit`` doubles the up-projection GEMM (SwiGLU-style); a
+    non-gated activation (e.g. ReLU^2 in NemotronH) keeps the factor at 1.
+    """
+    gated_multiplier = 2 if config.gated_linear_unit else 1
+    shared_expert_num = config.moe_shared_expert_num or 0
+    effective_ffn_hidden_size = config.moe_ffn_hidden_size * (
+        config.moe_router_topk + shared_expert_num
+    )
+    return (
+        6
+        * config.gbs
+        * config.enc_seq_len
+        * config.hs
+        * effective_ffn_hidden_size
+        * gated_multiplier
+    )
+
+
 def _non_mla_attn_layer_flops(config: FLOPSConfig):
     """Model FLOPs for attention layer."""
     return (
@@ -536,7 +562,10 @@ def _hybrid_model_flops(config: FLOPSConfig):
     assert config.is_hybrid_model == True
     assert config.hybrid_override_pattern is not None
 
-    num_attn_layers, num_mamba_layers, num_mlp_layers = 0, 0, 0
+    # NemotronH hybrid pattern legend:
+    #   "M" -> Mamba layer, "*" -> attention layer, "-" -> dense MLP layer,
+    #   "E" -> MoE FFN layer (routed + shared experts).
+    num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = 0, 0, 0, 0
     for c in config.hybrid_override_pattern:
         if c == "M":
             num_mamba_layers += 1
@@ -544,10 +573,13 @@ def _hybrid_model_flops(config: FLOPSConfig):
             num_mlp_layers += 1
         elif c == "*":
             num_attn_layers += 1
+        elif c == "E":
+            num_moe_layers += 1
     return (
         num_attn_layers * _non_mla_attn_layer_flops(config)
         + num_mamba_layers * _mamba_layer_flops(config)
         + num_mlp_layers * _mlp_layer_flops(config)
+        + num_moe_layers * _moe_layer_flops(config)
         + 6 * config.gbs * config.enc_seq_len * config.hs * config.vocab_size
     )
 
