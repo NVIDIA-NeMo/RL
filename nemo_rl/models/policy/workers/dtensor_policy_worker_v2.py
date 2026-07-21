@@ -426,10 +426,17 @@ class DTensorPolicyWorkerV2Impl(
                 self._ipc_worker_state: dict = {}
 
     def _update_moe_gate_bias_if_supported(self) -> None:
-        """Update the non-gradient MoE routing bias after the optimizer step."""
-        update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
-        if update_moe_gate_bias is not None:
-            update_moe_gate_bias()
+        """Update the non-gradient MoE routing bias after the optimizer step.
+
+        Under pipeline parallelism ``self.model`` is the raw AutoPipeline, which
+        does not expose the hook; each trimmed stage in ``model_handle.parts``
+        does and updates only the MoE layers it owns.
+        """
+        model_parts = self.model_handle.parts if self.pp_enabled else [self.model]
+        for model_part in model_parts:
+            update_moe_gate_bias = getattr(model_part, "update_moe_gate_bias", None)
+            if update_moe_gate_bias is not None:
+                update_moe_gate_bias()
 
     def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
@@ -765,6 +772,7 @@ class DTensorPolicyWorkerV2Impl(
                     )
                     for opt in optimizers_list:
                         opt.step()
+                    self._update_moe_gate_bias_if_supported()
 
                 # Broadcast loss from last PP stage so all ranks report correct value.
                 # Undo dp*cp scaling from PPLossAdapter (needed for FSDP grad averaging
