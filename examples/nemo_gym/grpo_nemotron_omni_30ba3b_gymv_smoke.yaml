@@ -24,7 +24,7 @@ defaults: grpo_nanov3.yaml
 
 grpo:
   num_prompts_per_step: 1                # smoke: minimal loop
-  num_generations_per_prompt: 4          # gbs = 1 * 4 = 4
+  num_generations_per_prompt: 16         # gbs = 1 * 16 = 16
   num_val_generations_per_prompt: 1
   max_rollout_turns: 4
   max_num_epochs: 1
