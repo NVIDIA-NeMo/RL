@@ -2881,3 +2881,43 @@ def test_subset_softmax_matches_full_vocab_reference(temperature):
     ref.sum().backward()
     new.sum().backward()
     torch.testing.assert_close(new_logits.grad, ref_logits.grad, atol=1e-6, rtol=1e-6)
+
+
+def test_vocab_parallel_gather_columns_tp_sharded(monkeypatch):
+    """TP path via an emulated 2-rank group: running the production code per
+    vocab shard and summing (what ``all_reduce(SUM)`` does — each column is
+    owned by exactly one rank) must reproduce the full-logits column slice,
+    and each shard's backward must receive exactly its own columns' grads."""
+    import nemo_rl.distributed.model_utils as mu
+
+    torch.manual_seed(7)
+    batch, seq, vocab, k = 2, 5, 32, 6
+    full = torch.randn(batch, seq, vocab)
+    idx = torch.randperm(vocab)[:k].sort().values
+    v_local = vocab // 2
+    shards = [
+        full[..., :v_local].clone().requires_grad_(True),
+        full[..., v_local:].clone().requires_grad_(True),
+    ]
+
+    outputs = []
+    for rank in (0, 1):
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda g=None: 2)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda g=None, _r=rank: _r)
+        monkeypatch.setattr(
+            torch.distributed, "all_reduce", lambda t, op=None, group=None: None
+        )
+        outputs.append(
+            mu.vocab_parallel_gather_columns(shards[rank], idx, tp_group=object())
+        )
+    combined = outputs[0] + outputs[1]
+
+    truth = full[..., idx].float()
+    torch.testing.assert_close(combined, truth)
+
+    grad_out = torch.randn_like(combined)
+    combined.backward(grad_out)
+    ref = full.clone().requires_grad_(True)
+    ref[..., idx].float().backward(grad_out)
+    torch.testing.assert_close(shards[0].grad, ref.grad[..., :v_local])
+    torch.testing.assert_close(shards[1].grad, ref.grad[..., v_local:])
