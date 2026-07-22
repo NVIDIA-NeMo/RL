@@ -18,6 +18,7 @@ Supports Qwen3 tool calling, DeepSeekR1Parser reasoning, and prefix token splici
 """
 
 import asyncio
+import logging
 import threading
 import time
 import uuid
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(
