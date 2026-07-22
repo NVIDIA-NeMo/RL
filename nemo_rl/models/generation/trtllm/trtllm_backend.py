@@ -110,12 +110,9 @@ class NcclExtension(WorkerExtension):
                 with in-flight requests still in the engine (in-flight
                 weight update).
             recompute_kv: Only meaningful with ``drain=False``. If True,
-                preempt every in-flight request after the swap so the
-                scheduler re-prefills them under the new weights, and
-                clear the prefix-reuse pool. If False, in-flight requests
-                keep decoding with their existing KV cache (new-Q × old-K
-                mixing on the first decode under new weights — callers
-                tolerate this via importance-sampling correction).
+                preempt in-flight requests so they re-prefill under the new weights.
+                Otherwise, they keep decoding with their current KV cache. The
+                reusable prefix cache is cleared after every weight update.
         """
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
@@ -137,6 +134,7 @@ class NcclExtension(WorkerExtension):
                 # iter is enqueued, but its GPU forward may still be in flight.
                 # Block here so we don't overwrite weights mid-forward
                 torch.cuda.synchronize()
+                model_engine.model_loader.begin_update_weights()
                 for module in model.modules():
                     if hasattr(module, "pre_reload_weights") and not getattr(
                         module, "_weights_removed", False
@@ -148,6 +146,7 @@ class NcclExtension(WorkerExtension):
                     src=0,
                     post_unpack_func=load_model_weight_func,
                 )
+                model_engine.model_loader.finalize_update_weights()
                 for module in model.modules():
                     if hasattr(module, "process_weights_after_loading") and not getattr(
                         module, "_weights_removed", False
@@ -159,9 +158,9 @@ class NcclExtension(WorkerExtension):
                         module.post_load_weights()
                 torch.cuda.current_stream().synchronize()
 
-                if not drain and recompute_kv:
-                    self.engine.reset_prefix_cache()
+                self.engine.reset_prefix_cache()
             except Exception as e:
+                model_engine.model_loader.abort_update_weights()
                 print(f"Error in NcclExtension.update_weights_from_collective: {e}")
                 return False
 
@@ -203,6 +202,7 @@ class NcclExtension(WorkerExtension):
         weights = None
         try:
             self.maybe_init_zmq()
+            model_engine.model_loader.begin_update_weights()
             for module in model.modules():
                 if hasattr(module, "pre_reload_weights") and not getattr(
                     module, "_weights_removed", False
@@ -252,6 +252,7 @@ class NcclExtension(WorkerExtension):
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
+            model_engine.model_loader.finalize_update_weights()
             for module in model.modules():
                 if hasattr(module, "process_weights_after_loading") and not getattr(
                     module, "_weights_removed", False
@@ -262,10 +263,12 @@ class NcclExtension(WorkerExtension):
                 ):
                     module.post_load_weights()
             torch.cuda.current_stream().synchronize()
+            self.engine.reset_prefix_cache()
             gc.collect()
             torch.cuda.empty_cache()
             return True
         except Exception as e:
+            model_engine.model_loader.abort_update_weights()
             print(
                 f"Error in NcclExtension.update_weights_via_ipc_zmq: {e}\n"
                 f"{traceback.format_exc()}"

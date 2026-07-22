@@ -44,7 +44,7 @@ def _extension(backend):
 
 def _ipc_extension(backend):
     """Reuse the collective-path fixture, then add IPC-ZMQ-only state."""
-    extension, _, _, model_loader, _ = _extension(backend)
+    extension, _, _, model_loader, engine = _extension(backend)
     # Pre-set zmq_socket so maybe_init_zmq() short-circuits (no real bind).
     extension.zmq_socket = MagicMock()
     # Two fp32 weights: 8 B and 12 B, each 512-B aligned -> offsets 512, 1024.
@@ -52,15 +52,15 @@ def _ipc_extension(backend):
         "a": (torch.Size([2]), torch.float32),
         "b": (torch.Size([3]), torch.float32),
     }
-    return extension, model_loader
+    return extension, model_loader, engine
 
 
 @pytest.mark.parametrize(
-    ("drain", "recompute_kv", "should_reset"),
-    [(True, False, False), (False, False, False), (False, True, True)],
+    ("drain", "recompute_kv"),
+    [(True, False), (False, False), (False, True)],
 )
 def test_collective_refit_runs_at_async_engine_boundary(
-    monkeypatch, drain, recompute_kv, should_reset
+    monkeypatch, drain, recompute_kv
 ):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
@@ -79,7 +79,11 @@ def test_collective_refit_runs_at_async_engine_boundary(
         "process"
     )
     module.post_load_weights.side_effect = lambda: call_order.append("post")
+    model_loader.begin_update_weights.side_effect = lambda: call_order.append("begin")
     model_loader.reload.side_effect = lambda *_, **__: call_order.append("reload")
+    model_loader.finalize_update_weights.side_effect = lambda: call_order.append(
+        "finalize"
+    )
     monkeypatch.setattr(backend, "packed_broadcast_consumer", packed_consumer)
     monkeypatch.setattr(
         backend.torch.cuda, "synchronize", lambda: call_order.append("cuda_sync")
@@ -104,14 +108,17 @@ def test_collective_refit_runs_at_async_engine_boundary(
     )
     assert call_order == [
         "cuda_sync",
+        "begin",
         "pre",
         "broadcast",
         "reload",
+        "finalize",
         "process",
         "post",
         "stream_sync",
     ]
-    assert engine.reset_prefix_cache.called is should_reset
+    model_loader.abort_update_weights.assert_not_called()
+    engine.reset_prefix_cache.assert_called_once_with()
 
 
 def test_collective_refit_requires_metadata():
@@ -127,7 +134,7 @@ def test_collective_refit_requires_metadata():
 def test_collective_refit_returns_false_when_reload_fails(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
-    extension, _, _, model_loader, _ = _extension(backend)
+    extension, _, _, model_loader, engine = _extension(backend)
 
     def packed_consumer(*, post_unpack_func, **_):
         post_unpack_func([("model.weight", torch.tensor([1.0]))])
@@ -137,13 +144,17 @@ def test_collective_refit_returns_false_when_reload_fails(monkeypatch):
     monkeypatch.setattr(backend.torch.cuda, "synchronize", lambda: None)
 
     assert extension.update_weights_from_collective() is False
+    model_loader.begin_update_weights.assert_called_once_with()
+    model_loader.finalize_update_weights.assert_not_called()
+    model_loader.abort_update_weights.assert_called_once_with()
+    engine.reset_prefix_cache.assert_not_called()
 
 
 def test_ipc_zmq_streams_chunk_and_reloads_with_aligned_offsets(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
     from nemo_rl.models.policy.utils import IPCProtocol
 
-    extension, model_loader = _ipc_extension(backend)
+    extension, model_loader, engine = _ipc_extension(backend)
 
     buffer = torch.zeros(1024, dtype=torch.uint8)
     monkeypatch.setattr(backend, "rebuild_cuda_tensor_from_ipc", lambda h, d: buffer)
@@ -165,6 +176,10 @@ def test_ipc_zmq_streams_chunk_and_reloads_with_aligned_offsets(monkeypatch):
     assert weights["a"].shape == torch.Size([2])
     assert weights["b"].shape == torch.Size([3])
     assert kwargs["allow_partial_loading"] is True
+    model_loader.begin_update_weights.assert_called_once_with()
+    model_loader.finalize_update_weights.assert_called_once_with()
+    model_loader.abort_update_weights.assert_not_called()
+    engine.reset_prefix_cache.assert_called_once_with()
     # COMPLETE is ACKed after the final chunk.
     assert extension.zmq_socket.send.call_count == 2
 
@@ -173,7 +188,7 @@ def test_ipc_zmq_offset_mismatch_returns_false_without_reload(monkeypatch):
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
     from nemo_rl.models.policy.utils import IPCProtocol
 
-    extension, model_loader = _ipc_extension(backend)
+    extension, model_loader, engine = _ipc_extension(backend)
 
     buffer = torch.zeros(1024, dtype=torch.uint8)
     monkeypatch.setattr(backend, "rebuild_cuda_tensor_from_ipc", lambda h, d: buffer)
@@ -187,6 +202,10 @@ def test_ipc_zmq_offset_mismatch_returns_false_without_reload(monkeypatch):
 
     assert extension.update_weights_via_ipc_zmq() is False
     model_loader.reload.assert_not_called()
+    model_loader.begin_update_weights.assert_called_once_with()
+    model_loader.finalize_update_weights.assert_not_called()
+    model_loader.abort_update_weights.assert_called_once_with()
+    engine.reset_prefix_cache.assert_not_called()
 
 
 def test_zmq_address_and_cleanup_are_per_gpu_and_idempotent():
