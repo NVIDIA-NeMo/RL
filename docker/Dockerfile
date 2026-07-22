@@ -142,7 +142,7 @@ ARG SKIP_TRTLLM_BUILD
 ARG BASE_IMAGE
 ARG UV_VERSION
 ARG TARGETARCH
-ARG TRTLLM_CCACHE_MAXSIZE=200G
+ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
@@ -229,7 +229,12 @@ fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
     UV_LINK_MODE=hardlink uv sync --locked --extra sglang --no-install-project
 fi
+uv sync --link-mode symlink --locked --extra mcore --no-install-project
+uv sync --link-mode symlink --locked --extra automodel --no-install-project
+uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    # Build TRT-LLM after every other backend cache warmup. The final
+    # --all-groups sync below restores the intended default environment.
     # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py
     # invokes tools/build-custom-trtllm.sh during this sync.
     echo "TRT-LLM uv cache state before build:"
@@ -279,9 +284,6 @@ if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     fi
 fi
 
-uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
-uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8

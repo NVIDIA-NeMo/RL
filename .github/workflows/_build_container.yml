@@ -175,29 +175,6 @@ jobs:
           echo "Using TRT-LLM uv cache tag $TAG for $BASE_IMAGE, uv $UV_VERSION, on $ARCH"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      # Temporary one-shot migration from the old TRT-LLM-ref-scoped tags.
-      # Remove this step after both architecture builds have run successfully.
-      - name: Migrate legacy TRT-LLM ccache tag (temporary)
-        if: inputs.trtllm-ccache-tag != ''
-        shell: bash
-        env:
-          LEGACY_TAG: trtllm-ccache-${{ steps.trtllm_ccache_tag.outputs.arch }}-bf2ef86f
-          NEW_TAG: ${{ steps.trtllm_ccache_tag.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          LEGACY_REF="$REGISTRY/$IMAGE_NAME:$LEGACY_TAG"
-          NEW_REF="$REGISTRY/$IMAGE_NAME:$NEW_TAG"
-          if docker buildx imagetools inspect "$NEW_REF" >/dev/null 2>&1; then
-            echo "TRT-LLM ccache tag $NEW_REF already exists; skipping migration"
-          elif docker buildx imagetools inspect "$LEGACY_REF" >/dev/null 2>&1; then
-            echo "Migrating TRT-LLM ccache tag $LEGACY_REF to $NEW_REF"
-            docker buildx imagetools create --tag "$NEW_REF" "$LEGACY_REF"
-            docker buildx imagetools inspect "$NEW_REF" >/dev/null
-          else
-            echo "Legacy TRT-LLM ccache tag $LEGACY_REF was not found; skipping migration"
-          fi
-
       - name: Resolve TRT-LLM ccache seed
         id: trtllm_ccache_seed
         if: inputs.trtllm-ccache-tag != ''
