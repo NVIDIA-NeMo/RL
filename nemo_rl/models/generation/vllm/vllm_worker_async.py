@@ -737,6 +737,15 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
+        # vLLM 0.20's OpenAIServingChat.__init__ does not accept
+        # ``chat_template_kwargs`` — the Jinja kwargs are threaded per-request via
+        # ``request.chat_template_kwargs``. Pull the recipe-provided defaults out
+        # of the init bag and inject them into each incoming request below so
+        # values like ``truncate_history_thinking`` actually reach the template
+        # instead of silently defaulting.
+        default_chat_template_kwargs: dict[str, Any] = (
+            serving_chat_kwargs.pop("chat_template_kwargs", None) or {}
+        )
         openai_serving_render = NeMoRLOpenAIServingRender(
             model_config=engine_client.model_config,
             renderer=engine_client.renderer,
@@ -776,6 +785,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             # If they do not match, the inference will be off policy and destroy training stability.
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
+
+            # Merge recipe-level chat_template_kwargs into the request. Client-
+            # provided keys win so a caller can still override per request.
+            if default_chat_template_kwargs:
+                request.chat_template_kwargs = {
+                    **default_chat_template_kwargs,
+                    **(request.chat_template_kwargs or {}),
+                }
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -844,6 +861,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         @app.post("/tokenize")
         async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):
+            # Chat-mode tokenize also renders the chat template — inject the
+            # same default kwargs so /tokenize and /v1/chat/completions produce
+            # identical prompt tokens under multi-turn.
+            if default_chat_template_kwargs and hasattr(
+                request, "chat_template_kwargs"
+            ):
+                request.chat_template_kwargs = {
+                    **default_chat_template_kwargs,
+                    **(request.chat_template_kwargs or {}),
+                }
+
             generator = await openai_serving_tokenization.create_tokenize(
                 request, raw_request
             )

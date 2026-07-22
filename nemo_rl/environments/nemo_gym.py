@@ -476,6 +476,7 @@ Depending on your data shape, you may want to change these values."""
             ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
 Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
+output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(seen_token_ids)]}
 """
 
             prompt_token_ids = output_item_dict.pop("prompt_token_ids")
