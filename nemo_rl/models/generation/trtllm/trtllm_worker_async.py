@@ -122,6 +122,10 @@ class TrtllmAsyncGenerationWorkerImpl:
         self._stats_task: Optional[asyncio.Task] = None
         self.inflight_batch_sizes: list[int] = []
         self.num_pending_samples: list[int] = []
+        # KV-cache utilization as a 0-1 fraction (mirrors vLLM's
+        # kv_cache_usage_perc) so both backends' figures are comparable.
+        self.kv_cache_usage_perc: list[float] = []
+        self._kv_stats_keys_logged = False
 
         if not self.is_model_owner:
             return
@@ -426,6 +430,7 @@ class TrtllmAsyncGenerationWorkerImpl:
                 # the current 0-gauge) so every interval yields one point.
                 ifb_sample = 0
                 ctx_sample = 0
+                kv_sample = 0.0
                 if records:
                     stats = records[-1]
                     if isinstance(stats, (str, bytes, bytearray)):
@@ -445,9 +450,46 @@ class TrtllmAsyncGenerationWorkerImpl:
                         # queued/pending prefill work. Keep the same two-series
                         # shape the consumer asserts on.
                         ctx_sample = int(ctx) if ctx is not None else 0
+                        # KV-cache utilization as a 0-1 fraction, mirroring
+                        # vLLM's kv_cache_usage_perc. TRT-LLM's serialized
+                        # IterationStats exposes a kvCacheStats sub-object with
+                        # block counts (usedNumBlocks / maxNumBlocks /
+                        # freeNumBlocks) — not a ready percent — so derive it:
+                        #   kv = usedNumBlocks / maxNumBlocks
+                        # (fallback 1 - freeNumBlocks/maxNumBlocks), guarded for
+                        # maxNumBlocks == 0 -> 0.0. One-time log of the observed
+                        # kvCacheStats keys to ease field-name debugging.
+                        kv_stats = self._get_stat_field(stats, "kvCacheStats")
+                        if kv_stats is not None and not self._kv_stats_keys_logged:
+                            self._kv_stats_keys_logged = True
+                            _keys = (
+                                list(kv_stats.keys())
+                                if isinstance(kv_stats, dict)
+                                else dir(kv_stats)
+                            )
+                            print(
+                                "📋[TRT-LLM Metric Logger] kvCacheStats keys: "
+                                f"{_keys}",
+                                flush=True,
+                            )
+                        max_blocks = self._get_stat_field(kv_stats, "maxNumBlocks")
+                        used_blocks = self._get_stat_field(kv_stats, "usedNumBlocks")
+                        free_blocks = self._get_stat_field(kv_stats, "freeNumBlocks")
+                        try:
+                            max_blocks = float(max_blocks) if max_blocks is not None else 0.0
+                            if max_blocks > 0:
+                                if used_blocks is not None:
+                                    kv_sample = float(used_blocks) / max_blocks
+                                elif free_blocks is not None:
+                                    kv_sample = 1.0 - float(free_blocks) / max_blocks
+                                # Clamp into [0, 1] to match vLLM's fraction.
+                                kv_sample = min(1.0, max(0.0, kv_sample))
+                        except (TypeError, ValueError):
+                            kv_sample = 0.0
                 with self._trtllm_metrics_lock:
                     self.inflight_batch_sizes.append(ifb_sample)
                     self.num_pending_samples.append(ctx_sample)
+                    self.kv_cache_usage_perc.append(kv_sample)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -470,6 +512,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             return {
                 "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
+                "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
             }
 
     def clear_trtllm_logger_metrics(self) -> None:
@@ -478,6 +521,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         with self._trtllm_metrics_lock:
             self.inflight_batch_sizes = []
             self.num_pending_samples = []
+            self.kv_cache_usage_perc = []
 
     def shutdown(self) -> bool:
         if self._stats_task is not None:
