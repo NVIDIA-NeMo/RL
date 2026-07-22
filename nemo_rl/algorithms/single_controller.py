@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Literal, Optional
 
 import ray
@@ -55,9 +56,9 @@ from nemo_rl.algorithms.grpo import GRPOLoggerConfig
 from nemo_rl.algorithms.staleness_sampler import (
     StalenessSampler,
     count_groups,
-    incomplete_group_indices,
     min_weight_version,
 )
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import Timer
@@ -114,6 +115,13 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     # Concurrency limits
     max_inflight_prompts: int = 8
     max_buffered_rollouts: int = 8  # _buffer_capacity semaphore size
+
+    # Rollout dispatch gating (read by _rollout_pump). over_sampling=False
+    # gates each batch on max_rollout_version vs trainer_version; force_in_order
+    # stamps target_step on each dispatch so downstream consumers can match
+    # rollout batches to trainer steps exactly.
+    over_sampling: bool = False
+    force_in_order: bool = False
 
     # Training
     max_train_steps: int = 10
@@ -235,6 +243,8 @@ class SingleControllerActor:
         weight_synchronizer: Any,
         loss_fn: Any,
         advantage_estimator: Any | None = None,
+        rollout_manager: Any = None,
+        dataloader: Any = None,
     ) -> None:
         self._cfg = cfg
         self._prompts = prompts
@@ -244,6 +254,8 @@ class SingleControllerActor:
         self._weight_synchronizer = weight_synchronizer
         self._loss_fn = loss_fn
         self._advantage_estimator = advantage_estimator
+        self._rollout_manager = rollout_manager
+        self._dataloader = dataloader
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
@@ -259,11 +271,24 @@ class SingleControllerActor:
         # values at config construction, so no runtime assert is needed here.
         if cfg.batch_selection_strategy == "strict_on_policy":
             cfg.max_weight_staleness_versions = 0
+            cfg.over_sampling = False
             print(
-                "Using strict_on_policy, auto setting "
-                "max_weight_staleness_versions to 0.",
+                "Using strict_on_policy, auto setting max_weight_staleness_versions "
+                "to 0 and over_sampling to False.",
                 flush=True,
             )
+        if cfg.max_weight_staleness_versions == 0 and cfg.over_sampling:
+            raise ValueError(
+                "max_weight_staleness_versions=0 requires over_sampling=False: "
+                "with zero staleness the dispatch gate needs to advance one batch "
+                "per trainer_version, which over_sampling=True bypasses."
+            )
+        if cfg.force_in_order and cfg.over_sampling:
+            raise ValueError(
+                "force_in_order=True requires over_sampling=False so that each "
+                "dispatched batch corresponds to exactly one target training step."
+            )
+
         if cfg.target_groups_per_step is None:
             cfg.target_groups_per_step = cfg.min_groups_per_batch
         if cfg.target_groups_per_step < cfg.min_groups_per_batch:
@@ -313,6 +338,14 @@ class SingleControllerActor:
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
 
+        # Rollout batch counter — pre-incremented before each dispatch, so start
+        # at -1 to allow the first batch through the strict_on_policy gate.
+        self._max_rollout_version: int = -1
+
+        # Active rollout tasks used by downstream synchronization/drain paths.
+        # TaskGroup remains responsible for task ownership and cancellation.
+        self._dispatched_rollouts: set[asyncio.Task[None]] = set()
+
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released after clear_samples.
         self._buffer_capacity: asyncio.Semaphore = asyncio.Semaphore(
@@ -321,7 +354,6 @@ class SingleControllerActor:
 
         self._trainer_version: int = 0
         self._train_steps: int = 0
-        self._rollout_done: bool = False
         # Completed prompt-list passes; only advances when
         # cfg.max_num_epochs is set (see _rollout_pump).
         self._current_epoch: int = 0
@@ -351,14 +383,19 @@ class SingleControllerActor:
         """Main entry point. Runs until max_train_steps is reached."""
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
-
-        await train_task
-
-        rollout_task.cancel()
         try:
-            await rollout_task
-        except asyncio.CancelledError:
-            pass
+            done, _ = await asyncio.wait(
+                {rollout_task, train_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if rollout_task in done:
+                # Propagate rollout failures immediately. A normally exhausted
+                # rollout pump leaves the train pump to drain committed groups.
+                await rollout_task
+            await train_task
+        finally:
+            rollout_task.cancel()
+            train_task.cancel()
+            await asyncio.gather(rollout_task, train_task, return_exceptions=True)
 
         return {
             "train_steps": self._train_steps,
@@ -397,74 +434,111 @@ class SingleControllerActor:
     # ── the three pumps + the inline advantage stage ───────────────────────
 
     async def _rollout_pump(self) -> None:
-        """Dispatch prompts as concurrent coroutines, one per prompt group.
+        """Continuously dispatch rollout tasks until cancellation.
 
-        Flow per prompt:
+        Per batch (over_sampling=False):
+          0. Wait while _max_rollout_version >= trainer_version + max_staleness,
+             then claim the next step by incrementing _max_rollout_version.
+
+        Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
-          2. Wait for _rollout_permitted (paused during weight sync)
-          3. Call gen.generate_and_push(prompt, dp_client) — RPC to GenWorker
-             GenWorker generates and calls DataPlane put_samples directly
-          4. Decrement _inflight_rollouts
+          2. Acquire sem (cap concurrent in-flight rollouts)
+          3. Wait for _rollout_permitted (paused during weight sync)
+          4. Call rollout_manager.generate_and_push(prompt) — local async
+             RolloutManager reserves a slot, runs the rollout, then commits the
+             group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
+          5. Decrement _inflight_rollouts
         """
-        n = self._cfg.max_rollout_prompts
-        max_epochs = self._cfg.max_num_epochs
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
+        over_sampling = self._cfg.over_sampling
+        max_staleness = self._cfg.max_weight_staleness_versions
+        force_in_order = self._cfg.force_in_order
+        print("rollout_pump: starting", flush=True)
 
-        start = time.monotonic()
-        print(f"rollout_pump: dispatching {n} prompts", flush=True)
-
-        async def _one_group(prompt: str) -> None:
-            await self._buffer_capacity.acquire()
-            await self._rollout_permitted.wait()
-            async with sem:
-                self._inflight_rollouts += 1
-                try:
-                    await self._ray_get(
-                        self._gen.generate_and_push.remote(prompt, self._dp_client)
-                    )
-                    if self._cfg.diagnostics:
-                        print(
-                            f"  rollout done for prompt='{prompt[:20]}...'",
-                            flush=True,
-                        )
-                finally:
-                    self._inflight_rollouts -= 1
-
-        dispatched = 0
-        if max_epochs is None:
-            # Unbounded-epoch path: max_rollout_prompts alone caps dispatch,
-            # all prompts in flight together (cycling through the list).
-            tasks = [
-                asyncio.ensure_future(_one_group(self._prompts[i % len(self._prompts)]))
-                for i in range(n)
-            ]
-            await asyncio.gather(*tasks)
-            dispatched = n
-        else:
-            # Epoch-bounded path: one gather per pass over the prompt list,
-            # mirroring grpo.py's per-epoch dataset iteration. Ends at
-            # whichever bound is hit first (epochs or total prompt budget).
-            while dispatched < n and self._current_epoch < max_epochs:
-                k = min(len(self._prompts), n - dispatched)
-                tasks = [
-                    asyncio.ensure_future(_one_group(self._prompts[i]))
-                    for i in range(k)
-                ]
-                await asyncio.gather(*tasks)
-                dispatched += k
-                self._current_epoch += 1
-                print(
-                    f"rollout_pump: epoch {self._current_epoch}/{max_epochs} "
-                    f"complete ({dispatched}/{n} prompts)",
-                    flush=True,
+        async def _dispatch_one_prompt(
+            prompt: DatumSpec,
+            target_step: Optional[int],
+            task_started_event: asyncio.Event,
+        ) -> None:
+            task_started_event.set()
+            self._inflight_rollouts += 1
+            try:
+                await self._rollout_manager.generate_and_push(
+                    prompt, target_step=target_step
                 )
+            except BaseException:
+                # On success ownership transfers to the train pump, which
+                # releases this permit after consuming the committed group.
+                self._buffer_capacity.release()
+                raise
+            finally:
+                self._inflight_rollouts -= 1
+                sem.release()
 
-        self._rollout_done = True
-        print(
-            f"rollout_pump: finished {dispatched} prompts in "
-            f"{time.monotonic() - start:.2f}s",
-            flush=True,
-        )
+            if self._cfg.diagnostics:
+                content = ""
+                for i in range(len(prompt["message_log"])):
+                    if prompt["message_log"][i]["role"] == "user":
+                        content = prompt["message_log"][i]["content"]
+                        break
+                print(f"  rollout done for prompt='{content[:20]}...'", flush=True)
+
+        def _release_permits_if_task_not_started(
+            _: asyncio.Task[Any],
+            *,
+            task_started_event: asyncio.Event,
+        ) -> None:
+            if not task_started_event.is_set():
+                self._buffer_capacity.release()
+                sem.release()
+
+        max_epochs = self._cfg.max_num_epochs
+        async with asyncio.TaskGroup() as rollout_tasks:
+            while max_epochs is None or self._current_epoch < max_epochs:
+                for prompt_batch in self._dataloader:
+                    # over_sampling=False: batch-level gate on max_rollout_version.
+                    if not over_sampling:
+                        while (
+                            self._max_rollout_version
+                            >= self._trainer_version + max_staleness
+                        ):
+                            await asyncio.sleep(0.005)
+                        self._max_rollout_version += 1
+
+                    # target_step = batch dispatch index when force_in_order is on.
+                    target_step = self._max_rollout_version if force_in_order else None
+
+                    for prompt_idx in range(prompt_batch.size):
+                        prompt: DatumSpec = {  # type: ignore
+                            k: v[prompt_idx] for k, v in prompt_batch.items()
+                        }
+
+                        # check if buffer is full
+                        await self._buffer_capacity.acquire()
+                        # check if inflight rollouts is full
+                        await sem.acquire()
+                        # wait for rollout to be permitted
+                        await self._rollout_permitted.wait()
+
+                        task_started_event = asyncio.Event()
+                        # dispatch rollout
+                        task = rollout_tasks.create_task(
+                            _dispatch_one_prompt(
+                                prompt, target_step, task_started_event
+                            )
+                        )
+                        self._dispatched_rollouts.add(task)
+                        task.add_done_callback(self._dispatched_rollouts.discard)
+                        task.add_done_callback(
+                            partial(
+                                _release_permits_if_task_not_started,
+                                task_started_event=task_started_event,
+                            )
+                        )
+
+                self._current_epoch += 1
+
+        print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
@@ -539,18 +613,6 @@ class SingleControllerActor:
                         )
 
                     if group_indices is None:
-                        if self._rollout_done:
-                            # No group is selectable and no more samples
-                            # will arrive: flush groups that can never
-                            # complete so the emptiness check fires
-                            # instead of spinning forever.
-                            await self._flush_incomplete_groups()
-                            if (
-                                self._claimed_meta is None
-                                or self._claimed_meta.size == 0
-                            ):
-                                rollout_exhausted = True
-                                break
                         await asyncio.sleep(0.005)
                         continue
 
@@ -849,46 +911,6 @@ class SingleControllerActor:
         )
         self._claimed_meta = self._claimed_meta.drop(indices)
         return evicted_meta
-
-    async def _flush_incomplete_groups(self) -> None:
-        """Drop groups that can never become selectable after rollout shutdown.
-
-        With ``_rollout_done`` set, a group that is uncommitted or short of
-        ``expected_num_samples`` will never receive more rows, yet the sampler
-        neither selects nor evicts it — without this flush the train pump
-        spins forever and ``run()`` hangs. Drain rows still unclaimed at
-        DataPlane first: a group can straddle a ``claim_meta`` batch boundary,
-        so incomplete-in-``_claimed_meta`` does not yet prove
-        incomplete-in-partition.
-        """
-        while True:
-            before = self._claimed_meta.size if self._claimed_meta is not None else 0
-            await self._claim_available_meta()
-            after = self._claimed_meta.size if self._claimed_meta is not None else 0
-            if after == before:
-                break
-        if self._claimed_meta is None or self._claimed_meta.size == 0:
-            return
-        indices = incomplete_group_indices(
-            self._claimed_meta,
-            group_size=self._cfg.group_size,
-        )
-        if not indices:
-            return
-        dropped = self._claimed_meta.subset(indices)
-        print(
-            f"WARNING: rollout done: dropping {dropped.size} sample(s) from "
-            f"incomplete prompt group(s) that can no longer complete",
-            flush=True,
-        )
-        await self._call_dp(
-            "clear_samples",
-            sample_ids=dropped.sample_ids,
-            partition_id=dropped.partition_id,
-        )
-        self._claimed_meta = self._claimed_meta.drop(indices)
-        # No _buffer_capacity release: the rollout pump has exited, so no
-        # dispatcher will acquire again this run.
 
 
 def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
