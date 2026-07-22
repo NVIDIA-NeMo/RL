@@ -677,7 +677,20 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     else:
         kernel = getattr(self, "kernel", None)
         kernel_name = type(kernel).__name__ if kernel is not None else None
-        if "FlashInferCutlass" not in str(kernel_name):
+        if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
+            # vLLM 0.25 prefers the CuTe-DSL kernel, but it stores the weight
+            # column-major [K, N] while this refit-friendly override (and the
+            # MXFP8 refit loader) keeps the canonical [N, K] layout. The
+            # CUTLASS kernel consumes [N, K] and is supported wherever
+            # CuTe-DSL is (both require SM100), so swap it in.
+            from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+                FlashInferCutlassMxfp8LinearKernel,
+            )
+
+            kernel = FlashInferCutlassMxfp8LinearKernel(kernel.config)
+            self.kernel = kernel
+            kernel_name = type(kernel).__name__
+        if kernel_name != "FlashInferCutlassMxfp8LinearKernel":
             raise AssertionError(
                 f"Unsupported MXFP8 linear kernel for refit: {kernel_name}"
             )
@@ -727,7 +740,9 @@ def create_weights_mxfp8_moe(
     FusedMoE, but those are read-only properties backed by moe_config. Keep the
     upstream allocation behavior while relying on those existing properties.
     """
-    from vllm.model_executor.layers.fused_moe.layer import (
+    # vLLM 0.25 moved FusedMoeWeightScaleSupported out of fused_moe.layer;
+    # it is re-exported from the fused_moe package.
+    from vllm.model_executor.layers.fused_moe import (
         FusedMoeWeightScaleSupported,
     )
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
@@ -882,7 +897,7 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         shuffle_matrix_a,
         shuffle_matrix_sf_a,
     )
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSupported
+    from vllm.model_executor.layers.fused_moe import FusedMoeWeightScaleSupported
     from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
         swap_w13_to_w31,
     )
