@@ -198,6 +198,13 @@ Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable R
 Tools and techniques for debugging distributed Ray applications and RL training runs.
 :::
 
+:::{grid-item-card} {octicon}`graph` Observability
+:link: observability/index
+:link-type: doc
+
+OpenTelemetry traces and `rl.*` metrics via nemo-lens: span groups, configuration, vLLM tracing, and an OTLP export stack.
+:::
+
 :::{grid-item-card} {octicon}`zap` FP8 Quantization
 :link: fp8
 :link-type: doc
@@ -326,6 +333,12 @@ debugging.md
 nsys-profiling.md
 fp8.md
 guides/use-custom-vllm.md
+```
+
+```{toctree}
+:caption: Observability
+
+observability/index.md
 ```
 
 ```{toctree}

@@ -89,6 +89,15 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
+try:
+    from nemo.lens.helpers import managed_span, trace_fn
+except ImportError:
+    from nemo_rl.telemetry._fallbacks import managed_span, trace_fn
+
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.setup import get_telemetry
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+
 # ===============================================================================
 # Configuration
 # ===============================================================================
@@ -185,6 +194,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: PPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    telemetry: Optional[TelemetryConfig] = None
 
 
 # ===============================================================================
@@ -883,6 +893,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
 # ===============================================================================
 
 
+@trace_fn(RLSpanGroup.JOB, "rl.ppo.job")
 def ppo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -908,6 +919,8 @@ def ppo_train(
     - Configurable policy training start epoch
     """
     timer = Timer()
+    _telemetry = get_telemetry()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -997,10 +1010,25 @@ def ppo_train(
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                timer.time("total_step_time"),
+                managed_span(
+                    RLSpanGroup.STEP,
+                    "rl.ppo.step",
+                    tracer=_tracer,
+                    **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
+                ),
+            ):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.ppo.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
                             master_config.ppo["num_generations_per_prompt"]
@@ -1061,7 +1089,14 @@ def ppo_train(
                             policy.offload_to_cpu()
                         policy_generation.prepare_for_generation()
 
-                with timer.time("generation"):
+                with (
+                    timer.time("generation"),
+                    managed_span(
+                        RLSpanGroup.ROLLOUT,
+                        "rl.ppo.collect_rollouts",
+                        tracer=_tracer,
+                    ),
+                ):
                     if policy_generation is not None:
                         policy_generation.clear_logger_metrics()
 
@@ -1132,7 +1167,14 @@ def ppo_train(
                 # Process rewards and build training data
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
                 print("▶ Processing rewards...", flush=True)
-                with timer.time("reward_calculation"):
+                with (
+                    timer.time("reward_calculation"),
+                    managed_span(
+                        RLSpanGroup.REWARD,
+                        "rl.ppo.compute_rewards",
+                        tracer=_tracer,
+                    ),
+                ):
                     rewards = repeated_batch["total_reward"]
 
                 with timer.time("data_processing"):
@@ -1206,7 +1248,14 @@ def ppo_train(
                     policy.prepare_for_lp_inference()
 
                 print("▶ Computing logprobs...", flush=True)
-                with timer.time("policy_and_reference_logprobs"):
+                with (
+                    timer.time("policy_and_reference_logprobs"),
+                    managed_span(
+                        RLSpanGroup.LOGPROB,
+                        "rl.ppo.compute_logprobs",
+                        tracer=_tracer,
+                    ),
+                ):
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "input_ids": train_data["input_ids"],
@@ -1236,7 +1285,14 @@ def ppo_train(
                 # Build prompt IDs for advantage estimation (groups responses from same prompt).
                 # Use the token-length-based extractor so multi-turn prompts containing
                 # assistant messages still resolve to the original prompt only.
-                with timer.time("advantage_calculation"):
+                with (
+                    timer.time("advantage_calculation"),
+                    managed_span(
+                        RLSpanGroup.ADVANTAGE,
+                        "rl.ppo.compute_advantages",
+                        tracer=_tracer,
+                    ),
+                ):
                     print("▶ Computing advantages...", flush=True)
                     initial_prompt_message_logs = extract_initial_prompt_messages(
                         repeated_batch["message_log"],
@@ -1282,7 +1338,15 @@ def ppo_train(
                     with timer.time("value_training_prep"):
                         value_model.prepare_for_training()
 
-                    with timer.time("value_training"):
+                    with (
+                        timer.time("value_training"),
+                        managed_span(
+                            RLSpanGroup.POLICY_UPDATE,
+                            "rl.ppo.value_update",
+                            tracer=_tracer,
+                            **{"rl.iteration": total_steps + 1},
+                        ),
+                    ):
                         print("▶ Training value...", flush=True)
                         value_results = value_model.train(
                             train_data,
@@ -1309,7 +1373,15 @@ def ppo_train(
                             POLICY_GENERATION_STALE = True
 
                         print("▶ Training policy...", flush=True)
-                        with timer.time("policy_training"):
+                        with (
+                            timer.time("policy_training"),
+                            managed_span(
+                                RLSpanGroup.POLICY_UPDATE,
+                                "rl.ppo.policy_update",
+                                tracer=_tracer,
+                                **{"rl.iteration": total_steps + 1},
+                            ),
+                        ):
                             train_results = policy.train(
                                 train_data,
                                 loss_fn,
@@ -1552,7 +1624,14 @@ def ppo_train(
                                 metric_name
                             ]
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.ppo.save_checkpoint",
+                            tracer=_tracer,
+                        ),
+                    ):
                         print(
                             f"Saving checkpoint for step {total_steps + 1}...",
                             flush=True,
@@ -1736,7 +1815,16 @@ def validate(
         return {}, {}
 
     timer = Timer()
-    with timer.time("total_validation_time"):
+    _telemetry = get_telemetry()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
+    with (
+        timer.time("total_validation_time"),
+        managed_span(
+            RLSpanGroup.EVALUATE,
+            "rl.ppo.evaluate",
+            tracer=_tracer,
+        ),
+    ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []
