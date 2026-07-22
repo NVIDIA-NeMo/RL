@@ -48,6 +48,7 @@ class TrtllmSpecificArgs(TypedDict):
     #   "qwen3"       -> Qwen3ToolParser      (JSON format: {"name":..., "arguments":{...}})
     #   "qwen3_coder" -> Qwen3CoderToolParser  (XML format: <function=...>)
     tool_parser: NotRequired[str]
+    reasoning_parser: NotRequired[str]
 
 
 class TrtllmConfig(GenerationConfig):

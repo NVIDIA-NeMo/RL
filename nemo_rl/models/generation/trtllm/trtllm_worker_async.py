@@ -281,10 +281,16 @@ class TrtllmAsyncGenerationWorkerImpl:
             model_name=self.model_name,
             port=port,
             max_seq_len=self.cfg["trtllm_cfg"]["max_model_len"],
+            sampling_config={
+                "temperature": self.cfg["temperature"],
+                "top_p": self.cfg["top_p"],
+            },
+            stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
             default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
                 "default_chat_template_kwargs"
             ),
             tool_parser=self.cfg["trtllm_cfg"].get("tool_parser"),
+            reasoning_parser=self.cfg["trtllm_cfg"].get("reasoning_parser"),
         )
         print(
             f"[TrtllmAsyncWorker] HTTP server started: {self._http_base_url}",

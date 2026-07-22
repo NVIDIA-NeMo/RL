@@ -39,8 +39,11 @@ def create_app(
     tokenizer: Any,
     model_name: str,
     max_seq_len: int,
+    sampling_config: dict[str, Any],
+    stop_token_ids: list[int] | None = None,
     default_chat_template_kwargs: dict[str, Any] | None = None,
     tool_parser: str | None = None,
+    reasoning_parser: str | None = None,
 ) -> "FastAPI":
     """Build a FastAPI application backed by *llm* (``tensorrt_llm.LLM``)."""
     from fastapi import FastAPI, Request
@@ -65,22 +68,35 @@ def create_app(
             "TRT-LLM HTTP server requires the LLM's loaded Hugging Face model config"
         )
 
-    # Cache parsers for both thinking modes.
-    from tensorrt_llm.llmapi.reasoning_parser import DeepSeekR1Parser
+    if reasoning_parser is not None:
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
-    _reasoning_parsers = {
-        enabled: DeepSeekR1Parser(reasoning_at_start=enabled)
-        for enabled in (False, True)
-    }
+        # Validate the configured parser when the server starts. A fresh parser is
+        # created per request below with that request's chat-template arguments.
+        ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser, _server_template_kwargs
+        )
 
-    # Strip generated stop tokens to preserve prefix continuity across turns.
-    _eos_token_ids: set[int] = set()
-    for _tok in ("<|im_end|>", "<|endoftext|>"):
-        _tid = tokenizer.convert_tokens_to_ids(_tok)
-        if isinstance(_tid, int) and _tid != tokenizer.unk_token_id:
-            _eos_token_ids.add(_tid)
-    if tokenizer.eos_token_id is not None:
-        _eos_token_ids.add(tokenizer.eos_token_id)
+    # Match TRT-LLM's effective EOS set so this adapter can trim every returned
+    # stop token and its logprob together, preserving multi-turn continuity.
+    _eos_token_ids: set[int] = set(stop_token_ids or [])
+
+    def _add_eos_token_ids(token_ids: Any) -> None:
+        if isinstance(token_ids, int):
+            _eos_token_ids.add(token_ids)
+        elif token_ids is not None:
+            _eos_token_ids.update(
+                token_id for token_id in token_ids if isinstance(token_id, int)
+            )
+
+    _add_eos_token_ids(tokenizer.eos_token_id)
+    generation_config = getattr(llm, "_generation_config", None)
+    generation_eos_token_ids = (
+        generation_config.get("eos_token_id")
+        if isinstance(generation_config, dict)
+        else getattr(generation_config, "eos_token_id", None)
+    )
+    _add_eos_token_ids(generation_eos_token_ids)
 
     app = FastAPI()
 
@@ -93,18 +109,28 @@ def create_app(
         body: dict = await request.json()
         messages: list[dict] = body.get("messages", [])
         tools: list[dict] | None = body.get("tools")
-        temperature = body.get("temperature", 1.0)
-        top_p = body.get("top_p", 1.0)
         logprobs_requested = body.get("logprobs", False)
+
+        # The NeMo-RL generation config, not the request, is the source of truth
+        # for sampling params.
+        for key in ("temperature", "top_p"):
+            assert key in body, f"request must include {key}"
+            assert body[key] == sampling_config[key], (
+                f"request {key} {body[key]!r} must match the "
+                f"NeMo-RL generation config ({sampling_config[key]})"
+            )
 
         # Request kwargs override server defaults.
         per_request_kwargs: dict[str, Any] = body.get("chat_template_kwargs") or {}
         effective_template_kwargs = {**_server_template_kwargs, **per_request_kwargs}
-        enable_thinking: bool = bool(
-            effective_template_kwargs.get("enable_thinking", True)
-        )
 
-        reasoning_parser = _reasoning_parsers[enable_thinking]
+        _active_reasoning_parser = (
+            ReasoningParserFactory.create_reasoning_parser(
+                reasoning_parser, effective_template_kwargs
+            )
+            if reasoning_parser is not None
+            else None
+        )
 
         try:
             conversation, mm_coroutine, _ = parse_chat_messages_coroutines(
@@ -168,9 +194,11 @@ def create_app(
         from tensorrt_llm.executor.utils import RequestError
 
         sampling = TrtSamplingParams(
-            temperature=float(temperature),
-            top_p=float(top_p),
+            temperature=float(sampling_config["temperature"]),
+            top_p=float(sampling_config["top_p"]),
             max_tokens=int(max_tokens),
+            # Include generated stop tokens so the adapter can trim tokens and logprobs together.
+            include_stop_str_in_output=True,
             logprobs=True,
         )
 
@@ -212,8 +240,6 @@ def create_app(
                 gen_logprobs.pop()
 
         gen_text = tokenizer.decode(gen_token_ids, skip_special_tokens=False)
-        # Strip EOS strings that TRT-LLM may append to decoded output.
-        gen_text = gen_text.replace("<|im_end|>", "").replace("<|endoftext|>", "")
 
         finish_reason = "stop"
         if gen.finish_reason is not None:
@@ -221,10 +247,14 @@ def create_app(
             if "length" in fr:
                 finish_reason = "length"
 
-        # Split reasoning from answer using the (possibly per-request) parser.
-        parsed = reasoning_parser.parse(gen_text)
-        reasoning_content: str = parsed.reasoning_content
-        answer_text: str = parsed.content
+        # Split reasoning from answer, if a parser is configured.
+        if _active_reasoning_parser is not None:
+            parsed = _active_reasoning_parser.parse(gen_text)
+            reasoning_content: str = parsed.reasoning_content
+            answer_text: str = parsed.content
+        else:
+            reasoning_content = ""
+            answer_text = gen_text
 
         if tools:
             content_text, parsed_tool_calls = _parse_tool_calls(answer_text, tools)
@@ -441,13 +471,17 @@ def start_server(
     tokenizer: Any,
     model_name: str,
     max_seq_len: int,
+    sampling_config: dict[str, Any],
+    stop_token_ids: list[int] | None = None,
     host: str = "0.0.0.0",
     port: int = 0,
     default_chat_template_kwargs: dict[str, Any] | None = None,
     tool_parser: str | None = None,
+    reasoning_parser: str | None = None,
 ) -> "tuple[threading.Thread, str, Any]":
     """Start the HTTP server in a daemon thread and return (thread, base_url, server)."""
     import uvicorn
+
     from nemo_rl.distributed.virtual_cluster import (
         _get_free_port_local,
         _get_node_ip_local,
@@ -464,8 +498,11 @@ def start_server(
         tokenizer,
         model_name,
         max_seq_len=max_seq_len,
+        sampling_config=sampling_config,
+        stop_token_ids=stop_token_ids,
         default_chat_template_kwargs=default_chat_template_kwargs,
         tool_parser=tool_parser,
+        reasoning_parser=reasoning_parser,
     )
 
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
