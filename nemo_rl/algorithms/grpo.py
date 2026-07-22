@@ -3986,7 +3986,7 @@ def async_grpo_train(
                         step + 1, num_prompts_per_step, max_trajectory_age_steps
                     )
                 )
-                if not next_step_ready:
+                if not next_step_ready:  # pragma: no cover
                     print(
                         f"  Pipeline barrier: step {step} ready but "
                         f"step {step + 1} not yet — waiting for lookahead fill "
