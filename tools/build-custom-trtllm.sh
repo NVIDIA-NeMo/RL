@@ -33,10 +33,11 @@ assert_patch_target() {
 show_ccache_status() {
     local phase=$1
 
-    echo "ccache status ${phase}:"
+    echo "[TRTLLM_CCACHE] status ${phase}:"
     # Includes cache size, limits, hit rates, misses, errors, and uncacheable
-    # calls. Verbose mode expands the error and uncacheable counters.
-    ccache --show-stats --verbose
+    # calls. Prefix every line so the outer uv log filter can retain this
+    # output without also exposing unrelated verbose build-backend chatter.
+    ccache --show-stats --verbose | sed -u 's/^/[TRTLLM_CCACHE] /'
 }
 
 filter_ninja_progress() {
@@ -237,9 +238,9 @@ if ((CCACHE_FILES_BEFORE > 0 && CCACHE_HITS == 0)); then
     echo "[ERROR] ccache contained ${CCACHE_FILES_BEFORE} files before the build, but this build had zero cache hits."
     exit 1
 elif ((CCACHE_FILES_BEFORE > 0)); then
-    echo "ccache validation passed: ${CCACHE_HITS} hits from an existing cache."
+    echo "[TRTLLM_CCACHE] validation passed: ${CCACHE_HITS} hits from an existing cache."
 else
-    echo "No existing ccache entries were found; allowing this cold build."
+    echo "[TRTLLM_CCACHE] No existing cache entries were found; allowing this cold build."
 fi
 
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."

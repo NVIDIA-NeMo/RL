@@ -244,11 +244,29 @@ if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     # temporary cache mount is removed. Keep the backend's custom wheel cache
     # in the same mount because uv can miss no-build-isolation wheels across
     # build environments.
+    # Keep verbose mode internally so uv forwards custom-backend output. Show
+    # only tagged ccache statistics and Ninja milestones during successful
+    # builds; retain the full stream for failure diagnostics.
+    TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
     set +e
     UV_CACHE_DIR=/root/.cache/trtllm-uv \
         TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-uv/trtllm-wheels \
-        uv sync --verbose --link-mode copy --locked --extra trtllm --no-install-project
-    TRTLLM_SYNC_STATUS=$?
+        uv sync --verbose --link-mode copy --locked --extra trtllm --no-install-project \
+        2>&1 | tee "$TRTLLM_SYNC_LOG" \
+        | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
+    TRTLLM_SYNC_PIPE_STATUS=("${PIPESTATUS[@]}")
+    TRTLLM_SYNC_STATUS=${TRTLLM_SYNC_PIPE_STATUS[0]}
+    for PIPE_STATUS in "${TRTLLM_SYNC_PIPE_STATUS[@]:1}"; do
+        if [[ "${TRTLLM_SYNC_STATUS}" -eq 0 && "${PIPE_STATUS}" -ne 0 ]]; then
+            TRTLLM_SYNC_STATUS=${PIPE_STATUS}
+        fi
+    done
+    if [[ "${TRTLLM_SYNC_STATUS}" -ne 0 ]]; then
+        echo "[ERROR] TRT-LLM uv sync failed with exit code ${TRTLLM_SYNC_STATUS}." >&2
+        echo "[ERROR] Last 200 lines of captured uv output:" >&2
+        tail -n 200 "$TRTLLM_SYNC_LOG" >&2
+    fi
+    rm -f "$TRTLLM_SYNC_LOG"
     set -e
 
     echo "TRT-LLM uv cache state after build:"
