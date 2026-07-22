@@ -1057,6 +1057,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(
         **{
             "policy": {
                 "model_name": "test-policy",
+                "tokenizer": {"name": "test-policy", "use_fastokens": False},
                 "generation": {
                     "temperature": 1.0,
                     "top_p": 1.0,
