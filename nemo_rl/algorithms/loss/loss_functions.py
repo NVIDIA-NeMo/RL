@@ -92,7 +92,11 @@ class DraftCrossEntropyLossFn(LossFunction):
                 False,
             )
         else:
-            teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
+            # Match DistributedCrossEntropy semantics: backward propagates only
+            # through student logits, never into the (policy) teacher.
+            teacher_probs = torch.nn.functional.softmax(
+                teacher_logits.detach(), dim=-1
+            )
             student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
             per_token_loss = -(teacher_probs * student_log_probs).sum(dim=-1)
 
