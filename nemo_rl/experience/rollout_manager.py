@@ -492,13 +492,37 @@ class AsyncNemoGymRolloutImpl:
         """Dispatch rows to NeMo-Gym and return completions + metrics."""
         nemo_gym_env = self._task_to_env["nemo_gym"]
 
-        # Run generation.
+        # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            results, env_timing_metrics = await nemo_gym_env.run_rollouts.remote(
-                inputs, self._tokenizer, timer_prefix
-            )
+            results: list[dict | None] = [None for _ in inputs]
+            received_row_indices: set[int] = set()
+            env_timing_metrics: dict[str, Any] = {}
+            async for result_ref in nemo_gym_env.run_rollouts.options(
+                num_returns="streaming"
+            ).remote(inputs, self._tokenizer, timer_prefix):
+                rowidx, result, timing_metrics = await result_ref
+                if not isinstance(rowidx, int) or not 0 <= rowidx < len(inputs):
+                    raise ValueError(
+                        f"NeMo-Gym returned invalid row index {rowidx!r} for "
+                        f"{len(inputs)} inputs"
+                    )
+                if rowidx in received_row_indices:
+                    raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
+                received_row_indices.add(rowidx)
+                results[rowidx] = result
+                if timing_metrics is not None:
+                    env_timing_metrics = timing_metrics
+
+            if any(result is None for result in results):
+                raise RuntimeError(
+                    "NeMo-Gym rollout stream ended before all rows arrived"
+                )
             # Convert results to completions.
-            completions = [self._result_to_completion(r) for r in results]
+            completions = [
+                self._result_to_completion(result)
+                for result in results
+                if result is not None
+            ]
 
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):

@@ -37,16 +37,29 @@ from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype,
     verify_right_padding,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.checkpoint_engine import (
+    VllmCheckpointEngineRpcMixin,
+)
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    VllmConfig,
+)
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
 )
+from nemo_rl.models.generation.vllm.worker_utils import (
+    resolve_data_parallel_local_rank,
+    resolve_distributed_executor_backend,
+)
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    checkpoint_engine_refit_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +260,17 @@ class BaseVllmGenerationWorker:
         self._init_config(
             config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
         )
+        self._sparse_refit_receiver: Any = None
+        if (
+            self.is_model_owner
+            and self.cfg.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
+        ):
+            # Keep sparse receiver dependencies and threads off other refit paths.
+            from nemo_rl.models.generation.vllm.vllm_sparse_refit import (
+                VllmSparseRefitReceiver,
+            )
+
+            self._sparse_refit_receiver = VllmSparseRefitReceiver(self)
 
         if not self.is_model_owner:
             return
@@ -280,7 +304,10 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        _apply_vllm_patches(self.py_executable, extra_env_vars=extra_env_vars)
+        _apply_vllm_patches(
+            self.py_executable,
+            extra_env_vars=extra_env_vars,
+        )
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -320,6 +347,28 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
+        if checkpoint_engine_config is not None:
+            from nemo_rl.models.generation.vllm.checkpoint_engine import (
+                configure_nixl_worker,
+            )
+
+            configure_nixl_worker(self.cfg, vllm_kwargs)
+
+        # A speculative_config with num_speculative_tokens == 0 is the supported
+        # way to disable speculative decoding (e.g. MTP) from a launch script
+        # without restructuring the config. Drop it so vLLM runs without a drafter.
+        speculative_config = vllm_kwargs.get("speculative_config")
+        if (
+            isinstance(speculative_config, dict)
+            and speculative_config.get("num_speculative_tokens") == 0
+        ):
+            vllm_kwargs["speculative_config"] = None
+            if not _resolve_enable_prefix_caching(self.cfg["vllm_cfg"]):
+                logger.warning(
+                    "Speculative decoding is disabled (num_speculative_tokens=0); "
+                    "consider enabling prefix caching for better generation performance."
+                )
 
         # Calculate total parallel size (TP * PP)
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
@@ -340,11 +389,12 @@ class BaseVllmGenerationWorker:
                 f"VLLM_RAY_BUNDLE_INDICES environment variable set to: {os.environ.get('VLLM_RAY_BUNDLE_INDICES')}"
             )
 
-            # Use Ray for distributed execution in parallel mode
-            vllm_kwargs["distributed_executor_backend"] = "ray"
-        else:
-            # For non-parallel mode, explicitly set executor to None to avoid Ray issues
-            vllm_kwargs["distributed_executor_backend"] = None
+        executor_backend = resolve_distributed_executor_backend(
+            self.tensor_parallel_size,
+            self.pipeline_parallel_size,
+            self.expert_parallel_size,
+        )
+        vllm_kwargs["distributed_executor_backend"] = executor_backend
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -356,7 +406,11 @@ class BaseVllmGenerationWorker:
             world_size = int(os.environ["VLLM_DP_SIZE"]) * model_parallel_size
             rank = int(os.environ["RANK"]) % world_size
             os.environ["VLLM_DP_RANK"] = str(rank // model_parallel_size)
-            os.environ["VLLM_DP_RANK_LOCAL"] = str((rank % 8) // model_parallel_size)
+            os.environ["VLLM_DP_RANK_LOCAL"] = str(
+                resolve_data_parallel_local_rank(
+                    rank, model_parallel_size, executor_backend
+                )
+            )
             # set vLLM DP address and port
             leader_rank = int(os.environ["RANK"]) // world_size * world_size
             addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
@@ -372,7 +426,7 @@ class BaseVllmGenerationWorker:
         # weights via refit, but the MTP draft layer is not covered by refit, so
         # those layers are loaded directly from the checkpoint after engine init
         # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
-        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config")
+        spec_cfg = vllm_kwargs.get("speculative_config")
         mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
         self._mtp_load_from_disk: bool = (
             load_format == "dummy"
@@ -504,7 +558,13 @@ class BaseVllmGenerationWorker:
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
-            worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
+            worker_extension_cls=(
+                "nemo_rl.models.generation.vllm.vllm_backend."
+                "VllmInternalWorkerExtensionWithCheckpointEngine"
+                if checkpoint_engine_config is not None
+                else "nemo_rl.models.generation.vllm.vllm_backend."
+                "VllmInternalWorkerExtension"
+            ),
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
@@ -650,8 +710,29 @@ class BaseVllmGenerationWorker:
                     metrics[metric.name] = metric.value
         return metrics
 
+    def report_refit_server_base_url(self) -> str | None:
+        receiver = self._sparse_refit_receiver
+        return receiver.report_refit_server_base_url() if receiver is not None else None
 
-class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
+    def start_zmq_sparse_refit_relay(self) -> str:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        return receiver.start_zmq_sparse_refit_relay()
+
+    def configure_zmq_sparse_refit_relay(self, relay_addresses: list[str]) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        receiver.configure_zmq_sparse_refit_relay(relay_addresses)
+
+    def stop_zmq_sparse_refit_relay(self) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is not None:
+            receiver.stop_zmq_sparse_refit_relay()
+
+
+class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
 
@@ -665,6 +746,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.collective_rpc(
                 "load_mtp_weights_from_disk", args=(self.model_name,)
             )
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.start_sync_server()
 
     def init_collective(
         self,
@@ -783,12 +866,15 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
             if hasattr(generation, "logprobs") and generation.logprobs:
                 try:
-                    for idx, logprob_dict in enumerate(generation.logprobs):
+                    for idx, (token_id, logprob_dict) in enumerate(
+                        zip(generated_tokens, generation.logprobs)
+                    ):
                         if logprob_dict:
-                            position = sequence_length + idx
-                            full_logprobs[position] = next(iter(logprob_dict.items()))[
-                                1
-                            ].logprob
+                            sampled_logprob = logprob_dict.get(token_id)
+                            if sampled_logprob is not None:
+                                full_logprobs[sequence_length + idx] = (
+                                    sampled_logprob.logprob
+                                )
                 except Exception:
                     import traceback
 
@@ -979,11 +1065,11 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "update_weights_via_ipc_zmq",
                 args=tuple(),
             )
-            worker_result = result_or_coro[0]
+            worker_results = cast(list[bool], result_or_coro)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
             return True
@@ -1010,11 +1096,11 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_from_collective", args=tuple()
             )
-            worker_result = result_or_coro[0]
+            worker_results = cast(list[bool], result_or_coro)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
             return True
@@ -1090,6 +1176,9 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self._sparse_refit_receiver is not None:
+                self._sparse_refit_receiver.shutdown()
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())
