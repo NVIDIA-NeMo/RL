@@ -306,6 +306,7 @@ The validation set you pass in will directly be used for validation with no addi
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
             teacher_worker_groups=teacher_worker_groups,
             alias_to_group_alias=alias_to_group_alias,
+            processor=processor,
         )
     else:
         print("🚀 Running synchronous GRPO training")
