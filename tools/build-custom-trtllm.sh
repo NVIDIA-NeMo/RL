@@ -39,6 +39,37 @@ show_ccache_status() {
     ccache --show-stats --verbose
 }
 
+filter_ninja_progress() {
+    # NINJA_STATUS below emits machine-readable progress markers. Collapse
+    # thousands of per-edge lines into the first edge, 5% milestones, and the
+    # final edge while tee keeps the unfiltered output for failure diagnostics.
+    awk '
+        BEGIN {
+            last_bucket = -1
+            last_finished = -1
+            last_total = -1
+        }
+        /^NINJA_PROGRESS:/ {
+            split($0, fields, ":")
+            finished = fields[2] + 0
+            total = fields[3] + 0
+            percent = fields[4]
+            gsub(/[^0-9]/, "", percent)
+            if (total != last_total || finished < last_finished) {
+                last_bucket = -1
+            }
+            bucket = int((percent + 0) / 5)
+            if (bucket > last_bucket || finished == total) {
+                printf "Ninja progress: %d/%d (%d%%)\n", finished, total, percent
+                fflush()
+                last_bucket = bucket
+            }
+            last_finished = finished
+            last_total = total
+        }
+    '
+}
+
 # Required positional arguments: the fork URL and commit ref to build.
 # This is purely a build script — it does not resolve defaults. The caller owns
 # the source of truth (the PEP 517 backend _backend.py reads them from the
@@ -151,15 +182,49 @@ CCACHE_FILES_BEFORE=$(ccache --print-stats | awk '$1 == "files_in_cache" {print 
 CCACHE_FILES_BEFORE=${CCACHE_FILES_BEFORE:-0}
 ccache --zero-stats
 
-TRTLLM_BUILD_STATUS=0
-python3 scripts/build_wheel.py \
-    -a "$ARCH" \
-    -G Ninja \
-    --clean \
-    --use_ccache \
-    --nvrtc_dynamic_linking \
-    --job_count "$JOBS" \
-    -D "ENABLE_UCX=OFF" || TRTLLM_BUILD_STATUS=$?
+# Keep full output for failure diagnostics, but stream only 5% Ninja milestones.
+TRTLLM_BUILD_LOG=$(mktemp /tmp/trtllm-build.XXXXXX.log)
+set +x
+TRTLLM_BUILD_CMD=(
+    python3 scripts/build_wheel.py
+    -a "$ARCH"
+    -G Ninja
+    --clean
+    --use_ccache
+    --nvrtc_dynamic_linking
+    --job_count "$JOBS"
+    -D "ENABLE_UCX=OFF"
+)
+set +e
+NINJA_STATUS='NINJA_PROGRESS:%f:%t:%p:' \
+    PYTHONUNBUFFERED=1 \
+    "${TRTLLM_BUILD_CMD[@]}" 2>&1 \
+    | tee "$TRTLLM_BUILD_LOG" \
+    | filter_ninja_progress
+TRTLLM_BUILD_PIPE_STATUS=("${PIPESTATUS[@]}")
+set -e
+
+TRTLLM_BUILD_STATUS=${TRTLLM_BUILD_PIPE_STATUS[0]}
+for PIPE_STATUS in "${TRTLLM_BUILD_PIPE_STATUS[@]:1}"; do
+    if ((TRTLLM_BUILD_STATUS == 0 && PIPE_STATUS != 0)); then
+        TRTLLM_BUILD_STATUS=$PIPE_STATUS
+    fi
+done
+if ((TRTLLM_BUILD_STATUS != 0)); then
+    echo "[ERROR] Command failed with exit code ${TRTLLM_BUILD_STATUS}:" >&2
+    printf '  ' >&2
+    printf '%q ' "${TRTLLM_BUILD_CMD[@]}" >&2
+    printf '\n' >&2
+    if grep -q '^FAILED:' "$TRTLLM_BUILD_LOG"; then
+        echo "[ERROR] Ninja failed command(s):" >&2
+        # Ninja prints the full compiler/linker command immediately after FAILED.
+        grep -A1 '^FAILED:' "$TRTLLM_BUILD_LOG" >&2
+    fi
+    echo "[ERROR] Last 200 lines of captured command output:" >&2
+    tail -n 200 "$TRTLLM_BUILD_LOG" >&2
+fi
+rm -f "$TRTLLM_BUILD_LOG"
+set -x
 
 show_ccache_status "after TRT-LLM build"
 if ((TRTLLM_BUILD_STATUS != 0)); then
