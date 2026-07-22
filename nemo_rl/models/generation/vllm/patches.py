@@ -215,6 +215,118 @@ def _patch_vllm_tool_parser_namespace_tool(logger) -> None:
     logger.info("Successfully patched vLLM NamespaceTool import for openai compat.")
 
 
+def _patch_vllm_ray_executor_v2_tcpstore_port(logger) -> None:
+    """Keep RayExecutorV2's TCPStore port out of the MessageQueue's scan range.
+
+    vLLM 0.25's ``RayExecutorV2._init_executor`` picks the torch.distributed
+    TCPStore port with a bind-probe (Step 3) but only binds it much later, in
+    the rank-0 worker's ``init_process_group``. In between, Step 4 builds the
+    broadcast ``MessageQueue``; when the engine spans nodes that queue needs a
+    real TCP socket, so it calls ``get_open_port()`` and *binds and holds* the
+    result (``shm_broadcast.py``: ``remote_subscribe_port = get_open_port()``
+    then ``remote_socket.bind(...)``). Both searches start at ``VLLM_PORT``, so
+    the queue deterministically takes the very port the probe just released and
+    engine startup dies with ``EADDRINUSE`` (DeepSeek-V3 generation TP=32,
+    observed on port 7000). Engines that fit on one node use a shm/ipc socket
+    instead and never allocate a TCP port here, which is why only node-spanning
+    engines are affected.
+
+    Offsetting the TCPStore search past the queue's scan range removes the
+    collision while keeping both ports inside the engine's 100-port window, and
+    therefore below the OS ephemeral floor. That band is deliberate: leaving
+    ``VLLM_PORT`` unset would send vLLM to kernel-assigned ephemeral ports and
+    reintroduce the TOCTOU contention this layout exists to prevent (#2380,
+    #3103).
+
+    The offset must be applied *before* the ``local_dp_rank is None`` test, not
+    inside it. vLLM's own disjoint-window branch below reads as if it only
+    applies to DP engines, but ``ParallelConfig.__post_init__`` takes the
+    "offline SPMD" path for every engine NeMo-RL builds and assigns
+    ``data_parallel_rank_local = envs.VLLM_DP_RANK_LOCAL`` (0 by default) and
+    ``data_parallel_master_port = envs.VLLM_DP_MASTER_PORT`` (0 by default). So
+    a plain non-DP engine arrives here with ``local_dp_rank=0``, not ``None``:
+    the ``None`` branch is dead, and the DP branch searches from
+    ``0 + 100 + 0 * 32 = 100``, fails all 32 attempts on the privileged range,
+    and falls through to ``get_open_port()`` — straight back to ``VLLM_PORT``.
+    That is exactly the port the MessageQueue takes. See RL-1104.
+
+    Returns without raising when the snippet is missing, but logs at warning
+    level so a silent no-op is visible in worker logs.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/executor/ray_executor_v2.py")
+    except RuntimeError:
+        logger.warning(
+            "Could not locate ray_executor_v2.py; TCPStore port patch NOT applied. "
+            "Engines spanning nodes may fail with EADDRINUSE at startup."
+        )
+        return
+
+    marker = "start_port=envs.VLLM_PORT + 32"
+    old_snippet = (
+        "        if local_dp_rank is None:\n            return get_open_port()\n"
+    )
+    new_snippet = (
+        "        if envs.VLLM_PORT is not None:\n"
+        "            # NeMo-RL: this port and the broadcast MessageQueue's remote\n"
+        "            # socket are both allocated from VLLM_PORT, but the queue\n"
+        "            # binds and holds its port before this one is bound in the\n"
+        "            # rank-0 worker, so a shared search collides. Search a window\n"
+        "            # past the queue's, still inside the engine's reserved\n"
+        "            # 100-port band.\n"
+        "            #\n"
+        "            # This has to run *before* the local_dp_rank test below:\n"
+        "            # ParallelConfig leaves a non-DP engine with\n"
+        "            # data_parallel_rank_local=0 (not None) and\n"
+        "            # data_parallel_master_port=0, so that branch searches from\n"
+        "            # port 100, fails on the privileged range, and falls back to\n"
+        "            # get_open_port() -- straight back to VLLM_PORT.\n"
+        "            try:\n"
+        "                return _get_open_port(\n"
+        "                    start_port=envs.VLLM_PORT + 32, max_attempts=32\n"
+        "                )\n"
+        "            except RuntimeError:\n"
+        "                pass\n"
+        "        if local_dp_rank is None:\n"
+        "            return get_open_port()\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("vLLM RayExecutorV2 TCPStore port patch already applied.")
+            return
+
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply RayExecutorV2 TCPStore port patch: expected "
+                "snippet not found in %s. The vLLM version may have changed. "
+                "Engines spanning nodes may fail with EADDRINUSE at startup.",
+                file_to_patch,
+            )
+            return
+
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    # Read back so a patch that silently failed to land is not reported as
+    # applied; this is the failure mode that previously went unnoticed.
+    try:
+        with open(file_to_patch) as handle:
+            applied = marker in handle.read()
+    except OSError as error:
+        logger.warning("Could not verify TCPStore port patch: %s", error)
+        return
+
+    if applied:
+        logger.info("Successfully patched vLLM RayExecutorV2 TCPStore port selection.")
+    else:
+        logger.warning(
+            "RayExecutorV2 TCPStore port patch did not persist to %s. Engines "
+            "spanning nodes may fail with EADDRINUSE at startup.",
+            file_to_patch,
+        )
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -244,3 +356,4 @@ def _apply_vllm_patches(
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
+    _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
