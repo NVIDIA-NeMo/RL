@@ -86,14 +86,19 @@ from nemo_rl.environments.nemo_gym import (
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
 )
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_TASK_INDEX_KEY,
+    NEXT_NEMO_GYM_TASK_INDEX_KEY,
+)
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
     GenerationInterface,
     resolve_routed_experts_dtype_name_for_model,
 )
@@ -117,6 +122,7 @@ from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
     print_message_log_samples,
+    should_log_nemo_gym_full_result_tables,
 )
 from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
@@ -131,6 +137,25 @@ from nemo_rl.weight_sync.factory import create_weight_synchronizer
 # Configuration
 # ===============================================================================
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _get_next_nemo_gym_task_index(
+    rollouts_state: dict[str, Any] | None,
+    replay_buffer_state: dict[str, Any] | None,
+) -> int:
+    """Recover the next unique NeMo-Gym task index from checkpoint state."""
+    next_task_index = int((rollouts_state or {}).get(NEXT_NEMO_GYM_TASK_INDEX_KEY, 0))
+    if replay_buffer_state is None:
+        return next_task_index
+
+    saved_task_indices = [
+        int(trajectory[NEMO_GYM_TASK_INDEX_KEY])
+        for trajectory in replay_buffer_state.get("trajectories", [])
+        if trajectory.get(NEMO_GYM_TASK_INDEX_KEY) is not None
+    ]
+    if saved_task_indices:
+        next_task_index = max(next_task_index, max(saved_task_indices) + 1)
+    return next_task_index
 
 
 class RewardScalingConfig(TypedDict):
@@ -2015,15 +2040,13 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
-    """Whether NeMo Gym is responsible for full response logging (wandb/metrics paths).
+    """Whether NeMo Gym is responsible for full response logging.
 
-    When **True**, we **skip** the expensive per-step ``train_data_step*.jsonl`` dump and
-    **keep** ``full_result``-style keys in rollout metrics (large payloads).
+    When **True**, skip the expensive per-step ``train_data_step*.jsonl`` dump.
+    When **False** (the default if unset), write the local JSONL file.
 
-    When **False** (default if unset), we **strip** ``full_result`` from rollout metrics and
-    **write** the ``train_data_step*.jsonl`` file (can be very large for Gym).
-
-    Set via ``env.should_log_nemo_gym_responses`` in the master config.
+    W&B full-result Tables are controlled independently by
+    ``logger.wandb.log_nemo_gym_full_result_tables``.
     """
     env_config = master_config.env
     should_log_nemo_gym_responses = bool(
@@ -2684,12 +2707,12 @@ def grpo_train(
                         # token, but run_async_nemo_gym_rollout asserts these are unset because
                         # NeMo-Gym manages its own stop criteria. Clear them here so the
                         # assertion reflects user intent (null in YAML) rather than the auto-fill.
-                        generation_config = {
+                        generation_config: GenerationConfig = {
                             **master_config.policy["generation"],
                             "stop_token_ids": None,
                             "stop_strings": None,
                         }
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
@@ -2698,6 +2721,10 @@ def grpo_train(
                                 "max_total_sequence_length"
                             ],
                             generation_config=generation_config,
+                            log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                                wandb_enabled=master_config.logger["wandb_enabled"],
+                                wandb_config=master_config.logger["wandb"],
+                            ),
                             max_rollout_turns=None,
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
@@ -2708,12 +2735,6 @@ def grpo_train(
                         repeated_batch = nemo_gym_rollout_result.final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
-
-                        # NeMo Gym responses can be very large and expensive to log. Here we have logic to opt-in to logging.
-                        if not _should_log_nemo_gym_responses(master_config):
-                            for key in list(rollout_metrics):
-                                if "full_result" in key:
-                                    rollout_metrics.pop(key)
 
                     # Use async rollouts when enabled by config/backend defaults.
                     elif _should_use_async_rollouts(master_config):
@@ -3567,13 +3588,17 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
                     tokenizer=tokenizer,
                     task_to_env=val_task_to_env,
                     max_seq_len=master_config.policy["max_total_sequence_length"],
                     generation_config=generation_config,
+                    log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                        wandb_enabled=master_config.logger["wandb_enabled"],
+                        wandb_config=master_config.logger["wandb"],
+                    ),
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
@@ -3878,6 +3903,8 @@ def async_grpo_train(
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    replay_buffer_state = None
+    rollouts_state = None
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):
@@ -3899,6 +3926,16 @@ def async_grpo_train(
                 f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
                 "Starting with an empty replay buffer."
             )
+
+        rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
+        if os.path.exists(rollouts_path):
+            # weights_only=False: this is a trusted same-job checkpoint artifact.
+            rollouts_state = torch.load(rollouts_path, weights_only=False)
+
+    next_nemo_gym_task_index = _get_next_nemo_gym_task_index(
+        rollouts_state=rollouts_state,
+        replay_buffer_state=replay_buffer_state,
+    )
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -3935,6 +3972,7 @@ def async_grpo_train(
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
+        next_nemo_gym_task_index=next_nemo_gym_task_index,
     )
 
     # Start trajectory collection in background
@@ -4688,6 +4726,14 @@ def async_grpo_train(
                             "✅ Saved replay buffer with "
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
                         )
+                        rollouts_state = ray.get(
+                            trajectory_collector.get_rollouts_state.remote()
+                        )
+                        torch.save(
+                            rollouts_state,
+                            os.path.join(checkpoint_path, "rollouts.pt"),
+                        )
+
                         # Defer the directory rename until any async write
                         # completes; flushed at the next save or on training exit.
                         checkpointer.begin_finalization(

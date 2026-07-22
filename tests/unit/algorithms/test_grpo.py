@@ -56,6 +56,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.experience.interfaces import NEXT_NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
@@ -853,6 +854,13 @@ class StubAsyncTrajectoryCollector:
         """
         mock = MagicMock()
         mock.remote = MagicMock(return_value={})
+        return mock
+
+    @property
+    def get_rollouts_state(self):
+        """Return a remote-callable mock yielding collector rollout state."""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={NEXT_NEMO_GYM_TASK_INDEX_KEY: 0})
         return mock
 
 

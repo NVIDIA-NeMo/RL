@@ -412,6 +412,7 @@ logger:
   wandb:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "ppo-dapo-megatron-dev"
     name: "ppo_dapo_megatron_1B"

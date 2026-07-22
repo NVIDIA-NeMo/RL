@@ -374,6 +374,7 @@ jobs:
         needs.pre-flight.outputs.test_level != 'none' &&
         needs.pre-flight.outputs.image_tag == '' &&
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
+        vars.DISABLE_GB200_TESTS != 'true' &&
         contains('L1 L2', needs.pre-flight.outputs.test_level) &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
@@ -801,6 +802,7 @@ jobs:
         always() &&
         contains('L1 L2', needs.pre-flight.outputs.test_level) &&
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
+        vars.DISABLE_GB200_TESTS != 'true' &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
         (
@@ -952,6 +954,7 @@ jobs:
                     ) &&
                     (
                       needs.org-member-pre-flight.outputs.is_member != 'true' ||
+                      vars.DISABLE_GB200_TESTS == 'true' ||
                       !contains('L1 L2', needs.pre-flight.outputs.test_level) ||
                       needs.cicd-functional-tests-gb200.result == 'success'
                     ) &&
