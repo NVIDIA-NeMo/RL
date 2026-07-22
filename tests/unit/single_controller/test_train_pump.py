@@ -295,8 +295,8 @@ def test_train_pump_drives_mcore_training_step(
             trainer_handle=trainer,
             weight_synchronizer=weight_sync,
             loss_fn=SimpleLossFn(),
-            advantage_estimator=adv_est,
             rollout_manager=rollout_manager,
+            advantage_estimator=adv_est,
             dataloader=None,
             tq_buffer=tq_buffer,
         )

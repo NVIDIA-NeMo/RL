@@ -95,10 +95,10 @@ def reduce_advantage_pump_metrics(
     masked_advantages: list[torch.Tensor],
     sequence_lengths: list[int],
 ) -> dict[str, float]:
-    """Reduce per-step accumulators from _advantage_pump into step scalars.
+    """Reduce per-step accumulators from _advantage_stage into step scalars.
 
     Args:
-        rewards: One tensor per advantage_pump call; each row a sample reward.
+        rewards: One tensor per advantage_stage call; each row a sample reward.
         masked_advantages: Token-masked advantages, one tensor per call.
         sequence_lengths: All input_lengths trained on this step.
 

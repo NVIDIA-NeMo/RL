@@ -257,14 +257,14 @@ def test_rollout_pump_writes_expected_tq_data(
     single_multi_step_calculator_input_sample,  # noqa: F811
     tmp_path,
 ):
-    """SC._rollout_pump writes max_rollout_prompts * num_generations rows to TQ with the expected fields and tags."""
+    """SC._rollout_pump writes num_prompts * num_generations rows to TQ with the expected fields and tags."""
     vllm_generation, tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
     input_sample = single_multi_step_calculator_input_sample
 
     num_generations = 2
-    max_rollout_prompts = 2
+    num_prompts = 2
     # TQReplayBuffer.commit writes ``num_generations`` training rows per prompt.
-    expected_samples = max_rollout_prompts * num_generations
+    expected_samples = num_prompts * num_generations
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
 
@@ -281,8 +281,8 @@ def test_rollout_pump_writes_expected_tq_data(
         max_weight_staleness_versions=1,
         min_groups_per_batch=1,
         group_size=num_generations,
-        max_inflight_prompts=max_rollout_prompts,
-        max_buffered_rollouts=max_rollout_prompts,
+        max_inflight_prompts=num_prompts,
+        max_buffered_rollouts=num_prompts,
         max_train_steps=1,
         max_num_epochs=None,
         over_sampling=True,
@@ -298,7 +298,7 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
     batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
-    dataloader = [batched_sample] * max_rollout_prompts
+    dataloader = [batched_sample] * num_prompts
 
     tq_buffer = TQReplayBuffer(
         dp_adapter,
@@ -322,8 +322,8 @@ def test_rollout_pump_writes_expected_tq_data(
         trainer_handle=object(),
         weight_synchronizer=object(),
         loss_fn=None,
-        advantage_estimator=None,
         rollout_manager=rollout_manager,
+        advantage_estimator=None,
         dataloader=dataloader,
         tq_buffer=tq_buffer,
     )
@@ -366,7 +366,7 @@ def test_rollout_pump_writes_expected_tq_data(
         head, _, tail = sid.rpartition("_g")
         assert head and tail.isdigit(), f"unexpected sample_id: {sid}"
         group_ids.add(head)
-    assert len(group_ids) == max_rollout_prompts
+    assert len(group_ids) == num_prompts
 
     bulk = ray.get(
         tq_actor.get_samples.remote(

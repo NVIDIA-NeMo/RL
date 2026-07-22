@@ -237,8 +237,8 @@ class SingleControllerActor:
         trainer_handle: Any,
         weight_synchronizer: Any,
         loss_fn: Any,
+        rollout_manager: Any,
         advantage_estimator: Any | None = None,
-        rollout_manager: Any = None,
         dataloader: Any = None,
         tq_buffer: Any = None,
     ) -> None:
@@ -565,6 +565,7 @@ class SingleControllerActor:
         )
 
         while self._train_steps < self._cfg.max_train_steps:
+            version_during_step = self._trainer_version
             groups_dispatched = 0
             min_sample_version = None
             step_open = False
@@ -728,8 +729,8 @@ class SingleControllerActor:
             self._timer.reset()
 
             # min sample version refers to the version each consumed sample was
-            # generated with; lag = current trainer version - oldest sample version.
-            lag = self._trainer_version - min_sample_version  # type: ignore
+            # generated with; lag = training version - oldest sample version.
+            lag = version_during_step - min_sample_version  # type: ignore
             print(
                 f"train step {self._train_steps}/{self._cfg.max_train_steps}  "
                 f"trainer_v={self._trainer_version}  "
