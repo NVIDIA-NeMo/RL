@@ -31,9 +31,9 @@ ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 # Empty default; CI overrides with --build-context to inject pre-compiled wheels
 FROM scratch AS uv-cache-seed
 
-# Empty default; CI overrides with --build-context to restore the uv cache used
-# only while resolving and building TRT-LLM.
-FROM scratch AS trtllm-uv-cache-seed
+# Empty default; CI overrides with --build-context to restore custom TRT-LLM
+# wheels across builds. Normal downloads use the shared uv cache.
+FROM scratch AS trtllm-wheel-cache-seed
 
 # Empty default; CI overrides with --build-context to restore the TRT-LLM
 # compiler cache from a registry image.
@@ -42,7 +42,7 @@ FROM scratch AS trtllm-ccache-seed
 # Empty defaults for incremental cache export. CI overrides these contexts
 # with the current cache images when appending a delta layer, and leaves them
 # empty when periodically compacting the cache into a full snapshot.
-FROM scratch AS trtllm-uv-cache-output-base
+FROM scratch AS trtllm-wheel-cache-output-base
 FROM scratch AS trtllm-ccache-output-base
 
 # Default custom-setup stage: installs apptainer.
@@ -181,15 +181,14 @@ COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
-COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
 COPY --from=nemo-rl --link research/ ./research/
-COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
+COPY --from=nemo-rl --link \
+    --exclude=TensorRT-LLM-workspace \
+    --exclude=TensorRT-LLM-workspace/** \
+    3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
-    --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
-    --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked \
-    --mount=type=cache,id=trtllm-ccache-${TARGETARCH},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
 CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
 if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
@@ -209,101 +208,97 @@ fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
     bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL:-} ${BUILD_CUSTOM_FLASHINFER_REF:-}
 fi
-# uv sync has a more reliable resolver than simple uv pip install which can fail
+# The TRT-LLM workspace is copied later. --frozen consumes the committed lock
+# without evaluating that absent local source; the late layer runs uv lock
+# --check with the complete workspace before starting the TRT-LLM build.
 
 # Sync each training + inference backend one at a time (since they may conflict)
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
-UV_LINK_MODE=hardlink uv sync --locked --no-install-project
+UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --locked --extra vllm --no-install-project
+    UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --locked --extra sglang --no-install-project
+    UV_LINK_MODE=hardlink uv sync --frozen --extra sglang --no-install-project
 fi
-uv sync --link-mode symlink --locked --extra mcore --no-install-project
-uv sync --link-mode symlink --locked --extra automodel --no-install-project
-uv sync --link-mode symlink --locked --extra modelopt --no-install-project
-if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    # These settings are build-only and intentionally do not persist in the
-    # final NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp
-    # changes between ephemeral CI runners.
-    export CCACHE_DIR=/root/.cache/ccache
-    export CCACHE_COMPILERCHECK=content
-    export CCACHE_COMPRESS=true
-    export CCACHE_MAXSIZE="${TRTLLM_CCACHE_MAXSIZE}"
-
-    # Merge the registry seed into the builder-local cache mount only when
-    # TRT-LLM will build. Cache entries are content-addressed, so newer local
-    # entries are kept when both exist.
-    rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
-
-    # Reuse packages already downloaded by the normal dependency syncs while
-    # keeping TRT-LLM's writable cache isolated for independent persistence.
-    # The dedicated cache image therefore only needs to store TRT-specific
-    # additions, not another copy of the general uv cache seed.
-    rsync -a --ignore-existing /root/.cache/uv/ /root/.cache/trtllm-uv/
-
-    # Build TRT-LLM after every other backend cache warmup. The final
-    # --all-groups sync below restores the intended default environment.
-    # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py
-    # invokes tools/build-custom-trtllm.sh during this sync.
-    echo "TRT-LLM uv cache state before build:"
-    du -sh /root/.cache/trtllm-uv
-    echo "TRT-LLM ccache state before build:"
-    ccache --show-stats
-    du -sh "${CCACHE_DIR}"
-    ccache --zero-stats
-
-    # This cache mount is on a different filesystem than the venv. Copy mode
-    # avoids cross-device hardlink failures and dangling symlinks after the
-    # temporary cache mount is removed. Keep the backend's custom wheel cache
-    # in the same mount because uv can miss no-build-isolation wheels across
-    # build environments.
-    # Keep verbose mode internally so uv forwards custom-backend output. Show
-    # only tagged ccache statistics and Ninja milestones during successful
-    # builds; retain the full stream for failure diagnostics.
-    TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
-    set +e
-    UV_CACHE_DIR=/root/.cache/trtllm-uv \
-        TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-uv/trtllm-wheels \
-        uv sync --verbose --link-mode copy --locked --extra trtllm --no-install-project \
-        2>&1 | tee "$TRTLLM_SYNC_LOG" \
-        | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
-    TRTLLM_SYNC_PIPE_STATUS=("${PIPESTATUS[@]}")
-    TRTLLM_SYNC_STATUS=${TRTLLM_SYNC_PIPE_STATUS[0]}
-    for PIPE_STATUS in "${TRTLLM_SYNC_PIPE_STATUS[@]:1}"; do
-        if [[ "${TRTLLM_SYNC_STATUS}" -eq 0 && "${PIPE_STATUS}" -ne 0 ]]; then
-            TRTLLM_SYNC_STATUS=${PIPE_STATUS}
-        fi
-    done
-    if [[ "${TRTLLM_SYNC_STATUS}" -ne 0 ]]; then
-        echo "[ERROR] TRT-LLM uv sync failed with exit code ${TRTLLM_SYNC_STATUS}." >&2
-        echo "[ERROR] Last 200 lines of captured uv output:" >&2
-        tail -n 200 "$TRTLLM_SYNC_LOG" >&2
-    fi
-    rm -f "$TRTLLM_SYNC_LOG"
-    set -e
-
-    echo "TRT-LLM uv cache state after build:"
-    du -sh /root/.cache/trtllm-uv
-    echo "TRT-LLM ccache state for this build:"
-    ccache --show-stats
-    du -sh "${CCACHE_DIR}"
-    if [[ "${TRTLLM_SYNC_STATUS}" -ne 0 ]]; then
-        exit "${TRTLLM_SYNC_STATUS}"
-    fi
-fi
-
-uv sync --link-mode symlink --locked --all-groups --no-install-project
+uv sync --link-mode symlink --frozen --extra mcore --no-install-project
+uv sync --link-mode symlink --frozen --extra automodel --no-install-project
+uv sync --link-mode symlink --frozen --extra modelopt --no-install-project
+uv sync --link-mode symlink --frozen --all-groups --no-install-project
 
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 
 echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
+EOF
+
+# Keep the frequently changing TRT-LLM build inputs after the other backend
+# warmups so TRT-only changes can reuse expensive wheels such as Transformer
+# Engine from the preceding layer.
+COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
+COPY --from=nemo-rl --link 3rdparty/TensorRT-LLM-workspace/ ./3rdparty/TensorRT-LLM-workspace/
+
+RUN --mount=type=ssh \
+    --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
+    --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked \
+    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+# Validate the complete project before any TRT-LLM compilation starts.
+uv lock --check
+
+if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
+    exit 0
+fi
+
+# These settings are build-only and intentionally do not persist in the final
+# NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
+# between ephemeral CI runners.
+export CCACHE_DIR=/root/.cache/ccache
+export CCACHE_COMPILERCHECK=content
+export CCACHE_COMPRESS=true
+export CCACHE_MAXSIZE="${TRTLLM_CCACHE_MAXSIZE}"
+
+# Cache entries are content-addressed, so keep newer builder-local entries when
+# merging the registry seed.
+rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ "${CCACHE_DIR}/"
+
+# uv uses the shared image cache. Only the custom wheel needs a cache mount
+# because uv can miss no-build-isolation wheels across build environments.
+echo "TRT-LLM cache state before build:"
+du -sh /root/.cache/uv /root/.cache/trtllm-wheels
+
+TRTLLM_SYNC_LOG=$(mktemp /tmp/trtllm-sync.XXXXXX.log)
+set +e
+UV_CACHE_DIR=/root/.cache/uv \
+    TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
+    uv sync --verbose --link-mode symlink --locked --extra trtllm --no-install-project \
+    2>&1 | tee "$TRTLLM_SYNC_LOG" \
+    | awk '/\[TRTLLM_CCACHE\]|Ninja progress:/ { print; fflush() }'
+TRTLLM_SYNC_STATUS=$?
+set -e
+if [[ "${TRTLLM_SYNC_STATUS}" -ne 0 ]]; then
+    echo "[ERROR] TRT-LLM uv sync failed with exit code ${TRTLLM_SYNC_STATUS}." >&2
+    echo "[ERROR] Last 200 lines of captured uv output:" >&2
+    tail -n 200 "$TRTLLM_SYNC_LOG" >&2
+    rm -f "$TRTLLM_SYNC_LOG"
+    exit "${TRTLLM_SYNC_STATUS}"
+fi
+rm -f "$TRTLLM_SYNC_LOG"
+
+echo "TRT-LLM cache state after build:"
+du -sh /root/.cache/uv /root/.cache/trtllm-wheels
+
+# Restore the intended default environment in the same layer so the transient
+# TRT-LLM installation does not add a large intermediate venv layer.
+uv sync --link-mode symlink --locked --all-groups --no-install-project
+
+# The final sync can repopulate the shared uv cache, so repeat the security
+# cleanup performed in the preceding dependency layer.
+find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -363,7 +358,8 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked <<"EOF" bash -exu
+ARG BASE_IMAGE
+RUN --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
 NEGATIVE_FILTERS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
@@ -374,11 +370,9 @@ fi
 if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS trtllm"
 fi
-# The hermetic-stage TRT-LLM sync stores its compiled wheel in this dedicated
-# cache mount. Reuse that wheel while creating the release-stage Ray venv;
-# uv's normal cache remains on the image filesystem, so UV_LINK_MODE=symlink
-# cannot leave links to this temporary mount in the finished image.
-export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-uv/trtllm-wheels
+# Reuse the custom wheel produced by the hermetic stage. Normal uv artifacts
+# stay in /root/.cache/uv, which remains available to symlinked environments.
+export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels
 export TRTLLM_REQUIRE_CACHED_WHEEL=1
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
@@ -419,11 +413,12 @@ RUN echo "This distribution includes open source which is archived at the follow
 # target immediately after the release target with the same Buildx builder, so
 # it can read the cache mount without adding ccache data to the release image.
 FROM base AS trtllm-ccache-export
+ARG BASE_IMAGE
 ARG CCACHE_EXPORT_NONCE
 ARG CCACHE_EXPORT_MODE=full
 ARG TARGETARCH
 RUN --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
-    --mount=type=cache,id=trtllm-ccache-${TARGETARCH},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
+    --mount=type=cache,id=trtllm-ccache-${TARGETARCH}-${BASE_IMAGE},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
 # Make this export run once per CI build instead of reusing an older layer.
 echo "Exporting TRT-LLM ccache for build ${CCACHE_EXPORT_NONCE:-local} (${CCACHE_EXPORT_MODE})"
 # The hermetic layer may have been reused from BuildKit without executing its
@@ -459,45 +454,40 @@ FROM trtllm-ccache-output-base AS trtllm-ccache
 COPY --link --from=trtllm-ccache-export /tmp/trtllm-ccache-export/ /
 LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"
 
-# Export the builder-local TRT-LLM uv cache independently from the general uv
-# cache. CI builds this target with the same Buildx builder as the release.
-FROM base AS trtllm-uv-cache-export
+# Export only the custom TRT-LLM wheels. Normal downloads stay in the shared uv
+# cache, while this small cache mount survives changes to the late TRT layer.
+FROM base AS trtllm-wheel-cache-export
+ARG BASE_IMAGE
 ARG TARGETARCH
-ARG UV_CACHE_EXPORT_MODE=full
-ARG UV_CACHE_EXPORT_NONCE
-RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
-    --mount=type=bind,from=trtllm-uv-cache-seed,source=.,target=/tmp/trtllm-uv-cache-seed \
-    --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked <<"EOF" bash -exu
-# Make this export run once per CI build instead of reusing an older layer.
-echo "Exporting TRT-LLM uv cache for build ${UV_CACHE_EXPORT_NONCE:-local} (${UV_CACHE_EXPORT_MODE})"
-echo "TRT-LLM uv cache state before export:"
-du -sh /root/.cache/trtllm-uv
-mkdir -p /tmp/trtllm-uv-cache-export
-case "${UV_CACHE_EXPORT_MODE}" in
+ARG WHEEL_CACHE_EXPORT_MODE=full
+ARG WHEEL_CACHE_EXPORT_NONCE
+RUN --mount=type=bind,from=trtllm-wheel-cache-seed,source=.,target=/tmp/trtllm-wheel-cache-seed \
+    --mount=type=cache,id=trtllm-wheel-cache-${TARGETARCH}-${BASE_IMAGE},from=trtllm-wheel-cache-seed,source=.,target=/root/.cache/trtllm-wheels,sharing=locked <<"EOF" bash -exu
+echo "Exporting TRT-LLM wheel cache for build ${WHEEL_CACHE_EXPORT_NONCE:-local} (${WHEEL_CACHE_EXPORT_MODE})"
+# If the release RUN was a BuildKit cache hit, restore the seed into a fresh
+# builder-local mount before exporting it.
+if [[ -z "$(find /root/.cache/trtllm-wheels -mindepth 1 -print -quit)" ]]; then
+    rsync -a /tmp/trtllm-wheel-cache-seed/ /root/.cache/trtllm-wheels/
+fi
+mkdir -p /tmp/trtllm-wheel-cache-export
+case "${WHEEL_CACHE_EXPORT_MODE}" in
     incremental)
-        # Exclude both the previous TRT cache and files supplied by the shared
-        # uv seed. Only TRT-specific additions become a new registry layer.
         rsync -aH --checksum \
-            --compare-dest=/tmp/trtllm-uv-cache-seed/ \
-            --compare-dest=/tmp/uv-cache-seed/ \
-            /root/.cache/trtllm-uv/ /tmp/trtllm-uv-cache-export/
+            --compare-dest=/tmp/trtllm-wheel-cache-seed/ \
+            /root/.cache/trtllm-wheels/ /tmp/trtllm-wheel-cache-export/
         ;;
     full)
-        # A compacted dedicated snapshot still excludes the shared uv seed;
-        # the hermetic build merges that seed back before every TRT-LLM sync.
-        rsync -aH --checksum \
-            --compare-dest=/tmp/uv-cache-seed/ \
-            /root/.cache/trtllm-uv/ /tmp/trtllm-uv-cache-export/
+        cp -a /root/.cache/trtllm-wheels/. /tmp/trtllm-wheel-cache-export/
         ;;
     *)
-        echo "Unsupported UV_CACHE_EXPORT_MODE: ${UV_CACHE_EXPORT_MODE}" >&2
+        echo "Unsupported WHEEL_CACHE_EXPORT_MODE: ${WHEEL_CACHE_EXPORT_MODE}" >&2
         exit 1
         ;;
 esac
-echo "TRT-LLM uv cache export payload:"
-du -sh /tmp/trtllm-uv-cache-export
+echo "TRT-LLM wheel cache export payload:"
+du -sh /tmp/trtllm-wheel-cache-export
 EOF
 
-FROM trtllm-uv-cache-output-base AS trtllm-uv-cache
-COPY --link --from=trtllm-uv-cache-export /tmp/trtllm-uv-cache-export/ /
+FROM trtllm-wheel-cache-output-base AS trtllm-wheel-cache
+COPY --link --from=trtllm-wheel-cache-export /tmp/trtllm-wheel-cache-export/ /
 LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"

@@ -28,13 +28,12 @@ The package is declared as no-build-isolation-package in the root
 pyproject.toml so this backend runs inside the main venv and has access
 to torch, ninja, cmake, and the CUDA toolkit.
 
-Build coordinates (git URL / ref) are read from environment variables;
-see 3rdparty/TensorRT-LLM-workspace/pyproject.toml for the full list.
+Build coordinates (git URL / ref) are read from the workspace's
+``[tool.trtllm]`` table in pyproject.toml.
 """
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import os
 import platform
@@ -104,12 +103,10 @@ def _build_input_tag(arch: str) -> str:
     lazily so prepare_metadata_for_build_wheel (called under ``uv lock`` without
     torch) never triggers it.
     """
-    try:
-        import torch  # noqa: PLC0415
+    # Import lazily because metadata-only hooks do not need this heavy dependency.
+    import torch  # noqa: PLC0415
 
-        toolchain = f"torch{torch.__version__},cuda{torch.version.cuda}"
-    except Exception:
-        toolchain = "torch?"
+    toolchain = f"torch{torch.__version__},cuda{torch.version.cuda}"
     return f"arch={arch}|{toolchain}"
 
 
@@ -205,49 +202,38 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     cache_base = env.get("TRTLLM_WHEEL_CACHE_DIR", "/opt/trtllm_wheels")
     cache_dir = _wheel_cache_dir(cache_base, git_url, git_ref, _build_input_tag(arch))
 
-    cached = sorted(glob.glob(str(cache_dir / "tensorrt_llm-*.whl")))
-    if cached:
-        src = cached[-1]
-        dst = os.path.join(str(wheel_directory), Path(src).name)
-        shutil.copy2(src, dst)
-        print(f"[trtllm-backend] Cache hit — reusing wheel: {src}", flush=True)
-        return Path(dst).name
+    wheel = max(cache_dir.glob("tensorrt_llm-*.whl"), default=None)
+    if wheel is None:
+        if env.get("TRTLLM_REQUIRE_CACHED_WHEEL") == "1":
+            raise RuntimeError(
+                "TRT-LLM cached wheel is required but was not found at "
+                f"{cache_dir}. Refusing to compile TRT-LLM during release venv prefetch."
+            )
 
-    if env.get("TRTLLM_REQUIRE_CACHED_WHEEL") == "1":
-        raise RuntimeError(
-            "TRT-LLM cached wheel is required but was not found at "
-            f"{cache_dir}. Refusing to compile TRT-LLM during release venv prefetch."
+        # Build directly into cache_dir so later venv syncs can reuse the wheel.
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        env["WHEEL_OUTPUT_DIR"] = str(cache_dir)
+        venv_bin = str(Path(sys.executable).parent)
+        env["PATH"] = f"{venv_bin}:{env.get('PATH', os.defpath)}"
+        subprocess.run(
+            ["bash", str(script), git_url, git_ref],
+            check=True,
+            env=env,
+            cwd=str(repo_root),
         )
+        wheel = max(cache_dir.glob("tensorrt_llm-*.whl"), default=None)
+        if wheel is None:
+            raise RuntimeError(
+                f"No tensorrt_llm-*.whl found in {cache_dir} after build. "
+                "Check the build-custom-trtllm.sh output above for errors."
+            )
+        print(f"[trtllm-backend] Wheel built and cached to: {cache_dir}", flush=True)
+    else:
+        print(f"[trtllm-backend] Cache hit — reusing wheel: {wheel}", flush=True)
 
-    # Cache miss: build directly into cache_dir so the result is immediately
-    # cached for subsequent venv syncs without a separate copy step.
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    env["WHEEL_OUTPUT_DIR"] = str(cache_dir)
-
-    # Make `python3` inside the shell script resolve to the same Python that
-    # uv is using for the build (the venv Python, not the system one).
-    venv_bin = str(Path(sys.executable).parent)
-    env["PATH"] = f"{venv_bin}:{env.get('PATH', os.defpath)}"
-
-    subprocess.run(
-        ["bash", str(script), git_url, git_ref],
-        check=True,
-        env=env,
-        cwd=str(repo_root),
-    )
-
-    wheels = sorted(glob.glob(str(cache_dir / "tensorrt_llm-*.whl")))
-    if not wheels:
-        raise RuntimeError(
-            f"No tensorrt_llm-*.whl found in {cache_dir} after build. "
-            "Check the build-custom-trtllm.sh output above for errors."
-        )
-
-    # Copy from cache_dir into wheel_directory so uv can find and install it.
-    dst = os.path.join(str(wheel_directory), Path(wheels[-1]).name)
-    shutil.copy2(wheels[-1], dst)
-    print(f"[trtllm-backend] Wheel built and cached to: {cache_dir}", flush=True)
-    return Path(dst).name
+    destination = Path(wheel_directory) / wheel.name
+    shutil.copy2(wheel, destination)
+    return destination.name
 
 
 def build_sdist(sdist_directory, config_settings=None):

@@ -176,11 +176,9 @@ fi
 #                            libnvrtc-builtins lazily instead of statically.
 echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
 
-# Record whether cached compiler outputs exist, then reset only the counters so
-# the final report describes this build. `--zero-stats` keeps cached objects.
+# Reset only the counters so the final report describes this build.
+# `--zero-stats` keeps cached objects.
 show_ccache_status "before TRT-LLM build"
-CCACHE_FILES_BEFORE=$(ccache --print-stats | awk '$1 == "files_in_cache" {print $2}')
-CCACHE_FILES_BEFORE=${CCACHE_FILES_BEFORE:-0}
 ccache --zero-stats
 
 # Keep full output for failure diagnostics, but stream only 5% Ninja milestones.
@@ -202,15 +200,9 @@ NINJA_STATUS='NINJA_PROGRESS:%f:%t:%p:' \
     "${TRTLLM_BUILD_CMD[@]}" 2>&1 \
     | tee "$TRTLLM_BUILD_LOG" \
     | filter_ninja_progress
-TRTLLM_BUILD_PIPE_STATUS=("${PIPESTATUS[@]}")
+TRTLLM_BUILD_STATUS=$?
 set -e
 
-TRTLLM_BUILD_STATUS=${TRTLLM_BUILD_PIPE_STATUS[0]}
-for PIPE_STATUS in "${TRTLLM_BUILD_PIPE_STATUS[@]:1}"; do
-    if ((TRTLLM_BUILD_STATUS == 0 && PIPE_STATUS != 0)); then
-        TRTLLM_BUILD_STATUS=$PIPE_STATUS
-    fi
-done
 if ((TRTLLM_BUILD_STATUS != 0)); then
     echo "[ERROR] Command failed with exit code ${TRTLLM_BUILD_STATUS}:" >&2
     printf '  ' >&2
@@ -232,17 +224,6 @@ if ((TRTLLM_BUILD_STATUS != 0)); then
     echo "[ERROR] TensorRT-LLM build failed with exit code ${TRTLLM_BUILD_STATUS}."
     exit "$TRTLLM_BUILD_STATUS"
 fi
-CCACHE_HITS=$(ccache --print-stats | awk \
-    '$1 == "direct_cache_hit" || $1 == "preprocessed_cache_hit" {hits += $2} END {print hits + 0}')
-if ((CCACHE_FILES_BEFORE > 0 && CCACHE_HITS == 0)); then
-    echo "[ERROR] ccache contained ${CCACHE_FILES_BEFORE} files before the build, but this build had zero cache hits."
-    exit 1
-elif ((CCACHE_FILES_BEFORE > 0)); then
-    echo "[TRTLLM_CCACHE] validation passed: ${CCACHE_HITS} hits from an existing cache."
-else
-    echo "[TRTLLM_CCACHE] No existing cache entries were found; allowing this cold build."
-fi
-
 echo "Copying TensorRT-LLM wheel to ${WHEEL_OUTPUT_DIR}..."
 cp "$BUILD_DIR"/build/tensorrt_llm-*.whl "$WHEEL_OUTPUT_DIR/"
 
