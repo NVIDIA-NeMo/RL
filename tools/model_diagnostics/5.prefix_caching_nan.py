@@ -38,8 +38,13 @@ parser.add_argument("--model", type=str, default=MODEL)
 parser.add_argument("--tp", type=int, default=TP)
 args = parser.parse_args()
 
+from nemo_rl.models.generation.vllm.patches import ensure_vllm_source_compat
+
+# Must run before vLLM pulls in tool_parsers (openai<2.25 NamespaceTool compat).
+ensure_vllm_source_compat()
+
 import vllm
-from vllm import LLM, SamplingParams
+from vllm import LLM, SamplingParams  # noqa: E402
 
 print(f"vLLM version: {vllm.__version__}")
 
