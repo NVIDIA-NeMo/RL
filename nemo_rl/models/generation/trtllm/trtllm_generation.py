@@ -467,6 +467,7 @@ class TrtllmGeneration(GenerationInterface):
         logger_metrics: dict[str, dict[int, list[Any]]] = {
             "inflight_batch_sizes": {},
             "num_pending_samples": {},
+            "kv_cache_usage_perc": {},
         }
         for dp_idx, stats in zip(dp_indices, results):
             if not stats:
@@ -477,6 +478,9 @@ class TrtllmGeneration(GenerationInterface):
             pending = stats.get("num_pending_samples")
             if pending:
                 logger_metrics["num_pending_samples"][dp_idx] = pending
+            kv = stats.get("kv_cache_usage_perc")
+            if kv:
+                logger_metrics["kv_cache_usage_perc"][dp_idx] = kv
         return logger_metrics
 
     def clear_logger_metrics(self) -> None:
