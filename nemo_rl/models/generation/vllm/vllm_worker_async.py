@@ -1393,6 +1393,23 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         return cast(list[str], list_of_worker_results)
 
+    async def reset_collective_async(self) -> None:
+        """Async version of reset_collective.
+
+        Tears down the cross-cluster NCCL comm via collective_rpc into the
+        VllmInternalWorkerExtension running inside the engine process.
+        """
+        await self.llm.collective_rpc("reset_collective", args=tuple())
+
+    async def warmup_nccl_library_async(self) -> None:
+        """Async version of warmup_nccl_library.
+
+        Delegates to the VllmInternalWorkerExtension method inside the engine
+        process via collective_rpc, which pre-warms NCCL's per-process lazy
+        init before the first real cross-cluster collective.
+        """
+        await self.llm.collective_rpc("warmup_nccl_library", args=tuple())
+
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))

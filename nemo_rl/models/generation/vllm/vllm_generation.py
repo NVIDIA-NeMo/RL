@@ -185,6 +185,8 @@ class VllmGeneration(GenerationInterface):
             strategy=strategy,
             use_unified_pg=needs_cross_node_parallelism,
         )
+        # Store so add_dp_worker can reuse the PG for replacement actors.
+        self.cluster = cluster
 
         # Create worker builder for VllmGenerationWorker
         if self.cfg["vllm_cfg"]["async_engine"]:
@@ -288,7 +290,8 @@ class VllmGeneration(GenerationInterface):
         self._router: Optional[Any] = None
         self._last_synced_world_size: Optional[int] = None
         self._last_synced_comm_epoch: int = 0
-        if not self.cfg["colocated"]["enabled"]:
+        ft_enabled = bool(self.cfg.get("fault_tolerance", {}).get("enabled", False))
+        if not self.cfg["colocated"]["enabled"] and ft_enabled:
             from nemo_rl.models.generation.generation_router import GenerationRouter
 
             auto_recover = bool(self.cfg.get("fault_tolerance", {}).get("auto_recover", True))
@@ -332,7 +335,35 @@ class VllmGeneration(GenerationInterface):
                 node_id_by_shard=node_id_by_shard,
                 worker_indices_by_shard=worker_indices_by_shard,
             )
+            # Start the background event loop now so call_async() works from
+            # init_collective() during setup.  Health polling is NOT enabled
+            # yet — the poller loop idles until enable_health_polling() is
+            # called from prepare_refit_info() once the full cluster is ready.
             self._router.start_background()
+            self._health_monitoring_started: bool = False
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        # threading.Event contains _thread.lock which cannot be pickled by Ray.
+        # Exclude these and recreate them in __setstate__.
+        state.pop("_generating", None)
+        state.pop("_refitting", None)
+        # GenerationRouter owns an asyncio event loop and asyncio primitives
+        # (_asyncio.Future, Lock, etc.) that cannot be pickled.  The router is
+        # only needed for lifecycle ops (init_collective, weight sync, fault
+        # detection); AsyncTrajectoryCollector only calls generate(), so it is
+        # safe to drop the router on the deserialized copy.
+        state.pop("_router", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        import threading as _threading
+
+        self.__dict__.update(state)
+        self._generating = _threading.Event()
+        self._refitting = _threading.Event()
+        self._router = None
+        self._health_monitoring_started = False
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -574,6 +605,9 @@ class VllmGeneration(GenerationInterface):
         # Save device UUIDs
         self.device_uuids = self._report_device_id()
 
+        # Health polling is enabled from prepare_refit_info() after the full
+        # cluster is ready — nothing to do here for the deferred path.
+
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting
         method_name = (
@@ -726,9 +760,12 @@ class VllmGeneration(GenerationInterface):
 
     def _raw_reset_collective(self) -> list:
         """Dispatch reset_collective directly to workers (used by router internally)."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "reset_collective", data={}, max_workers=None
+        method_name = (
+            "reset_collective_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "reset_collective"
         )
+        futures = self.worker_group.run_all_workers_single_data(method_name)
         results = []
         for f in futures:
             try:
@@ -961,6 +998,7 @@ class VllmGeneration(GenerationInterface):
         self,
         pre_append_hook: Optional[Callable[[], None]] = None,
         node_id: Optional[str] = None,
+        dead_bundle_indices: Optional[tuple[int, list[int]]] = None,
     ):
         """SLURM version: restart a dead shard on the same node.
 
@@ -968,9 +1006,25 @@ class VllmGeneration(GenerationInterface):
         them all to ``node_id`` via NodeAffinitySchedulingStrategy if provided,
         and appends them atomically. Returns
         ``(actor_handles, None, worker_indices, base_url)``.
+
+        ``dead_bundle_indices``: ``(node_idx, [bundle_idx, ...])`` from the
+        dead shard's worker metadata.  When provided, the replacement is created
+        inside the original unified placement group at the freed bundle slot so
+        Ray immediately grants it the GPU that the killed actor vacated.
+        Without this, ``placement_group=None`` would force the actor to wait
+        for a non-PG GPU that never becomes available when all GPUs live inside
+        the unified PG.
         """
         model_parallel_size = self.tp_size * self.pp_size
         dp_shard_idx = self.worker_group.dp_size  # next shard slot
+
+        # Use the unified placement group if we have the dead shard's bundle
+        # info so the replacement claims the freed bundle slot immediately.
+        pgs = self.cluster.get_placement_groups() if hasattr(self, "cluster") else []
+        target_pg = pgs[0] if pgs and dead_bundle_indices is not None else None
+        # node_id scheduling is incompatible with PG placement; rely on the PG
+        # bundle to pin the actor to the right node.
+        effective_node_id = None if target_pg is not None else node_id
 
         actors: list[Any] = []
         names: list[str] = []
@@ -982,13 +1036,22 @@ class VllmGeneration(GenerationInterface):
                 if local_rank == 0
                 else None
             )
+            # Map local_rank to the correct PG bundle index from the dead shard.
+            if dead_bundle_indices is not None and local_rank < len(dead_bundle_indices[1]):
+                pg_bundle_index = dead_bundle_indices[1][local_rank]
+            elif dead_bundle_indices is not None:
+                pg_bundle_index = dead_bundle_indices[1][0]
+            else:
+                pg_bundle_index = 0
+
             actor, name, bi_resolved, _ = self.worker_group.spawn_worker_only(
-                placement_group=None,
+                placement_group=target_pg,
                 bundle_indices=bi,
                 dp_shard_idx=dp_shard_idx,
-                compact_dead_indices=(local_rank == 0),
+                compact_dead_indices=False,
                 local_rank=local_rank,
-                node_id=node_id,
+                node_id=effective_node_id,
+                placement_group_bundle_index=pg_bundle_index,
             )
             actors.append(actor)
             names.append(name)
@@ -997,15 +1060,24 @@ class VllmGeneration(GenerationInterface):
         # Warm NCCL on the new actor while vLLM is still loading the model.
         # This hides the 15-20s lazy-init cost behind model-load time so the
         # first init_collective including this shard doesn't spike step time.
+        is_async = self.cfg["vllm_cfg"]["async_engine"]
         try:
-            ray.get(actors[0].warmup_nccl_library.remote(), timeout=60)
+            warmup_method = getattr(
+                actors[0],
+                "warmup_nccl_library_async" if is_async else "warmup_nccl_library",
+            )
+            ray.get(warmup_method.remote(), timeout=60)
         except Exception as e:  # noqa: BLE001
             print(f"[add_dp_worker] warmup_nccl_library failed (non-fatal): {e}", flush=True)
 
         cached_info = getattr(self, "_cached_state_dict_info", None)
         if cached_info is not None:
             try:
-                ray.get(actors[0].prepare_refit_info.remote(cached_info), timeout=300)
+                refit_method = getattr(
+                    actors[0],
+                    "prepare_refit_info_async" if is_async else "prepare_refit_info",
+                )
+                ray.get(refit_method.remote(cached_info), timeout=300)
             except Exception as e:
                 print(f"[add_dp_worker] prepare_refit_info failed: {e}", flush=True)
 
@@ -1127,8 +1199,6 @@ class VllmGeneration(GenerationInterface):
                 return combined
 
             except RayActorError:
-                if self._router is None:
-                    raise
                 print(
                     "[vllm_generation] RayActorError in generate; "
                     "probing workers to identify dead shards, then retrying",
@@ -1222,56 +1292,102 @@ class VllmGeneration(GenerationInterface):
             f"outside this method."
         )
 
-        # Determine the leader worker for the current data parallel shard
-        leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
-            self.current_generate_dp_shard_idx
-        )
-
-        # Run the async method on the selected leader worker
-        worker_gen_proxy = self.worker_group.run_single_worker_single_data(
-            method_name=method_name,
-            worker_idx=leader_worker_idx,
-            data=data,
-            greedy=greedy,
-        )
-
-        # Increment the round-robin worker group index
-        self.current_generate_dp_shard_idx = (
-            self.current_generate_dp_shard_idx + 1
-        ) % self.worker_group.dp_size
+        from ray.exceptions import RayActorError
 
         timeout_seconds = float(
             os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
         )  # Default 15 minutes
 
-        try:
-            sample_result_ref = await anext(worker_gen_proxy)
-        except StopAsyncIteration:
-            raise RuntimeError(
-                f"Worker produced no output for the given sample {data}."
+        per_shard_ws = self.tp_size * self.pp_size
+
+        while self.worker_group.dp_size > 0:
+            # Clamp shard index in case another concurrent coroutine just
+            # called mark_workers_dead and reduced dp_size while this
+            # coroutine was holding an index valid under the old dp_size.
+            self.current_generate_dp_shard_idx %= self.worker_group.dp_size
+            # Determine the leader worker for the current data parallel shard
+            leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
+                self.current_generate_dp_shard_idx
             )
 
-        # Materialize the result from Ray's object store. ``anext`` above
-        # resolves when the worker yields, but the object bytes have not yet
-        # crossed the network to the driver — this is where that happens, and
-        # where a Ray deadlock / unreachable worker would manifest, hence the
-        # timeout.
-        try:
-            sample_result = await asyncio.wait_for(
-                sample_result_ref, timeout=timeout_seconds
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"Timeout waiting for worker results after {timeout_seconds}s. "
-                f"For longer sequences, increase timeout by setting: "
-                f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
-                f"{int(timeout_seconds * 2)}"
+            # Run the async method on the selected leader worker
+            worker_gen_proxy = self.worker_group.run_single_worker_single_data(
+                method_name=method_name,
+                worker_idx=leader_worker_idx,
+                data=data,
+                greedy=greedy,
             )
 
-        # sample_result is a tuple: (original_idx, BatchedDataDict).
-        original_idx, result_batch = sample_result
-        result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
-        yield (original_idx, result_batch)
+            # Increment the round-robin worker group index
+            self.current_generate_dp_shard_idx = (
+                self.current_generate_dp_shard_idx + 1
+            ) % max(1, self.worker_group.dp_size)
+
+            try:
+                sample_result_ref = await anext(worker_gen_proxy)
+            except StopAsyncIteration:
+                raise RuntimeError(
+                    f"Worker produced no output for the given sample {data}."
+                )
+            except RayActorError:
+                # Worker is dead — mark it and retry on the next shard.
+                dead_indices = list(
+                    range(leader_worker_idx, leader_worker_idx + per_shard_ws)
+                )
+                self.worker_group.mark_workers_dead(dead_indices)
+                print(
+                    f"[vllm_generation] generate_async: worker {leader_worker_idx} "
+                    f"dead (ActorDiedError); marked dead, retrying on next shard",
+                    flush=True,
+                )
+                if self.worker_group.dp_size > 0:
+                    self.current_generate_dp_shard_idx = (
+                        self.current_generate_dp_shard_idx
+                        % self.worker_group.dp_size
+                    )
+                continue
+
+            # Materialize the result from Ray's object store. ``anext`` above
+            # resolves when the worker yields, but the object bytes have not yet
+            # crossed the network to the driver — this is where that happens, and
+            # where a Ray deadlock / unreachable worker would manifest, hence the
+            # timeout.
+            try:
+                sample_result = await asyncio.wait_for(
+                    sample_result_ref, timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"Timeout waiting for worker results after {timeout_seconds}s. "
+                    f"For longer sequences, increase timeout by setting: "
+                    f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
+                    f"{int(timeout_seconds * 2)}"
+                )
+            except RayActorError:
+                # Worker died while materializing — same recovery as above.
+                dead_indices = list(
+                    range(leader_worker_idx, leader_worker_idx + per_shard_ws)
+                )
+                self.worker_group.mark_workers_dead(dead_indices)
+                print(
+                    f"[vllm_generation] generate_async: worker {leader_worker_idx} "
+                    f"dead (ActorDiedError at wait_for); marked dead, retrying on next shard",
+                    flush=True,
+                )
+                if self.worker_group.dp_size > 0:
+                    self.current_generate_dp_shard_idx = (
+                        self.current_generate_dp_shard_idx
+                        % self.worker_group.dp_size
+                    )
+                continue
+
+            # sample_result is a tuple: (original_idx, BatchedDataDict).
+            original_idx, result_batch = sample_result
+            result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
+            yield (original_idx, result_batch)
+            return
+
+        raise RuntimeError("generate_async: no alive DP shards remaining")
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -1389,12 +1505,19 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Pre-warm NCCL on the initial cohort so the first refit doesn't pay
-        # the 15-20s lazy-init cost during init_collective.
-        warmup_futures = self.worker_group.run_all_workers_single_data(
-            "warmup_nccl_library",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        ray.get(warmup_futures)
+        # the 15-20s lazy-init cost during init_collective. Only needed in
+        # non-colocated mode where the cross-cluster NCCL group is used.
+        if self._router is not None:
+            warmup_method = (
+                "warmup_nccl_library_async"
+                if self.cfg["vllm_cfg"]["async_engine"]
+                else "warmup_nccl_library"
+            )
+            warmup_futures = self.worker_group.run_all_workers_single_data(
+                warmup_method,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+            ray.get(warmup_futures)
 
         # Use run_all_workers_single_data to send data to all workers
         futures = self.worker_group.run_all_workers_single_data(
@@ -1408,6 +1531,14 @@ class VllmGeneration(GenerationInterface):
 
         # Cache so add_dp_worker can replay this on a newly-spawned worker.
         self._cached_state_dict_info = state_dict_info
+
+        # Enable health polling now that the full cluster is ready (model
+        # loaded, refit info distributed).  The background event loop was
+        # already started in __init__; this just unpauses the probe cycle.
+        # Guarded by a flag so it only fires once.
+        if self._router is not None and not self._health_monitoring_started:
+            self._router.enable_health_polling()
+            self._health_monitoring_started = True
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""
@@ -1430,7 +1561,9 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    def _raw_update_weights_from_collective(self) -> list[ray.ObjectRef]:
+    def _raw_update_weights_from_collective(
+        self, include_worker_indices: Optional[list[int]] = None
+    ) -> list[ray.ObjectRef]:
         """Dispatch update_weights_from_collective directly to workers (used by router)."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1441,9 +1574,13 @@ class VllmGeneration(GenerationInterface):
             else "update_weights_from_collective"
         )
 
+        restrict = (
+            set(include_worker_indices) if include_worker_indices is not None else None
+        )
         return self.worker_group.run_all_workers_single_data(
             method_name,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            restrict_to_indices=restrict,
         )
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
@@ -1496,7 +1633,10 @@ class VllmGeneration(GenerationInterface):
             futures.append(future)
             dp_indices.append(dp_idx)
 
-        results = ray.get(futures)
+        try:
+            results = ray.get(futures)
+        except Exception:  # noqa: BLE001 — dead worker (e.g. ray-kill); return empty
+            return {}
         vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
@@ -1533,7 +1673,10 @@ class VllmGeneration(GenerationInterface):
             "clear_vllm_logger_metrics",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        ray.get(futures)
+        try:
+            ray.get(futures)
+        except Exception:  # noqa: BLE001 — dead worker; best-effort clear
+            pass
 
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting."""

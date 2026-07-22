@@ -173,6 +173,10 @@ class GenerationRouter:
 
         # Background asyncio event loop (set by start_background()).
         self._loop: Optional[Any] = None
+        # Health polling is disabled until enable_health_polling() is called.
+        # This lets the event loop start immediately (so call_async works) while
+        # deferring actual HTTP probing until the full cluster is ready.
+        self._health_polling_enabled: bool = False
 
         # Fault-tolerance metrics for wandb; reset when the process restarts.
         self._total_shards_at_bootstrap: int = 0
@@ -314,11 +318,22 @@ class GenerationRouter:
                 # Bump epoch if the removed shard was in the live comm; forces proactive re-init.
                 if removed_entry is not None and removed_entry.in_comm:
                     self._comm_reset_epoch += 1
+                # Capture the dead shard's PG bundle info before marking dead,
+                # so add_shard can reuse the freed bundle slot.
+                dead_bundle_indices: Optional[tuple[int, list[int]]] = None
+                if self._generation is not None and worker_indices:
+                    _wg = getattr(self._generation, "worker_group", None)
+                    if _wg is not None:
+                        _meta = _wg._worker_metadata
+                        leader = worker_indices[0]
+                        if isinstance(_meta, list) and leader < len(_meta):
+                            dead_bundle_indices = _meta[leader].get("bundle_indices")
                 self._last_fault_event = {
                     "kind": "remove",
                     "shard_id": shard_id,
                     "reason": reason,
                     "node_id": node_id,
+                    "bundle_indices": dead_bundle_indices,
                     "monotonic_ts": time.monotonic(),
                 }
 
@@ -374,10 +389,16 @@ class GenerationRouter:
             # Heavy work: vLLM worker init (~1-2min for 4B). Run on a thread so
             # the asyncio loop stays responsive (health poll, /metrics, /shards).
             target_node_id = (self._last_fault_event or {}).get("node_id") or None
+            # Bundle indices of the dead shard: lets add_dp_worker reuse the
+            # freed PG bundle slot so Ray grants the GPU immediately instead of
+            # waiting for a non-PG GPU that may never become available.
+            target_bundle_indices = (self._last_fault_event or {}).get("bundle_indices") or None
 
             def _do_add() -> tuple[list[Any], Any, list[int], Optional[str]]:
                 return self._generation.add_dp_worker(
-                    pre_append_hook=_gate_up, node_id=target_node_id
+                    pre_append_hook=_gate_up,
+                    node_id=target_node_id,
+                    dead_bundle_indices=target_bundle_indices,
                 )
 
             try:
@@ -542,6 +563,9 @@ class GenerationRouter:
         assert self._http_session is not None
         timeout = aiohttp.ClientTimeout(total=self.health_timeout_s)
         while True:
+            if not self._health_polling_enabled:
+                await asyncio.sleep(0.5)
+                continue
             try:
                 async with self._table_lock:
                     # Probe ready/joining AND cordoned shards. Cordoned ones
@@ -549,11 +573,27 @@ class GenerationRouter:
                     # by a transient probe failure (e.g. cross-cluster NCCL
                     # rendezvous blocking the worker's event loop) and is now
                     # answering /openapi.json again, promote it back to ready.
+                    # Shards without an HTTP URL (expose_http_server=False) are
+                    # skipped — their liveness is checked via Ray actor handles.
                     targets = [
                         (s.shard_id, s._health_url, s.status)
                         for s in self._shards.values()
                         if s.status in ("ready", "joining", "cordoned")
+                        and s.url  # skip shards with no HTTP server
                     ]
+                if not targets:
+                    # No HTTP-probing shards — fall back to Ray actor liveness.
+                    await self._check_actor_liveness()
+                    try:
+                        self._refresh_joinable_stability()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[router] joinable refresh failed: {e}", flush=True)
+                    try:
+                        await self._reconcile_recovery()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[router] reconcile recovery failed: {e}", flush=True)
+                    await asyncio.sleep(self.health_poll_interval_s)
+                    continue
                 results = await asyncio.gather(
                     *(self._probe(self._http_session, url, timeout) for _, url, _ in targets),
                     return_exceptions=False,
@@ -598,10 +638,15 @@ class GenerationRouter:
                                 )
                         else:
                             entry.consecutive_successes = 0
-                            entry.consecutive_failures += 1
-                            # Skip cordoning during NCCL re-init (event loop stall causes probe misses).
+                            # During NCCL re-init the vLLM engine's event loop
+                            # may stall briefly, causing probe misses that are
+                            # not real failures.  Reset the failure counter
+                            # rather than accumulating it, so the first tick
+                            # after reinit completes doesn't immediately cordon.
                             if nccl_paused:
+                                entry.consecutive_failures = 0
                                 continue
+                            entry.consecutive_failures += 1
                             if (
                                 entry.status in ("ready", "joining")
                                 and entry.consecutive_failures >= self.failure_threshold
@@ -1044,6 +1089,106 @@ class GenerationRouter:
                 flush=True,
             )
 
+    async def _check_actor_liveness(self) -> None:
+        """Ping Ray actor handles for shards that have no HTTP URL.
+
+        Used when expose_http_server=False so the health poller can still
+        detect crashed actors without HTTP probing.
+
+        Mirrors the HTTP probing path:
+        - Successful ping increments ``consecutive_successes`` (so joining
+          shards become joinable without HTTP).
+        - Failed pings accumulate ``consecutive_failures``; cordon fires only
+          after ``failure_threshold`` consecutive failures, not on the first.
+        - During NCCL reinit, failure counter is reset instead of accumulated
+          (actor event loop may stall during collective ops).
+        """
+        import ray
+        from ray.exceptions import GetTimeoutError, RayActorError
+
+        async with self._table_lock:
+            nccl_paused = self._nccl_reinit_in_progress
+            n_alive_or_joining = sum(
+                1 for s in self._shards.values()
+                if s.status in ("ready", "joining")
+            )
+            actor_targets = [
+                (s.shard_id, list(s.actor_handles))
+                for s in self._shards.values()
+                if s.status in ("ready", "joining") and s.actor_handles
+            ]
+
+        loop = asyncio.get_running_loop()
+        for shard_id, handles in actor_targets:
+            if not handles:
+                continue
+            leader = handles[0]
+            ok = True
+            definitive_death = False  # RayActorError → actor is gone, skip threshold
+            try:
+                await loop.run_in_executor(
+                    None, lambda h=leader: ray.get(h.is_alive.remote(), timeout=5.0)
+                )
+            except RayActorError:
+                ok = False
+                definitive_death = True  # ray.kill or crash: cordon immediately
+            except (GetTimeoutError, Exception):  # noqa: BLE001
+                ok = False
+
+            async with self._table_lock:
+                entry = self._shards.get(shard_id)
+                if entry is None:
+                    continue
+                if ok:
+                    entry.consecutive_failures = 0
+                    entry.consecutive_successes += 1
+                    entry.last_health_ok_at = time.monotonic()
+                    # Auto-uncordon deadlock escape: same logic as HTTP path.
+                    if (
+                        entry.status == "cordoned"
+                        and n_alive_or_joining == 0
+                        and entry.consecutive_successes >= self.join_success_threshold
+                    ):
+                        successes = entry.consecutive_successes
+                        entry.status = "joining"
+                        entry.consecutive_failures = 0
+                        entry.consecutive_successes = 0
+                        entry.successful_refits_since_join = 0
+                        n_alive_or_joining = 1
+                        print(
+                            f"[router] auto-uncordoned {shard_id} "
+                            f"(0 alive shards, {successes} successful pings); "
+                            f"status=joining; will re-promote on next refit",
+                            flush=True,
+                        )
+                else:
+                    entry.consecutive_successes = 0
+                    if nccl_paused and not definitive_death:
+                        # During NCCL reinit, transient timeouts are expected.
+                        # But a RayActorError means the actor is gone — still
+                        # cordon immediately even while NCCL is reinitializing.
+                        entry.consecutive_failures = 0
+                        continue
+                    # RayActorError: actor is definitively dead (ray.kill or crash).
+                    # Skip the consecutive-failure threshold and cordon immediately
+                    # so the next weight broadcast excludes it rather than hanging.
+                    if definitive_death:
+                        entry.consecutive_failures = self.failure_threshold
+                    else:
+                        entry.consecutive_failures += 1
+                    if (
+                        entry.status in ("ready", "joining")
+                        and entry.consecutive_failures >= self.failure_threshold
+                    ):
+                        entry.status = "cordoned"
+                        print(
+                            f"[router] actor liveness check failed for {shard_id}; cordoning",
+                            flush=True,
+                        )
+                        asyncio.create_task(
+                            self._fire_cordon_hook(shard_id, "actor liveness threshold breached")
+                        )
+
     @staticmethod
     async def _probe(
         session: aiohttp.ClientSession, url: str, timeout: aiohttp.ClientTimeout
@@ -1118,11 +1263,15 @@ class GenerationRouter:
 
             if not failed_idxs:
                 async with self._table_lock:
-                    for sid in dispatched_sids:
-                        entry = self._shards.get(sid)
-                        if entry is not None:
+                    for sid, entry in self._shards.items():
+                        if sid in dispatched_sids:
                             entry.in_comm = True
                             entry.proven = True
+                        else:
+                            # Shard was excluded from this cohort (e.g. cordoned);
+                            # clear in_comm so update_weights_from_collective does
+                            # not dispatch to it.
+                            entry.in_comm = False
                 return {"success": True}
 
             if self._is_rendezvous_master_failure(failed_idxs, exc_types):
@@ -1188,16 +1337,33 @@ class GenerationRouter:
                 "promoted_shards": [],
             }
 
+        prev_flag = self._nccl_reinit_in_progress
+        self._nccl_reinit_in_progress = True
         try:
             self._refit_attempts += 1
 
             async with self._table_lock:
                 eligible_promote = self._eligible_promote_sids()
+                # Build (worker_idx, shard_id) pairs in ascending worker_idx
+                # order — this matches the future ordering produced by
+                # run_all_workers_single_data so that failed_idxs map back to
+                # the right shard even if remove_shard pops a shard from
+                # _shards concurrently during the executor dispatch below.
+                in_comm_workers = sorted(
+                    (i, sid)
+                    for sid, s in self._shards.items()
+                    if s.in_comm
+                    for i in s.worker_indices
+                )
+                in_comm_indices = [i for i, _ in in_comm_workers]
+                dispatch_shard_ids = [sid for _, sid in in_comm_workers]
 
             loop = asyncio.get_running_loop()
 
             def _dispatch() -> list:
-                return generation._raw_update_weights_from_collective()
+                return generation._raw_update_weights_from_collective(
+                    include_worker_indices=in_comm_indices or None
+                )
 
             futures = await loop.run_in_executor(None, _dispatch)
 
@@ -1231,6 +1397,7 @@ class GenerationRouter:
                     reason="update_weights_from_collective: per-worker error",
                     exception_types=exc_types,
                     force_evict_idxs=failed_fast,
+                    shard_ids_in_order=dispatch_shard_ids,
                 )
                 new_ws = self.current_gen_world_size()
                 msg = (
@@ -1266,6 +1433,8 @@ class GenerationRouter:
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             raise RuntimeError(f"run_update_weights_from_collective failed: {e}") from e
+        finally:
+            self._nccl_reinit_in_progress = prev_flag
 
     async def run_reset_collective(self) -> None:
         """Gen-side reset_collective: tear down weight-sync NCCL group on all shards."""
@@ -1349,6 +1518,22 @@ class GenerationRouter:
             f"(shards={len(self._shards)}, ready={self.shard_count_ready()})",
             flush=True,
         )
+
+    def enable_health_polling(self) -> None:
+        """Allow the health poller to start probing shards.
+
+        Called once the full cluster is ready (gen workers loaded, policy
+        workers initialized, refit info distributed) so that the first probe
+        cycle does not see transiently-unresponsive servers and cordon healthy
+        shards.
+        """
+        if not self._health_polling_enabled:
+            self._health_polling_enabled = True
+            print(
+                f"GenerationRouter health polling enabled "
+                f"(shards={len(self._shards)}, ready={self.shard_count_ready()})",
+                flush=True,
+            )
 
     def call_async(self, coro: Any) -> Any:
         """Run an async coroutine synchronously from a non-async context.

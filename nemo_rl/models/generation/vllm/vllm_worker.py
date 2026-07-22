@@ -81,6 +81,17 @@ class BaseVllmGenerationWorker:
         """
         return f"{self.__class__.__name__}"
 
+    def get_node_id(self) -> str:
+        """Return the Ray node ID this actor is running on.
+
+        Available directly on the outer actor (both sync and async) so the
+        GenerationRouter can record node affinity without going through
+        collective_rpc.
+        """
+        import ray
+
+        return ray.get_runtime_context().get_node_id()
+
     @staticmethod
     def configure_worker(
         num_gpus: int | float, bundle_indices: Optional[tuple[int, list[int]]] = None

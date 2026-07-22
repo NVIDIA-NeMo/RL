@@ -705,6 +705,7 @@ class RayWorkerGroup:
         compact_dead_indices: bool = True,
         local_rank: int = 0,
         node_id: Optional[str] = None,
+        placement_group_bundle_index: int = 0,
     ) -> tuple[Any, str, tuple[int, list[int]], int]:
         """Phase A of add_worker: spawn the actor handle WITHOUT appending.
 
@@ -808,7 +809,7 @@ class RayWorkerGroup:
 
         worker = self._remote_worker_builder(
             placement_group=placement_group,
-            placement_group_bundle_index=0,
+            placement_group_bundle_index=placement_group_bundle_index,
             num_gpus=num_gpus,
             bundle_indices=bundle_indices,
             **extra_options,
@@ -853,6 +854,24 @@ class RayWorkerGroup:
             }
         )
         if is_leader:
+            # If there are dead slots, update the sharding layout so that
+            # get_worker_coords(new_worker_idx) returns valid coordinates
+            # instead of raising ValueError.  Inheriting the dead worker's
+            # slot gives the replacement the same DP/TP/PP coords as the
+            # shard it replaces, without any index compaction.
+            if self._dead_indices and hasattr(
+                self.sharding_annotations, "replace_worker_id"
+            ):
+                # Pick the lowest dead leader index (the TP followers are not
+                # in dp_leader_worker_indices; we only care about leaders here).
+                dead_leaders = sorted(
+                    idx for idx in self._dead_indices
+                    if idx not in self.dp_leader_worker_indices
+                )
+                if dead_leaders:
+                    self.sharding_annotations.replace_worker_id(
+                        dead_leaders[0], new_worker_idx
+                    )
             self.dp_leader_worker_indices.append(new_worker_idx)
         return new_worker_idx
 
@@ -1009,6 +1028,7 @@ class RayWorkerGroup:
         method_name: str,
         *args,
         run_rank_0_only_axes: list[str] | None = None,
+        restrict_to_indices: Optional[set[int]] = None,
         **kwargs,
     ) -> list[ray.ObjectRef]:
         """Run a method on all workers in parallel with the same data.
@@ -1017,6 +1037,8 @@ class RayWorkerGroup:
             method_name: Name of the method to call on each worker
             *args, **kwargs: Arguments to pass to the method
             run_rank_0_only_axes: List of named axes for which only rank 0 should run the method.
+            restrict_to_indices: When provided, dispatch ONLY to workers whose index is in
+                this set. Dead workers are always skipped regardless of this set.
 
         Returns:
             list[ray.ObjectRef]: A list of ray futures
@@ -1036,6 +1058,8 @@ class RayWorkerGroup:
 
         for worker_idx, worker in enumerate(self.workers):
             if worker_idx in self._dead_indices:
+                continue
+            if restrict_to_indices is not None and worker_idx not in restrict_to_indices:
                 continue
             worker_coords = self.sharding_annotations.get_worker_coords(worker_idx)
 

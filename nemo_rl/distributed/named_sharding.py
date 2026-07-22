@@ -144,6 +144,21 @@ class NamedSharding:
         """
         return all(coords.get(ax, 0) == 0 for ax in axes)
 
+    def replace_worker_id(self, old_id: int, new_id: int) -> bool:
+        """Replace ``old_id`` with ``new_id`` in the layout in-place.
+
+        Used when a dead worker slot is claimed by a recovery replacement so
+        that ``get_worker_coords(new_id)`` returns the same axes as
+        ``get_worker_coords(old_id)`` would have.
+
+        Returns True if ``old_id`` was found and replaced, False otherwise.
+        """
+        indices = np.where(self._layout == old_id)
+        if not indices[0].size:
+            return False
+        self._layout[indices] = new_id
+        return True
+
     def get_ranks_by_coord(self, **coords: int) -> list[int]:
         """Gets all ranks that match the specified coordinates for named axes.
 
