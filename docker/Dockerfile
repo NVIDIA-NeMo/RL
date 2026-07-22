@@ -184,14 +184,6 @@ RUN --mount=type=ssh \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
-# These settings are build-only and intentionally do not persist in the final
-# NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
-# between ephemeral CI runners.
-export CCACHE_DIR=/root/.cache/ccache
-export CCACHE_COMPILERCHECK=content
-export CCACHE_COMPRESS=true
-export CCACHE_MAXSIZE="${TRTLLM_CCACHE_MAXSIZE}"
-
 CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
 SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
 if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
@@ -201,10 +193,6 @@ elif [ -n "$SEED_KEY" ]; then
     mkdir -p /root/.cache/uv
     rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
 fi
-
-# Merge the registry seed into the builder-local cache mount. Cache entries
-# are content-addressed, so newer local entries are kept when both exist.
-rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
 
 uv venv --seed
 # The custom build scripts will alter the pyproject.toml and uv.lock
@@ -233,6 +221,19 @@ uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    # These settings are build-only and intentionally do not persist in the
+    # final NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp
+    # changes between ephemeral CI runners.
+    export CCACHE_DIR=/root/.cache/ccache
+    export CCACHE_COMPILERCHECK=content
+    export CCACHE_COMPRESS=true
+    export CCACHE_MAXSIZE="${TRTLLM_CCACHE_MAXSIZE}"
+
+    # Merge the registry seed into the builder-local cache mount only when
+    # TRT-LLM will build. Cache entries are content-addressed, so newer local
+    # entries are kept when both exist.
+    rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
+
     # Build TRT-LLM after every other backend cache warmup. The final
     # --all-groups sync below restores the intended default environment.
     # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py

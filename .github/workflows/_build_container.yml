@@ -93,9 +93,28 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Resolve TRT-LLM build state
+        id: trtllm_build
+        shell: bash
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          set -euo pipefail
+
+          # Match Dockerfile semantics: any non-empty value skips TRT-LLM.
+          SKIP_VALUE=$(printf '%s\n' "$BUILD_ARGS" | sed -nE 's/^[[:space:]]*SKIP_TRTLLM_BUILD[[:space:]]*=(.*)$/\1/p' | tail -1)
+          SKIP_VALUE=$(printf '%s' "$SKIP_VALUE" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+          if [[ -n "$SKIP_VALUE" ]]; then
+            echo "TRT-LLM build is disabled by SKIP_TRTLLM_BUILD"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "TRT-LLM build is enabled"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Resolve TRT-LLM ccache tag
         id: trtllm_ccache_tag
-        if: inputs.trtllm-ccache-tag != ''
+        if: inputs.trtllm-ccache-tag != '' && steps.trtllm_build.outputs.enabled == 'true'
         shell: bash
         env:
           BUILD_ARGS: ${{ inputs.build-args }}
@@ -133,7 +152,7 @@ jobs:
 
       - name: Resolve TRT-LLM uv cache tag
         id: trtllm_uv_cache_tag
-        if: inputs.trtllm-uv-cache-tag != ''
+        if: inputs.trtllm-uv-cache-tag != '' && steps.trtllm_build.outputs.enabled == 'true'
         shell: bash
         env:
           BUILD_ARGS: ${{ inputs.build-args }}
@@ -177,7 +196,7 @@ jobs:
 
       - name: Resolve TRT-LLM ccache seed
         id: trtllm_ccache_seed
-        if: inputs.trtllm-ccache-tag != ''
+        if: steps.trtllm_ccache_tag.outputs.tag != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -191,7 +210,7 @@ jobs:
 
       - name: Resolve TRT-LLM uv cache seed
         id: trtllm_uv_cache_seed
-        if: inputs.trtllm-uv-cache-tag != ''
+        if: steps.trtllm_uv_cache_tag.outputs.tag != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -302,7 +321,7 @@ jobs:
         # Cache mounts survive a failed RUN in the current Buildx builder. Run
         # this step after both successful and failed image builds so completed
         # compiler outputs are preserved for the next retry.
-        if: ${{ always() && !cancelled() && inputs.trtllm-ccache-tag != '' && steps.trtllm_ccache_tag.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_build.outputs.enabled == 'true' && inputs.trtllm-ccache-tag != '' && steps.trtllm_ccache_tag.outcome == 'success' }}
         uses: docker/build-push-action@v5
         with:
           file: ${{ inputs.dockerfile }}
@@ -326,7 +345,7 @@ jobs:
       - name: Update TRT-LLM uv cache image
         # Persist downloads and source archives even when the release build
         # fails, so a retry can resume without repopulating this cache.
-        if: ${{ always() && !cancelled() && inputs.trtllm-uv-cache-tag != '' && steps.trtllm_uv_cache_tag.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_build.outputs.enabled == 'true' && inputs.trtllm-uv-cache-tag != '' && steps.trtllm_uv_cache_tag.outcome == 'success' }}
         uses: docker/build-push-action@v5
         with:
           file: ${{ inputs.dockerfile }}
