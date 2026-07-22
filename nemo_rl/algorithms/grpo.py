@@ -183,6 +183,8 @@ class GRPOConfig(TypedDict):
     advantage_clip_high: NotRequired[float | None]
     use_leave_one_out_baseline: bool
     val_period: int
+    # Earliest training step eligible for periodic validation.
+    val_start_at: int
     val_batch_size: int | None  # None for NeMo-Gym compatibility
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
@@ -190,6 +192,8 @@ class GRPOConfig(TypedDict):
     val_at_end: bool
     max_val_samples: int | None  # None for NeMo-Gym compatibility
     validation_generation: NotRequired[ValidationGenerationConfig | None]
+    # Number of independent validation rollouts generated for each prompt.
+    num_val_generations_per_prompt: NotRequired[int]
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
     async_grpo: NotRequired[AsyncGRPOConfig]
@@ -2258,6 +2262,7 @@ def grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo["val_start_at"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
@@ -2859,9 +2864,11 @@ def grpo_train(
                     )
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if (
+                    val_period > 0
+                    and total_steps + 1 >= val_start_at
+                    and (total_steps + 1) % val_period == 0
+                ) or (val_at_end and is_last_step):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -3272,6 +3279,34 @@ def grpo_train(
         mlperf_logger.finalize()
 
 
+def _calculate_observed_pass_metrics(
+    total_rewards: list[float], num_generations_per_prompt: int
+) -> dict[str, float]:
+    """Calculate observed pass metrics from prompt-grouped validation rewards."""
+    assert num_generations_per_prompt >= 1, (
+        "grpo.num_val_generations_per_prompt must be >= 1"
+    )
+
+    metric_names = (
+        f"pass@{num_generations_per_prompt}",
+        f"pass^{num_generations_per_prompt}",
+        f"pass@1[avg-of-{num_generations_per_prompt}]",
+    )
+    if not total_rewards:
+        return dict.fromkeys(metric_names, 0.0)
+
+    rewards = torch.tensor(total_rewards, dtype=torch.float32)
+    assert rewards.numel() % num_generations_per_prompt == 0, (
+        "Validation rewards must be divisible by grpo.num_val_generations_per_prompt"
+    )
+    passed = rewards.view(-1, num_generations_per_prompt) > 0
+    return {
+        metric_names[0]: passed.any(dim=1).float().mean().item(),
+        metric_names[1]: passed.all(dim=1).float().mean().item(),
+        metric_names[2]: passed.float().mean().item(),
+    }
+
+
 def validate(
     policy_generation: GenerationInterface,
     val_dataloader: Optional[StatefulDataLoader],
@@ -3292,10 +3327,17 @@ def validate(
     timer = Timer()
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
+        num_val_generations_per_prompt = int(
+            master_config.grpo.get("num_val_generations_per_prompt", 1)
+        )
+        assert num_val_generations_per_prompt >= 1, (
+            "grpo.num_val_generations_per_prompt must be >= 1"
+        )
 
         total_rewards = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
+        additional_metrics_to_report = dict()
 
         max_batches = (
             master_config.grpo["max_val_samples"]
@@ -3322,7 +3364,9 @@ def validate(
             if batch_idx >= max_batches:
                 break
 
-            additional_metrics_to_report = dict()
+            if num_val_generations_per_prompt > 1:
+                val_batch = val_batch.repeat_interleave(num_val_generations_per_prompt)
+
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
@@ -3377,9 +3421,19 @@ def validate(
 
             all_message_logs.extend(to_env)
 
-        # Calculate validation metrics
+        # For grouped validation, pass@k is the benchmark accuracy and MLPerf
+        # convergence metric. Retain pass^k and average pass@1 as diagnostics.
         num_samples = len(total_rewards)
-        if num_samples > 0:
+        observed_pass_metrics: dict[str, float] = {}
+        if num_val_generations_per_prompt > 1:
+            observed_pass_metrics = _calculate_observed_pass_metrics(
+                total_rewards,
+                num_val_generations_per_prompt,
+            )
+            accuracy = observed_pass_metrics[
+                f"pass@{num_val_generations_per_prompt}"
+            ]
+        elif num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
             accuracy = rewards_t.mean().item()
         else:
@@ -3392,8 +3446,9 @@ def validate(
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
-            **additional_metrics_to_report,
+            **observed_pass_metrics,
         }
+        val_metrics.update(additional_metrics_to_report)
 
         # Print sample conversations only once at the end of validation
         try:
@@ -3416,7 +3471,15 @@ def validate(
 
     # Print summary of validation results
     print("\n📊 Validation Results:")
-    print(f"    • Accuracy: {accuracy:.4f}")
+    if num_val_generations_per_prompt > 1:
+        for metric_name in (
+            f"pass@{num_val_generations_per_prompt}",
+            f"pass^{num_val_generations_per_prompt}",
+            f"pass@1[avg-of-{num_val_generations_per_prompt}]",
+        ):
+            print(f"    • {metric_name}: {val_metrics[metric_name]:.4f}")
+    else:
+        print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
@@ -3567,6 +3630,7 @@ def async_grpo_train(
         "total_valid_tokens", 0
     )  # Default to 0 for backward compatibility with older checkpoints
     val_period = master_config.grpo["val_period"]
+    val_start_at = master_config.grpo["val_start_at"]
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
@@ -4213,7 +4277,11 @@ def async_grpo_train(
                 is_last_step = step + 1 == master_config.grpo["max_num_steps"]
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (step + 1) % val_period == 0) or (
+                if (
+                    val_period > 0
+                    and step + 1 >= val_start_at
+                    and (step + 1) % val_period == 0
+                ) or (
                     val_at_end and is_last_step
                 ):
                     # Pause trajectory collection during validation to reduce memory pressure

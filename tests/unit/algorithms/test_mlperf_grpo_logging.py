@@ -163,6 +163,22 @@ def test_mlperf_grpo_logger_tracks_lifecycle_and_target() -> None:
     assert {"reduced_train_loss": 0.2, "reward": 0.4, "grad_norm": 0.6} in tracked_stats
 
 
+def test_mlperf_grpo_logger_allows_disabled_target() -> None:
+    config = _config()
+    config["logger"]["mlperf"]["target_accuracy"] = None
+    fake = _FakeMLLogger()
+    logger = MLPerfGRPOLogger(config, mllogger=fake)
+    logger.log_init_stop_run_start()
+
+    logger.start_eval(2)
+    logger.end_eval(2, {"accuracy": 1.0})
+
+    assert logger.target_accuracy is None
+    assert not logger.target_reached
+    assert not logger.run_stopped
+    assert config["grpo"]["max_num_steps"] == 4
+
+
 def test_mlperf_final_eval_defers_run_stop_until_train_metrics() -> None:
     config = _config()
     fake = _FakeMLLogger()

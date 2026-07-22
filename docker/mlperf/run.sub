@@ -1,0 +1,568 @@
+#!/bin/bash
+
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#           http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#SBATCH --exclusive
+#SBATCH --mem=0
+
+# GRPO runs as a Ray cluster (bringup ported from nemo-rl ray.sub): a single
+# driver on the head node schedules Megatron training and vLLM generation on
+# disaggregated pools (DGXNNODES = TRAIN_NODES + GEN_NODES), or a single
+# colocated pool where TRAIN_NODES and the logical generation resource pool
+# refer to the same physical allocation.
+# Launch: source config_GB300_<...>.sh && sbatch -N $DGXNNODES --time=$WALLTIME run.sub
+
+set -eux
+
+# Refit collectives span policy and generation actors. Keep launch-order knobs
+# global so every Ray process joins communicators with symmetric settings.
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export NCCL_LAUNCH_ORDER_IMPLICIT="${NCCL_LAUNCH_ORDER_IMPLICIT:-1}"
+
+echo "PROLOG_START $(date +%s)"
+
+# Vars without defaults
+: "${CONT:?CONT not set}"
+: "${DGXSYSTEM:?DGXSYSTEM not set}"
+: "${WALLTIME_RUNANDTIME:?WALLTIME_RUNANDTIME not set}"
+: "${TRAIN_NODES:?TRAIN_NODES not set}"
+: "${GEN_NODES:?GEN_NODES not set}"
+
+# Vars with defaults
+: "${MLPERF_RULESET:=6.0.0}"
+: "${MLPERF_SCALE:='unknown'}"
+: "${MLPERF_CLUSTER_NAME:='unknown'}"
+: "${MILESTONE_YML:=unknown}"
+: "${NEXP:=1}"
+: "${CHECK_COMPLIANCE:=$(( ! ${FORCE_SUCCESS_STATUS:-0} ))}"
+: "${SEED_BASE:=${SEED-$RANDOM}}"
+: "${CLEAR_CACHES:=1}"
+: "${DATESTAMP:=$(date +'%y%m%d%H%M%S%N')}"
+: "${LOGDIR:=./results}"
+: "${NCCL_TEST:=0}"
+: "${NCCL_TEST_WALLTIME:=10}"
+: "${RUN_ONLY_NCCL:=0}"
+: "${WORK_DIR:=/opt/nemo-rl}"
+: "${DGXNGPU:=4}"
+: "${DROPCACHE_CMD:="sudo /sbin/sysctl vm.drop_caches=3"}"
+: "${USER_DROPCACHE:=}"
+: "${EXTRA_ASSETS:=}"
+: "${SRUN_KILL_ON_BAD_EXIT:=0}"
+
+# Ray ports: all below the ephemeral range (see port layout in nemo-rl ray.sub)
+: "${OMP_NUM_THREADS:=16}"
+export OMP_NUM_THREADS
+NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
+OBJECT_MANAGER_PORT=${OBJECT_MANAGER_PORT:-53003}
+RUNTIME_ENV_AGENT_PORT=${RUNTIME_ENV_AGENT_PORT:-53005}
+DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
+METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
+PORT=${PORT:-9900}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-9901}
+DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
+DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-10002}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-11000}
+RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-120}
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((DGXNGPU * 16))}
+num_retries=3
+
+if [[ "${DGXNNODES}" -ne "${SLURM_JOB_NUM_NODES}" ]]; then
+    echo "ERROR: DGXNNODES (${DGXNNODES}) != SLURM_JOB_NUM_NODES (${SLURM_JOB_NUM_NODES})" >&2
+    exit 1
+fi
+if [[ "${COLOCATED_GENERATION:-0}" == "1" ]]; then
+    if [[ "${TRAIN_NODES}" -ne "${DGXNNODES}" ]]; then
+        echo "ERROR: colocated TRAIN_NODES (${TRAIN_NODES}) != DGXNNODES (${DGXNNODES})" >&2
+        exit 1
+    fi
+    if [[ "${GEN_NODES}" -ne "${TRAIN_NODES}" ]]; then
+        echo "ERROR: colocated GEN_NODES (${GEN_NODES}) must equal TRAIN_NODES (${TRAIN_NODES})" >&2
+        exit 1
+    fi
+else
+    if [[ "$((TRAIN_NODES + GEN_NODES))" -ne "${DGXNNODES}" ]]; then
+        echo "ERROR: TRAIN_NODES (${TRAIN_NODES}) + GEN_NODES (${GEN_NODES}) != DGXNNODES (${DGXNNODES})" >&2
+        exit 1
+    fi
+fi
+
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+  ulimit -Sn 65535
+fi
+
+# A host uv cache dir would redirect `uv run` away from the image's baked cache
+unset UV_CACHE_DIR
+
+# RUNSUB_DIR is the directory containing the run.sub script
+if [[ "${SLURM_JOB_ID}" ]]; then
+    export RUNSUB_DIR=$(dirname $(scontrol show job "${SLURM_JOB_ID}" | awk -F= '/Command=/{print $2}'))
+else
+    export RUNSUB_DIR=$(dirname "${BASH_SOURCE[0]}")
+fi
+
+PYXIS_DEFAULTS=( '--no-container-mount-home' '--container-remap-root' '--container-writable' )
+
+# --overlap: the EXIT-trap invocation can race still-terminating Ray job steps
+cleanup_pyxis() {
+    srun --overlap --ntasks-per-node=1 /bin/bash -c 'if [[ "$(enroot list)" ]]; then enroot remove -f $(enroot list); fi'
+}
+cleanup_pyxis
+
+# Other vars
+export MODEL_NAME="qwen35_397b_grpo"
+export MODEL_FRAMEWORK="pytorch"
+LOGBASE="${DATESTAMP}"
+export DATESTAMP LOGBASE DGXSYSTEM CONT MLPERF_SCALE MLPERF_CLUSTER_NAME MILESTONE_YML EXTRA_ASSETS
+export SPREFIX="${MODEL_NAME}_${MODEL_FRAMEWORK}_${DGXNNODES}x${DGXNGPU}_${DATESTAMP}"
+
+readonly LOG_FILE_BASE="${LOGDIR}/${LOGBASE}"
+readonly _cont_name="${MODEL_NAME}_${SLURM_JOB_ID}"
+
+# Ray cluster log dir, identity-mounted by config_mounts.sh (the head
+# container touches STARTED_RAY_HEAD on the same path the host polls).
+# LOGDIR must exist before realpath.
+( umask 0002; mkdir -p "${LOGDIR}" )
+# The launcher commonly passes a relative --logdir.  Pyxis requires every
+# host-side mount source to be absolute, so canonicalize it before
+# config_mounts.sh constructs the container mount list.
+export LOGDIR="$(realpath "${LOGDIR}")"
+export RAY_CLUSTER_LOG_DIR="$(realpath ${LOGDIR})/ray-${SLURM_JOB_ID}"
+mkdir -p "${RAY_CLUSTER_LOG_DIR}"
+
+source ${RUNSUB_DIR}/config_mounts.sh
+echo _cont_mounts="${_cont_mounts}"
+
+cleanup_containers() {
+    touch "${RAY_CLUSTER_LOG_DIR}/ENDED" || true
+    cleanup_pyxis
+}
+trap cleanup_containers TERM EXIT
+
+# Setup container (pull once per node)
+srun --ntasks-per-node=1 --container-image="${CONT}" --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" true
+srun -N1 -n1 --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" ibv_devinfo --list || true
+srun -N1 -n1 --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" nvidia-smi topo -m
+
+nvidia-smi
+
+if [[ "${INIT_EXPECTED_MOUNTS:-0}" -eq 1 ]]; then
+    srun -N1 -n1 --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" --container-mounts="${_cont_mounts}" \
+        python3 -m mlperf_common.mountcheck --expected_mounts_csv "${LOGDIR}/${SPREFIX}_expected-mounts.csv" \
+            --mounts_to_verify $mounts_to_verify --initialize
+fi
+
+# Default to 1 once expected-mounts.csv is committed.
+if [[ "${VERIFY_MOUNTS:-0}" -eq 1 ]]; then
+    (srun --ntasks-per-node=1 --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" --container-mounts="${_cont_mounts}" \
+        --container-workdir=/workspace/llm \
+        python3 -m mlperf_common.mountcheck --expected_mounts_csv expected-mounts.csv --mounts_to_verify $mounts_to_verify
+    ) |& tee "${LOGDIR}/${SPREFIX}_mountcheck.log"
+fi
+
+# Sorted hostnames; head node = first. Train/gen placement is done by
+# nemo-rl's virtual cluster; the split only sizes pools via hydra overrides.
+nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sort)
+nodes_array=($nodes)
+head_node=${nodes_array[0]}
+# IPv4 only: `getent hosts` can return an IPv6 link-local address first, which
+# Ray cannot use here. `$IP:$PORT` needs brackets for IPv6, and link-local
+# addresses also need a scope identifier.
+head_node_ip=$(getent ahostsv4 $head_node 2>/dev/null | awk '{ print $1; exit }' || true)
+if [[ -z "$head_node_ip" ]]; then
+    head_node_ip=$(host $head_node 2>/dev/null | awk '/has address/ { print $4 }' | head -1 || true)
+fi
+if [[ -z "$head_node_ip" ]]; then
+    head_node_ip=$head_node
+fi
+ip_head=$head_node_ip:$PORT
+export MASTER_ADDR=$head_node
+echo "using MASTER_ADDR \"${MASTER_ADDR}\" of list \"${SLURM_JOB_NODELIST}\""
+
+echo "NCCL_TEST = ${NCCL_TEST}"
+if [[ ${NCCL_TEST} -eq 1 ]]; then
+    set +e
+    echo "NCCL_TEST_START $(date +%s)"
+    (srun --mpi="${SLURM_MPI_TYPE:-pmix}" \
+          --ntasks-per-node="${DGXNGPU}" \
+          --container-name="${_cont_name}" \
+          "${PYXIS_DEFAULTS[@]}" \
+          --container-mounts="${_cont_mounts}" \
+          --time="${NCCL_TEST_WALLTIME}" \
+          all_reduce_perf_mpi -b 16M -e 4G -f 2)
+    echo "NCCL_TEST_STOP $(date +%s)"
+    set -e
+fi
+if [ ${RUN_ONLY_NCCL} -gt 0 ]; then
+    exit 0
+fi
+
+########################################################
+# Ray cluster bringup (ported from nemo-rl ray.sub)
+########################################################
+GRES_ARG=""
+if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
+    GRES_ARG="--gres=gpu:${DGXNGPU}"
+fi
+
+COMMON_SRUN_ARGS="$GRES_ARG"
+COMMON_SRUN_ARGS+=" --mpi=${SLURM_MPI_TYPE:-pmix}"
+COMMON_SRUN_ARGS+=" --container-mounts=$_cont_mounts"
+COMMON_SRUN_ARGS+=" --container-name=${_cont_name}"
+COMMON_SRUN_ARGS+=" --container-workdir=$WORK_DIR"
+COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
+COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
+
+declare -A SRUN_PIDS
+
+check_srun_processes() {
+  for name in "${!SRUN_PIDS[@]}"; do
+    pid="${SRUN_PIDS[$name]}"
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[ERROR] Background srun '$name' died (pid=$pid). Attempting to exit." >&2
+      touch "$RAY_CLUSTER_LOG_DIR/ENDED"
+      exit 1
+    fi
+  done
+}
+
+# NVLink/topology probe embedded into Ray --resources; key names must stay
+# in sync with nemo_rl/distributed/virtual_cluster.py.
+TOPO_PROBE_SCRIPT="$RAY_CLUSTER_LOG_DIR/topology_probe.sh"
+cat > "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
+CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
+if [[ -z "\$CLUSTER_UUID" ]]; then
+  CLUSTER_UUID=""
+fi
+
+TOPO_RANK=""
+if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "block.node" ]]; then
+  _block_part="\${SLURM_TOPOLOGY_ADDR%%.*}"
+  _node_part="\${SLURM_TOPOLOGY_ADDR##*.}"
+  _block_digits=\$(echo "\$_block_part" | tr -dc '0-9')
+  _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
+  if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
+    TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
+  fi
+elif [[ -n "\${SLURM_PROCID:-}" ]]; then
+  TOPO_RANK=\$(( 10#\$SLURM_PROCID ))
+else
+  _hostname_digits=\$(hostname | tr -dc '0-9')
+  if [[ -n "\$_hostname_digits" ]]; then
+    TOPO_RANK=\$(( 10#\$_hostname_digits ))
+  fi
+fi
+
+RAY_RESOURCES='{\"worker_units\": '"$DGXNGPU"', \"slurm_managed_ray_cluster\": 1'
+if [[ -n "\$CLUSTER_UUID" ]]; then
+  RAY_RESOURCES+=', \"nvlink_domain_'\${CLUSTER_UUID}'\": 1'
+fi
+if [[ -n "\$TOPO_RANK" ]]; then
+  RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
+fi
+RAY_RESOURCES+='}'
+export RAY_RESOURCES
+TOPO_PROBE_EOF
+
+ray_node_body=$(cat <<EOF
+exit-dramatically() {
+    pkill -P \$\$ || true
+    kill -TERM 0 || true
+    exit 1
+}
+export -f exit-dramatically
+
+# Apply an optional patch to the baked NeMo-RL source in this node's writable
+# container. This block is expanded by the host before the per-node command is
+# launched, so every Ray node receives the same temporary source change.
+if [[ -n "${NRL_RUNTIME_PATCH_CONTAINER:-}" ]]; then
+  if git -C /opt/nemo-rl apply --check "${NRL_RUNTIME_PATCH_CONTAINER:-}"; then
+    git -C /opt/nemo-rl apply "${NRL_RUNTIME_PATCH_CONTAINER:-}"
+    echo "Applied runtime NeMo-RL patch ${NRL_RUNTIME_PATCH_CONTAINER:-}"
+  elif git -C /opt/nemo-rl apply --reverse --check "${NRL_RUNTIME_PATCH_CONTAINER:-}"; then
+    echo "Runtime NeMo-RL patch already applied"
+  else
+    echo "ERROR: runtime NeMo-RL patch does not apply: ${NRL_RUNTIME_PATCH_CONTAINER:-}" >&2
+    exit 1
+  fi
+fi
+
+monitor-sidecar() {
+  set +x
+  while true; do
+    sleep 60
+    if [[ -f "$RAY_CLUSTER_LOG_DIR/ENDED" ]]; then
+      echo "Detected ENDED file, terminating..."
+      exit-dramatically
+    fi
+  done
+}
+monitor-sidecar &
+
+log-sync-sidecar() {
+  set +x
+  mkdir -p $RAY_CLUSTER_LOG_DIR/ray/\$(hostname)
+  while true; do
+    sleep $RAY_LOG_SYNC_FREQUENCY
+    if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
+      for session_dir in /tmp/ray/session_[0-9]*/; do
+        if [[ -d "\$session_dir/logs" ]]; then
+          session_name=\$(basename "\$session_dir")
+          mkdir -p "$RAY_CLUSTER_LOG_DIR/ray/\$(hostname)/\$session_name"
+          rsync -ahP "\$session_dir/logs/" "$RAY_CLUSTER_LOG_DIR/ray/\$(hostname)/\$session_name/logs/" 2>/dev/null || true
+        fi
+      done
+    fi
+    if [[ -f "$RAY_CLUSTER_LOG_DIR/ENDED" ]]; then
+      echo "Log sync sidecar terminating..."
+      break
+    fi
+  done
+}
+log-sync-sidecar &
+
+# Patch ray's nsight.py so nsys profiles use the real py_executable
+sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py || true
+
+source $RAY_CLUSTER_LOG_DIR/topology_probe.sh
+EOF
+)
+
+head_cmd=$(cat <<EOF
+touch $RAY_CLUSTER_LOG_DIR/STARTED_RAY_HEAD
+$ray_node_body
+
+cat <<EOFINNER | tee /launch-head.sh
+ray stop --force || true
+rm -rf /tmp/ray/session_latest /tmp/ray/session_[0-9]* || true
+ray start --head \
+    --disable-usage-stats \
+    --resources="\$RAY_RESOURCES" \
+    --node-ip-address="$head_node_ip" \
+    --port=${PORT} \
+    --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
+    --dashboard-port=${DASHBOARD_PORT} \
+    --dashboard-host="$head_node_ip" \
+    --include-dashboard=True \
+    --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
+    --object-manager-port=$((${OBJECT_MANAGER_PORT} + 1)) \
+    --runtime-env-agent-port=$((${RUNTIME_ENV_AGENT_PORT} + 1)) \
+    --dashboard-agent-grpc-port=$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \
+    --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
+    --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
+    --block
+EOFINNER
+chmod +x /launch-head.sh
+
+count=0
+while [[ \$count -lt $num_retries ]]; do
+  bash /launch-head.sh
+  count=\$((count+1))
+  echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
+  sleep 5
+done
+touch $RAY_CLUSTER_LOG_DIR/ENDED
+exit 1
+EOF
+)
+srun $COMMON_SRUN_ARGS "${PYXIS_DEFAULTS[@]}" --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $RAY_CLUSTER_LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
+SRUN_PIDS["ray-head"]=$!
+
+NUM_ACTORS=$((DGXNGPU * SLURM_JOB_NUM_NODES))
+
+for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
+  node_i=${nodes_array[$i]}
+  worker_cmd=$(cat <<EOF
+$ray_node_body
+
+cat <<EOFINNER | tee /launch-worker.sh
+ray stop --force || true
+rm -rf /tmp/ray/session_latest /tmp/ray/session_[0-9]* || true
+ray start --address "$ip_head" \
+          --disable-usage-stats \
+          --resources="\$RAY_RESOURCES" \
+          --min-worker-port=${MIN_WORKER_PORT} \
+          --max-worker-port=${MAX_WORKER_PORT} \
+          --node-manager-port=${NODE_MANAGER_PORT} \
+          --object-manager-port=${OBJECT_MANAGER_PORT} \
+          --runtime-env-agent-port=${RUNTIME_ENV_AGENT_PORT} \
+          --dashboard-agent-grpc-port=${DASHBOARD_AGENT_GRPC_PORT} \
+          --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} \
+          --metrics-export-port=${METRICS_EXPORT_PORT} \
+          --block
+EOFINNER
+
+count=0
+while [[ \$count -lt $num_retries ]]; do
+  bash /launch-worker.sh
+  count=\$((count+1))
+  echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
+  sleep 5
+done
+touch $RAY_CLUSTER_LOG_DIR/ENDED
+exit 1
+EOF
+)
+  srun $COMMON_SRUN_ARGS "${PYXIS_DEFAULTS[@]}" --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $RAY_CLUSTER_LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
+  SRUN_PIDS["ray-worker-$i"]=$!
+  sleep 1
+done
+
+# Wait for the head container to start
+while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_node test -f $RAY_CLUSTER_LOG_DIR/STARTED_RAY_HEAD; do
+  echo "[INFO][$(date)] Waiting for head node container to start..."
+  sleep 2
+done
+
+# Wait for all worker_units (GPUs) to join the Ray cluster
+extract_worker_units() {
+  status_output=$(srun --overlap --container-name=${_cont_name} "${PYXIS_DEFAULTS[@]}" --nodes=1 --ntasks=1 -w "$head_node" ray status)
+  if echo "$status_output" | grep -q "worker_units"; then
+    worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
+    echo $worker_units
+  else
+    echo 0
+  fi
+}
+
+while true; do
+  worker_units=$(extract_worker_units)
+  echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
+  if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
+    break
+  fi
+  check_srun_processes
+  sleep 2
+done
+
+echo "All Ray workers connected!"
+
+echo "PROLOG_STOP $(date +%s)"
+
+if [[ "${USER_DROPCACHE:-}" ]]; then
+    DROPCACHE_CMD="${USER_DROPCACHE}"
+fi
+
+# The Ray cluster stays up across experiments; each experiment runs a fresh driver
+for _experiment_index in $(seq -w 1 "${NEXP}"); do
+    echo "EXPERIMENT_START $(date +%s)"
+
+    export _experiment_index
+    (
+        echo "Beginning trial ${_experiment_index} of ${NEXP}"
+
+        # Save environment vars
+        export -p > "${LOGDIR}/${SLURM_JOB_ID}_${_experiment_index}.env"
+
+        echo ":::DLPAL ${CONT} ${SLURM_JOB_ID} ${SLURM_JOB_NUM_NODES} ${SLURM_JOB_NODELIST} ${MLPERF_CLUSTER_NAME} ${DGXSYSTEM}"
+        echo ":::SYSJSON $(srun -N1 -n1 --overlap --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" mlperf-sysjson.sh)"
+        srun -N1 -n1 --overlap --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" bash -c 'echo ":::GITCOMMITID ${GIT_COMMIT_ID} ${LAUNCHER_GIT_COMMIT_ID}"'
+
+        export SEED=$(($SEED_BASE - 1 + 10#$_experiment_index))  # `10#` makes sure we interpret number in base 10
+        export MLPERF_MLLOG_FILE="/results/${LOGBASE}_${_experiment_index}_mllog.log"
+
+        # Clear caches. --overlap is required on every srun while the Ray job
+        # steps are alive (they hold the allocation's CPUs) or it deadlocks.
+        if [ "${CLEAR_CACHES}" -eq 1 ]; then
+            srun --overlap --ntasks-per-node=1 bash -c '
+                 host=$(hostname)
+                 echo "$host sync_start"
+                 sync && echo "$host sync_done"
+                 cache_before=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 '"${DROPCACHE_CMD}"'
+                 cache_after=$(awk "/^Cached:/ {print \$2}" /proc/meminfo)
+                 echo "$host cache_cleared ${cache_before}kB to ${cache_after}kB"
+            '
+            srun -N1 -n1 --overlap --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" --container-mounts="${_cont_mounts}" \
+                --container-workdir=/workspace/llm \
+                python -c "
+from callback_logging import mllogger
+mllogger.event(key=mllogger.constants.CACHE_CLEAR, value=True)"
+        fi
+
+        # Run the driver ONCE on the Ray head node (not per rank/GPU)
+        set +e
+        echo "RUNANDTIME_START $(date +%s)"
+        srun -N1 -n1 --overlap \
+             --time="${WALLTIME_RUNANDTIME}" \
+             --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" \
+             --container-mounts="${_cont_mounts}" \
+             --container-workdir=${WORK_DIR} \
+             -w "$head_node" \
+             bash /workspace/llm/run_and_time.sh
+        RUN_AND_TIME_EXIT_STATUS=$?
+        echo "RUNANDTIME_STOP $(date +%s)"
+        echo "${RUN_AND_TIME_EXIT_STATUS}" > "/tmp/run_and_time_exit_status_${SLURM_JOB_ID}_${_experiment_index}.txt"
+        set -e
+
+    ) |& tee "${LOG_FILE_BASE}_${_experiment_index}.log"
+
+    RUN_AND_TIME_EXIT_STATUS=$(cat "/tmp/run_and_time_exit_status_${SLURM_JOB_ID}_${_experiment_index}.txt" 2>/dev/null || echo "255")
+
+    # Compliance runs on the tee'd console log: only it contains BOTH the
+    # run.sub-side events (CACHE_CLEAR) and the driver's mllog stdout lines.
+    if [[ "${CHECK_COMPLIANCE}" -eq 1 ]]; then
+      srun -N1 -n1 --overlap --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" \
+           --container-mounts="$(realpath ${LOGDIR}):/results" \
+           --container-workdir="/results" \
+           python3 -m mlperf_logging.compliance_checker --usage training \
+           --ruleset "${MLPERF_RULESET}" \
+           --log_output "/results/compliance_${DATESTAMP}.out" \
+           "/results/${LOGBASE}_${_experiment_index}.log" \
+      || true
+      EXTRA_ASSETS="${EXTRA_ASSETS} --asset /results/compliance_${DATESTAMP}.out"
+    fi
+
+    if [ "${JET:-0}" -eq 1 ]; then # JET START
+      _JET_CREATE="${JET_CREATE:-} --data origin=${JET_ORIGIN:-"mlperf-manual"} \
+        --data workload.spec.nodes=${DGXNNODES} \
+        --data workload.spec.name=${MODEL_NAME} \
+        --data workload.spec.framework=${MODEL_FRAMEWORK} \
+        --data workload.spec.scale=${MLPERF_SCALE} \
+        --data workload.spec.platform=${DGXSYSTEM} \
+        --data workload.spec.cluster=${MLPERF_CLUSTER_NAME} \
+        --data workload.key=${MODEL_NAME}_${MODEL_FRAMEWORK}_${DGXSYSTEM} \
+        --data workload.spec.datestamp=${DATESTAMP} \
+        --data workload.spec.experiment_index=${_experiment_index} \
+        --data workload.spec.milestone_yml=${MILESTONE_YML} \
+        --data workload.spec.label=${JET_LABEL:-""} \
+        --data duration=$(sacct -j $SLURM_JOB_ID -X --format=ElapsedRaw --noheader | awk '{$1=$1; print}' ) \
+        --mllogger /results/${LOGBASE}_${_experiment_index}.log \
+        --asset /results/${LOGBASE}_${_experiment_index}_mllog.log \
+        --asset /results/slurm-${SLURM_JOB_ID}.out \
+        --data source_image.name=${CONT} \
+        --data slurm.job=${SLURM_JOB_ID} \
+        --data slurm.exit_code=${RUN_AND_TIME_EXIT_STATUS} \
+        --data system.env.NEMO_RL_COMMIT_HASH=\$(cat /NEMO_RL_COMMIT_HASH.env) \
+        --data system.env.NEMO_GYM_COMMIT_HASH=\$(cat /NEMO_GYM_COMMIT_HASH.env) \
+        --data system.env.MBRIDGE_COMMIT_HASH=\$(cat /MBRIDGE_COMMIT_HASH.env) \
+        ${EXTRA_ASSETS}"
+
+      srun -N1 -n1 --overlap \
+        --container-name="${_cont_name}" "${PYXIS_DEFAULTS[@]}" \
+        --container-mounts="${_cont_mounts}" \
+        bash -c "${_JET_CREATE} && ${JET_UPLOAD} && rm output.zip"
+    fi # JET END
+
+    echo "EXPERIMENT_STOP $(date +%s)"
+    if [[ "${RUN_AND_TIME_EXIT_STATUS}" -ne 0 ]]; then
+        exit "${RUN_AND_TIME_EXIT_STATUS}"
+    fi
+done
+
+# Tear down the Ray cluster (sidecars watch for the ENDED file)
+touch "${RAY_CLUSTER_LOG_DIR}/ENDED"
+sleep 5

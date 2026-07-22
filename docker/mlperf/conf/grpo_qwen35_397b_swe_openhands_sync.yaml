@@ -1,0 +1,57 @@
+# Qwen 3.5 SWE/OpenHands synchronous GRPO recipe.
+#
+# Keep the benchmark shape and runtime settings aligned with the async recipe;
+# only the GRPO mode, colocated resource declaration, and optimizer-state
+# precision differ for this run.
+
+defaults: grpo_qwen35_397b_swe_openhands_async_gbs256.yaml
+
+grpo:
+  async_grpo:
+    enabled: false
+
+logger:
+  # Keep optimizer dtype names serializable for checkpoint metadata and hparams;
+  # NeMo-RL resolves them to torch.dtype only at the Megatron boundary.
+  tensorboard_enabled: true
+
+policy:
+  megatron_cfg:
+    optimizer:
+      # Follow the precision-aware optimizer layout used by grpo-studies:
+      # BF16 gradients and Adam moments, with FP32 master parameters.
+      bf16: true
+      fp16: false
+      use_precision_aware_optimizer: true
+      main_params_dtype: fp32
+      main_grads_dtype: bfloat16
+      exp_avg_dtype: bfloat16
+      exp_avg_sq_dtype: bfloat16
+    env_vars:
+      # The colocated refit path imports policy weight buffers via CUDA IPC.
+      # expandable_segments allocations fail at that boundary on this stack
+      # with pidfd_getfd: Bad file descriptor; keep ordinary CUDA IPC buffers
+      # for the colocated run.
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+  generation:
+    vllm_cfg:
+      # NeMo-Gym's Responses API rollout path requires vLLM's async engine.
+      # "Sync" here means non-async GRPO scheduling (async_grpo.enabled=false)
+      # with colocated policy/generation resources, not a synchronous vLLM
+      # engine.  The colocated refit still uses CUDA IPC.
+      async_engine: true
+      gpu_memory_utilization: 0.60
+    vllm_kwargs:
+      # Validated vLLM throughput settings for the Qwen 3.5 rollout path.
+      max_num_batched_tokens: 16384
+      performance_mode: throughput
+      compilation_config:
+        # FULL_AND_PIECEWISE requires VLLM_COMPILE; mode 0 overrides it to NONE.
+        mode: VLLM_COMPILE
+        backend: inductor
+        cudagraph_mode: FULL_AND_PIECEWISE
+    colocated:
+      enabled: true
+      resources:
+        num_nodes: 16
+        gpus_per_node: 4

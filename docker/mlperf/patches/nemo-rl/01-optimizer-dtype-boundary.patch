@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: NVIDIA MLPerf Training <mlperf-training@nvidia.com>
+Subject: [PATCH] Normalize optimizer dtype names at the MCore boundary
+
+Keep the high-level NeMo-RL config serializable for checkpoint metadata and
+TensorBoard hparams while passing torch.dtype values to Megatron Core.
+
+Upstream status: local carry for the Qwen 3.5 recipe; no upstream PR yet.
+---
+ nemo_rl/models/megatron/setup.py | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/nemo_rl/models/megatron/setup.py b/nemo_rl/models/megatron/setup.py
+--- a/nemo_rl/models/megatron/setup.py
++++ b/nemo_rl/models/megatron/setup.py
+@@ -951,3 +951,26 @@ def _validate_dtype_config(
+ 
+ 
++def _normalize_optimizer_dtypes(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
++    """Convert serializable dtype names to torch.dtype at the MCore boundary."""
++    normalized = dict(optimizer_cfg)
++    dtype_map = {
++        "float32": torch.float32,
++        "fp32": torch.float32,
++        "bfloat16": torch.bfloat16,
++        "bf16": torch.bfloat16,
++        "float16": torch.float16,
++        "fp16": torch.float16,
++    }
++    for key in (
++        "main_params_dtype",
++        "main_grads_dtype",
++        "exp_avg_dtype",
++        "exp_avg_sq_dtype",
++    ):
++        value = normalized.get(key)
++        if isinstance(value, str):
++            normalized[key] = dtype_map[value.lower()]
++    return normalized
++
++
+ def _create_megatron_config(
+@@ -973,5 +996,5 @@ def _create_megatron_config(
+     optimizer_kwargs = {
+-        **config["megatron_cfg"]["optimizer"],
++        **_normalize_optimizer_dtypes(config["megatron_cfg"]["optimizer"]),
+         "overlap_param_gather": overlap_param_gather,
+         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
+     }

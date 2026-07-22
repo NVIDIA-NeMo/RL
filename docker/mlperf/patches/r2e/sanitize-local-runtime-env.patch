@@ -1,0 +1,52 @@
+From 96252d0fafa94b09b5c3a8bddc00789a9d365f1b Mon Sep 17 00:00:00 2001
+Subject: [PATCH] r2e: isolate testbed Python from the harness environment
+
+Applies to nv-R2E-Gym 6823e64f94ae645f5265c03af0eb2e8523530a0d.
+This replaces the previous full-file local.py overlay with only the environment
+sanitization required to avoid false-zero rewards on Python 3.8 testbeds.
+---
+diff --git a/src/r2egym/agenthub/runtime/local.py b/src/r2egym/agenthub/runtime/local.py
+--- a/src/r2egym/agenthub/runtime/local.py
++++ b/src/r2egym/agenthub/runtime/local.py
+@@ -124,12 +124,22 @@ class LocalRuntime(Runtime):
+         def run_command():
+             nonlocal exec_result, process, exception
+             try:
++                # The eval harness's Python environment must not leak into the
++                # repository testbed subprocess.
++                import os as _os
++
++                _clean_env = {
++                    key: value
++                    for key, value in _os.environ.items()
++                    if key not in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP")
++                }
+                 process = subprocess.Popen(
+                     cmd,
+                     shell=True,
+                     stdout=subprocess.PIPE,
+                     stderr=subprocess.STDOUT,
+-                    text=False
++                    text=False,
++                    env=_clean_env,
+                 )
+                 exec_result, _ = process.communicate()
+             except Exception as e:
+@@ -216,3 +226,17 @@ class LocalRuntime(Runtime):
+ 
+     def close(self):
+         pass
++
++    def run_tests(self, timeout: int = 300) -> tuple[str, str]:
++        # Remove stale build-time paths from testbed virtual environments and
++        # repeat the interpreter-variable isolation at the shell boundary.
++        self.run(
++            "grep -ls r2egym_setup /testbed/.venv/lib/*/site-packages/*.pth"
++            " 2>/dev/null | xargs -r rm -f"
++        )
++        output, error_code = self.run(
++            f"env -u PYTHONPATH -u PYTHONHOME bash {self.alt_path}/run_tests.sh",
++            timeout=timeout,
++        )
++        output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
++        return output, error_code

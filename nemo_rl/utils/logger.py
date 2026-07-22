@@ -78,7 +78,7 @@ class GPUMonitoringConfig(TypedDict):
 class MLPerfLoggerConfig(TypedDict):
     enabled: NotRequired[bool]
     benchmark: NotRequired[str]
-    target_accuracy: NotRequired[float]
+    target_accuracy: NotRequired[float | None]
     force_success_status: NotRequired[bool]
     log_file: NotRequired[str]
 

@@ -1,0 +1,16 @@
+# Qwen 3.5 SWE/OpenHands RCP profile: GBS256 (16 prompts x 16 generations).
+
+defaults: grpo_qwen35_397b_swe_openhands_async.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 16
+  max_num_steps: 30
+  val_start_at: 20
+
+policy:
+  max_grad_norm: 0.125
+  megatron_cfg:
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-6

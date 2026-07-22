@@ -1,0 +1,181 @@
+From c8b7f52d402eed496063fe36415ce9cf3db315b3 Mon Sep 17 00:00:00 2001
+From: Jeremi Piotrowski <jpiotrowski@nvidia.com>
+Date: Fri, 17 Jul 2026 17:06:51 +0200
+Subject: [PATCH] grpo: support delayed periodic validation
+
+Apply the same validation-start gate to the legacy synchronous, asynchronous,
+and TransferQueue synchronous trainers. Adapted to NeMo-RL
+41352f74610762cd2f3014533be27f4c30f8524e from
+33bae24adbeba76a685617f89ff31604505e3a1a.
+---
+diff --git a/examples/configs/grpo_math_1B.yaml b/examples/configs/grpo_math_1B.yaml
+--- a/examples/configs/grpo_math_1B.yaml
++++ b/examples/configs/grpo_math_1B.yaml
+@@ -8,6 +8,7 @@ grpo:
+   normalize_rewards: true
+   use_leave_one_out_baseline: true
+   val_period: 10
++  val_start_at: 0
+   val_at_start: false
+   val_at_end: false
+   overlong_filtering: false
+diff --git a/examples/nemo_gym/grpo_nanov3.yaml b/examples/nemo_gym/grpo_nanov3.yaml
+--- a/examples/nemo_gym/grpo_nanov3.yaml
++++ b/examples/nemo_gym/grpo_nanov3.yaml
+@@ -8,6 +8,7 @@ grpo:
+   normalize_rewards: true
+   use_leave_one_out_baseline: true
+   val_period: 5
++  val_start_at: 0
+   val_at_start: False
+   val_at_end: False
+   overlong_filtering: true
+diff --git a/examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml b/examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
+--- a/examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
++++ b/examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
+@@ -24,6 +24,7 @@ grpo:
+   normalize_rewards: true
+   use_leave_one_out_baseline: true
+   val_period: 5                     # LEARNING: validate every 5 steps -> ~the curve
++  val_start_at: 0
+   val_at_start: true                # SMOKE-TEST: was false (run one validation pass up front to check the score)
+   val_at_end: true                  # SMOKE-TEST: was false (also score after the 2 training steps)
+   overlong_filtering: true          # zero loss for trajectories truncated at 80k
+diff --git a/examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml b/examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+--- a/examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
++++ b/examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+@@ -6,7 +6,8 @@ grpo:
+   max_num_steps: 1000000
+   normalize_rewards: true
+   use_leave_one_out_baseline: true
+   val_period: 10
++  val_start_at: 0
+   val_at_start: true
+   val_at_end: false
+   overlong_filtering: false
+diff --git a/examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml b/examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml
+--- a/examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml
++++ b/examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml
+@@ -21,7 +21,8 @@ grpo:
+   use_leave_one_out_baseline: true
+   advantage_clip_low: -50
+   advantage_clip_high: 50
+   val_period: -1
++  val_start_at: 0
+   val_at_start: false
+   val_at_end: false
+   overlong_filtering: false
+diff --git a/examples/nemo_gym/nemotron-3-super/stage2_swe1.yaml b/examples/nemo_gym/nemotron-3-super/stage2_swe1.yaml
+--- a/examples/nemo_gym/nemotron-3-super/stage2_swe1.yaml
++++ b/examples/nemo_gym/nemotron-3-super/stage2_swe1.yaml
+@@ -21,7 +21,8 @@ grpo:
+   use_leave_one_out_baseline: true
+   advantage_clip_low: -100
+   advantage_clip_high: 100
+   val_period: 10
++  val_start_at: 0
+   val_at_start: false
+   val_at_end: false
+   overlong_filtering: true
+diff --git a/examples/nemo_gym/nemotron-3-super/stage2_swe2.yaml b/examples/nemo_gym/nemotron-3-super/stage2_swe2.yaml
+--- a/examples/nemo_gym/nemotron-3-super/stage2_swe2.yaml
++++ b/examples/nemo_gym/nemotron-3-super/stage2_swe2.yaml
+@@ -21,7 +21,8 @@ grpo:
+   use_leave_one_out_baseline: true
+   advantage_clip_low: -100
+   advantage_clip_high: 100
+   val_period: 100
++  val_start_at: 0
+   val_at_start: false
+   val_at_end: false
+   overlong_filtering: true
+diff --git a/examples/nemo_gym/nemotron-3-super/stage3_rlhf.yaml b/examples/nemo_gym/nemotron-3-super/stage3_rlhf.yaml
+--- a/examples/nemo_gym/nemotron-3-super/stage3_rlhf.yaml
++++ b/examples/nemo_gym/nemotron-3-super/stage3_rlhf.yaml
+@@ -21,7 +21,8 @@ grpo:
+   use_leave_one_out_baseline: true
+   advantage_clip_low: -50
+   advantage_clip_high: 50
+   val_period: 10000
++  val_start_at: 0
+   val_at_start: false
+   val_at_end: false
+   overlong_filtering: false
+diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
+--- a/nemo_rl/algorithms/grpo.py
++++ b/nemo_rl/algorithms/grpo.py
+@@ -183,6 +183,8 @@ class GRPOConfig(TypedDict):
+     advantage_clip_high: NotRequired[float | None]
+     use_leave_one_out_baseline: bool
+     val_period: int
++    # Earliest training step eligible for periodic validation.
++    val_start_at: int
+     val_batch_size: int | None  # None for NeMo-Gym compatibility
+     val_at_start: bool
+     # Whether to run validation on the last training step. Setting this to True ensures the
+@@ -2258,6 +2260,7 @@ def grpo_train(
+     val_at_start = master_config.grpo["val_at_start"]
+     val_at_end = master_config.grpo["val_at_end"]
+     val_period = master_config.grpo["val_period"]
++    val_start_at = master_config.grpo["val_start_at"]
+     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+     refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
+ 
+@@ -2861,8 +2864,10 @@ def grpo_train(
+ 
+                 # Run validation if it's a validation step or last step with val_at_end
+-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
+-                    val_at_end and is_last_step
+-                ):
++                if (
++                    val_period > 0
++                    and total_steps + 1 >= val_start_at
++                    and (total_steps + 1) % val_period == 0
++                ) or (val_at_end and is_last_step):
+                     memory_tracker.snapshot_start_of_stage("Validation", dir())
+                     if NEED_REFIT and POLICY_GENERATION_STALE:
+                         refit_policy_generation(
+@@ -3567,6 +3569,7 @@ def async_grpo_train(
+         "total_valid_tokens", 0
+     )  # Default to 0 for backward compatibility with older checkpoints
+     val_period = master_config.grpo["val_period"]
++    val_start_at = master_config.grpo["val_start_at"]
+     val_at_start = master_config.grpo["val_at_start"]
+     val_at_end = master_config.grpo["val_at_end"]
+     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+@@ -4213,7 +4216,11 @@ def async_grpo_train(
+                 is_last_step = step + 1 == master_config.grpo["max_num_steps"]
+ 
+                 # Run validation if it's a validation step or last step with val_at_end
+-                if (val_period > 0 and (step + 1) % val_period == 0) or (
++                if (
++                    val_period > 0
++                    and step + 1 >= val_start_at
++                    and (step + 1) % val_period == 0
++                ) or (
+                     val_at_end and is_last_step
+                 ):
+                     # Pause trajectory collection during validation to reduce memory pressure
+diff --git a/nemo_rl/algorithms/grpo_sync.py b/nemo_rl/algorithms/grpo_sync.py
+--- a/nemo_rl/algorithms/grpo_sync.py
++++ b/nemo_rl/algorithms/grpo_sync.py
+@@ -434,5 +434,6 @@ def grpo_train_sync(
+     val_at_start = master_config.grpo["val_at_start"]
+     val_at_end = master_config.grpo["val_at_end"]
+     val_period = master_config.grpo["val_period"]
++    val_start_at = master_config.grpo["val_start_at"]
+     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+ 
+@@ -960,7 +961,11 @@ def grpo_train_sync(
+                         and (current_step + 1 == len(wrapped_dataloader))
+                     )
+ 
+-                if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
++                if (
++                    val_period > 0
++                    and total_steps + 1 >= val_start_at
++                    and (total_steps + 1) % val_period == 0
++                ) or (
+                     val_at_end and is_last_step
+                 ):
+                     memory_tracker.snapshot_start_of_stage("Validation", dir())

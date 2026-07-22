@@ -25,6 +25,7 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 5                     # LEARNING: validate every 5 steps -> ~the curve
+  val_start_at: 0
   val_at_start: true                # SMOKE-TEST: was false (run one validation pass up front to check the score)
   val_at_end: true                  # SMOKE-TEST: was false (also score after the 2 training steps)
   overlong_filtering: true          # zero loss for trajectories truncated at 80k
@@ -363,4 +364,3 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 16   # 16 = DP1 minimum; 32 = DP2 for ~2x training throughput
-

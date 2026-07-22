@@ -15,93 +15,12 @@ index e248038..2ad2e92 100644
      debug: bool = False
  
  
-@@ -511,9 +517,92 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
+@@ -511,9 +517,11 @@ EVAL_HARNESS_COMMIT={eval_harness_commit} \\
              f'export UV_INSTALL_DIR="{self.config.r2e_gym_setup_dir}/uv" && '
              f'export UV_PYTHON_INSTALL_DIR="{self.config.r2e_gym_setup_dir}/python" && '
              f'export PATH="{self.config.r2e_gym_setup_dir}/uv/bin:$PATH" && '
++            # R2E-Gym compatibility imports are patched once by setup_scripts/r2e_gym.sh.
 +            f'export PYTHONPATH="/r2egym_setup/R2E-Gym/venv/lib/python3.12/site-packages:{self.config.r2e_gym_setup_dir}/R2E-Gym/venv/lib/python3.12/site-packages:/r2egym_setup/R2E-Gym/src:{self.config.r2e_gym_setup_dir}/R2E-Gym/src:$PYTHONPATH" && '
-+            r"""python - <<'PY_R2E_RUNTIME' || true
-+from pathlib import Path
-+
-+path = Path('/r2egym_setup/R2E-Gym/src/r2egym/agenthub/runtime/docker.py')
-+if path.exists():
-+    text = path.read_text()
-+
-+    old_import = "import docker\nfrom docker.models.containers import Container\n"
-+    new_import = (
-+        "try:\n"
-+        "    import docker\n"
-+        "    from docker.models.containers import Container\n"
-+        "except ModuleNotFoundError:\n"
-+        "    docker = None\n"
-+        "\n"
-+        "    class Container:  # type: ignore[no-redef]\n"
-+        "        pass\n"
-+    )
-+    if old_import in text:
-+        text = text.replace(old_import, new_import, 1)
-+
-+    old_second = "\nimport docker\nimport kubernetes\n"
-+    new_second = (
-+        "\n"
-+        "try:\n"
-+        "    import docker as _docker_sdk\n"
-+        "except ModuleNotFoundError:\n"
-+        "    _docker_sdk = None\n"
-+        "else:\n"
-+        "    docker = _docker_sdk\n"
-+        "try:\n"
-+        "    import kubernetes\n"
-+        "except ModuleNotFoundError:\n"
-+        "    kubernetes = None\n"
-+    )
-+    if old_second in text:
-+        text = text.replace(old_second, new_second, 1)
-+
-+    old_from_env = "        if self.backend == \"docker\":\n            self.client = docker.from_env(timeout=120)\n"
-+    new_from_env = (
-+        "        if self.backend == \"docker\":\n"
-+        "            if docker is None:\n"
-+        "                raise RuntimeError(\"Docker SDK is required only when DockerRuntime backend is selected\")\n"
-+        "            self.client = docker.from_env(timeout=120)\n"
-+    )
-+    if old_from_env in text:
-+        text = text.replace(old_from_env, new_from_env, 1)
-+
-+    path.write_text(text)
-+
-+utils_path = Path('/r2egym_setup/R2E-Gym/src/r2egym/agenthub/utils/utils.py')
-+if utils_path.exists():
-+    text = utils_path.read_text()
-+    old_openai = "import openai\n"
-+    new_openai = (
-+        "try:\n"
-+        "    import openai\n"
-+        "except ModuleNotFoundError:\n"
-+        "    openai = None\n"
-+    )
-+    if old_openai in text:
-+        text = text.replace(old_openai, new_openai, 1)
-+        utils_path.write_text(text)
-+
-+log_path = Path('/r2egym_setup/R2E-Gym/src/r2egym/agenthub/utils/log.py')
-+if log_path.exists():
-+    text = log_path.read_text()
-+    old_rich = "from rich.logging import RichHandler\n"
-+    new_rich = (
-+        "try:\n"
-+        "    from rich.logging import RichHandler\n"
-+        "except ModuleNotFoundError:\n"
-+        "    import logging\n"
-+        "\n"
-+        "    class RichHandler(logging.StreamHandler):  # type: ignore[no-redef]\n"
-+        "        pass\n"
-+    )
-+    if old_rich in text:
-+        text = text.replace(old_rich, new_rich, 1)
-+        log_path.write_text(text)
-+PY_R2E_RUNTIME
-+"""
              # Run with clean environment to avoid venv contamination
 -            # Use the pre-built venv directly with its absolute path
 -            f"env -u VIRTUAL_ENV {self.config.r2e_gym_setup_dir}/R2E-Gym/venv/bin/python src/r2egym/agenthub/run/run_local_evaluation.py "
@@ -267,7 +186,7 @@ diff --git a/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh b/response
 index 7c00229..e2b2536 100755
 --- a/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
 +++ b/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
-@@ -40,6 +40,88 @@ cd $r2e_gym_dir
+@@ -40,6 +40,89 @@ cd $r2e_gym_dir
  echo "Checking out $eval_harness_commit..."
  git checkout $eval_harness_commit
  
@@ -334,7 +253,8 @@ index 7c00229..e2b2536 100755
 +    import logging
 +
 +    class RichHandler(logging.StreamHandler):  # type: ignore[no-redef]
-+        pass
++        def __init__(self, *args, **kwargs):
++            super().__init__()
 +"""
 +if old_rich in text:
 +    text = text.replace(old_rich, new_rich, 1)

@@ -1,0 +1,42 @@
+From 545ac643f2a1e0bcccaed2eb009cf15f164fe223 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] gym: bound transient server disconnect retries
+
+Qualified in Qwen source `6cb9b79189e250396f9ccbeaae37f77a2ae5fe37`
+and applied to Gym
+610a08ab5fe9f8f5fb5fff36b170429ea67f0f92. This replaces the previous
+full-file server_utils.py overlay with the exact missing behavior.
+---
+diff --git a/nemo_gym/server_utils.py b/nemo_gym/server_utils.py
+--- a/nemo_gym/server_utils.py
++++ b/nemo_gym/server_utils.py
+@@ -149,4 +149,7 @@
+ # This is not intended to be changed. If you want to increase this, we should probably figure out how to improve server-side robustness.
+ MAX_NUM_TRIES = 3
+-
++TRANSIENT_RETRY_SECONDS = float(
++    getenv("NEMO_GYM_TRANSIENT_RETRY_SECONDS", "120")
++)
++
+ _NUM_SERVER_DISCONNECTED_ERROR: int = 0
+@@ -185,7 +188,9 @@
+                 print(
+                     f"[request_retry url={url} error=ServerDisconnectedError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f}] "
+                     f"Hit {_NUM_SERVER_DISCONNECTED_ERROR} global `ServerDisconnectedError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
+                     flush=True,
+                 )
+-
++            if time.monotonic() - retry_start > TRANSIENT_RETRY_SECONDS:
++                raise
++
+             await asyncio.sleep(0.5)
+@@ -197,7 +202,9 @@
+                 print(
+                     f"[request_retry url={url} error=ClientOSError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f}] "
+                     f"Hit {_NUM_CLIENT_OS_ERROR} global `ClientOSError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
+                     flush=True,
+                 )
+-
++            if time.monotonic() - retry_start > TRANSIENT_RETRY_SECONDS:
++                raise
++
+             await asyncio.sleep(0.5)

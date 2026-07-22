@@ -950,6 +950,29 @@ def _validate_dtype_config(
         )
 
 
+def _normalize_optimizer_dtypes(optimizer_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Convert serializable dtype names to torch.dtype at the MCore boundary."""
+    normalized = dict(optimizer_cfg)
+    dtype_map = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }
+    for key in (
+        "main_params_dtype",
+        "main_grads_dtype",
+        "exp_avg_dtype",
+        "exp_avg_sq_dtype",
+    ):
+        value = normalized.get(key)
+        if isinstance(value, str):
+            normalized[key] = dtype_map[value.lower()]
+    return normalized
+
+
 def _create_megatron_config(
     model_cfg: Any,
     checkpoint_config: CheckpointConfig,
@@ -971,7 +994,7 @@ def _create_megatron_config(
         "overlap_param_gather"
     ]
     optimizer_kwargs = {
-        **config["megatron_cfg"]["optimizer"],
+        **_normalize_optimizer_dtypes(config["megatron_cfg"]["optimizer"]),
         "overlap_param_gather": overlap_param_gather,
         "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
     }

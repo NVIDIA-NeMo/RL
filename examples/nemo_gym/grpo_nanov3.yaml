@@ -9,6 +9,7 @@ grpo:
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 5
+  val_start_at: 0
   val_at_start: False
   val_at_end: False
   overlong_filtering: true

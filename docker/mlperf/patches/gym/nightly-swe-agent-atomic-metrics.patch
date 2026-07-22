@@ -1,0 +1,40 @@
+From fa45760494a2402d290374c7e32a9452b121a866 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] gym: make per-trajectory metrics writes recoverable and atomic
+
+Applies after the existing optimized Gym patches to Gym
+610a08ab5fe9f8f5fb5fff36b170429ea67f0f92.
+---
+diff --git a/responses_api_agents/swe_agents/app.py b/responses_api_agents/swe_agents/app.py
+--- a/responses_api_agents/swe_agents/app.py
++++ b/responses_api_agents/swe_agents/app.py
+@@ -1283,14 +1283,26 @@ def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
+ 
+ 
+ def update_metrics(metrics_fpath: Path, update_dict: Dict[str, Any]) -> None:
+-    with metrics_fpath.open() as f:
+-        existing_dict = json.loads(f.read())
++    try:
++        existing_dict = json.loads(metrics_fpath.read_text())
++    except json.JSONDecodeError:
++        print(
++            f"WARNING: Rebuilding malformed metrics file at {metrics_fpath}",
++            flush=True,
++        )
++        existing_dict = {}
+ 
+     existing_dict = {k: v for k, v in existing_dict.items() if v is not None}
+     update_dict = {k: v for k, v in update_dict.items() if v is not None}
+ 
+-    with metrics_fpath.open("w") as f:
+-        json.dump(existing_dict | update_dict, f)
++    temp_metrics_fpath = metrics_fpath.with_name(
++        f".{metrics_fpath.name}.{uuid.uuid4().hex}.tmp"
++    )
++    try:
++        temp_metrics_fpath.write_text(json.dumps(existing_dict | update_dict))
++        temp_metrics_fpath.replace(metrics_fpath)
++    finally:
++        temp_metrics_fpath.unlink(missing_ok=True)
+ 
+ 
+ # _TOOL_PARAM_BOOL_FIELDS_DEFAULT_FALSE = ("defer_loading",)

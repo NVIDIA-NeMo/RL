@@ -1,0 +1,29 @@
+From ac6c648 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] fla: restrict Blackwell GDN backward autotuning
+
+Backport of upstream fla PR #1000 to the locked fla-core 0.4.2 wheel. This
+retains the existing Blackwell protection without the former 338-line file
+overlay or the separate diagnostic global-autotuner monkey patch.
+---
+diff --git a/fla/ops/gated_delta_rule/wy_fast.py b/fla/ops/gated_delta_rule/wy_fast.py
+--- a/fla/ops/gated_delta_rule/wy_fast.py
++++ b/fla/ops/gated_delta_rule/wy_fast.py
+@@ -110,11 +110,16 @@ def prepare_wy_repr_fwd_kernel(
+     'USE_G': lambda args: args['g'] is not None,
+     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+ })
++# Backport of upstream fla PR #1000 (commit ac6c648, 2026-07-02): Blackwell
++# can select unstable Triton configs for prepare_wy_repr_bwd_kernel during
++# autotuning (fla issues #999/#913: silent GDN backward hang on B200-class).
++# Restrict to the config validated on B200 until the wider space is
++# re-validated. Ported onto fla-core 0.4.2 (key list here has no 'HV').
+ @triton.autotune(
+     configs=[
+         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+-        for num_warps in [2, 4]
+-        for num_stages in [2, 3, 4]
++        for num_warps in ([2] if IS_NVIDIA_BLACKWELL else [2, 4])
++        for num_stages in ([4] if IS_NVIDIA_BLACKWELL else [2, 3, 4])
+     ],
+     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+     **autotune_cache_kwargs,

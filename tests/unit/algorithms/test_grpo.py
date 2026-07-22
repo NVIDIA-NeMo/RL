@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,6 +27,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
+    _calculate_observed_pass_metrics,
     _apply_configured_message_level_advantage_penalties,
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
@@ -197,6 +198,7 @@ def mock_grpo_components():
                 "num_generations_per_prompt": 1,
                 "max_rollout_turns": 1,
                 "val_period": 100,
+                "val_start_at": 0,
                 "val_batch_size": 1,
                 "val_at_start": False,
                 "val_at_end": False,
@@ -2089,6 +2091,80 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+@pytest.mark.parametrize(
+    ("val_at_end", "expected_validation_steps"),
+    [(False, [4]), (True, [4, 5])],
+)
+def test_periodic_validation_starts_at_configured_step(
+    mock_grpo_components, train_func, val_at_end, expected_validation_steps
+):
+    """Both trainers preserve cadence while honoring the validation lower bound."""
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.update(
+        {
+            "max_num_steps": 5,
+            "val_period": 2,
+            "val_start_at": 3,
+            "val_at_end": val_at_end,
+        }
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {
+        "mean_gen_tokens_per_sample": 10.0,
+        "max_gen_tokens": 20,
+        "min_gen_tokens": 5,
+    }
+
+    with ExitStack() as stack:
+        if train_func == async_grpo_train:
+            master_config.policy["generation"]["colocated"]["enabled"] = False
+            stack.enter_context(
+                mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+            )
+        else:
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                    return_value=(mock_batch, mock_rollout_metrics),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                    return_value=_mock_seq_logprob_error_result(),
+                )
+            )
+
+        mock_validate = stack.enter_context(
+            patch("nemo_rl.algorithms.grpo.validate", return_value=({}, {}))
+        )
+        train_func(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    assert [call.kwargs["step"] for call in mock_validate.call_args_list] == (
+        expected_validation_steps
+    )
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
     """Test that GRPO training loop exits when max_num_steps is reached"""
     # Set max steps to 12
@@ -2610,6 +2686,34 @@ def test_reinforce_plus_plus_global_normalization():
 # ============================================================================
 
 
+def test_calculate_observed_pass_metrics():
+    metrics = _calculate_observed_pass_metrics(
+        [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        num_generations_per_prompt=4,
+    )
+
+    assert metrics == pytest.approx(
+        {
+            "pass@4": 2 / 3,
+            "pass^4": 1 / 3,
+            "pass@1[avg-of-4]": 5 / 12,
+        }
+    )
+
+
 class TestValidateFunction:
     """Tests for the validate() function."""
 
@@ -2785,6 +2889,68 @@ class TestValidateFunction:
         # Verify metrics are returned correctly
         assert "accuracy" in val_metrics
         assert "avg_length" in val_metrics
+
+    def test_grouped_validation_uses_pass_at_k_as_accuracy(
+        self, mock_grpo_components
+    ):
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [{"role": "user", "content": "a", "token_ids": torch.tensor([1])}],
+                    [{"role": "user", "content": "b", "token_ids": torch.tensor([2])}],
+                ],
+                "task_name": ["math", "math"],
+                "extra_env_info": [{}, {}],
+                "loss_multiplier": torch.tensor([1.0, 1.0]),
+                "idx": torch.tensor([0, 1]),
+                "length": torch.tensor([1, 1]),
+                "total_reward": torch.tensor([0.0, 0.0]),
+            }
+        )
+        mock_dataloader = MagicMock(spec=StatefulDataLoader)
+        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        mock_config = mock_grpo_components["master_config"]
+        mock_config.grpo.update(
+            {
+                "max_val_samples": 2,
+                "val_batch_size": 2,
+                "num_val_generations_per_prompt": 4,
+                "validation_generation": None,
+            }
+        )
+
+        def run_rollout(_policy, repeated_batch, *_args, **_kwargs):
+            assert repeated_batch["idx"].tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
+            repeated_batch["total_reward"] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+            )
+            return repeated_batch, {"mean_gen_tokens_per_sample": 1.0}
+
+        with (
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                side_effect=run_rollout,
+            ),
+            patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False),
+            patch(
+                "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                return_value=False,
+            ),
+            patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+        ):
+            val_metrics, _ = validate(
+                MagicMock(),
+                mock_dataloader,
+                MagicMock(),
+                {"math": MagicMock(spec=EnvironmentInterface)},
+                step=0,
+                master_config=mock_config,
+            )
+
+        assert val_metrics["accuracy"] == pytest.approx(1.0)
+        assert val_metrics["pass@4"] == pytest.approx(1.0)
+        assert val_metrics["pass^4"] == pytest.approx(0.5)
+        assert val_metrics["pass@1[avg-of-4]"] == pytest.approx(5 / 8)
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""

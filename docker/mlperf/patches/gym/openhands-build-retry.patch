@@ -1,0 +1,47 @@
+diff --git a/responses_api_agents/swe_agents/setup_scripts/openhands.sh b/responses_api_agents/swe_agents/setup_scripts/openhands.sh
+--- a/responses_api_agents/swe_agents/setup_scripts/openhands.sh
++++ b/responses_api_agents/swe_agents/setup_scripts/openhands.sh
+@@ -107,6 +107,6 @@
+ # Retry `make build` with a timeout guard on the first attempt
+ MAX_MAKE_BUILD_ATTEMPTS=2
+-MAKE_BUILD_TIMEOUT_SECONDS=$((2 * 60))
++MAKE_BUILD_TIMEOUT_SECONDS=$((5 * 60))
+ MAKE_BUILD_TIMEOUT_MINUTES=$((MAKE_BUILD_TIMEOUT_SECONDS / 60))
+ 
+ attempt=1
+@@ -114,29 +114,33 @@
+     echo "Running make build (attempt $attempt/$MAX_MAKE_BUILD_ATTEMPTS)..."
+ 
+     if [ "$attempt" -lt "$MAX_MAKE_BUILD_ATTEMPTS" ]; then
+         if timeout "$MAKE_BUILD_TIMEOUT_SECONDS" make build; then
+             echo "make build completed successfully."
+             break
++        else
++            exit_code=$?
+         fi
+ 
+-        exit_code=$?
+         if [ "$exit_code" -eq 124 ]; then
+             echo "make build timed out after $MAKE_BUILD_TIMEOUT_MINUTES minutes."
+         else
+             echo "make build failed with exit code $exit_code."
+         fi
+ 
+         echo "Retrying make build after cleanup..."
+         make clean || true
++        rm -rf .venv
+         attempt=$((attempt + 1))
+         continue
+     fi
+ 
+     if make build; then
+         echo "make build completed successfully."
+         break
++    else
++        exit_code=$?
+     fi
+ 
+-    exit_code=$?
+     echo "make build failed on the final attempt with exit code $exit_code."
++    exit "$exit_code"
+ done
