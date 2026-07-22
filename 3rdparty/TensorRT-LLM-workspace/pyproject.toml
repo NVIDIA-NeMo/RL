@@ -113,9 +113,9 @@ backend-path = ["."]
 # Single source of truth for which TensorRT-LLM fork/commit the custom wheel
 # builds. _backend.py reads these, folds them into the wheel cache key, and
 # passes them to tools/build-custom-trtllm.sh as its required argv (the script
-# itself takes no defaults). The CI ccache tag suffix is derived from `ref` in
-# .github/workflows/_build_container.yml, so bumping `ref` here invalidates both
-# the wheel cache and the ccache image in one edit. When bumping, also re-sync
+# itself takes no defaults). The wheel cache is ref-scoped, while the CI ccache
+# image is scoped by base image and architecture so valid compiler objects can
+# be reused across ref and uv-version changes. When bumping `ref`, also re-sync
 # [project].dependencies against the new requirements.txt.
 url = "https://github.com/NVIDIA/TensorRT-LLM.git"
 ref = "bf2ef86f9a2652132b11773d4041e292c553c142"   # pragma: allowlist secret

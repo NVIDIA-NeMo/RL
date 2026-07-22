@@ -31,6 +31,10 @@ ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 # Empty default; CI overrides with --build-context to inject pre-compiled wheels
 FROM scratch AS uv-cache-seed
 
+# Empty default; CI overrides with --build-context to restore the uv cache used
+# only while resolving and building TRT-LLM.
+FROM scratch AS trtllm-uv-cache-seed
+
 # Empty default; CI overrides with --build-context to restore the TRT-LLM
 # compiler cache from a registry image.
 FROM scratch AS trtllm-ccache-seed
@@ -178,6 +182,7 @@ COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 RUN --mount=type=ssh \
     --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
     --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
+    --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
 # These settings are build-only and intentionally do not persist in the final
 # NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
@@ -227,7 +232,33 @@ fi
 if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py
     # invokes tools/build-custom-trtllm.sh during this sync.
-    uv sync --link-mode symlink --locked --extra trtllm --no-install-project
+    echo "TRT-LLM uv cache state before build:"
+    du -sh /root/.cache/trtllm-uv
+    echo "TRT-LLM ccache state before build:"
+    ccache --show-stats
+    du -sh "${CCACHE_DIR}"
+    ccache --zero-stats
+
+    # This cache mount is on a different filesystem than the venv. Copy mode
+    # avoids cross-device hardlink failures and dangling symlinks after the
+    # temporary cache mount is removed. Keep the backend's custom wheel cache
+    # in the same mount because uv can miss no-build-isolation wheels across
+    # build environments.
+    set +e
+    UV_CACHE_DIR=/root/.cache/trtllm-uv \
+        TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-uv/trtllm-wheels \
+        uv sync --verbose --link-mode copy --locked --extra trtllm --no-install-project
+    TRTLLM_SYNC_STATUS=$?
+    set -e
+
+    echo "TRT-LLM uv cache state after build:"
+    du -sh /root/.cache/trtllm-uv
+    echo "TRT-LLM ccache state for this build:"
+    ccache --show-stats
+    du -sh "${CCACHE_DIR}"
+    if [[ "${TRTLLM_SYNC_STATUS}" -ne 0 ]]; then
+        exit "${TRTLLM_SYNC_STATUS}"
+    fi
 fi
 
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
@@ -363,3 +394,20 @@ EOF
 
 FROM scratch AS trtllm-ccache
 COPY --from=trtllm-ccache-export /tmp/trtllm-ccache-export/ /
+
+# Export the builder-local TRT-LLM uv cache independently from the general uv
+# cache. CI builds this target with the same Buildx builder as the release.
+FROM base AS trtllm-uv-cache-export
+ARG TARGETARCH
+ARG UV_CACHE_EXPORT_NONCE
+RUN --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked <<"EOF" bash -exu
+# Make this copy run once per CI build instead of reusing an older export layer.
+echo "Exporting TRT-LLM uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
+echo "TRT-LLM uv cache state before export:"
+du -sh /root/.cache/trtllm-uv
+mkdir -p /tmp/trtllm-uv-cache-export
+cp -a /root/.cache/trtllm-uv/. /tmp/trtllm-uv-cache-export/
+EOF
+
+FROM scratch AS trtllm-uv-cache
+COPY --from=trtllm-uv-cache-export /tmp/trtllm-uv-cache-export/ /

@@ -61,9 +61,10 @@ REQUIRES: list[str] = _META["project"].get("dependencies", [])
 # Fork URL + commit ref to build. The [tool.trtllm] table in this same
 # pyproject.toml is the sole source of truth. This backend reads it here, folds
 # it into the wheel cache key, and passes it to tools/build-custom-trtllm.sh as
-# argv (the script takes no defaults); the CI ccache tag suffix is derived from
-# the same `ref`. There is no env-var override — to build a different fork/ref,
-# edit [tool.trtllm].
+# argv (the script takes no defaults). The CI ccache image is scoped separately
+# by base image and architecture so it can span ref and uv-version changes.
+# There is no env-var override — to build a different fork/ref, edit
+# [tool.trtllm].
 _TRTLLM: dict[str, str] = _META["tool"]["trtllm"]
 TRTLLM_URL: str = _TRTLLM["url"]
 TRTLLM_REF: str = _TRTLLM["ref"]

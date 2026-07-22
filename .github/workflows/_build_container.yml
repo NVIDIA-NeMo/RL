@@ -40,6 +40,11 @@ on:
         default: ""
         description: Prefix for the TRT-LLM ccache image tag; the target architecture and a hash of the effective base image are appended automatically. Empty disables the ccache.
         type: string
+      trtllm-uv-cache-tag:
+        required: false
+        default: ""
+        description: Prefix for the TRT-LLM uv cache image tag; the target architecture and a hash of the effective base image and uv version are appended automatically. Empty disables the cache.
+        type: string
       dockerfile:
         required: true
         description: Path to the Dockerfile.
@@ -126,6 +131,50 @@ jobs:
             echo "tag=$TAG"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Resolve TRT-LLM uv cache tag
+        id: trtllm_uv_cache_tag
+        if: inputs.trtllm-uv-cache-tag != ''
+        shell: bash
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+          CACHE_TAG_PREFIX: ${{ inputs.trtllm-uv-cache-tag }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # The uv cache format and contents can change with both the base image
+          # and uv itself, so include both in this cache's identity.
+          BASE_IMAGE=$(printf '%s\n' "$BUILD_ARGS" | sed -nE 's/^[[:space:]]*BASE_IMAGE[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$/\1/p' | tail -1)
+          if [[ -z "$BASE_IMAGE" ]]; then
+            BASE_IMAGE=$(sed -nE 's/^[[:space:]]*ARG[[:space:]]+BASE_IMAGE[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$/\1/p' "$DOCKERFILE" | tail -1)
+          fi
+          if [[ -z "$BASE_IMAGE" ]]; then
+            echo "Could not resolve BASE_IMAGE from build args or $DOCKERFILE" >&2
+            exit 1
+          fi
+
+          UV_VERSION=$(printf '%s\n' "$BUILD_ARGS" | sed -nE 's/^[[:space:]]*UV_VERSION[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$/\1/p' | tail -1)
+          if [[ -z "$UV_VERSION" ]]; then
+            UV_VERSION=$(sed -nE 's/^[[:space:]]*ARG[[:space:]]+UV_VERSION[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$/\1/p' "$DOCKERFILE" | tail -1)
+          fi
+          if [[ -z "$UV_VERSION" ]]; then
+            echo "Could not resolve UV_VERSION from build args or $DOCKERFILE" >&2
+            exit 1
+          fi
+
+          ARCH="${PLATFORM#*/}"
+          ARCH="${ARCH%%/*}"
+          if [[ -z "$ARCH" || "$PLATFORM" != */* || "$PLATFORM" == *,* ]]; then
+            echo "Expected a single OS/architecture platform, got: $PLATFORM" >&2
+            exit 1
+          fi
+
+          CACHE_KEY=$(printf '%s\n%s' "$BASE_IMAGE" "$UV_VERSION" | sha256sum | cut -c1-12)
+          TAG="${CACHE_TAG_PREFIX}-${ARCH}-${CACHE_KEY}"
+          echo "Using TRT-LLM uv cache tag $TAG for $BASE_IMAGE, uv $UV_VERSION, on $ARCH"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       # Temporary one-shot migration from the old TRT-LLM-ref-scoped tags.
       # Remove this step after both architecture builds have run successfully.
       - name: Migrate legacy TRT-LLM ccache tag (temporary)
@@ -161,6 +210,24 @@ jobs:
             echo "build-context=trtllm-ccache-seed=docker-image://$REF" >> "$GITHUB_OUTPUT"
           else
             echo "No TRT-LLM ccache image found at $REF; starting with an empty cache"
+          fi
+
+      - name: Resolve TRT-LLM uv cache seed
+        id: trtllm_uv_cache_seed
+        if: inputs.trtllm-uv-cache-tag != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="$REGISTRY/$IMAGE_NAME:${{ steps.trtllm_uv_cache_tag.outputs.tag }}"
+          GENERIC_REF="$REGISTRY/$IMAGE_NAME:uv-cache"
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "Using dedicated TRT-LLM uv cache seed $REF"
+            echo "build-context=trtllm-uv-cache-seed=docker-image://$REF" >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "$GENERIC_REF" >/dev/null 2>&1; then
+            echo "No dedicated TRT-LLM uv cache found; bootstrapping it from $GENERIC_REF"
+            echo "build-context=trtllm-uv-cache-seed=docker-image://$GENERIC_REF" >> "$GITHUB_OUTPUT"
+          else
+            echo "No dedicated or generic uv cache image found; starting with an empty TRT-LLM uv cache"
           fi
 
       - name: Get recently merged PR cache refs
@@ -243,6 +310,7 @@ jobs:
           build-contexts: |
             ${{ inputs.build-contexts }}
             ${{ steps.trtllm_ccache_seed.outputs.build-context }}
+            ${{ steps.trtllm_uv_cache_seed.outputs.build-context }}
           build-args: ${{ inputs.build-args }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
@@ -267,6 +335,7 @@ jobs:
           build-contexts: |
             ${{ inputs.build-contexts }}
             ${{ steps.trtllm_ccache_seed.outputs.build-context }}
+            ${{ steps.trtllm_uv_cache_seed.outputs.build-context }}
           build-args: |
             ${{ inputs.build-args }}
             CCACHE_EXPORT_KEY=${{ github.run_id }}-${{ github.run_attempt }}
@@ -276,3 +345,27 @@ jobs:
           no-cache: false
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trtllm_ccache_tag.outputs.tag }}
           target: trtllm-ccache
+
+      - name: Update TRT-LLM uv cache image
+        # Persist downloads and source archives even when the release build
+        # fails, so a retry can resume without repopulating this cache.
+        if: ${{ always() && !cancelled() && inputs.trtllm-uv-cache-tag != '' && steps.trtllm_uv_cache_tag.outcome == 'success' }}
+        uses: docker/build-push-action@v5
+        with:
+          file: ${{ inputs.dockerfile }}
+          push: true
+          context: .
+          platforms: ${{ inputs.platform }}
+          build-contexts: |
+            ${{ inputs.build-contexts }}
+            ${{ steps.trtllm_ccache_seed.outputs.build-context }}
+            ${{ steps.trtllm_uv_cache_seed.outputs.build-context }}
+          build-args: |
+            ${{ inputs.build-args }}
+            UV_CACHE_EXPORT_NONCE=${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: |
+            ${{ steps.build_meta.outputs.cache-from }}
+            ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
+          no-cache: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trtllm_uv_cache_tag.outputs.tag }}
+          target: trtllm-uv-cache
