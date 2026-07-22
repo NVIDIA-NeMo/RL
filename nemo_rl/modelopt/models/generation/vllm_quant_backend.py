@@ -566,6 +566,36 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             for buf in patched_quantizer_buffers:
                 del buf.weight_loader
 
+    @contextmanager
+    def _attach_input_quantizer_amax_loaders(self, model):
+        """Eagerly attach weight_loaders to input_quantizer amax buffers.
+
+        vLLM >= 0.25 loads refit weights through per-module
+        ``load_weights`` (e.g. ``LinearBase.load_weights``), which resolves
+        targets via ``getattr`` and calls ``param.weight_loader(param,
+        loaded_weight, shard_id)`` directly — it never iterates
+        ``model.named_parameters()``, so the lazy attach in
+        ``_patch_named_parameters_to_include_buffers`` no longer fires and
+        quantizer amax buffers arrive without a loader (AttributeError:
+        'Tensor' object has no attribute 'weight_loader').
+        """
+
+        def input_amax_loader(param, loaded_weight, *args, **kwargs):
+            param.copy_(torch.max(param, loaded_weight))
+
+        attached = []
+        for name, buf in model.named_buffers():
+            if "input_quantizer" not in name:
+                continue
+            if not hasattr(buf, "weight_loader"):
+                buf.weight_loader = input_amax_loader
+                attached.append(buf)
+        try:
+            yield
+        finally:
+            for buf in attached:
+                del buf.weight_loader
+
     def _load_weights(self, weights):
         """Load pre-folded weights and input_quantizer amax buffers.
 
@@ -620,6 +650,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 contexts.enter_context(
                     self._patch_named_parameters_to_include_buffers(child)
                 )
+            contexts.enter_context(
+                self._attach_input_quantizer_amax_loaders(self.model_runner.model)
+            )
             return super()._load_weights(weights)
 
     def get_weight_snapshot(self, name: str) -> torch.Tensor:
