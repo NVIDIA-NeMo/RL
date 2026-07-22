@@ -18,25 +18,20 @@ Supports Qwen3 tool calling, DeepSeekR1Parser reasoning, and prefix token splici
 """
 
 import asyncio
-import json
 import logging
-import re
 import threading
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
 
-if TYPE_CHECKING:
-    from fastapi import FastAPI
-
 logger = logging.getLogger(__name__)
-
-_TOOL_BOT = "<tool_call>\n"
-_TOOL_CALL_RE = re.compile(r"<tool_call>\n(.*?)\n</tool_call>", re.DOTALL)
 
 
 def create_app(
@@ -45,26 +40,40 @@ def create_app(
     model_name: str,
     max_seq_len: int,
     default_chat_template_kwargs: dict[str, Any] | None = None,
+    tool_parser: str | None = None,
 ) -> "FastAPI":
     """Build a FastAPI application backed by *llm* (``tensorrt_llm.LLM``)."""
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
 
-    # default_chat_template_kwargs from config override these built-in defaults.
-    _default_template_kwargs: dict[str, Any] = {
+    # Per-request template kwargs override these defaults.
+    _server_template_kwargs: dict[str, Any] = {
         "enable_thinking": True,
         **(default_chat_template_kwargs or {}),
     }
 
-    # reasoning_at_start=True: Qwen3 hybrid template ends gen prompt with "<think>\n"
-    # so model output starts inside the reasoning block without a leading <think> tag.
-    # parse() is stateless — safe for concurrent requests.
+    # Use the configured parser or infer one from the model config.
+    _tool_parser_name = _resolve_tool_parser_name(tool_parser, model_name)
+    _tool_parser_instance = _build_tool_parser(_tool_parser_name)
+    _parse_tool_calls = _make_parse_tool_calls(_tool_parser_instance)
+
+    from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+
+    model_config = getattr(llm, "_hf_model_config", None)
+    if model_config is None:
+        raise RuntimeError(
+            "TRT-LLM HTTP server requires the LLM's loaded Hugging Face model config"
+        )
+
+    # Cache parsers for both thinking modes.
     from tensorrt_llm.llmapi.reasoning_parser import DeepSeekR1Parser
 
-    _reasoning_parser = DeepSeekR1Parser(reasoning_at_start=True)
+    _reasoning_parsers = {
+        enabled: DeepSeekR1Parser(reasoning_at_start=enabled)
+        for enabled in (False, True)
+    }
 
-    # Stop tokens TRT-LLM appends to gen_token_ids but NOT reproduced by apply_chat_template.
-    # Must be stripped so seen_token_ids stays a valid prefix of the next turn's prompt_token_ids.
+    # Strip generated stop tokens to preserve prefix continuity across turns.
     _eos_token_ids: set[int] = set()
     for _tok in ("<|im_end|>", "<|endoftext|>"):
         _tid = tokenizer.convert_tokens_to_ids(_tok)
@@ -88,16 +97,48 @@ def create_app(
         top_p = body.get("top_p", 1.0)
         logprobs_requested = body.get("logprobs", False)
 
-        prompt_token_ids = _build_prompt_token_ids(
-            messages,
-            tokenizer,
-            tools=tools,
-            default_template_kwargs=_default_template_kwargs,
+        # Request kwargs override server defaults.
+        per_request_kwargs: dict[str, Any] = body.get("chat_template_kwargs") or {}
+        effective_template_kwargs = {**_server_template_kwargs, **per_request_kwargs}
+        enable_thinking: bool = bool(
+            effective_template_kwargs.get("enable_thinking", True)
         )
 
-        # Prefix splice: empty required_prefix_ids (no prior assistant turn) → returns template unchanged.
+        reasoning_parser = _reasoning_parsers[enable_thinking]
+
+        try:
+            conversation, mm_coroutine, _ = parse_chat_messages_coroutines(
+                messages, model_config
+            )
+            mm_data, mm_embeddings = await mm_coroutine
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
+
+        # This token-only adapter does not support multimodal inputs.
+        if mm_data is not None or mm_embeddings is not None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "NeMo-RL's TRT-LLM HTTP adapter does not support "
+                    "multimodal chat inputs"
+                },
+            )
+
+        # Full retokenization avoids accumulating generation token IDs twice.
+        prompt_token_ids = _build_prompt_token_ids(
+            conversation,
+            tokenizer,
+            tools=tools,
+            default_template_kwargs=effective_template_kwargs,
+        )
+
+        # Empty required_prefix_ids on turn one returns the template unchanged.
         required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
-            messages, tokenizer, tools, _default_template_kwargs
+            messages,
+            conversation,
+            tokenizer,
+            tools,
+            effective_template_kwargs,
         )
 
         adj_prompt = replace_prefix_tokens(
@@ -171,7 +212,7 @@ def create_app(
                 gen_logprobs.pop()
 
         gen_text = tokenizer.decode(gen_token_ids, skip_special_tokens=False)
-        # Strip EOS tokens that TRT-LLM may append to output token ids.
+        # Strip EOS strings that TRT-LLM may append to decoded output.
         gen_text = gen_text.replace("<|im_end|>", "").replace("<|endoftext|>", "")
 
         finish_reason = "stop"
@@ -180,15 +221,17 @@ def create_app(
             if "length" in fr:
                 finish_reason = "length"
 
-        # Qwen3 hybrid: gen prompt ends with "<think>\n"; reasoning_at_start=True splits on "</think>".
-        parsed = _reasoning_parser.parse(gen_text)
+        # Split reasoning from answer using the (possibly per-request) parser.
+        parsed = reasoning_parser.parse(gen_text)
         reasoning_content: str = parsed.reasoning_content
         answer_text: str = parsed.content
 
-        parsed_tool_calls = _parse_tool_calls(answer_text) if tools else []
+        if tools:
+            content_text, parsed_tool_calls = _parse_tool_calls(answer_text, tools)
+        else:
+            content_text, parsed_tool_calls = answer_text, []
 
         if parsed_tool_calls:
-            content_text = _strip_tool_call_tags(answer_text)
             msg_dict: dict[str, Any] = {
                 "role": "assistant",
                 "content": content_text or None,
@@ -215,11 +258,7 @@ def create_app(
             "created": int(time.time()),
             "model": model_name,
             "choices": [
-                {
-                    "index": 0,
-                    "message": msg_dict,
-                    "finish_reason": finish_reason,
-                }
+                {"index": 0, "message": msg_dict, "finish_reason": finish_reason}
             ],
             "usage": {
                 "prompt_tokens": len(adj_prompt),
@@ -247,53 +286,80 @@ def create_app(
 
 
 # ---------------------------------------------------------------------------
-#  Tool-call parsing — mirrors Qwen3ToolParser.detect_and_parse() exactly
+#  Tool-call parser factory — delegates to TRT-LLM's registered parsers
+
 # ---------------------------------------------------------------------------
 
 
-def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
-    """Extract <tool_call> blocks; arg serialisation is byte-identical to Qwen3ToolParser."""
-    results: list[dict[str, Any]] = []
-    for raw in _TOOL_CALL_RE.findall(text):
-        try:
-            obj = json.loads(raw.strip())
-        except json.JSONDecodeError:
-            continue
-        func_name = obj.get("name", "unknown")
-        # json.dumps with ensure_ascii=False matches Qwen3ToolParser.parse_base_json
-        arguments = json.dumps(
-            obj.get("parameters") or obj.get("arguments", {}),
-            ensure_ascii=False,
-        )
-        results.append(
+def _resolve_tool_parser_name(configured_name: str | None, model_name: str) -> str:
+    """Resolve the configured parser or infer it from the model."""
+    if configured_name:
+        return configured_name
+
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
+        resolve_auto_tool_parser,
+    )
+
+    resolved_name = resolve_auto_tool_parser(model_name)
+    if resolved_name:
+        return resolved_name
+
+    raise ValueError(
+        f"Could not infer a tool parser from {model_name!r}; "
+        "set trtllm_cfg.tool_parser explicitly."
+    )
+
+
+def _build_tool_parser(name: str) -> Any:
+    """Instantiate a TRT-LLM tool parser by registered name."""
+    # Import lazily and preserve import errors.
+    from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
+
+    return ToolParserFactory.create_tool_parser(name)
+
+
+def _make_parse_tool_calls(tool_parser_instance: Any) -> Any:
+    """Return a tool-call parser bound to a specific parser instance."""
+
+    def _parse(text: str, tools: list[dict] | None) -> tuple[str, list[dict[str, Any]]]:
+        if not text or not tool_parser_instance.has_tool_call(text):
+            return text, []
+
+        # Preserve argument types with TRT-LLM typed tool schemas.
+        typed_tools: list[Any] = []
+        if tools:
+            from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam
+
+            typed_tools = [ChatCompletionToolsParam(**tool) for tool in tools]
+
+        result = tool_parser_instance.detect_and_parse(text, typed_tools)
+        calls = [
             {
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
                 "function": {
-                    "name": func_name,
-                    "arguments": arguments,
+                    "name": item.name,
+                    "arguments": item.parameters,
                 },
             }
-        )
-    return results
+            for item in (result.calls or [])
+        ]
+        if not calls:
+            return text, []
+        return result.normal_text.strip(), calls
 
-
-def _strip_tool_call_tags(text: str) -> str:
-    """Return text with all <tool_call>...</tool_call> blocks removed (everything before first tag)."""
-    idx = text.find(_TOOL_BOT)
-    if idx == -1:
-        return text.strip()
-    return text[:idx].strip()
+    return _parse
 
 
 # ---------------------------------------------------------------------------
 #  Prompt construction
+
 # ---------------------------------------------------------------------------
 
 
 def _to_int_ids(enc: Any) -> list[int]:
-    """Coerce apply_chat_template output to flat list[int] (handles transformers v5 BatchEncoding)."""
-    if hasattr(enc, "input_ids"):  # v5 BatchEncoding
+    """Coerce chat-template output to a flat list[int]."""
+    if hasattr(enc, "input_ids"):  # transformers v5 BatchEncoding
         enc = enc.input_ids
     if len(enc) and isinstance(enc[0], (list, tuple)):  # batch-of-one nesting
         enc = enc[0]
@@ -319,47 +385,37 @@ def _build_prompt_token_ids(
     }
     if tools:
         template_kwargs["tools"] = tools
-
-    clean = [_strip_token_fields(m) for m in messages]
-    return _to_int_ids(tokenizer.apply_chat_template(clean, **template_kwargs))
-
-
-def _strip_token_fields(msg: dict[str, Any]) -> dict[str, Any]:
-    """Strip NeMo RL on-policy fields before passing to apply_chat_template."""
-    skip = {"prompt_token_ids", "generation_token_ids", "generation_log_probs"}
-    return {k: v for k, v in msg.items() if k not in skip}
+    return _to_int_ids(tokenizer.apply_chat_template(messages, **template_kwargs))
 
 
 def _compute_splice_inputs(
-    messages: list[dict[str, Any]],
+    raw_messages: list[dict[str, Any]],
+    conversation: list[dict[str, Any]],
     tokenizer: Any,
     tools: list[dict[str, Any]] | None,
     default_template_kwargs: dict[str, Any],
 ) -> tuple[list[int], list[int]]:
-    """Return (required_prefix_ids, template_prefix_ids) for replace_prefix_tokens.
-
-    required_prefix_ids: last assistant's prompt+gen token IDs (empty on turn 1).
-    template_prefix_ids: apply_chat_template up to last assistant turn, used only to count EOS.
-    """
+    """Return preserved and rendered token IDs for the on-policy prefix splice."""
     required_prefix_ids: list[int] = []
-    for _m in reversed(messages):
+    for _m in reversed(raw_messages):
         if _m.get("role") == "assistant" and "prompt_token_ids" in _m:
             required_prefix_ids = list(_m["prompt_token_ids"]) + list(
                 _m.get("generation_token_ids") or []
             )
             break
 
-    _clean = [_strip_token_fields(m) for m in messages]
     _last_asst_idx = next(
         (
             i
-            for i in reversed(range(len(_clean)))
-            if _clean[i].get("role") == "assistant"
+            for i in reversed(range(len(conversation)))
+            if conversation[i].get("role") == "assistant"
         ),
         None,
     )
     _msgs_to_last_asst = (
-        _clean[: _last_asst_idx + 1] if _last_asst_idx is not None else _clean
+        conversation[: _last_asst_idx + 1]
+        if _last_asst_idx is not None
+        else conversation
     )
     _prefix_tkw: dict[str, Any] = {
         **default_template_kwargs,
@@ -376,6 +432,7 @@ def _compute_splice_inputs(
 
 # ---------------------------------------------------------------------------
 #  Server lifecycle
+
 # ---------------------------------------------------------------------------
 
 
@@ -387,10 +444,10 @@ def start_server(
     host: str = "0.0.0.0",
     port: int = 0,
     default_chat_template_kwargs: dict[str, Any] | None = None,
+    tool_parser: str | None = None,
 ) -> "tuple[threading.Thread, str, Any]":
     """Start the HTTP server in a daemon thread and return (thread, base_url, server)."""
     import uvicorn
-
     from nemo_rl.distributed.virtual_cluster import (
         _get_free_port_local,
         _get_node_ip_local,
@@ -408,7 +465,9 @@ def start_server(
         model_name,
         max_seq_len=max_seq_len,
         default_chat_template_kwargs=default_chat_template_kwargs,
+        tool_parser=tool_parser,
     )
+
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
 

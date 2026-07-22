@@ -44,6 +44,10 @@ class TrtllmSpecificArgs(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
     default_chat_template_kwargs: NotRequired[dict[str, Any]]
+    # TRT-LLM's registered parser names:
+    #   "qwen3"       -> Qwen3ToolParser      (JSON format: {"name":..., "arguments":{...}})
+    #   "qwen3_coder" -> Qwen3CoderToolParser  (XML format: <function=...>)
+    tool_parser: NotRequired[str]
 
 
 class TrtllmConfig(GenerationConfig):

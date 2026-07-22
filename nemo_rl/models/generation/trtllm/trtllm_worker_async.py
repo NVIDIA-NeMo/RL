@@ -284,6 +284,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             default_chat_template_kwargs=self.cfg["trtllm_cfg"].get(
                 "default_chat_template_kwargs"
             ),
+            tool_parser=self.cfg["trtllm_cfg"].get("tool_parser"),
         )
         print(
             f"[TrtllmAsyncWorker] HTTP server started: {self._http_base_url}",

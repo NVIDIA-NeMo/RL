@@ -14,7 +14,7 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -93,7 +93,7 @@ def _bare_generation(*, colocated=True, dp_size=2, **trtllm_overrides):
         (
             _Cluster(world_size=4, gpus_per_node=2),
             {"tensor_parallel_size": 4},
-            "does not support cross-node tensor parallelism",
+            "only supported for non-colocated",
         ),
     ],
 )
@@ -102,6 +102,69 @@ def test_invalid_async_engine_configuration_fails_before_worker_start(
 ):
     with pytest.raises(AssertionError, match=error):
         TrtllmGeneration(cluster, _config(**config_update))
+
+
+def _placement_config(tp_size: int, *, colocated: bool = False) -> dict:
+    config = _config(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
+    config["colocated"]["enabled"] = colocated
+    return config
+
+
+def test_init_cluster_placement_groups_uses_unified_pg_for_cross_node_tp():
+    cluster = MagicMock(num_gpus_per_node=4)
+
+    TrtllmGeneration.init_cluster_placement_groups(cluster, _placement_config(8))
+
+    cluster._init_placement_groups.assert_called_once_with(
+        strategy="PACK",
+        use_unified_pg=True,
+    )
+
+
+def test_init_cluster_placement_groups_uses_per_node_pgs_for_node_local_tp():
+    cluster = MagicMock(num_gpus_per_node=4)
+
+    TrtllmGeneration.init_cluster_placement_groups(cluster, _placement_config(4))
+
+    cluster._init_placement_groups.assert_called_once_with(
+        strategy="PACK",
+        use_unified_pg=False,
+    )
+
+
+def test_init_cluster_placement_groups_rejects_colocated_cross_node_tp():
+    cluster = MagicMock(num_gpus_per_node=4)
+
+    with pytest.raises(AssertionError, match="only supported for non-colocated"):
+        TrtllmGeneration.init_cluster_placement_groups(
+            cluster, _placement_config(8, colocated=True)
+        )
+
+    cluster._init_placement_groups.assert_not_called()
+
+
+def test_cross_node_tp_replicas_use_unified_placement_group():
+    generation = TrtllmGeneration.__new__(TrtllmGeneration)
+    generation.model_parallel_size = 8
+    generation.worker_group = MagicMock()
+
+    unified_pg = MagicMock()
+    bundle_to_node = {i: f"node-{i // 4}" for i in range(16)}
+    cluster = MagicMock()
+    cluster.get_placement_groups.return_value = [unified_pg]
+    cluster._sorted_bundle_indices = list(range(16))
+
+    with patch.object(
+        trtllm_generation.ray.util,
+        "placement_group_table",
+        return_value={"bundles_to_node_id": bundle_to_node},
+    ):
+        result = generation._get_tied_worker_bundle_indices(cluster)
+
+    assert result == [
+        (0, list(range(8))),
+        (0, list(range(8, 16))),
+    ]
 
 
 @pytest.mark.asyncio
