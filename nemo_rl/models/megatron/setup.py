@@ -1150,7 +1150,12 @@ def _enable_batch_invariant_kernels_if_requested(config: PolicyConfig) -> None:
     mirror the legacy ``if args.batch_invariant_mode: enable_batch_invariant_mode()``
     hook here, calling it before initialize_megatron so the patches are active from the
     start of the worker lifetime.
+
+    ``zero_train_gen_mismatch`` applies TE cuBLAS workspace shrink via
+    ``patches.apply_te_gemm_cublas_pinned_patch`` instead of Megatron BIK.
     """
+    if config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
+        return
     if not config["megatron_cfg"].get("batch_invariant_mode"):
         return
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -1165,21 +1170,22 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     """Propagate zero_train_gen_mismatch flag to its constituent sub-knobs.
 
     When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False,
-    attention_backend=flash (FA4 via TE), and defaults env vars for
-    batch-invariant TE/cuBLAS/MoE/Mamba kernels if not already set by the
-    environment. Router replay and moe_grouped_gemm must be configured explicitly.
+    attention_backend=flash (FA4 via TE), applies TE cuBLAS workspace shrink via
+    patches.py, and defaults env vars for cuBLAS/MoE/Mamba determinism if not
+    already set by the environment. Router replay and moe_grouped_gemm must be
+    configured explicitly.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
     import os
 
+    from nemo_rl.models.policy.workers.patches import apply_te_gemm_cublas_pinned_patch
+
     mc = config["megatron_cfg"]
     mc["batch_invariant_mode"] = True
     mc.setdefault("use_mamba_mem_eff_path", False)
     mc.setdefault("attention_backend", "flash")
-    # Default to cuBLAS workspace shrink (te_gemm_cublas_pinned) so the flag
-    # delivers batch-invariant TE GEMM without requiring the env var to be set.
-    os.environ.setdefault("NRL_BI_KERNELS", "te_gemm_cublas_pinned")
+    apply_te_gemm_cublas_pinned_patch()
     # Starve PyTorch's own cuBLAS workspace so non-TE aten::mm/addmm paths also
     # pick workspace-free (splitK=1, reduction=NONE) algorithms.
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
