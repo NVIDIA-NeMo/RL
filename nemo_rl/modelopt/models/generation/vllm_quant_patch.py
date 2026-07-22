@@ -70,9 +70,31 @@ def _tolerate_dummy_weight_nan_amax():
         MaxCalibrator.collect = _original_collect
 
 
+def _drop_nonclass_quant_registry_keys() -> None:
+    """Drop non-class keys from ModelOpt's QuantModuleRegistry.
+
+    vLLM >= 0.25 turned FusedMoE/SharedFusedMoE into factory functions, but
+    ModelOpt's vLLM plugin still registers them as QuantModuleRegistry keys.
+    Registry lookups run issubclass(<module type>, <key>) over all keys
+    (modelopt/torch/opt/dynamic.py::_get_registered_nn_class) and raise
+    TypeError on a function key. Dense fakequant rollout does not use those
+    entries; MoE fakequant with vLLM >= 0.25 needs a ModelOpt-side port to
+    the MoERunner/RoutedExperts layout.
+    """
+    import inspect
+
+    from modelopt.torch.quantization.nn import QuantModuleRegistry
+
+    for key in list(QuantModuleRegistry._registry):
+        if not inspect.isclass(key):
+            QuantModuleRegistry.unregister(key)
+
+
 def _fakequant_run_prolog_worker(self) -> None:
     def calibrate_loop(model: Any = None) -> None:
         self.model_runner._dummy_run(1, skip_eplb=True, remove_lora=False)
+
+    _drop_nonclass_quant_registry_keys()
 
     quant_cfg = resolve_quant_cfg(os.environ["VLLM_QUANT_CFG"])
     print(f"quant_cfg: {quant_cfg}")
