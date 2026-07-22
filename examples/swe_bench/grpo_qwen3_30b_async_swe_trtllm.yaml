@@ -6,6 +6,7 @@ defaults: ../nemo_gym/grpo_qwen3_30ba3b_thinking_swe2.yaml
 policy:
   generation:
     backend: trtllm
+    stop_token_ids: [151643, 151645]
     trtllm_cfg:
       tensor_parallel_size: 2
       precision: ${policy.precision}
@@ -17,6 +18,7 @@ policy:
       in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
       recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
       expose_http_server: true
+      reasoning_parser: "deepseek-r1"
       default_chat_template_kwargs:
         enable_thinking: true
         truncate_history_thinking: false
