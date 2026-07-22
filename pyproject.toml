@@ -70,7 +70,7 @@ dependencies = [
   "pybase64",                                                                                                 # for sglang refit
   "awscrt>=0.35.0",                                                                                           # for parallel S3 refit transport
   "zstandard",                                                                                                # for sparse refit body compression
-  "fastokens-b10>=0.1.1",                                                                                                    # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
+  "fastokens-b10>=0.1.1",                                                                                     # Rust-backed BPE tokenizer (~10x faster encode); enable at runtime with NRL_USE_FASTOKENS=1
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                   # for transformer-engine no build isolation
   # tilelang — replacement Triton kernel mamba-ssm requires when
   # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
