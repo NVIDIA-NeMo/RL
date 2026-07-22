@@ -25,7 +25,7 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 
 _PARTITION_ID = "rollout_data"
-# TQReplayBuffer.add writes these training-row fields per prompt;
+# TQReplayBuffer.commit writes these training-row fields per prompt;
 # _advantage_stage writes ``advantages`` back on top.
 _BULK_FIELDS = [
     "input_ids",
