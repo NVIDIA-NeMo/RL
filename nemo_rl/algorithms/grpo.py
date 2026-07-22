@@ -937,8 +937,12 @@ def setup(
             node_resource_constraints=inference_node_resource_constraints,
         )
         if inference_node_resource_constraints is not None:
-            VllmGeneration.init_cluster_placement_groups(
-                inference_cluster, generation_config
+            {
+                "vllm": VllmGeneration,
+                "trtllm": TrtllmGeneration,
+            }[generation_config["backend"]].init_cluster_placement_groups(
+                inference_cluster,
+                generation_config,
             )
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",

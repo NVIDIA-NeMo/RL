@@ -42,6 +42,33 @@ from nemo_rl.models.generation.trtllm.config import TrtllmConfig
 class TrtllmGeneration(GenerationInterface):
     """TRT-LLM generation backend (requires trtllm_cfg.async_engine=true)."""
 
+    @staticmethod
+    def init_cluster_placement_groups(
+        cluster: RayVirtualCluster,
+        config: TrtllmConfig,
+    ) -> None:
+        """Pre-initialize placement groups matching TRT-LLM's topology."""
+        trtllm_cfg = config["trtllm_cfg"]
+        tp = trtllm_cfg["tensor_parallel_size"]
+        pp = trtllm_cfg.get("pipeline_parallel_size", 1)
+        assert pp == 1, (
+            "TRT-LLM backend does not support pipeline parallelism yet "
+            f"(pipeline_parallel_size={pp}, must be 1)."
+        )
+        model_parallel_size = tp * pp
+        colocated = bool(config.get("colocated", {}).get("enabled", False))
+
+        needs_cross_node = model_parallel_size > cluster.num_gpus_per_node
+        assert not (needs_cross_node and colocated), (
+            "TRT-LLM cross-node tensor parallelism is only supported for "
+            "non-colocated generation."
+        )
+
+        cluster._init_placement_groups(
+            strategy=None if colocated else "PACK",
+            use_unified_pg=needs_cross_node,
+        )
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -96,24 +123,7 @@ class TrtllmGeneration(GenerationInterface):
             "synchronous engine path (async_engine=false) is no longer supported."
         )
 
-        # Colocated reuses the policy's placement group → no PACK rearrangement.
-        # Non-colocated uses PACK so inference workers cluster together rather
-        # than interleaving with training bundles (SPREAD would emit something
-        # like [[0,3,6],[1,4,7],[2,5]] across nodes, breaking TP placement).
-        strategy = None if self.colocated_enabled else "PACK"
-        # Cross-node TP needs a single unified placement group so workers can
-        # land on bundles spanning node boundaries (e.g. TP=8 on 2x4 GPUs).
-        needs_cross_node_parallelism = (
-            self.model_parallel_size > cluster.num_gpus_per_node
-        )
-        assert not (needs_cross_node_parallelism and self.colocated_enabled), (
-            "TRT-LLM cross-node tensor parallelism is only supported for "
-            "non-colocated generation."
-        )
-        cluster._init_placement_groups(
-            strategy=strategy,
-            use_unified_pg=needs_cross_node_parallelism,
-        )
+        self.init_cluster_placement_groups(cluster, config)
 
         worker_cls = "nemo_rl.models.generation.trtllm.trtllm_worker_async.TrtllmAsyncGenerationWorker"
         worker_builder = RayWorkerBuilder(worker_cls, config)
