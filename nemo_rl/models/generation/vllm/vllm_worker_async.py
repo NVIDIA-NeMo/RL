@@ -146,7 +146,6 @@ def _replace_prefix_from_suffix_messages(
     )
 
 
-<<<<<<< HEAD
 def _replace_prefix_tokens(
     tokenizer,
     model_prefix_token_ids: list[int],
@@ -270,8 +269,6 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     )
 
 
-=======
->>>>>>> 735736afc (refactor into utils, cleanup)
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     def __init__(
         self,
@@ -809,7 +806,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
                 engine_prompt = res[1][0]
 
-                final_prompt_token_ids = replace_prefix_tokens(
+                final_prompt_token_ids = _replace_prefix_tokens(
                     tokenizer=self.renderer.tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
