@@ -60,8 +60,11 @@ def parse_hf_expert_weight(name: str) -> HfExpertWeight | None:
     projection = match.group("projection")
     shard_id = _HF_PROJECTION_SHARDS[projection]
     parameter_leaf = "w2_weight" if shard_id == "w2" else "w13_weight"
+    # vLLM 0.25 stores expert weights on the RoutedExperts submodule of the
+    # MoERunner returned by the FusedMoE factory, so the named_parameters()
+    # key gains a ".routed_experts." segment.
     return HfExpertWeight(
-        parameter_name=f"{match.group('prefix')}.{parameter_leaf}",
+        parameter_name=f"{match.group('prefix')}.routed_experts.{parameter_leaf}",
         expert_id=int(match.group("expert_id")),
         shard_id=shard_id,
         tp_shard_dim=1 if shard_id == "w2" else 0,
