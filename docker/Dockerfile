@@ -39,6 +39,12 @@ FROM scratch AS trtllm-uv-cache-seed
 # compiler cache from a registry image.
 FROM scratch AS trtllm-ccache-seed
 
+# Empty defaults for incremental cache export. CI overrides these contexts
+# with the current cache images when appending a delta layer, and leaves them
+# empty when periodically compacting the cache into a full snapshot.
+FROM scratch AS trtllm-uv-cache-output-base
+FROM scratch AS trtllm-ccache-output-base
+
 # Default custom-setup stage: installs apptainer.
 # Override with: --build-context custom-setup=<your-dir>
 FROM scratch AS custom-setup
@@ -234,6 +240,12 @@ if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
     # entries are kept when both exist.
     rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
 
+    # Reuse packages already downloaded by the normal dependency syncs while
+    # keeping TRT-LLM's writable cache isolated for independent persistence.
+    # The dedicated cache image therefore only needs to store TRT-specific
+    # additions, not another copy of the general uv cache seed.
+    rsync -a --ignore-existing /root/.cache/uv/ /root/.cache/trtllm-uv/
+
     # Build TRT-LLM after every other backend cache warmup. The final
     # --all-groups sync below restores the intended default environment.
     # The custom PEP 517 backend in 3rdparty/TensorRT-LLM-workspace/_backend.py
@@ -316,6 +328,7 @@ FROM hermetic AS release
 # Re-declare build args for this stage
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+ARG SKIP_TRTLLM_BUILD
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
@@ -350,7 +363,7 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN <<"EOF" bash -exu
+RUN --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked <<"EOF" bash -exu
 NEGATIVE_FILTERS=""
 if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS vllm"
@@ -358,6 +371,15 @@ fi
 if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
 fi
+if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS trtllm"
+fi
+# The hermetic-stage TRT-LLM sync stores its compiled wheel in this dedicated
+# cache mount. Reuse that wheel while creating the release-stage Ray venv;
+# uv's normal cache remains on the image filesystem, so UV_LINK_MODE=symlink
+# cannot leave links to this temporary mount in the finished image.
+export TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-uv/trtllm-wheels
+export TRTLLM_REQUIRE_CACHED_WHEEL=1
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
 else
@@ -397,38 +419,85 @@ RUN echo "This distribution includes open source which is archived at the follow
 # target immediately after the release target with the same Buildx builder, so
 # it can read the cache mount without adding ccache data to the release image.
 FROM base AS trtllm-ccache-export
-ARG CCACHE_EXPORT_KEY
+ARG CCACHE_EXPORT_NONCE
+ARG CCACHE_EXPORT_MODE=full
 ARG TARGETARCH
 RUN --mount=type=bind,from=trtllm-ccache-seed,source=.,target=/tmp/trtllm-ccache-seed \
     --mount=type=cache,id=trtllm-ccache-${TARGETARCH},target=/root/.cache/ccache,sharing=locked <<"EOF" bash -exu
-# Make this copy run once per CI build instead of reusing an older export layer.
-echo "Exporting TRT-LLM ccache for build ${CCACHE_EXPORT_KEY:-local}"
+# Make this export run once per CI build instead of reusing an older layer.
+echo "Exporting TRT-LLM ccache for build ${CCACHE_EXPORT_NONCE:-local} (${CCACHE_EXPORT_MODE})"
 # The hermetic layer may have been reused from BuildKit without executing its
-# RUN command, leaving this builder-local mount empty. Merge the registry seed
-# again here so an existing remote cache can never be replaced by an empty one.
-rsync -a --ignore-existing /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
+# RUN command, leaving this builder-local mount empty. Restore the seed only in
+# that case; unconditionally merging it would resurrect entries ccache evicted.
+if [[ -z "$(find /root/.cache/ccache -mindepth 1 -print -quit)" ]]; then
+    rsync -a /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
+fi
 echo "TRT-LLM ccache state before export:"
 ccache --show-stats
 mkdir -p /tmp/trtllm-ccache-export
-cp -a /root/.cache/ccache/. /tmp/trtllm-ccache-export/
+case "${CCACHE_EXPORT_MODE}" in
+    incremental)
+        # The output image inherits the seed layers, so copy only files whose
+        # content or metadata differs from the seed into the new top layer.
+        rsync -aH --checksum \
+            --compare-dest=/tmp/trtllm-ccache-seed/ \
+            /root/.cache/ccache/ /tmp/trtllm-ccache-export/
+        ;;
+    full)
+        cp -a /root/.cache/ccache/. /tmp/trtllm-ccache-export/
+        ;;
+    *)
+        echo "Unsupported CCACHE_EXPORT_MODE: ${CCACHE_EXPORT_MODE}" >&2
+        exit 1
+        ;;
+esac
+echo "TRT-LLM ccache export payload:"
+du -sh /tmp/trtllm-ccache-export
 EOF
 
-FROM scratch AS trtllm-ccache
-COPY --from=trtllm-ccache-export /tmp/trtllm-ccache-export/ /
+FROM trtllm-ccache-output-base AS trtllm-ccache
+COPY --link --from=trtllm-ccache-export /tmp/trtllm-ccache-export/ /
+LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"
 
 # Export the builder-local TRT-LLM uv cache independently from the general uv
 # cache. CI builds this target with the same Buildx builder as the release.
 FROM base AS trtllm-uv-cache-export
 ARG TARGETARCH
+ARG UV_CACHE_EXPORT_MODE=full
 ARG UV_CACHE_EXPORT_NONCE
-RUN --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked <<"EOF" bash -exu
-# Make this copy run once per CI build instead of reusing an older export layer.
-echo "Exporting TRT-LLM uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
+RUN --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed \
+    --mount=type=bind,from=trtllm-uv-cache-seed,source=.,target=/tmp/trtllm-uv-cache-seed \
+    --mount=type=cache,id=trtllm-uv-cache-${TARGETARCH},from=trtllm-uv-cache-seed,source=.,target=/root/.cache/trtllm-uv,sharing=locked <<"EOF" bash -exu
+# Make this export run once per CI build instead of reusing an older layer.
+echo "Exporting TRT-LLM uv cache for build ${UV_CACHE_EXPORT_NONCE:-local} (${UV_CACHE_EXPORT_MODE})"
 echo "TRT-LLM uv cache state before export:"
 du -sh /root/.cache/trtllm-uv
 mkdir -p /tmp/trtllm-uv-cache-export
-cp -a /root/.cache/trtllm-uv/. /tmp/trtllm-uv-cache-export/
+case "${UV_CACHE_EXPORT_MODE}" in
+    incremental)
+        # Exclude both the previous TRT cache and files supplied by the shared
+        # uv seed. Only TRT-specific additions become a new registry layer.
+        rsync -aH --checksum \
+            --compare-dest=/tmp/trtllm-uv-cache-seed/ \
+            --compare-dest=/tmp/uv-cache-seed/ \
+            /root/.cache/trtllm-uv/ /tmp/trtllm-uv-cache-export/
+        ;;
+    full)
+        # A compacted dedicated snapshot still excludes the shared uv seed;
+        # the hermetic build merges that seed back before every TRT-LLM sync.
+        rsync -aH --checksum \
+            --compare-dest=/tmp/uv-cache-seed/ \
+            /root/.cache/trtllm-uv/ /tmp/trtllm-uv-cache-export/
+        ;;
+    *)
+        echo "Unsupported UV_CACHE_EXPORT_MODE: ${UV_CACHE_EXPORT_MODE}" >&2
+        exit 1
+        ;;
+esac
+echo "TRT-LLM uv cache export payload:"
+du -sh /tmp/trtllm-uv-cache-export
 EOF
 
-FROM scratch AS trtllm-uv-cache
-COPY --from=trtllm-uv-cache-export /tmp/trtllm-uv-cache-export/ /
+FROM trtllm-uv-cache-output-base AS trtllm-uv-cache
+COPY --link --from=trtllm-uv-cache-export /tmp/trtllm-uv-cache-export/ /
+LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"

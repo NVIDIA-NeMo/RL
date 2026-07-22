@@ -213,6 +213,12 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
         print(f"[trtllm-backend] Cache hit — reusing wheel: {src}", flush=True)
         return Path(dst).name
 
+    if env.get("TRTLLM_REQUIRE_CACHED_WHEEL") == "1":
+        raise RuntimeError(
+            "TRT-LLM cached wheel is required but was not found at "
+            f"{cache_dir}. Refusing to compile TRT-LLM during release venv prefetch."
+        )
+
     # Cache miss: build directly into cache_dir so the result is immediately
     # cached for subsequent venv syncs without a separate copy step.
     cache_dir.mkdir(parents=True, exist_ok=True)

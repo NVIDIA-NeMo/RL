@@ -203,7 +203,10 @@ jobs:
           REF="$REGISTRY/$IMAGE_NAME:${{ steps.trtllm_ccache_tag.outputs.tag }}"
           if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
             echo "Using TRT-LLM ccache seed $REF"
-            echo "build-context=trtllm-ccache-seed=docker-image://$REF" >> "$GITHUB_OUTPUT"
+            {
+              echo "ref=$REF"
+              echo "build-context=trtllm-ccache-seed=docker-image://$REF"
+            } >> "$GITHUB_OUTPUT"
           else
             echo "No TRT-LLM ccache image found at $REF; starting with an empty cache"
           fi
@@ -215,16 +218,76 @@ jobs:
         run: |
           set -euo pipefail
           REF="$REGISTRY/$IMAGE_NAME:${{ steps.trtllm_uv_cache_tag.outputs.tag }}"
-          GENERIC_REF="$REGISTRY/$IMAGE_NAME:uv-cache"
           if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
             echo "Using dedicated TRT-LLM uv cache seed $REF"
-            echo "build-context=trtllm-uv-cache-seed=docker-image://$REF" >> "$GITHUB_OUTPUT"
-          elif docker buildx imagetools inspect "$GENERIC_REF" >/dev/null 2>&1; then
-            echo "No dedicated TRT-LLM uv cache found; bootstrapping it from $GENERIC_REF"
-            echo "build-context=trtllm-uv-cache-seed=docker-image://$GENERIC_REF" >> "$GITHUB_OUTPUT"
+            {
+              echo "ref=$REF"
+              echo "build-context=trtllm-uv-cache-seed=docker-image://$REF"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "No dedicated or generic uv cache image found; starting with an empty TRT-LLM uv cache"
+            echo "No dedicated TRT-LLM uv cache found; starting with the shared uv cache only"
           fi
+
+      - name: Configure TRT-LLM ccache export
+        id: trtllm_ccache_export
+        if: steps.trtllm_ccache_tag.outputs.tag != ''
+        shell: bash
+        env:
+          SEED_REF: ${{ steps.trtllm_ccache_seed.outputs.ref }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          # Each incremental export adds one OCI layer. Periodically emit a
+          # full snapshot so the mutable tag has a bounded layer chain and
+          # evicted ccache entries disappear from the published image.
+          MAX_INCREMENTAL_LAYERS=16
+          CACHE_LAYOUT=incremental-v1
+          EXPORT_MODE=full
+          if [[ -n "$SEED_REF" ]]; then
+            IMAGE_METADATA=$(docker buildx imagetools inspect "$SEED_REF" --format "{{len (index .Image \"$PLATFORM\").RootFS.DiffIDs}} {{index (index .Image \"$PLATFORM\").Config.Labels \"com.nvidia.nemo-rl.cache-layout\"}}" 2>/dev/null || true)
+            if [[ -z "$IMAGE_METADATA" ]]; then
+              IMAGE_METADATA=$(docker buildx imagetools inspect "$SEED_REF" --format '{{len .Image.RootFS.DiffIDs}} {{index .Image.Config.Labels "com.nvidia.nemo-rl.cache-layout"}}' 2>/dev/null || true)
+            fi
+            read -r LAYER_COUNT EXISTING_LAYOUT <<< "$IMAGE_METADATA"
+            if [[ "$EXISTING_LAYOUT" == "$CACHE_LAYOUT" && "$LAYER_COUNT" =~ ^[0-9]+$ ]] && (( LAYER_COUNT < MAX_INCREMENTAL_LAYERS )); then
+              EXPORT_MODE=incremental
+              echo "Appending an incremental ccache layer to $SEED_REF ($LAYER_COUNT existing layers)"
+              echo "output-base-context=trtllm-ccache-output-base=docker-image://$SEED_REF" >> "$GITHUB_OUTPUT"
+            else
+              echo "Compacting TRT-LLM ccache into a full snapshot (layout: ${EXISTING_LAYOUT:-legacy}, layers: ${LAYER_COUNT:-unknown})"
+            fi
+          fi
+          echo "export-mode=$EXPORT_MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Configure TRT-LLM uv cache export
+        id: trtllm_uv_cache_export
+        if: steps.trtllm_uv_cache_tag.outputs.tag != ''
+        shell: bash
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          SEED_REF: ${{ steps.trtllm_uv_cache_seed.outputs.ref }}
+        run: |
+          set -euo pipefail
+
+          MAX_INCREMENTAL_LAYERS=16
+          CACHE_LAYOUT=incremental-v1
+          EXPORT_MODE=full
+          if [[ -n "$SEED_REF" ]]; then
+            IMAGE_METADATA=$(docker buildx imagetools inspect "$SEED_REF" --format "{{len (index .Image \"$PLATFORM\").RootFS.DiffIDs}} {{index (index .Image \"$PLATFORM\").Config.Labels \"com.nvidia.nemo-rl.cache-layout\"}}" 2>/dev/null || true)
+            if [[ -z "$IMAGE_METADATA" ]]; then
+              IMAGE_METADATA=$(docker buildx imagetools inspect "$SEED_REF" --format '{{len .Image.RootFS.DiffIDs}} {{index .Image.Config.Labels "com.nvidia.nemo-rl.cache-layout"}}' 2>/dev/null || true)
+            fi
+            read -r LAYER_COUNT EXISTING_LAYOUT <<< "$IMAGE_METADATA"
+            if [[ "$EXISTING_LAYOUT" == "$CACHE_LAYOUT" && "$LAYER_COUNT" =~ ^[0-9]+$ ]] && (( LAYER_COUNT < MAX_INCREMENTAL_LAYERS )); then
+              EXPORT_MODE=incremental
+              echo "Appending an incremental uv cache layer to $SEED_REF ($LAYER_COUNT existing layers)"
+              echo "output-base-context=trtllm-uv-cache-output-base=docker-image://$SEED_REF" >> "$GITHUB_OUTPUT"
+            else
+              echo "Compacting TRT-LLM uv cache into a full snapshot (layout: ${EXISTING_LAYOUT:-legacy}, layers: ${LAYER_COUNT:-unknown})"
+            fi
+          fi
+          echo "export-mode=$EXPORT_MODE" >> "$GITHUB_OUTPUT"
 
       - name: Get recently merged PR cache refs
         id: recent_pr_cache_refs
@@ -321,7 +384,7 @@ jobs:
         # Cache mounts survive a failed RUN in the current Buildx builder. Run
         # this step after both successful and failed image builds so completed
         # compiler outputs are preserved for the next retry.
-        if: ${{ always() && !cancelled() && steps.trtllm_build.outputs.enabled == 'true' && inputs.trtllm-ccache-tag != '' && steps.trtllm_ccache_tag.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_build.outputs.enabled == 'true' && inputs.trtllm-ccache-tag != '' && steps.trtllm_ccache_tag.outcome == 'success' && steps.trtllm_ccache_export.outcome == 'success' }}
         uses: docker/build-push-action@v5
         with:
           file: ${{ inputs.dockerfile }}
@@ -332,20 +395,23 @@ jobs:
             ${{ inputs.build-contexts }}
             ${{ steps.trtllm_ccache_seed.outputs.build-context }}
             ${{ steps.trtllm_uv_cache_seed.outputs.build-context }}
+            ${{ steps.trtllm_ccache_export.outputs.output-base-context }}
           build-args: |
             ${{ inputs.build-args }}
-            CCACHE_EXPORT_KEY=${{ github.run_id }}-${{ github.run_attempt }}
+            CCACHE_EXPORT_NONCE=${{ github.run_id }}-${{ github.run_attempt }}
+            CCACHE_EXPORT_MODE=${{ steps.trtllm_ccache_export.outputs.export-mode }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
             ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
           no-cache: false
+          provenance: false
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trtllm_ccache_tag.outputs.tag }}
           target: trtllm-ccache
 
       - name: Update TRT-LLM uv cache image
         # Persist downloads and source archives even when the release build
         # fails, so a retry can resume without repopulating this cache.
-        if: ${{ always() && !cancelled() && steps.trtllm_build.outputs.enabled == 'true' && inputs.trtllm-uv-cache-tag != '' && steps.trtllm_uv_cache_tag.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_build.outputs.enabled == 'true' && inputs.trtllm-uv-cache-tag != '' && steps.trtllm_uv_cache_tag.outcome == 'success' && steps.trtllm_uv_cache_export.outcome == 'success' }}
         uses: docker/build-push-action@v5
         with:
           file: ${{ inputs.dockerfile }}
@@ -356,12 +422,15 @@ jobs:
             ${{ inputs.build-contexts }}
             ${{ steps.trtllm_ccache_seed.outputs.build-context }}
             ${{ steps.trtllm_uv_cache_seed.outputs.build-context }}
+            ${{ steps.trtllm_uv_cache_export.outputs.output-base-context }}
           build-args: |
             ${{ inputs.build-args }}
             UV_CACHE_EXPORT_NONCE=${{ github.run_id }}-${{ github.run_attempt }}
+            UV_CACHE_EXPORT_MODE=${{ steps.trtllm_uv_cache_export.outputs.export-mode }}
           cache-from: |
             ${{ steps.build_meta.outputs.cache-from }}
             ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
           no-cache: false
+          provenance: false
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.trtllm_uv_cache_tag.outputs.tag }}
           target: trtllm-uv-cache
