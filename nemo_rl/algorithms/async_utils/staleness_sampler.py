@@ -69,6 +69,9 @@ class StalenessSampler:
             current_train_weight: Current trainer weight version.
             min_prompt_groups: Minimum groups required; returns (None, 0) below this.
             max_prompt_groups: Cap on groups returned when the threshold is met.
+                Selection is greedy without waiting: it returns all currently
+                eligible groups up to this cap (never deliberately fewer, and it
+                does not wait for the cap to fill).
 
         Returns:
             meta: Concatenated KVBatchMeta, or None if not enough groups.
