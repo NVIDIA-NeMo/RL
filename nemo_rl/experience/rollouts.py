@@ -724,10 +724,15 @@ def run_multi_turn_rollout(
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
 
     # Build per-task lookup for chat-template tokenization once, before the loop.
-    task_obs_use_chat_template: dict[str, bool] = {
-        task_name: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
-        for task_name, env in task_to_env.items()
-    }
+    # Skip the Ray call when max_rollout_turns=0 — the dict is never consulted.
+    task_obs_use_chat_template: dict[str, bool] = (
+        {
+            task_name: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
+            for task_name, env in task_to_env.items()
+        }
+        if max_rollout_turns > 0
+        else {}
+    )
 
     # Multi-reward accumulator: dict of {name: Tensor[B]} for multi-reward envs (e.g. GDPO), None for single-reward.
     multi_rewards: dict[str, torch.Tensor] | None = None
@@ -1350,10 +1355,15 @@ async def _run_multi_turn_rollout_async(
 
     # Build per-task lookup for chat-template tokenization once, before spawning
     # per-sample coroutines. Avoids N×len(task_to_env) Ray RPCs (one per sample).
-    task_obs_use_chat_template: dict[str, bool] = {
-        tn: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
-        for tn, env in task_to_env.items()
-    }
+    # Skip when max_rollout_turns=0 — the dict is never consulted by any sample.
+    task_obs_use_chat_template: dict[str, bool] = (
+        {
+            tn: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
+            for tn, env in task_to_env.items()
+        }
+        if max_rollout_turns > 0
+        else {}
+    )
 
     sample_initial_states = []
     for i in range(batch_size):
@@ -2531,10 +2541,11 @@ def _postprocess_single_nemo_gym_group(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
             ),
             "loss_multiplier": input_batch["loss_multiplier"],
-            # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
+            # Required by get_idx_grouping for advantage estimation grouping.
+            "idx": input_batch["idx"],
+            "task_name": input_batch.get("task_name", [None] * len(results)),
+            # Unused DatumSpec fields:
             # extra_env_info: dict[str, Any]
-            # idx: int
-            # task_name: NotRequired[str]
             # stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
             # Extra information not in the DatumSpec used by the GRPO algorithm
             "total_reward": torch.tensor([r["full_result"]["reward"] for r in results]),
