@@ -64,7 +64,7 @@ class VllmShardedExpertRefitMixin:
 
             self._validate_expert_storage(name, param)
 
-            quant_method = getattr(owner, "base_quant_method", None)
+            quant_method = getattr(owner, "quant_method", None)
             backend = getattr(quant_method, "unquantized_backend", None)
             backend_name = getattr(backend, "name", None)
             if getattr(owner, "quant_config", None) is not None or backend_name not in {
@@ -78,10 +78,11 @@ class VllmShardedExpertRefitMixin:
                     "policy.generation.vllm_kwargs.moe_backend=triton."
                 )
 
+            moe_config = owner.moe_config
             use_ep = bool(getattr(owner, "use_ep", False))
             local_expert_ids: list[int] | None = None
             if use_ep:
-                if bool(getattr(owner, "enable_eplb", False)):
+                if bool(moe_config.moe_parallel_config.enable_eplb):
                     raise RuntimeError(
                         "Sharded refit does not support dynamic vLLM expert load "
                         "balancing because ownership can change after metadata "
@@ -95,7 +96,7 @@ class VllmShardedExpertRefitMixin:
                 logical_num_experts = int(
                     cast(
                         int,
-                        getattr(owner, "logical_num_experts", expert_map.numel()),
+                        getattr(moe_config, "num_logical_experts", expert_map.numel()),
                     )
                 )
                 global_num_experts = int(
@@ -117,8 +118,8 @@ class VllmShardedExpertRefitMixin:
                 ]
 
             expert_params[name] = {
-                "tp_rank": int(getattr(owner, "tp_rank", 0)),
-                "tp_size": int(getattr(owner, "tp_size", 1)),
+                "tp_rank": int(moe_config.tp_rank),
+                "tp_size": int(moe_config.tp_size),
                 "local_expert_ids": local_expert_ids,
             }
 
@@ -223,7 +224,7 @@ class VllmShardedExpertRefitMixin:
 
             full_shape, _dtype = self.state_dict_info[name]
             expected_shape = list(full_shape)
-            tp_size = int(getattr(owner, "tp_size", 1))
+            tp_size = int(owner.moe_config.tp_size)
             shard_dim = expert_weight.tp_shard_dim
             expected_shape[shard_dim] //= tp_size
             if tensor.shape != torch.Size(expected_shape):
