@@ -187,6 +187,8 @@ mcore = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # TE v2.15 Megatron attention_backend=flash requires flash_attn.cute (FA4).
+  "flash-attn-4==4.0.0b13 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
@@ -350,7 +352,7 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.17.0",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.23.0",
@@ -563,12 +565,12 @@ requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.17.0"
+version = "2.15.0+42b8400"
 requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.17.0"
+version = "2.15.0+42b8400"
 requires-dist = ["torch", "transformer-engine"]
 
 [[tool.uv.dependency-metadata]]
