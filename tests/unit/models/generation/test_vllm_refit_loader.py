@@ -37,13 +37,15 @@ class _FakeExpertOwner:
     ):
         self.use_ep = use_ep
         self._expert_map = expert_map
-        self.logical_num_experts = 4
         self.global_num_experts = 4
-        self.enable_eplb = False
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
+        self.moe_config = SimpleNamespace(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            num_logical_experts=4,
+            moe_parallel_config=SimpleNamespace(enable_eplb=False),
+        )
         self.quant_config = None
-        self.base_quant_method = _FakeUnquantizedMethod(backend_name)
+        self.quant_method = _FakeUnquantizedMethod(backend_name)
 
     def weight_loader(self, *args, **kwargs):
         raise AssertionError("The fake weight loader should not be called")
@@ -62,16 +64,21 @@ def _expert_param(shape, owner):
 
 @pytest.mark.vllm
 def test_destination_local_copy_matches_vllm_full_weight_tp_loading():
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
     from nemo_rl.models.generation.vllm.vllm_backend import (
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
-    owner = FusedMoE.__new__(FusedMoE)
+    owner = RoutedExperts.__new__(RoutedExperts)
     torch.nn.Module.__init__(owner)
-    owner.moe_config = SimpleNamespace(is_act_and_mul=True)
-    owner.moe_parallel_config = SimpleNamespace(tp_rank=1)
+    # vLLM 0.25's _load_w13/_load_w2 take tp_rank as an argument and read the
+    # TP size from moe_config.moe_parallel_config to slice the checkpoint
+    # weight per rank.
+    owner.moe_config = SimpleNamespace(
+        is_act_and_mul=True,
+        moe_parallel_config=SimpleNamespace(tp_size=2),
+    )
     reference_w13 = _expert_param((2, 8, 6), owner)
     reference_w2 = _expert_param((2, 6, 4), owner)
     destination_w13 = _expert_param((2, 8, 6), owner)
@@ -257,8 +264,8 @@ def test_checkpoint_engine_weight_layout_reports_ep_and_pp_ownership(monkeypatch
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [
-                ("model.layers.0.mlp.experts.w13_weight", w13),
-                ("model.layers.0.mlp.experts.w2_weight", w2),
+                ("model.layers.0.mlp.experts.routed_experts.w13_weight", w13),
+                ("model.layers.0.mlp.experts.routed_experts.w2_weight", w2),
             ]
         )
     )
@@ -269,7 +276,9 @@ def test_checkpoint_engine_weight_layout_reports_ep_and_pp_ownership(monkeypatch
 
     layout = ext._checkpoint_engine_weight_layout()
 
-    assert layout["expert_params"]["model.layers.0.mlp.experts.w13_weight"] == {
+    assert layout["expert_params"][
+        "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    ] == {
         "tp_rank": 0,
         "tp_size": 1,
         "local_expert_ids": [1, 3],
@@ -290,7 +299,9 @@ def test_checkpoint_engine_weight_layout_rejects_shuffled_backend():
     )
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
-            named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
+            named_parameters=lambda: [
+                ("model.layers.0.mlp.experts.routed_experts.w13_weight", param)
+            ]
         )
     )
     with pytest.raises(ValueError, match="canonical unquantized Triton"):
@@ -311,7 +322,9 @@ def test_checkpoint_engine_weight_layout_rejects_transposed_experts():
     )
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
-            named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
+            named_parameters=lambda: [
+                ("model.layers.0.mlp.experts.routed_experts.w13_weight", param)
+            ]
         )
     )
     with pytest.raises(ValueError, match="canonical expert-weight orientation"):
@@ -335,8 +348,8 @@ def test_sharded_refit_directly_loads_full_ep_owned_experts():
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
             named_parameters=lambda: [
-                ("model.layers.0.mlp.experts.w13_weight", w13),
-                ("model.layers.0.mlp.experts.w2_weight", w2),
+                ("model.layers.0.mlp.experts.routed_experts.w13_weight", w13),
+                ("model.layers.0.mlp.experts.routed_experts.w2_weight", w2),
             ]
         )
     )
@@ -413,7 +426,7 @@ def test_sharded_refit_loads_sparse_local_expert_ids_individually():
     expert_2 = torch.full((4, 4), 2.0)
 
     ext._load_destination_local_expert_group(
-        "model.layers.0.mlp.experts.w13_weight",
+        "model.layers.0.mlp.experts.routed_experts.w13_weight",
         param,
         "w1",
         [(0, expert_0), (2, expert_2)],
@@ -437,7 +450,9 @@ def test_sharded_refit_keeps_full_tp_weight_for_standard_loader():
     )
     ext.model_runner = SimpleNamespace(
         model=SimpleNamespace(
-            named_parameters=lambda: [("model.layers.0.mlp.experts.w13_weight", param)]
+            named_parameters=lambda: [
+                ("model.layers.0.mlp.experts.routed_experts.w13_weight", param)
+            ]
         )
     )
     name = "model.layers.0.mlp.experts.0.gate_proj.weight"
@@ -458,7 +473,7 @@ def test_sharded_refit_requires_bound_vllm_expert_loader():
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
-    param_name = "model.layers.0.mlp.experts.w13_weight"
+    param_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     param = torch.nn.Parameter(torch.zeros(1, 8, 4), requires_grad=False)
     param.weight_loader = lambda *args, **kwargs: None
@@ -478,7 +493,7 @@ def test_sharded_refit_rejects_noncanonical_expert_dimensions():
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
-    param_name = "model.layers.0.mlp.experts.w13_weight"
+    param_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     owner = _FakeExpertOwner(use_ep=False)
     param = _expert_param((8, 4), owner)
@@ -498,7 +513,7 @@ def test_sharded_refit_validates_source_shape_against_reported_tp_size():
         VllmInternalWorkerExtensionWithCheckpointEngine,
     )
 
-    param_name = "model.layers.0.mlp.experts.w13_weight"
+    param_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
     weight_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
     owner = _FakeExpertOwner(use_ep=False, tp_size=2)
     param = _expert_param((1, 8, 4), owner)
