@@ -171,7 +171,13 @@ class MLPerfGRPOLogger:
         optimizer_cfg = megatron_cfg.get("optimizer") or policy_cfg.get("optimizer") or {}
         scheduler_cfg = megatron_cfg.get("scheduler") or {}
         generation_cfg = policy_cfg.get("generation") or {}
-        backend_cfg = generation_cfg.get("vllm_cfg") or {}
+        generation_backend = generation_cfg.get("backend", "vllm")
+        backend_cfg = generation_cfg.get(f"{generation_backend}_cfg") or {}
+        generation_expert_parallelism = (
+            backend_cfg.get("moe_expert_parallel_size")
+            if generation_backend == "trtllm"
+            else backend_cfg.get("expert_parallel_size")
+        )
 
         benchmark = str(self.mlperf_config.get("benchmark", "grpo_nemo_gym"))
 
@@ -219,10 +225,10 @@ class MLPerfGRPOLogger:
             self.constants.CONTEXT_PARALLELISM: megatron_cfg.get("context_parallel_size"),
             self.constants.EXPERT_PARALLELISM: megatron_cfg.get("expert_model_parallel_size"),
             # Generation parallelism
-            "generation_backend": generation_cfg.get("backend"),
+            "generation_backend": generation_backend,
             "generation_tensor_parallelism": backend_cfg.get("tensor_parallel_size"),
-            "generation_pipeline_parallelism": backend_cfg.get("pipeline_parallel_size"),
-            "generation_expert_parallelism": backend_cfg.get("expert_parallel_size"),
+            "generation_pipeline_parallelism": backend_cfg.get("pipeline_parallel_size", 1),
+            "generation_expert_parallelism": generation_expert_parallelism,
             "generation_training_rollout_temperature": generation_cfg.get("temperature"),
             "generation_training_rollout_top_p": generation_cfg.get("top_p"),
             "generation_validation_rollout_temperature": (
