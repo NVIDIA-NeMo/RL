@@ -1343,8 +1343,30 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         def __init__(self):
             self.values = iter(
                 [
-                    _ReadyRef((1, {"value": "second"}, None)),
-                    _ReadyRef((0, {"value": "first"}, {"remote_time": 2.0})),
+                    _ReadyRef(
+                        (
+                            1,
+                            {
+                                "value": "second",
+                                "input_message_log": [
+                                    {"role": "user", "token_ids": [1]}
+                                ],
+                            },
+                            None,
+                        )
+                    ),
+                    _ReadyRef(
+                        (
+                            0,
+                            {
+                                "value": "first",
+                                "input_message_log": [
+                                    {"role": "user", "token_ids": [1]}
+                                ],
+                            },
+                            {"remote_time": 2.0},
+                        )
+                    ),
                 ]
             )
 
@@ -1377,7 +1399,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
         "agent": agent,
     }
 
-    completions, metrics = asyncio.run(
+    completions, prompt_message_log, metrics = asyncio.run(
         manager._run_rollouts(
             inputs=[
                 {"agent_ref": {"name": "agent"}},
@@ -1389,6 +1411,8 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     )
 
     assert completions == ["first", "second"]
+    assert prompt_message_log[0]["role"] == "user"
+    torch.testing.assert_close(prompt_message_log[0]["token_ids"], torch.tensor([1]))
     assert metrics == {
         "completion_count": 2,
         "agent": "agent",
