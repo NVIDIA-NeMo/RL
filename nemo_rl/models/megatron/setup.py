@@ -283,6 +283,8 @@ def validate_and_set_config(
             f"policy.hf_config_overrides.rope_scaling."
         )
 
+    _apply_zero_train_gen_mismatch(config)
+
     megatron_cfg, model_cfg = setup_model_config(
         config,
         rank,
@@ -1163,9 +1165,9 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     """Propagate zero_train_gen_mismatch flag to its constituent sub-knobs.
 
     When True, forces batch_invariant_mode=True, use_mamba_mem_eff_path=False,
-    and defaults env vars for batch-invariant TE/cuBLAS/MoE/Mamba kernels
-    if not already set by the environment.
-    Router replay and moe_grouped_gemm must be configured explicitly.
+    attention_backend=flash (FA4 via TE), and defaults env vars for
+    batch-invariant TE/cuBLAS/MoE/Mamba kernels if not already set by the
+    environment. Router replay and moe_grouped_gemm must be configured explicitly.
     """
     if not config.get("megatron_cfg", {}).get("zero_train_gen_mismatch"):
         return
@@ -1174,6 +1176,7 @@ def _apply_zero_train_gen_mismatch(config: PolicyConfig) -> None:
     mc = config["megatron_cfg"]
     mc["batch_invariant_mode"] = True
     mc.setdefault("use_mamba_mem_eff_path", False)
+    mc.setdefault("attention_backend", "flash")
     # Default to cuBLAS workspace shrink (te_gemm_cublas_pinned) so the flag
     # delivers batch-invariant TE GEMM without requiring the env var to be set.
     os.environ.setdefault("NRL_BI_KERNELS", "te_gemm_cublas_pinned")
