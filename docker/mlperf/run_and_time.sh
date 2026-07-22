@@ -31,7 +31,7 @@ set -e
 : "${RECIPE:=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_gbs256.yaml}"
 : "${MLPERF_MLLOG_FILE:=/results/mllog.log}"
 : "${MLPERF_TARGET_ACCURACY:=1.0}"
-: "${MLPERF_BENCHMARK_NAME:=qwen35_397b_grpo_swe}"
+: "${MLPERF_BENCHMARK_NAME:=qwen35_397b_grpo}"
 : "${EXP_NAME:=${SPREFIX:-qwen35_397b_grpo}}"
 : "${EXTRA_ARGS:=$@}"
 

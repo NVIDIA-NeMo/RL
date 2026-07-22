@@ -14,7 +14,13 @@
 
 """run.sub-side mllogger shim (training-side logging is mlperf_grpo_logging.py)."""
 
+import os
+
 from mlperf_common.frameworks.pyt import PyTCommunicationHandler
 from mlperf_common.logging import MLLoggerWrapper
+from mlperf_logging import mllog
+
+if log_file := os.environ.get("MLPERF_MLLOG_FILE"):
+    mllog.config(filename=log_file)
 
 mllogger = MLLoggerWrapper(PyTCommunicationHandler(), value=None)

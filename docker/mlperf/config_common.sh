@@ -6,7 +6,7 @@ export DGXNGPU=4
 export RECIPE=${RECIPE:-qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_gbs256.yaml}
 
 export MLPERF_TARGET_ACCURACY=${MLPERF_TARGET_ACCURACY:-1.0}
-export MLPERF_BENCHMARK_NAME=qwen35_397b_grpo_swe
+export MLPERF_BENCHMARK_NAME=qwen35_397b_grpo
 
 # Idle-GPU reaper exemption: async GRPO idles the training pool while the
 # replay buffer fills from slow SWE rewards. sbatch reads SBATCH_COMMENT at

@@ -152,11 +152,21 @@ class MLPerfGRPOLogger:
     def sample_count(self, step: int) -> int:
         return int(step) * self.global_batch_size
 
-    def block_size_samples(self) -> int:
+    def block_size_samples(self, start_step: int) -> int:
+        start_step = int(start_step)
+        max_num_steps = int(self.config["grpo"].get("max_num_steps", 0))
         val_period = int(self.config["grpo"].get("val_period", 0))
-        if val_period <= 0:
-            val_period = int(self.config["grpo"].get("max_num_steps", 0))
-        return val_period * self.global_batch_size
+        if val_period > 0:
+            val_start_at = int(self.config["grpo"].get("val_start_at", 0))
+            block_end_step = (
+                val_start_at
+                if start_step < val_start_at
+                else start_step + val_period
+            )
+        else:
+            block_end_step = max_num_steps
+        block_end_step = min(block_end_step, max_num_steps)
+        return max(0, block_end_step - start_step) * self.global_batch_size
 
     def log_init_start(self) -> None:
         self._start(self.constants.INIT_START)
@@ -168,6 +178,7 @@ class MLPerfGRPOLogger:
     ) -> None:
         cfg = self.config
         grpo_cfg = cfg["grpo"]
+        loss_fn_cfg = cfg["loss_fn"]
         policy_cfg = cfg["policy"]
         megatron_cfg = policy_cfg.get("megatron_cfg") or {}
         # Fall back to the policy-level optimizer for non-Megatron (dtensor) runs.
@@ -236,6 +247,15 @@ class MLPerfGRPOLogger:
             ).get("top_p"),
             "num_prompts_per_step": grpo_cfg.get("num_prompts_per_step"),
             "num_generations_per_prompt": grpo_cfg.get("num_generations_per_prompt"),
+            "truncated_importance_sampling_ratio_min": loss_fn_cfg.get(
+                "truncated_importance_sampling_ratio_min"
+            ),
+            "truncated_importance_sampling_ratio": loss_fn_cfg.get(
+                "truncated_importance_sampling_ratio"
+            ),
+            "truncated_importance_sampling_type": loss_fn_cfg.get(
+                "truncated_importance_sampling_type"
+            ),
             "target_accuracy": self.target_accuracy,
         }
         # fmt: on
@@ -243,6 +263,19 @@ class MLPerfGRPOLogger:
         for key, value in logging_configs.items():
             if value is not None:
                 self._event(key=key, value=value)
+
+    def log_hyperparams_after_setup(self, data_parallel_size: int) -> None:
+        micro_batch_size = int(self.config["policy"]["train_micro_batch_size"])
+        denominator = micro_batch_size * int(data_parallel_size)
+        if denominator <= 0 or self.global_batch_size % denominator != 0:
+            raise ValueError(
+                "train_global_batch_size must be divisible by "
+                "train_micro_batch_size * data_parallel_size"
+            )
+        self._event(
+            key=self.constants.GRADIENT_ACCUMULATION_STEPS,
+            value=self.global_batch_size // denominator,
+        )
 
     @staticmethod
     def _dataset_len(dataset: Any) -> Optional[int]:
@@ -267,7 +300,7 @@ class MLPerfGRPOLogger:
         self._start(
             self.constants.BLOCK_START,
             metadata={
-                self.constants.SAMPLES_COUNT: self.block_size_samples(),
+                self.constants.SAMPLES_COUNT: self.block_size_samples(step),
                 "step": int(step),
             },
         )

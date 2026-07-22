@@ -221,6 +221,11 @@ The validation set you pass in will directly be used for validation with no addi
         alias_to_group_alias,
     ) = setup(config, tokenizer, train_dataset, val_dataset)
 
+    if mlperf_logger is not None:
+        mlperf_logger.log_hyperparams_after_setup(
+            data_parallel_size=policy.data_parallel_size
+        )
+
     # NeMo-Gym is spun up inside setup() (overlapped with vLLM model load).
     # Bind task_to_env and val_task_to_env for the nemo_gym env.
     # Hardcode here to match `run_async_nemo_gym_rollout`.

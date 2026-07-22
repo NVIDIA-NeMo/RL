@@ -60,6 +60,11 @@ def _config() -> dict[str, Any]:
             },
         },
         "cluster": {"num_nodes": 4},
+        "loss_fn": {
+            "truncated_importance_sampling_ratio_min": 0.999,
+            "truncated_importance_sampling_ratio": 1.002,
+            "truncated_importance_sampling_type": "seq-mask-tis",
+        },
         "grpo": {
             "seed": 42,
             "max_num_steps": 4,
@@ -121,6 +126,7 @@ def test_mlperf_grpo_logger_tracks_lifecycle_and_target() -> None:
 
     logger.log_init_start()
     logger.log_hyperparams(train_dataset=range(3), val_dataset=range(2))
+    logger.log_hyperparams_after_setup(data_parallel_size=2)
     logger.log_init_stop_run_start()
 
     logger.start_eval(0)
@@ -162,6 +168,36 @@ def test_mlperf_grpo_logger_tracks_lifecycle_and_target() -> None:
     ]
     assert {"reduced_train_loss": 0.2, "reward": 0.4, "grad_norm": 0.6} in tracked_stats
 
+    importance_sampling_calls = {
+        kwargs["key"]: kwargs["value"]
+        for method, kwargs in fake.calls
+        if method == "event"
+        and kwargs.get("key")
+        in {
+            "truncated_importance_sampling_ratio_min",
+            "truncated_importance_sampling_ratio",
+            "truncated_importance_sampling_type",
+        }
+    }
+    assert importance_sampling_calls == {
+        "truncated_importance_sampling_ratio_min": 0.999,
+        "truncated_importance_sampling_ratio": 1.002,
+        "truncated_importance_sampling_type": "seq-mask-tis",
+    }
+
+    gradient_accumulation_calls = [
+        kwargs
+        for method, kwargs in fake.calls
+        if method == "event" and kwargs.get("key") == "gradient_accumulation_steps"
+    ]
+    assert gradient_accumulation_calls == [
+        {
+            "key": "gradient_accumulation_steps",
+            "value": 4,
+            "metadata": {},
+        }
+    ]
+
 
 def test_mlperf_grpo_logger_allows_disabled_target() -> None:
     config = _config()
@@ -177,6 +213,36 @@ def test_mlperf_grpo_logger_allows_disabled_target() -> None:
     assert not logger.target_reached
     assert not logger.run_stopped
     assert config["grpo"]["max_num_steps"] == 4
+
+
+def test_mlperf_train_block_start_and_stop_sample_counts_match() -> None:
+    config = _config()
+    config["grpo"].update(
+        {
+            "max_num_steps": 4,
+            "val_period": 1,
+            "val_start_at": 3,
+        }
+    )
+    fake = _FakeMLLogger()
+    logger = MLPerfGRPOLogger(config, mllogger=fake)
+
+    logger.start_train_block(0)
+    logger.stop_train_block(3)
+    logger.start_train_block(3)
+    logger.stop_train_block(4)
+
+    block_start_counts = [
+        kwargs["metadata"]["samples_count"]
+        for method, kwargs in fake.calls
+        if method == "start" and kwargs.get("key") == "block_start"
+    ]
+    block_stop_counts = [
+        kwargs["metadata"]["samples_count"]
+        for method, kwargs in fake.calls
+        if method == "end" and kwargs.get("key") == "block_stop"
+    ]
+    assert block_start_counts == block_stop_counts == [24, 8]
 
 
 def test_mlperf_final_eval_defers_run_stop_until_train_metrics() -> None:
