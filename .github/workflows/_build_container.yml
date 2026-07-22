@@ -38,7 +38,7 @@ on:
       trtllm-ccache-tag:
         required: false
         default: ""
-        description: Arch-scoped prefix for the TRT-LLM ccache image tag (e.g. trtllm-ccache-arm64); the short TRT-LLM ref from [tool.trtllm] is appended automatically. Empty disables the ccache.
+        description: Prefix for the TRT-LLM ccache image tag; the target architecture and a hash of the effective base image are appended automatically. Empty disables the ccache.
         type: string
       dockerfile:
         required: true
@@ -92,17 +92,62 @@ jobs:
         id: trtllm_ccache_tag
         if: inputs.trtllm-ccache-tag != ''
         shell: bash
+        env:
+          BUILD_ARGS: ${{ inputs.build-args }}
+          CACHE_TAG_PREFIX: ${{ inputs.trtllm-ccache-tag }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
-          # Single source of truth for the built ref is [tool.trtllm].ref in the
-          # workspace pyproject.toml.
-          PYPROJECT=3rdparty/TensorRT-LLM-workspace/pyproject.toml
-          REF=$(sed -nE '/^\[tool\.trtllm\]/,/^\[/{s/^[[:space:]]*ref[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p;}' "$PYPROJECT" | head -1)
-          if [ -z "$REF" ]; then
-            echo "Could not read [tool.trtllm].ref from $PYPROJECT" >&2
+
+          # Prefer an explicit build-arg override, then fall back to the
+          # Dockerfile default used by the build.
+          BASE_IMAGE=$(printf '%s\n' "$BUILD_ARGS" | sed -nE 's/^[[:space:]]*BASE_IMAGE[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$/\1/p' | tail -1)
+          if [[ -z "$BASE_IMAGE" ]]; then
+            BASE_IMAGE=$(sed -nE 's/^[[:space:]]*ARG[[:space:]]+BASE_IMAGE[[:space:]]*=[[:space:]]*(.+)[[:space:]]*$/\1/p' "$DOCKERFILE" | tail -1)
+          fi
+          if [[ -z "$BASE_IMAGE" ]]; then
+            echo "Could not resolve BASE_IMAGE from build args or $DOCKERFILE" >&2
             exit 1
           fi
-          echo "tag=${{ inputs.trtllm-ccache-tag }}-${REF:0:8}" >> "$GITHUB_OUTPUT"
+
+          ARCH="${PLATFORM#*/}"
+          ARCH="${ARCH%%/*}"
+          if [[ -z "$ARCH" || "$PLATFORM" != */* || "$PLATFORM" == *,* ]]; then
+            echo "Expected a single OS/architecture platform, got: $PLATFORM" >&2
+            exit 1
+          fi
+
+          BASE_IMAGE_KEY=$(printf '%s' "$BASE_IMAGE" | sha256sum | cut -c1-12)
+          TAG="${CACHE_TAG_PREFIX}-${ARCH}-${BASE_IMAGE_KEY}"
+          echo "Using TRT-LLM ccache tag $TAG for $BASE_IMAGE on $ARCH"
+          {
+            echo "arch=$ARCH"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      # Temporary one-shot migration from the old TRT-LLM-ref-scoped tags.
+      # Remove this step after both architecture builds have run successfully.
+      - name: Migrate legacy TRT-LLM ccache tag (temporary)
+        if: inputs.trtllm-ccache-tag != ''
+        shell: bash
+        env:
+          LEGACY_TAG: trtllm-ccache-${{ steps.trtllm_ccache_tag.outputs.arch }}-bf2ef86f
+          NEW_TAG: ${{ steps.trtllm_ccache_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          LEGACY_REF="$REGISTRY/$IMAGE_NAME:$LEGACY_TAG"
+          NEW_REF="$REGISTRY/$IMAGE_NAME:$NEW_TAG"
+          if docker buildx imagetools inspect "$NEW_REF" >/dev/null 2>&1; then
+            echo "TRT-LLM ccache tag $NEW_REF already exists; skipping migration"
+          elif docker buildx imagetools inspect "$LEGACY_REF" >/dev/null 2>&1; then
+            echo "Migrating TRT-LLM ccache tag $LEGACY_REF to $NEW_REF"
+            docker buildx imagetools create --tag "$NEW_REF" "$LEGACY_REF"
+            docker buildx imagetools inspect "$NEW_REF" >/dev/null
+          else
+            echo "Legacy TRT-LLM ccache tag $LEGACY_REF was not found; skipping migration"
+          fi
 
       - name: Resolve TRT-LLM ccache seed
         id: trtllm_ccache_seed

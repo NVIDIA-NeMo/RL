@@ -30,6 +30,15 @@ assert_patch_target() {
     }
 }
 
+show_ccache_status() {
+    local phase=$1
+
+    echo "ccache status ${phase}:"
+    # Includes cache size, limits, hit rates, misses, errors, and uncacheable
+    # calls. Verbose mode expands the error and uncacheable counters.
+    ccache --show-stats --verbose
+}
+
 # Required positional arguments: the fork URL and commit ref to build.
 # This is purely a build script — it does not resolve defaults. The caller owns
 # the source of truth (the PEP 517 backend _backend.py reads them from the
@@ -137,12 +146,12 @@ echo "Building TensorRT-LLM wheel (arch=${ARCH}, jobs=${JOBS})..."
 
 # Record whether cached compiler outputs exist, then reset only the counters so
 # the final report describes this build. `--zero-stats` keeps cached objects.
-echo "ccache state before build:"
-ccache --show-stats
+show_ccache_status "before TRT-LLM build"
 CCACHE_FILES_BEFORE=$(ccache --print-stats | awk '$1 == "files_in_cache" {print $2}')
 CCACHE_FILES_BEFORE=${CCACHE_FILES_BEFORE:-0}
 ccache --zero-stats
 
+TRTLLM_BUILD_STATUS=0
 python3 scripts/build_wheel.py \
     -a "$ARCH" \
     -G Ninja \
@@ -150,10 +159,13 @@ python3 scripts/build_wheel.py \
     --use_ccache \
     --nvrtc_dynamic_linking \
     --job_count "$JOBS" \
-    -D "ENABLE_UCX=OFF"
+    -D "ENABLE_UCX=OFF" || TRTLLM_BUILD_STATUS=$?
 
-echo "ccache statistics for this build:"
-ccache --show-stats
+show_ccache_status "after TRT-LLM build"
+if ((TRTLLM_BUILD_STATUS != 0)); then
+    echo "[ERROR] TensorRT-LLM build failed with exit code ${TRTLLM_BUILD_STATUS}."
+    exit "$TRTLLM_BUILD_STATUS"
+fi
 CCACHE_HITS=$(ccache --print-stats | awk \
     '$1 == "direct_cache_hit" || $1 == "preprocessed_cache_hit" {hits += $2} END {print hits + 0}')
 if ((CCACHE_FILES_BEFORE > 0 && CCACHE_HITS == 0)); then
