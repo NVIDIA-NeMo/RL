@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import logging
 import re
 import socket
-import traceback
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -35,8 +35,11 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 
+logger = logging.getLogger(__name__)
+
 try:
     import vllm  # noqa: F401
+    from vllm.distributed.parallel_state import get_pp_group
     from vllm.v1.worker.gpu_worker import Worker as VllmWorker
 except ImportError:
     raise ImportError(
@@ -170,6 +173,9 @@ def _read_mtp_layer_weights_from_checkpoint(
 
 
 class VllmInternalWorkerExtension:
+    # True once the MTP drafter has been served by a one-time disk load (see
+    # load_mtp_weights_from_disk); refit then leaves those static weights alone.
+    _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
 
@@ -316,9 +322,9 @@ class VllmInternalWorkerExtension:
 
         This path is only used for the Eagle3 online-training flow, where the
         trainer exports draft parameters under a `draft.` prefix before sending
-        them to vLLM.
-        This implementation is specific to the eagle model. For MTP, we can add
-        similar logic to this function to split weights and send it to the drafter.
+        them to vLLM. MTP parameters do not use the `draft.` prefix; they remain
+        in the policy stream and are forwarded separately by
+        ``_maybe_refit_mtp_drafter``.
         The "draft." prefix is added here https://github.com/isomap/RL/blob/d3a5e1396d00f82fb888d9ec6800687a23bb4017/nemo_rl/models/policy/workers/megatron_policy_worker.py#L967-L997
         """
         policy_weights = []
@@ -366,22 +372,92 @@ class VllmInternalWorkerExtension:
             trimmed.append((key, tensor))
         return trimmed
 
+    def _get_drafter_model(self) -> Any:
+        """Return the vLLM drafter's underlying model, or None if absent.
+
+        The drafter holds the speculative-decoding draft model (Eagle3 or MTP),
+        which vLLM keeps as a module separate from the main model. Typed ``Any``
+        because these are dynamic vLLM model classes whose ``load_weights`` /
+        ``mtp_start_layer_idx`` members are not visible through ``nn.Module``.
+        """
+        draft_owner = getattr(self.model_runner, "drafter", None)
+        return getattr(draft_owner, "model", None) if draft_owner else None
+
     def _load_draft_weights(
         self, draft_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
         if not draft_weights:
             return
 
-        draft_owner = getattr(self.model_runner, "drafter", None)
-        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
-
+        draft_model = self._get_drafter_model()
         if draft_model is None:
-            print(
+            logger.warning(
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
             )
             return
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
+
+    def _mtp_drafter_refit_enabled(self) -> bool:
+        """Whether MTP drafter weights should be refreshed from the refit stream.
+
+        For MTP speculative decoding where the trainer co-trains the MTP layer
+        (``mtp_num_layers > 0``), the MTP weights are exported as part of the
+        policy weight stream during refit (without the ``draft.`` prefix used by
+        Eagle3), so the drafter must be fed those weights on every refit.
+
+        Returns False when the MTP weights were instead loaded once from disk
+        (see ``load_mtp_weights_from_disk``) — the path used when the trainer
+        does not co-train the MTP layer — to avoid clobbering and re-processing
+        those static weights.
+        """
+        if self._mtp_drafter_from_disk:
+            return False
+        spec_config = getattr(self.model_runner.vllm_config, "speculative_config", None)
+        method = getattr(spec_config, "method", None) if spec_config else None
+        if method not in ("deepseek_mtp", "mtp"):
+            return False
+        return self._get_drafter_model() is not None
+
+    def _maybe_refit_mtp_drafter(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+        """Load refit weights into an MTP drafter co-trained with the policy.
+
+        The drafter's ``load_weights`` selects the MTP-specific parameters (and
+        shared embed_tokens / lm_head) it needs from the full policy weight
+        stream. Megatron pads the vocab dimension, so weights are trimmed to the
+        drafter's expected vocab size first, matching ``_load_draft_weights``.
+        """
+        if not self._mtp_drafter_refit_enabled():
+            return
+        draft_model = self._get_drafter_model()
+        if draft_model is None:
+            return
+        weights = self._trim_vocab_padding(draft_model, weights)
+        draft_model.load_weights(weights=weights)
+
+    def _maybe_process_mtp_drafter_after_loading(self) -> None:
+        """Finalize MTP drafter weights after a refit (e.g. MoE grouped-GEMM layout).
+
+        Mirrors the main-model post-processing so the freshly refit MTP layers
+        are converted to their runtime layout. Skipped for the disk-load path,
+        which already processes its weights once at startup.
+        """
+        if not self._mtp_drafter_refit_enabled():
+            return
+        draft_model = self._get_drafter_model()
+        if draft_model is None:
+            return
+
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
+
+        draft_model_config = (
+            self.model_runner.vllm_config.speculative_config.draft_model_config
+        )
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(draft_model, draft_model_config, self.device)
 
     def load_mtp_weights_from_disk(self, model_path: str) -> bool:
         """Load only the MTP (multi-token-prediction) draft weights from disk.
@@ -399,10 +475,16 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if MTP weights were loaded.
         """
-        draft_owner = getattr(self.model_runner, "drafter", None)
-        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
+        draft_model = self._get_drafter_model()
         if draft_model is None:
-            print("[mtp] Drafter unavailable; cannot load MTP weights from disk.")
+            # vLLM places the speculative drafter only on the last pipeline
+            # stage. Its absence is expected on every earlier stage, but means
+            # the engine cannot serve speculative decoding on the owning stage.
+            if get_pp_group().is_last_rank:
+                raise RuntimeError(
+                    "[mtp] vLLM speculative_config is set for MTP but the drafter "
+                    "model is unavailable; cannot load MTP weights from disk."
+                )
             return False
 
         predictor = draft_model.model
@@ -434,9 +516,13 @@ class VllmInternalWorkerExtension:
         )
         with set_current_vllm_config(self.model_runner.vllm_config):
             process_weights_after_loading(draft_model, draft_model_config, self.device)
-        print(
-            f"[mtp] Loaded MTP draft weights for layers "
-            f"{sorted(mtp_layer_indices)} from {model_path}"
+        # Mark that the MTP drafter is served from a one-time disk load so refit
+        # does not re-load or re-process these static weights.
+        self._mtp_drafter_from_disk = True
+        logger.info(
+            "[mtp] Loaded MTP draft weights for layers %s from %s",
+            sorted(mtp_layer_indices),
+            model_path,
         )
         return True
 
@@ -456,7 +542,11 @@ class VllmInternalWorkerExtension:
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         self._load_hf_weights(policy_weights)
+        # Eagle3 draft weights are exported with the `draft.` prefix.
         self._load_draft_weights(draft_weights)
+        # MTP drafters co-trained with the policy receive their weights from the
+        # policy stream (no `draft.` prefix), so feed it the policy weights too.
+        self._maybe_refit_mtp_drafter(policy_weights)
 
     def _get_sparse_delta_applier(self) -> Any:
         if self._sparse_delta_applier is None:
@@ -487,6 +577,7 @@ class VllmInternalWorkerExtension:
                 process_weights_after_loading(
                     self.model_runner.model, self.model_config, self.device
                 )
+            self._maybe_process_mtp_drafter_after_loading()
 
         yield finalize
         # Preserve the IPC lifetime boundary: the COMPLETE ACK is sent before
@@ -593,9 +684,9 @@ class VllmInternalWorkerExtension:
         except Exception as e:
             if self._weight_update_errors_are_fatal():
                 raise
-            print(
-                f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
-                f"{traceback.format_exc()}"
+            logger.exception(
+                "Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: %s",
+                e,
             )
             return False
 
@@ -622,8 +713,9 @@ class VllmInternalWorkerExtension:
         except Exception as e:
             if self._weight_update_errors_are_fatal():
                 raise
-            print(
-                f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"
+            logger.exception(
+                "Error in VllmInternalWorkerExtension.update_weights_from_collective: %s",
+                e,
             )
             return False
 
