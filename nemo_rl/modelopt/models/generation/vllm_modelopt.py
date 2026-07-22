@@ -23,7 +23,6 @@ materialization of FlashInfer's global-scale views, and retention of
 method-owned MoE kernel references across layerwise reload.
 """
 
-import copy
 from types import MethodType
 from typing import Any
 
@@ -88,71 +87,20 @@ def _load_modelopt_moe_input_scale(
     return True if return_success else None
 
 
-def _normalized_w4a16_config(config: dict[str, Any]) -> dict[str, Any]:
-    normalized = copy.deepcopy(config)
-    quantization = normalized.get("quantization")
-    target = quantization if isinstance(quantization, dict) else normalized
+def _validated_w4a16_config(config: dict[str, Any]) -> dict[str, Any]:
+    quantization = config.get("quantization")
+    target = quantization if isinstance(quantization, dict) else config
     if str(target.get("quant_algo", "")).upper() != _W4A16_ALGO:
         raise ValueError(f"{NEMO_MODELOPT_W4A16} requires quant_algo={_W4A16_ALGO!r}")
-    # vLLM 0.20 validates known ModelOpt algorithms before dispatching to a
-    # custom subclass. Normalize only for its parser; class identity selects
-    # the W4A16 methods below.
-    target["quant_algo"] = _W4A4_ALGO
-    return normalized
+    # vLLM 0.25 understands W4A16_NVFP4 natively, so the algo passes through
+    # unchanged (the base __init__ keys use_a16/LinearMethodCls off it).
+    return config
 
 
 def _canonicalize_nvfp4_scale_(scale: torch.Tensor) -> None:
     """Remove the E4M3 sign bit before Marlin's unsigned scale conversion."""
     with torch.no_grad():
         scale.copy_(scale.to(torch.float32).abs().to(scale.dtype))
-
-
-def _pad_nvfp4_moe_for_marlin(
-    w13: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2: torch.Tensor,
-    w2_scale: torch.Tensor,
-    *,
-    is_act_and_mul: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Apply rank-local post-load padding required by the Marlin MoE kernel."""
-    num_experts = w13.shape[0]
-    num_shards = 2 if is_act_and_mul else 1
-    intermediate_size = w13.shape[1] // num_shards
-    hidden_size = w13.shape[2] * 2
-    if hidden_size % 128 == 0:
-        tile_size = 64
-    elif hidden_size % 64 == 0:
-        tile_size = 128
-    else:
-        raise ValueError(
-            f"W4A16 Marlin MoE requires hidden_size divisible by 64, got {hidden_size}"
-        )
-    padded_size = (intermediate_size + tile_size - 1) // tile_size * tile_size
-    if padded_size == intermediate_size:
-        return w13, w13_scale, w2, w2_scale, intermediate_size
-
-    def pad_w13(tensor: torch.Tensor) -> torch.Tensor:
-        tensor = tensor.view(
-            num_experts,
-            num_shards,
-            intermediate_size,
-            tensor.shape[-1],
-        )
-        tensor = torch.nn.functional.pad(
-            tensor,
-            (0, 0, 0, padded_size - intermediate_size),
-        )
-        return tensor.reshape(num_experts, num_shards * padded_size, -1)
-
-    w13 = pad_w13(w13)
-    w13_scale = pad_w13(w13_scale)
-    w2 = torch.nn.functional.pad(w2, (0, (padded_size - intermediate_size) // 2))
-    w2_scale = torch.nn.functional.pad(
-        w2_scale,
-        (0, (padded_size - intermediate_size) // 16),
-    )
-    return w13, w13_scale, w2, w2_scale, padded_size
 
 
 def register_nemo_modelopt_nvfp4() -> None:
@@ -165,14 +113,7 @@ def register_nemo_modelopt_nvfp4() -> None:
         MarlinNvFp4LinearKernel,
         NvFp4LinearLayerConfig,
     )
-    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-        FusedMoEMethodBase,
-    )
-    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
-        NvFp4MoeBackend,
-        is_global_sf_supported_for_nvfp4_backend,
-        select_nvfp4_moe_backend,
-    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
     from vllm.model_executor.layers.linear import (
         register_weight_loader_v2_supported_method,
     )
@@ -182,8 +123,6 @@ def register_nemo_modelopt_nvfp4() -> None:
         ModelOptNvFp4FusedMoE,
         ModelOptNvFp4LinearMethod,
     )
-    from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
-    from vllm.model_executor.utils import replace_parameter
 
     class NemoModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         """Native W4A4 MoE plus the vLLM 0.20 input-scale loader fix."""
@@ -297,29 +236,16 @@ def register_nemo_modelopt_nvfp4() -> None:
             return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
     class NemoModelOptW4A16FusedMoE(ModelOptNvFp4FusedMoE):
-        """ModelOpt W4A16 MoE using vLLM's NVFP4 Marlin implementation."""
+        """ModelOpt W4A16 MoE using vLLM's NVFP4 Marlin implementation.
+
+        vLLM 0.25's base __init__ keys weight-only mode off
+        quant_config.quant_method == "W4A16_NVFP4" (activation_key=None), so
+        the 0.20-era duplicated __init__ is gone; the algo passes through
+        from_config unchanged.
+        """
 
         moe_kernel: Any
         moe_quant_config: Any
-
-        def __init__(self, quant_config: object, moe_config: object) -> None:
-            # Duplicates vLLM v0.20.0 ModelOptNvFp4FusedMoE.__init__ except
-            # activation_key=None (weight-only); the base hard-wires
-            # kNvfp4Dynamic and offers no hook:
-            # https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/model_executor/layers/quantization/modelopt.py#L1218-L1234
-            # Intentionally calls FusedMoEMethodBase.__init__ to skip the
-            # parent __init__; do not replace it with super().__init__().
-            # Re-sync on vLLM bumps.
-            FusedMoEMethodBase.__init__(self, moe_config)
-            self.quant_config = quant_config
-            self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
-                config=self.moe,
-                weight_key=kNvfp4Static,
-                activation_key=None,
-            )
-            self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
-                self.nvfp4_backend
-            )
 
         def create_weights(
             self,
@@ -344,35 +270,20 @@ def register_nemo_modelopt_nvfp4() -> None:
         def process_weights_after_loading(self, layer: Any) -> None:
             reload_kernel = self.moe_kernel
             reload_quant_config = self.moe_quant_config
-            original_intermediate_size = (
-                layer.moe_config.intermediate_size_per_partition
-            )
             if self.nvfp4_backend == NvFp4MoeBackend.MARLIN:
-                w13, w13_scale, w2, w2_scale, padded_size = _pad_nvfp4_moe_for_marlin(
-                    layer.w13_weight,
-                    layer.w13_weight_scale,
-                    layer.w2_weight,
-                    layer.w2_weight_scale,
-                    is_act_and_mul=self.moe.is_act_and_mul,
-                )
-                replace_parameter(layer, "w13_weight", w13)
-                replace_parameter(layer, "w13_weight_scale", w13_scale)
-                replace_parameter(layer, "w2_weight", w2)
-                replace_parameter(layer, "w2_weight_scale", w2_scale)
+                # vLLM 0.25's prepare_nvfp4_moe_layer_for_marlin pads the
+                # rank-local intermediate tiles itself (and asserts on the
+                # unpadded checkpoint shapes), so no NeMo-side pre-padding.
+                # Only the E4M3 sign-bit canonicalization of the ModelOpt
+                # export remains our concern.
                 _canonicalize_nvfp4_scale_(layer.w13_weight_scale)
                 _canonicalize_nvfp4_scale_(layer.w2_weight_scale)
-                layer.moe_config.intermediate_size_per_partition = padded_size
             # W4A16 checkpoint metadata deliberately omits activation scales so
             # layerwise reload never waits for tensors that do not exist. The
             # native Marlin converter accepts None and removes these attributes.
             layer.w13_input_scale = None
             layer.w2_input_scale = None
-            try:
-                super().process_weights_after_loading(layer)
-            finally:
-                layer.moe_config.intermediate_size_per_partition = (
-                    original_intermediate_size
-                )
+            super().process_weights_after_loading(layer)
             if reload_kernel is not None:
                 self.moe_kernel = reload_kernel
                 self.moe_quant_config = reload_quant_config
@@ -401,7 +312,13 @@ def register_nemo_modelopt_nvfp4() -> None:
 
         @classmethod
         def from_config(cls, config: dict[str, Any]) -> Any:
-            return super().from_config(_normalized_w4a16_config(config))
+            instance = super().from_config(_validated_w4a16_config(config))
+            # vLLM 0.25's ModelOptNvFp4Config.__init__ selects LinearMethodCls
+            # from the quant algo as an *instance* attribute, which shadows
+            # the class attribute above; rebind the NeMo method explicitly so
+            # W4A16 linears keep the refit-friendly Marlin implementation.
+            instance.LinearMethodCls = NemoModelOptW4A16LinearMethod
+            return instance
 
     register_quantization_config(NEMO_MODELOPT_W4A4)(NemoModelOptNvFp4Config)
     register_quantization_config(NEMO_MODELOPT_W4A16)(NemoModelOptW4A16Config)
