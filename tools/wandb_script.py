@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument("--org", type=str, default="nvidia")
     parser.add_argument("--project", type=str, default="nemo-rl")
     parser.add_argument("--uid", type=str, required=True)
-    parser.add_argument("--at-step", type=int, default=5)
+    parser.add_argument("--at-step", type=int, default=6)
     parser.add_argument("--average-steps", type=int, default=5)
     return parser.parse_args()
 
