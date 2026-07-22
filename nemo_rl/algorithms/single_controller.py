@@ -827,6 +827,11 @@ class SingleControllerActor:
             repeated_batch=repeated_batch,
             **kwargs,
         )
+        response_advantages = torch.masked_select(advantages, mask.bool())
+        self._step_log_dict["rewards"].append(rewards.detach().cpu())
+        self._step_log_dict["masked_advantages"].append(
+            response_advantages.detach().cpu()
+        )
 
         await self._call_dp(
             "put_samples",

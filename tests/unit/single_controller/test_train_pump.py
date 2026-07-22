@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import gc
+import math
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import ray
@@ -161,7 +163,7 @@ class _FakeAdvEstimator:
         repeated_batch: dict,
         **kwargs,
     ) -> torch.Tensor:
-        return rewards.detach().clone()
+        return rewards.unsqueeze(-1).expand(mask.shape).detach().clone()
 
 
 @ray.remote(num_cpus=0)  # pragma: no cover
@@ -177,6 +179,41 @@ class _CallLog:
 
     def get(self) -> list[tuple[str, dict]]:
         return list(self._entries)
+
+
+class _RecordingLogger:
+    """Forward metrics logged inside SC to a Ray actor visible to the test."""
+
+    def __init__(self, log_handle: Any) -> None:
+        self._log = log_handle
+
+    def log_metrics(
+        self,
+        metrics: dict[str, Any],
+        step: int,
+        prefix: str | None = "",
+    ) -> None:
+        ray.get(
+            self._log.record.remote(
+                "metrics",
+                {
+                    "metrics": dict(metrics),
+                    "step": int(step),
+                    "prefix": prefix,
+                },
+            )
+        )
+
+
+@ray.remote(num_cpus=1, num_gpus=0)
+class _RecordingSingleControllerActor(
+    SingleControllerActor.__ray_metadata__.modified_class
+):
+    """SingleControllerActor variant with an observable logger."""
+
+    def __init__(self, *, metric_log_handle: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._logger = _RecordingLogger(metric_log_handle)
 
 
 class _FakeWeightSync:
@@ -288,7 +325,8 @@ def test_train_pump_drives_mcore_training_step(
             },
         )
 
-        ctrl = SingleControllerActor.remote(
+        ctrl = _RecordingSingleControllerActor.remote(
+            metric_log_handle=log,
             cfg=cfg,
             dp_client_handle=dp_client,
             gen_handle=None,
@@ -311,6 +349,16 @@ def test_train_pump_drives_mcore_training_step(
         entries = ray.get(log.get.remote())
         sync_versions = [p["version"] for k, p in entries if k == "sync_weights"]
         assert sync_versions == list(range(1, train_steps + 1))
+
+        train_metrics = [
+            p["metrics"]
+            for kind, p in entries
+            if kind == "metrics" and p["prefix"] == "train"
+        ]
+        assert len(train_metrics) == train_steps
+        for metrics in train_metrics:
+            assert math.isfinite(metrics["reward"])
+            assert math.isfinite(metrics["advantages/mean"])
 
     finally:
         trainer.shutdown()
