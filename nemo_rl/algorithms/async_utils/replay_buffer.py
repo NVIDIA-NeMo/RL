@@ -755,6 +755,8 @@ class TQReplayBuffer:
                     partition_id=self._partition_id,
                 )
             except BaseException as rollback_error:
+                if isinstance(commit_error, asyncio.CancelledError):
+                    raise commit_error from rollback_error
                 raise BaseExceptionGroup(
                     f"commit and rollback both failed for group_id={group_id!r}",
                     [commit_error, rollback_error],
