@@ -193,9 +193,9 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.engine",
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
-        "vllm.entrypoints.serve.render",
         "vllm.entrypoints.serve.tokenize",
         "vllm.reasoning",
+        "vllm.renderers",
         "vllm.tool_parsers",
         "vllm.v1",
         "vllm.v1.engine",
@@ -218,7 +218,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.registry = "registry"
 
-    class OpenAIServingRender:
+    class OnlineRenderer:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.renderer = kwargs["renderer"]
@@ -230,7 +230,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.kwargs = kwargs
             self.instances.append(self)
 
-    class OpenAIServingTokenization:
+    class ServingTokenization:
         instances = []
 
         def __init__(self, **kwargs):
@@ -274,12 +274,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         TokenizeResponse=type("TokenizeResponse", (), {}),
     )
     make_module(
-        "vllm.entrypoints.serve.render.serving",
-        OpenAIServingRender=OpenAIServingRender,
+        "vllm.renderers.online_renderer",
+        OnlineRenderer=OnlineRenderer,
     )
     make_module(
         "vllm.entrypoints.serve.tokenize.serving",
-        OpenAIServingTokenization=OpenAIServingTokenization,
+        ServingTokenization=ServingTokenization,
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
     make_module(
@@ -1581,8 +1581,8 @@ def test_vllm_http_server(cluster, tokenizer):
                     "annotations": None,
                     "audio": None,
                     "function_call": None,
-                    "tool_calls": [],
-                    "reasoning_content": None,
+                    # vLLM 0.25 omits tool_calls when empty and dropped
+                    # reasoning_content in favor of reasoning.
                     "reasoning": None,
                 },
                 "logprobs": {
@@ -1598,6 +1598,7 @@ def test_vllm_http_server(cluster, tokenizer):
                 "finish_reason": "length",
                 "stop_reason": None,
                 "token_ids": None,
+                "routed_experts": None,
             }
         ],
         "service_tier": None,
@@ -1610,13 +1611,18 @@ def test_vllm_http_server(cluster, tokenizer):
         },
         "prompt_logprobs": None,
         "prompt_token_ids": None,
+        "prompt_text": None,
         "kv_transfer_params": None,
+        "metrics": None,
     }
 
     def _standardize(d: dict) -> dict:
         d = deepcopy(d)
         d.pop("id")
         d.pop("created")
+        # vLLM 0.25 populates system_fingerprint with the version + build hash
+        # (e.g. "vllm-0.25.1-<hash>"), which is wheel-specific.
+        d.pop("system_fingerprint", None)
         # We don't want to implicate log prob accuracy in this test.
         d["choices"][0]["logprobs"]["content"][0].pop("logprob")
 
