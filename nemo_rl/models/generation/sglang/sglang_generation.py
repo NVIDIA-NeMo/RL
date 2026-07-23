@@ -76,6 +76,7 @@ class SGLangGeneration(GenerationInterface):
     ):
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg
+        self._owns_runtime = True
         self._async_loop: AsyncLoopThread | None = AsyncLoopThread()
         self._http_client: HttpClient | None = None
 
@@ -177,10 +178,12 @@ class SGLangGeneration(GenerationInterface):
     # ``_http_client`` (httpx) and ``_async_loop`` (a live thread + asyncio
     # loop) hold contextvars/threads and cannot pickle; ``_health_monitor``
     # owns engine-liveness threads that belong to the driver only. Drop all
-    # three and rebuild the client/loop lazily after unpickle (the collector
-    # never runs health monitoring, so ``_health_monitor`` stays ``None``).
+    # three and mark the deserialized copy as a non-owner before rebuilding its
+    # local client/loop. A collector copy may use actor handles but must never
+    # terminate the driver-owned engines, router, or health monitor.
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
+        state["_owns_runtime"] = False
         state["_http_client"] = None
         state["_async_loop"] = None
         state["_health_monitor"] = None
@@ -188,6 +191,7 @@ class SGLangGeneration(GenerationInterface):
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
+        self._owns_runtime = False
         if self.__dict__.get("_async_loop") is None:
             self._async_loop = AsyncLoopThread()
         if self.__dict__.get("_http_client") is None:
@@ -470,42 +474,48 @@ class SGLangGeneration(GenerationInterface):
             self._health_monitor.resume()
 
     def shutdown(self) -> bool:
-        if self._health_monitor:
-            self._health_monitor.stop()
-
         ok = True
-        engines = [e for e in self.all_engines if e is not None]
-        if engines:
-            try:
-                ray.get([e.shutdown.remote() for e in engines])
-            except Exception as e:
-                logger.warning(f"Engine shutdown failed: {e}")
-                ok = False
-            self.all_engines = [None] * len(self.all_engines)
+        if getattr(self, "_owns_runtime", True):
+            health_monitor = getattr(self, "_health_monitor", None)
+            if health_monitor:
+                health_monitor.stop()
 
-        if self._router_actor is not None:
-            try:
-                ray.get(self._router_actor.stop.remote())
-                ray.kill(self._router_actor)
-            except Exception as e:
-                logger.warning(f"Router terminate failed: {e}")
-                ok = False
-            self._router_actor = None
+            all_engines = getattr(self, "all_engines", [])
+            engines = [e for e in all_engines if e is not None]
+            if engines:
+                try:
+                    ray.get([e.shutdown.remote() for e in engines])
+                except Exception as e:
+                    logger.warning(f"Engine shutdown failed: {e}")
+                    ok = False
+                self.all_engines = [None] * len(all_engines)
 
-        if self._http_client is not None:
+            router_actor = getattr(self, "_router_actor", None)
+            if router_actor is not None:
+                try:
+                    ray.get(router_actor.stop.remote())
+                    ray.kill(router_actor)
+                except Exception as e:
+                    logger.warning(f"Router terminate failed: {e}")
+                    ok = False
+                self._router_actor = None
+
+        http_client = getattr(self, "_http_client", None)
+        async_loop = getattr(self, "_async_loop", None)
+        if http_client is not None:
             try:
-                if self._async_loop is not None:
-                    self._async_loop.run(self._http_client.aclose())
+                if async_loop is not None:
+                    async_loop.run(http_client.aclose())
                 else:
-                    self._http_client.shutdown()
+                    http_client.shutdown()
             except Exception as e:
                 logger.warning(f"HTTP client shutdown failed: {e}")
                 ok = False
             self._http_client = None
 
-        if self._async_loop is not None:
+        if async_loop is not None:
             try:
-                self._async_loop.close()
+                async_loop.close()
             except Exception as e:
                 logger.warning(f"AsyncLoopThread close failed: {e}")
                 ok = False
