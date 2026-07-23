@@ -455,6 +455,13 @@ case "${CCACHE_EXPORT_MODE}" in
 esac
 echo "TRT-LLM ccache export payload:"
 du -sh /tmp/trtllm-ccache-export
+CCACHE_HAS_DELTA=true
+if [[ "${CCACHE_EXPORT_MODE}" == "incremental" ]] && \
+    [[ -z "$(find /tmp/trtllm-ccache-export -mindepth 1 ! -type d -print -quit)" ]]; then
+    CCACHE_HAS_DELTA=false
+fi
+echo "TRT-LLM ccache export has delta: ${CCACHE_HAS_DELTA}"
+printf '%s\n' "${CCACHE_HAS_DELTA}" > /tmp/trtllm-ccache-export-has-delta
 EOF
 
 FROM trtllm-ccache-output-base AS trtllm-ccache
@@ -493,8 +500,21 @@ case "${WHEEL_CACHE_EXPORT_MODE}" in
 esac
 echo "TRT-LLM wheel cache export payload:"
 du -sh /tmp/trtllm-wheel-cache-export
+WHEEL_CACHE_HAS_DELTA=true
+if [[ "${WHEEL_CACHE_EXPORT_MODE}" == "incremental" ]] && \
+    [[ -z "$(find /tmp/trtllm-wheel-cache-export -mindepth 1 ! -type d -print -quit)" ]]; then
+    WHEEL_CACHE_HAS_DELTA=false
+fi
+echo "TRT-LLM wheel cache export has delta: ${WHEEL_CACHE_HAS_DELTA}"
+printf '%s\n' "${WHEEL_CACHE_HAS_DELTA}" > /tmp/trtllm-wheel-cache-export-has-delta
 EOF
 
 FROM trtllm-wheel-cache-output-base AS trtllm-wheel-cache
 COPY --link --from=trtllm-wheel-cache-export /tmp/trtllm-wheel-cache-export/ /
 LABEL com.nvidia.nemo-rl.cache-layout="incremental-v1"
+
+# Export only the delta decisions so CI can avoid pushing no-op incremental
+# cache layers. This target stays small even when the cache seeds are large.
+FROM scratch AS trtllm-cache-export-status
+COPY --from=trtllm-ccache-export /tmp/trtllm-ccache-export-has-delta /ccache-has-delta
+COPY --from=trtllm-wheel-cache-export /tmp/trtllm-wheel-cache-export-has-delta /wheel-has-delta

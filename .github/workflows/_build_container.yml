@@ -320,11 +320,76 @@ jobs:
             ${{ steps.build_meta.outputs.tags }}
           target: ${{ inputs.target }}
 
+      - name: Probe TRT-LLM incremental cache exports
+        id: trtllm_cache_export_status
+        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache_export.outcome == 'success' && (steps.trtllm_cache_export.outputs.ccache_mode == 'incremental' || steps.trtllm_cache_export.outputs.wheel_mode == 'incremental') }}
+        # This is an optional churn optimization. If the probe fails, leave its
+        # outputs unset so the cache update steps below retain their old,
+        # fail-open behavior and push.
+        continue-on-error: true
+        uses: docker/build-push-action@v5
+        with:
+          file: ${{ inputs.dockerfile }}
+          push: false
+          context: .
+          platforms: ${{ inputs.platform }}
+          build-contexts: |
+            ${{ inputs.build-contexts }}
+            ${{ steps.trtllm_cache_seed.outputs.ccache_context }}
+            ${{ steps.trtllm_cache_seed.outputs.wheel_context }}
+          build-args: |
+            ${{ inputs.build-args }}
+            CCACHE_EXPORT_NONCE=${{ github.run_id }}-${{ github.run_attempt }}
+            CCACHE_EXPORT_MODE=${{ steps.trtllm_cache_export.outputs.ccache_mode || 'full' }}
+            WHEEL_CACHE_EXPORT_NONCE=${{ github.run_id }}-${{ github.run_attempt }}
+            WHEEL_CACHE_EXPORT_MODE=${{ steps.trtllm_cache_export.outputs.wheel_mode || 'full' }}
+          cache-from: |
+            ${{ steps.build_meta.outputs.cache-from }}
+            ${{ steps.recent_pr_cache_refs.outputs.cache-from }}
+          no-cache: false
+          provenance: false
+          outputs: type=local,dest=${{ runner.temp }}/trtllm-cache-export-status-${{ github.run_id }}-${{ github.run_attempt }}
+          target: trtllm-cache-export-status
+
+      - name: Check TRT-LLM incremental cache deltas
+        id: trtllm_cache_delta
+        if: steps.trtllm_cache_export_status.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          STATUS_DIR: ${{ runner.temp }}/trtllm-cache-export-status-${{ github.run_id }}-${{ github.run_attempt }}
+          CCACHE_MODE: ${{ steps.trtllm_cache_export.outputs.ccache_mode }}
+          WHEEL_MODE: ${{ steps.trtllm_cache_export.outputs.wheel_mode }}
+        run: |
+          set -euo pipefail
+
+          resolve_delta() {
+            local mode="$1"
+            local status_file="$2"
+            if [[ "$mode" != "incremental" ]]; then
+              echo true
+              return
+            fi
+            [[ -f "$status_file" ]] || return 1
+            local has_delta
+            has_delta=$(<"$status_file")
+            [[ "$has_delta" == "true" || "$has_delta" == "false" ]] || return 1
+            echo "$has_delta"
+          }
+
+          CCACHE_HAS_DELTA=$(resolve_delta "$CCACHE_MODE" "$STATUS_DIR/ccache-has-delta")
+          WHEEL_HAS_DELTA=$(resolve_delta "$WHEEL_MODE" "$STATUS_DIR/wheel-has-delta")
+          {
+            echo "ccache_has_delta=$CCACHE_HAS_DELTA"
+            echo "wheel_has_delta=$WHEEL_HAS_DELTA"
+          } >> "$GITHUB_OUTPUT"
+          echo "TRT-LLM incremental cache deltas: ccache=$CCACHE_HAS_DELTA, wheel=$WHEEL_HAS_DELTA"
+
       - name: Update TRT-LLM ccache image
         # Cache mounts survive a failed RUN in the current Buildx builder. Run
         # this step after both successful and failed image builds so completed
         # compiler outputs are preserved for the next retry.
-        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.ccache_tag != '' && steps.trtllm_cache_export.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.ccache_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.ccache_has_delta != 'false' }}
         uses: docker/build-push-action@v5
         with:
           file: ${{ inputs.dockerfile }}
@@ -350,7 +415,7 @@ jobs:
       - name: Update TRT-LLM wheel cache image
         # Persist the custom wheel even when the release build fails, so a
         # retry can reuse completed compilation work.
-        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.wheel_tag != '' && steps.trtllm_cache_export.outcome == 'success' }}
+        if: ${{ always() && !cancelled() && steps.trtllm_cache.outputs.enabled == 'true' && steps.trtllm_cache.outputs.wheel_tag != '' && steps.trtllm_cache_export.outcome == 'success' && steps.trtllm_cache_delta.outputs.wheel_has_delta != 'false' }}
         uses: docker/build-push-action@v5
         with:
           file: ${{ inputs.dockerfile }}
