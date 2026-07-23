@@ -52,6 +52,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_cp_sharded_next_token_logprobs,
     get_logprobs_from_vocab_parallel_logits,
@@ -68,6 +69,7 @@ from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
 # Union type for any post-processing function
 PostProcessingFunction = Union[
     "LossPostProcessor",
+    "ValueLossPostProcessor",
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
     "FullLogitsPostProcessor",
@@ -123,7 +125,7 @@ def _build_model_batch(
                 processed_inputs.input_ids
             )
 
-    if is_reward_model or not allow_flash_attn_args:
+    if not allow_flash_attn_args:
         model_batch.pop("flash_attn_kwargs", None)
 
     drop_explicit_only_kwargs_not_in_forward(model, model_batch)
@@ -410,7 +412,13 @@ def forward_with_post_processing_fn(
         )
         metrics = {"full_logits": result}
     elif isinstance(post_processing_fn, ScorePostProcessor):
-        result = post_processing_fn(logits=logits)
+        result = post_processing_fn(
+            logits=logits,
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=processed_mb.original_batch_size,
+            original_seq_len=processed_mb.original_seq_len,
+        )
         metrics = {"scores": result}
     else:
         raise TypeError(
@@ -683,6 +691,67 @@ class LossPostProcessor:
             )
 
         return loss, loss_metrics
+
+
+class ValueLossPostProcessor(LossPostProcessor):
+    """Compute a scalar token-classification loss on the full CP sequence.
+
+    Policy logits are vocabulary-sharded, so :class:`LossPostProcessor`
+    redistributes both logits and loss data into CP-local sequence shards. A
+    regression value head instead emits one scalar per token. Gather those
+    scalars back into global sequence order and keep PPO returns, masks, and old
+    values in their original full-sequence layout.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.cp_loss_is_replicated = self.cp_size > 1
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
+        processed_inputs: ProcessedInputs,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        *,
+        cp_sharder: Optional[ContextParallelSharder],
+        sequence_dim: int = 1,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if self.cp_size <= 1:
+            return super().__call__(
+                logits=logits,
+                data_dict=data_dict,
+                processed_inputs=processed_inputs,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                cp_sharder=cp_sharder,
+                sequence_dim=sequence_dim,
+            )
+
+        assert not self.enable_seq_packing, (
+            "DTensor context parallelism is incompatible with sequence packing."
+        )
+        local_logits = to_local_if_dtensor(logits).to(torch.float32)
+        full_logits = allgather_cp_sharded_tensor(
+            local_logits, self.cp_mesh.get_group(), seq_dim=sequence_dim
+        )
+
+        # Regression value losses consume logits directly; preserving the
+        # generic preparation step keeps wrapped LossFunction attributes and
+        # future LOGIT preprocessing behavior consistent.
+        loss_input, data_dict = prepare_loss_input(
+            full_logits,
+            data_dict,
+            self.loss_fn,
+            sampling_params=self.sampling_params,
+        )
+        return self.loss_fn(
+            data=data_dict,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            **loss_input,
+        )
 
 
 class LogprobsPostProcessor:
@@ -1105,22 +1174,33 @@ class ScorePostProcessor:
     def __init__(
         self,
         cfg: PolicyConfig,
+        enable_seq_packing: bool = False,
     ):
         """Initialize ScorePostProcessor.
 
         Args:
             cfg: Configuration dictionary
+            enable_seq_packing: Whether to unpack scores from packed sequences
         """
         self.cfg = cfg
+        self.enable_seq_packing = enable_seq_packing
 
     def __call__(
         self,
         logits: torch.Tensor,
+        data_dict: Optional[BatchedDataDict[Any]] = None,
+        processed_inputs: Optional[ProcessedInputs] = None,
+        original_batch_size: Optional[int] = None,
+        original_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Extract scores from reward model outputs.
 
         Args:
             logits: Model output logits
+            data_dict: Original microbatch data
+            processed_inputs: Inputs after optional sequence packing
+            original_batch_size: Batch size before sequence packing
+            original_seq_len: Sequence length before sequence packing
 
         Returns:
             Scores tensor
@@ -1128,6 +1208,25 @@ class ScorePostProcessor:
         logits = logits.to(torch.float32)
         rm_scores = to_local_if_dtensor(logits)
         rm_scores = rm_scores.squeeze(-1)
+
+        if self.enable_seq_packing:
+            assert data_dict is not None
+            assert processed_inputs is not None
+            assert original_batch_size is not None
+            assert original_seq_len is not None
+            unpacked_scores = torch.zeros(
+                (original_batch_size, original_seq_len),
+                dtype=rm_scores.dtype,
+                device=rm_scores.device,
+            )
+            input_lengths = data_dict["input_lengths"]
+            cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
+            for i in range(original_batch_size):
+                start = cu_seqlens[i].item()
+                end = cu_seqlens[i + 1].item()
+                seq_len_actual = input_lengths[i].item()
+                unpacked_scores[i, :seq_len_actual] = rm_scores[0, start:end]
+            rm_scores = unpacked_scores
 
         return rm_scores
 
