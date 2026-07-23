@@ -2262,7 +2262,7 @@ def _refit_sglang_dispatch(
     )
 
 
-def refit_policy_generation(
+def _refit_policy_generation_impl(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
     colocated_inference: bool,
@@ -2396,6 +2396,60 @@ def refit_policy_generation(
         policy_generation.resume_after_refit()
 
     return {}
+
+
+def refit_policy_generation(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    colocated_inference: bool,
+    _refit_buffer_size_gb: Optional[float] = None,
+    timer: Optional[Timer] = None,
+    kv_scales: Optional[dict[str, float]] = None,
+) -> dict[str, float]:
+    """Refit generation weights and emit bounded SGLang lifecycle markers."""
+    if not isinstance(policy_generation, SGLangGeneration):
+        return _refit_policy_generation_impl(
+            policy,
+            policy_generation,
+            colocated_inference,
+            _refit_buffer_size_gb,
+            timer,
+            kv_scales,
+        )
+
+    transfer = "ipc" if colocated_inference else "broadcast"
+    refit_index = getattr(policy_generation, "_nrl_completed_refits", 0) + 1
+    started_at = time.monotonic()
+    print(
+        f"NRL_SGLANG_REFIT_START transfer={transfer} refit={refit_index}",
+        flush=True,
+    )
+    try:
+        metrics = _refit_policy_generation_impl(
+            policy,
+            policy_generation,
+            colocated_inference,
+            _refit_buffer_size_gb,
+            timer,
+            kv_scales,
+        )
+    except BaseException as error:
+        print(
+            "NRL_SGLANG_REFIT_FAILURE "
+            f"transfer={transfer} refit={refit_index} "
+            f"phase=prepare_or_transfer error_type={type(error).__name__}",
+            flush=True,
+        )
+        raise
+
+    policy_generation._nrl_completed_refits = refit_index
+    duration_s = time.monotonic() - started_at
+    print(
+        "NRL_SGLANG_REFIT_SUCCESS "
+        f"transfer={transfer} refit={refit_index} duration_s={duration_s:.3f}",
+        flush=True,
+    )
+    return metrics
 
 
 def _initial_policy_generation_stale(
