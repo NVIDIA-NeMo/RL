@@ -457,6 +457,13 @@ class DraftConfig(TypedDict):
     loss_weight: NotRequired[float]
     num_layers: NotRequired[int | None]
     aux_layer_indices: NotRequired[list[int] | None]
+    # Decoupled learning rate for the draft submodule. When lr is set, the draft
+    # params train in their own optimizer param group with this peak LR (and
+    # min_lr, if given), following the same warmup/decay schedule as the policy.
+    # Useful when the draft is trained from scratch and needs a larger LR than
+    # the (fine-tuned) policy. When lr is unset/None, the draft shares the policy LR.
+    lr: NotRequired[float | None]
+    min_lr: NotRequired[float | None]
 
 
 class TokenizerConfig(TypedDict):

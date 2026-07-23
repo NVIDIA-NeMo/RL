@@ -1,0 +1,64 @@
+defaults: ../../grpo_math_1B.yaml
+
+# Identical to grpo-qwen3-8b-base-1n8g-megatron-eagle3-scratch-draft.yaml, except
+# the from-scratch draft trains with its OWN peak learning rate (policy.draft.lr).
+# The draft params get a dedicated optimizer param group whose max_lr comes from
+# policy.draft.lr, following the same warmup/decay schedule as the policy; every
+# other param keeps the policy LR (megatron_cfg.optimizer.lr). This lets the
+# random-init draft learn faster than the fine-tuned 8B policy.
+# The draft LR schedule is logged live as train/draft_lr, and the peak is encoded
+# in the wandb run name (draftlr1e-4) for tracking.
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-8b-base-1n8g-megatron-eagle3-scratch-draft-draftlr1e-4
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 4
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 4
+    sequence_parallel: true
+    apply_rope_fusion: false
+    activation_checkpointing: true
+    defer_fp32_logits: true
+  draft:
+    enabled: true
+    # Random-init draft: architecture derived from the policy model
+    # (1 decoder layer, full 151936 vocab, aux layers auto-selected).
+    model_name: null
+    loss_weight: 1.0
+    num_layers: 1
+    aux_layer_indices: null
+    # Decoupled draft learning rate (from-scratch draft needs a larger LR than
+    # the fine-tuned policy, whose megatron_cfg.optimizer.lr is 5e-6). Tunable.
+    lr: 1.0e-4
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.6
+      max_model_len: 4100  # 4096 + num_speculative_tokens + 1 (drafter headroom)
+    vllm_kwargs:
+      speculative_config:
+        method: "eagle3"
+        # Local config dir (no weights): same architecture as
+        # AngelSlim/Qwen3-8B_eagle3 but draft_vocab_size == vocab_size so shapes
+        # match the scratch megatron draft. vLLM dummy-loads it and the first
+        # refit pushes the random-init weights from the trainer.
+        model: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/speculative_rl/RL/results/eagle3-scratch-draft-8b-vllm-config
+        num_speculative_tokens: 3
+        draft_tensor_parallel_size: 1
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-8b-base-1n8g-megatron-eagle3-scratch-draft-draftlr1e-4
+cluster:
+  gpus_per_node: 8

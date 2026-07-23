@@ -140,6 +140,24 @@ def _model_self_packs_for_cp(model: Any) -> bool:
     return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
 
 
+def _draft_scheduled_lr(optimizer: Any, scheduler: Any) -> Optional[float]:
+    """Current scheduled LR of the Eagle draft param group, or None if absent.
+
+    Draft params carry ``grad_norm_group == "draft"`` (see build_draft_model), so
+    they live in their own optimizer param group(s) when ``policy.draft.lr`` is
+    set. Both draft groups (wd / no-wd) share the same ``max_lr``, so the first
+    match yields the draft LR. Returns None when there is no dedicated draft
+    group (draft disabled, or draft.lr unset so the draft shares the policy LR).
+    """
+    for group in optimizer.param_groups:
+        if any(
+            getattr(p, "grad_norm_group", None) == "draft"
+            for p in group.get("params", [])
+        ):
+            return scheduler.get_lr(group)
+    return None
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
@@ -804,6 +822,11 @@ class MegatronPolicyWorkerImpl(
                         curr_wd = self.scheduler.get_wd()
                         loss_metrics["lr"] = curr_lr
                         loss_metrics["wd"] = curr_wd
+                        draft_lr = _draft_scheduled_lr(
+                            self.optimizer, self.scheduler
+                        )
+                        if draft_lr is not None:
+                            loss_metrics["draft_lr"] = draft_lr
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
                         mb_losses.append(loss_metrics["loss"])
@@ -1313,6 +1336,7 @@ class MegatronPolicyWorkerImpl(
         # the value of THIS step, not the next one. (terrykong, #2683:832).
         curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
         curr_wd = self.scheduler.get_wd()
+        draft_lr = _draft_scheduled_lr(self.optimizer, self.scheduler)
 
         # Scheduler increment matches sync path's ``increment=gbs``.
         self.scheduler.step(increment=state["gbs"])
@@ -1375,6 +1399,8 @@ class MegatronPolicyWorkerImpl(
                     out[k] = _scale_metric(k, v)
             out["lr"] = curr_lr
             out["wd"] = curr_wd
+            if draft_lr is not None:
+                out["draft_lr"] = draft_lr
             out["global_valid_seqs"] = global_valid_seqs_f
             out["global_valid_toks"] = global_valid_toks_f
             rescaled_metrics.append(out)
