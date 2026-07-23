@@ -228,18 +228,13 @@ def _clamp_max_num_steps(
     )
 
 
-def _maybe_inject_megatron_train_iters(
-    master_config: MasterConfig, dataloader: StatefulDataLoader
-) -> None:
-    """Set megatron_cfg.train_iters; must run before _build_trainer."""
+def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
+    """Set train_iters from max_num_steps after its dataloader clamp."""
     policy_config = master_config.policy
     if not policy_config.get("megatron_cfg", {}).get("enabled", False):
         return
     grpo_config = master_config.grpo
-    policy_config["megatron_cfg"]["train_iters"] = min(
-        grpo_config["max_num_steps"],
-        grpo_config["max_num_epochs"] * len(dataloader),
-    )
+    policy_config["megatron_cfg"]["train_iters"] = grpo_config["max_num_steps"]
 
 
 def setup_single_controller(
@@ -325,7 +320,7 @@ def setup_single_controller(
     )
 
     _clamp_max_num_steps(master_config, dataloader)
-    _maybe_inject_megatron_train_iters(master_config, dataloader)
+    _maybe_inject_megatron_train_iters(master_config)
 
     # ==========================
     # Setup Clusters & Workers

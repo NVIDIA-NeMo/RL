@@ -1138,6 +1138,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""
+        if not hasattr(self, "worker_group"):
+            return True
         try:
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")

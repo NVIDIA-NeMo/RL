@@ -39,7 +39,7 @@ def _make_master_config(
     megatron_enabled: bool = False,
     env: dict | None = None,
     max_num_steps: int = 100,
-    max_num_epochs: int = 1,
+    max_num_epochs: int | None = 1,
     num_prompts_per_step: int = 4,
 ) -> MasterConfig:
     """Build a partially-populated MasterConfig for unit tests.
@@ -370,6 +370,18 @@ class TestSetup:
         setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 8
+
+    def test_megatron_train_iters_with_unbounded_epochs(self, patched_factories):
+        """None max_num_epochs leaves max_num_steps as the Megatron limit."""
+        mc = _make_master_config(
+            megatron_enabled=True,
+            max_num_steps=100,
+            max_num_epochs=None,
+        )
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.grpo["max_num_steps"] == 100
+        assert mc.policy["megatron_cfg"]["train_iters"] == 100
 
     def test_megatron_train_iters_not_set_when_disabled(self, patched_factories):
         mc = _make_master_config(megatron_enabled=False)
