@@ -58,6 +58,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGymConfig,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    split_nemo_gym_runtime_options,
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
@@ -516,16 +517,11 @@ def setup(
                 return deferred_vllm
 
             def init_nemo_gym():
-                nemo_gym_dict = dict(env_configs["nemo_gym"])
+                runtime_options, nemo_gym_dict = split_nemo_gym_runtime_options(
+                    dict(env_configs["nemo_gym"])
+                )
                 # These are NeMo-RL-side fields consumed by NemoGymConfig, not
                 # NeMo-Gym global config entries.
-                invalid_tool_call_patterns = nemo_gym_dict.pop(
-                    "invalid_tool_call_patterns", None
-                )
-                thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
-                truncate_noncontiguous_episodes = nemo_gym_dict.pop(
-                    "truncate_noncontiguous_episodes", None
-                )
                 # Pass prebuilt cache + venv dirs through the global config so the
                 # gym reuses image-baked venvs instead of rebuilding them.
                 uv_cache_dir = get_nemo_gym_uv_cache_dir()
@@ -537,10 +533,14 @@ def setup(
                 nemo_gym_cfg = NemoGymConfig(
                     model_name=generation_config["model_name"],
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
-                    invalid_tool_call_patterns=invalid_tool_call_patterns,
-                    thinking_tags=thinking_tags,
+                    invalid_tool_call_patterns=(
+                        runtime_options.invalid_tool_call_patterns
+                    ),
+                    thinking_tags=runtime_options.thinking_tags,
                     use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-                    truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+                    truncate_noncontiguous_episodes=(
+                        runtime_options.truncate_noncontiguous_episodes
+                    ),
                     initial_global_config_dict=nemo_gym_dict,
                 )
                 nemo_gym_opts = {

@@ -85,6 +85,7 @@ from nemo_rl.environments.nemo_gym import (
     NemoGymConfig,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
+    split_nemo_gym_runtime_options,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
@@ -610,16 +611,11 @@ def setup(
             nemo_gym_py_exec = create_local_venv_on_each_node(
                 nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
             )
-        nemo_gym_dict = dict(env_configs["nemo_gym"])
+        runtime_options, nemo_gym_dict = split_nemo_gym_runtime_options(
+            dict(env_configs["nemo_gym"])
+        )
         # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
         # (where the detector reads them), not part of Gym's global config.
-        invalid_tool_call_patterns = nemo_gym_dict.pop(
-            "invalid_tool_call_patterns", None
-        )
-        thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
-        truncate_noncontiguous_episodes = nemo_gym_dict.pop(
-            "truncate_noncontiguous_episodes", None
-        )
         # Pass prebuilt cache + venv dirs through the global config so the gym reuses
         # image-baked venvs instead of rebuilding them.
         uv_cache_dir = get_nemo_gym_uv_cache_dir()
@@ -631,8 +627,8 @@ def setup(
         nemo_gym_cfg = NemoGymConfig(
             model_name=model_name,
             base_urls=base_urls,
-            invalid_tool_call_patterns=invalid_tool_call_patterns,
-            thinking_tags=thinking_tags,
+            invalid_tool_call_patterns=runtime_options.invalid_tool_call_patterns,
+            thinking_tags=runtime_options.thinking_tags,
             require_routed_experts=router_replay_enabled(policy_config),
             routed_experts_dtype=(
                 resolve_routed_experts_dtype_name_for_model(model_name)
@@ -640,7 +636,9 @@ def setup(
                 else "int16"
             ),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-            truncate_noncontiguous_episodes=truncate_noncontiguous_episodes,
+            truncate_noncontiguous_episodes=(
+                runtime_options.truncate_noncontiguous_episodes
+            ),
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}

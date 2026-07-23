@@ -22,6 +22,7 @@ from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel, ConfigDict
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.virtual_cluster import (
@@ -49,6 +50,32 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+class NemoGymRuntimeOptions(BaseModel):
+    """NeMo-RL-owned options nested under ``env.nemo_gym``.
+
+    The remaining keys in that mapping are forwarded to NeMo Gym as its global
+    config. Keeping NeMo-RL's options in a model gives every call site the same
+    defaults without hidden ``dict.get`` fallbacks.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    invalid_tool_call_patterns: list[str] | None = None
+    thinking_tags: list[str] | None = None
+    truncate_noncontiguous_episodes: bool = False
+
+
+def split_nemo_gym_runtime_options(
+    config: dict[str, Any],
+) -> tuple[NemoGymRuntimeOptions, dict[str, Any]]:
+    """Split NeMo-RL runtime options from the config forwarded to NeMo Gym."""
+    options = NemoGymRuntimeOptions.model_validate(config)
+    gym_global_config = dict(config)
+    for key in NemoGymRuntimeOptions.model_fields:
+        gym_global_config.pop(key, None)
+    return options, gym_global_config
 
 
 def _has_nan_generation_logprobs(result: dict) -> bool:
@@ -115,7 +142,7 @@ class NemoGymConfig(TypedDict):
     # When absent/false (default), such an episode raises the contiguity
     # assertion below, which kills the rollout task; under async GRPO a single
     # such episode can then stall the training step indefinitely.
-    truncate_noncontiguous_episodes: NotRequired[bool]
+    truncate_noncontiguous_episodes: bool
 
 
 def _detect_invalid_tool_call_and_malformed_thinking(
