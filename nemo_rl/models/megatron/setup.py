@@ -18,7 +18,6 @@ import os
 import threading
 import time
 import warnings
-from dataclasses import dataclass
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -39,17 +38,9 @@ from megatron.bridge.training.config import (
     DistributedInitConfig,
     LoggerConfig,
     OptimizerConfig,
-    OptimizerConfigOverrideProvider,
-    OptimizerConfigOverrideProviderContext,
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,
-)
-from megatron.core.optimizer import (
-    ParamGroupOverride,
-    ParamKey,
-    ParamPredicate,
-    get_standard_config_overrides,
 )
 from megatron.bridge.training.initialize import (
     initialize_megatron,
@@ -76,45 +67,6 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
 
 _HF_CONFIG_PATCHED = False
-
-def _is_draft_param(param: "torch.nn.Parameter") -> bool:
-    """True for Eagle draft params, tagged with grad_norm_group == 'draft'.
-
-    Matching by this attribute (set in build_draft_model) rather than by name is
-    robust to the module wrapper prefixes (Float16Module/DDP) present on the
-    param names at optimizer-construction time.
-    """
-    return getattr(param, "grad_norm_group", None) == DRAFT_GRAD_NORM_GROUP
-
-
-@dataclass
-class _DraftLROverrideProvider(OptimizerConfigOverrideProvider):
-    """Give the Eagle draft submodule its own peak learning rate.
-
-    Draft params are placed in a dedicated optimizer param group whose
-    ``max_lr``/``min_lr`` come from ``policy.draft.lr``/``policy.draft.min_lr``;
-    all other params keep the policy LR. The scheduler drives each group by its
-    own ``max_lr``, so the draft follows the same warmup/decay shape scaled to
-    its own peak — the same mechanism Megatron uses for decoupled/embedding LRs.
-    This lets a from-scratch draft train at a larger LR than the fine-tuned
-    policy. Standard weight-decay overrides are preserved.
-    """
-
-    draft_lr: float
-    draft_min_lr: float | None = None
-
-    def build_config_overrides(
-        self, context: OptimizerConfigOverrideProviderContext
-    ) -> dict[ParamKey, ParamGroupOverride] | None:
-        overrides = get_standard_config_overrides(config=context.optimizer_config) or {}
-        draft_override: ParamGroupOverride = {"max_lr": self.draft_lr}
-        if self.draft_min_lr is not None:
-            draft_override["min_lr"] = self.draft_min_lr
-        draft_key = ParamKey(
-            predicate=ParamPredicate(name=DRAFT_GRAD_NORM_GROUP, fn=_is_draft_param)
-        )
-        overrides[draft_key] = draft_override
-        return overrides
 
 
 def _patch_hf_config_double_instantiation():
@@ -182,7 +134,6 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.config import ModelAndOptimizerState, RuntimeConfig
 from nemo_rl.models.megatron.draft.utils import (
-    DRAFT_GRAD_NORM_GROUP,
     build_draft_model,
     find_draft_owner_chunk,
     get_attached_draft_model,
@@ -1426,20 +1377,11 @@ def setup_model_and_optimizer(
     )
 
     if load_optimizer:
-        # Give the draft submodule its own peak LR when policy.draft.lr is set.
-        # None keeps the default provider (draft shares the policy LR).
-        optimizer_config_override_provider = None
-        if draft_enabled and policy_cfg["draft"].get("lr") is not None:
-            optimizer_config_override_provider = _DraftLROverrideProvider(
-                draft_lr=policy_cfg["draft"]["lr"],
-                draft_min_lr=policy_cfg["draft"].get("min_lr"),
-            )
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
             scheduler_config=megatron_cfg.scheduler,
             model=model,
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
-            optimizer_config_override_provider=optimizer_config_override_provider,
         )
     else:
         optimizer = None
