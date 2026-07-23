@@ -423,6 +423,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     async def post_init_async(self):
         if self.llm is not None:
+            # AsyncLLM.collective_rpc returns a coroutine. Keep this hook in
+            # post-init so it is explicitly awaited before refit or sleep.
+            await self.llm.collective_rpc(
+                "_initialize_nemotron_omni_radio_layerscale", args=tuple()
+            )
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
         if self._mtp_load_from_disk:
@@ -448,6 +453,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
+        from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
@@ -745,6 +751,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # instead of silently defaulting.
         default_chat_template_kwargs: dict[str, Any] = (
             serving_chat_kwargs.pop("chat_template_kwargs", None) or {}
+        )
+        # The stock vLLM API server resolves a configured template path before
+        # constructing OpenAIServingRender. NeMo-RL builds these serving
+        # objects directly, so it must perform the same step; otherwise
+        # Transformers treats the path itself as literal Jinja and the rendered
+        # prompt loses multimodal markers such as ``<image>``.
+        serving_chat_kwargs["chat_template"] = load_chat_template(
+            serving_chat_kwargs["chat_template"]
         )
         openai_serving_render = NeMoRLOpenAIServingRender(
             model_config=engine_client.model_config,

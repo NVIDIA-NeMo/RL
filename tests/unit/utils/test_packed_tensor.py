@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
 import torch
 
+import nemo_rl.utils.packed_tensor as packed_tensor
 from nemo_rl.utils.packed_tensor import (
+    get_target_packed_tensor_size,
     packed_broadcast_consumer,
     packed_broadcast_producer,
 )
@@ -66,6 +69,75 @@ def create_mock_model_params():
 def create_mock_state_dict_info(params):
     """Create state dict info (name -> (shape, dtype)) from params."""
     return {name: (tensor.shape, tensor.dtype) for name, tensor in params}
+
+
+def test_explicit_packed_tensor_size_does_not_depend_on_local_gpu(monkeypatch):
+    """A fixed size is safe for collectives spanning heterogeneous GPUs."""
+    get_target_packed_tensor_size.cache_clear()
+    monkeypatch.setenv("NRL_REFIT_BUFFER_SIZE_BYTES", "536870912")
+    try:
+        assert get_target_packed_tensor_size() == 512 * 1024**2
+    finally:
+        get_target_packed_tensor_size.cache_clear()
+
+
+@pytest.mark.parametrize("value", ["not-an-int", "0", "-1", str(5 * 1024**3 + 1)])
+def test_explicit_packed_tensor_size_rejects_invalid_values(monkeypatch, value):
+    get_target_packed_tensor_size.cache_clear()
+    monkeypatch.setenv("NRL_REFIT_BUFFER_SIZE_BYTES", value)
+    try:
+        with pytest.raises(ValueError, match="NRL_REFIT_BUFFER_SIZE_BYTES"):
+            get_target_packed_tensor_size()
+    finally:
+        get_target_packed_tensor_size.cache_clear()
+
+
+@pytest.mark.parametrize("role", ["producer", "consumer"])
+def test_packed_broadcast_synchronizes_every_stream_before_return(
+    monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    class FakeStream:
+        def __init__(self) -> None:
+            self.synchronize_calls = 0
+
+        def synchronize(self) -> None:
+            self.synchronize_calls += 1
+
+    streams: list[FakeStream] = []
+
+    def make_stream() -> FakeStream:
+        stream = FakeStream()
+        streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(packed_tensor, "get_num_buffers", lambda: 2)
+    monkeypatch.setattr(packed_tensor, "get_target_packed_tensor_size", lambda: 1)
+    monkeypatch.setattr(packed_tensor.torch.cuda, "Stream", make_stream)
+    monkeypatch.setattr(
+        packed_tensor.torch.cuda, "stream", lambda _stream: nullcontext()
+    )
+    monkeypatch.setattr(
+        packed_tensor.torch, "empty", lambda *_args, **_kwargs: object()
+    )
+
+    if role == "producer":
+        packed_broadcast_producer(
+            iterator=iter(()),
+            group=object(),
+            src=0,
+            post_iter_func=lambda tensor: tensor,
+        )
+    else:
+        packed_broadcast_consumer(
+            iterator=iter(()),
+            group=object(),
+            src=0,
+            post_unpack_func=lambda tensors: tensors,
+        )
+
+    # The first loop iteration reuses stream 1, so it synchronizes once before
+    # work and once at shutdown. Stream 0 is reached only by the shutdown loop.
+    assert [stream.synchronize_calls for stream in streams] == [1, 2]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

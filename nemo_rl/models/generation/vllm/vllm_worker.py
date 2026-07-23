@@ -494,11 +494,6 @@ class BaseVllmGenerationWorker:
         )
 
         self._create_engine(llm_kwargs)
-        # Nemotron Omni checkpoints fold RADIO LayerScale into adjacent weights,
-        # while stock vLLM still allocates ls1/ls2 parameters. Initialize those
-        # parameters before colocated level-1 sleep releases their CUDA storage;
-        # mutating them later from prepare_refit_info corrupts sleep/wake state.
-        self.llm.collective_rpc("_initialize_nemotron_omni_radio_layerscale")
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
         )
@@ -646,6 +641,13 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     def post_init(self):
         if self.llm is not None:
+            # Nemotron Omni checkpoints fold RADIO LayerScale into adjacent
+            # weights, while stock vLLM still allocates ls1/ls2 parameters.
+            # Initialize them after engine creation but before any refit or
+            # colocated level-1 sleep releases their CUDA storage.
+            self.llm.collective_rpc(
+                "_initialize_nemotron_omni_radio_layerscale", args=tuple()
+            )
             self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
         if self._mtp_load_from_disk:

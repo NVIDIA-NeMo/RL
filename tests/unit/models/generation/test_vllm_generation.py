@@ -49,6 +49,54 @@ from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
 model_name = "Qwen/Qwen3-0.6B"
+
+
+def test_vllm_post_init_initializes_radio_layerscale_before_other_collectives():
+    calls = []
+
+    class FakeLLM:
+        def collective_rpc(self, method, args=tuple()):
+            calls.append((method, args))
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.llm = FakeLLM()
+    worker._mtp_load_from_disk = False
+    worker.report_device_id = lambda: ["gpu-0"]
+
+    worker.post_init()
+
+    assert calls == [
+        ("_initialize_nemotron_omni_radio_layerscale", tuple()),
+        ("bind_numa", tuple()),
+    ]
+    assert worker.vllm_device_ids == ["gpu-0"]
+
+
+@pytest.mark.asyncio
+async def test_vllm_async_post_init_awaits_radio_layerscale_initialization():
+    calls = []
+
+    class FakeAsyncLLM:
+        async def collective_rpc(self, method, args=tuple()):
+            calls.append((method, args))
+
+    async def report_device_id_async():
+        return ["gpu-0"]
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = FakeAsyncLLM()
+    worker._mtp_load_from_disk = False
+    worker.report_device_id_async = report_device_id_async
+
+    await worker.post_init_async()
+
+    assert calls == [
+        ("_initialize_nemotron_omni_radio_layerscale", tuple()),
+        ("bind_numa", tuple()),
+    ]
+    assert worker.vllm_device_ids == ["gpu-0"]
+
+
 # Define basic vLLM test config
 basic_vllm_test_config: VllmConfig = {
     "backend": "vllm",
@@ -294,6 +342,15 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     class ReasoningParserManager:
         import_reasoning_parser = MagicMock()
 
+    load_chat_template = MagicMock(
+        side_effect=lambda value: None if value is None else f"resolved:{value}"
+    )
+
+    make_module(
+        "vllm.entrypoints.chat_utils",
+        load_chat_template=load_chat_template,
+    )
+
     make_module(
         "vllm.entrypoints.openai.chat_completion.protocol",
         ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
@@ -339,7 +396,12 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         ToolParserManager=ToolParserManager,
     )
     make_module("vllm.v1.engine.async_llm", logger=MagicMock())
-    return ToolParserManager, ReasoningParserManager, OpenAIServingChat
+    return (
+        ToolParserManager,
+        ReasoningParserManager,
+        OpenAIServingChat,
+        load_chat_template,
+    )
 
 
 class _FakeFastAPIApp:
@@ -359,6 +421,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         tool_parser_manager,
         reasoning_parser_manager,
         openai_serving_chat,
+        load_chat_template,
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -370,6 +433,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
             "reasoning_parser_plugin": "/plugins/reasoning_parser.py",
             "http_server_serving_chat_kwargs": {
                 "reasoning_parser": "nano_v3",
+                "chat_template": "/templates/omni.jinja",
             },
         },
     }
@@ -387,7 +451,12 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     reasoning_parser_manager.import_reasoning_parser.assert_called_once_with(
         "/plugins/reasoning_parser.py"
     )
+    load_chat_template.assert_called_once_with("/templates/omni.jinja")
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
+    assert (
+        openai_serving_chat.instances[0].kwargs["chat_template"]
+        == "resolved:/templates/omni.jinja"
+    )
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
 

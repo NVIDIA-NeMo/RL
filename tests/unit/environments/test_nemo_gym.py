@@ -206,7 +206,7 @@ def test_nemo_gym_postprocess_uses_batch_decode():
 
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            _MockSelf(), nemo_gym_result, tokenizer
+            _MockSelf(), {}, nemo_gym_result, tokenizer
         )
     )
 

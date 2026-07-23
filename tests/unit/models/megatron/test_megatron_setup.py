@@ -134,7 +134,8 @@ class TestValidateModelPaths:
         assert "model_" in pretrained_path
         assert pt_checkpoint_exists is False
 
-    def test_checkpoint_exists(self, tmp_path):
+    @pytest.mark.parametrize("metadata_file", ["metadata.json", ".metadata"])
+    def test_checkpoint_exists(self, tmp_path, metadata_file):
         """Test when a Megatron checkpoint already exists."""
         from nemo_rl.models.megatron.setup import validate_model_paths
 
@@ -142,6 +143,8 @@ class TestValidateModelPaths:
         checkpoint_dir = tmp_path / "checkpoints" / "test-model"
         iter_dir = checkpoint_dir / "iter_0000000"
         iter_dir.mkdir(parents=True)
+        for required_file in ("run_config.yaml", "train_state.pt", metadata_file):
+            (iter_dir / required_file).touch()
 
         config = {"model_name": "test-model"}
 
@@ -155,6 +158,26 @@ class TestValidateModelPaths:
 
         assert hf_model_name == "test-model"
         assert pt_checkpoint_exists is True
+
+    def test_incomplete_automatic_hf_conversion_is_not_a_cache_hit(self, tmp_path):
+        """Partial distcp shards must not suppress a fresh HF conversion."""
+        from nemo_rl.models.megatron.setup import validate_model_paths
+
+        checkpoint_dir = tmp_path / "checkpoints" / "test-model"
+        iter_dir = checkpoint_dir / "iter_0000000"
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "__0_0.distcp").touch()
+
+        with patch(
+            "nemo_rl.models.megatron.setup.get_megatron_checkpoint_dir",
+            return_value=str(tmp_path / "checkpoints"),
+        ):
+            _, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+                {"model_name": "test-model"}
+            )
+
+        assert pretrained_path == str(checkpoint_dir)
+        assert pt_checkpoint_exists is False
 
     def test_hf_config_overrides_change_hashed_pretrained_path(self, tmp_path):
         """Test that different hf_config_overrides map to different hashed paths."""

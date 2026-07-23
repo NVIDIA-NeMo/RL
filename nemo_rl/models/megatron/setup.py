@@ -495,9 +495,22 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
         hf_model_subdir = f"{hf_model_subdir}__hfovr_{overrides_hash}"
     pretrained_path = os.path.join(get_megatron_checkpoint_dir(), hf_model_subdir)
-    pt_checkpoint_exists = os.path.exists(pretrained_path) and os.path.exists(
-        os.path.join(pretrained_path, "iter_0000000")
+    # A previous conversion can leave the iteration directory and large distcp
+    # shards behind before Bridge writes its completion metadata. Treating that
+    # directory alone as a cache hit makes every policy rank skip the HF import,
+    # only to fail later while loading run_config.yaml. A completed Bridge
+    # conversion has its config and train state plus metadata for either the
+    # MCore torch_dist or PyTorch DCP checkpoint format.
+    iter_path = os.path.join(pretrained_path, "iter_0000000")
+    bridge_files_exist = all(
+        os.path.isfile(os.path.join(iter_path, filename))
+        for filename in ("run_config.yaml", "train_state.pt")
     )
+    checkpoint_metadata_exists = any(
+        os.path.isfile(os.path.join(iter_path, filename))
+        for filename in ("metadata.json", ".metadata")
+    )
+    pt_checkpoint_exists = bridge_files_exist and checkpoint_metadata_exists
     return hf_model_name, pretrained_path, pt_checkpoint_exists
 
 
